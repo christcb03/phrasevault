@@ -1,0 +1,34 @@
+---
+# ── Install type ───────────────────────────────────────────────────────────────
+# saltbox    : deploys using Saltbox conventions (saltbox Docker network,
+#              Traefik labels, /opt/appname data dir, Watchtower managed)
+# ubuntu     : plain Docker on Ubuntu, no Traefik, direct port binding
+# custom     : you override all variables yourself
+install_type: saltbox
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+phrasevault_image: "ghcr.io/christcb03/phrasevault:latest"
+phrasevault_container_name: phrasevault
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+phrasevault_data_dir: /opt/phrasevault
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# saltbox uses the 'saltbox' bridge network; ubuntu uses a direct port binding
+phrasevault_docker_network: "saltbox"       # ignored for ubuntu install_type
+phrasevault_port: "8080"                    # host port for ubuntu install_type
+
+# ── Traefik (saltbox only) ─────────────────────────────────────────────────────
+phrasevault_domain: "phrasevault.{{ ansible_hostname }}.local"
+phrasevault_traefik_router: phrasevault
+phrasevault_traefik_certresolver: cfdns     # your Saltbox cert resolver name
+
+# ── Runtime config ─────────────────────────────────────────────────────────────
+# PV_API_KEY must be set — use Ansible Vault to keep it encrypted
+phrasevault_api_key: "{{ vault_phrasevault_api_key }}"
+phrasevault_log_level: INFO
+phrasevault_docs_enabled: "0"
+
+# ── System user (non-saltbox only) ────────────────────────────────────────────
+phrasevault_uid: 1000
+phrasevault_gid: 1000

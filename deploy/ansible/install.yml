@@ -1,0 +1,27 @@
+---
+# PhraseVault install playbook
+#
+# Usage:
+#   ansible-playbook install.yml -i your_inventory \
+#     -e install_type=saltbox \
+#     -e phrasevault_domain=phrasevault.yourdomain.com \
+#     --ask-vault-pass
+#
+# install_type options:
+#   saltbox  (default) — Saltbox/Traefik Docker stack
+#   ubuntu             — plain Docker, direct port binding
+#   custom             — full variable control
+#
+# Required vars (set in group_vars or pass with -e):
+#   vault_phrasevault_api_key  — API key, stored encrypted in Ansible Vault
+
+- name: Install PhraseVault
+  hosts: "{{ target_hosts | default('mediabox') }}"
+  gather_facts: true
+  become: true
+
+  vars:
+    install_type: saltbox
+
+  roles:
+    - role: "{{ playbook_dir }}/roles/phrasevault"

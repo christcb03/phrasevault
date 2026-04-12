@@ -1,0 +1,26 @@
+---
+# Custom deployment — override all variables in your playbook.
+# This task file is intentionally minimal; callers set everything via vars.
+
+- name: "PhraseVault | Custom | Deploy container"
+  community.docker.docker_container:
+    name: "{{ phrasevault_container_name }}"
+    image: "{{ phrasevault_image }}"
+    state: started
+    restart_policy: unless-stopped
+    networks: "{{ phrasevault_custom_networks | default(omit) }}"
+    ports: "{{ phrasevault_custom_ports | default(omit) }}"
+    volumes:
+      - "{{ phrasevault_data_dir }}:/data"
+    env:
+      PV_API_KEY: "{{ phrasevault_api_key }}"
+      PV_DB_PATH: "/data/phrasevault.db"
+      PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
+      PV_DOCS: "{{ phrasevault_docs_enabled }}"
+    labels: "{{ phrasevault_custom_labels | default({}) }}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: "30s"
+      timeout: "5s"
+      retries: 3
+      start_period: "10s"

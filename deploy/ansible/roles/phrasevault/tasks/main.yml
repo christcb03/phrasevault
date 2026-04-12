@@ -1,0 +1,50 @@
+---
+# PhraseVault install — delegates to the correct sub-task file based on install_type
+
+- name: "PhraseVault | Validate install_type"
+  ansible.builtin.assert:
+    that:
+      - install_type in ['saltbox', 'ubuntu', 'custom']
+    fail_msg: "install_type must be one of: saltbox, ubuntu, custom"
+
+- name: "PhraseVault | Assert API key is set"
+  ansible.builtin.assert:
+    that:
+      - phrasevault_api_key is defined
+      - phrasevault_api_key | length > 16
+    fail_msg: "phrasevault_api_key must be set and at least 16 characters. Store it in Ansible Vault."
+
+- name: "PhraseVault | Create data directory"
+  ansible.builtin.file:
+    path: "{{ phrasevault_data_dir }}"
+    state: directory
+    owner: "{{ phrasevault_uid }}"
+    group: "{{ phrasevault_gid }}"
+    mode: "0750"
+  become: true
+
+- name: "PhraseVault | Pull Docker image"
+  community.docker.docker_image:
+    name: "{{ phrasevault_image }}"
+    source: pull
+    force_source: false
+
+- name: "PhraseVault | Deploy (saltbox)"
+  ansible.builtin.include_tasks: saltbox.yml
+  when: install_type == 'saltbox'
+
+- name: "PhraseVault | Deploy (ubuntu)"
+  ansible.builtin.include_tasks: ubuntu.yml
+  when: install_type == 'ubuntu'
+
+- name: "PhraseVault | Deploy (custom)"
+  ansible.builtin.include_tasks: custom.yml
+  when: install_type == 'custom'
+
+- name: "PhraseVault | Wait for container to be healthy"
+  community.docker.docker_container_info:
+    name: "{{ phrasevault_container_name }}"
+  register: pv_info
+  until: pv_info.container.State.Health.Status == 'healthy'
+  retries: 12
+  delay: 5

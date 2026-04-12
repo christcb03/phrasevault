@@ -1,0 +1,32 @@
+# Reference docker-compose for standalone use.
+# For Saltbox deployment use the Ansible role in deploy/ansible/.
+
+services:
+  phrasevault:
+    image: ghcr.io/christcb03/phrasevault:latest
+    # Or build locally:
+    # build: .
+    container_name: phrasevault
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /opt/phrasevault:/data
+    environment:
+      PV_API_KEY: "${PV_API_KEY}"   # required — set in .env or shell
+      PV_DB_PATH: /data/phrasevault.db
+      PV_LOG_LEVEL: INFO
+      PV_DOCS: "0"                  # set to "1" to enable /docs UI
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      # Traefik labels (uncomment if using Traefik reverse proxy)
+      # traefik.enable: "true"
+      # traefik.http.routers.phrasevault.rule: "Host(`phrasevault.yourdomain.com`)"
+      # traefik.http.routers.phrasevault.tls: "true"
+      # traefik.http.services.phrasevault.loadbalancer.server.port: "8080"
+      com.centurylinklabs.watchtower.enable: "true"

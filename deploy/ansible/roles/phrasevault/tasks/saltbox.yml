@@ -1,0 +1,45 @@
+---
+# Saltbox deployment — follows Saltbox container conventions:
+#   - saltbox Docker network (Traefik-aware)
+#   - Traefik labels for automatic HTTPS routing
+#   - Watchtower label for automatic image updates
+#   - Data at /opt/{{ container_name }}
+
+- name: "PhraseVault | Saltbox | Remove existing container (idempotent)"
+  community.docker.docker_container:
+    name: "{{ phrasevault_container_name }}"
+    state: absent
+  ignore_errors: true
+
+- name: "PhraseVault | Saltbox | Deploy container"
+  community.docker.docker_container:
+    name: "{{ phrasevault_container_name }}"
+    image: "{{ phrasevault_image }}"
+    state: started
+    restart_policy: unless-stopped
+    networks:
+      - name: "{{ phrasevault_docker_network }}"
+    volumes:
+      - "{{ phrasevault_data_dir }}:/data"
+    env:
+      PV_API_KEY: "{{ phrasevault_api_key }}"
+      PV_DB_PATH: "/data/phrasevault.db"
+      PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
+      PV_DOCS: "{{ phrasevault_docs_enabled }}"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.phrasevault.rule: "Host(`{{ phrasevault_domain }}`)"
+      traefik.http.routers.phrasevault.tls: "true"
+      traefik.http.routers.phrasevault.tls.certresolver: "{{ phrasevault_traefik_certresolver }}"
+      traefik.http.services.phrasevault.loadbalancer.server.port: "8080"
+      com.centurylinklabs.watchtower.enable: "true"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: "30s"
+      timeout: "5s"
+      retries: 3
+      start_period: "10s"
+
+- name: "PhraseVault | Saltbox | Confirm container on saltbox network"
+  ansible.builtin.debug:
+    msg: "PhraseVault deployed on {{ phrasevault_docker_network }} network — reachable at https://{{ phrasevault_domain }}"
