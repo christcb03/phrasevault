@@ -33,9 +33,9 @@ dev = ["pytest>=7.0", "pytest-cov"]
 phrasevault = "phrasevault.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/christcb/phrasevault"
-Repository = "https://github.com/christcb/phrasevault"
-Issues = "https://github.com/christcb/phrasevault/issues"
+Homepage = "https://github.com/christcb03/phrasevault"
+Repository = "https://github.com/christcb03/phrasevault"
+Issues = "https://github.com/christcb03/phrasevault/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
