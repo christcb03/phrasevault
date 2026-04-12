@@ -23,7 +23,31 @@
     mode: "0750"
   become: true
 
-- name: "PhraseVault | Pull Docker image"
+- name: "PhraseVault | Build image from source"
+  when: phrasevault_build_from_source | bool
+  block:
+    - name: "PhraseVault | Clone repo for build"
+      ansible.builtin.git:
+        repo: "{{ phrasevault_repo_url }}"
+        dest: "{{ phrasevault_build_dir }}"
+        version: "{{ phrasevault_repo_version }}"
+        force: true
+
+    - name: "PhraseVault | Build Docker image"
+      community.docker.docker_image:
+        name: "{{ phrasevault_image }}"
+        build:
+          path: "{{ phrasevault_build_dir }}"
+        source: build
+        force_source: true
+
+    - name: "PhraseVault | Clean up build directory"
+      ansible.builtin.file:
+        path: "{{ phrasevault_build_dir }}"
+        state: absent
+
+- name: "PhraseVault | Pull Docker image from registry"
+  when: not (phrasevault_build_from_source | bool)
   community.docker.docker_image:
     name: "{{ phrasevault_image }}"
     source: pull

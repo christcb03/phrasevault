@@ -10,6 +10,14 @@ install_type: saltbox
 phrasevault_image: "ghcr.io/christcb03/phrasevault:latest"
 phrasevault_container_name: phrasevault
 
+# ── Build from source (use until first GHCR image is available) ───────────────
+# Set to true to clone the repo and build the image on the target host.
+# Set to false (default) to pull the pre-built image from GHCR.
+phrasevault_build_from_source: false
+phrasevault_repo_url: "https://github.com/christcb03/phrasevault.git"
+phrasevault_repo_version: "main"
+phrasevault_build_dir: "/tmp/phrasevault-build"
+
 # ── Data ──────────────────────────────────────────────────────────────────────
 phrasevault_data_dir: /opt/phrasevault
 
