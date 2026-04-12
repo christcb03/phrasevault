@@ -1,0 +1,105 @@
+{
+  "forest_id": "example_forest",
+  "version": "v1.0",
+  "date": "2026-04-12",
+  "description": "Example forest demonstrating PhraseVault confidence scoring. Not real data.",
+  "effective_score_formula": "effective(N) = stored(N) - 0.01 * sum(w(l)*(stored(N)-stored(l))) / sum(w(l)) where w(l)=1/(1+stored(l)), only anchors with score < stored(N) apply",
+  "trees": [
+    {
+      "tree_id": "EXAMPLE_tree",
+      "description": "Demonstration knowledge tree",
+      "nodes": [
+        {
+          "triplet_id": "E0_Root",
+          "shell": 1,
+          "words": ["this system exists", "data is stored", "passphrases address storage"],
+          "links": [],
+          "truth_score": 0.0,
+          "impossibility_measure": 0.0,
+          "superseded": false,
+          "node_type": "axiom",
+          "source": "example"
+        },
+        {
+          "triplet_id": "E1_Encryption_Works",
+          "shell": 3,
+          "words": [
+            "symmetric encryption with a strong key protects data",
+            "Argon2id derives a strong key from a passphrase",
+            "XSalsa20-Poly1305 provides authenticated encryption"
+          ],
+          "links": ["E0_Root"],
+          "truth_score": 0.05,
+          "impossibility_measure": 0.05129329438755058,
+          "superseded": false,
+          "node_type": "fundamental",
+          "source": "example"
+        },
+        {
+          "triplet_id": "E2_Address_Derivation",
+          "shell": 3,
+          "words": [
+            "BLAKE3 derives a deterministic address from a passphrase",
+            "the same passphrase always produces the same address",
+            "different passphrases produce different addresses with overwhelming probability"
+          ],
+          "links": ["E0_Root"],
+          "truth_score": 0.05,
+          "impossibility_measure": 0.05129329438755058,
+          "superseded": false,
+          "node_type": "fundamental",
+          "source": "example"
+        },
+        {
+          "triplet_id": "E3_Chain_Integrity",
+          "shell": 3,
+          "words": [
+            "each entry address includes the previous address",
+            "inserting or reordering entries breaks every subsequent address",
+            "chain integrity is cryptographically verifiable"
+          ],
+          "links": ["E1_Encryption_Works", "E2_Address_Derivation"],
+          "truth_score": 0.08,
+          "impossibility_measure": 0.08338160893905101,
+          "superseded": false,
+          "node_type": "architectural_feature",
+          "source": "example"
+        },
+        {
+          "triplet_id": "E4_Passphrase_Strength",
+          "shell": 3,
+          "words": [
+            "passphrase strength is the sole security parameter",
+            "four or more random words provide adequate entropy",
+            "Argon2id slows brute-force to approximately one attempt per second"
+          ],
+          "links": ["E1_Encryption_Works"],
+          "truth_score": 0.10,
+          "impossibility_measure": 0.10536051565782628,
+          "superseded": false,
+          "node_type": "security_property",
+          "source": "example"
+        },
+        {
+          "triplet_id": "E5_Open_Algorithm",
+          "shell": 3,
+          "words": [
+            "all algorithms are public — security does not depend on secrecy of design",
+            "Kerckhoffs principle: only the passphrase need be secret",
+            "open source enables independent audit and verification"
+          ],
+          "links": ["E4_Passphrase_Strength", "E0_Root"],
+          "truth_score": 0.02,
+          "impossibility_measure": 0.020202707317519466,
+          "superseded": false,
+          "node_type": "design_principle",
+          "source": "example"
+        }
+      ]
+    }
+  ],
+  "forest_metadata": {
+    "total_nodes": 6,
+    "note": "Example only. Never commit real forest data to version control."
+  }
+}
