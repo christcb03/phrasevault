@@ -25,7 +25,7 @@ from pathlib import Path
 # Allow running as `python -m phrasevault.cli` from the HomeLab directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from phrasevault import crypto, store, transfer
+from phrasevault import crypto, store, transfer, identity as id_module
 from phrasevault.vault import Vault
 
 
@@ -146,6 +146,102 @@ def cmd_sync_info(args):
     print(json.dumps(info, indent=2))
 
 
+# ── identity commands ─────────────────────────────────────────────────────────
+
+def cmd_identity_keygen(args):
+    """
+    Derive and cache the secp256k1 keypair for this passphrase.
+    Safe to run multiple times (idempotent).
+    Takes ~2s (two Argon2id operations).
+    """
+    passphrase = get_passphrase()
+    print("[identity] Deriving identity keypair... (Argon2id ~2s)")
+    with Vault(passphrase, get_db_path(args)) as v:
+        info = v.create_identity()
+    print(f"[identity] ✓ Identity created")
+    print(f"[identity]   DID:         {info['did']}")
+    print(f"[identity]   ETH address: {info['eth_address']}")
+    print(f"[identity]   Public key:  {info['public_key_hex']}")
+    print()
+    print("[identity] Your DID is your permanent identity on the PhraseVault network.")
+    print("[identity] It is derived from your passphrase — same passphrase = same DID.")
+
+
+def cmd_identity_whoami(args):
+    """Show the DID and public key for the current passphrase (fast, no Argon2id)."""
+    passphrase = get_passphrase()
+    with Vault(passphrase, get_db_path(args)) as v:
+        info = v.get_identity()
+    if info is None:
+        print("[identity] No identity found. Run `phrasevault identity keygen` first.")
+        sys.exit(1)
+    print(f"DID:         {info['did']}")
+    print(f"ETH address: {info['eth_address']}")
+    print(f"Public key:  {info['public_key_hex']}")
+
+
+def cmd_identity_pubkey(args):
+    """Print only the public key hex (useful for piping to other commands)."""
+    passphrase = get_passphrase()
+    with Vault(passphrase, get_db_path(args)) as v:
+        info = v.get_identity()
+    if info is None:
+        print("[identity] No identity found. Run `phrasevault identity keygen` first.",
+              file=sys.stderr)
+        sys.exit(1)
+    print(info["public_key_hex"])
+
+
+def cmd_identity_sign(args):
+    """
+    Sign a message with this vault's secp256k1 private key.
+    Outputs the 65-byte signature as hex.  Takes ~1s.
+    """
+    passphrase = get_passphrase()
+    message = args.message.encode("utf-8")
+    print("[identity] Signing... (Argon2id ~1s)")
+    with Vault(passphrase, get_db_path(args)) as v:
+        try:
+            sig = v.sign_message(message)
+        except ValueError as e:
+            print(f"[identity] ✗ {e}")
+            sys.exit(1)
+    print(f"[identity] ✓ Signature: {sig.hex()}")
+
+
+def cmd_identity_verify(args):
+    """
+    Verify a signature against a message and a known public key.
+    All three are required.  No passphrase needed — verification is public.
+    """
+    message    = args.message.encode("utf-8")
+    pubkey_hex = args.pubkey
+    try:
+        sig_bytes = bytes.fromhex(args.signature)
+    except ValueError:
+        print("[identity] ✗ Signature must be hex-encoded.")
+        sys.exit(1)
+    compressed_pubkey = bytes.fromhex(pubkey_hex)
+    valid = id_module.verify(compressed_pubkey, message, sig_bytes)
+    if valid:
+        eth_addr = id_module.pubkey_to_eth_address(compressed_pubkey)
+        print(f"[identity] ✓ Valid signature from {eth_addr}")
+    else:
+        print("[identity] ✗ Invalid signature.")
+        sys.exit(1)
+
+
+def cmd_identity(args):
+    """Dispatch to identity sub-subcommands."""
+    {
+        "keygen":  cmd_identity_keygen,
+        "whoami":  cmd_identity_whoami,
+        "pubkey":  cmd_identity_pubkey,
+        "sign":    cmd_identity_sign,
+        "verify":  cmd_identity_verify,
+    }[args.identity_command](args)
+
+
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -187,6 +283,27 @@ def main():
     # sync-info
     si = sub.add_parser("sync-info", help="Show sync state for sharing with a peer")
 
+    # identity
+    id_p = sub.add_parser("identity", help="Manage secp256k1 identity keypair")
+    id_sub = id_p.add_subparsers(dest="identity_command", required=True)
+
+    id_sub.add_parser("keygen",
+        help="Derive and cache your secp256k1 keypair from your passphrase (~2s)")
+
+    id_sub.add_parser("whoami",
+        help="Show your DID, Ethereum address, and public key")
+
+    id_sub.add_parser("pubkey",
+        help="Print only your public key hex (for piping)")
+
+    id_sign = id_sub.add_parser("sign", help="Sign a message with your private key (~1s)")
+    id_sign.add_argument("message", help="Message to sign (UTF-8 string)")
+
+    id_verify = id_sub.add_parser("verify", help="Verify a signature (no passphrase needed)")
+    id_verify.add_argument("message",   help="Original message (UTF-8 string)")
+    id_verify.add_argument("signature", help="Signature as hex string")
+    id_verify.add_argument("pubkey",    help="Signer's public key as hex string")
+
     args = p.parse_args()
     {
         "store":     cmd_store,
@@ -196,6 +313,7 @@ def main():
         "import":    cmd_import,
         "score":     cmd_score,
         "sync-info": cmd_sync_info,
+        "identity":  cmd_identity,
     }[args.command](args)
 
 

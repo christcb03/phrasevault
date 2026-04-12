@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import crypto, store
+from . import crypto, store, identity
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,6 +236,78 @@ class Vault:
             except Exception:
                 continue
         return None
+
+    # ─── identity ─────────────────────────────────────────────────────────
+
+    def create_identity(self) -> dict:
+        """
+        Derive this vault's secp256k1 keypair from the passphrase and cache
+        the public key in the database.
+
+        Safe to call multiple times — idempotent (updates if already exists).
+        The private key is NEVER stored; it is always re-derived on demand.
+
+        Returns the identity info dict: public_key_hex, eth_address, did.
+
+        Warning: takes ~1s (two Argon2id runs — one for the vault slot,
+        one for the identity seed).
+        """
+        seed = identity.derive_identity_seed(self.passphrase)
+        _, compressed_pubkey = identity.keypair_from_seed(seed)
+        info = identity.identity_info(compressed_pubkey)
+        store.store_identity(
+            self.conn,
+            self.slot,
+            compressed_pubkey,
+            info["eth_address"],
+            info["did"],
+        )
+        return info
+
+    def get_identity(self) -> dict | None:
+        """
+        Return the cached identity for this vault's passphrase slot.
+        Returns None if create_identity() has never been called.
+        Fast — no Argon2id, just a DB lookup.
+        """
+        row = store.fetch_identity(self.conn, self.slot)
+        if row is None:
+            return None
+        return {
+            "public_key_hex": bytes(row["public_key"]).hex(),
+            "eth_address":    row["eth_address"],
+            "did":            row["did"],
+        }
+
+    def sign_message(self, message: bytes) -> bytes:
+        """
+        Sign a message with this vault's secp256k1 private key.
+        Returns a 65-byte recoverable ECDSA signature (Ethereum-compatible).
+
+        Takes ~1s (Argon2id seed derivation).
+        Raise ValueError if create_identity() has never been called for this slot.
+        """
+        if store.fetch_identity(self.conn, self.slot) is None:
+            raise ValueError(
+                "No identity found. Run `phrasevault identity keygen` first."
+            )
+        seed = identity.derive_identity_seed(self.passphrase)
+        private_key_bytes, _ = identity.keypair_from_seed(seed)
+        return identity.sign(private_key_bytes, message)
+
+    def verify_signature(
+        self, message: bytes, signature: bytes, public_key_hex: str
+    ) -> bool:
+        """
+        Verify a secp256k1 signature against a known public key.
+        public_key_hex: 66-char hex string (33-byte compressed pubkey).
+        Returns True if valid, False otherwise.  Never raises.
+        """
+        try:
+            compressed_pubkey = bytes.fromhex(public_key_hex)
+            return identity.verify(compressed_pubkey, message, signature)
+        except Exception:
+            return False
 
     def close(self) -> None:
         """Close the database connection."""

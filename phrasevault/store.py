@@ -113,6 +113,17 @@ CREATE INDEX IF NOT EXISTS idx_entries_timestamp ON entries(timestamp_ns);
 CREATE INDEX IF NOT EXISTS idx_entries_confidence ON entries(confidence);
 CREATE INDEX IF NOT EXISTS idx_entries_shell ON entries(shell);
 CREATE INDEX IF NOT EXISTS idx_entries_superseded ON entries(superseded);
+
+CREATE TABLE IF NOT EXISTS identity_keys (
+    -- One row per passphrase-slot.  The private key is NEVER stored here —
+    -- it is always re-derived from the passphrase via Argon2id when needed.
+    -- Only the public key is cached so we can show the DID/address instantly.
+    slot            TEXT    PRIMARY KEY,      -- same slot as chain_heads
+    public_key      BLOB    NOT NULL,         -- 33-byte compressed secp256k1
+    eth_address     TEXT    NOT NULL,         -- '0x...' derived from pubkey
+    did             TEXT    NOT NULL,         -- 'did:ethr:0x...'
+    created_at_ns   INTEGER NOT NULL
+);
 """
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -258,3 +269,41 @@ def count_entries(conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM entries WHERE superseded = 0"
     ).fetchone()[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IDENTITY OPERATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def store_identity(
+    conn: sqlite3.Connection,
+    slot: str,
+    public_key: bytes,
+    eth_address: str,
+    did: str,
+) -> None:
+    """
+    Cache the public identity for a passphrase slot.
+    Idempotent: silently replaces if the slot already exists
+    (e.g. re-running keygen after a DB migration).
+    """
+    conn.execute(
+        """
+        INSERT INTO identity_keys (slot, public_key, eth_address, did, created_at_ns)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(slot) DO UPDATE SET
+            public_key  = excluded.public_key,
+            eth_address = excluded.eth_address,
+            did         = excluded.did,
+            created_at_ns = excluded.created_at_ns
+        """,
+        (slot, public_key, eth_address, did, int(time.time_ns())),
+    )
+    conn.commit()
+
+
+def fetch_identity(conn: sqlite3.Connection, slot: str) -> sqlite3.Row | None:
+    """Return the cached identity row for a slot, or None if keygen hasn't run."""
+    return conn.execute(
+        "SELECT * FROM identity_keys WHERE slot = ?", (slot,)
+    ).fetchone()
