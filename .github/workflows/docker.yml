@@ -3,11 +3,6 @@ name: Build and push Docker image
 on:
   push:
     branches: [main]
-    paths:
-      - "phrasevault/**"
-      - "Dockerfile"
-      - "requirements.txt"
-      - "pyproject.toml"
   workflow_dispatch:   # allow manual trigger from GitHub UI
 
 env:
