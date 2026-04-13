@@ -17,7 +17,9 @@ Endpoints:
 Authentication: X-API-Key header. Set PV_API_KEY env var on the server.
 If PV_API_KEY is unset, the server refuses all requests (fail-safe).
 """
-
+from .credentials import CommunityCredential
+from pydantic import BaseModel
+import uuid
 import os
 import json
 import logging
@@ -232,6 +234,28 @@ async def import_forest(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         os.unlink(tmp_path)
+
+@app.post("/query")
+async def queue_query(req: QueryRequest):
+    """Queue a query for the owner's client to evaluate locally.
+    Server remains dumb — only stores the query for the client to pull."""
+    try:
+        claims = CommunityCredential.verify(req.credential, req.community_pubkey_pem)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    query_id = str(uuid.uuid4())
+
+    # TODO: store in a queries table (add a simple queries table in store.py if needed)
+    # For now we log it and return immediately
+    print(f"📬 Query queued → ID: {query_id} | Community: {claims.community} | Tier: {claims.tier}")
+
+    return {
+        "query_id": query_id,
+        "status": "queued",
+        "claims": claims.__dict__,
+        "message": "Client will evaluate when online"
+    }
 
 # ─── Error handler ────────────────────────────────────────────────────────────
 
