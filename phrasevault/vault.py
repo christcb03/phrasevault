@@ -318,3 +318,11 @@ class Vault:
 
     def __exit__(self, *_):
         self.close()
+
+# Add at the bottom of vault.py
+from .forest import import_forest_to_db, export_db_to_forest, verify_file
+
+# Expose forest functions through the main Vault class
+Vault.import_forest = import_forest_to_db
+Vault.export_forest = export_db_to_forest
+Vault.verify_forest_file = verify_file
