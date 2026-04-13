@@ -329,3 +329,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
+client_parser = subparsers.add_parser("client", help="Run client-side query evaluator")
+client_parser.add_argument("--poll", action="store_true", help="Poll server for queued queries")
