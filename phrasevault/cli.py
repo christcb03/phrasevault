@@ -241,6 +241,16 @@ def cmd_identity(args):
         "verify":  cmd_identity_verify,
     }[args.identity_command](args)
 
+# In cli.py — add to the main parser
+identity_parser = subparsers.add_parser("identity", help="Manage secp256k1 identity")
+# ... existing identity commands ...
+
+# New server/client commands
+server_parser = subparsers.add_parser("server", help="Start dumb relay server")
+server_parser.add_argument("--host", default="0.0.0.0")
+server_parser.add_argument("--port", type=int, default=8000)
+
+client_parser = subparsers.add_parser("client", help="Run client query evaluator")
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
