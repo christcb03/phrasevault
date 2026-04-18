@@ -24,7 +24,9 @@ dependencies = [
     "blake3>=1.0.8",
     "argon2-cffi>=23.1.0",
     "PyNaCl>=1.6.2",
-    "coincurve>=20.0.0",
+    # 21.0.0 fails to build (hatchling: "Expected exactly one LICENSE file in cffi distribution").
+    # Pin 20.x until a fixed 21.x is published. See PyPI / ccxt#27246 / NixOS#437068.
+    "coincurve>=20.0.0,<21",
     "pycryptodome>=3.20.0",
 ]
 
