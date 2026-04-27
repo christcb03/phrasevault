@@ -13,11 +13,11 @@ def open_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 def init_schema(conn: sqlite3.Connection):
-    conn.execute("""CREATE TABLE IF NOT EXISTS forest_nodes ( ... )""")  # unchanged
+    # forest_nodes and entries tables (unchanged)
+    conn.execute("""CREATE TABLE IF NOT EXISTS forest_nodes (...)""")  # your existing table
+    conn.execute("""CREATE TABLE IF NOT EXISTS entries (...)""")  # your existing table
 
-    conn.execute("""CREATE TABLE IF NOT EXISTS entries ( ... )""")  # unchanged
-
-    # === NEW: Relationship table with learning ===
+    # NEW: Relationship strength + learning table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS node_relationships (
             source_address TEXT,
@@ -33,4 +33,4 @@ def init_schema(conn: sqlite3.Connection):
     """)
 
     conn.commit()
-    print("✅ Database schema initialized with relationship strength learning")
+    print("✅ Database schema ready with full relationship strength + learning")
