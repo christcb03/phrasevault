@@ -4,6 +4,11 @@
  * Single-user server: one identity (passphrase from env), one writable feed,
  * N followed feeds. Exposes the Relay query engine and node operations over REST.
  *
+ * Auth: secp256k1 challenge-response. Passphrase never crosses the wire.
+ *   GET  /auth/challenge  → one-time nonce (5-min TTL)
+ *   POST /auth/verify     → { challenge, signature } → { token, identity }
+ *   Bearer <token>        → 24-hour session token on all API routes
+ *
  * Start with:
  *   PV_PASSPHRASE=... PV_DATA_DIR=./data node dist/server/index.js
  */
@@ -13,7 +18,6 @@ import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
-import { randomBytes } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { deriveIdentity } from "../identity/index.js";
@@ -25,7 +29,11 @@ import {
   createCrosslinkNode, createWatchlistEntryNode,
   MediaPayload, StoragePointerPayload, CrosslinkPayload, WatchlistEntryPayload,
 } from "../apps/relay/index.js";
-import { deriveApiToken, verifyBearer } from "../auth/index.js";
+import {
+  deriveAuthPubKey,
+  createChallenge, consumeChallenge, verifyAuthSignature,
+  createSession, verifySession,
+} from "../auth/index.js";
 
 // ── Config from environment ────────────────────────────────────────────────
 
@@ -40,12 +48,14 @@ if (!PASSPHRASE) {
   process.exit(1);
 }
 
-// ── Auth token (derived from passphrase, distinct domain from keypair) ─────
+// ── Auth state ─────────────────────────────────────────────────────────────
 
-const API_TOKEN = deriveApiToken(PASSPHRASE);
+const AUTH_PUB_KEY = deriveAuthPubKey(PASSPHRASE);
+const challenges   = new Map<string, number>(); // nonce → expiry timestamp
+const sessions     = new Map<string, number>(); // token → expiry timestamp
 
-// Routes exempt from bearer-token auth
-const PUBLIC_ROUTES = new Set(["/health", "/auth/login", "/auth/challenge"]);
+// Routes that bypass auth entirely
+const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify"]);
 // API route prefixes that require auth (SPA routes pass through without auth)
 const API_PREFIXES = [
   "/search", "/media", "/storage", "/crosslink", "/watchlist",
@@ -65,7 +75,6 @@ await replication.shareOwnFeed(ownStore);
 const engine = new RelayQueryEngine();
 engine.addFeed(pubKeyHex, ownStore);
 
-// Load previously followed feeds from disk (persisted in followed.json)
 import { readFileSync, writeFileSync, existsSync } from "fs";
 const FOLLOWED_PATH = path.join(DATA_DIR, "followed.json");
 const followedKeys: string[] = existsSync(FOLLOWED_PATH)
@@ -96,29 +105,31 @@ app.addHook("onRequest", async (req, reply) => {
   const isApiRoute = API_PREFIXES.some(p => url === p || url.startsWith(p + "/"));
   if (!isApiRoute) return;
 
-  // All API routes require a valid bearer token
   const header = req.headers.authorization ?? "";
-  if (!header.startsWith("Bearer ") || !verifyBearer(header.slice(7), API_TOKEN)) {
+  if (!header.startsWith("Bearer ") || !verifySession(sessions, header.slice(7))) {
     return reply.status(401).send({ error: "unauthorized" });
   }
 });
 
 // ── Auth endpoints ─────────────────────────────────────────────────────────
 
-app.post<{ Body: { passphrase?: string } }>("/auth/login", async (req, reply) => {
-  const { passphrase } = req.body ?? {};
-  if (!passphrase || !verifyBearer(deriveApiToken(passphrase), API_TOKEN)) {
-    await new Promise(r => setTimeout(r, 200)); // slow down brute force
-    return reply.status(401).send({ error: "invalid passphrase" });
-  }
-  return { token: API_TOKEN, identity: pubKeyHex };
-});
-
-// Placeholder for future challenge-response upgrade
 app.get("/auth/challenge", async () => ({
-  challenge: randomBytes(32).toString("hex"),
-  note: "sign this nonce with your secp256k1 private key, then POST to /auth/verify",
+  challenge: createChallenge(challenges),
 }));
+
+app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", async (req, reply) => {
+  const { challenge, signature } = req.body ?? {};
+  if (!challenge || !signature) return reply.status(400).send({ error: "missing fields" });
+
+  if (!consumeChallenge(challenges, challenge)) {
+    return reply.status(401).send({ error: "invalid or expired challenge" });
+  }
+  if (!verifyAuthSignature(AUTH_PUB_KEY, challenge, signature)) {
+    await new Promise(r => setTimeout(r, 200));
+    return reply.status(401).send({ error: "invalid signature" });
+  }
+  return { token: createSession(sessions), identity: pubKeyHex };
+});
 
 // ── Static files + SPA fallback ────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { signChallenge } from './crypto'
 
 interface Props {
   onLogin: (token: string, identity: string) => void
@@ -14,10 +15,17 @@ export default function LoginPage({ onLogin }: Props) {
     setError('')
     setLoading(true)
     try {
-      const res = await fetch('/auth/login', {
+      // 1. Get a one-time challenge nonce from the server
+      const { challenge } = await fetch('/auth/challenge').then(r => r.json())
+
+      // 2. Sign it locally — passphrase never leaves the browser
+      const signature = await signChallenge(passphrase, challenge)
+
+      // 3. Prove ownership; server returns a session token
+      const res = await fetch('/auth/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passphrase }),
+        body: JSON.stringify({ challenge, signature }),
       })
       if (!res.ok) {
         setError('Invalid passphrase.')

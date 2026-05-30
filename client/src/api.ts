@@ -9,15 +9,6 @@ function authHeaders(): Record<string, string> {
 
 export class UnauthorizedError extends Error {}
 
-export async function login(passphrase: string): Promise<{ token: string; identity: string }> {
-  const res = await fetch(`${BASE}/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ passphrase }),
-  });
-  if (!res.ok) throw new UnauthorizedError('invalid passphrase');
-  return res.json();
-}
 
 export interface MediaSource {
   storageNodeId: string;
