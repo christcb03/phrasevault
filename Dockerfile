@@ -39,9 +39,10 @@ COPY --from=builder /app/dist ./dist
 
 VOLUME ["/data"]
 
-RUN groupadd -r phrasevault && useradd -r -g phrasevault phrasevault \
- && mkdir -p /data && chown phrasevault:phrasevault /data
-USER phrasevault
+# node:22-slim ships with a 'node' user at UID/GID 1000 — use it
+# so the container user matches the Ansible-created host data directory (1000:1000).
+RUN mkdir -p /data && chown node:node /data
+USER node
 
 EXPOSE 8080
 
