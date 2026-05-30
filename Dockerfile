@@ -1,10 +1,14 @@
 FROM node:22-alpine AS builder
 
+# Native module build deps (argon2, sodium-native)
+RUN apk add --no-cache python3 make g++
+
 WORKDIR /app
 
-# Build backend
+# Install all deps (including native compilation via postinstall)
 COPY package*.json ./
-RUN npm ci --ignore-scripts
+RUN npm ci
+
 COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build
@@ -23,11 +27,13 @@ LABEL org.opencontainers.image.title="PhraseVault"
 LABEL org.opencontainers.image.source="https://github.com/christcb03/phrasevault"
 LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
 
-RUN apk add --no-cache python3 make g++
-
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --ignore-scripts --omit=dev
+
+# Install prod deps with build tools available, then remove tools to keep image lean
+RUN apk add --no-cache --virtual .build-deps python3 make g++ \
+ && npm ci --omit=dev \
+ && apk del .build-deps
 
 COPY --from=builder /app/dist ./dist
 

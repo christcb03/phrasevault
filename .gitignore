@@ -31,7 +31,7 @@ env/
 !pyproject.toml
 !package.json
 !package-lock.json
-!tsconfig.json
+!tsconfig*.json
 !terraform.tfvars.example
 
 # Secrets
