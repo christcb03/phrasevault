@@ -4,7 +4,7 @@
  */
 
 declare module "hypercore" {
-  import { Readable } from "stream";
+  import { Readable, Duplex } from "stream";
 
   interface HypercoreOptions {
     valueEncoding?: "json" | "utf-8" | "binary";
@@ -40,7 +40,9 @@ declare module "hypercore" {
     get(index: number, options?: { wait?: boolean; timeout?: number }): Promise<T>;
     createReadStream(options?: ReadStreamOptions): Readable & AsyncIterable<T>;
     update(options?: { wait?: boolean }): Promise<boolean>;
+    replicate(isInitiatorOrStream: boolean | Duplex, options?: Record<string, unknown>): Duplex;
   }
 
   export = Hypercore;
+  export { HypercoreOptions, AppendResult, ReadStreamOptions };
 }
