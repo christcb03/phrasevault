@@ -3,7 +3,7 @@
 This file is the canonical planning log. Update it when decisions are made.
 It exists so context can be recovered after conversation resets.
 
-Last updated: 2026-05-30 (10:15 EDT)
+Last updated: 2026-05-30 (12:30 EDT)
 
 ---
 
@@ -353,6 +353,185 @@ When a friend's server goes offline:
 - Watch Together is scoped to platforms that permit embedding/sync (settled — not a technical problem to solve, just a feature availability constraint communicated to users)
 - Ownership verification for uploads: user self-attests responsibility via ToS (settled). The 5-friend sharing limit keeps content non-publicly-indexable, significantly reducing legal exposure vs. a public locker service.
 - Final name TBD (PlexVault is working name)
+
+---
+
+## Relay — Media Application Layer (built 2026-05-30)
+
+Relay is the media middleware layer sitting between the PhraseVault platform and
+the final user-facing app (name TBD). Lives in `src/apps/relay/`.
+
+### Three-Layer Stack
+
+```
+[Final App TBD — catchy name, user-facing]
+         ↓
+[Relay / MediaNode — node types, query engine, HTTP API]
+         ↓
+[PhraseVault — crypto, Hypercore feeds, Hyperswarm replication]
+```
+
+The final app name has not been chosen yet. Do NOT conflate the user app with
+the Relay middleware or the PhraseVault infrastructure.
+
+### Node Types (`src/apps/relay/types.ts`)
+
+All payload interfaces extend `Record<string, unknown>` for PVNode<P> compatibility.
+
+- **MediaNode** — one node per title (movie, series, episode, short). Metadata:
+  title, year, kind, genres, imdb_id. Not per-file — one node represents the
+  concept, regardless of how many copies exist across friends.
+
+- **StoragePointerNode** — attached to a MediaNode by a specific user. Points
+  to where the actual file lives: endpoint_url, content_hash (BLAKE3),
+  size_bytes, encoding, available flag. Multiple users can attach pointers to
+  the same MediaNode (dedup at the concept layer).
+
+- **CrosslinkNode** — created when a user "adds" a friend's content. Links to
+  a StoragePointer. No file copy. File streams live from the friend's node.
+
+- **WatchlistEntryNode** — tracks a user's watch status for a title (unwatched /
+  watching / watched / skipped) and progress in milliseconds.
+
+### Query Engine (`src/apps/relay/query.ts`)
+
+`RelayQueryEngine` aggregates multiple Hypercore feeds into a unified view.
+4-pass index build per `refresh()` call:
+1. Collect all nodes from all feeds
+2. Group StoragePointers by media_node_id, ranked by encoding quality
+3. Build crosslink + watchlist lookup
+4. Assemble `MediaResult[]` with deduped sources
+
+`search(filters)` supports: text query, kind filter, availableOnly, watchStatus.
+`getById(id)` returns a single MediaResult with all sources and watchlist state.
+`pickBestSource()` ranks: 4K HDR > 4K > 2160p > 1080p > 720p > other.
+
+### HTTP API (`src/server/index.ts`)
+
+Fastify server. Config from env (required: `PV_PASSPHRASE`; optional: `PV_DATA_DIR`,
+`PV_PORT`, `PV_HOST`, `PV_LOG_LEVEL`).
+
+Endpoints:
+- `GET /health` — status, identity pubkey, feed length, following count, indexed count
+- `GET /identity` — publicKey hex, DID, feedKey hex
+- `GET /search?q=&kind=&available=&watchStatus=` — search across all feeds
+- `GET /media/:id` — single title by id
+- `POST /media` — publish a new media node to own feed
+- `POST /storage` — publish a storage pointer
+- `POST /crosslink` — crosslink a friend's storage pointer into your library
+- `POST /watchlist` — add/update watchlist entry
+- `POST /follow` — start following a peer's feed
+- `DELETE /follow/:feedKey` — unfollow a peer
+- `GET /following` — list followed feed keys
+
+Followed feed keys are persisted to `$PV_DATA_DIR/followed.json`.
+
+### Frontend (`client/`)
+
+React + Vite + TypeScript + Tailwind CSS (v4). Dark theme.
+- Search bar with kind filter (movie/series/episode/short) and available-only toggle
+- MediaCard list — title, year, encoding, source count, watchlist badge
+- DetailPanel modal — all sources with Play buttons, IMDb link, watchlist status
+- Follow peer form in header
+- Dev proxy: `/api` → `http://localhost:8080`
+- Build output: `dist/client/` (served by Fastify's @fastify/static as SPA)
+
+### Key Technical Decisions
+
+- **Debian not Alpine for runtime image** — `sodium-native` (used by hypercore)
+  ships prebuilt `linux-x64` (glibc) binaries but NOT `linux-x64-musl`. Alpine
+  uses musl, so the binary never loads and the server crashes. Use `node:22-slim`
+  (Debian Bookworm slim).
+
+- **Use `node` user (UID 1000) not a custom system user** — `node:22-slim` ships
+  with a `node` user at UID/GID 1000. Creating a system user with `useradd -r`
+  assigns an unpredictable UID that won't match the Ansible-provisioned host data
+  directory (which is also 1000:1000 to match the primary ubuntu user `chris`).
+
+- **Builder stage uses build tools; runtime does not** — `python3/make/g++` are
+  needed in the builder for any packages that fall back to source compilation.
+  The runtime stage uses the Debian prebuilt binaries — no build tools needed.
+
+---
+
+## Deployment Infrastructure (as of 2026-05-30)
+
+### Pipeline
+
+```
+git push → GitHub Actions (CI) → GHCR → Watchtower → presubuntu
+```
+
+- **CI:** `.github/workflows/docker.yml` — builds two-stage Docker image on every
+  push to `main`, pushes to `ghcr.io/christcb03/phrasevault:latest` and `sha-<short>`.
+- **GHCR:** GitHub Container Registry. Image is public (readable without auth).
+- **Watchtower:** Runs alongside the app on presubuntu. Polls GHCR every 300 seconds,
+  pulls and restarts the container automatically when a new image is available.
+  This is the CD (Continuous Delivery) loop — no SSH from GitHub needed.
+- **Ansible playbook:** `HomeLab/playbooks/relay.yml` — used for initial deployment
+  and passphrase-changing re-deploys. Installs Docker CE if not present.
+
+### Test Server: presubuntu
+
+- **Host:** `presubuntu-vpn` (Ansible inventory)
+- **IP:** `192.168.0.184` (internal, accessible via VPN to pveprod)
+- **URL:** `http://192.168.0.184:8080` (HTTP, VPN required)
+- **VM:** Proxmox VM 101 on pveprod — Ubuntu 24.04 LTS, 2 vCPU, 8GB RAM, 100GB disk
+- **Data dir:** `/opt/phrasevault/data` (bind-mounted to container `/data`)
+- **Container:** `phrasevault` (plus `watchtower-phrasevault` sidecar)
+- **Passphrase:** stored encrypted in `HomeLab/vault.yml` as `vault_phrasevault_passphrase`
+
+### Re-deploying (if Watchtower hasn't picked up yet, or passphrase changes)
+
+```bash
+cd ~/Projects/HomeLab
+ansible-playbook playbooks/relay.yml
+```
+
+### Node Identity
+
+The server's identity (keypair and feed key) is deterministically derived from
+`PV_PASSPHRASE`. The same passphrase always produces the same identity. Feed data
+lives in `/opt/phrasevault/data/feeds/<pubkey-hex>/`. **Back up the passphrase —
+losing it means losing the feed identity.**
+
+---
+
+## Actions GitHub Workflow Note
+
+The workflow uses `actions/checkout@v4`, `docker/build-push-action@v5`, etc. These
+are still on Node.js 20. GitHub will force Node.js 24 by default from June 16, 2026
+and remove Node.js 20 from runners September 16, 2026. Update action versions before
+then: `@v5` for checkout, `@v6` for build-push-action, etc.
+
+---
+
+## What's Next (as of 2026-05-30)
+
+**Phase 3 — Content:**
+- TMDB API integration for movie poster images and richer metadata
+- Watchlist management UI (update status, track progress_ms)
+- Add media via TMDB search (not just manual JSON input)
+
+**Phase 4 — Domain + HTTPS:**
+- DNS entry for the test server (e.g. `relay-test.turnernetworking.com`)
+- Caddy or Traefik reverse proxy for HTTPS termination on presubuntu
+- Or move to mediabox with Saltbox/Traefik already in place
+
+**Phase 5 — Watch Together (future):**
+- WebSocket sync room on the server
+- Embedded player in the frontend
+- Text chat sidebar
+
+**Phase 6 — Browser Extension (future):**
+- Same React components, different mounting point
+- Inject into Plex/Jellyfin web UI or run as standalone side panel
+
+**Phase 7 — Production + Premium Tier (future):**
+- Jellyfin integration
+- Friend discovery via Hyperswarm DHT
+- Hosted storage with BLAKE3 dedup
+- Credit system for watchlist capacity billing
 
 ---
 
