@@ -488,6 +488,107 @@ cd ~/Projects/HomeLab
 ansible-playbook playbooks/relay.yml
 ```
 
+### Deploying alongside HomeLab Panel
+
+PhraseVault (Relay) and **homelab-panel** share the same presubuntu deployment
+pattern. They are separate containers, separate GHCR images, and separate
+Watchtower sidecars — no code coupling between the repos.
+
+| | PhraseVault (Relay) | homelab-panel |
+|---|---|---|
+| **Repo** | `phrasevault-repo` | `HomeLab/services/homelab-panel` |
+| **Image** | `ghcr.io/christcb03/phrasevault:latest` | `ghcr.io/christcb03/homelab-panel:latest` |
+| **Port** | `8080` | `3001` |
+| **Container** | `phrasevault` | `homelab-panel` |
+| **Watchtower** | `watchtower-phrasevault` | `watchtower-homelab-panel` |
+| **Data dir** | `/opt/phrasevault/data` | `/opt/homelab-panel/data` |
+| **Playbook** | `HomeLab/playbooks/relay.yml` | `HomeLab/playbooks/homelab_panel.yml` |
+
+**Deploy both apps:**
+
+```bash
+cd ~/Projects/HomeLab
+ansible-playbook playbooks/presubuntu.yml
+```
+
+**CD loop (identical for both):**
+
+```
+git push main → GitHub Actions → GHCR → Watchtower (300s poll) → container restart
+```
+
+homelab-panel additionally mounts `/opt/homelab` (HomeLab git clone),
+`~/.ssh`, and `~/.vault_encryption_key` so it can spawn `ansible-playbook` and
+`terraform` from the UI. PhraseVault does not need these mounts.
+
+**URLs on presubuntu (VPN):**
+
+- Relay: `http://192.168.0.184:8080`
+- HomeLab panel: `http://192.168.0.184:3001`
+
+Before the first homelab-panel GHCR image exists, set
+`homelab_panel_build_from_source: true` in `playbooks/homelab_panel.yml`
+(same pattern as PhraseVault's `phrasevault_build_from_source`).
+
+### HTTPS via Traefik + Cloudflare (2026-05-30)
+
+The container runs on the `saltbox` Docker network alongside Traefik. Traefik
+handles TLS termination; certificates are issued automatically via Cloudflare DNS
+challenge (resolver: `cfdns`). The direct port binding stays for VPN access.
+
+**Live URLs:**
+- VPN: `http://192.168.0.184:8080`
+- Public HTTPS: `https://pvtest.turnernetworking.com`
+
+**Re-deploy (updates container, DNS record, and cert if needed):**
+```bash
+cd ~/Projects/HomeLab
+ansible-playbook playbooks/relay.yml
+```
+
+The playbook reads Cloudflare API credentials from `/srv/git/saltbox/accounts.yml`
+on the target host, looks up the server's public IP via ipify, and keeps the DNS
+A record in sync. Set `phrasevault_cloudflare_dns: false` to skip DNS on hosts
+that don't run Saltbox.
+
+**Traefik labels applied (no Authelia — PhraseVault has its own auth):**
+- `traefik.http.routers.phrasevault.entrypoints: websecure`
+- `traefik.http.routers.phrasevault.middlewares: globalHeaders@file,hsts@file`
+
+---
+
+### Authentication (2026-05-30)
+
+secp256k1 challenge-response. **The passphrase never leaves the browser.**
+
+Auth keypair derivation (browser-safe, no argon2):
+```
+authPrivKey = BLAKE3("phrasevault:api-auth-v1:" + passphrase)   // 32 bytes
+authPubKey  = secp256k1.getPublicKey(authPrivKey)               // 33 bytes compressed
+```
+
+This is domain-separated from the identity keypair (which uses argon2id and
+is derived server-side only). Same domain tag as the old API token — so the
+key material is the same bytes, just treated as a keypair instead of a hex string.
+
+**Login flow:**
+1. `GET /auth/challenge` → one-time nonce (5-min TTL, consumed on use)
+2. Browser signs `BLAKE3("phrasevault:auth-challenge:v1:" + nonce)` with auth private key
+3. `POST /auth/verify { challenge, signature }` → server verifies sig against known auth pubkey
+4. Server issues 24-hour session token (random 32 bytes, stored in-memory Map)
+5. All API routes require `Authorization: Bearer <session-token>`
+
+**Client crypto** (`client/src/crypto.ts`): `@noble/secp256k1` v3 + `@noble/hashes`
+(BLAKE3, SHA256, HMAC). `prehash: false` on sign since we pre-hash with BLAKE3.
+
+**Session tokens** are in-memory — they expire on server restart (users re-auth).
+This is acceptable for a single-user personal server.
+
+**Upgrade path to multi-user:** replace session Map with JWTs; keep the
+challenge-response flow identical; derive auth keypair per-user with argon2id.
+
+---
+
 ### Node Identity
 
 The server's identity (keypair and feed key) is deterministically derived from
@@ -513,10 +614,10 @@ then: `@v5` for checkout, `@v6` for build-push-action, etc.
 - Watchlist management UI (update status, track progress_ms)
 - Add media via TMDB search (not just manual JSON input)
 
-**Phase 4 — Domain + HTTPS:**
-- DNS entry for the test server (e.g. `relay-test.turnernetworking.com`)
-- Caddy or Traefik reverse proxy for HTTPS termination on presubuntu
-- Or move to mediabox with Saltbox/Traefik already in place
+**Phase 4 — Domain + HTTPS: ✅ DONE (2026-05-30)**
+- Traefik on presubuntu (Saltbox) with Cloudflare DNS challenge for cert
+- `https://pvtest.turnernetworking.com` (port forward 443→192.168.0.184 required on router)
+- Cloudflare A record auto-registered by Ansible playbook
 
 **Phase 5 — Watch Together (future):**
 - WebSocket sync room on the server
