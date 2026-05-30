@@ -23,6 +23,7 @@
       PV_PORT: "8080"
       PV_HOST: "0.0.0.0"
       PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
+      PV_TMDB_KEY: "{{ phrasevault_tmdb_key | default('') }}"
     labels: "{{ {} if not phrasevault_traefik_enabled | bool else {
         'traefik.enable': 'true',
         'traefik.http.routers.' + phrasevault_traefik_router + '.rule': 'Host(`' + phrasevault_domain + '`)',

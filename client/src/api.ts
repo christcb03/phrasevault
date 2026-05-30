@@ -68,6 +68,35 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new UnauthorizedError('session expired');
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+export interface TmdbSearchResult {
+  tmdb_id: string;
+  media_type: 'movie' | 'tv';
+  title: string;
+  year: string;
+  poster_path: string | null;
+  overview: string | null;
+}
+
+export interface TmdbDetails extends TmdbSearchResult {
+  genres: string[];
+  imdb_id?: string;
+  tvdb_id?: string;
+  runtime_min?: number;
+}
+
+export type WatchStatus = 'unwatched' | 'watching' | 'watched' | 'skipped';
+
 export const api = {
   health: () => get<HealthResponse>('/health'),
   search: (params: { q?: string; kind?: string; available?: boolean; watchStatus?: string }) => {
@@ -81,6 +110,12 @@ export const api = {
   getMedia: (id: string) => get<MediaResult>(`/media/${id}`),
   follow: (feedKey: string) => post('/follow', { feedKey }),
   following: () => get<{ keys: string[] }>('/following'),
+  addMedia: (body: object) => post<{ id: string }>('/media', body),
+  addStorage: (body: object) => post<{ id: string }>('/storage', body),
   addWatchlist: (body: object) => post('/watchlist', body),
   addCrosslink: (body: object) => post('/crosslink', body),
+  updateWatchlist: (mediaId: string, status: WatchStatus, progressMs?: number) =>
+    patch<{ id: string; status: string }>(`/watchlist/${mediaId}`, { status, progress_ms: progressMs }),
+  tmdbSearch: (q: string) => get<{ results: TmdbSearchResult[] }>(`/tmdb/search?q=${encodeURIComponent(q)}`),
+  tmdbDetails: (id: string, type: 'movie' | 'tv') => get<TmdbDetails>(`/tmdb/details?id=${id}&type=${type}`),
 };

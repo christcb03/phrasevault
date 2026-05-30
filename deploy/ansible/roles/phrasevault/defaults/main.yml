@@ -49,6 +49,12 @@ phrasevault_dns_proxied: true
 phrasevault_passphrase: "{{ vault_phrasevault_passphrase }}"
 phrasevault_log_level: info
 
+# TMDB API key — enables movie poster images and metadata lookup.
+# Get a free key at https://www.themoviedb.org/settings/api
+# Store in Ansible Vault as vault_phrasevault_tmdb_key and set:
+#   phrasevault_tmdb_key: "{{ vault_phrasevault_tmdb_key }}"
+phrasevault_tmdb_key: ""
+
 # ── Watchtower (ubuntu only) ───────────────────────────────────────────────────
 # Polls GHCR and restarts the container when a new image is pushed by CI.
 # This is your CD loop — no SSH from GitHub needed.

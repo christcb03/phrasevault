@@ -42,6 +42,7 @@ const DATA_DIR   = process.env.PV_DATA_DIR ?? "./data";
 const PORT       = parseInt(process.env.PV_PORT ?? "8080", 10);
 const HOST       = process.env.PV_HOST ?? "0.0.0.0";
 const LOG_LEVEL  = process.env.PV_LOG_LEVEL ?? "info";
+const TMDB_KEY   = process.env.PV_TMDB_KEY ?? "";
 
 if (!PASSPHRASE) {
   console.error("PV_PASSPHRASE environment variable is required");
@@ -59,7 +60,7 @@ const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify"]);
 // API route prefixes that require auth (SPA routes pass through without auth)
 const API_PREFIXES = [
   "/search", "/media", "/storage", "/crosslink", "/watchlist",
-  "/follow", "/following", "/identity", "/auth",
+  "/follow", "/following", "/identity", "/auth", "/tmdb",
 ];
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
@@ -141,11 +142,8 @@ await app.register(staticFiles, {
 });
 
 app.setNotFoundHandler(async (req, reply) => {
-  if (req.url.startsWith("/health") || req.url.startsWith("/search") ||
-      req.url.startsWith("/media") || req.url.startsWith("/storage") ||
-      req.url.startsWith("/crosslink") || req.url.startsWith("/watchlist") ||
-      req.url.startsWith("/follow") || req.url.startsWith("/identity") ||
-      req.url.startsWith("/following") || req.url.startsWith("/auth")) {
+  if (API_PREFIXES.some(p => req.url === p || req.url.startsWith(p + "/") || req.url.startsWith(p + "?")) ||
+      req.url.startsWith("/health")) {
     return reply.status(404).send({ error: "not found" });
   }
   return reply.sendFile("index.html");
@@ -230,6 +228,86 @@ app.post<{ Body: WatchlistEntryPayload }>("/watchlist", async (req, reply) => {
   await engine.refresh();
   reply.status(201);
   return { id: node.id };
+});
+
+// ── Watchlist status update ────────────────────────────────────────────────
+// PATCH /watchlist/:mediaId creates a new entry (append-only log).
+// The query engine always uses the last entry per media_id, so this is how
+// status updates work without mutating existing nodes.
+
+app.patch<{
+  Params: { mediaId: string };
+  Body: { status?: string; progress_ms?: number };
+}>("/watchlist/:mediaId", async (req, reply) => {
+  const result = engine.getById(req.params.mediaId);
+  if (!result) return reply.status(404).send({ error: "media not found" });
+
+  const existing = result.watchlistEntry;
+  const status = (req.body.status ?? existing?.payload.status ?? "unwatched") as import("../apps/relay/types.js").WatchStatus;
+  const node = await createWatchlistEntryNode(PASSPHRASE!, {
+    media_node_id: req.params.mediaId,
+    crosslink_node_id: existing?.payload.crosslink_node_id ?? "",
+    status,
+    added_at: existing?.payload.added_at ?? Date.now(),
+    progress_ms: req.body.progress_ms ?? existing?.payload.progress_ms,
+    size_bytes: existing?.payload.size_bytes ?? 0,
+    ...(status === "watched" ? { watched_at: Date.now() } : {}),
+  });
+  await ownStore.append(node);
+  await engine.refresh();
+  return { id: node.id, status };
+});
+
+// ── TMDB proxy ────────────────────────────────────────────────────────────
+// Keeps the API key server-side. Env var: PV_TMDB_KEY
+
+const TMDB_BASE = "https://api.themoviedb.org/3";
+
+app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
+  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — set PV_TMDB_KEY" });
+  const { q } = req.query;
+  if (!q) return reply.status(400).send({ error: "q is required" });
+
+  const res = await fetch(`${TMDB_BASE}/search/multi?api_key=${TMDB_KEY}&query=${encodeURIComponent(q)}&include_adult=false`);
+  const data = await res.json() as { results?: Record<string, unknown>[] };
+
+  const results = (data.results ?? [])
+    .filter((r) => r.media_type === "movie" || r.media_type === "tv")
+    .slice(0, 12)
+    .map((r) => ({
+      tmdb_id: String(r.id),
+      media_type: r.media_type as string,
+      title: (r.media_type === "movie" ? r.title : r.name) as string,
+      year: ((r.media_type === "movie" ? r.release_date : r.first_air_date) as string ?? "").slice(0, 4),
+      poster_path: (r.poster_path as string | null) ?? null,
+      overview: (r.overview as string | null) ?? null,
+    }));
+
+  return { results };
+});
+
+app.get<{ Querystring: { id?: string; type?: string } }>("/tmdb/details", async (req, reply) => {
+  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — set PV_TMDB_KEY" });
+  const { id, type } = req.query;
+  if (!id || !type) return reply.status(400).send({ error: "id and type are required" });
+
+  const segment = type === "tv" ? "tv" : "movie";
+  const res = await fetch(`${TMDB_BASE}/${segment}/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`);
+  const d = await res.json() as Record<string, unknown>;
+
+  const extIds = (d.external_ids ?? {}) as Record<string, unknown>;
+  return {
+    tmdb_id: String(d.id),
+    media_type: type,
+    title: (type === "movie" ? d.title : d.name) as string,
+    year: ((type === "movie" ? d.release_date : d.first_air_date) as string ?? "").slice(0, 4),
+    genres: ((d.genres as { name: string }[] | undefined) ?? []).map((g) => g.name),
+    imdb_id: (d.imdb_id ?? extIds.imdb_id ?? undefined) as string | undefined,
+    tvdb_id: extIds.tvdb_id ? String(extIds.tvdb_id) : undefined,
+    runtime_min: (type === "movie" ? d.runtime : (d.episode_run_time as number[] | undefined)?.[0]) as number | undefined,
+    poster_path: (d.poster_path as string | null) ?? null,
+    overview: (d.overview as string | null) ?? null,
+  };
 });
 
 // ── Follow / unfollow peers ────────────────────────────────────────────────

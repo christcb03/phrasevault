@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api, TOKEN_KEY, UnauthorizedError } from './api'
-import type { MediaResult, HealthResponse } from './api'
+import type { MediaResult, HealthResponse, WatchStatus } from './api'
 import LoginPage from './LoginPage'
+import AddMediaModal from './AddMediaModal'
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY))
@@ -14,6 +15,7 @@ export default function App() {
   const [selected, setSelected] = useState<MediaResult | null>(null)
   const [followKey, setFollowKey] = useState('')
   const [followMsg, setFollowMsg] = useState('')
+  const [showAddMedia, setShowAddMedia] = useState(false)
 
   function handleLogin(newToken: string) {
     sessionStorage.setItem(TOKEN_KEY, newToken)
@@ -88,6 +90,12 @@ export default function App() {
             </button>
           </form>
           {followMsg && <span className="text-xs text-green-400">{followMsg}</span>}
+          <button
+            onClick={() => setShowAddMedia(true)}
+            className="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1.5"
+          >
+            + Add Media
+          </button>
           <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-2">
             Lock
           </button>
@@ -138,7 +146,21 @@ export default function App() {
         )}
       </div>
 
-      {selected && <DetailPanel result={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <DetailPanel
+          result={selected}
+          onClose={() => setSelected(null)}
+          onUnauthorized={handleUnauthorized}
+          onWatchlistChange={search}
+        />
+      )}
+      {showAddMedia && (
+        <AddMediaModal
+          onClose={() => setShowAddMedia(false)}
+          onAdded={search}
+          onUnauthorized={handleUnauthorized}
+        />
+      )}
     </div>
   )
 }
@@ -175,7 +197,36 @@ function MediaCard({ result, onSelect }: { result: MediaResult; onSelect: (r: Me
   )
 }
 
-function DetailPanel({ result, onClose }: { result: MediaResult; onClose: () => void }) {
+function DetailPanel({
+  result, onClose, onUnauthorized, onWatchlistChange,
+}: {
+  result: MediaResult
+  onClose: () => void
+  onUnauthorized: () => void
+  onWatchlistChange: () => void
+}) {
+  const [updatingStatus, setUpdatingStatus] = useState(false)
+
+  async function handleStatusClick(status: WatchStatus) {
+    setUpdatingStatus(true)
+    try {
+      await api.updateWatchlist(result.id, status)
+      onWatchlistChange()
+      onClose()
+    } catch (e) {
+      if (e instanceof UnauthorizedError) onUnauthorized()
+    } finally {
+      setUpdatingStatus(false)
+    }
+  }
+
+  const statuses: { value: WatchStatus; label: string }[] = [
+    { value: 'unwatched', label: 'Unwatched' },
+    { value: 'watching', label: 'Watching' },
+    { value: 'watched', label: 'Watched' },
+    { value: 'skipped', label: 'Skip' },
+  ]
+
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-6" onClick={onClose}>
       <div className="bg-gray-900 border border-gray-700 rounded-xl max-w-lg w-full p-6" onClick={e => e.stopPropagation()}>
@@ -193,6 +244,30 @@ function DetailPanel({ result, onClose }: { result: MediaResult; onClose: () => 
         {result.genres && result.genres.length > 0 && (
           <p className="text-sm text-gray-400 mb-4">{result.genres.join(' · ')}</p>
         )}
+
+        <div className="mb-4">
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Watchlist</p>
+          <div className="flex gap-2 flex-wrap">
+            {statuses.map(s => {
+              const active = result.watchlist?.status === s.value
+              return (
+                <button
+                  key={s.value}
+                  onClick={() => handleStatusClick(s.value)}
+                  disabled={updatingStatus || active}
+                  className={`text-xs rounded px-3 py-1.5 transition-colors disabled:cursor-default
+                    ${active
+                      ? 'bg-indigo-600 text-white'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+                    }`}
+                >
+                  {s.label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
         <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
           Sources ({result.sources.length})
         </h3>
