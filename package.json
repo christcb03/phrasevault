@@ -11,9 +11,11 @@
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
   "dependencies": {
+    "@fastify/cors": "^11.2.0",
     "@noble/hashes": "^1.4.0",
     "@noble/secp256k1": "^2.1.0",
     "argon2": "^0.31.2",
+    "fastify": "^5.8.5",
     "hypercore": "^10.33.0",
     "hyperswarm": "^4.17.0",
     "tweetnacl": "^1.0.3"

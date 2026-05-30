@@ -1,45 +1,44 @@
-FROM python:3.11-slim
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --ignore-scripts
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+
+# ── Runtime image ──────────────────────────────────────────────────────────
+FROM node:22-alpine
 
 LABEL org.opencontainers.image.title="PhraseVault"
 LABEL org.opencontainers.image.source="https://github.com/christcb03/phrasevault"
 LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
 
-# System deps for argon2-cffi and PyNaCl native extensions
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libffi-dev \
-    libsodium-dev \
- && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 
-# Install dependencies first (layer cache)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir fastapi uvicorn[standard]
+COPY package*.json ./
+RUN npm ci --ignore-scripts --omit=dev
 
-# Install the package
-COPY pyproject.toml .
-COPY phrasevault/ phrasevault/
-RUN pip install --no-cache-dir -e .
+COPY --from=builder /app/dist ./dist
 
-# Data volume — SQLite DB lives here
 VOLUME ["/data"]
 
-# Non-root user
-RUN useradd -r -u 1000 -s /sbin/nologin phrasevault \
- && mkdir -p /data \
- && chown phrasevault:phrasevault /data
+RUN addgroup -S phrasevault && adduser -S -G phrasevault phrasevault \
+ && mkdir -p /data && chown phrasevault:phrasevault /data
 USER phrasevault
 
 EXPOSE 8080
 
-# PV_API_KEY must be set at runtime — server refuses all requests if unset
-ENV PV_DB_PATH=/data/phrasevault.db \
-    PV_LOG_LEVEL=INFO \
-    PV_DOCS=0
+ENV PV_DATA_DIR=/data \
+    PV_PORT=8080 \
+    PV_HOST=0.0.0.0 \
+    PV_LOG_LEVEL=info
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:8080/health || exit 1
 
-CMD ["uvicorn", "phrasevault.server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["node", "dist/server/index.js"]
