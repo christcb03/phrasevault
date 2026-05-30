@@ -34,6 +34,14 @@ phrasevault_traefik_router: phrasevault
 phrasevault_traefik_certresolver: cfdns
 phrasevault_traefik_middlewares: "globalHeaders@file,hsts@file"
 
+# Cloudflare DNS — auto-register an A record when Traefik is enabled.
+# Reads API credentials from Saltbox's accounts.yml on the target host.
+# Requires community.general >= 2.0 on the Ansible control machine.
+phrasevault_cloudflare_dns: false
+phrasevault_saltbox_accounts_path: /srv/git/saltbox/accounts.yml
+phrasevault_traefik_zone: turnernetworking.com
+phrasevault_dns_proxied: true
+
 # ── Runtime config ─────────────────────────────────────────────────────────────
 # PV_PASSPHRASE is the identity key — every node's feed is derived from this.
 # Store it in Ansible Vault: vault_phrasevault_passphrase

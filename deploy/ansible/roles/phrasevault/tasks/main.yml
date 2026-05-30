@@ -116,6 +116,37 @@
   ansible.builtin.include_tasks: custom.yml
   when: install_type == 'custom'
 
+- name: "PhraseVault | Register Cloudflare DNS record"
+  when: (phrasevault_traefik_enabled | bool) and (phrasevault_cloudflare_dns | bool)
+  block:
+    - name: "PhraseVault | Cloudflare | Read Saltbox accounts for credentials"
+      ansible.builtin.slurp:
+        src: "{{ phrasevault_saltbox_accounts_path }}"
+      register: _sb_accounts_raw
+
+    - name: "PhraseVault | Cloudflare | Parse credentials"
+      ansible.builtin.set_fact:
+        _sb_cf: "{{ (_sb_accounts_raw.content | b64decode | from_yaml).cloudflare }}"
+
+    - name: "PhraseVault | Cloudflare | Get public IP"
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+      register: _public_ip
+
+    - name: "PhraseVault | Cloudflare | Add A record for {{ phrasevault_domain }}"
+      community.general.cloudflare_dns:
+        account_api_token: "{{ _sb_cf.api }}"
+        account_email: "{{ _sb_cf.email }}"
+        zone: "{{ phrasevault_traefik_zone }}"
+        state: present
+        solo: true
+        proxied: "{{ phrasevault_dns_proxied | bool }}"
+        type: A
+        value: "{{ _public_ip.content | trim }}"
+        record: "{{ phrasevault_domain | replace('.' + phrasevault_traefik_zone, '') }}"
+      delegate_to: localhost
+
 - name: "PhraseVault | Wait for container to be healthy"
   community.docker.docker_container_info:
     name: "{{ phrasevault_container_name }}"
