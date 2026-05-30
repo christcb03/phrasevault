@@ -28,6 +28,8 @@
         'traefik.enable': 'true',
         'traefik.http.routers.' + phrasevault_traefik_router + '.rule': 'Host(`' + phrasevault_domain + '`)',
         'traefik.http.routers.' + phrasevault_traefik_router + '.entrypoints': 'websecure',
+        'traefik.http.routers.' + phrasevault_traefik_router + '.tls': 'true',
+        'traefik.http.routers.' + phrasevault_traefik_router + '.tls.certresolver': phrasevault_traefik_certresolver,
         'traefik.http.routers.' + phrasevault_traefik_router + '.middlewares': phrasevault_traefik_middlewares,
         'traefik.http.services.' + phrasevault_traefik_router + '.loadbalancer.server.port': '8080'
       } }}"
