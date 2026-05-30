@@ -45,5 +45,4 @@ export class MemoryStore implements NodeStore {
   }
 }
 
-// TODO: HypercoreStore — one Hypercore feed per user identity keypair
-// Each feed is append-only, cryptographically signed, replicable by anyone
+export { HypercoreStore } from "./hypercore.js";
