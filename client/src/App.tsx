@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api } from './api'
+import { api, TOKEN_KEY, UnauthorizedError } from './api'
 import type { MediaResult, HealthResponse } from './api'
+import LoginPage from './LoginPage'
 
 export default function App() {
+  const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY))
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState('')
@@ -13,21 +15,42 @@ export default function App() {
   const [followKey, setFollowKey] = useState('')
   const [followMsg, setFollowMsg] = useState('')
 
+  function handleLogin(newToken: string) {
+    sessionStorage.setItem(TOKEN_KEY, newToken)
+    setToken(newToken)
+  }
+
+  function handleLogout() {
+    sessionStorage.removeItem(TOKEN_KEY)
+    setToken(null)
+  }
+
+  function handleUnauthorized() {
+    sessionStorage.removeItem(TOKEN_KEY)
+    setToken(null)
+  }
+
   useEffect(() => {
+    if (!token) return
     api.health().then(setHealth).catch(() => {})
-  }, [])
+  }, [token])
 
   const search = useCallback(async () => {
+    if (!token) return
     setLoading(true)
     try {
       const res = await api.search({ q: query || undefined, kind: kind || undefined, available: availableOnly || undefined })
       setResults(res.results)
+    } catch (err) {
+      if (err instanceof UnauthorizedError) handleUnauthorized()
     } finally {
       setLoading(false)
     }
-  }, [query, kind, availableOnly])
+  }, [token, query, kind, availableOnly])
 
   useEffect(() => { search() }, [search])
+
+  if (!token) return <LoginPage onLogin={handleLogin} />
 
   async function handleFollow(e: React.FormEvent) {
     e.preventDefault()
@@ -36,6 +59,7 @@ export default function App() {
       setFollowMsg('Following! Reload to see their library.')
       setFollowKey('')
     } catch (err: unknown) {
+      if (err instanceof UnauthorizedError) { handleUnauthorized(); return }
       setFollowMsg(err instanceof Error ? err.message : 'Error')
     }
   }
@@ -64,6 +88,9 @@ export default function App() {
             </button>
           </form>
           {followMsg && <span className="text-xs text-green-400">{followMsg}</span>}
+          <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-2">
+            Lock
+          </button>
         </div>
       </header>
 

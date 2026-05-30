@@ -1,5 +1,24 @@
 const BASE = import.meta.env.DEV ? '/api' : '';
 
+export const TOKEN_KEY = 'pv_token';
+
+function authHeaders(): Record<string, string> {
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+export class UnauthorizedError extends Error {}
+
+export async function login(passphrase: string): Promise<{ token: string; identity: string }> {
+  const res = await fetch(`${BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ passphrase }),
+  });
+  if (!res.ok) throw new UnauthorizedError('invalid passphrase');
+  return res.json();
+}
+
 export interface MediaSource {
   storageNodeId: string;
   endpointUrl: string;
@@ -41,7 +60,8 @@ export interface HealthResponse {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
+  if (res.status === 401) throw new UnauthorizedError('session expired');
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -49,9 +69,10 @@ async function get<T>(path: string): Promise<T> {
 async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
+  if (res.status === 401) throw new UnauthorizedError('session expired');
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }

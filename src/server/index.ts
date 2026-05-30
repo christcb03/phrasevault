@@ -13,6 +13,7 @@ import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomBytes } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { deriveIdentity } from "../identity/index.js";
@@ -24,6 +25,7 @@ import {
   createCrosslinkNode, createWatchlistEntryNode,
   MediaPayload, StoragePointerPayload, CrosslinkPayload, WatchlistEntryPayload,
 } from "../apps/relay/index.js";
+import { deriveApiToken, verifyBearer } from "../auth/index.js";
 
 // ── Config from environment ────────────────────────────────────────────────
 
@@ -37,6 +39,18 @@ if (!PASSPHRASE) {
   console.error("PV_PASSPHRASE environment variable is required");
   process.exit(1);
 }
+
+// ── Auth token (derived from passphrase, distinct domain from keypair) ─────
+
+const API_TOKEN = deriveApiToken(PASSPHRASE);
+
+// Routes exempt from bearer-token auth
+const PUBLIC_ROUTES = new Set(["/health", "/auth/login", "/auth/challenge"]);
+// API route prefixes that require auth (SPA routes pass through without auth)
+const API_PREFIXES = [
+  "/search", "/media", "/storage", "/crosslink", "/watchlist",
+  "/follow", "/following", "/identity", "/auth",
+];
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 
@@ -70,7 +84,44 @@ await engine.refresh();
 const app = Fastify({ logger: { level: LOG_LEVEL } });
 await app.register(cors, { origin: true });
 
-// Serve the React frontend from dist/client/
+// ── Auth middleware ────────────────────────────────────────────────────────
+
+app.addHook("onRequest", async (req, reply) => {
+  const url = req.url.split("?")[0];
+
+  // Pass through public routes unconditionally
+  if (PUBLIC_ROUTES.has(url)) return;
+
+  // Pass through SPA/frontend routes (they load the React app which shows login)
+  const isApiRoute = API_PREFIXES.some(p => url === p || url.startsWith(p + "/"));
+  if (!isApiRoute) return;
+
+  // All API routes require a valid bearer token
+  const header = req.headers.authorization ?? "";
+  if (!header.startsWith("Bearer ") || !verifyBearer(header.slice(7), API_TOKEN)) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+});
+
+// ── Auth endpoints ─────────────────────────────────────────────────────────
+
+app.post<{ Body: { passphrase?: string } }>("/auth/login", async (req, reply) => {
+  const { passphrase } = req.body ?? {};
+  if (!passphrase || !verifyBearer(deriveApiToken(passphrase), API_TOKEN)) {
+    await new Promise(r => setTimeout(r, 200)); // slow down brute force
+    return reply.status(401).send({ error: "invalid passphrase" });
+  }
+  return { token: API_TOKEN, identity: pubKeyHex };
+});
+
+// Placeholder for future challenge-response upgrade
+app.get("/auth/challenge", async () => ({
+  challenge: randomBytes(32).toString("hex"),
+  note: "sign this nonce with your secp256k1 private key, then POST to /auth/verify",
+}));
+
+// ── Static files + SPA fallback ────────────────────────────────────────────
+
 const clientDir = path.join(__dirname, "../client");
 await app.register(staticFiles, {
   root: clientDir,
@@ -78,19 +129,18 @@ await app.register(staticFiles, {
   decorateReply: false,
 });
 
-// SPA fallback: all non-API routes serve index.html
 app.setNotFoundHandler(async (req, reply) => {
   if (req.url.startsWith("/health") || req.url.startsWith("/search") ||
       req.url.startsWith("/media") || req.url.startsWith("/storage") ||
       req.url.startsWith("/crosslink") || req.url.startsWith("/watchlist") ||
       req.url.startsWith("/follow") || req.url.startsWith("/identity") ||
-      req.url.startsWith("/following")) {
+      req.url.startsWith("/following") || req.url.startsWith("/auth")) {
     return reply.status(404).send({ error: "not found" });
   }
   return reply.sendFile("index.html");
 });
 
-// ── Health ─────────────────────────────────────────────────────────────────
+// ── Health (public) ────────────────────────────────────────────────────────
 
 app.get("/health", async () => ({
   status: "ok",
