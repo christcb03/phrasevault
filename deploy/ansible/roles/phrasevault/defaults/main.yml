@@ -23,10 +23,16 @@ phrasevault_data_dir: /opt/phrasevault/data
 phrasevault_docker_network: "saltbox"   # ignored for ubuntu install_type
 phrasevault_port: "8080"               # host port for ubuntu install_type
 
-# ── Traefik (saltbox only) ─────────────────────────────────────────────────────
-phrasevault_domain: "phrasevault.{{ ansible_hostname }}.local"
+# ── Traefik ────────────────────────────────────────────────────────────────────
+# Set phrasevault_traefik_enabled: true to expose the container via Traefik
+# (HTTPS + cert from Cloudflare DNS challenge). The saltbox Docker network must
+# exist on the target host.  The direct port binding stays in place for VPN
+# access alongside the Traefik HTTPS route.
+phrasevault_traefik_enabled: false
+phrasevault_domain: ""                # e.g. pvtest.turnernetworking.com
 phrasevault_traefik_router: phrasevault
 phrasevault_traefik_certresolver: cfdns
+phrasevault_traefik_middlewares: "globalHeaders@file,hsts@file"
 
 # ── Runtime config ─────────────────────────────────────────────────────────────
 # PV_PASSPHRASE is the identity key — every node's feed is derived from this.
