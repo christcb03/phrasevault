@@ -1,6 +1,5 @@
 ---
-# Ubuntu deployment — plain Docker, no Traefik, direct port binding.
-# Use this when there's no Saltbox/Traefik stack on the host.
+# Ubuntu deployment — plain Docker, direct port binding, Watchtower for auto-updates.
 
 - name: "PhraseVault | Ubuntu | Deploy container"
   community.docker.docker_container:
@@ -13,17 +12,35 @@
     volumes:
       - "{{ phrasevault_data_dir }}:/data"
     env:
-      PV_API_KEY: "{{ phrasevault_api_key }}"
-      PV_DB_PATH: "/data/phrasevault.db"
+      PV_PASSPHRASE: "{{ phrasevault_passphrase }}"
+      PV_DATA_DIR: "/data"
+      PV_PORT: "8080"
+      PV_HOST: "0.0.0.0"
       PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
-      PV_DOCS: "{{ phrasevault_docs_enabled }}"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: "30s"
       timeout: "5s"
       retries: 3
-      start_period: "10s"
+      start_period: "15s"
 
-- name: "PhraseVault | Ubuntu | Confirm port binding"
+- name: "PhraseVault | Ubuntu | Deploy Watchtower for auto-updates"
+  when: phrasevault_watchtower_enabled | bool
+  community.docker.docker_container:
+    name: "watchtower-phrasevault"
+    image: "containrrr/watchtower:latest"
+    state: started
+    restart_policy: unless-stopped
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    env:
+      WATCHTOWER_POLL_INTERVAL: "{{ phrasevault_watchtower_interval | string }}"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+    command: "{{ phrasevault_container_name }}"
+
+- name: "PhraseVault | Ubuntu | Show access info"
   ansible.builtin.debug:
-    msg: "PhraseVault listening on http://{{ inventory_hostname }}:{{ phrasevault_port }}"
+    msg:
+      - "PhraseVault is running at http://{{ ansible_host }}:{{ phrasevault_port }}"
+      - "Watchtower polls GHCR every {{ phrasevault_watchtower_interval }}s and auto-updates on new CI pushes"

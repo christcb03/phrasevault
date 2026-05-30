@@ -1,41 +1,45 @@
 ---
 # ── Install type ───────────────────────────────────────────────────────────────
-# saltbox    : deploys using Saltbox conventions (saltbox Docker network,
-#              Traefik labels, /opt/appname data dir, Watchtower managed)
-# ubuntu     : plain Docker on Ubuntu, no Traefik, direct port binding
-# custom     : you override all variables yourself
-install_type: saltbox
+# saltbox    : Saltbox Docker network + Traefik labels + Watchtower managed
+# ubuntu     : plain Docker on Ubuntu, direct port binding + Watchtower
+# custom     : override everything yourself
+install_type: ubuntu
 
 # ── Image ─────────────────────────────────────────────────────────────────────
 phrasevault_image: "ghcr.io/christcb03/phrasevault:latest"
 phrasevault_container_name: phrasevault
 
 # ── Build from source (use until first GHCR image is available) ───────────────
-# Set to true to clone the repo and build the image on the target host.
-# Set to false (default) to pull the pre-built image from GHCR.
+# Set to true to clone the repo and build locally instead of pulling from GHCR.
 phrasevault_build_from_source: false
 phrasevault_repo_url: "https://github.com/christcb03/phrasevault.git"
 phrasevault_repo_version: "main"
 phrasevault_build_dir: "/tmp/phrasevault-build"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-phrasevault_data_dir: /opt/phrasevault
+phrasevault_data_dir: /opt/phrasevault/data
 
 # ── Network ───────────────────────────────────────────────────────────────────
-# saltbox uses the 'saltbox' bridge network; ubuntu uses a direct port binding
-phrasevault_docker_network: "saltbox"       # ignored for ubuntu install_type
-phrasevault_port: "8080"                    # host port for ubuntu install_type
+phrasevault_docker_network: "saltbox"   # ignored for ubuntu install_type
+phrasevault_port: "8080"               # host port for ubuntu install_type
 
 # ── Traefik (saltbox only) ─────────────────────────────────────────────────────
 phrasevault_domain: "phrasevault.{{ ansible_hostname }}.local"
 phrasevault_traefik_router: phrasevault
-phrasevault_traefik_certresolver: cfdns     # your Saltbox cert resolver name
+phrasevault_traefik_certresolver: cfdns
 
 # ── Runtime config ─────────────────────────────────────────────────────────────
-# PV_API_KEY must be set — use Ansible Vault to keep it encrypted
-phrasevault_api_key: "{{ vault_phrasevault_api_key }}"
-phrasevault_log_level: INFO
-phrasevault_docs_enabled: "0"
+# PV_PASSPHRASE is the identity key — every node's feed is derived from this.
+# Store it in Ansible Vault: vault_phrasevault_passphrase
+# Generate a strong one: openssl rand -base64 32
+phrasevault_passphrase: "{{ vault_phrasevault_passphrase }}"
+phrasevault_log_level: info
+
+# ── Watchtower (ubuntu only) ───────────────────────────────────────────────────
+# Polls GHCR and restarts the container when a new image is pushed by CI.
+# This is your CD loop — no SSH from GitHub needed.
+phrasevault_watchtower_enabled: true
+phrasevault_watchtower_interval: 300    # seconds between GHCR polls (5 min)
 
 # ── System user (non-saltbox only) ────────────────────────────────────────────
 phrasevault_uid: 1000

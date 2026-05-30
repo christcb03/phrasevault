@@ -7,12 +7,63 @@
       - install_type in ['saltbox', 'ubuntu', 'custom']
     fail_msg: "install_type must be one of: saltbox, ubuntu, custom"
 
-- name: "PhraseVault | Assert API key is set"
+- name: "PhraseVault | Assert passphrase is set"
   ansible.builtin.assert:
     that:
-      - phrasevault_api_key is defined
-      - phrasevault_api_key | length > 16
-    fail_msg: "phrasevault_api_key must be set and at least 16 characters. Store it in Ansible Vault."
+      - phrasevault_passphrase is defined
+      - phrasevault_passphrase | length >= 16
+    fail_msg: >
+      phrasevault_passphrase must be set (min 16 chars).
+      Generate one: openssl rand -base64 32
+      Store it in Ansible Vault as vault_phrasevault_passphrase.
+
+- name: "PhraseVault | Install Docker CE (ubuntu)"
+  when: install_type == 'ubuntu'
+  block:
+    - name: "PhraseVault | Docker | Install apt deps"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: "PhraseVault | Docker | Add Docker GPG key"
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+      args:
+        creates: /etc/apt/keyrings/docker.asc
+
+    - name: "PhraseVault | Docker | Add Docker apt repo"
+      ansible.builtin.shell: |
+        echo \
+          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+          https://download.docker.com/linux/ubuntu \
+          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+          | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: "PhraseVault | Docker | Install Docker CE packages"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: "PhraseVault | Docker | Enable and start Docker service"
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
 
 - name: "PhraseVault | Create data directory"
   ansible.builtin.file:
@@ -46,12 +97,12 @@
         path: "{{ phrasevault_build_dir }}"
         state: absent
 
-- name: "PhraseVault | Pull Docker image from registry"
+- name: "PhraseVault | Pull Docker image from GHCR"
   when: not (phrasevault_build_from_source | bool)
   community.docker.docker_image:
     name: "{{ phrasevault_image }}"
     source: pull
-    force_source: false
+    force_source: true
 
 - name: "PhraseVault | Deploy (saltbox)"
   ansible.builtin.include_tasks: saltbox.yml
@@ -70,5 +121,5 @@
     name: "{{ phrasevault_container_name }}"
   register: pv_info
   until: pv_info.container.State.Health.Status == 'healthy'
-  retries: 12
-  delay: 5
+  retries: 20
+  delay: 10
