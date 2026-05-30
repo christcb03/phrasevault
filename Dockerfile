@@ -1,11 +1,12 @@
-FROM node:22-alpine AS builder
+FROM node:22-slim AS builder
 
-# Native module build deps (argon2, sodium-native)
-RUN apk add --no-cache python3 make g++
+# Build tools needed for any packages that fall back to source compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install all deps (including native compilation via postinstall)
 COPY package*.json ./
 RUN npm ci
 
@@ -21,7 +22,7 @@ RUN cd client && npm run build
 # Output lands in dist/client/ (per vite.config.ts outDir)
 
 # ── Runtime ────────────────────────────────────────────────────────────────
-FROM node:22-alpine
+FROM node:22-slim
 
 LABEL org.opencontainers.image.title="PhraseVault"
 LABEL org.opencontainers.image.source="https://github.com/christcb03/phrasevault"
@@ -30,16 +31,15 @@ LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
 WORKDIR /app
 COPY package*.json ./
 
-# Install prod deps with build tools available, then remove tools to keep image lean
-RUN apk add --no-cache --virtual .build-deps python3 make g++ \
- && npm ci --omit=dev \
- && apk del .build-deps
+# node:22-slim is Debian/glibc — sodium-native and argon2 prebuilt linux-x64
+# binaries work without compilation. No build tools needed here.
+RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 
 VOLUME ["/data"]
 
-RUN addgroup -S phrasevault && adduser -S -G phrasevault phrasevault \
+RUN groupadd -r phrasevault && useradd -r -g phrasevault phrasevault \
  && mkdir -p /data && chown phrasevault:phrasevault /data
 USER phrasevault
 
@@ -50,7 +50,8 @@ ENV PV_DATA_DIR=/data \
     PV_HOST=0.0.0.0 \
     PV_LOG_LEVEL=info
 
+# Use node for the health check — no wget needed in the slim image
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
+    CMD node -e "require('http').get('http://localhost:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 CMD ["node", "dist/server/index.js"]
