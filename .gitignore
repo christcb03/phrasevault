@@ -1,3 +1,8 @@
+# Node.js
+node_modules/
+dist/
+*.tsbuildinfo
+
 # Python
 __pycache__/
 *.py[cod]
@@ -24,6 +29,10 @@ env/
 *.json
 !examples/*.json
 !pyproject.toml
+!package.json
+!package-lock.json
+!tsconfig.json
+!terraform.tfvars.example
 
 # Secrets
 .env
