@@ -10,7 +10,11 @@
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import staticFiles from "@fastify/static";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { deriveIdentity } from "../identity/index.js";
 import { HypercoreStore } from "../store/hypercore.js";
 import { ReplicationManager } from "../replication/index.js";
@@ -65,6 +69,26 @@ await engine.refresh();
 
 const app = Fastify({ logger: { level: LOG_LEVEL } });
 await app.register(cors, { origin: true });
+
+// Serve the React frontend from dist/client/
+const clientDir = path.join(__dirname, "../client");
+await app.register(staticFiles, {
+  root: clientDir,
+  prefix: "/",
+  decorateReply: false,
+});
+
+// SPA fallback: all non-API routes serve index.html
+app.setNotFoundHandler(async (req, reply) => {
+  if (req.url.startsWith("/health") || req.url.startsWith("/search") ||
+      req.url.startsWith("/media") || req.url.startsWith("/storage") ||
+      req.url.startsWith("/crosslink") || req.url.startsWith("/watchlist") ||
+      req.url.startsWith("/follow") || req.url.startsWith("/identity") ||
+      req.url.startsWith("/following")) {
+    return reply.status(404).send({ error: "not found" });
+  }
+  return reply.sendFile("index.html");
+});
 
 // ── Health ─────────────────────────────────────────────────────────────────
 

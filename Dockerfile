@@ -2,14 +2,21 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
+# Build backend
 COPY package*.json ./
 RUN npm ci --ignore-scripts
-
 COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build
 
-# ── Runtime image ──────────────────────────────────────────────────────────
+# Build frontend
+COPY client/package*.json ./client/
+RUN cd client && npm ci
+COPY client/ ./client/
+RUN cd client && npm run build
+# Output lands in dist/client/ (per vite.config.ts outDir)
+
+# ── Runtime ────────────────────────────────────────────────────────────────
 FROM node:22-alpine
 
 LABEL org.opencontainers.image.title="PhraseVault"
@@ -19,7 +26,6 @@ LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
 RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm ci --ignore-scripts --omit=dev
 
