@@ -5,9 +5,9 @@ import * as secp from '@noble/secp256k1'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import type { TruthNode, TruthLink, NewNode, NewLink } from './types.js'
 
-// @noble/secp256k1 v2 requires HMAC to be wired up before use.
+// @noble/secp256k1 v2 uses `etc.hmacSha256Sync` for synchronous signing.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-;(secp.utils as any).hmacSha256Sync = (key: Uint8Array, ...msgs: Uint8Array[]) => {
+;(secp as any).etc.hmacSha256Sync = (key: Uint8Array, ...msgs: Uint8Array[]) => {
   const merged = msgs.reduce((a, b) => { const c = new Uint8Array(a.length + b.length); c.set(a); c.set(b, a.length); return c }, new Uint8Array())
   return hmac(sha256, key, merged)
 }
