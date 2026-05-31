@@ -1,7 +1,16 @@
 import { blake3 } from '@noble/hashes/blake3'
+import { hmac } from '@noble/hashes/hmac'
+import { sha256 } from '@noble/hashes/sha256'
 import * as secp from '@noble/secp256k1'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import type { TruthNode, TruthLink, NewNode, NewLink } from './types.js'
+
+// @noble/secp256k1 v2 requires HMAC to be wired up before use.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+;(secp.utils as any).hmacSha256Sync = (key: Uint8Array, ...msgs: Uint8Array[]) => {
+  const merged = msgs.reduce((a, b) => { const c = new Uint8Array(a.length + b.length); c.set(a); c.set(b, a.length); return c }, new Uint8Array())
+  return hmac(sha256, key, merged)
+}
 
 // ─── ID derivation ────────────────────────────────────────────────────────────
 
