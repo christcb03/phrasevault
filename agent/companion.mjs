@@ -2,69 +2,306 @@
 /**
  * PhraseVault Local Auth Agent
  *
- * Reads the passphrase from ~/.config/phrasevault/config.json on startup,
- * derives the auth private key, then discards the passphrase from memory.
+ * Signs server challenges on behalf of the browser so the passphrase never
+ * enters a browser process. Listens only on 127.0.0.1:8765.
  *
- * Listens on 127.0.0.1:8765 and handles challenge-signing on behalf of
- * the browser so the passphrase never enters a browser process.
- *
- * Chrome Private Network Access: responds to OPTIONS preflight with
- * Access-Control-Allow-Private-Network: true.
+ * Usage:
+ *   node companion.mjs            — start (runs setup wizard if no config)
+ *   node companion.mjs --setup    — (re-)run setup wizard
+ *   node companion.mjs --detach   — fork to background, exit parent
+ *   node companion.mjs --status   — check if companion is running
+ *   node companion.mjs --stop     — stop a running companion
  */
 
-import { createServer } from 'node:http'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { createServer }                         from 'node:http'
+import { readFileSync, writeFileSync,
+         existsSync, mkdirSync, openSync,
+         closeSync }                            from 'node:fs'
+import { join, dirname }                        from 'node:path'
+import { homedir }                              from 'node:os'
+import { createInterface }                      from 'node:readline'
+import { fileURLToPath }                        from 'node:url'
 
-// ── Crypto setup ────────────────────────────────────────────────────────────
+// ── Paths ────────────────────────────────────────────────────────────────────
 
-// Locate noble packages relative to this file's repo root.
-// agent/ lives one level below repo root; noble is in repo root node_modules.
+const CONFIG_DIR  = join(homedir(), '.config', 'phrasevault')
+const CONFIG_PATH = join(CONFIG_DIR, 'config.json')
+const PID_PATH    = join(CONFIG_DIR, 'companion.pid')
+const LOG_PATH    = join(CONFIG_DIR, 'companion.log')
+
+// ── Crypto setup ─────────────────────────────────────────────────────────────
+
 const repoRoot = new URL('..', import.meta.url).pathname
-const resolve = (pkg) => join(repoRoot, 'node_modules', pkg)
+const resolve  = (pkg) => join(repoRoot, 'node_modules', pkg)
 
-const { blake3 }   = await import(resolve('@noble/hashes/blake3.js'))
-const secp         = await import(resolve('@noble/secp256k1/index.js'))
+const { blake3 } = await import(resolve('@noble/hashes/blake3.js'))
+const secp       = await import(resolve('@noble/secp256k1/index.js'))
 
-const ENC               = new TextEncoder()
-const DOMAIN_AUTH       = ENC.encode('phrasevault:api-auth-v1:')
-const DOMAIN_CHALLENGE  = ENC.encode('phrasevault:auth-challenge:v1:')
+const ENC              = new TextEncoder()
+const DOMAIN_AUTH      = ENC.encode('phrasevault:api-auth-v1:')
+const DOMAIN_CHALLENGE = ENC.encode('phrasevault:auth-challenge:v1:')
 
 function concat(a, b) {
   const out = new Uint8Array(a.length + b.length)
-  out.set(a, 0)
-  out.set(b, a.length)
+  out.set(a, 0); out.set(b, a.length)
   return out
 }
 
-function toHex(bytes) {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+function deriveAuthKey(passphrase) {
+  return blake3(concat(DOMAIN_AUTH, ENC.encode(passphrase)))
 }
 
-// ── Load passphrase and derive auth key ─────────────────────────────────────
+async function signChallenge(authKey, challenge) {
+  const msgHash = blake3(concat(DOMAIN_CHALLENGE, ENC.encode(challenge)))
+  const sig = await secp.signAsync(msgHash, authKey, { lowS: true })
+  return sig.toCompactHex()
+}
 
-const CONFIG_PATH = join(homedir(), '.config', 'phrasevault', 'config.json')
+// ── Config ───────────────────────────────────────────────────────────────────
 
-let authPrivKey
-try {
-  const raw = readFileSync(CONFIG_PATH, 'utf8')
-  const { passphrase } = JSON.parse(raw)
-  if (!passphrase || typeof passphrase !== 'string') {
-    throw new Error('"passphrase" key missing or empty in config.json')
+function loadConfig() {
+  if (!existsSync(CONFIG_PATH)) return null
+  try {
+    return JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+  } catch {
+    return null
   }
-  authPrivKey = blake3(concat(DOMAIN_AUTH, ENC.encode(passphrase)))
-  // Overwrite string in memory as best-effort (V8 may not honour this, but it's good practice)
-} catch (err) {
-  console.error(`[companion] Failed to load passphrase: ${err.message}`)
-  console.error(`[companion] Expected: ${CONFIG_PATH}`)
-  console.error('[companion] Create it with: {"passphrase":"your-passphrase-here"}')
-  process.exit(1)
 }
 
-console.log('[companion] Auth key derived. Passphrase reference released.')
+function saveConfig(cfg) {
+  mkdirSync(CONFIG_DIR, { recursive: true })
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 })
+}
 
-// ── HTTP server ──────────────────────────────────────────────────────────────
+// ── Interactive prompts ───────────────────────────────────────────────────────
+
+function readLine(prompt) {
+  return new Promise(resolve => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    rl.question(prompt, answer => { rl.close(); resolve(answer.trim()) })
+  })
+}
+
+function readSecret(prompt) {
+  return new Promise(resolve => {
+    if (!process.stdin.isTTY) {
+      // Non-interactive: read a single line from stdin
+      const rl = createInterface({ input: process.stdin })
+      rl.once('line', line => { rl.close(); resolve(line.trim()) })
+      return
+    }
+    process.stdout.write(prompt)
+    process.stdin.setRawMode(true)
+    process.stdin.resume()
+    process.stdin.setEncoding('utf8')
+    let input = ''
+    function handler(ch) {
+      if (ch === '\r' || ch === '\n' || ch === '') {
+        process.stdin.setRawMode(false)
+        process.stdin.pause()
+        process.stdin.removeListener('data', handler)
+        process.stdout.write('\n')
+        resolve(input)
+      } else if (ch === '') {
+        process.stdout.write('\n')
+        process.exit(0)
+      } else if (ch === '' || ch === '\b') {
+        if (input.length > 0) { input = input.slice(0, -1); process.stdout.write('\b \b') }
+      } else {
+        input += ch
+        process.stdout.write('*')
+      }
+    }
+    process.stdin.on('data', handler)
+  })
+}
+
+// ── Server test ───────────────────────────────────────────────────────────────
+
+async function testServerAuth(serverUrl, authKey, timeoutMs = 5000) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const challengeRes = await fetch(`${serverUrl}/auth/challenge`, { signal: ctrl.signal })
+    if (!challengeRes.ok) return { ok: false, reason: `challenge endpoint returned ${challengeRes.status}` }
+    const { challenge } = await challengeRes.json()
+
+    const signature = await signChallenge(authKey, challenge)
+
+    const verifyRes = await fetch(`${serverUrl}/auth/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challenge, signature }),
+      signal: ctrl.signal,
+    })
+    clearTimeout(timer)
+
+    if (verifyRes.ok) return { ok: true }
+    if (verifyRes.status === 401) return { ok: false, reason: 'passphrase does not match this server' }
+    return { ok: false, reason: `server returned ${verifyRes.status}` }
+  } catch (err) {
+    clearTimeout(timer)
+    if (err.name === 'AbortError') return { ok: false, reason: 'connection timed out' }
+    return { ok: false, reason: err.message }
+  }
+}
+
+// ── Setup wizard ──────────────────────────────────────────────────────────────
+
+async function runSetupWizard(existingConfig) {
+  console.log('\n╔══════════════════════════════════════╗')
+  console.log('║   PhraseVault Companion Setup        ║')
+  console.log('╚══════════════════════════════════════╝\n')
+
+  if (existingConfig) {
+    console.log('Existing config found. This will update it.\n')
+  }
+
+  // ── Passphrase ──
+  console.log('Your passphrase is used to derive your identity.')
+  console.log('It never leaves this machine.\n')
+
+  let passphrase
+  while (true) {
+    passphrase = await readSecret('Passphrase: ')
+    if (passphrase.length < 8) {
+      console.log('Passphrase must be at least 8 characters. Try again.')
+      continue
+    }
+    const confirm = await readSecret('Confirm passphrase: ')
+    if (passphrase !== confirm) {
+      console.log('Passphrases do not match. Try again.\n')
+      continue
+    }
+    break
+  }
+
+  const authKey = deriveAuthKey(passphrase)
+  console.log('\n✓ Passphrase accepted and key derived.\n')
+
+  // ── Servers ──
+  const servers = existingConfig?.servers ?? []
+  console.log('Add your MediaForest server(s). Leave blank when done.')
+  if (servers.length > 0) {
+    console.log(`Currently configured: ${servers.map(s => s.url).join(', ')}`)
+    const keep = await readLine('Keep existing servers? [Y/n]: ')
+    if (keep.toLowerCase() === 'n') servers.length = 0
+  }
+
+  while (true) {
+    const url = await readLine(`Server URL ${servers.length + 1} (e.g. https://pvtest.turnernetworking.com): `)
+    if (!url) break
+
+    const cleanUrl = url.replace(/\/$/, '')
+    process.stdout.write(`  Testing connection to ${cleanUrl}... `)
+    const result = await testServerAuth(cleanUrl, authKey)
+
+    if (result.ok) {
+      console.log('✓ Connected and passphrase verified!')
+      const name = await readLine('  Friendly name for this server (optional): ')
+      servers.push({ url: cleanUrl, name: name || null, registered: true })
+    } else {
+      console.log(`✗ ${result.reason}`)
+      const add = await readLine('  Add it anyway? [y/N]: ')
+      if (add.toLowerCase() === 'y') {
+        const name = await readLine('  Friendly name: ')
+        servers.push({ url: cleanUrl, name: name || null, registered: false })
+      }
+    }
+
+    const more = await readLine('Add another server? [y/N]: ')
+    if (more.toLowerCase() !== 'y') break
+  }
+
+  if (servers.length === 0) {
+    console.log('\nNo servers configured. You can add them later with --setup.')
+  }
+
+  // ── Save ──
+  const cfg = { passphrase, servers }
+  saveConfig(cfg)
+  console.log(`\n✓ Config saved to ${CONFIG_PATH}`)
+  console.log('  (chmod 600 — readable only by you)\n')
+
+  return cfg
+}
+
+// ── Startup self-test ─────────────────────────────────────────────────────────
+
+async function runSelfTests(authKey, servers) {
+  if (!servers || servers.length === 0) {
+    console.log('[companion] No servers configured — skipping self-test')
+    return
+  }
+  for (const srv of servers) {
+    process.stdout.write(`[companion] Testing ${srv.url}... `)
+    const result = await testServerAuth(srv.url, authKey, 5000)
+    if (result.ok) {
+      console.log('✓ OK')
+    } else {
+      console.log(`✗ ${result.reason}`)
+      if (result.reason?.includes('passphrase does not match')) {
+        console.error('[companion] WARNING: Passphrase mismatch on server — run --setup to reconfigure')
+      }
+    }
+  }
+}
+
+// ── Daemon control ────────────────────────────────────────────────────────────
+
+function writePid() {
+  mkdirSync(CONFIG_DIR, { recursive: true })
+  writeFileSync(PID_PATH, String(process.pid))
+}
+
+function readPid() {
+  if (!existsSync(PID_PATH)) return null
+  try { return parseInt(readFileSync(PID_PATH, 'utf8').trim(), 10) } catch { return null }
+}
+
+function isRunning(pid) {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+
+async function handleStatusCommand() {
+  const pid = readPid()
+  if (!pid || !isRunning(pid)) {
+    console.log('companion: not running')
+    process.exit(1)
+  }
+  console.log(`companion: running (PID ${pid})`)
+  process.exit(0)
+}
+
+async function handleStopCommand() {
+  const pid = readPid()
+  if (!pid || !isRunning(pid)) {
+    console.log('companion: not running')
+    process.exit(0)
+  }
+  process.kill(pid, 'SIGTERM')
+  console.log(`companion: stopped (PID ${pid})`)
+  process.exit(0)
+}
+
+async function handleDetachCommand(originalArgs) {
+  const { spawn } = await import('node:child_process')
+  mkdirSync(CONFIG_DIR, { recursive: true })
+  const logFd = openSync(LOG_PATH, 'a')
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(import.meta.url), ...originalArgs.filter(a => a !== '--detach')],
+    { detached: true, stdio: ['ignore', logFd, logFd], env: process.env },
+  )
+  child.unref()
+  closeSync(logFd)
+  console.log(`[companion] Started in background (PID ${child.pid})`)
+  console.log(`[companion] Logs: ${LOG_PATH}`)
+  console.log('[companion] Run with --status to confirm, --stop to stop.')
+  process.exit(0)
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PV_AGENT_PORT ?? '8765', 10)
 const HOST = '127.0.0.1'
@@ -76,10 +313,9 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Private-Network': 'true',
 }
 
-function send(res, status, body) {
-  const json = JSON.stringify(body)
+function sendJson(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json', ...CORS_HEADERS })
-  res.end(json)
+  res.end(JSON.stringify(body))
 }
 
 function readBody(req) {
@@ -94,58 +330,91 @@ function readBody(req) {
   })
 }
 
-const server = createServer(async (req, res) => {
-  // CORS preflight (Chrome Private Network Access sends this first)
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, CORS_HEADERS)
-    res.end()
-    return
-  }
+function startHttpServer(authKey, config) {
+  const httpServer = createServer(async (req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, CORS_HEADERS); res.end(); return
+    }
 
-  if (req.method === 'GET' && req.url === '/health') {
-    send(res, 200, { ok: true, version: '1' })
-    return
-  }
-
-  if (req.method === 'POST' && req.url === '/sign') {
-    let body
-    try {
-      body = await readBody(req)
-    } catch {
-      send(res, 400, { error: 'invalid body' })
+    if (req.method === 'GET' && req.url === '/health') {
+      sendJson(res, 200, {
+        ok: true,
+        version: '1',
+        servers: (config.servers ?? []).map(s => ({ url: s.url, name: s.name })),
+      })
       return
     }
-    if (!body?.challenge || typeof body.challenge !== 'string') {
-      send(res, 400, { error: 'challenge required' })
+
+    if (req.method === 'POST' && req.url === '/sign') {
+      let body
+      try { body = await readBody(req) }
+      catch { sendJson(res, 400, { error: 'invalid body' }); return }
+
+      if (!body?.challenge || typeof body.challenge !== 'string') {
+        sendJson(res, 400, { error: 'challenge required' }); return
+      }
+      try {
+        const signature = await signChallenge(authKey, body.challenge)
+        sendJson(res, 200, { signature })
+      } catch (err) {
+        console.error('[companion] sign error:', err)
+        sendJson(res, 500, { error: 'signing failed' })
+      }
       return
     }
-    try {
-      const msgHash = blake3(concat(DOMAIN_CHALLENGE, ENC.encode(body.challenge)))
-      const sig = await secp.signAsync(msgHash, authPrivKey, { lowS: true })
-      send(res, 200, { signature: sig.toCompactHex() })
-    } catch (err) {
-      console.error('[companion] sign error:', err)
-      send(res, 500, { error: 'signing failed' })
+
+    sendJson(res, 404, { error: 'not found' })
+  })
+
+  httpServer.listen(PORT, HOST, () => {
+    const serverList = (config.servers ?? []).map(s => s.url).join(', ') || '(none)'
+    console.log(`[companion] Listening on ${HOST}:${PORT}`)
+    console.log(`[companion] Servers: ${serverList}`)
+  })
+
+  httpServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[companion] Port ${PORT} in use — is the companion already running? Try --status`)
+    } else {
+      console.error('[companion] Server error:', err)
     }
-    return
-  }
+    process.exit(1)
+  })
 
-  send(res, 404, { error: 'not found' })
-})
+  process.on('SIGTERM', () => { httpServer.close(); process.exit(0) })
+  process.on('SIGINT',  () => { httpServer.close(); process.exit(0) })
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`[companion] Listening on ${HOST}:${PORT}`)
-})
+// ── Main ──────────────────────────────────────────────────────────────────────
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[companion] Port ${PORT} already in use. Is the companion already running?`)
-  } else {
-    console.error('[companion] Server error:', err)
-  }
+const args = process.argv.slice(2)
+
+if (args.includes('--status')) { await handleStatusCommand() }
+if (args.includes('--stop'))   { await handleStopCommand() }
+if (args.includes('--detach')) { await handleDetachCommand(args) }
+
+const forceSetup = args.includes('--setup')
+let config = loadConfig()
+
+if (!config || forceSetup) {
+  config = await runSetupWizard(config)
+}
+
+if (!config?.passphrase) {
+  console.error('[companion] No passphrase in config. Run --setup.')
   process.exit(1)
-})
+}
 
-// Graceful shutdown
-process.on('SIGTERM', () => { server.close(); process.exit(0) })
-process.on('SIGINT',  () => { server.close(); process.exit(0) })
+// Derive key and clear passphrase reference
+const authKey = deriveAuthKey(config.passphrase)
+const runConfig = { ...config, passphrase: undefined }
+console.log('[companion] Key derived. Passphrase reference released.')
+
+// Self-test each configured server
+await runSelfTests(authKey, runConfig.servers)
+
+// Write PID for --status / --stop
+writePid()
+
+// Start signing server
+startHttpServer(authKey, runConfig)
