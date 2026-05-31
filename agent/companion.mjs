@@ -5,10 +5,12 @@
  * Signs server challenges on behalf of the browser so the passphrase never
  * enters a browser process. Listens only on 127.0.0.1:8765.
  *
- * Usage:
- *   node companion.mjs            — start (runs setup wizard if no config)
- *   node companion.mjs --setup    — (re-)run setup wizard
- *   node companion.mjs --detach   — fork to background, exit parent
+ * Normal usage:
+ *   node companion.mjs       — first run: setup wizard then start in background
+ *                              subsequent runs: show config, offer to start
+ *
+ * Maintenance flags:
+ *   node companion.mjs --setup    — re-run setup wizard, then start
  *   node companion.mjs --status   — check if companion is running
  *   node companion.mjs --stop     — stop a running companion
  */
@@ -389,36 +391,60 @@ function startHttpServer(authKey, config) {
 
 const args = process.argv.slice(2)
 
+// Maintenance flags — handle and exit
 if (args.includes('--status')) { await handleStatusCommand() }
 if (args.includes('--stop'))   { await handleStopCommand() }
+// --detach is used internally by handleDetachCommand; not documented as user-facing
 if (args.includes('--detach')) { await handleDetachCommand(args) }
+
+// ── Config ───────────────────────────────────────────────────────────────────
 
 const forceSetup = args.includes('--setup')
 let config = loadConfig()
 
 if (!config || forceSetup) {
   config = await runSetupWizard(config)
-  if (forceSetup) {
-    console.log('Setup complete. Run without --setup (or with --detach) to start the companion.')
-    process.exit(0)
-  }
+} else {
+  // Existing config — show a summary so the user knows what's loaded
+  console.log(`\nConfig:  ${CONFIG_PATH}`)
+  const serverList = (config.servers ?? []).map(s => s.name ? `${s.name} (${s.url})` : s.url).join('\n         ') || '(none configured)'
+  console.log(`Servers: ${serverList}`)
 }
 
 if (!config?.passphrase) {
-  console.error('[companion] No passphrase in config. Run --setup.')
+  console.error('[companion] No passphrase in config. Run again to set it up.')
   process.exit(1)
 }
 
-// Derive key and clear passphrase reference
+// ── Already running? ─────────────────────────────────────────────────────────
+
+const existingPid = readPid()
+if (existingPid && isRunning(existingPid)) {
+  console.log(`\n[companion] Already running (PID ${existingPid}) — nothing to do.`)
+  console.log(`[companion] Use --stop to stop it.`)
+  process.exit(0)
+}
+
+// ── Derive key ────────────────────────────────────────────────────────────────
+
 const authKey = deriveAuthKey(config.passphrase)
 const runConfig = { ...config, passphrase: undefined }
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+// If stdin is a TTY: ask whether to start in background (default yes).
+// If stdin is not a TTY (e.g. the detached child): start in foreground directly.
+
+if (process.stdin.isTTY) {
+  const answer = await readLine('\nStart agent in background? [Y/n]: ')
+  if (answer.toLowerCase() !== 'n') {
+    await handleDetachCommand(args.filter(a => a !== '--setup'))
+    // handleDetachCommand calls process.exit(0) for the parent — won't reach here
+  }
+  console.log('[companion] Starting in foreground. Ctrl+C to stop.')
+}
+
+// Foreground start (also used by the detached child process)
 console.log('[companion] Key derived. Passphrase reference released.')
-
-// Self-test each configured server
 await runSelfTests(authKey, runConfig.servers)
-
-// Write PID for --status / --stop
 writePid()
-
-// Start signing server
 startHttpServer(authKey, runConfig)
