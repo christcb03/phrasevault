@@ -77,6 +77,11 @@ export async function deriveIdentity(passphrase: string): Promise<Identity> {
  * Sign a message (typically a node's canonical JSON) with the identity key.
  * Returns a 64-byte compact signature.
  */
+export async function derivePrivKeyHex(passphrase: string): Promise<string> {
+  const privKey = await derivePrivateKey(passphrase);
+  return Buffer.from(privKey).toString('hex');
+}
+
 export async function sign(passphrase: string, message: Uint8Array): Promise<Uint8Array> {
   const privKey = await derivePrivateKey(passphrase);
   const msgHash = blake3(message);

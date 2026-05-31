@@ -262,6 +262,127 @@ export function registerForestRoutes(
     },
   )
 
+  // ─── Provider management ───────────────────────────────────────────────────
+
+  // List all providers with their current config.
+  app.get('/config/providers', async (_req, reply) => {
+    const configRoot = db.getNodesByType('tree.root').find(n => n.label === 'Configuration')
+      ?? db.getNodesByType('forest.root')[0]
+    if (!configRoot) return reply.send([])
+
+    const sections = walker.children(configRoot.id, 'branch')
+    const providerSection = sections.find(c => c.node.label === 'Metadata Providers')
+    if (!providerSection) return reply.send([])
+
+    const providers = walker.children(providerSection.node.id, 'branch')
+      .filter(c => c.node.type === 'config.provider')
+      .map(c => {
+        const pp = c.node.payload as { provider_id: string; name: string; enabled: boolean }
+        const configVals: Record<string, unknown> = {}
+        for (const val of walker.children(c.node.id, 'branch')) {
+          const vp = val.node.payload as { key?: string; value?: unknown }
+          if (vp?.key) configVals[vp.key as string] = vp.value
+        }
+        return { node_id: c.node.id, provider_id: pp.provider_id, name: pp.name, enabled: pp.enabled, config: configVals }
+      })
+    return reply.send(providers)
+  })
+
+  // Upsert a provider's config (api_key, enabled). Creates the provider node if needed.
+  app.put<{
+    Params: { providerId: string }
+    Body: { api_key?: string; enabled?: boolean; name?: string }
+  }>(
+    '/config/providers/:providerId',
+    async (req, reply) => {
+      const now = Date.now()
+      const { providerId } = req.params
+
+      const configRoot = db.getNodesByType('tree.root').find(n => n.label === 'Configuration')
+      if (!configRoot) return reply.status(503).send({ error: 'forest not bootstrapped' })
+
+      const sections = walker.children(configRoot.id, 'branch')
+      const providerSection = sections.find(c => c.node.label === 'Metadata Providers')
+      if (!providerSection) return reply.status(503).send({ error: 'providers section not found' })
+
+      // Find or create the provider node.
+      let providerEntry = walker.children(providerSection.node.id, 'branch')
+        .find(c => c.node.type === 'config.provider' &&
+          (c.node.payload as { provider_id: string }).provider_id === providerId)
+
+      const enabled = req.body.enabled ?? (providerEntry
+        ? (providerEntry.node.payload as { enabled: boolean }).enabled
+        : false)
+      const name = req.body.name ?? (providerEntry
+        ? (providerEntry.node.payload as { name: string }).name
+        : providerId.toUpperCase())
+
+      if (!providerEntry) {
+        // Create provider node and link it under Metadata Providers.
+        const provNode = await createNode({
+          type: 'config.provider', label: name,
+          payload: { provider_id: providerId, name, enabled },
+          created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertNode(provNode)
+        const provLink = await createLink({
+          parent_id: providerSection.node.id, child_id: provNode.id,
+          link_type: 'branch', truth_score: 1.0, sort_key: providerId,
+          score_method: null, created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertLink(provLink)
+        // Re-fetch so we can add children below.
+        providerEntry = walker.children(providerSection.node.id, 'branch')
+          .find(c => (c.node.payload as { provider_id: string }).provider_id === providerId)!
+      } else if (enabled !== (providerEntry.node.payload as { enabled: boolean }).enabled) {
+        // Provider node is immutable — create a new one superseding the old.
+        const newProvNode = await createNode({
+          type: 'config.provider', label: name,
+          payload: { provider_id: providerId, name, enabled },
+          created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertNode(newProvNode)
+        const newProvLink = await createLink({
+          parent_id: providerSection.node.id, child_id: newProvNode.id,
+          link_type: 'branch', truth_score: 1.0, sort_key: providerId,
+          score_method: null, created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertLink(newProvLink)
+        db.softRemoveLink(providerEntry.link.id, authorPubKey, '')
+        db.supersedeLink(providerEntry.link.id, newProvLink.id)
+        providerEntry = walker.children(providerSection.node.id, 'branch')
+          .find(c => (c.node.payload as { provider_id: string }).provider_id === providerId)!
+      }
+
+      if (!providerEntry) return reply.status(500).send({ error: 'provider entry not found after upsert' })
+
+      // Upsert api_key config.value if provided.
+      if (req.body.api_key !== undefined) {
+        const existingKey = walker.children(providerEntry.node.id, 'branch')
+          .find(c => c.node.type === 'config.value' && (c.node.payload as { key: string }).key === 'api_key')
+
+        const keyNode = await createNode({
+          type: 'config.value', label: 'api_key',
+          payload: { key: 'api_key', value: req.body.api_key },
+          created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertNode(keyNode)
+        const keyLink = await createLink({
+          parent_id: providerEntry.node.id, child_id: keyNode.id,
+          link_type: 'branch', truth_score: 1.0, sort_key: 'api_key',
+          score_method: null, created_at: now, author: authorPubKey,
+        }, privKeyHex)
+        db.insertLink(keyLink)
+        if (existingKey) {
+          db.softRemoveLink(existingKey.link.id, authorPubKey, '')
+          db.supersedeLink(existingKey.link.id, keyLink.id)
+        }
+      }
+
+      return reply.send({ provider_id: providerId, enabled, updated: true })
+    },
+  )
+
   // ─── Prune ─────────────────────────────────────────────────────────────────
 
   app.get('/forest/prune/preview', async (_req, reply) => {

@@ -97,6 +97,25 @@ export interface TmdbDetails extends TmdbSearchResult {
 
 export type WatchStatus = 'unwatched' | 'watching' | 'watched' | 'skipped';
 
+export interface ProviderConfig {
+  node_id: string;
+  provider_id: string;
+  name: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+}
+
+async function put<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new UnauthorizedError('session expired');
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
 export const api = {
   health: () => get<HealthResponse>('/health'),
   search: (params: { q?: string; kind?: string; available?: boolean; watchStatus?: string }) => {
@@ -118,4 +137,7 @@ export const api = {
     patch<{ id: string; status: string }>(`/watchlist/${mediaId}`, { status, progress_ms: progressMs }),
   tmdbSearch: (q: string) => get<{ results: TmdbSearchResult[] }>(`/tmdb/search?q=${encodeURIComponent(q)}`),
   tmdbDetails: (id: string, type: 'movie' | 'tv') => get<TmdbDetails>(`/tmdb/details?id=${id}&type=${type}`),
+  getProviders: () => get<ProviderConfig[]>('/config/providers'),
+  upsertProvider: (providerId: string, body: { api_key?: string; enabled?: boolean; name?: string }) =>
+    put<{ provider_id: string; enabled: boolean; updated: boolean }>(`/config/providers/${providerId}`, body),
 };

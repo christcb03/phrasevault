@@ -161,6 +161,35 @@ export class ForestWalker {
     return result
   }
 
+  // Get config map for a specific provider (regardless of enabled state).
+  getProviderConfig(providerId: string): Record<string, unknown> | null {
+    const configRoot = this.db.getNodesByType('tree.root').find(n => n.label === 'Configuration')
+      ?? this.db.getNodesByType('forest.root')[0]
+    if (!configRoot) return null
+
+    const sections = this.children(configRoot.id, 'branch')
+    const providerSection = sections.find(c => c.node.label === 'Metadata Providers')
+    if (!providerSection) return null
+
+    const providerNode = this.children(providerSection.node.id, 'branch')
+      .find(c => c.node.type === 'config.provider' &&
+        (c.node.payload as { provider_id: string }).provider_id === providerId)
+    if (!providerNode) return null
+
+    const config: Record<string, unknown> = {}
+    for (const val of this.children(providerNode.node.id, 'branch')) {
+      const vp = val.node.payload as { key?: string; value?: unknown }
+      if (vp?.key) config[vp.key as string] = vp.value
+    }
+    // Include top-level provider fields
+    const pp = providerNode.node.payload as { provider_id: string; name: string; enabled: boolean }
+    config['_provider_id'] = pp.provider_id
+    config['_name'] = pp.name
+    config['_enabled'] = pp.enabled
+    config['_node_id'] = providerNode.node.id
+    return config
+  }
+
   // Get all enabled metadata providers from the config tree.
   getEnabledProviders(): Array<{ provider_id: string; name: string; config: Record<string, unknown> }> {
     const configRoot = this.db.getNodesByType('tree.root').find(n => n.label === 'Configuration')

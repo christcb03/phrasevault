@@ -1,26 +1,13 @@
-/**
- * PhraseVault / Relay HTTP API server.
- *
- * Single-user server: one identity (passphrase from env), one writable feed,
- * N followed feeds. Exposes the Relay query engine and node operations over REST.
- *
- * Auth: secp256k1 challenge-response. Passphrase never crosses the wire.
- *   GET  /auth/challenge  → one-time nonce (5-min TTL)
- *   POST /auth/verify     → { challenge, signature } → { token, identity }
- *   Bearer <token>        → 24-hour session token on all API routes
- *
- * Start with:
- *   PV_PASSPHRASE=... PV_DATA_DIR=./data node dist/server/index.js
- */
-
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-import { deriveIdentity } from "../identity/index.js";
+
+import { deriveIdentity, derivePrivKeyHex } from "../identity/index.js";
 import { HypercoreStore } from "../store/hypercore.js";
 import { ReplicationManager } from "../replication/index.js";
 import { RelayQueryEngine } from "../apps/relay/query.js";
@@ -34,15 +21,20 @@ import {
   createChallenge, consumeChallenge, verifyAuthSignature,
   createSession, verifySession,
 } from "../auth/index.js";
+import {
+  ForestDB, ForestWalker, PVFSVerifier, Pruner,
+  registerForestRoutes, createNode, createLink,
+} from "../forest/index.js";
+import type { ConfigProviderPayload } from "../forest/types.js";
 
 // ── Config from environment ────────────────────────────────────────────────
 
-const PASSPHRASE = process.env.PV_PASSPHRASE;
-const DATA_DIR   = process.env.PV_DATA_DIR ?? "./data";
-const PORT       = parseInt(process.env.PV_PORT ?? "8080", 10);
-const HOST       = process.env.PV_HOST ?? "0.0.0.0";
-const LOG_LEVEL  = process.env.PV_LOG_LEVEL ?? "info";
-const TMDB_KEY   = process.env.PV_TMDB_KEY ?? "";
+const PASSPHRASE   = process.env.PV_PASSPHRASE;
+const DATA_DIR     = process.env.PV_DATA_DIR ?? "./data";
+const PORT         = parseInt(process.env.PV_PORT ?? "8080", 10);
+const HOST         = process.env.PV_HOST ?? "0.0.0.0";
+const LOG_LEVEL    = process.env.PV_LOG_LEVEL ?? "info";
+const TMDB_KEY_ENV = process.env.PV_TMDB_KEY ?? "";  // legacy fallback only
 
 if (!PASSPHRASE) {
   console.error("PV_PASSPHRASE environment variable is required");
@@ -52,22 +44,33 @@ if (!PASSPHRASE) {
 // ── Auth state ─────────────────────────────────────────────────────────────
 
 const AUTH_PUB_KEY = deriveAuthPubKey(PASSPHRASE);
-const challenges   = new Map<string, number>(); // nonce → expiry timestamp
-const sessions     = new Map<string, number>(); // token → expiry timestamp
+const challenges   = new Map<string, number>();
+const sessions     = new Map<string, number>();
 
-// Routes that bypass auth entirely
 const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify"]);
-// API route prefixes that require auth (SPA routes pass through without auth)
 const API_PREFIXES = [
   "/search", "/media", "/storage", "/crosslink", "/watchlist",
   "/follow", "/following", "/identity", "/auth", "/tmdb",
+  "/forest", "/config", "/pvfs",
 ];
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────
+// ── Identity & forest ──────────────────────────────────────────────────────
 
-const identity   = await deriveIdentity(PASSPHRASE);
-const pubKeyHex  = Buffer.from(identity.publicKey).toString("hex");
-const ownStore   = new HypercoreStore(path.join(DATA_DIR, "feeds"), pubKeyHex);
+const identity  = await deriveIdentity(PASSPHRASE);
+const pubKeyHex = Buffer.from(identity.publicKey).toString("hex");
+const privKeyHex = await derivePrivKeyHex(PASSPHRASE);
+
+const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
+const forestDb = new ForestDB(FOREST_DB_PATH);
+const forestWalker = new ForestWalker(forestDb);
+const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex);
+const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex);
+
+await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex);
+
+// ── Hypercore / relay ──────────────────────────────────────────────────────
+
+const ownStore = new HypercoreStore(path.join(DATA_DIR, "feeds"), pubKeyHex);
 await ownStore.open();
 
 const replication = new ReplicationManager(path.join(DATA_DIR, "feeds"));
@@ -76,7 +79,6 @@ await replication.shareOwnFeed(ownStore);
 const engine = new RelayQueryEngine();
 engine.addFeed(pubKeyHex, ownStore);
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
 const FOLLOWED_PATH = path.join(DATA_DIR, "followed.json");
 const followedKeys: string[] = existsSync(FOLLOWED_PATH)
   ? JSON.parse(readFileSync(FOLLOWED_PATH, "utf-8"))
@@ -98,14 +100,9 @@ await app.register(cors, { origin: true });
 
 app.addHook("onRequest", async (req, reply) => {
   const url = req.url.split("?")[0];
-
-  // Pass through public routes unconditionally
   if (PUBLIC_ROUTES.has(url)) return;
-
-  // Pass through SPA/frontend routes (they load the React app which shows login)
   const isApiRoute = API_PREFIXES.some(p => url === p || url.startsWith(p + "/"));
   if (!isApiRoute) return;
-
   const header = req.headers.authorization ?? "";
   if (!header.startsWith("Bearer ") || !verifySession(sessions, header.slice(7))) {
     return reply.status(401).send({ error: "unauthorized" });
@@ -121,7 +118,6 @@ app.get("/auth/challenge", async () => ({
 app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", async (req, reply) => {
   const { challenge, signature } = req.body ?? {};
   if (!challenge || !signature) return reply.status(400).send({ error: "missing fields" });
-
   if (!consumeChallenge(challenges, challenge)) {
     return reply.status(401).send({ error: "invalid or expired challenge" });
   }
@@ -131,6 +127,10 @@ app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", a
   }
   return { token: createSession(sessions), identity: pubKeyHex };
 });
+
+// ── Forest routes (forest, config, pvfs, prune) ───────────────────────────
+
+registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex);
 
 // ── Static files + SPA fallback ────────────────────────────────────────────
 
@@ -188,7 +188,7 @@ app.get<{ Params: { id: string } }>("/media/:id", async (req, reply) => {
   return serializeResult(result);
 });
 
-// ── Publish media (own library) ────────────────────────────────────────────
+// ── Publish media ──────────────────────────────────────────────────────────
 
 app.post<{ Body: MediaPayload }>("/media", async (req, reply) => {
   const node = await createMediaNode(PASSPHRASE!, req.body);
@@ -230,11 +230,6 @@ app.post<{ Body: WatchlistEntryPayload }>("/watchlist", async (req, reply) => {
   return { id: node.id };
 });
 
-// ── Watchlist status update ────────────────────────────────────────────────
-// PATCH /watchlist/:mediaId creates a new entry (append-only log).
-// The query engine always uses the last entry per media_id, so this is how
-// status updates work without mutating existing nodes.
-
 app.patch<{
   Params: { mediaId: string };
   Body: { status?: string; progress_ms?: number };
@@ -259,12 +254,22 @@ app.patch<{
 });
 
 // ── TMDB proxy ────────────────────────────────────────────────────────────
-// Keeps the API key server-side. Env var: PV_TMDB_KEY
+// Forest config takes priority; PV_TMDB_KEY env var is legacy fallback.
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 
+function getTmdbKey(): string {
+  try {
+    const cfg = forestWalker.getProviderConfig("tmdb");
+    const key = cfg?.["api_key"] as string | undefined;
+    if (key) return key;
+  } catch { /* fall through */ }
+  return TMDB_KEY_ENV;
+}
+
 app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
-  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — set PV_TMDB_KEY" });
+  const TMDB_KEY = getTmdbKey();
+  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — add API key in Settings" });
   const { q } = req.query;
   if (!q) return reply.status(400).send({ error: "q is required" });
 
@@ -287,7 +292,8 @@ app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
 });
 
 app.get<{ Querystring: { id?: string; type?: string } }>("/tmdb/details", async (req, reply) => {
-  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — set PV_TMDB_KEY" });
+  const TMDB_KEY = getTmdbKey();
+  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — add API key in Settings" });
   const { id, type } = req.query;
   if (!id || !type) return reply.status(400).send({ error: "id and type are required" });
 
@@ -345,6 +351,7 @@ async function shutdown() {
   await app.close();
   await replication.close();
   await ownStore.close();
+  forestDb.close();
   process.exit(0);
 }
 process.on("SIGTERM", shutdown);
@@ -355,6 +362,87 @@ process.on("SIGINT", shutdown);
 await app.listen({ port: PORT, host: HOST });
 app.log.info(`identity: ${pubKeyHex.slice(0, 16)}...`);
 app.log.info(`feed: ${ownStore.feedKey.toString("hex").slice(0, 16)}...`);
+app.log.info(`forest: ${FOREST_DB_PATH}`);
+
+// ── Bootstrap forest (runs once on first start) ────────────────────────────
+
+async function bootstrapForest(
+  db: ForestDB,
+  walker: ForestWalker,
+  authorPubKey: string,
+  privKey: string,
+): Promise<void> {
+  if (db.getNodesByType("forest.root").length > 0) return;
+
+  const now = Date.now();
+
+  const forestRoot = await createNode({
+    type: "forest.root", label: "MediaForest",
+    payload: { version: 1 }, created_at: now, author: authorPubKey,
+  }, privKey);
+  db.insertNode(forestRoot);
+
+  // Null-parent link marks it as the forest root.
+  const forestRootLink = await createLink({
+    parent_id: null, child_id: forestRoot.id,
+    link_type: "branch", truth_score: 1.0, sort_key: null,
+    score_method: null, created_at: now, author: authorPubKey,
+  }, privKey);
+  db.insertLink(forestRootLink);
+
+  const configRoot = await createNode({
+    type: "tree.root", label: "Configuration",
+    payload: {}, created_at: now, author: authorPubKey,
+  }, privKey);
+  db.insertNode(configRoot);
+  db.insertLink(await createLink({
+    parent_id: forestRoot.id, child_id: configRoot.id,
+    link_type: "branch", truth_score: 1.0, sort_key: "config",
+    score_method: null, created_at: now, author: authorPubKey,
+  }, privKey));
+
+  const providersSection = await createNode({
+    type: "config.section", label: "Metadata Providers",
+    payload: {}, created_at: now, author: authorPubKey,
+  }, privKey);
+  db.insertNode(providersSection);
+  db.insertLink(await createLink({
+    parent_id: configRoot.id, child_id: providersSection.id,
+    link_type: "branch", truth_score: 1.0, sort_key: "metadata_providers",
+    score_method: null, created_at: now, author: authorPubKey,
+  }, privKey));
+
+  const tmdbProvider = await createNode({
+    type: "config.provider", label: "TMDB",
+    payload: {
+      provider_id: "tmdb",
+      name: "The Movie Database (TMDB)",
+      enabled: false,
+    } satisfies ConfigProviderPayload,
+    created_at: now, author: authorPubKey,
+  }, privKey);
+  db.insertNode(tmdbProvider);
+  db.insertLink(await createLink({
+    parent_id: providersSection.id, child_id: tmdbProvider.id,
+    link_type: "branch", truth_score: 1.0, sort_key: "tmdb",
+    score_method: null, created_at: now, author: authorPubKey,
+  }, privKey));
+
+  // If legacy env var is set, migrate it into the config tree automatically.
+  if (TMDB_KEY_ENV) {
+    const apiKeyNode = await createNode({
+      type: "config.value", label: "api_key",
+      payload: { key: "api_key", value: TMDB_KEY_ENV },
+      created_at: now, author: authorPubKey,
+    }, privKey);
+    db.insertNode(apiKeyNode);
+    db.insertLink(await createLink({
+      parent_id: tmdbProvider.id, child_id: apiKeyNode.id,
+      link_type: "branch", truth_score: 1.0, sort_key: "api_key",
+      score_method: null, created_at: now, author: authorPubKey,
+    }, privKey));
+  }
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

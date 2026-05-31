@@ -3,6 +3,7 @@ import { api, TOKEN_KEY, UnauthorizedError } from './api'
 import type { MediaResult, HealthResponse, WatchStatus } from './api'
 import LoginPage from './LoginPage'
 import AddMediaModal from './AddMediaModal'
+import SettingsPage from './SettingsPage'
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY))
@@ -16,6 +17,7 @@ export default function App() {
   const [followKey, setFollowKey] = useState('')
   const [followMsg, setFollowMsg] = useState('')
   const [showAddMedia, setShowAddMedia] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
 
   function handleLogin(newToken: string) {
     sessionStorage.setItem(TOKEN_KEY, newToken)
@@ -53,6 +55,9 @@ export default function App() {
   useEffect(() => { search() }, [search])
 
   if (!token) return <LoginPage onLogin={handleLogin} />
+  if (showSettings) return (
+    <SettingsPage onClose={() => setShowSettings(false)} onUnauthorized={handleUnauthorized} />
+  )
 
   async function handleFollow(e: React.FormEvent) {
     e.preventDefault()
@@ -96,7 +101,14 @@ export default function App() {
           >
             + Add Media
           </button>
-          <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-2">
+          <button
+            onClick={() => setShowSettings(true)}
+            className="text-xs text-gray-400 hover:text-gray-200 px-2 py-1.5"
+            title="Settings"
+          >
+            ⚙
+          </button>
+          <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-1">
             Lock
           </button>
         </div>
