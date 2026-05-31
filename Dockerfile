@@ -12,7 +12,7 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+RUN npm run build && cp src/forest/schema.sql dist/forest/
 
 # Build frontend
 COPY client/package*.json ./client/
