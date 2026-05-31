@@ -14,9 +14,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const MIGRATIONS: string[] = [
   readFileSync(join(__dirname, 'schema.sql'), 'utf8'),
-  // Migration 1: add visibility column and index (2026-05-31)
-  `ALTER TABLE truth_nodes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
-   CREATE INDEX IF NOT EXISTS idx_nodes_visibility ON truth_nodes(visibility);`,
 ]
 
 // ─── ForestDB ─────────────────────────────────────────────────────────────────
