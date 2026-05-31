@@ -138,6 +138,6 @@ export const api = {
   tmdbSearch: (q: string) => get<{ results: TmdbSearchResult[] }>(`/tmdb/search?q=${encodeURIComponent(q)}`),
   tmdbDetails: (id: string, type: 'movie' | 'tv') => get<TmdbDetails>(`/tmdb/details?id=${id}&type=${type}`),
   getProviders: () => get<ProviderConfig[]>('/config/providers'),
-  upsertProvider: (providerId: string, body: { api_key?: string; enabled?: boolean; name?: string }) =>
+  upsertProvider: (providerId: string, body: { read_access_token?: string; enabled?: boolean; name?: string }) =>
     put<{ provider_id: string; enabled: boolean; updated: boolean }>(`/config/providers/${providerId}`, body),
 };

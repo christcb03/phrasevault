@@ -22,7 +22,7 @@ export default function SettingsPage({ onClose, onUnauthorized }: Props) {
         const keys: Record<string, string> = {}
         const enab: Record<string, boolean> = {}
         for (const p of list) {
-          keys[p.provider_id] = (p.config.api_key as string) ?? ''
+          keys[p.provider_id] = (p.config.read_access_token as string) ?? ''
           enab[p.provider_id] = p.enabled
         }
         setApiKeys(keys)
@@ -37,7 +37,7 @@ export default function SettingsPage({ onClose, onUnauthorized }: Props) {
     setMsg(null)
     try {
       await api.upsertProvider(providerId, {
-        api_key: apiKeys[providerId] ?? '',
+        read_access_token: apiKeys[providerId] ?? '',
         enabled: enabled[providerId] ?? false,
       })
       setMsg({ id: providerId, text: 'Saved.', ok: true })
@@ -45,7 +45,7 @@ export default function SettingsPage({ onClose, onUnauthorized }: Props) {
       const list = await api.getProviders()
       setProviders(list)
       for (const p of list) {
-        setApiKeys(prev => ({ ...prev, [p.provider_id]: (p.config.api_key as string) ?? '' }))
+        setApiKeys(prev => ({ ...prev, [p.provider_id]: (p.config.read_access_token as string) ?? '' }))
         setEnabled(prev => ({ ...prev, [p.provider_id]: p.enabled }))
       }
     } catch (err) {
@@ -160,11 +160,11 @@ function ProviderCard({
 
       <div className="space-y-2">
         <label className="block text-xs text-gray-400">
-          API Key
+          Read Access Token
           {meta && (
             <a href={meta.docsUrl} target="_blank" rel="noreferrer"
               className="ml-2 text-indigo-400 hover:text-indigo-300">
-              Get a free key →
+              Get a free token →
             </a>
           )}
         </label>
@@ -172,7 +172,7 @@ function ProviderCard({
           type="password"
           value={apiKey}
           onChange={e => onApiKeyChange(e.target.value)}
-          placeholder="Paste your API key…"
+          placeholder="Paste your Read Access Token…"
           className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 font-mono"
         />
       </div>

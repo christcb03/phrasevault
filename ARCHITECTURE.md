@@ -556,12 +556,12 @@ Mac. Eliminates the need to ever type a passphrase into a browser.
    signature to call `/auth/verify` → auto-login with no UI interaction
 3. If not alive: shows manual passphrase form as fallback
 
-**Config file (`~/.config/phrasevault/config.json`):**
+**Config file (`~/.config/phrasevault/config.json`, chmod 600):**
 ```json
 {
   "passphrase": "your-passphrase",
   "servers": [
-    { "url": "http://192.168.0.184:8080", "pubKey": "<server-pub-key-hex>", "registered": true }
+    { "url": "https://pvtest.turnernetworking.com", "name": "pvtest", "registered": true }
   ]
 }
 ```
@@ -570,10 +570,13 @@ Mac. Eliminates the need to ever type a passphrase into a browser.
 `agent/com.phrasevault.companion.plist` — launchd plist, loads via
 `launchctl load ~/Library/LaunchAgents/com.phrasevault.companion.plist`
 
+**Companion capabilities (implemented):**
+- Setup wizard — first-run interactive prompt; tests passphrase against each server
+- Startup self-test — challenge-response verify at each start
+- Background daemon mode — PID file, `--stop`/`--status` flags
+- Normal UX requires no flags: detects existing config, offers background start
+
 **Future companion responsibilities:**
-- Setup wizard (prompt passphrase, test against server, save config)
-- Startup self-test (verify stored passphrase works at each start)
-- Background daemon mode (`--detach` flag, PID file)
 - Encrypt payloads before write (forest encryption key derivation)
 - Decrypt payloads on read (companion acts as crypto proxy)
 - Community key management (ECIES wrap/unwrap)
@@ -611,9 +614,14 @@ Provider configuration lives in the Config tree (private nodes):
 config.root "Configuration"
   └─branch─ config.section "Metadata Providers"
                └─branch─ config.provider "TMDB"
-                            ├─branch─ config.value "api_key"   → (encrypted)
-                            └─branch─ config.value "enabled"   → (encrypted)
+                            ├─branch─ config.value "read_access_token"  → (encrypted)
+                            └─branch─ config.value "enabled"            → (encrypted)
 ```
+
+**TMDB uses a v4 Read Access Token** (Bearer auth), not a v3 API Key. The token
+is stored under the key `read_access_token` in the `config.provider "TMDB"` node.
+Get a token at https://www.themoviedb.org/settings/api — use the "API Read Access Token"
+(the long JWT), not the shorter "API Key".
 
 ### HTTP API
 
@@ -783,11 +791,11 @@ Remove `PV_PASSPHRASE` single-user model:
 5. `PV_PASSPHRASE` env var triggers backward-compat single-user mode
 6. Update companion to register with each server in its servers list
 
-### Phase 7 — Companion Upgrade
+### Phase 7 — Companion Upgrade ✅ Partially done (2026-05-31)
 
-1. Setup wizard (first-run: prompt passphrase, test against server, save)
-2. Startup self-test (challenge-response verify at each start)
-3. `--detach` background daemon mode, PID file
+1. ✅ Setup wizard (first-run: prompt passphrase, test against server, save)
+2. ✅ Startup self-test (challenge-response verify at each start)
+3. ✅ Background daemon mode, PID file, `--stop`/`--status` flags
 4. Derive and manage `forestEncKey`; encrypt/decrypt as crypto proxy for browser
 5. Server list management; auto-register on new server connection
 6. Revoke flow (signed DELETE to server)

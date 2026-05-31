@@ -22,8 +22,8 @@
     volumes:
       - "{{ phrasevault_data_dir }}:/data"
     env:
-      PV_API_KEY: "{{ phrasevault_api_key }}"
-      PV_DB_PATH: "/data/phrasevault.db"
+      PV_PASSPHRASE: "{{ phrasevault_passphrase }}"
+      PV_DATA_DIR: "/data"
       PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
       PV_DOCS: "{{ phrasevault_docs_enabled }}"
     labels:
@@ -34,7 +34,7 @@
       traefik.http.services.phrasevault.loadbalancer.server.port: "8080"
       com.centurylinklabs.watchtower.enable: "true"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: "30s"
       timeout: "5s"
       retries: 3

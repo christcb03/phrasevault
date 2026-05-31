@@ -35,7 +35,7 @@ const DATA_DIR     = process.env.PV_DATA_DIR ?? "./data";
 const PORT         = parseInt(process.env.PV_PORT ?? "8080", 10);
 const HOST         = process.env.PV_HOST ?? "0.0.0.0";
 const LOG_LEVEL    = process.env.PV_LOG_LEVEL ?? "info";
-const TMDB_KEY_ENV = process.env.PV_TMDB_KEY ?? "";  // legacy fallback only
+const TMDB_TOKEN_ENV = process.env.PV_TMDB_KEY ?? "";  // legacy fallback only
 
 if (!PASSPHRASE) {
   console.error("PV_PASSPHRASE environment variable is required");
@@ -256,26 +256,31 @@ app.patch<{
 });
 
 // ── TMDB proxy ────────────────────────────────────────────────────────────
+// Uses the TMDB v4 Read Access Token via Authorization: Bearer header.
 // Forest config takes priority; PV_TMDB_KEY env var is legacy fallback.
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 
-function getTmdbKey(): string {
+function getTmdbToken(): string {
   try {
     const cfg = forestWalker.getProviderConfig("tmdb");
-    const key = cfg?.["api_key"] as string | undefined;
-    if (key) return key;
+    const token = cfg?.["read_access_token"] as string | undefined;
+    if (token) return token;
   } catch { /* fall through */ }
-  return TMDB_KEY_ENV;
+  return TMDB_TOKEN_ENV;
+}
+
+function tmdbHeaders(token: string): Record<string, string> {
+  return { Authorization: `Bearer ${token}`, Accept: "application/json" };
 }
 
 app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
-  const TMDB_KEY = getTmdbKey();
-  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — add API key in Settings" });
+  const token = getTmdbToken();
+  if (!token) return reply.status(503).send({ error: "TMDB not configured — add Read Access Token in Settings" });
   const { q } = req.query;
   if (!q) return reply.status(400).send({ error: "q is required" });
 
-  const res = await fetch(`${TMDB_BASE}/search/multi?api_key=${TMDB_KEY}&query=${encodeURIComponent(q)}&include_adult=false`);
+  const res = await fetch(`${TMDB_BASE}/search/multi?query=${encodeURIComponent(q)}&include_adult=false`, { headers: tmdbHeaders(token) });
   const data = await res.json() as { results?: Record<string, unknown>[] };
 
   const results = (data.results ?? [])
@@ -294,13 +299,13 @@ app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
 });
 
 app.get<{ Querystring: { id?: string; type?: string } }>("/tmdb/details", async (req, reply) => {
-  const TMDB_KEY = getTmdbKey();
-  if (!TMDB_KEY) return reply.status(503).send({ error: "TMDB not configured — add API key in Settings" });
+  const token = getTmdbToken();
+  if (!token) return reply.status(503).send({ error: "TMDB not configured — add Read Access Token in Settings" });
   const { id, type } = req.query;
   if (!id || !type) return reply.status(400).send({ error: "id and type are required" });
 
   const segment = type === "tv" ? "tv" : "movie";
-  const res = await fetch(`${TMDB_BASE}/${segment}/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids`);
+  const res = await fetch(`${TMDB_BASE}/${segment}/${id}?append_to_response=external_ids`, { headers: tmdbHeaders(token) });
   const d = await res.json() as Record<string, unknown>;
 
   const extIds = (d.external_ids ?? {}) as Record<string, unknown>;
@@ -423,12 +428,12 @@ async function bootstrapForest(
   }, privKey))
 
   // If legacy env var is set, migrate it into the config tree automatically.
-  if (TMDB_KEY_ENV) {
-    const apiKeyNode = await makeNode("config.value", "api_key", { key: "api_key", value: TMDB_KEY_ENV })
-    db.insertNode(apiKeyNode)
+  if (TMDB_TOKEN_ENV) {
+    const tokenNode = await makeNode("config.value", "read_access_token", { key: "read_access_token", value: TMDB_TOKEN_ENV })
+    db.insertNode(tokenNode)
     db.insertLink(await createLink({
-      parent_id: tmdbProvider.id, child_id: apiKeyNode.id,
-      link_type: "branch", truth_score: 1.0, sort_key: "api_key",
+      parent_id: tmdbProvider.id, child_id: tokenNode.id,
+      link_type: "branch", truth_score: 1.0, sort_key: "read_access_token",
       score_method: null, created_at: now, author: authorPubKey,
     }, privKey))
   }
