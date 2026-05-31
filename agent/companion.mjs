@@ -398,6 +398,10 @@ let config = loadConfig()
 
 if (!config || forceSetup) {
   config = await runSetupWizard(config)
+  if (forceSetup) {
+    console.log('Setup complete. Run without --setup (or with --detach) to start the companion.')
+    process.exit(0)
+  }
 }
 
 if (!config?.passphrase) {
