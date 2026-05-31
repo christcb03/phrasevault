@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS truth_nodes (
   id         TEXT PRIMARY KEY,
   type       TEXT NOT NULL,
   label      TEXT NOT NULL,
-  payload    TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'public',  -- 'public' | 'private' | 'community:<id>'
+  payload    TEXT NOT NULL,                   -- plaintext JSON or base64 AES-GCM ciphertext
   created_at INTEGER NOT NULL,
   author     TEXT NOT NULL,
   sig        TEXT NOT NULL
@@ -56,6 +57,9 @@ CREATE INDEX IF NOT EXISTS idx_links_type
 
 CREATE INDEX IF NOT EXISTS idx_nodes_type
   ON truth_nodes(type);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_visibility
+  ON truth_nodes(visibility);
 
 CREATE INDEX IF NOT EXISTS idx_sibling_next
   ON link_sibling_order(next_link_id);

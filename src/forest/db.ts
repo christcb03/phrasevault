@@ -14,6 +14,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const MIGRATIONS: string[] = [
   readFileSync(join(__dirname, 'schema.sql'), 'utf8'),
+  // Migration 1: add visibility column and index (2026-05-31)
+  `ALTER TABLE truth_nodes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
+   CREATE INDEX IF NOT EXISTS idx_nodes_visibility ON truth_nodes(visibility);`,
 ]
 
 // ─── ForestDB ─────────────────────────────────────────────────────────────────
@@ -49,10 +52,15 @@ export class ForestDB {
   // ─── Nodes ──────────────────────────────────────────────────────────────────
 
   insertNode(node: TruthNode): void {
+    // For public nodes, payload is an object — serialize to JSON.
+    // For private/community nodes, payload is already a base64 ciphertext string.
+    const payloadStr = typeof node.payload === 'string'
+      ? node.payload
+      : JSON.stringify(node.payload)
     this.db.prepare(`
-      INSERT OR IGNORE INTO truth_nodes (id, type, label, payload, created_at, author, sig)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(node.id, node.type, node.label, JSON.stringify(node.payload), node.created_at, node.author, node.sig)
+      INSERT OR IGNORE INTO truth_nodes (id, type, label, visibility, payload, created_at, author, sig)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(node.id, node.type, node.label, node.visibility, payloadStr, node.created_at, node.author, node.sig)
   }
 
   getNode(id: string): TruthNode | null {
@@ -247,7 +255,7 @@ export class ForestDB {
 // ─── Row deserialization ──────────────────────────────────────────────────────
 
 interface RawNode {
-  id: string; type: string; label: string; payload: string
+  id: string; type: string; label: string; visibility: string; payload: string
   created_at: number; author: string; sig: string
 }
 
@@ -260,7 +268,13 @@ interface RawLink {
 }
 
 function deserializeNode(row: RawNode): TruthNode {
-  return { ...row, payload: JSON.parse(row.payload) } as TruthNode
+  // For public nodes, parse JSON payload back to object.
+  // For private/community nodes, leave payload as the raw ciphertext string —
+  // decryption happens in the application layer with the user's enc key.
+  const payload = row.visibility === 'public'
+    ? JSON.parse(row.payload)
+    : row.payload   // opaque base64 ciphertext
+  return { ...row, payload } as TruthNode
 }
 
 function deserializeLink(row: RawLink): TruthLink {

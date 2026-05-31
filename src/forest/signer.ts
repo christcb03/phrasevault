@@ -5,9 +5,14 @@ import type { TruthNode, TruthLink, NewNode, NewLink } from './types.js'
 
 // ─── ID derivation ────────────────────────────────────────────────────────────
 
-// Node ID = BLAKE3(type + "\0" + label + "\0" + JSON(payload) + "\0" + created_at + "\0" + author)
+// Node ID = BLAKE3(type + "\0" + label + "\0" + visibility + "\0" + payload_str + "\0" + created_at + "\0" + author)
+// visibility is part of the preimage: changing visibility creates a new node.
+// payload_str is the stored value (plaintext JSON for public, base64 ciphertext for private/community).
 export function deriveNodeId(node: NewNode): string {
-  const content = `${node.type}\0${node.label}\0${JSON.stringify(node.payload)}\0${node.created_at}\0${node.author}`
+  const payloadStr = typeof node.payload === 'string'
+    ? node.payload   // already serialized (private/community ciphertext)
+    : JSON.stringify(node.payload)
+  const content = `${node.type}\0${node.label}\0${node.visibility}\0${payloadStr}\0${node.created_at}\0${node.author}`
   return bytesToHex(blake3(content))
 }
 

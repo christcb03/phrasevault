@@ -19,7 +19,7 @@ export default function App() {
   const [showAddMedia, setShowAddMedia] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
 
-  function handleLogin(newToken: string) {
+  function handleLogin(newToken: string, _identity?: string) {
     sessionStorage.setItem(TOKEN_KEY, newToken)
     setToken(newToken)
   }

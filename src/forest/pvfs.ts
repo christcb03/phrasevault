@@ -5,6 +5,7 @@ import { bytesToHex } from '@noble/hashes/utils'
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
 import { createNode, createLink } from './signer.js'
+import { serializePayload } from './cipher.js'
 import type {
   TruthNode, PvfsFilePayload, PvfsIntegrityFailurePayload,
 } from './types.js'
@@ -28,6 +29,7 @@ export class PVFSVerifier {
     private walker: ForestWalker,
     private authorPubKey: string,
     private privKeyHex: string,
+    private encKey: Uint8Array,
   ) {}
 
   // Verify a file by reading bytes from the given location and checking BLAKE3 hash.
@@ -61,16 +63,18 @@ export class PVFSVerifier {
   ): Promise<IntegrityFailureRecord> {
     const now = Date.now()
 
+    const rawFailurePayload: PvfsIntegrityFailurePayload = {
+      file_node_id:     fileNodeId,
+      location_node_id: locationNodeId,
+      expected_hash:    expectedHash,
+      actual_hash:      actualHash,
+      detected_at:      now,
+    }
     const failureNode = await createNode({
       type: 'pvfs.integrity_failure',
       label: `Integrity failure: ${fileNodeId.slice(0, 12)}`,
-      payload: {
-        file_node_id:     fileNodeId,
-        location_node_id: locationNodeId,
-        expected_hash:    expectedHash,
-        actual_hash:      actualHash,
-        detected_at:      now,
-      } satisfies PvfsIntegrityFailurePayload,
+      visibility: 'private',
+      payload: serializePayload(rawFailurePayload, 'private', this.encKey),
       created_at: now,
       author: this.authorPubKey,
     }, this.privKeyHex)
@@ -104,6 +108,7 @@ export class PVFSVerifier {
     const newFileNode = await createNode({
       type: 'pvfs.file',
       label: oldNode.label,
+      visibility: 'public',
       payload: {
         content_hash:      newHash,
         size_bytes:        sizeBytes,

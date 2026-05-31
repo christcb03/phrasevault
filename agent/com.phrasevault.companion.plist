@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.phrasevault.companion</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <!-- Update the path below to match your checkout location -->
+    <string>/Users/chris/Projects/phrasevault-repo/agent/companion.mjs</string>
+  </array>
+
+  <!-- Bind only to localhost — never exposed to the network -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PV_AGENT_PORT</key>
+    <string>8765</string>
+  </dict>
+
+  <!-- Start on login and keep alive if it crashes -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/phrasevault-companion.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/phrasevault-companion.log</string>
+</dict>
+</plist>

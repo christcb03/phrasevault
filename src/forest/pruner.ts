@@ -1,6 +1,7 @@
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
 import { createNode } from './signer.js'
+import { serializePayload } from './cipher.js'
 import type { PruneCandidate, PrunePreview, PruneResult, PrunePolicyPayload } from './types.js'
 
 export class Pruner {
@@ -9,6 +10,7 @@ export class Pruner {
     private walker: ForestWalker,
     private authorPubKey: string,
     private privKeyHex: string,
+    private encKey: Uint8Array,
   ) {}
 
   // ─── Policy resolution ───────────────────────────────────────────────────────
@@ -92,17 +94,19 @@ export class Pruner {
       })
     }
 
+    const rawRecord = {
+      pruned_at:   now,
+      dry_run:     dryRun,
+      node_count:  preview.node_count,
+      link_count:  preview.link_count,
+      node_ids:    preview.candidates.map(c => c.node.id),
+      policy_id:   null,
+    }
     const recordNode = await createNode({
       type: 'event.prune_record',
       label: `Prune ${dryRun ? 'preview' : 'run'} at ${new Date(now).toISOString()}`,
-      payload: {
-        pruned_at:   now,
-        dry_run:     dryRun,
-        node_count:  preview.node_count,
-        link_count:  preview.link_count,
-        node_ids:    preview.candidates.map(c => c.node.id),
-        policy_id:   null,
-      },
+      visibility: 'private',
+      payload: serializePayload(rawRecord, 'private', this.encKey),
       created_at: now,
       author: this.authorPubKey,
     }, this.privKeyHex)

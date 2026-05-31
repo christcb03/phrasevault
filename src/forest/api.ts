@@ -4,7 +4,9 @@ import type { ForestWalker } from './walker.js'
 import type { PVFSVerifier } from './pvfs.js'
 import type { Pruner } from './pruner.js'
 import { createNode, createLink } from './signer.js'
-import type { NewNode, NewLink } from './types.js'
+import { defaultVisibility, serializePayload, deserializePayload } from './cipher.js'
+import type { NewNode, NewLink, TruthNode } from './types.js'
+import type { Visibility } from './cipher.js'
 
 export function registerForestRoutes(
   app: FastifyInstance,
@@ -14,7 +16,33 @@ export function registerForestRoutes(
   pruner: Pruner,
   authorPubKey: string,
   privKeyHex: string,
+  encKey: Uint8Array,
 ): void {
+
+  // Decrypt a node's payload in API responses. Returns plaintext payload for owner.
+  function decryptNode(node: TruthNode): TruthNode {
+    if (node.visibility === 'public') return node
+    const payload = deserializePayload(node.payload as string, node.visibility as Visibility, encKey)
+    return { ...node, payload }
+  }
+
+  // Resolve (decrypt if needed) a node's payload to a typed object.
+  function resolvePayload<T>(node: TruthNode): T {
+    if (node.visibility === 'public') return node.payload as T
+    return deserializePayload(node.payload as string, node.visibility as Visibility, encKey) as T
+  }
+
+  // Create a node with correct visibility and encrypted payload.
+  async function makeNode(
+    type: TruthNode['type'],
+    label: string,
+    rawPayload: unknown,
+    now: number,
+  ): Promise<TruthNode> {
+    const vis = defaultVisibility(type)
+    const payload = serializePayload(rawPayload, vis, vis === 'public' ? null : encKey)
+    return createNode({ type, label, visibility: vis, payload, created_at: now, author: authorPubKey }, privKeyHex)
+  }
 
   // ─── Forest ────────────────────────────────────────────────────────────────
 
@@ -37,17 +65,19 @@ export function registerForestRoutes(
     async (req, reply) => {
       const node = db.getNode(req.params.nodeId)
       if (!node) return reply.status(404).send({ error: 'node not found' })
-      return reply.send(node)
+      return reply.send(decryptNode(node))
     },
   )
 
-  app.post<{ Body: Omit<NewNode, 'author'> }>(
+  app.post<{ Body: Omit<NewNode, 'author' | 'visibility'> & { visibility?: Visibility } }>(
     '/forest/node',
     async (req, reply) => {
-      const input: NewNode = { ...req.body, author: authorPubKey }
+      const vis: Visibility = req.body.visibility ?? defaultVisibility(req.body.type)
+      const payload = serializePayload(req.body.payload, vis, vis === 'public' ? null : encKey)
+      const input: NewNode = { ...req.body, author: authorPubKey, visibility: vis, payload }
       const node = await createNode(input, privKeyHex)
       db.insertNode(node)
-      return reply.status(201).send(node)
+      return reply.status(201).send(decryptNode(node))
     },
   )
 
@@ -106,35 +136,27 @@ export function registerForestRoutes(
       // Ensure section node exists.
       let sectionNode = db.getNodesByType('config.section').find(n => n.label === section)
       if (!sectionNode) {
-        sectionNode = await createNode({
-          type: 'config.section', label: section,
-          payload: {}, created_at: now, author: authorPubKey,
-        }, privKeyHex)
+        sectionNode = await makeNode('config.section', section, {}, now)
         db.insertNode(sectionNode)
 
         // Link section under config root.
         const configRoot = db.getNodesByType('tree.root').find(n => n.label === 'Configuration')
         if (configRoot) {
-          const sectionLink = await createLink({
+          db.insertLink(await createLink({
             parent_id: configRoot.id, child_id: sectionNode.id,
             link_type: 'branch', truth_score: 1.0, sort_key: section,
             score_method: null, created_at: now, author: authorPubKey,
-          }, privKeyHex)
-          db.insertLink(sectionLink)
+          }, privKeyHex))
         }
       }
 
-      // Create new config.value node.
-      const valueNode = await createNode({
-        type: 'config.value', label: key,
-        payload: { key, value: req.body.value },
-        created_at: now, author: authorPubKey,
-      }, privKeyHex)
+      // Create new config.value node (private).
+      const valueNode = await makeNode('config.value', key, { key, value: req.body.value }, now)
       db.insertNode(valueNode)
 
       // Find and supersede any existing link for this key under this section.
       const existing = walker.children(sectionNode.id, 'branch')
-        .find(c => c.node.type === 'config.value' && (c.node.payload as { key: string }).key === key)
+        .find(c => c.node.type === 'config.value' && resolvePayload<{ key: string }>(c.node).key === key)
 
       const newLink = await createLink({
         parent_id: sectionNode.id, child_id: valueNode.id,
@@ -149,7 +171,7 @@ export function registerForestRoutes(
         db.supersedeLink(existing.link.id, newLink.id)
       }
 
-      return reply.send(valueNode)
+      return reply.send(decryptNode(valueNode))
     },
   )
 
@@ -202,13 +224,7 @@ export function registerForestRoutes(
   app.post<{ Body: Omit<NewNode, 'author' | 'type'> & { payload: import('./types.js').PvfsFilePayload } }>(
     '/pvfs/file',
     async (req, reply) => {
-      const node = await createNode({
-        type: 'pvfs.file',
-        label: req.body.label,
-        payload: req.body.payload,
-        created_at: Date.now(),
-        author: authorPubKey,
-      }, privKeyHex)
+      const node = await makeNode('pvfs.file', req.body.label, req.body.payload, Date.now())
       db.insertNode(node)
       return reply.status(201).send(node)
     },
@@ -224,13 +240,12 @@ export function registerForestRoutes(
       if (!fileNode) return reply.status(404).send({ error: 'file node not found' })
 
       const now = Date.now()
-      const locNode = await createNode({
-        type: 'pvfs.location',
-        label: req.body.payload.uri,
-        payload: { ...req.body.payload, last_verified: null, last_seen: now },
-        created_at: now,
-        author: authorPubKey,
-      }, privKeyHex)
+      const locNode = await makeNode(
+        'pvfs.location',
+        req.body.payload.uri,
+        { ...req.body.payload, last_verified: null, last_seen: now },
+        now,
+      )
       db.insertNode(locNode)
 
       const link = await createLink({
@@ -277,10 +292,10 @@ export function registerForestRoutes(
     const providers = walker.children(providerSection.node.id, 'branch')
       .filter(c => c.node.type === 'config.provider')
       .map(c => {
-        const pp = c.node.payload as { provider_id: string; name: string; enabled: boolean }
+        const pp = resolvePayload<{ provider_id: string; name: string; enabled: boolean }>(c.node)
         const configVals: Record<string, unknown> = {}
         for (const val of walker.children(c.node.id, 'branch')) {
-          const vp = val.node.payload as { key?: string; value?: unknown }
+          const vp = resolvePayload<{ key?: string; value?: unknown }>(val.node)
           if (vp?.key) configVals[vp.key as string] = vp.value
         }
         return { node_id: c.node.id, provider_id: pp.provider_id, name: pp.name, enabled: pp.enabled, config: configVals }
@@ -308,39 +323,30 @@ export function registerForestRoutes(
       // Find or create the provider node.
       let providerEntry = walker.children(providerSection.node.id, 'branch')
         .find(c => c.node.type === 'config.provider' &&
-          (c.node.payload as { provider_id: string }).provider_id === providerId)
+          resolvePayload<{ provider_id: string }>(c.node).provider_id === providerId)
 
       const enabled = req.body.enabled ?? (providerEntry
-        ? (providerEntry.node.payload as { enabled: boolean }).enabled
+        ? resolvePayload<{ enabled: boolean }>(providerEntry.node).enabled
         : false)
       const name = req.body.name ?? (providerEntry
-        ? (providerEntry.node.payload as { name: string }).name
+        ? resolvePayload<{ name: string }>(providerEntry.node).name
         : providerId.toUpperCase())
 
       if (!providerEntry) {
         // Create provider node and link it under Metadata Providers.
-        const provNode = await createNode({
-          type: 'config.provider', label: name,
-          payload: { provider_id: providerId, name, enabled },
-          created_at: now, author: authorPubKey,
-        }, privKeyHex)
+        const provNode = await makeNode('config.provider', name, { provider_id: providerId, name, enabled }, now)
         db.insertNode(provNode)
-        const provLink = await createLink({
+        db.insertLink(await createLink({
           parent_id: providerSection.node.id, child_id: provNode.id,
           link_type: 'branch', truth_score: 1.0, sort_key: providerId,
           score_method: null, created_at: now, author: authorPubKey,
-        }, privKeyHex)
-        db.insertLink(provLink)
+        }, privKeyHex))
         // Re-fetch so we can add children below.
         providerEntry = walker.children(providerSection.node.id, 'branch')
-          .find(c => (c.node.payload as { provider_id: string }).provider_id === providerId)!
-      } else if (enabled !== (providerEntry.node.payload as { enabled: boolean }).enabled) {
+          .find(c => resolvePayload<{ provider_id: string }>(c.node).provider_id === providerId)!
+      } else if (enabled !== resolvePayload<{ enabled: boolean }>(providerEntry.node).enabled) {
         // Provider node is immutable — create a new one superseding the old.
-        const newProvNode = await createNode({
-          type: 'config.provider', label: name,
-          payload: { provider_id: providerId, name, enabled },
-          created_at: now, author: authorPubKey,
-        }, privKeyHex)
+        const newProvNode = await makeNode('config.provider', name, { provider_id: providerId, name, enabled }, now)
         db.insertNode(newProvNode)
         const newProvLink = await createLink({
           parent_id: providerSection.node.id, child_id: newProvNode.id,
@@ -351,7 +357,7 @@ export function registerForestRoutes(
         db.softRemoveLink(providerEntry.link.id, authorPubKey, '')
         db.supersedeLink(providerEntry.link.id, newProvLink.id)
         providerEntry = walker.children(providerSection.node.id, 'branch')
-          .find(c => (c.node.payload as { provider_id: string }).provider_id === providerId)!
+          .find(c => resolvePayload<{ provider_id: string }>(c.node).provider_id === providerId)!
       }
 
       if (!providerEntry) return reply.status(500).send({ error: 'provider entry not found after upsert' })
@@ -359,13 +365,9 @@ export function registerForestRoutes(
       // Upsert api_key config.value if provided.
       if (req.body.api_key !== undefined) {
         const existingKey = walker.children(providerEntry.node.id, 'branch')
-          .find(c => c.node.type === 'config.value' && (c.node.payload as { key: string }).key === 'api_key')
+          .find(c => c.node.type === 'config.value' && resolvePayload<{ key: string }>(c.node).key === 'api_key')
 
-        const keyNode = await createNode({
-          type: 'config.value', label: 'api_key',
-          payload: { key: 'api_key', value: req.body.api_key },
-          created_at: now, author: authorPubKey,
-        }, privKeyHex)
+        const keyNode = await makeNode('config.value', 'api_key', { key: 'api_key', value: req.body.api_key }, now)
         db.insertNode(keyNode)
         const keyLink = await createLink({
           parent_id: providerEntry.node.id, child_id: keyNode.id,

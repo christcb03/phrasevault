@@ -24,6 +24,7 @@ import {
 import {
   ForestDB, ForestWalker, PVFSVerifier, Pruner,
   registerForestRoutes, createNode, createLink,
+  deriveForestEncKey, serializePayload, defaultVisibility,
 } from "../forest/index.js";
 import type { ConfigProviderPayload } from "../forest/types.js";
 
@@ -59,14 +60,15 @@ const API_PREFIXES = [
 const identity  = await deriveIdentity(PASSPHRASE);
 const pubKeyHex = Buffer.from(identity.publicKey).toString("hex");
 const privKeyHex = await derivePrivKeyHex(PASSPHRASE);
+const forestEncKey = deriveForestEncKey(PASSPHRASE);
 
 const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
 const forestDb = new ForestDB(FOREST_DB_PATH);
 const forestWalker = new ForestWalker(forestDb);
-const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex);
-const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex);
+const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 
-await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex);
+await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 
 // ── Hypercore / relay ──────────────────────────────────────────────────────
 
@@ -130,7 +132,7 @@ app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", a
 
 // ── Forest routes (forest, config, pvfs, prune) ───────────────────────────
 
-registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex);
+registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey);
 
 // ── Static files + SPA fallback ────────────────────────────────────────────
 
@@ -371,76 +373,64 @@ async function bootstrapForest(
   walker: ForestWalker,
   authorPubKey: string,
   privKey: string,
+  encKey: Uint8Array,
 ): Promise<void> {
   if (db.getNodesByType("forest.root").length > 0) return;
 
   const now = Date.now();
 
-  const forestRoot = await createNode({
-    type: "forest.root", label: "MediaForest",
-    payload: { version: 1 }, created_at: now, author: authorPubKey,
-  }, privKey);
-  db.insertNode(forestRoot);
+  // Helper: create a node with correct visibility and payload serialization.
+  async function makeNode(type: Parameters<typeof createNode>[0]["type"], label: string, rawPayload: unknown) {
+    const vis = defaultVisibility(type)
+    const payload = serializePayload(rawPayload, vis, vis === "public" ? null : encKey)
+    return createNode({ type, label, visibility: vis, payload, created_at: now, author: authorPubKey }, privKey)
+  }
 
-  // Null-parent link marks it as the forest root.
-  const forestRootLink = await createLink({
+  const forestRoot = await makeNode("forest.root", "MediaForest", { version: 1 })
+  db.insertNode(forestRoot)
+  db.insertLink(await createLink({
     parent_id: null, child_id: forestRoot.id,
     link_type: "branch", truth_score: 1.0, sort_key: null,
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey);
-  db.insertLink(forestRootLink);
+  }, privKey))
 
-  const configRoot = await createNode({
-    type: "tree.root", label: "Configuration",
-    payload: {}, created_at: now, author: authorPubKey,
-  }, privKey);
-  db.insertNode(configRoot);
+  const configRoot = await makeNode("tree.root", "Configuration", {})
+  db.insertNode(configRoot)
   db.insertLink(await createLink({
     parent_id: forestRoot.id, child_id: configRoot.id,
     link_type: "branch", truth_score: 1.0, sort_key: "config",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey));
+  }, privKey))
 
-  const providersSection = await createNode({
-    type: "config.section", label: "Metadata Providers",
-    payload: {}, created_at: now, author: authorPubKey,
-  }, privKey);
-  db.insertNode(providersSection);
+  const providersSection = await makeNode("config.section", "Metadata Providers", {})
+  db.insertNode(providersSection)
   db.insertLink(await createLink({
     parent_id: configRoot.id, child_id: providersSection.id,
     link_type: "branch", truth_score: 1.0, sort_key: "metadata_providers",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey));
+  }, privKey))
 
-  const tmdbProvider = await createNode({
-    type: "config.provider", label: "TMDB",
-    payload: {
-      provider_id: "tmdb",
-      name: "The Movie Database (TMDB)",
-      enabled: false,
-    } satisfies ConfigProviderPayload,
-    created_at: now, author: authorPubKey,
-  }, privKey);
-  db.insertNode(tmdbProvider);
+  const tmdbProvider = await makeNode("config.provider", "TMDB", {
+    provider_id: "tmdb",
+    name: "The Movie Database (TMDB)",
+    enabled: false,
+  } satisfies ConfigProviderPayload)
+  db.insertNode(tmdbProvider)
   db.insertLink(await createLink({
     parent_id: providersSection.id, child_id: tmdbProvider.id,
     link_type: "branch", truth_score: 1.0, sort_key: "tmdb",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey));
+  }, privKey))
 
   // If legacy env var is set, migrate it into the config tree automatically.
   if (TMDB_KEY_ENV) {
-    const apiKeyNode = await createNode({
-      type: "config.value", label: "api_key",
-      payload: { key: "api_key", value: TMDB_KEY_ENV },
-      created_at: now, author: authorPubKey,
-    }, privKey);
-    db.insertNode(apiKeyNode);
+    const apiKeyNode = await makeNode("config.value", "api_key", { key: "api_key", value: TMDB_KEY_ENV })
+    db.insertNode(apiKeyNode)
     db.insertLink(await createLink({
       parent_id: tmdbProvider.id, child_id: apiKeyNode.id,
       link_type: "branch", truth_score: 1.0, sort_key: "api_key",
       score_method: null, created_at: now, author: authorPubKey,
-    }, privKey));
+    }, privKey))
   }
 }
 

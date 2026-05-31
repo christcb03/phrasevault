@@ -1,6 +1,10 @@
 // Truth Forest — core type definitions.
 // All DB access, signing, and traversal modules import from here.
 
+// ─── Visibility ───────────────────────────────────────────────────────────────
+
+export type Visibility = 'public' | 'private' | `community:${string}`
+
 // ─── Node Types ───────────────────────────────────────────────────────────────
 
 export type NodeType =
@@ -12,6 +16,8 @@ export type NodeType =
   | 'config.provider'
   | 'config.value'
   | 'config.prune_policy'
+  // Community / access control
+  | 'community'
   // Media
   | 'media.movie'
   | 'media.series'
@@ -44,15 +50,17 @@ export type LinkType =
 
 // ─── Core Structures ──────────────────────────────────────────────────────────
 
-// Immutable. ID = BLAKE3(type + label + JSON(payload) + created_at + author).
+// Immutable. ID = BLAKE3(type + label + visibility + JSON(payload) + created_at + author).
+// payload is plaintext object if visibility="public"; base64 AES-GCM ciphertext otherwise.
 export interface TruthNode {
   id:         string
   type:       NodeType
   label:      string
-  payload:    unknown
-  created_at: number    // unix ms
-  author:     string    // secp256k1 pubkey hex
-  sig:        string    // secp256k1 signature over id
+  visibility: Visibility   // 'public' | 'private' | 'community:<id>'
+  payload:    unknown      // plaintext object (public) or base64 ciphertext (private/community)
+  created_at: number       // unix ms
+  author:     string       // secp256k1 pubkey hex
+  sig:        string       // secp256k1 signature over id
 }
 
 // Content-addressed ID, but soft-delete and supersede fields are mutable.
@@ -239,6 +247,7 @@ export interface PruneResult extends PrunePreview {
 
 // ─── DB-layer input types (no sig/id required — computed at write time) ──────
 
+// NewNode: caller supplies visibility; payload must already be encrypted if private/community.
 export type NewNode = Omit<TruthNode, 'id' | 'sig'>
 
 export type NewLink = Omit<TruthLink,
