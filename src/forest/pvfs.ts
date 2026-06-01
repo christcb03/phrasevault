@@ -1,5 +1,7 @@
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
+import { copyFile, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import path from 'node:path'
 import { blake3 } from '@noble/hashes/blake3'
 import { bytesToHex } from '@noble/hashes/utils'
 import type { ForestDB } from './db.js'
@@ -7,7 +9,7 @@ import type { ForestWalker } from './walker.js'
 import { createNode, createLink } from './signer.js'
 import { serializePayload } from './cipher.js'
 import type {
-  TruthNode, PvfsFilePayload, PvfsIntegrityFailurePayload,
+  TruthNode, PvfsFilePayload, PvfsLocationPayload, PvfsIntegrityFailurePayload,
 } from './types.js'
 
 export interface VerifyResult {
@@ -30,6 +32,7 @@ export class PVFSVerifier {
     private authorPubKey: string,
     private privKeyHex: string,
     private encKey: Uint8Array,
+    private storeDir: string = '',
   ) {}
 
   // Verify a file by reading bytes from the given location and checking BLAKE3 hash.
@@ -155,27 +158,102 @@ export class PVFSVerifier {
     this.db.unsuspendLink(linkId)
   }
 
+  // ─── Ingest ──────────────────────────────────────────────────────────────────
+
+  // Copy a local file into the PVFS store, create pvfs.file + pvfs.location nodes,
+  // and optionally link the file node under a media node.
+  async ingest(
+    localPath: string,
+    opts: { mediaNodeId?: string; mimeType?: string; label?: string } = {},
+  ): Promise<{ fileNode: TruthNode; locationNode: TruthNode; contentHash: string }> {
+    if (!this.storeDir) throw new Error('storeDir not configured on PVFSVerifier')
+
+    const contentHash = await this.hashLocalFile(localPath)
+    const { size: sizeBytes } = await stat(localPath)
+    const mimeType = opts.mimeType ?? guessMime(localPath)
+    const label = opts.label ?? path.basename(localPath)
+    const now = Date.now()
+
+    // Dedup: only copy if not already in store
+    const destPath = path.join(this.storeDir, contentHash)
+    if (!existsSync(destPath)) {
+      await copyFile(localPath, destPath)
+    }
+
+    const filePayload: PvfsFilePayload = {
+      content_hash: contentHash,
+      size_bytes: sizeBytes,
+      mime_type: mimeType,
+      original_filename: path.basename(localPath),
+    }
+    const fileNode = await createNode({
+      type: 'pvfs.file',
+      label,
+      visibility: 'public',
+      payload: filePayload,
+      created_at: now,
+      author: this.authorPubKey,
+    }, this.privKeyHex)
+    this.db.insertNode(fileNode)
+
+    const locationPayload: PvfsLocationPayload = {
+      type: 'local',
+      uri: `pvfs-local:${contentHash}`,
+      peer_id: null,
+      last_verified: now,
+      last_seen: now,
+    }
+    const locationNode = await createNode({
+      type: 'pvfs.location',
+      label: `pvfs-local:${contentHash}`,
+      visibility: 'public',
+      payload: locationPayload,
+      created_at: now,
+      author: this.authorPubKey,
+    }, this.privKeyHex)
+    this.db.insertNode(locationNode)
+
+    this.db.insertLink(await createLink({
+      parent_id: fileNode.id, child_id: locationNode.id,
+      link_type: 'member', truth_score: 1.0,
+      sort_key: null, score_method: null,
+      created_at: now, author: this.authorPubKey,
+    }, this.privKeyHex))
+
+    if (opts.mediaNodeId) {
+      this.db.insertLink(await createLink({
+        parent_id: opts.mediaNodeId, child_id: fileNode.id,
+        link_type: 'file', truth_score: 1.0,
+        sort_key: null, score_method: null,
+        created_at: now, author: this.authorPubKey,
+      }, this.privKeyHex))
+    }
+
+    return { fileNode, locationNode, contentHash }
+  }
+
   // ─── Hash utilities ──────────────────────────────────────────────────────────
 
   // Hash a file at a local path or HTTP URL. Returns BLAKE3 hex.
   private async hashUri(uri: string): Promise<string> {
+    if (uri.startsWith('pvfs-local:')) {
+      if (!this.storeDir) throw new Error('storeDir not configured')
+      return this.hashLocalFile(path.join(this.storeDir, uri.slice('pvfs-local:'.length)))
+    }
     if (uri.startsWith('http://') || uri.startsWith('https://')) {
       return this.hashHttpStream(uri)
     }
     return this.hashLocalFile(uri.replace(/^file:\/\//, ''))
   }
 
-  private async hashLocalFile(path: string): Promise<string> {
+  private async hashLocalFile(filePath: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      // Node's built-in crypto doesn't support BLAKE3; use a streaming approach
-      // with @noble/hashes which provides an incremental API.
-      const stream = createReadStream(path)
-      const chunks: Buffer[] = []
-      stream.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-      stream.on('end', () => {
-        const data = Buffer.concat(chunks)
-        resolve(bytesToHex(blake3(data)))
+      const stream = createReadStream(filePath)
+      const hasher = blake3.create({})
+      stream.on('data', (chunk: Buffer | string) => {
+        hasher.update(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
       })
+      stream.on('end', () => resolve(bytesToHex(hasher.digest())))
       stream.on('error', reject)
     })
   }
@@ -186,4 +264,22 @@ export class PVFSVerifier {
     const buf = await resp.arrayBuffer()
     return bytesToHex(blake3(new Uint8Array(buf)))
   }
+}
+
+function guessMime(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase()
+  const map: Record<string, string> = {
+    '.mkv': 'video/x-matroska',
+    '.mp4': 'video/mp4',
+    '.m4v': 'video/x-m4v',
+    '.avi': 'video/x-msvideo',
+    '.mov': 'video/quicktime',
+    '.webm': 'video/webm',
+    '.ts': 'video/mp2t',
+    '.mp3': 'audio/mpeg',
+    '.flac': 'audio/flac',
+    '.aac': 'audio/aac',
+    '.m4a': 'audio/mp4',
+  }
+  return map[ext] ?? 'application/octet-stream'
 }

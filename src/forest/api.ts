@@ -1,3 +1,5 @@
+import { createReadStream, existsSync } from 'node:fs'
+import path from 'node:path'
 import type { FastifyInstance } from 'fastify'
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
@@ -5,7 +7,7 @@ import type { PVFSVerifier } from './pvfs.js'
 import type { Pruner } from './pruner.js'
 import { createNode, createLink } from './signer.js'
 import { defaultVisibility, serializePayload, deserializePayload } from './cipher.js'
-import type { NewNode, NewLink, TruthNode } from './types.js'
+import type { NewNode, NewLink, TruthNode, PvfsFilePayload } from './types.js'
 import type { Visibility } from './cipher.js'
 
 export function registerForestRoutes(
@@ -17,6 +19,7 @@ export function registerForestRoutes(
   authorPubKey: string,
   privKeyHex: string,
   encKey: Uint8Array,
+  pvfsStoreDir: string,
 ): void {
 
   // Decrypt a node's payload in API responses. Returns plaintext payload for owner.
@@ -199,7 +202,71 @@ export function registerForestRoutes(
       if (!node || node.type !== 'pvfs.file') return reply.status(404).send({ error: 'file node not found' })
       const locations = walker.children(req.params.nodeId, 'member')
         .filter(c => c.node.type === 'pvfs.location')
-      return reply.send({ node, locations: locations.map(l => l.node) })
+      const streamUrl = `${req.protocol}://${req.hostname}/pvfs/file/${req.params.nodeId}/stream`
+      return reply.send({ node, locations: locations.map(l => l.node), stream_url: streamUrl })
+    },
+  )
+
+  app.get<{ Params: { nodeId: string } }>(
+    '/pvfs/file/:nodeId/stream',
+    async (req, reply) => {
+      const node = db.getNode(req.params.nodeId)
+      if (!node || node.type !== 'pvfs.file') return reply.status(404).send({ error: 'file node not found' })
+
+      const payload = node.payload as PvfsFilePayload
+      const filePath = path.join(pvfsStoreDir, payload.content_hash)
+      if (!existsSync(filePath)) return reply.status(404).send({ error: 'file not in local store' })
+
+      const mimeType = payload.mime_type || 'application/octet-stream'
+      const totalSize = payload.size_bytes
+      const rangeHeader = req.headers['range'] as string | undefined
+
+      reply.header('Accept-Ranges', 'bytes')
+      reply.header('Content-Type', mimeType)
+
+      if (rangeHeader) {
+        const match = rangeHeader.match(/^bytes=(\d+)-(\d*)$/)
+        if (!match) return reply.status(416).send({ error: 'invalid range' })
+
+        const start = parseInt(match[1], 10)
+        const end = match[2] ? parseInt(match[2], 10) : totalSize - 1
+
+        if (start >= totalSize || end >= totalSize || start > end) {
+          reply.header('Content-Range', `bytes */${totalSize}`)
+          return reply.status(416).send({ error: 'range not satisfiable' })
+        }
+
+        reply.status(206)
+        reply.header('Content-Range', `bytes ${start}-${end}/${totalSize}`)
+        reply.header('Content-Length', end - start + 1)
+        return reply.send(createReadStream(filePath, { start, end }))
+      }
+
+      reply.header('Content-Length', totalSize)
+      return reply.send(createReadStream(filePath))
+    },
+  )
+
+  app.post<{
+    Body: { path: string; media_node_id?: string; mime_type?: string; label?: string }
+  }>(
+    '/pvfs/ingest',
+    async (req, reply) => {
+      const { path: localPath, media_node_id, mime_type, label } = req.body
+      if (!localPath) return reply.status(400).send({ error: 'path is required' })
+      if (!existsSync(localPath)) return reply.status(400).send({ error: `file not found: ${localPath}` })
+
+      try {
+        const result = await pvfs.ingest(localPath, { mediaNodeId: media_node_id, mimeType: mime_type, label })
+        const streamUrl = `${req.protocol}://${req.hostname}/pvfs/file/${result.fileNode.id}/stream`
+        return reply.status(201).send({
+          fileNodeId: result.fileNode.id,
+          contentHash: result.contentHash,
+          streamUrl,
+        })
+      } catch (err) {
+        return reply.status(500).send({ error: err instanceof Error ? err.message : 'ingest failed' })
+      }
     },
   )
 

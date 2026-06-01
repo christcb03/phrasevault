@@ -3,7 +3,7 @@ import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -63,9 +63,12 @@ const privKeyHex = await derivePrivKeyHex(PASSPHRASE);
 const forestEncKey = deriveForestEncKey(PASSPHRASE);
 
 const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
+const PVFS_STORE_DIR = path.join(DATA_DIR, "pvfs");
+mkdirSync(PVFS_STORE_DIR, { recursive: true });
+
 const forestDb = new ForestDB(FOREST_DB_PATH);
 const forestWalker = new ForestWalker(forestDb, forestEncKey);
-const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
 const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 
 await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
@@ -132,7 +135,7 @@ app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", a
 
 // ── Forest routes (forest, config, pvfs, prune) ───────────────────────────
 
-registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey);
+registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
 
 // ── Static files + SPA fallback ────────────────────────────────────────────
 
