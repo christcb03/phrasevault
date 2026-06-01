@@ -53,7 +53,10 @@ export interface HealthResponse {
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
   if (res.status === 401) throw new UnauthorizedError('session expired');
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error ?? `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 

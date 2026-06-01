@@ -35,6 +35,7 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
 
   async function handleSearch(q: string) {
     setQuery(q)
+    setError('')
     if (searchRef.current) clearTimeout(searchRef.current)
     if (!q.trim()) { setResults([]); return }
     searchRef.current = setTimeout(async () => {
@@ -43,7 +44,8 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
         const res = await api.tmdbSearch(q)
         setResults(res.results)
       } catch (e) {
-        if (e instanceof UnauthorizedError) onUnauthorized()
+        if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+        setError(e instanceof Error ? e.message : 'Search failed')
       } finally {
         setSearching(false)
       }
