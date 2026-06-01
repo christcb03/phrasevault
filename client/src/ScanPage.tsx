@@ -21,8 +21,8 @@ type JobResult = {
 }
 
 export default function ScanPage({ onClose, onUnauthorized }: Props) {
-  const [dirPath, setDirPath] = useState('/media')
-  const [limit, setLimit] = useState('500')
+  const [dirPath, setDirPath] = useState('/media/Movies')
+  const [limit, setLimit] = useState('5000')
   const [busy, setBusy] = useState(false)
   const [jobResult, setJobResult] = useState<JobResult | null>(null)
   const [isIngesting, setIsIngesting] = useState(false)
