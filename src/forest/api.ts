@@ -1,5 +1,6 @@
 import { createReadStream, existsSync } from 'node:fs'
 import path from 'node:path'
+import { scanVideoFiles } from './scan.js'
 import type { FastifyInstance } from 'fastify'
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
@@ -324,6 +325,62 @@ export function registerForestRoutes(
       db.insertLink(link)
 
       return reply.status(201).send({ node: locNode, link })
+    },
+  )
+
+  app.post<{
+    Body: {
+      path: string
+      dry_run?: boolean
+      extensions?: string[]
+      limit?: number
+    }
+  }>(
+    '/pvfs/scan',
+    async (req, reply) => {
+      const { path: dirPath, dry_run = true, extensions, limit } = req.body
+      if (!dirPath) return reply.status(400).send({ error: 'path is required' })
+      if (!existsSync(dirPath)) return reply.status(400).send({ error: `directory not found: ${dirPath}` })
+
+      const extSet = extensions
+        ? new Set(extensions.map(e => e.startsWith('.') ? e.toLowerCase() : '.' + e.toLowerCase()))
+        : undefined
+
+      let files
+      try {
+        files = scanVideoFiles(dirPath, extSet)
+      } catch (err) {
+        return reply.status(500).send({ error: err instanceof Error ? err.message : 'scan failed' })
+      }
+
+      const batch = limit ? files.slice(0, limit) : files
+
+      if (dry_run) {
+        return reply.send({ found: files.length, dry_run: true, files: batch })
+      }
+
+      // Live mode: hash + ingest each file
+      const ingested: Array<{ path: string; fileNodeId: string; contentHash: string; streamUrl: string }> = []
+      const failures: Array<{ path: string; error: string }> = []
+
+      for (const file of batch) {
+        try {
+          const result = await pvfs.ingest(file.path, { label: file.parsed.title || path.basename(file.path) })
+          const streamUrl = `${req.protocol}://${req.hostname}/pvfs/file/${result.fileNode.id}/stream`
+          ingested.push({ path: file.path, fileNodeId: result.fileNode.id, contentHash: result.contentHash, streamUrl })
+        } catch (err) {
+          failures.push({ path: file.path, error: err instanceof Error ? err.message : 'ingest failed' })
+        }
+      }
+
+      return reply.send({
+        found: files.length,
+        dry_run: false,
+        ingested: ingested.length,
+        failed: failures.length,
+        files: ingested,
+        failures,
+      })
     },
   )
 
