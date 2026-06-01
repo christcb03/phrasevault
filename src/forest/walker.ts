@@ -2,9 +2,15 @@ import type { ForestDB } from './db.js'
 import type {
   TruthNode, TruthLink, LinkedChild, WalkResult, VerificationResult,
 } from './types.js'
+import { deserializePayload, type Visibility } from './cipher.js'
 
 export class ForestWalker {
-  constructor(private db: ForestDB) {}
+  constructor(private db: ForestDB, private encKey: Uint8Array | null = null) {}
+
+  private resolvePayload<T>(node: TruthNode): T {
+    if (node.visibility === 'public') return node.payload as T
+    return deserializePayload(node.payload as string, node.visibility as Visibility, this.encKey) as T
+  }
 
   // ─── Root enumeration ───────────────────────────────────────────────────────
 
@@ -155,7 +161,7 @@ export class ForestWalker {
 
     const result: Record<string, unknown> = {}
     for (const child of this.children(sectionNode.node.id, 'branch')) {
-      const p = child.node.payload as { key?: string; value?: unknown }
+      const p = this.resolvePayload<{ key?: string; value?: unknown }>(child.node)
       if (p?.key !== undefined) result[p.key as string] = p.value ?? null
     }
     return result
@@ -173,16 +179,16 @@ export class ForestWalker {
 
     const providerNode = this.children(providerSection.node.id, 'branch')
       .find(c => c.node.type === 'config.provider' &&
-        (c.node.payload as { provider_id: string }).provider_id === providerId)
+        this.resolvePayload<{ provider_id: string }>(c.node).provider_id === providerId)
     if (!providerNode) return null
 
     const config: Record<string, unknown> = {}
     for (const val of this.children(providerNode.node.id, 'branch')) {
-      const vp = val.node.payload as { key?: string; value?: unknown }
+      const vp = this.resolvePayload<{ key?: string; value?: unknown }>(val.node)
       if (vp?.key) config[vp.key as string] = vp.value
     }
     // Include top-level provider fields
-    const pp = providerNode.node.payload as { provider_id: string; name: string; enabled: boolean }
+    const pp = this.resolvePayload<{ provider_id: string; name: string; enabled: boolean }>(providerNode.node)
     config['_provider_id'] = pp.provider_id
     config['_name'] = pp.name
     config['_enabled'] = pp.enabled

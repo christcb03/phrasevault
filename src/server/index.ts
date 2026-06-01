@@ -64,7 +64,7 @@ const forestEncKey = deriveForestEncKey(PASSPHRASE);
 
 const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
 const forestDb = new ForestDB(FOREST_DB_PATH);
-const forestWalker = new ForestWalker(forestDb);
+const forestWalker = new ForestWalker(forestDb, forestEncKey);
 const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 
