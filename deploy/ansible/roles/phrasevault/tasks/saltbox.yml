@@ -21,6 +21,7 @@
       - name: "{{ phrasevault_docker_network }}"
     volumes:
       - "{{ phrasevault_data_dir }}:/data"
+      - "/mnt/unionfs/Media:/media:ro"
     env:
       PV_PASSPHRASE: "{{ phrasevault_passphrase }}"
       PV_DATA_DIR: "/data"
