@@ -4,6 +4,7 @@ import type { MediaResult, HealthResponse, WatchStatus } from './api'
 import LoginPage from './LoginPage'
 import AddMediaModal from './AddMediaModal'
 import SettingsPage from './SettingsPage'
+import ScanPage from './ScanPage'
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY))
@@ -18,6 +19,7 @@ export default function App() {
   const [followMsg, setFollowMsg] = useState('')
   const [showAddMedia, setShowAddMedia] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [showScan, setShowScan] = useState(false)
 
   function handleLogin(newToken: string, _identity?: string) {
     sessionStorage.setItem(TOKEN_KEY, newToken)
@@ -57,6 +59,9 @@ export default function App() {
   if (!token) return <LoginPage onLogin={handleLogin} />
   if (showSettings) return (
     <SettingsPage onClose={() => setShowSettings(false)} onUnauthorized={handleUnauthorized} />
+  )
+  if (showScan) return (
+    <ScanPage onClose={() => setShowScan(false)} onUnauthorized={handleUnauthorized} />
   )
 
   async function handleFollow(e: React.FormEvent) {
@@ -100,6 +105,12 @@ export default function App() {
             className="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1.5"
           >
             + Add Media
+          </button>
+          <button
+            onClick={() => setShowScan(true)}
+            className="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1.5"
+          >
+            📂 Scan
           </button>
           <button
             onClick={() => setShowSettings(true)}

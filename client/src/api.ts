@@ -108,6 +108,34 @@ export interface ProviderConfig {
   config: Record<string, unknown>;
 }
 
+export interface ScannedFile {
+  path: string;
+  size_bytes: number;
+  ext: string;
+  parsed: {
+    title: string;
+    year: number | null;
+    kind: 'movie' | 'series' | 'unknown';
+    season: number | null;
+    episode: number | null;
+  };
+}
+
+export interface ScanResult {
+  found: number;
+  dry_run: true;
+  files: ScannedFile[];
+}
+
+export interface IngestResult {
+  found: number;
+  dry_run: false;
+  ingested: number;
+  failed: number;
+  files: Array<{ path: string; fileNodeId: string; contentHash: string; streamUrl: string }>;
+  failures: Array<{ path: string; error: string }>;
+}
+
 async function put<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'PUT',
@@ -143,4 +171,6 @@ export const api = {
   getProviders: () => get<ProviderConfig[]>('/config/providers'),
   upsertProvider: (providerId: string, body: { read_access_token?: string; enabled?: boolean; name?: string }) =>
     put<{ provider_id: string; enabled: boolean; updated: boolean }>(`/config/providers/${providerId}`, body),
+  pvfsScan: (body: { path: string; dry_run?: boolean; extensions?: string[]; limit?: number }) =>
+    post<ScanResult | IngestResult>('/pvfs/scan', body),
 };

@@ -29,19 +29,41 @@ export function parseMediaPath(filePath: string): ParsedMedia {
   const basename = path.basename(filePath, ext)
   const parentDir = path.basename(path.dirname(filePath))
 
-  // Normalize separators; keep parens for year detection
+  // ── Plex standard series: "Series Title - s01e01 - Episode Title"
+  // ── Plex multi-episode:   "Series Title - s01e01-e03 - Episode Title"
+  // Check BEFORE dot-normalization so Plex's proper-cased titles are preserved.
+  const plexSeries = basename.match(/^(.+?)\s+-\s+[Ss](\d{1,2})[Ee](\d{1,2})(?:-[Ee]\d{1,2})?(?:\s+-\s+.*)?$/)
+  if (plexSeries) {
+    return {
+      title: plexSeries[1].trim(),
+      year: null,
+      kind: 'series',
+      season: parseInt(plexSeries[2], 10),
+      episode: parseInt(plexSeries[3], 10),
+    }
+  }
+
+  // ── Plex daily: "Series Title - 2013-10-30 - Episode Title"
+  const plexDaily = basename.match(/^(.+?)\s+-\s+(\d{4})-\d{2}-\d{2}(?:\s+-\s+.*)?$/)
+  if (plexDaily) {
+    return {
+      title: plexDaily[1].trim(),
+      year: parseInt(plexDaily[2], 10),
+      kind: 'series',
+      season: null,
+      episode: null,
+    }
+  }
+
+  // ── Normalize separators for non-Plex files (dots/underscores → spaces)
   let name = basename.replace(/[._]+/g, ' ').trim()
 
-  // TV: SxxExx anywhere in name
+  // ── Generic SxxExx (e.g. dot-separated: Show.Name.S01E01.mkv)
   const tvMatch = name.match(/^(.*?)\s*[Ss](\d{1,2})[Ee](\d{1,2})/i)
   if (tvMatch) {
-    let rawTitle = tvMatch[1].trim()
-    // If the filename starts with SxxExx the title is in the parent dir
+    let rawTitle = tvMatch[1].replace(/[-\s]+$/, '').trim()
     if (!rawTitle) {
-      rawTitle = parentDir
-        .replace(/[._]+/g, ' ')
-        .replace(/\bSeason\s*\d+\b/i, '')
-        .trim()
+      rawTitle = parentDir.replace(/[._]+/g, ' ').replace(/\bSeason\s*\d+\b/i, '').trim()
     }
     return {
       title: cleanTitle(rawTitle) || rawTitle || basename,
@@ -52,7 +74,7 @@ export function parseMediaPath(filePath: string): ParsedMedia {
     }
   }
 
-  // Year in parens: "Title (2019)"
+  // ── Movie: year in parens — Plex standard "Movie Title (Year)"
   let year: number | null = null
   let titlePart = name
 
@@ -61,7 +83,6 @@ export function parseMediaPath(filePath: string): ParsedMedia {
     year = parseInt(parenYear[1], 10)
     titlePart = name.slice(0, parenYear.index!).trim()
   } else {
-    // Bare year surrounded by word boundaries
     const bareYear = name.match(/(?<!\d)((19|20)\d{2})(?!\d)/)
     if (bareYear) {
       year = parseInt(bareYear[1], 10)
@@ -69,10 +90,8 @@ export function parseMediaPath(filePath: string): ParsedMedia {
     }
   }
 
-  const title = cleanTitle(titlePart) || cleanTitle(name) || basename
-
   return {
-    title,
+    title: cleanTitle(titlePart) || cleanTitle(name) || basename,
     year,
     kind: year ? 'movie' : 'unknown',
     season: null,
