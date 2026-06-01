@@ -303,10 +303,10 @@ export function registerForestRoutes(
     return reply.send(providers)
   })
 
-  // Upsert a provider's config (api_key, enabled). Creates the provider node if needed.
+  // Upsert a provider's config (read_access_token, enabled). Creates the provider node if needed.
   app.put<{
     Params: { providerId: string }
-    Body: { api_key?: string; enabled?: boolean; name?: string }
+    Body: { read_access_token?: string; api_key?: string; enabled?: boolean; name?: string }
   }>(
     '/config/providers/:providerId',
     async (req, reply) => {
@@ -362,16 +362,18 @@ export function registerForestRoutes(
 
       if (!providerEntry) return reply.status(500).send({ error: 'provider entry not found after upsert' })
 
-      // Upsert api_key config.value if provided.
-      if (req.body.api_key !== undefined) {
+      // Upsert read_access_token config.value if provided (also accepts legacy api_key field).
+      const tokenValue = req.body.read_access_token ?? req.body.api_key
+      if (tokenValue !== undefined) {
         const existingKey = walker.children(providerEntry.node.id, 'branch')
-          .find(c => c.node.type === 'config.value' && resolvePayload<{ key: string }>(c.node).key === 'api_key')
+          .find(c => c.node.type === 'config.value' &&
+            ['read_access_token', 'api_key'].includes(resolvePayload<{ key: string }>(c.node).key as string))
 
-        const keyNode = await makeNode('config.value', 'api_key', { key: 'api_key', value: req.body.api_key }, now)
+        const keyNode = await makeNode('config.value', 'read_access_token', { key: 'read_access_token', value: tokenValue }, now)
         db.insertNode(keyNode)
         const keyLink = await createLink({
           parent_id: providerEntry.node.id, child_id: keyNode.id,
-          link_type: 'branch', truth_score: 1.0, sort_key: 'api_key',
+          link_type: 'branch', truth_score: 1.0, sort_key: 'read_access_token',
           score_method: null, created_at: now, author: authorPubKey,
         }, privKeyHex)
         db.insertLink(keyLink)
