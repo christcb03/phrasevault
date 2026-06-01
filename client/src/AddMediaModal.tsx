@@ -10,7 +10,7 @@ interface Props {
   onUnauthorized: () => void
 }
 
-type Step = 'search' | 'details'
+type Step = 'search' | 'pick' | 'storage'
 
 export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Props) {
   const [step, setStep] = useState<Step>('search')
@@ -31,7 +31,7 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
   const [codecVideo, setCodecVideo] = useState('h264')
   const [codecAudio, setCodecAudio] = useState('aac')
   const [contentHash, setContentHash] = useState('')
-  const [addToWatchlist, setAddToWatchlist] = useState(false)
+  const [alsoWatchlist, setAlsoWatchlist] = useState(true)
 
   async function handleSearch(q: string) {
     setQuery(q)
@@ -58,7 +58,7 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
     try {
       const d = await api.tmdbDetails(r.tmdb_id, r.media_type)
       setSelected(d)
-      setStep('details')
+      setStep('pick')
     } catch (e) {
       if (e instanceof UnauthorizedError) { onUnauthorized(); return }
       setError('Failed to load details from TMDB.')
@@ -67,7 +67,34 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
     }
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleAddToWatchlist() {
+    if (!selected) return
+    setError('')
+    setSubmitting(true)
+    try {
+      const kind = selected.media_type === 'tv' ? 'series' : 'movie'
+      const mediaRes = await api.addMedia({
+        title: selected.title,
+        year: parseInt(selected.year) || 0,
+        kind,
+        tmdb_id: selected.tmdb_id,
+        imdb_id: selected.imdb_id,
+        tvdb_id: selected.tvdb_id,
+        genres: selected.genres,
+        duration_ms: selected.runtime_min ? selected.runtime_min * 60 * 1000 : undefined,
+      })
+      await api.updateWatchlist(mediaRes.id, 'unwatched')
+      onAdded()
+      onClose()
+    } catch (e) {
+      if (e instanceof UnauthorizedError) { onUnauthorized(); return }
+      setError(e instanceof Error ? e.message : 'Error adding to watchlist')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function handleAddToLibrary(e: React.FormEvent) {
     e.preventDefault()
     if (!selected) return
     setError('')
@@ -95,7 +122,7 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
         codec_audio: codecAudio || undefined,
         available: true,
       })
-      if (addToWatchlist) {
+      if (alsoWatchlist) {
         await api.updateWatchlist(mediaRes.id, 'unwatched')
       }
       onAdded()
@@ -108,6 +135,10 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
     }
   }
 
+  const titleText = step === 'search' ? 'Add Media — Search TMDB'
+    : step === 'pick' ? selected?.title ?? ''
+    : `Add to Library — ${selected?.title}`
+
   return (
     <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50 p-6" onClick={onClose}>
       <div
@@ -115,12 +146,11 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-gray-800">
-          <h2 className="text-base font-semibold text-white">
-            {step === 'search' ? 'Add Media — Search TMDB' : `Add "${selected?.title}"`}
-          </h2>
-          <button onClick={onClose} className="text-gray-500 hover:text-white text-xl leading-none">×</button>
+          <h2 className="text-base font-semibold text-white truncate pr-4">{titleText}</h2>
+          <button onClick={onClose} className="text-gray-500 hover:text-white text-xl leading-none shrink-0">×</button>
         </div>
 
+        {/* ── Step 1: Search ── */}
         {step === 'search' && (
           <div className="p-6">
             <input
@@ -143,11 +173,7 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
                   className="flex items-center gap-3 w-full bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-indigo-600 rounded-lg px-3 py-2.5 text-left transition-colors disabled:opacity-50"
                 >
                   {r.poster_path ? (
-                    <img
-                      src={`${POSTER_BASE}${r.poster_path}`}
-                      alt=""
-                      className="w-8 h-12 object-cover rounded shrink-0"
-                    />
+                    <img src={`${POSTER_BASE}${r.poster_path}`} alt="" className="w-8 h-12 object-cover rounded shrink-0" />
                   ) : (
                     <div className="w-8 h-12 bg-gray-700 rounded shrink-0 flex items-center justify-center text-gray-600 text-xs">?</div>
                   )}
@@ -162,15 +188,12 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
           </div>
         )}
 
-        {step === 'details' && selected && (
-          <form onSubmit={handleSubmit} className="p-6 space-y-4">
-            <div className="flex gap-3 items-start mb-2">
+        {/* ── Step 2: Pick action ── */}
+        {step === 'pick' && selected && (
+          <div className="p-6">
+            <div className="flex gap-3 items-start mb-6">
               {selected.poster_path && (
-                <img
-                  src={`${POSTER_BASE}${selected.poster_path}`}
-                  alt=""
-                  className="w-12 h-18 object-cover rounded shrink-0"
-                />
+                <img src={`${POSTER_BASE}${selected.poster_path}`} alt="" className="w-14 rounded shrink-0" />
               )}
               <div>
                 <div className="font-medium text-white">{selected.title}</div>
@@ -178,137 +201,128 @@ export default function AddMediaModal({ onClose, onAdded, onUnauthorized }: Prop
                   {selected.year} · {selected.media_type === 'tv' ? 'TV Series' : 'Movie'}
                   {selected.genres?.length ? ' · ' + selected.genres.slice(0, 3).join(', ') : ''}
                 </div>
-                {selected.imdb_id && (
-                  <div className="text-xs text-gray-600 mt-0.5">IMDb: {selected.imdb_id}</div>
-                )}
+                {selected.imdb_id && <div className="text-xs text-gray-600 mt-0.5">IMDb: {selected.imdb_id}</div>}
               </div>
             </div>
 
-            <div className="border-t border-gray-800 pt-4">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Storage details</p>
-              <div className="space-y-3">
+            <div className="space-y-3">
+              <button
+                onClick={handleAddToWatchlist}
+                disabled={submitting}
+                className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm text-white rounded-lg px-4 py-3 font-medium text-left flex items-center gap-3"
+              >
+                <span className="text-lg">📋</span>
+                <div>
+                  <div className="font-medium">Add to Watchlist</div>
+                  <div className="text-xs text-indigo-300 font-normal">Track it — no file needed</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => setStep('storage')}
+                disabled={submitting}
+                className="w-full bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-sm text-white rounded-lg px-4 py-3 font-medium text-left flex items-center gap-3 border border-gray-700"
+              >
+                <span className="text-lg">📁</span>
+                <div>
+                  <div className="font-medium">Add to Library</div>
+                  <div className="text-xs text-gray-400 font-normal">I have a file / stream URL for this</div>
+                </div>
+              </button>
+            </div>
+
+            {error && <p className="text-red-400 text-xs mt-3">{error}</p>}
+
+            <button
+              onClick={() => setStep('search')}
+              className="mt-4 text-xs text-gray-500 hover:text-gray-300"
+            >
+              ← Back to search
+            </button>
+          </div>
+        )}
+
+        {/* ── Step 3: Storage details ── */}
+        {step === 'storage' && selected && (
+          <form onSubmit={handleAddToLibrary} className="p-6 space-y-4">
+            <div className="space-y-3">
+              <label className="block">
+                <span className="text-xs text-gray-400">Stream URL *</span>
+                <input
+                  required
+                  autoFocus
+                  value={endpointUrl}
+                  onChange={e => setEndpointUrl(e.target.value)}
+                  placeholder="https://…"
+                  className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+
+              <div className="grid grid-cols-2 gap-3">
                 <label className="block">
-                  <span className="text-xs text-gray-400">Stream URL *</span>
-                  <input
-                    required
-                    value={endpointUrl}
-                    onChange={e => setEndpointUrl(e.target.value)}
-                    placeholder="https://…"
-                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
-                  />
+                  <span className="text-xs text-gray-400">Quality</span>
+                  <select value={encoding} onChange={e => setEncoding(e.target.value)}
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none">
+                    <option>4K HDR</option><option>4K SDR</option><option>1080p</option><option>720p</option><option>480p</option>
+                  </select>
                 </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">Container</span>
+                  <select value={container} onChange={e => setContainer(e.target.value)}
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none">
+                    <option>mkv</option><option>mp4</option><option>m4v</option><option>avi</option>
+                  </select>
+                </label>
+              </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="block">
-                    <span className="text-xs text-gray-400">Quality</span>
-                    <select
-                      value={encoding}
-                      onChange={e => setEncoding(e.target.value)}
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none"
-                    >
-                      <option>4K HDR</option>
-                      <option>4K SDR</option>
-                      <option>1080p</option>
-                      <option>720p</option>
-                      <option>480p</option>
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-400">Container</span>
-                    <select
-                      value={container}
-                      onChange={e => setContainer(e.target.value)}
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none"
-                    >
-                      <option>mkv</option>
-                      <option>mp4</option>
-                      <option>m4v</option>
-                      <option>avi</option>
-                    </select>
-                  </label>
-                </div>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-xs text-gray-400">Video codec</span>
+                  <select value={codecVideo} onChange={e => setCodecVideo(e.target.value)}
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none">
+                    <option>h264</option><option>h265</option><option>av1</option><option>vp9</option>
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">Audio codec</span>
+                  <select value={codecAudio} onChange={e => setCodecAudio(e.target.value)}
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none">
+                    <option>aac</option><option>ac3</option><option>eac3</option><option>truehd</option><option>dts</option>
+                  </select>
+                </label>
+              </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="block">
-                    <span className="text-xs text-gray-400">Video codec</span>
-                    <select
-                      value={codecVideo}
-                      onChange={e => setCodecVideo(e.target.value)}
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none"
-                    >
-                      <option>h264</option>
-                      <option>h265</option>
-                      <option>av1</option>
-                      <option>vp9</option>
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-400">Audio codec</span>
-                    <select
-                      value={codecAudio}
-                      onChange={e => setCodecAudio(e.target.value)}
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none"
-                    >
-                      <option>aac</option>
-                      <option>ac3</option>
-                      <option>eac3</option>
-                      <option>truehd</option>
-                      <option>dts</option>
-                    </select>
-                  </label>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="block">
-                    <span className="text-xs text-gray-400">File size (GB)</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.1"
-                      value={sizeGb}
-                      onChange={e => setSizeGb(e.target.value)}
-                      placeholder="e.g. 8.5"
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-400">BLAKE3 hash (optional)</span>
-                    <input
-                      value={contentHash}
-                      onChange={e => setContentHash(e.target.value)}
-                      placeholder="leave blank to skip"
-                      className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
-                    />
-                  </label>
-                </div>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-xs text-gray-400">File size (GB)</span>
+                  <input type="number" min="0" step="0.1" value={sizeGb} onChange={e => setSizeGb(e.target.value)}
+                    placeholder="e.g. 8.5"
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500" />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">BLAKE3 hash (optional)</span>
+                  <input value={contentHash} onChange={e => setContentHash(e.target.value)}
+                    placeholder="leave blank to skip"
+                    className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500" />
+                </label>
               </div>
             </div>
 
-            <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer pt-1">
-              <input
-                type="checkbox"
-                checked={addToWatchlist}
-                onChange={e => setAddToWatchlist(e.target.checked)}
-                className="accent-indigo-500"
-              />
-              Add to watchlist (unwatched)
+            <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
+              <input type="checkbox" checked={alsoWatchlist} onChange={e => setAlsoWatchlist(e.target.checked)}
+                className="accent-indigo-500" />
+              Also add to watchlist
             </label>
 
             {error && <p className="text-red-400 text-xs">{error}</p>}
 
             <div className="flex gap-3 pt-2">
-              <button
-                type="button"
-                onClick={() => setStep('search')}
-                className="text-sm text-gray-400 hover:text-white px-4 py-2 rounded border border-gray-700 hover:border-gray-500"
-              >
+              <button type="button" onClick={() => setStep('pick')}
+                className="text-sm text-gray-400 hover:text-white px-4 py-2 rounded border border-gray-700 hover:border-gray-500">
                 ← Back
               </button>
-              <button
-                type="submit"
-                disabled={submitting || !endpointUrl}
-                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm text-white rounded px-4 py-2 font-medium"
-              >
+              <button type="submit" disabled={submitting || !endpointUrl}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm text-white rounded px-4 py-2 font-medium">
                 {submitting ? 'Adding…' : 'Add to Library'}
               </button>
             </div>
