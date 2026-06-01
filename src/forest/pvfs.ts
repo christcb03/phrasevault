@@ -1,5 +1,5 @@
 import { createReadStream, existsSync } from 'node:fs'
-import { copyFile, stat } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { blake3 } from '@noble/hashes/blake3'
@@ -160,25 +160,20 @@ export class PVFSVerifier {
 
   // ─── Ingest ──────────────────────────────────────────────────────────────────
 
-  // Copy a local file into the PVFS store, create pvfs.file + pvfs.location nodes,
-  // and optionally link the file node under a media node.
+  // Record a pointer to a local file — creates pvfs.file + pvfs.location nodes
+  // pointing to the file's existing path. No copying. Hashing is opt-in only
+  // (skip for large NAS libraries — 100TB+ would take days to hash up front).
   async ingest(
     localPath: string,
-    opts: { mediaNodeId?: string; mimeType?: string; label?: string } = {},
+    opts: { mediaNodeId?: string; mimeType?: string; label?: string; computeHash?: boolean } = {},
   ): Promise<{ fileNode: TruthNode; locationNode: TruthNode; contentHash: string }> {
-    if (!this.storeDir) throw new Error('storeDir not configured on PVFSVerifier')
-
-    const contentHash = await this.hashLocalFile(localPath)
     const { size: sizeBytes } = await stat(localPath)
     const mimeType = opts.mimeType ?? guessMime(localPath)
     const label = opts.label ?? path.basename(localPath)
     const now = Date.now()
 
-    // Dedup: only copy if not already in store
-    const destPath = path.join(this.storeDir, contentHash)
-    if (!existsSync(destPath)) {
-      await copyFile(localPath, destPath)
-    }
+    // Hash only when explicitly requested — default is to skip for NAS files
+    const contentHash = opts.computeHash ? await this.hashLocalFile(localPath) : ''
 
     const filePayload: PvfsFilePayload = {
       content_hash: contentHash,
@@ -196,16 +191,18 @@ export class PVFSVerifier {
     }, this.privKeyHex)
     this.db.insertNode(fileNode)
 
+    // URI points to the file's real location — no copy needed
+    const uri = `file://${localPath}`
     const locationPayload: PvfsLocationPayload = {
       type: 'local',
-      uri: `pvfs-local:${contentHash}`,
+      uri,
       peer_id: null,
-      last_verified: now,
+      last_verified: opts.computeHash ? now : null,
       last_seen: now,
     }
     const locationNode = await createNode({
       type: 'pvfs.location',
-      label: `pvfs-local:${contentHash}`,
+      label: uri,
       visibility: 'public',
       payload: locationPayload,
       created_at: now,
@@ -240,10 +237,13 @@ export class PVFSVerifier {
       if (!this.storeDir) throw new Error('storeDir not configured')
       return this.hashLocalFile(path.join(this.storeDir, uri.slice('pvfs-local:'.length)))
     }
+    if (uri.startsWith('file://')) {
+      return this.hashLocalFile(uri.slice('file://'.length))
+    }
     if (uri.startsWith('http://') || uri.startsWith('https://')) {
       return this.hashHttpStream(uri)
     }
-    return this.hashLocalFile(uri.replace(/^file:\/\//, ''))
+    return this.hashLocalFile(uri)
   }
 
   private async hashLocalFile(filePath: string): Promise<string> {

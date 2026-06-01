@@ -216,8 +216,23 @@ export function registerForestRoutes(
       if (!node || node.type !== 'pvfs.file') return reply.status(404).send({ error: 'file node not found' })
 
       const payload = node.payload as PvfsFilePayload
-      const filePath = path.join(pvfsStoreDir, payload.content_hash)
-      if (!existsSync(filePath)) return reply.status(404).send({ error: 'file not in local store' })
+
+      // Resolve the best local file path from pvfs.location nodes.
+      // Supports: file:///path (NAS pointer) and pvfs-local:<hash> (copied to store).
+      const locations = walker.children(req.params.nodeId, 'member')
+        .filter(c => c.node.type === 'pvfs.location')
+      const locPayload = locations.map(l => l.node.payload as import('./types.js').PvfsLocationPayload)
+        .find(p => p.type === 'local')
+
+      let filePath: string | null = null
+      if (locPayload) {
+        if (locPayload.uri.startsWith('file://')) {
+          filePath = locPayload.uri.slice('file://'.length)
+        } else if (locPayload.uri.startsWith('pvfs-local:')) {
+          filePath = path.join(pvfsStoreDir, locPayload.uri.slice('pvfs-local:'.length))
+        }
+      }
+      if (!filePath || !existsSync(filePath)) return reply.status(404).send({ error: 'file not found at stored location' })
 
       const mimeType = payload.mime_type || 'application/octet-stream'
       const totalSize = payload.size_bytes
