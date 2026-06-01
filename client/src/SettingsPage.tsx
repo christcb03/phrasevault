@@ -127,6 +127,7 @@ function ProviderCard({
   onEnabledChange: (v: boolean) => void
   onSave: () => void
 }) {
+  const [showToken, setShowToken] = useState(false)
   const providerMeta: Record<string, { description: string; docsUrl: string }> = {
     tmdb: {
       description: 'Movie & TV metadata, posters, and external IDs.',
@@ -168,13 +169,24 @@ function ProviderCard({
             </a>
           )}
         </label>
-        <input
-          type="password"
-          value={apiKey}
-          onChange={e => onApiKeyChange(e.target.value)}
-          placeholder="Paste your Read Access Token…"
-          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 font-mono"
-        />
+        <div className="relative">
+          <input
+            type={showToken ? 'text' : 'password'}
+            value={apiKey}
+            onChange={e => onApiKeyChange(e.target.value)}
+            placeholder="Paste your Read Access Token…"
+            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 pr-16 text-sm focus:outline-none focus:border-indigo-500 font-mono"
+          />
+          {apiKey && (
+            <button
+              type="button"
+              onClick={() => setShowToken(v => !v)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-500 hover:text-gray-300 px-1.5 py-0.5 rounded"
+            >
+              {showToken ? 'Hide' : 'Show'}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center gap-3 mt-4">

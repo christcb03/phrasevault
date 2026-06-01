@@ -108,8 +108,8 @@ export default function App() {
           >
             ⚙
           </button>
-          <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-1">
-            Lock
+          <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-gray-300 ml-1" title="Lock session">
+            🔒
           </button>
         </div>
       </header>
