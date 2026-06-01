@@ -172,5 +172,7 @@ export const api = {
   upsertProvider: (providerId: string, body: { read_access_token?: string; enabled?: boolean; name?: string }) =>
     put<{ provider_id: string; enabled: boolean; updated: boolean }>(`/config/providers/${providerId}`, body),
   pvfsScan: (body: { path: string; dry_run?: boolean; extensions?: string[]; limit?: number }) =>
-    post<ScanResult | IngestResult>('/pvfs/scan', body),
+    post<{ jobId: string }>('/pvfs/scan', body),
+  pvfsScanJob: (jobId: string) =>
+    get<{ status: 'running' | 'done' | 'error'; found: number; dry_run: boolean; files: ScannedFile[]; ingested?: number; failed?: number; failures?: Array<{ path: string; error: string }>; error?: string }>(`/pvfs/scan/job/${jobId}`),
 };

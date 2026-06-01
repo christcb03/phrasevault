@@ -1,6 +1,6 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { api, UnauthorizedError } from './api'
-import type { ScannedFile, ScanResult, IngestResult } from './api'
+import type { ScannedFile } from './api'
 
 interface Props {
   onClose: () => void
@@ -9,59 +9,96 @@ interface Props {
 
 type FilterKind = 'all' | 'movie' | 'series' | 'unknown'
 
+type JobResult = {
+  status: 'running' | 'done' | 'error'
+  found: number
+  dry_run: boolean
+  files: ScannedFile[]
+  ingested?: number
+  failed?: number
+  failures?: Array<{ path: string; error: string }>
+  error?: string
+}
+
 export default function ScanPage({ onClose, onUnauthorized }: Props) {
   const [dirPath, setDirPath] = useState('/media')
   const [limit, setLimit] = useState('500')
-  const [scanning, setScanning] = useState(false)
-  const [ingesting, setIngesting] = useState(false)
-  const [scanResult, setScanResult] = useState<ScanResult | null>(null)
-  const [ingestResult, setIngestResult] = useState<IngestResult | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [jobResult, setJobResult] = useState<JobResult | null>(null)
+  const [isIngesting, setIsIngesting] = useState(false)
   const [filterKind, setFilterKind] = useState<FilterKind>('all')
   const [filterQuery, setFilterQuery] = useState('')
   const [error, setError] = useState('')
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
+
+  function startPolling(jobId: string, onDone: (result: JobResult) => void) {
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await api.pvfsScanJob(jobId)
+        if (res.status !== 'running') {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          onDone(res as JobResult)
+        } else {
+          setJobResult(res as JobResult)
+        }
+      } catch (e) {
+        clearInterval(pollRef.current!)
+        pollRef.current = null
+        if (e instanceof UnauthorizedError) onUnauthorized()
+        else setError(e instanceof Error ? e.message : 'Poll failed')
+        setBusy(false)
+        setIsIngesting(false)
+      }
+    }, 2000)
+  }
 
   async function handleScan() {
     setError('')
-    setIngestResult(null)
-    setScanResult(null)
-    setScanning(true)
+    setJobResult(null)
+    setBusy(true)
     try {
-      const res = await api.pvfsScan({
-        path: dirPath,
-        dry_run: true,
-        limit: parseInt(limit) || undefined,
+      const { jobId } = await api.pvfsScan({ path: dirPath, dry_run: true, limit: parseInt(limit) || undefined })
+      startPolling(jobId, result => {
+        setBusy(false)
+        if (result.status === 'error') setError(result.error ?? 'Scan failed')
+        else setJobResult(result)
       })
-      setScanResult(res as ScanResult)
     } catch (e) {
+      setBusy(false)
       if (e instanceof UnauthorizedError) { onUnauthorized(); return }
       setError(e instanceof Error ? e.message : 'Scan failed')
-    } finally {
-      setScanning(false)
     }
   }
 
   async function handleIngest() {
-    if (!scanResult) return
     setError('')
-    setIngesting(true)
+    setIsIngesting(true)
+    setBusy(true)
     try {
-      const res = await api.pvfsScan({
-        path: dirPath,
-        dry_run: false,
-        limit: parseInt(limit) || undefined,
+      const { jobId } = await api.pvfsScan({ path: dirPath, dry_run: false, limit: parseInt(limit) || undefined })
+      startPolling(jobId, result => {
+        setBusy(false)
+        setIsIngesting(false)
+        if (result.status === 'error') setError(result.error ?? 'Ingest failed')
+        else setJobResult(result)
       })
-      setIngestResult(res as IngestResult)
     } catch (e) {
+      setBusy(false)
+      setIsIngesting(false)
       if (e instanceof UnauthorizedError) { onUnauthorized(); return }
       setError(e instanceof Error ? e.message : 'Ingest failed')
-    } finally {
-      setIngesting(false)
     }
   }
 
+  const isDryRunDone = jobResult?.status === 'done' && jobResult.dry_run
+  const isIngestDone = jobResult?.status === 'done' && !jobResult.dry_run
+
   const counts = useMemo(() => {
-    if (!scanResult) return { movies: 0, series: 0, unknown: 0 }
-    return scanResult.files.reduce(
+    if (!isDryRunDone || !jobResult) return { movies: 0, series: 0, unknown: 0 }
+    return jobResult.files.reduce(
       (acc, f) => {
         if (f.parsed.kind === 'movie') acc.movies++
         else if (f.parsed.kind === 'series') acc.series++
@@ -70,27 +107,32 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
       },
       { movies: 0, series: 0, unknown: 0 },
     )
-  }, [scanResult])
+  }, [jobResult, isDryRunDone])
 
   const filtered = useMemo(() => {
-    if (!scanResult) return []
+    if (!isDryRunDone || !jobResult) return []
     const q = filterQuery.toLowerCase()
-    return scanResult.files.filter(f => {
+    return jobResult.files.filter(f => {
       if (filterKind !== 'all' && f.parsed.kind !== filterKind) return false
       if (q && !f.parsed.title.toLowerCase().includes(q)) return false
       return true
     })
-  }, [scanResult, filterKind, filterQuery])
+  }, [jobResult, isDryRunDone, filterKind, filterQuery])
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
       <header className="border-b border-gray-800 px-6 py-4 flex items-center gap-4">
         <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-sm">← Back</button>
         <h1 className="text-base font-semibold text-white">Library Scan</h1>
-        {scanResult && !ingestResult && (
+        {busy && jobResult && (
+          <span className="text-xs text-gray-500 ml-2 animate-pulse">
+            {isIngesting ? 'Ingesting' : 'Scanning'} — {jobResult.found} found…
+          </span>
+        )}
+        {isDryRunDone && (
           <span className="text-xs text-gray-500 ml-2">
-            {scanResult.found} files found
-            {scanResult.found > filtered.length ? ` · ${filtered.length} shown` : ''}
+            {jobResult!.found} files
+            {jobResult!.found > filtered.length ? ` · ${filtered.length} shown` : ''}
           </span>
         )}
       </header>
@@ -101,7 +143,7 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
           <input
             value={dirPath}
             onChange={e => setDirPath(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleScan()}
+            onKeyDown={e => e.key === 'Enter' && !busy && handleScan()}
             placeholder="/media"
             className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500 font-mono"
           />
@@ -115,33 +157,43 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
           />
           <button
             onClick={handleScan}
-            disabled={scanning || ingesting || !dirPath}
+            disabled={busy || !dirPath}
             className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm text-white rounded-lg px-5 py-2.5 font-medium"
           >
-            {scanning ? 'Scanning…' : 'Scan'}
+            {busy && !isIngesting ? 'Scanning…' : 'Scan'}
           </button>
         </div>
 
         {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
 
-        {/* Scan results */}
-        {scanResult && !ingestResult && (
+        {/* Scanning progress */}
+        {busy && !isIngesting && (
+          <div className="text-center text-gray-500 py-12 text-sm animate-pulse">
+            Scanning {dirPath}…{jobResult ? ` (${jobResult.found} files found so far)` : ''}
+          </div>
+        )}
+        {busy && isIngesting && (
+          <div className="text-center text-gray-500 py-12 text-sm animate-pulse">
+            Ingesting… {jobResult ? `${jobResult.found} done` : ''}
+          </div>
+        )}
+
+        {/* Dry scan results */}
+        {isDryRunDone && jobResult && (
           <>
             <div className="flex items-center gap-4 mb-4 flex-wrap">
               <div className="flex gap-3 text-sm">
                 <span className="text-blue-400 font-medium">{counts.movies} movies</span>
                 <span className="text-purple-400 font-medium">{counts.series} TV</span>
-                {counts.unknown > 0 && (
-                  <span className="text-gray-500">{counts.unknown} unknown</span>
-                )}
+                {counts.unknown > 0 && <span className="text-gray-500">{counts.unknown} unknown</span>}
               </div>
               <div className="ml-auto">
                 <button
                   onClick={handleIngest}
-                  disabled={ingesting || scanResult.found === 0}
+                  disabled={busy || jobResult.found === 0}
                   className="bg-green-700 hover:bg-green-600 disabled:opacity-50 text-sm text-white rounded-lg px-4 py-2 font-medium"
                 >
-                  {ingesting ? 'Ingesting…' : `Ingest All (${scanResult.found})`}
+                  Ingest All ({jobResult.found})
                 </button>
               </div>
             </div>
@@ -156,7 +208,7 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
                       filterKind === k ? 'bg-gray-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'
                     }`}
                   >
-                    {k === 'all' ? `All (${scanResult.found})` : k === 'movie' ? `Movies (${counts.movies})` : k === 'series' ? `TV (${counts.series})` : `Unknown (${counts.unknown})`}
+                    {k === 'all' ? `All (${jobResult.found})` : k === 'movie' ? `Movies (${counts.movies})` : k === 'series' ? `TV (${counts.series})` : `Unknown (${counts.unknown})`}
                   </button>
                 ))}
               </div>
@@ -169,9 +221,7 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
             </div>
 
             <div className="space-y-0.5">
-              {filtered.map((f, i) => (
-                <FileRow key={i} file={f} />
-              ))}
+              {filtered.map((f, i) => <FileRow key={i} file={f} />)}
               {filtered.length === 0 && (
                 <div className="text-center text-gray-600 py-12 text-sm">No files match filter</div>
               )}
@@ -180,29 +230,28 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
         )}
 
         {/* Ingest results */}
-        {ingestResult && (
+        {isIngestDone && jobResult && (
           <div className="space-y-4">
             <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
               <div className="text-base font-semibold text-white mb-3">Ingestion complete</div>
               <div className="flex gap-6 text-sm">
                 <div>
-                  <span className="text-2xl font-bold text-green-400">{ingestResult.ingested}</span>
+                  <span className="text-2xl font-bold text-green-400">{jobResult.ingested}</span>
                   <span className="text-gray-500 ml-2">ingested</span>
                 </div>
-                {ingestResult.failed > 0 && (
+                {(jobResult.failed ?? 0) > 0 && (
                   <div>
-                    <span className="text-2xl font-bold text-red-400">{ingestResult.failed}</span>
+                    <span className="text-2xl font-bold text-red-400">{jobResult.failed}</span>
                     <span className="text-gray-500 ml-2">failed</span>
                   </div>
                 )}
               </div>
             </div>
-
-            {ingestResult.failures?.length > 0 && (
+            {jobResult.failures && jobResult.failures.length > 0 && (
               <div>
                 <p className="text-xs text-gray-500 font-semibold uppercase tracking-wider mb-2">Failures</p>
                 <div className="space-y-1">
-                  {ingestResult.failures.map((f, i) => (
+                  {jobResult.failures.map((f, i) => (
                     <div key={i} className="bg-gray-900 border border-red-900/50 rounded px-3 py-2">
                       <div className="text-xs text-gray-400 font-mono truncate">{f.path}</div>
                       <div className="text-xs text-red-400 mt-0.5">{f.error}</div>
@@ -211,9 +260,8 @@ export default function ScanPage({ onClose, onUnauthorized }: Props) {
                 </div>
               </div>
             )}
-
             <button
-              onClick={() => { setIngestResult(null); setScanResult(null) }}
+              onClick={() => setJobResult(null)}
               className="text-sm text-indigo-400 hover:text-indigo-300"
             >
               ← Scan another directory

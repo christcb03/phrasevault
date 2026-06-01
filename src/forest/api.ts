@@ -1,6 +1,7 @@
 import { createReadStream, existsSync } from 'node:fs'
 import path from 'node:path'
-import { scanVideoFiles } from './scan.js'
+import { scanVideoFilesAsync } from './scan.js'
+import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
@@ -328,13 +329,29 @@ export function registerForestRoutes(
     },
   )
 
-  app.post<{
-    Body: {
-      path: string
-      dry_run?: boolean
-      extensions?: string[]
-      limit?: number
+  // Background scan jobs — keyed by UUID, cleaned up after 2h
+  interface ScanJob {
+    status: 'running' | 'done' | 'error'
+    startedAt: number
+    dry_run: boolean
+    found: number
+    files: unknown[]
+    ingested?: number
+    failed?: number
+    failures?: Array<{ path: string; error: string }>
+    error?: string
+  }
+  const scanJobs = new Map<string, ScanJob>()
+
+  function cleanOldJobs() {
+    const cutoff = Date.now() - 2 * 60 * 60 * 1000
+    for (const [id, job] of scanJobs) {
+      if (job.startedAt < cutoff && job.status !== 'running') scanJobs.delete(id)
     }
+  }
+
+  app.post<{
+    Body: { path: string; dry_run?: boolean; extensions?: string[]; limit?: number }
   }>(
     '/pvfs/scan',
     async (req, reply) => {
@@ -342,45 +359,65 @@ export function registerForestRoutes(
       if (!dirPath) return reply.status(400).send({ error: 'path is required' })
       if (!existsSync(dirPath)) return reply.status(400).send({ error: `directory not found: ${dirPath}` })
 
+      cleanOldJobs()
+      const jobId = randomUUID()
+      const job: ScanJob = { status: 'running', startedAt: Date.now(), dry_run, found: 0, files: [] }
+      scanJobs.set(jobId, job)
+
       const extSet = extensions
         ? new Set(extensions.map(e => e.startsWith('.') ? e.toLowerCase() : '.' + e.toLowerCase()))
         : undefined
 
-      let files
-      try {
-        files = scanVideoFiles(dirPath, extSet)
-      } catch (err) {
-        return reply.status(500).send({ error: err instanceof Error ? err.message : 'scan failed' })
-      }
+      const baseUrl = `${req.protocol}://${req.hostname}`
 
-      const batch = limit ? files.slice(0, limit) : files
-
-      if (dry_run) {
-        return reply.send({ found: files.length, dry_run: true, files: batch })
-      }
-
-      // Live mode: hash + ingest each file
-      const ingested: Array<{ path: string; fileNodeId: string; contentHash: string; streamUrl: string }> = []
-      const failures: Array<{ path: string; error: string }> = []
-
-      for (const file of batch) {
+      // Run async — returns job ID immediately so the HTTP request doesn't time out
+      ;(async () => {
         try {
-          const result = await pvfs.ingest(file.path, { label: file.parsed.title || path.basename(file.path) })
-          const streamUrl = `${req.protocol}://${req.hostname}/pvfs/file/${result.fileNode.id}/stream`
-          ingested.push({ path: file.path, fileNodeId: result.fileNode.id, contentHash: result.contentHash, streamUrl })
-        } catch (err) {
-          failures.push({ path: file.path, error: err instanceof Error ? err.message : 'ingest failed' })
-        }
-      }
+          const files = await scanVideoFilesAsync(dirPath, extSet, n => { job.found = n })
+          const batch = limit ? files.slice(0, limit) : files
+          job.found = batch.length
 
-      return reply.send({
-        found: files.length,
-        dry_run: false,
-        ingested: ingested.length,
-        failed: failures.length,
-        files: ingested,
-        failures,
-      })
+          if (dry_run) {
+            job.files = batch
+            job.status = 'done'
+            return
+          }
+
+          const ingested: Array<{ path: string; fileNodeId: string; contentHash: string; streamUrl: string }> = []
+          const failures: Array<{ path: string; error: string }> = []
+
+          for (const file of batch) {
+            try {
+              const result = await pvfs.ingest(file.path, { label: file.parsed.title || path.basename(file.path) })
+              const streamUrl = `${baseUrl}/pvfs/file/${result.fileNode.id}/stream`
+              ingested.push({ path: file.path, fileNodeId: result.fileNode.id, contentHash: result.contentHash, streamUrl })
+            } catch (err) {
+              failures.push({ path: file.path, error: err instanceof Error ? err.message : 'ingest failed' })
+            }
+            job.found = ingested.length + failures.length
+          }
+
+          job.files = ingested
+          job.ingested = ingested.length
+          job.failed = failures.length
+          job.failures = failures
+          job.status = 'done'
+        } catch (err) {
+          job.error = err instanceof Error ? err.message : 'scan failed'
+          job.status = 'error'
+        }
+      })()
+
+      return reply.status(202).send({ jobId })
+    },
+  )
+
+  app.get<{ Params: { jobId: string } }>(
+    '/pvfs/scan/job/:jobId',
+    async (req, reply) => {
+      const job = scanJobs.get(req.params.jobId)
+      if (!job) return reply.status(404).send({ error: 'job not found' })
+      return reply.send(job)
     },
   )
 

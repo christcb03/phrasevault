@@ -1,4 +1,5 @@
 import { readdirSync, statSync } from 'node:fs'
+import { readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 export const DEFAULT_VIDEO_EXTENSIONS = new Set([
@@ -145,5 +146,45 @@ export function scanVideoFiles(
   }
 
   walk(dir)
+  return results
+}
+
+// Async version for large/network-mounted libraries. Yields control between
+// each directory so the event loop isn't blocked while waiting on NFS I/O.
+export async function scanVideoFilesAsync(
+  dir: string,
+  extensions: Set<string> = DEFAULT_VIDEO_EXTENSIONS,
+  onProgress?: (found: number) => void,
+): Promise<ScannedFile[]> {
+  const results: ScannedFile[] = []
+
+  async function walk(current: string) {
+    let entries: string[]
+    try {
+      entries = await readdir(current)
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry)
+      let st
+      try {
+        st = await stat(fullPath)
+      } catch {
+        continue
+      }
+      if (st.isDirectory()) {
+        await walk(fullPath)
+      } else if (st.isFile()) {
+        const ext = path.extname(entry).toLowerCase()
+        if (extensions.has(ext)) {
+          results.push({ path: fullPath, size_bytes: st.size, ext, parsed: parseMediaPath(fullPath) })
+          if (onProgress && results.length % 50 === 0) onProgress(results.length)
+        }
+      }
+    }
+  }
+
+  await walk(dir)
   return results
 }
