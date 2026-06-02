@@ -12,30 +12,21 @@
     restart_policy: unless-stopped
     pull: always
     ports:
-      - "{{ phrasevault_port }}:8080"
-    volumes: >-
-      {{ [phrasevault_data_dir + ':/data'] +
-         ([phrasevault_media_dir + ':/media:ro'] if phrasevault_media_dir | default('') | length > 0 else []) }}
+      - "{{ phrasevault_port }}:8081"
+    volumes:
+      - "{{ phrasevault_data_dir }}:/data"
     networks: "{{ [{'name': phrasevault_docker_network}] if phrasevault_traefik_enabled | bool else omit }}"
     networks_cli_compatible: false
     env:
       PV_DATA_DIR: "/data"
-      PV_PORT: "8080"
+      PV_PORT: "8081"
       PV_HOST: "0.0.0.0"
       PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
       PV_TMDB_KEY: "{{ phrasevault_tmdb_key | default('') }}"
-    labels: "{{ {} if not phrasevault_traefik_enabled | bool else {
-        'traefik.enable': 'true',
-        'traefik.http.routers.' + phrasevault_traefik_router + '.rule': 'Host(`' + phrasevault_domain + '`)',
-        'traefik.http.routers.' + phrasevault_traefik_router + '.entrypoints': 'websecure',
-        'traefik.http.routers.' + phrasevault_traefik_router + '.tls': 'true',
-        'traefik.http.routers.' + phrasevault_traefik_router + '.tls.certresolver': phrasevault_traefik_certresolver,
-        'traefik.http.routers.' + phrasevault_traefik_router + '.middlewares': phrasevault_traefik_middlewares,
-        'traefik.http.services.' + phrasevault_traefik_router + '.loadbalancer.server.port': '8080'
-      } }}"
+    labels: "{{ {'traefik.enable': 'false'} }}"
     healthcheck:
       test: ["CMD", "node", "-e",
-             "require('http').get('http://localhost:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+             "require('http').get('http://localhost:8081/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: "30s"
       timeout: "5s"
       retries: 3

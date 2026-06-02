@@ -14,13 +14,6 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build && cp src/forest/schema.sql dist/forest/
 
-# Build frontend
-COPY client/package*.json ./client/
-RUN cd client && npm ci
-COPY client/ ./client/
-RUN cd client && npm run build
-# Output lands in dist/client/ (per vite.config.ts outDir)
-
 # ── Runtime ────────────────────────────────────────────────────────────────
 FROM node:22-slim
 
@@ -44,15 +37,15 @@ VOLUME ["/data"]
 RUN mkdir -p /data && chown node:node /data
 USER node
 
-EXPOSE 8080
+EXPOSE 8081
 
 ENV PV_DATA_DIR=/data \
-    PV_PORT=8080 \
+    PV_PORT=8081 \
     PV_HOST=0.0.0.0 \
     PV_LOG_LEVEL=info
 
 # Use node for the health check — no wget needed in the slim image
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+    CMD node -e "require('http').get('http://localhost:8081/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 CMD ["node", "dist/server/index.js"]
