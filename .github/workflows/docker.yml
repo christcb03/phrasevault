@@ -15,6 +15,8 @@ jobs:
     permissions:
       contents: read
       packages: write   # required to push to ghcr.io
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
     steps:
       - name: Checkout
@@ -50,7 +52,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Telegram on success
-        if: success() && secrets.TELEGRAM_BOT_TOKEN != ''
+        if: success() && env.TELEGRAM_BOT_TOKEN != ''
         uses: appleboy/telegram-action@v1.0.1
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -61,7 +63,7 @@ jobs:
             Watchtower will deploy within 5 minutes.
 
       - name: Notify Telegram on failure
-        if: failure() && secrets.TELEGRAM_BOT_TOKEN != ''
+        if: failure() && env.TELEGRAM_BOT_TOKEN != ''
         uses: appleboy/telegram-action@v1.0.1
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
