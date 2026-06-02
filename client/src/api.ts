@@ -112,6 +112,8 @@ export interface ScannedFile {
   path: string;
   size_bytes: number;
   ext: string;
+  already_ingested?: boolean;
+  local_artwork?: string | null;
   parsed: {
     title: string;
     year: number | null;
@@ -119,6 +121,41 @@ export interface ScannedFile {
     season: number | null;
     episode: number | null;
   };
+}
+
+export interface MatchCandidate {
+  tmdb_id: string;
+  media_type: 'movie' | 'tv';
+  title: string;
+  year: string;
+  poster_path: string | null;
+  overview: string | null;
+  confidence: number;
+}
+
+export interface MatchSearchResult {
+  query: { title: string; year: number | null; kind: 'movie' | 'series' | 'unknown' };
+  candidates: MatchCandidate[];
+  best: MatchCandidate | null;
+  needs_review: boolean;
+}
+
+export type MatchSource =
+  | { source: 'tmdb'; tmdb_id: string; media_type: 'movie' | 'tv'; title: string; year: string; poster_path: string | null; overview: string | null }
+  | { source: 'manual'; title: string; year: number | null; kind: 'movie' | 'series' };
+
+export interface ImportItem {
+  kind: 'movie' | 'series';
+  files: ScannedFile[];
+  selected_seasons?: number[] | null;
+  match: MatchSource;
+}
+
+export interface ImportResult {
+  imported: number;
+  failed: number;
+  results: Array<{ mediaNodeId: string; title: string; fileCount: number }>;
+  failures: Array<{ title: string; error: string }>;
 }
 
 export interface ScanResult {
@@ -174,5 +211,10 @@ export const api = {
   pvfsScan: (body: { path: string; dry_run?: boolean; extensions?: string[]; limit?: number }) =>
     post<{ jobId: string }>('/pvfs/scan', body),
   pvfsScanJob: (jobId: string) =>
-    get<{ status: 'running' | 'done' | 'error'; found: number; dry_run: boolean; files: ScannedFile[]; ingested?: number; failed?: number; failures?: Array<{ path: string; error: string }>; error?: string }>(`/pvfs/scan/job/${jobId}`),
+    get<{ status: 'running' | 'done' | 'error'; found: number; new_count?: number; already_ingested_count?: number; dry_run: boolean; files: ScannedFile[]; ingested?: number; failed?: number; failures?: Array<{ path: string; error: string }>; error?: string }>(`/pvfs/scan/job/${jobId}`),
+  matchSearch: (body: { items: Array<{ title: string; year: number | null; kind: 'movie' | 'series' | 'unknown' }>; threshold?: number }) =>
+    post<{ results: MatchSearchResult[]; threshold: number }>('/media/match/search', body),
+  importBatch: (body: { items: ImportItem[] }) =>
+    post<ImportResult>('/media/import/batch', body),
+  artworkUrl: (localPath: string) => `${BASE}/pvfs/artwork?path=${encodeURIComponent(localPath)}`,
 };

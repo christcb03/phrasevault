@@ -4,25 +4,24 @@
  */
 
 import { nodeId } from "../crypto/index.js";
-import { deriveIdentity, sign, verify } from "../identity/index.js";
+import { identityFromPrivKey, signWithKey, verify } from "../identity/index.js";
 import { PVNode, UnsignedNode, canonicalize } from "./types.js";
 
 /**
- * Create and sign a new PhraseVault node.
- * passphrase is used transiently to derive the signing key — never stored.
+ * Create and sign a new PhraseVault node using a raw secp256k1 private key.
  */
 export async function createNode(
-  passphrase: string,
+  privKeyHex: string,
   partial: Omit<UnsignedNode, "author">,
 ): Promise<PVNode> {
-  const identity = await deriveIdentity(passphrase);
+  const identity = identityFromPrivKey(privKeyHex);
   const author = Buffer.from(identity.publicKey).toString("hex");
 
   const unsigned: UnsignedNode = { ...partial, author };
   const canonical = canonicalize(unsigned);
   const id = nodeId(canonical);
 
-  const sigBytes = await sign(passphrase, new TextEncoder().encode(canonical));
+  const sigBytes = await signWithKey(privKeyHex, new TextEncoder().encode(canonical));
   const signature = Buffer.from(sigBytes).toString("hex");
 
   return { id, ...unsigned, signature };

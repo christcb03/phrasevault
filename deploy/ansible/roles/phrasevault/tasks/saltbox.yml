@@ -4,43 +4,64 @@
 #   - Traefik labels for automatic HTTPS routing
 #   - Watchtower label for automatic image updates
 #   - Data at /opt/{{ container_name }}
+#   - Supervised by systemd so the container auto-recovers from docker rm
 
-- name: "PhraseVault | Saltbox | Remove existing container (idempotent)"
-  community.docker.docker_container:
-    name: "{{ phrasevault_container_name }}"
-    state: absent
-  ignore_errors: true
+- name: "PhraseVault | Saltbox | Pull latest image"
+  community.docker.docker_image:
+    name: "{{ phrasevault_image }}"
+    source: pull
+    force_source: true
 
-- name: "PhraseVault | Saltbox | Deploy container"
+- name: "PhraseVault | Saltbox | Ensure data directory exists"
+  ansible.builtin.file:
+    path: "{{ phrasevault_data_dir }}"
+    state: directory
+    owner: "{{ phrasevault_uid }}"
+    group: "{{ phrasevault_gid }}"
+    mode: "0750"
+
+- name: "PhraseVault | Saltbox | Install systemd service"
+  ansible.builtin.template:
+    src: phrasevault.service.j2
+    dest: /etc/systemd/system/phrasevault.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart phrasevault
+
+- name: "PhraseVault | Saltbox | Enable and start service"
+  ansible.builtin.systemd:
+    name: phrasevault
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: "PhraseVault | Saltbox | Deploy Watchtower for auto-updates"
+  when: phrasevault_watchtower_enabled | bool
   community.docker.docker_container:
-    name: "{{ phrasevault_container_name }}"
-    image: "{{ phrasevault_image }}"
+    name: "{{ phrasevault_watchtower_container_name }}"
+    image: "containrrr/watchtower:latest"
     state: started
     restart_policy: unless-stopped
     networks:
       - name: "{{ phrasevault_docker_network }}"
     volumes:
-      - "{{ phrasevault_data_dir }}:/data"
-      - "/mnt/unionfs/Media:/media:ro"
+      - "/var/run/docker.sock:/var/run/docker.sock"
     env:
-      PV_PASSPHRASE: "{{ phrasevault_passphrase }}"
-      PV_DATA_DIR: "/data"
-      PV_LOG_LEVEL: "{{ phrasevault_log_level }}"
-      PV_DOCS: "{{ phrasevault_docs_enabled }}"
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.phrasevault.rule: "Host(`{{ phrasevault_domain }}`)"
-      traefik.http.routers.phrasevault.tls: "true"
-      traefik.http.routers.phrasevault.tls.certresolver: "{{ phrasevault_traefik_certresolver }}"
-      traefik.http.services.phrasevault.loadbalancer.server.port: "8080"
-      com.centurylinklabs.watchtower.enable: "true"
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: "30s"
-      timeout: "5s"
-      retries: 3
-      start_period: "10s"
+      DOCKER_API_VERSION: "1.41"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_POLL_INTERVAL: "{{ phrasevault_watchtower_interval | string }}"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_NOTIFICATION_REPORT: "true"
+      WATCHTOWER_NOTIFICATIONS_HOSTNAME: "{{ ansible_hostname }}"
+      WATCHTOWER_NOTIFICATION_URL: "{{ phrasevault_watchtower_notify_url }}"
 
-- name: "PhraseVault | Saltbox | Confirm container on saltbox network"
+- name: "PhraseVault | Saltbox | Confirm deployment"
   ansible.builtin.debug:
-    msg: "PhraseVault deployed on {{ phrasevault_docker_network }} network — reachable at https://{{ phrasevault_domain }}"
+    msg: >-
+      PhraseVault deployed on {{ phrasevault_docker_network }} network — reachable at https://{{ phrasevault_domain }}.
+      Supervised by systemd (auto-recovers from docker rm).
+      Watchtower ({{ phrasevault_watchtower_container_name }}) polls GHCR every {{ phrasevault_watchtower_interval }}s.

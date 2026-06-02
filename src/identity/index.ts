@@ -1,14 +1,14 @@
 /**
  * secp256k1 identity — keypairs, signing, verification.
- * Ported from phrasevault/identity.py.
  *
- * One keypair per user, derived deterministically from passphrase.
- * Same passphrase → same identity on every device.
- * Private key is NEVER stored — always re-derived when needed.
+ * Two derivation paths:
+ *   passphrase → Argon2id → privKey  (companion/legacy single-user)
+ *   random bytes → stored server_key.json → privKey  (Phase 6 server)
  */
 
 import * as secp from "@noble/secp256k1";
 import { blake3 } from "@noble/hashes/blake3";
+import { randomBytes } from "crypto";
 import argon2 from "argon2";
 
 const TAG_IDENTITY = new TextEncoder().encode("phrasevault:identity:v1:");
@@ -87,6 +87,33 @@ export async function sign(passphrase: string, message: Uint8Array): Promise<Uin
   const msgHash = blake3(message);
   const sig = await secp.signAsync(msgHash, privKey);
   return sig.toCompactRawBytes();
+}
+
+/** Derive identity from a raw hex private key (no KDF — for server key path). */
+export function identityFromPrivKey(privKeyHex: string): Identity {
+  const privKey = Buffer.from(privKeyHex, "hex");
+  const pubKey = secp.getPublicKey(privKey, true);
+  const did = `did:key:z${Buffer.from(pubKey).toString("base64url")}`;
+  return { publicKey: pubKey as Uint8Array, did };
+}
+
+/** Sign with a raw private key (no passphrase derivation). */
+export async function signWithKey(privKeyHex: string, message: Uint8Array): Promise<Uint8Array> {
+  const privKey = Buffer.from(privKeyHex, "hex");
+  const msgHash = blake3(message);
+  const sig = await secp.signAsync(msgHash, privKey);
+  return sig.toCompactRawBytes();
+}
+
+/** Generate a valid random secp256k1 private key as hex. */
+export function generatePrivKey(): string {
+  while (true) {
+    const candidate = randomBytes(32);
+    try {
+      secp.getPublicKey(candidate);
+      return candidate.toString("hex");
+    } catch { /* retry — probability ≈ 2^-128 */ }
+  }
 }
 
 /**

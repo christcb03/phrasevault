@@ -846,7 +846,7 @@ git push → GitHub Actions (CI) → GHCR → Watchtower → presubuntu
 - **Forest DB:** `/opt/phrasevault/data/forest.db` (migrating to `forests/<pubkey>.db`)
 - **PVFS store:** `/opt/phrasevault/data/pvfs/`
 - **Container:** `phrasevault` (plus `watchtower-phrasevault` sidecar)
-- **Passphrase:** stored encrypted in `HomeLab/vault.yml` as `vault_phrasevault_passphrase`
+- **Telegram notifications:** Watchtower notify URL stored in `HomeLab/vault.yml` as `vault_phrasevault_telegram_url`
 
 ### HTTPS via Traefik + Cloudflare
 

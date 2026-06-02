@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-import { deriveIdentity, derivePrivKeyHex } from "../identity/index.js";
+import { deriveIdentity, derivePrivKeyHex, identityFromPrivKey, generatePrivKey } from "../identity/index.js";
 import { HypercoreStore } from "../store/hypercore.js";
 import { ReplicationManager } from "../replication/index.js";
 import { RelayQueryEngine } from "../apps/relay/query.js";
@@ -30,37 +30,74 @@ import type { ConfigProviderPayload } from "../forest/types.js";
 
 // ── Config from environment ────────────────────────────────────────────────
 
-const PASSPHRASE   = process.env.PV_PASSPHRASE;
-const DATA_DIR     = process.env.PV_DATA_DIR ?? "./data";
-const PORT         = parseInt(process.env.PV_PORT ?? "8080", 10);
-const HOST         = process.env.PV_HOST ?? "0.0.0.0";
-const LOG_LEVEL    = process.env.PV_LOG_LEVEL ?? "info";
+const PASSPHRASE     = process.env.PV_PASSPHRASE;   // deprecated — backward compat only
+const DATA_DIR       = process.env.PV_DATA_DIR ?? "./data";
+const PORT           = parseInt(process.env.PV_PORT ?? "8080", 10);
+const HOST           = process.env.PV_HOST ?? "0.0.0.0";
+const LOG_LEVEL      = process.env.PV_LOG_LEVEL ?? "info";
 const TMDB_TOKEN_ENV = process.env.PV_TMDB_KEY ?? "";  // legacy fallback only
 
-if (!PASSPHRASE) {
-  console.error("PV_PASSPHRASE environment variable is required");
-  process.exit(1);
+// ── Server key (Phase 6) ───────────────────────────────────────────────────
+
+interface ServerKey {
+  version: number;
+  identityPrivKey: string;      // 32-byte hex secp256k1 private key
+  authPubKey: string | null;    // 33-byte compressed hex — companion registers on first connect
 }
+
+const SERVER_KEY_PATH = path.join(DATA_DIR, "server_key.json");
+
+function loadOrCreateServerKey(): ServerKey {
+  if (existsSync(SERVER_KEY_PATH)) {
+    return JSON.parse(readFileSync(SERVER_KEY_PATH, "utf-8")) as ServerKey;
+  }
+  mkdirSync(DATA_DIR, { recursive: true });
+  const key: ServerKey = { version: 1, identityPrivKey: generatePrivKey(), authPubKey: null };
+  writeFileSync(SERVER_KEY_PATH, JSON.stringify(key, null, 2), { mode: 0o600 });
+  return key;
+}
+
+function saveServerKey(key: ServerKey): void {
+  writeFileSync(SERVER_KEY_PATH, JSON.stringify(key, null, 2), { mode: 0o600 });
+}
+
+// ── Identity & forest ──────────────────────────────────────────────────────
+
+let privKeyHex: string;
+let identity: Awaited<ReturnType<typeof deriveIdentity>>;
+
+if (PASSPHRASE) {
+  // Backward compat: derive identity from passphrase (existing deployments with PV_PASSPHRASE set)
+  console.warn("[PhraseVault] PV_PASSPHRASE is deprecated. Server will migrate to server_key.json on next fresh deploy.");
+  privKeyHex = await derivePrivKeyHex(PASSPHRASE);
+  identity   = await deriveIdentity(PASSPHRASE);
+} else {
+  const serverKey = loadOrCreateServerKey();
+  privKeyHex = serverKey.identityPrivKey;
+  identity   = identityFromPrivKey(privKeyHex);
+}
+
+const pubKeyHex    = Buffer.from(identity.publicKey).toString("hex");
+const forestEncKey = PASSPHRASE ? deriveForestEncKey(PASSPHRASE) : deriveForestEncKey(privKeyHex);
 
 // ── Auth state ─────────────────────────────────────────────────────────────
 
-const AUTH_PUB_KEY = deriveAuthPubKey(PASSPHRASE);
-const challenges   = new Map<string, number>();
-const sessions     = new Map<string, number>();
+// AUTH_PUB_KEY is the companion's auth public key. In passphrase mode it is derived
+// deterministically; in server-key mode it is registered by the companion on first connect.
+let AUTH_PUB_KEY: Uint8Array | null = PASSPHRASE ? deriveAuthPubKey(PASSPHRASE) : (() => {
+  const sk = loadOrCreateServerKey();
+  return sk.authPubKey ? Buffer.from(sk.authPubKey, "hex") : null;
+})();
 
-const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify"]);
+const challenges = new Map<string, number>();
+const sessions   = new Map<string, number>();
+
+const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify", "/auth/register"]);
 const API_PREFIXES = [
   "/search", "/media", "/storage", "/crosslink", "/watchlist",
   "/follow", "/following", "/identity", "/auth", "/tmdb",
   "/forest", "/config", "/pvfs",
 ];
-
-// ── Identity & forest ──────────────────────────────────────────────────────
-
-const identity  = await deriveIdentity(PASSPHRASE);
-const pubKeyHex = Buffer.from(identity.publicKey).toString("hex");
-const privKeyHex = await derivePrivKeyHex(PASSPHRASE);
-const forestEncKey = deriveForestEncKey(PASSPHRASE);
 
 const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
 const PVFS_STORE_DIR = path.join(DATA_DIR, "pvfs");
@@ -108,6 +145,9 @@ app.addHook("onRequest", async (req, reply) => {
   if (PUBLIC_ROUTES.has(url)) return;
   const isApiRoute = API_PREFIXES.some(p => url === p || url.startsWith(p + "/"));
   if (!isApiRoute) return;
+  if (!AUTH_PUB_KEY) {
+    return reply.status(401).send({ error: "server not configured: companion must POST /auth/register first" });
+  }
   const header = req.headers.authorization ?? "";
   if (!header.startsWith("Bearer ") || !verifySession(sessions, header.slice(7))) {
     return reply.status(401).send({ error: "unauthorized" });
@@ -123,6 +163,7 @@ app.get("/auth/challenge", async () => ({
 app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", async (req, reply) => {
   const { challenge, signature } = req.body ?? {};
   if (!challenge || !signature) return reply.status(400).send({ error: "missing fields" });
+  if (!AUTH_PUB_KEY) return reply.status(401).send({ error: "server not configured: companion must POST /auth/register first" });
   if (!consumeChallenge(challenges, challenge)) {
     return reply.status(401).send({ error: "invalid or expired challenge" });
   }
@@ -133,9 +174,28 @@ app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", a
   return { token: createSession(sessions), identity: pubKeyHex };
 });
 
+// Register companion auth pubkey (only accepted if server has no registered pubkey and no passphrase).
+app.post<{ Body: { pubKey?: string } }>("/auth/register", async (req, reply) => {
+  if (PASSPHRASE) {
+    return reply.status(400).send({ error: "server uses passphrase auth — registration not applicable" });
+  }
+  if (AUTH_PUB_KEY) {
+    return reply.status(409).send({ error: "already registered" });
+  }
+  const { pubKey } = req.body ?? {};
+  if (!pubKey || !/^[0-9a-f]{66}$/.test(pubKey)) {
+    return reply.status(400).send({ error: "pubKey must be a 33-byte compressed secp256k1 key in hex (66 chars)" });
+  }
+  const serverKey = loadOrCreateServerKey();
+  serverKey.authPubKey = pubKey;
+  saveServerKey(serverKey);
+  AUTH_PUB_KEY = Buffer.from(pubKey, "hex");
+  return { registered: true, serverIdentity: pubKeyHex };
+});
+
 // ── Forest routes (forest, config, pvfs, prune) ───────────────────────────
 
-registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
+registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR, getTmdbToken);
 
 // ── Static files + SPA fallback ────────────────────────────────────────────
 
@@ -196,7 +256,7 @@ app.get<{ Params: { id: string } }>("/media/:id", async (req, reply) => {
 // ── Publish media ──────────────────────────────────────────────────────────
 
 app.post<{ Body: MediaPayload }>("/media", async (req, reply) => {
-  const node = await createMediaNode(PASSPHRASE!, req.body);
+  const node = await createMediaNode(privKeyHex,req.body);
   await ownStore.append(node);
   await engine.refresh();
   reply.status(201);
@@ -204,7 +264,7 @@ app.post<{ Body: MediaPayload }>("/media", async (req, reply) => {
 });
 
 app.post<{ Body: StoragePointerPayload }>("/storage", async (req, reply) => {
-  const node = await createStoragePointerNode(PASSPHRASE!, req.body);
+  const node = await createStoragePointerNode(privKeyHex,req.body);
   await ownStore.append(node);
   await engine.refresh();
   reply.status(201);
@@ -214,7 +274,7 @@ app.post<{ Body: StoragePointerPayload }>("/storage", async (req, reply) => {
 // ── Watchlist ──────────────────────────────────────────────────────────────
 
 app.post<{ Body: CrosslinkPayload }>("/crosslink", async (req, reply) => {
-  const node = await createCrosslinkNode(PASSPHRASE!, {
+  const node = await createCrosslinkNode(privKeyHex,{
     ...req.body,
     added_at: req.body.added_at ?? Date.now(),
   });
@@ -225,7 +285,7 @@ app.post<{ Body: CrosslinkPayload }>("/crosslink", async (req, reply) => {
 });
 
 app.post<{ Body: WatchlistEntryPayload }>("/watchlist", async (req, reply) => {
-  const node = await createWatchlistEntryNode(PASSPHRASE!, {
+  const node = await createWatchlistEntryNode(privKeyHex,{
     ...req.body,
     added_at: req.body.added_at ?? Date.now(),
   });
@@ -244,7 +304,7 @@ app.patch<{
 
   const existing = result.watchlistEntry;
   const status = (req.body.status ?? existing?.payload.status ?? "unwatched") as import("../apps/relay/types.js").WatchStatus;
-  const node = await createWatchlistEntryNode(PASSPHRASE!, {
+  const node = await createWatchlistEntryNode(privKeyHex,{
     media_node_id: req.params.mediaId,
     crosslink_node_id: existing?.payload.crosslink_node_id ?? "",
     status,

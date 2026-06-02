@@ -1,0 +1,33 @@
+{# Build the docker run argument list so conditionals stay out of ExecStart #}
+{% set _media_mount = ' -v ' + phrasevault_media_dir + ':/media:ro' if phrasevault_media_dir | default('') | length > 0 else '' %}
+[Unit]
+Description=PhraseVault media server
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=10
+# Tear down any stale container from a previous run before starting.
+ExecStartPre=-/usr/bin/docker stop {{ phrasevault_container_name }}
+ExecStartPre=-/usr/bin/docker rm   {{ phrasevault_container_name }}
+ExecStart=/usr/bin/docker run --rm \
+  --name {{ phrasevault_container_name }} \
+  --network {{ phrasevault_docker_network }} \
+  -v {{ phrasevault_data_dir }}:/data{{ _media_mount }} \
+  -e PV_DATA_DIR=/data \
+  -e PV_LOG_LEVEL={{ phrasevault_log_level }} \
+  -e PV_DOCS={{ phrasevault_docs_enabled }} \
+  -e "PV_TMDB_KEY={{ phrasevault_tmdb_key | default('') }}" \
+  -l traefik.enable=true \
+  -l "traefik.http.routers.{{ phrasevault_traefik_router }}.rule=Host(\`{{ phrasevault_domain }}\`)" \
+  -l traefik.http.routers.{{ phrasevault_traefik_router }}.tls=true \
+  -l traefik.http.routers.{{ phrasevault_traefik_router }}.tls.certresolver={{ phrasevault_traefik_certresolver }} \
+  -l traefik.http.services.{{ phrasevault_traefik_router }}.loadbalancer.server.port=8080 \
+  -l com.centurylinklabs.watchtower.enable=true \
+  {{ phrasevault_image }}
+ExecStop=/usr/bin/docker stop {{ phrasevault_container_name }}
+
+[Install]
+WantedBy=multi-user.target

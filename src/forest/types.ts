@@ -101,6 +101,7 @@ export interface ConfigProviderPayload {
   provider_id: string    // e.g. "tmdb", "tvdb"
   name:        string
   enabled:     boolean
+  priority?:   Record<string, number>  // { movie: 1, tv: 2 } — lower = higher priority
 }
 
 export interface PrunePolicyPayload {

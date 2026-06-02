@@ -7,16 +7,6 @@
       - install_type in ['saltbox', 'ubuntu', 'custom']
     fail_msg: "install_type must be one of: saltbox, ubuntu, custom"
 
-- name: "PhraseVault | Assert passphrase is set"
-  ansible.builtin.assert:
-    that:
-      - phrasevault_passphrase is defined
-      - phrasevault_passphrase | length >= 16
-    fail_msg: >
-      phrasevault_passphrase must be set (min 16 chars).
-      Generate one: openssl rand -base64 32
-      Store it in Ansible Vault as vault_phrasevault_passphrase.
-
 - name: "PhraseVault | Install Docker CE (ubuntu)"
   when: install_type == 'ubuntu'
   block:

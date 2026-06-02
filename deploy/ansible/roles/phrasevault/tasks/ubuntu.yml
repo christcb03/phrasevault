@@ -13,12 +13,12 @@
     pull: always
     ports:
       - "{{ phrasevault_port }}:8080"
-    volumes:
-      - "{{ phrasevault_data_dir }}:/data"
+    volumes: >-
+      {{ [phrasevault_data_dir + ':/data'] +
+         ([phrasevault_media_dir + ':/media:ro'] if phrasevault_media_dir | default('') | length > 0 else []) }}
     networks: "{{ [{'name': phrasevault_docker_network}] if phrasevault_traefik_enabled | bool else omit }}"
     networks_cli_compatible: false
     env:
-      PV_PASSPHRASE: "{{ phrasevault_passphrase }}"
       PV_DATA_DIR: "/data"
       PV_PORT: "8080"
       PV_HOST: "0.0.0.0"
@@ -51,9 +51,13 @@
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
     env:
+      DOCKER_API_VERSION: "1.41"
       WATCHTOWER_POLL_INTERVAL: "{{ phrasevault_watchtower_interval | string }}"
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_NOTIFICATION_REPORT: "true"
+      WATCHTOWER_NOTIFICATIONS_HOSTNAME: "{{ ansible_hostname }}"
+      WATCHTOWER_NOTIFICATION_URL: "{{ phrasevault_watchtower_notify_url | default('') }}"
     command: "{{ phrasevault_container_name }}"
 
 - name: "PhraseVault | Ubuntu | Show access info"

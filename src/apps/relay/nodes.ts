@@ -17,10 +17,10 @@ import {
  * The node id serves as the dedup key: same metadata → same id.
  */
 export async function createMediaNode(
-  passphrase: string,
+  privKeyHex: string,
   payload: MediaPayload,
 ): Promise<MediaNode> {
-  const node = await createNode(passphrase, {
+  const node = await createNode(privKeyHex, {
     type: "media",
     timestamp: Date.now(),
     links: [],
@@ -35,10 +35,10 @@ export async function createMediaNode(
  * Links to the media node it describes.
  */
 export async function createStoragePointerNode(
-  passphrase: string,
+  privKeyHex: string,
   payload: StoragePointerPayload,
 ): Promise<StoragePointerNode> {
-  const node = await createNode(passphrase, {
+  const node = await createNode(privKeyHex, {
     type: "storage_pointer",
     timestamp: Date.now(),
     links: [payload.media_node_id],
@@ -53,10 +53,10 @@ export async function createStoragePointerNode(
  * Links to both the storage_pointer and the media node for easy traversal.
  */
 export async function createCrosslinkNode(
-  passphrase: string,
+  privKeyHex: string,
   payload: CrosslinkPayload,
 ): Promise<CrosslinkNode> {
-  const node = await createNode(passphrase, {
+  const node = await createNode(privKeyHex, {
     type: "crosslink",
     timestamp: payload.added_at,
     links: [payload.target_node_id, payload.media_node_id],
@@ -71,10 +71,10 @@ export async function createCrosslinkNode(
  * Links to the media node and the crosslink providing access.
  */
 export async function createWatchlistEntryNode(
-  passphrase: string,
+  privKeyHex: string,
   payload: WatchlistEntryPayload,
 ): Promise<WatchlistEntryNode> {
-  const node = await createNode(passphrase, {
+  const node = await createNode(privKeyHex, {
     type: "watchlist_entry",
     timestamp: payload.added_at,
     links: [payload.media_node_id, payload.crosslink_node_id],

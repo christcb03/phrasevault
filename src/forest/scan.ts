@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from 'node:fs'
+import { readdirSync, statSync, existsSync } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -23,6 +23,8 @@ export interface ScannedFile {
   size_bytes: number
   ext: string
   parsed: ParsedMedia
+  already_ingested?: boolean
+  local_artwork?: string | null  // absolute path to a sibling poster/folder image
 }
 
 export function parseMediaPath(filePath: string): ParsedMedia {
@@ -108,6 +110,21 @@ function cleanTitle(s: string): string {
     .trim()
 }
 
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
+
+function findLocalArtwork(filePath: string, title: string): string | null {
+  const dir = path.dirname(filePath)
+  const safeTitle = title.replace(/[<>:"/\\|?*]/g, '').trim()
+  const basenames = ['poster', 'folder', safeTitle]
+  for (const base of basenames) {
+    for (const ext of IMAGE_EXTENSIONS) {
+      const candidate = path.join(dir, base + ext)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return null
+}
+
 export function scanVideoFiles(
   dir: string,
   extensions: Set<string> = DEFAULT_VIDEO_EXTENSIONS,
@@ -134,11 +151,13 @@ export function scanVideoFiles(
       } else if (st.isFile()) {
         const ext = path.extname(entry).toLowerCase()
         if (extensions.has(ext)) {
+          const parsed = parseMediaPath(fullPath)
           results.push({
             path: fullPath,
             size_bytes: st.size,
             ext,
-            parsed: parseMediaPath(fullPath),
+            parsed,
+            local_artwork: findLocalArtwork(fullPath, parsed.title),
           })
         }
       }
@@ -151,10 +170,13 @@ export function scanVideoFiles(
 
 // Async version for large/network-mounted libraries. Yields control between
 // each directory so the event loop isn't blocked while waiting on NFS I/O.
+// onFile fires for every discovered file — use it to stream results to a job
+// object without waiting for the full scan to finish.
 export async function scanVideoFilesAsync(
   dir: string,
   extensions: Set<string> = DEFAULT_VIDEO_EXTENSIONS,
   onProgress?: (found: number) => void,
+  onFile?: (file: ScannedFile) => void,
 ): Promise<ScannedFile[]> {
   const results: ScannedFile[] = []
 
@@ -178,7 +200,10 @@ export async function scanVideoFilesAsync(
       } else if (st.isFile()) {
         const ext = path.extname(entry).toLowerCase()
         if (extensions.has(ext)) {
-          results.push({ path: fullPath, size_bytes: st.size, ext, parsed: parseMediaPath(fullPath) })
+          const parsed = parseMediaPath(fullPath)
+          const file: ScannedFile = { path: fullPath, size_bytes: st.size, ext, parsed, local_artwork: findLocalArtwork(fullPath, parsed.title) }
+          results.push(file)
+          onFile?.(file)
           if (onProgress && results.length % 50 === 0) onProgress(results.length)
         }
       }
