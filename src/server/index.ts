@@ -1,6 +1,5 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import staticFiles from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -8,14 +7,6 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 import { deriveIdentity, derivePrivKeyHex, identityFromPrivKey, generatePrivKey } from "../identity/index.js";
-import { HypercoreStore } from "../store/hypercore.js";
-import { ReplicationManager } from "../replication/index.js";
-import { RelayQueryEngine } from "../apps/relay/query.js";
-import {
-  createMediaNode, createStoragePointerNode,
-  createCrosslinkNode, createWatchlistEntryNode,
-  MediaPayload, StoragePointerPayload, CrosslinkPayload, WatchlistEntryPayload,
-} from "../apps/relay/index.js";
 import {
   deriveAuthPubKey,
   createChallenge, consumeChallenge, verifyAuthSignature,
@@ -32,17 +23,17 @@ import type { ConfigProviderPayload } from "../forest/types.js";
 
 const PASSPHRASE     = process.env.PV_PASSPHRASE;   // deprecated — backward compat only
 const DATA_DIR       = process.env.PV_DATA_DIR ?? "./data";
-const PORT           = parseInt(process.env.PV_PORT ?? "8080", 10);
+const PORT           = parseInt(process.env.PV_PORT ?? "8081", 10);  // default 8081 (platform port)
 const HOST           = process.env.PV_HOST ?? "0.0.0.0";
 const LOG_LEVEL      = process.env.PV_LOG_LEVEL ?? "info";
-const TMDB_TOKEN_ENV = process.env.PV_TMDB_KEY ?? "";  // legacy fallback only
+const TMDB_TOKEN_ENV = process.env.PV_TMDB_KEY ?? "";
 
-// ── Server key (Phase 6) ───────────────────────────────────────────────────
+// ── Server key ─────────────────────────────────────────────────────────────
 
 interface ServerKey {
   version: number;
-  identityPrivKey: string;      // 32-byte hex secp256k1 private key
-  authPubKey: string | null;    // 33-byte compressed hex — companion registers on first connect
+  identityPrivKey: string;
+  authPubKey: string | null;
 }
 
 const SERVER_KEY_PATH = path.join(DATA_DIR, "server_key.json");
@@ -67,7 +58,6 @@ let privKeyHex: string;
 let identity: Awaited<ReturnType<typeof deriveIdentity>>;
 
 if (PASSPHRASE) {
-  // Backward compat: derive identity from passphrase (existing deployments with PV_PASSPHRASE set)
   console.warn("[PhraseVault] PV_PASSPHRASE is deprecated. Server will migrate to server_key.json on next fresh deploy.");
   privKeyHex = await derivePrivKeyHex(PASSPHRASE);
   identity   = await deriveIdentity(PASSPHRASE);
@@ -80,10 +70,19 @@ if (PASSPHRASE) {
 const pubKeyHex    = Buffer.from(identity.publicKey).toString("hex");
 const forestEncKey = PASSPHRASE ? deriveForestEncKey(PASSPHRASE) : deriveForestEncKey(privKeyHex);
 
+const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
+const PVFS_STORE_DIR = path.join(DATA_DIR, "pvfs");
+mkdirSync(PVFS_STORE_DIR, { recursive: true });
+
+const forestDb     = new ForestDB(FOREST_DB_PATH);
+const forestWalker = new ForestWalker(forestDb, forestEncKey);
+const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
+const pruner       = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+
+await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+
 // ── Auth state ─────────────────────────────────────────────────────────────
 
-// AUTH_PUB_KEY is the companion's auth public key. In passphrase mode it is derived
-// deterministically; in server-key mode it is registered by the companion on first connect.
 let AUTH_PUB_KEY: Uint8Array | null = PASSPHRASE ? deriveAuthPubKey(PASSPHRASE) : (() => {
   const sk = loadOrCreateServerKey();
   return sk.authPubKey ? Buffer.from(sk.authPubKey, "hex") : null;
@@ -93,45 +92,7 @@ const challenges = new Map<string, number>();
 const sessions   = new Map<string, number>();
 
 const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify", "/auth/register"]);
-const API_PREFIXES = [
-  "/search", "/media", "/storage", "/crosslink", "/watchlist",
-  "/follow", "/following", "/identity", "/auth", "/tmdb",
-  "/forest", "/config", "/pvfs",
-];
-
-const FOREST_DB_PATH = process.env.FOREST_DB_PATH ?? path.join(DATA_DIR, "forest.db");
-const PVFS_STORE_DIR = path.join(DATA_DIR, "pvfs");
-mkdirSync(PVFS_STORE_DIR, { recursive: true });
-
-const forestDb = new ForestDB(FOREST_DB_PATH);
-const forestWalker = new ForestWalker(forestDb, forestEncKey);
-const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
-const pruner = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
-
-await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
-
-// ── Hypercore / relay ──────────────────────────────────────────────────────
-
-const ownStore = new HypercoreStore(path.join(DATA_DIR, "feeds"), pubKeyHex);
-await ownStore.open();
-
-const replication = new ReplicationManager(path.join(DATA_DIR, "feeds"));
-await replication.shareOwnFeed(ownStore);
-
-const engine = new RelayQueryEngine();
-engine.addFeed(pubKeyHex, ownStore);
-
-const FOLLOWED_PATH = path.join(DATA_DIR, "followed.json");
-const followedKeys: string[] = existsSync(FOLLOWED_PATH)
-  ? JSON.parse(readFileSync(FOLLOWED_PATH, "utf-8"))
-  : [];
-
-for (const key of followedKeys) {
-  const store = await replication.followFeed(key);
-  engine.addFeed(key, store);
-}
-
-await engine.refresh();
+const API_PREFIXES  = ["/forest", "/config", "/pvfs", "/auth", "/identity"];
 
 // ── Fastify ────────────────────────────────────────────────────────────────
 
@@ -146,7 +107,7 @@ app.addHook("onRequest", async (req, reply) => {
   const isApiRoute = API_PREFIXES.some(p => url === p || url.startsWith(p + "/"));
   if (!isApiRoute) return;
   if (!AUTH_PUB_KEY) {
-    return reply.status(401).send({ error: "server not configured: companion must POST /auth/register first" });
+    return reply.status(401).send({ error: "server not configured: POST /auth/register first" });
   }
   const header = req.headers.authorization ?? "";
   if (!header.startsWith("Bearer ") || !verifySession(sessions, header.slice(7))) {
@@ -163,7 +124,7 @@ app.get("/auth/challenge", async () => ({
 app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", async (req, reply) => {
   const { challenge, signature } = req.body ?? {};
   if (!challenge || !signature) return reply.status(400).send({ error: "missing fields" });
-  if (!AUTH_PUB_KEY) return reply.status(401).send({ error: "server not configured: companion must POST /auth/register first" });
+  if (!AUTH_PUB_KEY) return reply.status(401).send({ error: "server not configured: POST /auth/register first" });
   if (!consumeChallenge(challenges, challenge)) {
     return reply.status(401).send({ error: "invalid or expired challenge" });
   }
@@ -174,17 +135,19 @@ app.post<{ Body: { challenge?: string; signature?: string } }>("/auth/verify", a
   return { token: createSession(sessions), identity: pubKeyHex };
 });
 
-// Register companion auth pubkey (only accepted if server has no registered pubkey and no passphrase).
 app.post<{ Body: { pubKey?: string } }>("/auth/register", async (req, reply) => {
   if (PASSPHRASE) {
     return reply.status(400).send({ error: "server uses passphrase auth — registration not applicable" });
   }
-  if (AUTH_PUB_KEY) {
-    return reply.status(409).send({ error: "already registered" });
-  }
   const { pubKey } = req.body ?? {};
   if (!pubKey || !/^[0-9a-f]{66}$/.test(pubKey)) {
     return reply.status(400).send({ error: "pubKey must be a 33-byte compressed secp256k1 key in hex (66 chars)" });
+  }
+  if (AUTH_PUB_KEY) {
+    // Idempotent: if the same key is already registered, return success
+    const existing = Buffer.from(AUTH_PUB_KEY).toString("hex");
+    if (existing === pubKey) return { registered: true, serverIdentity: pubKeyHex };
+    return reply.status(409).send({ error: "already registered with a different key" });
   }
   const serverKey = loadOrCreateServerKey();
   serverKey.authPubKey = pubKey;
@@ -193,35 +156,16 @@ app.post<{ Body: { pubKey?: string } }>("/auth/register", async (req, reply) => 
   return { registered: true, serverIdentity: pubKeyHex };
 });
 
-// ── Forest routes (forest, config, pvfs, prune) ───────────────────────────
+// ── Forest routes ──────────────────────────────────────────────────────────
 
-registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR, getTmdbToken);
+registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
 
-// ── Static files + SPA fallback ────────────────────────────────────────────
-
-const clientDir = path.join(__dirname, "../client");
-await app.register(staticFiles, {
-  root: clientDir,
-  prefix: "/",
-  decorateReply: false,
-});
-
-app.setNotFoundHandler(async (req, reply) => {
-  if (API_PREFIXES.some(p => req.url === p || req.url.startsWith(p + "/") || req.url.startsWith(p + "?")) ||
-      req.url.startsWith("/health")) {
-    return reply.status(404).send({ error: "not found" });
-  }
-  return reply.sendFile("index.html");
-});
-
-// ── Health (public) ────────────────────────────────────────────────────────
+// ── Health ─────────────────────────────────────────────────────────────────
 
 app.get("/health", async () => ({
   status: "ok",
   identity: pubKeyHex,
-  feedLength: ownStore.length,
-  following: followedKeys.length,
-  indexed: engine.size,
+  forest: FOREST_DB_PATH,
 }));
 
 // ── Identity ───────────────────────────────────────────────────────────────
@@ -229,198 +173,12 @@ app.get("/health", async () => ({
 app.get("/identity", async () => ({
   publicKey: pubKeyHex,
   did: identity.did,
-  feedKey: ownStore.feedKey.toString("hex"),
 }));
-
-// ── Search ─────────────────────────────────────────────────────────────────
-
-app.get<{
-  Querystring: { q?: string; kind?: string; available?: string; watchStatus?: string }
-}>("/search", async (req) => {
-  const { q, kind, available, watchStatus } = req.query;
-  const results = engine.search({
-    query: q,
-    kind: kind as never,
-    availableOnly: available === "true",
-    watchStatus: watchStatus as never,
-  });
-  return { count: results.length, results: results.map(serializeResult) };
-});
-
-app.get<{ Params: { id: string } }>("/media/:id", async (req, reply) => {
-  const result = engine.getById(req.params.id);
-  if (!result) return reply.status(404).send({ error: "not found" });
-  return serializeResult(result);
-});
-
-// ── Publish media ──────────────────────────────────────────────────────────
-
-app.post<{ Body: MediaPayload }>("/media", async (req, reply) => {
-  const node = await createMediaNode(privKeyHex,req.body);
-  await ownStore.append(node);
-  await engine.refresh();
-  reply.status(201);
-  return { id: node.id };
-});
-
-app.post<{ Body: StoragePointerPayload }>("/storage", async (req, reply) => {
-  const node = await createStoragePointerNode(privKeyHex,req.body);
-  await ownStore.append(node);
-  await engine.refresh();
-  reply.status(201);
-  return { id: node.id };
-});
-
-// ── Watchlist ──────────────────────────────────────────────────────────────
-
-app.post<{ Body: CrosslinkPayload }>("/crosslink", async (req, reply) => {
-  const node = await createCrosslinkNode(privKeyHex,{
-    ...req.body,
-    added_at: req.body.added_at ?? Date.now(),
-  });
-  await ownStore.append(node);
-  await engine.refresh();
-  reply.status(201);
-  return { id: node.id };
-});
-
-app.post<{ Body: WatchlistEntryPayload }>("/watchlist", async (req, reply) => {
-  const node = await createWatchlistEntryNode(privKeyHex,{
-    ...req.body,
-    added_at: req.body.added_at ?? Date.now(),
-  });
-  await ownStore.append(node);
-  await engine.refresh();
-  reply.status(201);
-  return { id: node.id };
-});
-
-app.patch<{
-  Params: { mediaId: string };
-  Body: { status?: string; progress_ms?: number };
-}>("/watchlist/:mediaId", async (req, reply) => {
-  const result = engine.getById(req.params.mediaId);
-  if (!result) return reply.status(404).send({ error: "media not found" });
-
-  const existing = result.watchlistEntry;
-  const status = (req.body.status ?? existing?.payload.status ?? "unwatched") as import("../apps/relay/types.js").WatchStatus;
-  const node = await createWatchlistEntryNode(privKeyHex,{
-    media_node_id: req.params.mediaId,
-    crosslink_node_id: existing?.payload.crosslink_node_id ?? "",
-    status,
-    added_at: existing?.payload.added_at ?? Date.now(),
-    progress_ms: req.body.progress_ms ?? existing?.payload.progress_ms,
-    size_bytes: existing?.payload.size_bytes ?? 0,
-    ...(status === "watched" ? { watched_at: Date.now() } : {}),
-  });
-  await ownStore.append(node);
-  await engine.refresh();
-  return { id: node.id, status };
-});
-
-// ── TMDB proxy ────────────────────────────────────────────────────────────
-// Uses the TMDB v4 Read Access Token via Authorization: Bearer header.
-// Forest config takes priority; PV_TMDB_KEY env var is legacy fallback.
-
-const TMDB_BASE = "https://api.themoviedb.org/3";
-
-function getTmdbToken(): string {
-  try {
-    const cfg = forestWalker.getProviderConfig("tmdb");
-    const token = cfg?.["read_access_token"] as string | undefined;
-    if (token) return token;
-  } catch { /* fall through */ }
-  return TMDB_TOKEN_ENV;
-}
-
-function tmdbHeaders(token: string): Record<string, string> {
-  return { Authorization: `Bearer ${token}`, Accept: "application/json" };
-}
-
-app.get<{ Querystring: { q?: string } }>("/tmdb/search", async (req, reply) => {
-  const token = getTmdbToken();
-  if (!token) return reply.status(503).send({ error: "TMDB not configured — add Read Access Token in Settings" });
-  const { q } = req.query;
-  if (!q) return reply.status(400).send({ error: "q is required" });
-
-  const res = await fetch(`${TMDB_BASE}/search/multi?query=${encodeURIComponent(q)}&include_adult=false`, { headers: tmdbHeaders(token) });
-  const data = await res.json() as { results?: Record<string, unknown>[] };
-
-  const results = (data.results ?? [])
-    .filter((r) => r.media_type === "movie" || r.media_type === "tv")
-    .slice(0, 12)
-    .map((r) => ({
-      tmdb_id: String(r.id),
-      media_type: r.media_type as string,
-      title: (r.media_type === "movie" ? r.title : r.name) as string,
-      year: ((r.media_type === "movie" ? r.release_date : r.first_air_date) as string ?? "").slice(0, 4),
-      poster_path: (r.poster_path as string | null) ?? null,
-      overview: (r.overview as string | null) ?? null,
-    }));
-
-  return { results };
-});
-
-app.get<{ Querystring: { id?: string; type?: string } }>("/tmdb/details", async (req, reply) => {
-  const token = getTmdbToken();
-  if (!token) return reply.status(503).send({ error: "TMDB not configured — add Read Access Token in Settings" });
-  const { id, type } = req.query;
-  if (!id || !type) return reply.status(400).send({ error: "id and type are required" });
-
-  const segment = type === "tv" ? "tv" : "movie";
-  const res = await fetch(`${TMDB_BASE}/${segment}/${id}?append_to_response=external_ids`, { headers: tmdbHeaders(token) });
-  const d = await res.json() as Record<string, unknown>;
-
-  const extIds = (d.external_ids ?? {}) as Record<string, unknown>;
-  return {
-    tmdb_id: String(d.id),
-    media_type: type,
-    title: (type === "movie" ? d.title : d.name) as string,
-    year: ((type === "movie" ? d.release_date : d.first_air_date) as string ?? "").slice(0, 4),
-    genres: ((d.genres as { name: string }[] | undefined) ?? []).map((g) => g.name),
-    imdb_id: (d.imdb_id ?? extIds.imdb_id ?? undefined) as string | undefined,
-    tvdb_id: extIds.tvdb_id ? String(extIds.tvdb_id) : undefined,
-    runtime_min: (type === "movie" ? d.runtime : (d.episode_run_time as number[] | undefined)?.[0]) as number | undefined,
-    poster_path: (d.poster_path as string | null) ?? null,
-    overview: (d.overview as string | null) ?? null,
-  };
-});
-
-// ── Follow / unfollow peers ────────────────────────────────────────────────
-
-app.post<{ Body: { feedKey: string } }>("/follow", async (req, reply) => {
-  const { feedKey } = req.body;
-  if (followedKeys.includes(feedKey)) {
-    return reply.status(409).send({ error: "already following" });
-  }
-  const store = await replication.followFeed(feedKey);
-  engine.addFeed(feedKey, store);
-  followedKeys.push(feedKey);
-  writeFileSync(FOLLOWED_PATH, JSON.stringify(followedKeys));
-  await engine.refresh();
-  reply.status(201);
-  return { following: feedKey };
-});
-
-app.delete<{ Params: { feedKey: string } }>("/follow/:feedKey", async (req) => {
-  const { feedKey } = req.params;
-  await replication.unfollow(feedKey);
-  engine.removeFeed(feedKey);
-  const idx = followedKeys.indexOf(feedKey);
-  if (idx !== -1) followedKeys.splice(idx, 1);
-  writeFileSync(FOLLOWED_PATH, JSON.stringify(followedKeys));
-  await engine.refresh();
-  return { unfollowed: feedKey };
-});
-
-app.get("/following", async () => ({ keys: followedKeys }));
 
 // ── Shutdown ───────────────────────────────────────────────────────────────
 
 async function shutdown() {
   await app.close();
-  await replication.close();
-  await ownStore.close();
   forestDb.close();
   process.exit(0);
 }
@@ -431,10 +189,9 @@ process.on("SIGINT", shutdown);
 
 await app.listen({ port: PORT, host: HOST });
 app.log.info(`identity: ${pubKeyHex.slice(0, 16)}...`);
-app.log.info(`feed: ${ownStore.feedKey.toString("hex").slice(0, 16)}...`);
 app.log.info(`forest: ${FOREST_DB_PATH}`);
 
-// ── Bootstrap forest (runs once on first start) ────────────────────────────
+// ── Bootstrap forest ───────────────────────────────────────────────────────
 
 async function bootstrapForest(
   db: ForestDB,
@@ -447,87 +204,56 @@ async function bootstrapForest(
 
   const now = Date.now();
 
-  // Helper: create a node with correct visibility and payload serialization.
   async function makeNode(type: Parameters<typeof createNode>[0]["type"], label: string, rawPayload: unknown) {
-    const vis = defaultVisibility(type)
-    const payload = serializePayload(rawPayload, vis, vis === "public" ? null : encKey)
-    return createNode({ type, label, visibility: vis, payload, created_at: now, author: authorPubKey }, privKey)
+    const vis = defaultVisibility(type);
+    const payload = serializePayload(rawPayload, vis, vis === "public" ? null : encKey);
+    return createNode({ type, label, visibility: vis, payload, created_at: now, author: authorPubKey }, privKey);
   }
 
-  const forestRoot = await makeNode("forest.root", "MediaForest", { version: 1 })
-  db.insertNode(forestRoot)
+  const forestRoot = await makeNode("forest.root", "MediaForest", { version: 1 });
+  db.insertNode(forestRoot);
   db.insertLink(await createLink({
     parent_id: null, child_id: forestRoot.id,
     link_type: "branch", truth_score: 1.0, sort_key: null,
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey))
+  }, privKey));
 
-  const configRoot = await makeNode("tree.root", "Configuration", {})
-  db.insertNode(configRoot)
+  const configRoot = await makeNode("tree.root", "Configuration", {});
+  db.insertNode(configRoot);
   db.insertLink(await createLink({
     parent_id: forestRoot.id, child_id: configRoot.id,
     link_type: "branch", truth_score: 1.0, sort_key: "config",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey))
+  }, privKey));
 
-  const providersSection = await makeNode("config.section", "Metadata Providers", {})
-  db.insertNode(providersSection)
+  const providersSection = await makeNode("config.section", "Metadata Providers", {});
+  db.insertNode(providersSection);
   db.insertLink(await createLink({
     parent_id: configRoot.id, child_id: providersSection.id,
     link_type: "branch", truth_score: 1.0, sort_key: "metadata_providers",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey))
+  }, privKey));
 
   const tmdbProvider = await makeNode("config.provider", "TMDB", {
     provider_id: "tmdb",
     name: "The Movie Database (TMDB)",
     enabled: false,
-  } satisfies ConfigProviderPayload)
-  db.insertNode(tmdbProvider)
+  } satisfies ConfigProviderPayload);
+  db.insertNode(tmdbProvider);
   db.insertLink(await createLink({
     parent_id: providersSection.id, child_id: tmdbProvider.id,
     link_type: "branch", truth_score: 1.0, sort_key: "tmdb",
     score_method: null, created_at: now, author: authorPubKey,
-  }, privKey))
+  }, privKey));
 
-  // If legacy env var is set, migrate it into the config tree automatically.
   if (TMDB_TOKEN_ENV) {
-    const tokenNode = await makeNode("config.value", "read_access_token", { key: "read_access_token", value: TMDB_TOKEN_ENV })
-    db.insertNode(tokenNode)
+    const tokenNode = await makeNode("config.value", "read_access_token", { key: "read_access_token", value: TMDB_TOKEN_ENV });
+    db.insertNode(tokenNode);
     db.insertLink(await createLink({
       parent_id: tmdbProvider.id, child_id: tokenNode.id,
       link_type: "branch", truth_score: 1.0, sort_key: "read_access_token",
       score_method: null, created_at: now, author: authorPubKey,
-    }, privKey))
+    }, privKey));
   }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-function serializeResult(r: import("../apps/relay/query.js").MediaResult) {
-  return {
-    id: r.media.id,
-    title: r.media.payload.title,
-    year: r.media.payload.year,
-    kind: r.media.payload.kind,
-    genres: r.media.payload.genres,
-    imdb_id: r.media.payload.imdb_id,
-    sources: r.sources.map(s => ({
-      storageNodeId: s.storagePointer.id,
-      endpointUrl: s.storagePointer.payload.endpoint_url,
-      encoding: s.storagePointer.payload.encoding,
-      available: s.storagePointer.payload.available,
-      sizeBytes: s.storagePointer.payload.size_bytes,
-      feedOwner: s.feedOwner,
-    })),
-    bestSource: r.bestSource ? {
-      endpointUrl: r.bestSource.storagePointer.payload.endpoint_url,
-      encoding: r.bestSource.storagePointer.payload.encoding,
-    } : null,
-    watchlist: r.watchlistEntry ? {
-      status: r.watchlistEntry.payload.status,
-      addedAt: r.watchlistEntry.payload.added_at,
-      progressMs: r.watchlistEntry.payload.progress_ms,
-    } : null,
-  };
-}

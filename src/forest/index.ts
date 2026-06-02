@@ -1,5 +1,4 @@
 export { ForestDB } from './db.js'
-export type { MatchCandidate, MatchSearchResult } from './matcher.js'
 export { ForestWalker } from './walker.js'
 export { PVFSVerifier } from './pvfs.js'
 export { Pruner } from './pruner.js'
