@@ -99,6 +99,39 @@ tests/
 SECURITY.md
 ```
 
+## Local Auth Agent
+
+The `agent/companion.mjs` script is a local auth agent for MediaForest and other PhraseVault-backed apps. It holds your derived auth key in memory and signs server challenges automatically, so you only type your passphrase once per session.
+
+**Requirements:** Node.js 18+
+
+**First-time setup:**
+
+```bash
+cd /path/to/phrasevault-repo
+node agent/companion.mjs
+```
+
+The setup wizard will prompt for your passphrase, verify it against your server, and offer to run the agent in the background. Config is saved to `~/.config/phrasevault/config.json` (chmod 600).
+
+**Subsequent runs** (if not already running):
+
+```bash
+node agent/companion.mjs        # starts in background by default
+node agent/companion.mjs --status
+node agent/companion.mjs --stop
+node agent/companion.mjs --setup   # reconfigure
+```
+
+The agent listens on `http://localhost:8765`. MediaForest detects it automatically on login.
+
+**macOS auto-start** — install the provided launchd plist:
+
+```bash
+cp agent/com.phrasevault.companion.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.phrasevault.companion.plist
+```
+
 ## License
 
 GNU General Public License v3 or later. See [LICENSE](LICENSE).
