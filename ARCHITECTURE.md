@@ -626,12 +626,24 @@ Get a token at https://www.themoviedb.org/settings/api — use the "API Read Acc
 ### HTTP API
 
 Current endpoints (`src/server/index.ts`):
-- `GET /health` — status, identity pubkey, feed/forest counts
+
+Auth (public — no token required):
+- `GET /auth/status` — `{ hasOwner: bool }` — tells UI whether owner is registered
+- `GET /auth/challenge` — one-time nonce
+- `POST /auth/register { pubKey, inviteToken?, name? }` — first user: no token; subsequent users: token required
+- `POST /auth/verify { challenge, signature }` — returns `{ token, identity, userPubKey, userRole, userName }`
+
+Auth (owner only):
+- `POST /auth/invite` — generate a single-use 7-day invite token
+- `GET /auth/users` — list all registered users
+
+Media / library:
+- `GET /health` — status, identity pubkey, feed/forest counts, `hasOwner`
 - `GET /identity` — publicKey hex, DID, feedKey hex
-- `GET /search?q=&kind=&available=&watchStatus=`
+- `GET /search?q=&kind=&available=&watchStatus=` — results scoped to current user's watchlist
 - `GET /media/:id`
 - `POST /media`, `POST /storage`, `POST /crosslink`
-- `PATCH /watchlist/:mediaId`
+- `POST /watchlist`, `PATCH /watchlist/:mediaId` — watchlist entries tagged with current user's pubkey
 - `POST /follow`, `DELETE /follow/:feedKey`, `GET /following`
 - `GET /tmdb/search?q=`, `GET /tmdb/details?id=&type=`
 - Forest/config/PVFS/prune routes (see Forest HTTP API section below)
@@ -780,10 +792,19 @@ Add payload encryption for private and community nodes:
 7. Update companion — derive `forestEncKey` on startup; companion is the crypto boundary
 8. Default node types to correct visibility (public/private per table above)
 
-### Phase 6 — Multi-Tenant Server
+### Phase 6 — Multi-User Auth ✅ Done in MediaForest (2026-06-03)
 
-Remove `PV_PASSPHRASE` single-user model:
+MediaForest implements a pragmatic multi-user model on top of the single shared Hypercore feed (per-user SQLite forests are a future PhraseVault platform concern):
 
+- `server_key.json` holds a `users[]` array of `{ pubKey, name, role, createdAt }` records
+- First user to register becomes owner (no invite needed); all others require a one-time invite token
+- Invite tokens: single-use, 7-day TTL, stored in `DATA_DIR/invites.json`
+- Sessions map to a specific user pubkey; `verifySession()` returns the `UserRecord`
+- `/auth/status` lets the UI detect unregistered servers and show "Set up" vs "Login"
+- Watchlist entries carry `user_pub_key` in their payload; query engine filters per user at request time
+- Existing entries without `user_pub_key` are treated as "legacy" shared entries
+
+Full PhraseVault platform multi-tenant (per-user forest isolation) remains future work:
 1. `src/multi-tenant/users.ts` — users.db (pubKey → forest path registry)
 2. `src/multi-tenant/router.ts` — per-request ForestDB routing
 3. `src/multi-tenant/registration.ts` — open/closed mode, `/auth/register`, `/auth/revoke`
