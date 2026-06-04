@@ -94,6 +94,15 @@ fi
 NODE_BIN="$(which node)"
 echo "✓ Companion script: $AGENT_SCRIPT"
 
+# ── Install npm dependencies ──────────────────────────────────────────────────
+
+if [ ! -d "$REPO_DIR/node_modules/@noble" ]; then
+  echo
+  echo "Installing dependencies (npm install)…"
+  npm install --prefix "$REPO_DIR" --omit=dev --silent
+  echo "✓ Dependencies installed"
+fi
+
 # ── macOS: launchd ────────────────────────────────────────────────────────────
 
 if [ "$OS" = "Darwin" ]; then
