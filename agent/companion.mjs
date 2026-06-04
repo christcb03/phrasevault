@@ -347,6 +347,13 @@ function startHttpServer(authKey, config) {
       return
     }
 
+    if (req.method === 'GET' && req.url === '/pubkey') {
+      const pubKeyBytes = secp.getPublicKey(authKey, true)
+      const pubKey = Array.from(pubKeyBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+      sendJson(res, 200, { pubKey })
+      return
+    }
+
     if (req.method === 'POST' && req.url === '/sign') {
       let body
       try { body = await readBody(req) }
