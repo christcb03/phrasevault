@@ -426,7 +426,7 @@ async function handleDetachCommand(originalArgs) {
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PV_AGENT_PORT ?? '8765', 10)
-const HOST = '127.0.0.1'
+const HOST = process.env.PV_AGENT_BIND ?? '127.0.0.1'
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
