@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * PhraseVault Local Auth Agent
+ * PhraseVault / MediaForest Companion Agent
  *
- * Signs server challenges on behalf of the browser so the passphrase never
+ * Signs server challenges on behalf of the browser so your passphrase never
  * enters a browser process. Listens only on 127.0.0.1:8765.
  *
  * Normal usage:
@@ -19,7 +19,7 @@ import { createServer }                         from 'node:http'
 import { readFileSync, writeFileSync,
          existsSync, mkdirSync, openSync,
          closeSync }                            from 'node:fs'
-import { join, dirname }                        from 'node:path'
+import { join }                                 from 'node:path'
 import { homedir }                              from 'node:os'
 import { createInterface }                      from 'node:readline'
 import { fileURLToPath }                        from 'node:url'
@@ -51,6 +51,11 @@ function concat(a, b) {
 
 function deriveAuthKey(passphrase) {
   return blake3(concat(DOMAIN_AUTH, ENC.encode(passphrase)))
+}
+
+function pubKeyHex(authKey) {
+  const bytes = secp.getPublicKey(authKey, true)
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
 async function signChallenge(authKey, challenge) {
@@ -87,7 +92,6 @@ function readLine(prompt) {
 function readSecret(prompt) {
   return new Promise(resolve => {
     if (!process.stdin.isTTY) {
-      // Non-interactive: read a single line from stdin
       const rl = createInterface({ input: process.stdin })
       rl.once('line', line => { rl.close(); resolve(line.trim()) })
       return
@@ -98,16 +102,16 @@ function readSecret(prompt) {
     process.stdin.setEncoding('utf8')
     let input = ''
     function handler(ch) {
-      if (ch === '\r' || ch === '\n' || ch === '') {
+      if (ch === '\r' || ch === '\n' || ch === '') {
         process.stdin.setRawMode(false)
         process.stdin.pause()
         process.stdin.removeListener('data', handler)
         process.stdout.write('\n')
         resolve(input)
-      } else if (ch === '') {
+      } else if (ch === '') {
         process.stdout.write('\n')
         process.exit(0)
-      } else if (ch === '' || ch === '\b') {
+      } else if (ch === '' || ch === '\b') {
         if (input.length > 0) { input = input.slice(0, -1); process.stdout.write('\b \b') }
       } else {
         input += ch
@@ -118,14 +122,25 @@ function readSecret(prompt) {
   })
 }
 
-// ── Server test ───────────────────────────────────────────────────────────────
+// ── Server communication ──────────────────────────────────────────────────────
 
+/**
+ * Test auth against a server.
+ * Returns:
+ *   { ok: true }
+ *   { ok: false, reason, notRegistered: true }   — server reachable but key unknown
+ *   { ok: false, reason, noOwner: true }          — server has no users yet (owner setup)
+ *   { ok: false, reason }                         — connection or other error
+ */
 async function testServerAuth(serverUrl, authKey, timeoutMs = 5000) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const challengeRes = await fetch(`${serverUrl}/auth/challenge`, { signal: ctrl.signal })
-    if (!challengeRes.ok) return { ok: false, reason: `challenge endpoint returned ${challengeRes.status}` }
+    if (!challengeRes.ok) {
+      clearTimeout(timer)
+      return { ok: false, reason: `challenge endpoint returned ${challengeRes.status}` }
+    }
     const { challenge } = await challengeRes.json()
 
     const signature = await signChallenge(authKey, challenge)
@@ -139,7 +154,16 @@ async function testServerAuth(serverUrl, authKey, timeoutMs = 5000) {
     clearTimeout(timer)
 
     if (verifyRes.ok) return { ok: true }
-    if (verifyRes.status === 401) return { ok: false, reason: 'passphrase does not match this server' }
+
+    const errBody = await verifyRes.json().catch(() => ({}))
+    const errMsg = errBody?.error ?? ''
+
+    if (verifyRes.status === 401) {
+      if (errMsg.includes('server not configured') || errMsg.includes('register an owner')) {
+        return { ok: false, reason: 'Server has no users yet (owner setup needed)', noOwner: true }
+      }
+      return { ok: false, reason: 'Passphrase not registered on this server', notRegistered: true }
+    }
     return { ok: false, reason: `server returned ${verifyRes.status}` }
   } catch (err) {
     clearTimeout(timer)
@@ -148,21 +172,49 @@ async function testServerAuth(serverUrl, authKey, timeoutMs = 5000) {
   }
 }
 
+/**
+ * Register this key with a server.
+ * Returns { ok: true } or { ok: false, reason, needsInvite: true }
+ */
+async function registerWithServer(serverUrl, authKey, { inviteToken, name, password } = {}) {
+  const pubKey = pubKeyHex(authKey)
+  const body = { pubKey }
+  if (inviteToken) body.inviteToken = inviteToken
+  if (name)        body.name = name
+  if (password)    body.recoveryPassword = password
+
+  try {
+    const res = await fetch(`${serverUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (res.ok) return { ok: true }
+    const errBody = await res.json().catch(() => ({}))
+    const errMsg = errBody?.error ?? `server returned ${res.status}`
+    if (res.status === 403 && errMsg.includes('invite')) {
+      return { ok: false, reason: errMsg, needsInvite: true }
+    }
+    return { ok: false, reason: errMsg }
+  } catch (err) {
+    return { ok: false, reason: err.message }
+  }
+}
+
 // ── Setup wizard ──────────────────────────────────────────────────────────────
 
 async function runSetupWizard(existingConfig) {
-  console.log('\n╔══════════════════════════════════════╗')
-  console.log('║   PhraseVault Companion Setup        ║')
-  console.log('╚══════════════════════════════════════╝\n')
+  console.log('\n╔══════════════════════════════════════════╗')
+  console.log('║   MediaForest Companion Setup            ║')
+  console.log('╚══════════════════════════════════════════╝\n')
+  console.log('The companion stores your identity key and signs logins automatically.')
+  console.log('Your passphrase never leaves this machine.\n')
 
   if (existingConfig) {
     console.log('Existing config found. This will update it.\n')
   }
 
   // ── Passphrase ──
-  console.log('Your passphrase is used to derive your identity.')
-  console.log('It never leaves this machine.\n')
-
   let passphrase
   while (true) {
     passphrase = await readSecret('Passphrase: ')
@@ -179,11 +231,11 @@ async function runSetupWizard(existingConfig) {
   }
 
   const authKey = deriveAuthKey(passphrase)
-  console.log('\n✓ Passphrase accepted and key derived.\n')
+  console.log('\n✓ Key derived.\n')
 
   // ── Servers ──
   const servers = existingConfig?.servers ?? []
-  console.log('Add your MediaForest server(s). Leave blank when done.')
+  console.log('Add your MediaForest server URL(s). Leave blank when done.\n')
   if (servers.length > 0) {
     console.log(`Currently configured: ${servers.map(s => s.url).join(', ')}`)
     const keep = await readLine('Keep existing servers? [Y/n]: ')
@@ -191,17 +243,29 @@ async function runSetupWizard(existingConfig) {
   }
 
   while (true) {
-    const url = await readLine(`Server URL ${servers.length + 1} (e.g. https://pvtest.turnernetworking.com): `)
+    const url = await readLine(`Server URL (e.g. https://mymediaforest.example.com): `)
     if (!url) break
 
     const cleanUrl = url.replace(/\/$/, '')
-    process.stdout.write(`  Testing connection to ${cleanUrl}... `)
+    process.stdout.write(`  Connecting to ${cleanUrl}... `)
     const result = await testServerAuth(cleanUrl, authKey)
 
     if (result.ok) {
-      console.log('✓ Connected and passphrase verified!')
+      console.log('✓ Signed in successfully!')
       const name = await readLine('  Friendly name for this server (optional): ')
       servers.push({ url: cleanUrl, name: name || null, registered: true })
+    } else if (result.notRegistered || result.noOwner) {
+      console.log(result.noOwner ? '(new server, no accounts yet)' : '(not registered)')
+      const reg = await readLine('  Register a new account on this server? [Y/n]: ')
+      if (reg.toLowerCase() !== 'n') {
+        await runRegistrationFlow(cleanUrl, authKey, servers, result.noOwner)
+      } else {
+        const add = await readLine('  Add server without registering? [y/N]: ')
+        if (add.toLowerCase() === 'y') {
+          const name = await readLine('  Friendly name: ')
+          servers.push({ url: cleanUrl, name: name || null, registered: false })
+        }
+      }
     } else {
       console.log(`✗ ${result.reason}`)
       const add = await readLine('  Add it anyway? [y/N]: ')
@@ -216,16 +280,70 @@ async function runSetupWizard(existingConfig) {
   }
 
   if (servers.length === 0) {
-    console.log('\nNo servers configured. You can add them later with --setup.')
+    console.log('\nNo servers configured. Run --setup later to add one.')
   }
 
-  // ── Save ──
   const cfg = { passphrase, servers }
   saveConfig(cfg)
   console.log(`\n✓ Config saved to ${CONFIG_PATH}`)
   console.log('  (chmod 600 — readable only by you)\n')
 
   return cfg
+}
+
+async function runRegistrationFlow(serverUrl, authKey, servers, isOwnerSetup) {
+  console.log()
+  if (isOwnerSetup) {
+    console.log('  This will create the owner (admin) account on the server.')
+  } else {
+    console.log('  You can register without an invite if the server is in open mode.')
+    console.log('  If registration fails, ask the server owner for an invite token.\n')
+  }
+
+  const name = await readLine('  Your display name (optional): ')
+  const password = await readSecret('  Account password (lets you log in from any device — recommended): ')
+  if (password && password.length < 8) {
+    console.log('  Password must be at least 8 characters. Skipping password.')
+  }
+  const validPassword = password && password.length >= 8 ? password : null
+  let inviteToken = null
+
+  while (true) {
+    process.stdout.write('  Registering...')
+    const result = await registerWithServer(serverUrl, authKey, {
+      inviteToken: inviteToken || undefined,
+      name: name || undefined,
+      password: validPassword || undefined,
+    })
+
+    if (result.ok) {
+      console.log(' ✓ Registered!')
+      // Verify auth now works
+      process.stdout.write('  Verifying login... ')
+      const authResult = await testServerAuth(serverUrl, authKey)
+      if (authResult.ok) {
+        console.log('✓ Signed in successfully!')
+        const srvName = await readLine('  Friendly name for this server (optional): ')
+        servers.push({ url: serverUrl, name: srvName || null, registered: true })
+      } else {
+        console.log(`✗ ${authResult.reason}`)
+        console.log('  Registration succeeded but login failed. Check server logs.')
+        servers.push({ url: serverUrl, name: null, registered: false })
+      }
+      return
+    } else if (result.needsInvite) {
+      console.log(` ✗ ${result.reason}`)
+      inviteToken = await readLine('  Enter invite token (or leave blank to skip): ')
+      if (!inviteToken) {
+        console.log('  Skipping registration for this server.')
+        return
+      }
+    } else {
+      console.log(` ✗ ${result.reason}`)
+      const retry = await readLine('  Try again? [y/N]: ')
+      if (retry.toLowerCase() !== 'y') return
+    }
+  }
 }
 
 // ── Startup self-test ─────────────────────────────────────────────────────────
@@ -242,8 +360,10 @@ async function runSelfTests(authKey, servers) {
       console.log('✓ OK')
     } else {
       console.log(`✗ ${result.reason}`)
-      if (result.reason?.includes('passphrase does not match')) {
-        console.error('[companion] WARNING: Passphrase mismatch on server — run --setup to reconfigure')
+      if (result.notRegistered) {
+        console.error('[companion] WARNING: Not registered on this server — run --setup to register')
+      } else if (result.noOwner) {
+        console.error('[companion] WARNING: Server has no accounts yet — run --setup to register as owner')
       }
     }
   }
@@ -341,16 +461,14 @@ function startHttpServer(authKey, config) {
     if (req.method === 'GET' && req.url === '/health') {
       sendJson(res, 200, {
         ok: true,
-        version: '1',
-        servers: (config.servers ?? []).map(s => ({ url: s.url, name: s.name })),
+        version: '2',
+        servers: (config.servers ?? []).map(s => ({ url: s.url, name: s.name, registered: s.registered })),
       })
       return
     }
 
     if (req.method === 'GET' && req.url === '/pubkey') {
-      const pubKeyBytes = secp.getPublicKey(authKey, true)
-      const pubKey = Array.from(pubKeyBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-      sendJson(res, 200, { pubKey })
+      sendJson(res, 200, { pubKey: pubKeyHex(authKey) })
       return
     }
 
@@ -383,7 +501,7 @@ function startHttpServer(authKey, config) {
 
   httpServer.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`[companion] Port ${PORT} in use — is the companion already running? Try --status`)
+      console.error(`[companion] Port ${PORT} in use — already running? Try --status`)
     } else {
       console.error('[companion] Server error:', err)
     }
@@ -398,13 +516,9 @@ function startHttpServer(authKey, config) {
 
 const args = process.argv.slice(2)
 
-// Maintenance flags — handle and exit
 if (args.includes('--status')) { await handleStatusCommand() }
 if (args.includes('--stop'))   { await handleStopCommand() }
-// --detach is used internally by handleDetachCommand; not documented as user-facing
 if (args.includes('--detach')) { await handleDetachCommand(args) }
-
-// ── Config ───────────────────────────────────────────────────────────────────
 
 const forceSetup = args.includes('--setup')
 let config = loadConfig()
@@ -412,7 +526,6 @@ let config = loadConfig()
 if (!config || forceSetup) {
   config = await runSetupWizard(config)
 } else {
-  // Existing config — show a summary so the user knows what's loaded
   console.log(`\nConfig:  ${CONFIG_PATH}`)
   const serverList = (config.servers ?? []).map(s => s.name ? `${s.name} (${s.url})` : s.url).join('\n         ') || '(none configured)'
   console.log(`Servers: ${serverList}`)
@@ -423,34 +536,24 @@ if (!config?.passphrase) {
   process.exit(1)
 }
 
-// ── Already running? ─────────────────────────────────────────────────────────
-
 const existingPid = readPid()
 if (existingPid && isRunning(existingPid)) {
   console.log(`\n[companion] Already running (PID ${existingPid}) — nothing to do.`)
-  console.log(`[companion] Use --stop to stop it.`)
+  console.log(`[companion] Use --stop to stop it, --setup to reconfigure.`)
   process.exit(0)
 }
 
-// ── Derive key ────────────────────────────────────────────────────────────────
-
 const authKey = deriveAuthKey(config.passphrase)
 const runConfig = { ...config, passphrase: undefined }
-
-// ── Start ─────────────────────────────────────────────────────────────────────
-// If stdin is a TTY: ask whether to start in background (default yes).
-// If stdin is not a TTY (e.g. the detached child): start in foreground directly.
 
 if (process.stdin.isTTY) {
   const answer = await readLine('\nStart agent in background? [Y/n]: ')
   if (answer.toLowerCase() !== 'n') {
     await handleDetachCommand(args.filter(a => a !== '--setup'))
-    // handleDetachCommand calls process.exit(0) for the parent — won't reach here
   }
   console.log('[companion] Starting in foreground. Ctrl+C to stop.')
 }
 
-// Foreground start (also used by the detached child process)
 console.log('[companion] Key derived. Passphrase reference released.')
 await runSelfTests(authKey, runConfig.servers)
 writePid()

@@ -99,37 +99,27 @@ tests/
 SECURITY.md
 ```
 
-## Local Auth Agent
+## Local Auth Agent (Companion)
 
-The `agent/companion.mjs` script is a local auth agent for MediaForest and other PhraseVault-backed apps. It holds your derived auth key in memory and signs server challenges automatically, so you only type your passphrase once per session.
+The `agent/` directory contains the companion app for MediaForest. It holds your identity key in memory and signs logins automatically — once running, opening MediaForest logs you in with no password prompt.
 
-**Requirements:** Node.js 18+
-
-**First-time setup:**
+**Quick install (macOS/Linux):**
 
 ```bash
-cd /path/to/phrasevault-repo
-node agent/companion.mjs
+git clone https://github.com/christcb03/phrasevault.git ~/phrasevault-repo
+bash ~/phrasevault-repo/agent/install.sh
 ```
 
-The setup wizard will prompt for your passphrase, verify it against your server, and offer to run the agent in the background. Config is saved to `~/.config/phrasevault/config.json` (chmod 600).
+The install script sets up autostart (launchd on macOS, systemd on Linux) and runs the setup wizard. The wizard asks for your passphrase and server URL, and can register a new account on the server right there if you don't have one yet.
 
-**Subsequent runs** (if not already running):
+See **[agent/INSTALL.md](agent/INSTALL.md)** for the full guide.
 
-```bash
-node agent/companion.mjs        # starts in background by default
-node agent/companion.mjs --status
-node agent/companion.mjs --stop
-node agent/companion.mjs --setup   # reconfigure
-```
-
-The agent listens on `http://localhost:8765`. MediaForest detects it automatically on login.
-
-**macOS auto-start** — install the provided launchd plist:
+**Common commands:**
 
 ```bash
-cp agent/com.phrasevault.companion.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.phrasevault.companion.plist
+node agent/companion.mjs --status   # is it running?
+node agent/companion.mjs --stop     # stop it
+node agent/companion.mjs --setup    # reconfigure (add server, change passphrase)
 ```
 
 ## License
