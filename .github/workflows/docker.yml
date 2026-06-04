@@ -53,22 +53,22 @@ jobs:
 
       - name: Notify Telegram on success
         if: success() && env.TELEGRAM_BOT_TOKEN != ''
-        uses: appleboy/telegram-action@v1.0.1
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          message: |
-            ✅ PhraseVault image pushed to GHCR
-            Commit: ${{ github.sha }} by ${{ github.actor }}
-            Watchtower will deploy within 5 minutes.
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=✅ PhraseVault image pushed to GHCR
+          Commit: ${{ github.sha }} by ${{ github.actor }}
+          Watchtower will deploy within 5 minutes."
 
       - name: Notify Telegram on failure
         if: failure() && env.TELEGRAM_BOT_TOKEN != ''
-        uses: appleboy/telegram-action@v1.0.1
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          message: |
-            ❌ PhraseVault build FAILED
-            Commit: ${{ github.sha }} by ${{ github.actor }}
-            Check: https://github.com/${{ github.repository }}/actions
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=❌ PhraseVault build FAILED
+          Commit: ${{ github.sha }} by ${{ github.actor }}
+          Check: https://github.com/${{ github.repository }}/actions"
