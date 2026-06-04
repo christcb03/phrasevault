@@ -19,17 +19,66 @@ PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 
 OS="$(uname -s)"
 
-# ── Check Node.js ────────────────────────────────────────────────────────────
+# ── Check / install Node.js ───────────────────────────────────────────────────
+
+install_node() {
+  if [ "$OS" = "Darwin" ]; then
+    if command -v brew &>/dev/null; then
+      echo "  Installing Node.js via Homebrew…"
+      brew install node
+    else
+      echo "  Homebrew not found. Install Node.js from https://nodejs.org/ (v18+) then re-run this script."
+      exit 1
+    fi
+  elif [ "$OS" = "Linux" ]; then
+    # Detect package manager
+    if command -v apt-get &>/dev/null; then
+      echo "  Installing Node.js 20 LTS via NodeSource…"
+      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+      sudo apt-get install -y nodejs
+    elif command -v dnf &>/dev/null; then
+      echo "  Installing Node.js via dnf…"
+      sudo dnf install -y nodejs
+    elif command -v yum &>/dev/null; then
+      echo "  Installing Node.js via yum…"
+      curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+      sudo yum install -y nodejs
+    elif command -v pacman &>/dev/null; then
+      echo "  Installing Node.js via pacman…"
+      sudo pacman -Sy --noconfirm nodejs npm
+    else
+      echo "  Cannot detect package manager. Install Node.js from https://nodejs.org/ (v18+) then re-run."
+      exit 1
+    fi
+  else
+    echo "  Unsupported OS. Install Node.js from https://nodejs.org/ (v18+) then re-run."
+    exit 1
+  fi
+}
 
 if ! command -v node &>/dev/null; then
-  echo "✗ Node.js not found. Install it from https://nodejs.org/ (v18 or newer)."
-  exit 1
+  echo "✗ Node.js not found."
+  read -r -p "  Install it now? [Y/n] " yn
+  yn="${yn:-Y}"
+  if [[ "$yn" =~ ^[Yy] ]]; then
+    install_node
+  else
+    echo "  Skipping. Re-run this script after installing Node.js v18+ from https://nodejs.org/"
+    exit 1
+  fi
 fi
 
 NODE_VERSION="$(node --version | sed 's/v//' | cut -d. -f1)"
 if [ "$NODE_VERSION" -lt 18 ]; then
-  echo "✗ Node.js $NODE_VERSION is too old. Need v18+. Install from https://nodejs.org/"
-  exit 1
+  echo "✗ Node.js v$NODE_VERSION is too old (need v18+)."
+  read -r -p "  Upgrade it now? [Y/n] " yn
+  yn="${yn:-Y}"
+  if [[ "$yn" =~ ^[Yy] ]]; then
+    install_node
+  else
+    echo "  Skipping. Re-run after upgrading Node.js to v18+ from https://nodejs.org/"
+    exit 1
+  fi
 fi
 
 echo "✓ Node.js $(node --version) found at $(which node)"
