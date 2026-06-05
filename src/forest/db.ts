@@ -333,6 +333,16 @@ export class ForestDB {
       'SELECT * FROM pvfs_scan_jobs ORDER BY started_at DESC LIMIT ?',
     ).all(limit) as RawScanJob[]).map(deserializeScanJob)
   }
+
+  /** Wipe all forest nodes, links, and scan jobs (factory reset). */
+  factoryReset(): void {
+    this.db.exec(`
+      DELETE FROM link_sibling_order;
+      DELETE FROM truth_links;
+      DELETE FROM truth_nodes;
+      DELETE FROM pvfs_scan_jobs;
+    `)
+  }
 }
 
 export interface PvfsScanJobRow {

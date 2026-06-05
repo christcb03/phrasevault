@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import path from "path";
 import { fileURLToPath } from "url";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, rmSync } from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -98,7 +98,7 @@ const challenges = new Map<string, number>();
 const sessions   = new Map<string, number>();
 
 const PUBLIC_ROUTES = new Set(["/health", "/auth/challenge", "/auth/verify", "/auth/register"]);
-const API_PREFIXES  = ["/forest", "/config", "/pvfs", "/auth", "/identity"];
+const API_PREFIXES  = ["/forest", "/config", "/pvfs", "/auth", "/identity", "/admin"];
 
 // ── Fastify ────────────────────────────────────────────────────────────────
 
@@ -165,6 +165,54 @@ app.post<{ Body: { pubKey?: string } }>("/auth/register", async (req, reply) => 
 // ── Forest routes ──────────────────────────────────────────────────────────
 
 registerForestRoutes(app, forestDb, forestWalker, pvfsVerifier, pruner, pubKeyHex, privKeyHex, forestEncKey, PVFS_STORE_DIR);
+
+const PV_FACTORY_RESET_PHRASE = "DELETE ALL MEDIA DATA";
+
+app.get("/admin/factory-reset/preview", async (_req, reply) => {
+  const fileNodes = forestDb.getNodesByType("pvfs.file").length;
+  return reply.send({
+    warning:
+      "Permanently deletes all forest nodes, PVFS file metadata, scan jobs, and copied blobs in the PVFS store. "
+      + "MediaForest must call this during a full server factory reset.",
+    confirmation_phrase_required: PV_FACTORY_RESET_PHRASE,
+    pvfs_file_nodes: fileNodes,
+    forest_db: FOREST_DB_PATH,
+  });
+});
+
+app.post<{
+  Body: {
+    confirmation_phrase?: string;
+    acknowledge_irreversible?: boolean;
+  };
+}>("/admin/factory-reset", async (req, reply) => {
+  const { confirmation_phrase, acknowledge_irreversible } = req.body ?? {};
+  if (confirmation_phrase !== PV_FACTORY_RESET_PHRASE) {
+    return reply.status(400).send({
+      error: `confirmation_phrase must be exactly: ${PV_FACTORY_RESET_PHRASE}`,
+    });
+  }
+  if (!acknowledge_irreversible) {
+    return reply.status(400).send({ error: "acknowledge_irreversible must be true" });
+  }
+
+  forestDb.factoryReset();
+  if (existsSync(PVFS_STORE_DIR)) {
+    for (const name of readdirSync(PVFS_STORE_DIR)) {
+      const full = path.join(PVFS_STORE_DIR, name);
+      try {
+        unlinkSync(full);
+      } catch {
+        rmSync(full, { recursive: true, force: true });
+      }
+    }
+  }
+
+  await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+  await ensurePrimaryRoot(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+
+  return reply.send({ reset: true, forest_db: FOREST_DB_PATH, pvfs_store: PVFS_STORE_DIR });
+});
 
 // ── Health ─────────────────────────────────────────────────────────────────
 
