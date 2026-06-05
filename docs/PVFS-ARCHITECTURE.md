@@ -87,6 +87,10 @@ interface PrunePolicyPayload {
 
 `auto: true` + `retain_orphan_days: N` → **`POST /forest/prune`** (policy-driven) can hard-delete aged orphans via `pruner.ts`.
 
+### Factory reset (entire server)
+
+**`POST /admin/factory-reset`** (see [ADMIN-FACTORY-RESET.md](ADMIN-FACTORY-RESET.md)) clears all forest and PVFS metadata and the `pvfs/` blob store. It is **not** the same as per-file delete with `confirm_local_delete` — factory reset does **not** unlink `file://` paths on the host filesystem.
+
 ---
 
 ## pvfs:// P2P Protocol (Target Architecture)

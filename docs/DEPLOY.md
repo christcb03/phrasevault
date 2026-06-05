@@ -29,6 +29,19 @@ git push origin main
 - Run **without** `PV_PASSPHRASE` (service mode) so MF can `POST /auth/register` its secp256k1 key.
 - `PV_DATA_DIR=/data` — forest DB and `pvfs_scan_jobs` live under this path.
 
+## Admin factory reset
+
+| Method | Path |
+|--------|------|
+| GET | `/admin/factory-reset/preview` |
+| POST | `/admin/factory-reset` |
+
+Body for POST: `{ "confirmation_phrase": "DELETE ALL MEDIA DATA", "acknowledge_irreversible": true }`.
+
+Clears all nodes, links, scan jobs, and `pvfs/` store files; re-bootstraps an empty forest. **Does not remove `file://` media on disk.** Full detail: [ADMIN-FACTORY-RESET.md](ADMIN-FACTORY-RESET.md).
+
+MediaForest owner reset depends on this endpoint — deploy PhraseVault before testing MF factory reset.
+
 ## Manual redeploy
 
 If Watchtower did not pick up a new image (private GHCR may need host credentials):

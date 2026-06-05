@@ -70,6 +70,10 @@ Added **`pvfs_ref`** for user-tree → primary file references (`src/forest/type
 | GET | `/pvfs/stream/:id` | Alias of stream path above |
 | POST | `/pvfs/stream/:id/authorize` | Delegated browser token via MF session |
 
+## Admin factory reset
+
+See [ADMIN-FACTORY-RESET.md](ADMIN-FACTORY-RESET.md). Wipes forest + PVFS metadata (not `file://` library files on disk). Used by MediaForest owner factory reset.
+
 ## Not yet implemented
 
 - Folder / genre metadata trees (see `docs/PVFS-ARCHITECTURE.md`)

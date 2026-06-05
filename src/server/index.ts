@@ -196,22 +196,28 @@ app.post<{
     return reply.status(400).send({ error: "acknowledge_irreversible must be true" });
   }
 
-  forestDb.factoryReset();
-  if (existsSync(PVFS_STORE_DIR)) {
-    for (const name of readdirSync(PVFS_STORE_DIR)) {
-      const full = path.join(PVFS_STORE_DIR, name);
-      try {
-        unlinkSync(full);
-      } catch {
-        rmSync(full, { recursive: true, force: true });
+  try {
+    forestDb.factoryReset();
+    if (existsSync(PVFS_STORE_DIR)) {
+      for (const name of readdirSync(PVFS_STORE_DIR)) {
+        const full = path.join(PVFS_STORE_DIR, name);
+        try {
+          unlinkSync(full);
+        } catch {
+          rmSync(full, { recursive: true, force: true });
+        }
       }
     }
+
+    await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+    await ensurePrimaryRoot(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+
+    return reply.send({ reset: true, forest_db: FOREST_DB_PATH, pvfs_store: PVFS_STORE_DIR });
+  } catch (err) {
+    req.log.error({ err }, "PhraseVault factory reset failed");
+    const message = err instanceof Error ? err.message : "factory reset failed";
+    return reply.status(500).send({ error: message, message });
   }
-
-  await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
-  await ensurePrimaryRoot(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
-
-  return reply.send({ reset: true, forest_db: FOREST_DB_PATH, pvfs_store: PVFS_STORE_DIR });
 });
 
 // ── Health ─────────────────────────────────────────────────────────────────
