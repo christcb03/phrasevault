@@ -5,6 +5,13 @@ import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
 import type { PVFSVerifier } from './pvfs.js'
 import type { Pruner } from './pruner.js'
+import {
+  ensurePrimaryRoot, listPrimaryFiles, listAllFileLocations,
+  linkFileToPrimary, linkUserRefToPrimaryFile, PVFS_PRIMARY_LABEL,
+} from './pvfs-trees.js'
+import { startScanJob, getScanJob, buildIngestedUriSet, validateScanPath } from './pvfs-scan.js'
+import { previewRemoveFromPrimary, removeFromPrimary } from './pvfs-cascade.js'
+import { listPvfsFileOrphans, purgePvfsOrphans } from './pvfs-orphans.js'
 import { createNode, createLink } from './signer.js'
 import { defaultVisibility, serializePayload, deserializePayload } from './cipher.js'
 import type { NewNode, NewLink, TruthNode, PvfsFilePayload, PvfsLocationPayload, MediaMoviePayload, MediaSeriesPayload, MediaSeasonPayload } from './types.js'
@@ -195,6 +202,165 @@ export function registerForestRoutes(
 
   // ─── PVFS ──────────────────────────────────────────────────────────────────
 
+  app.get('/pvfs/trees/primary', async (_req, reply) => {
+    await ensurePrimaryRoot(db, walker, authorPubKey, privKeyHex, encKey)
+    const root = walker.findRoot(PVFS_PRIMARY_LABEL)
+    if (!root) return reply.status(503).send({ error: 'primary tree not initialized' })
+    const listed = listPrimaryFiles(db, walker, { offset: 0, limit: 1 })
+    return reply.send({
+      root_id: root.id,
+      label: PVFS_PRIMARY_LABEL,
+      file_count: listed?.total ?? 0,
+    })
+  })
+
+  app.get<{ Querystring: { offset?: string; limit?: string } }>(
+    '/pvfs/trees/primary/walk',
+    async (req, reply) => {
+      await ensurePrimaryRoot(db, walker, authorPubKey, privKeyHex, encKey)
+      const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0)
+      const limit = Math.min(500, Math.max(1, parseInt(req.query.limit ?? '100', 10) || 100))
+      const listed = listPrimaryFiles(db, walker, { offset, limit })
+      if (!listed) return reply.status(503).send({ error: 'primary tree not initialized' })
+      return reply.send({
+        root_id: listed.root.id,
+        label: PVFS_PRIMARY_LABEL,
+        total: listed.total,
+        offset,
+        limit,
+        files: listed.files,
+      })
+    },
+  )
+
+  app.get('/pvfs/locations', async (_req, reply) => {
+    return reply.send({ nodes: listAllFileLocations(db, walker) })
+  })
+
+  app.get<{ Querystring: { uri: string } }>('/pvfs/locations/by-uri', async (req, reply) => {
+    const uri = req.query.uri
+    if (!uri) return reply.status(400).send({ error: 'uri query parameter required' })
+    const nodes = listAllFileLocations(db, walker).filter(n => n.payload.uri === uri)
+    return reply.send({ nodes })
+  })
+
+  app.get<{ Params: { pubKey: string } }>('/pvfs/trees/user/:pubKey', async (req, reply) => {
+    if (!/^[0-9a-f]{66}$/.test(req.params.pubKey)) {
+      return reply.status(400).send({ error: 'pubKey must be 66 hex chars (compressed secp256k1)' })
+    }
+    const label = `pvfs:user:${req.params.pubKey}`
+    const root = walker.findRoot(label)
+    if (!root) return reply.send({ root_id: null, label, refs: [] })
+    const refs = walker.children(root.id, 'pvfs_ref').map(c => ({
+      file_node_id: c.node.id,
+      link_id: c.link.id,
+    }))
+    return reply.send({ root_id: root.id, label, refs })
+  })
+
+  app.post<{ Params: { pubKey: string }; Body: { primary_file_node_id?: string } }>(
+    '/pvfs/trees/user/:pubKey/ref',
+    async (req, reply) => {
+      const { pubKey } = req.params
+      const { primary_file_node_id } = req.body ?? {}
+      if (!/^[0-9a-f]{66}$/.test(pubKey)) {
+        return reply.status(400).send({ error: 'invalid pubKey' })
+      }
+      if (!primary_file_node_id) {
+        return reply.status(400).send({ error: 'primary_file_node_id required' })
+      }
+      try {
+        const result = await linkUserRefToPrimaryFile(
+          db, walker, authorPubKey, privKeyHex, encKey, pubKey, primary_file_node_id,
+        )
+        return reply.status(201).send(result)
+      } catch (err) {
+        return reply.status(404).send({ error: err instanceof Error ? err.message : 'ref failed' })
+      }
+    },
+  )
+
+  app.post<{ Body: { path: string; dry_run?: boolean; extensions?: string[]; limit?: number; compute_hash?: boolean } }>(
+    '/pvfs/scan',
+    async (req, reply) => {
+      const { path: dirPath, dry_run = true, extensions, limit, compute_hash } = req.body ?? {}
+      const pathErr = validateScanPath(dirPath)
+      if (pathErr) return reply.status(400).send({ error: pathErr })
+
+      const ingestedUris = buildIngestedUriSet(listAllFileLocations(db, walker))
+      const jobId = startScanJob(db, {
+        rootPath: dirPath,
+        dryRun: dry_run,
+        extensions,
+        limit,
+        computeHash: compute_hash,
+        ingestedUris,
+        pvfs,
+      })
+      return reply.status(202).send({ jobId })
+    },
+  )
+
+  app.get<{ Params: { jobId: string } }>('/pvfs/scan/:jobId', async (req, reply) => {
+    const job = getScanJob(db, req.params.jobId)
+    if (!job) return reply.status(404).send({ error: 'job not found' })
+    return reply.send(job)
+  })
+
+  app.get('/pvfs/scan', async (_req, reply) => {
+    const rows = db.listScanJobs(50)
+    return reply.send({
+      jobs: rows.map(r => ({
+        id: r.id,
+        status: r.status,
+        startedAt: r.started_at,
+        finishedAt: r.finished_at,
+        dry_run: r.dry_run,
+        root_path: r.root_path,
+        found: r.found,
+        new_count: r.new_count,
+        ingested: r.ingested,
+        failed: r.failed,
+      })),
+    })
+  })
+
+  app.get<{ Params: { fileNodeId: string } }>(
+    '/pvfs/trees/primary/files/:fileNodeId/remove-preview',
+    async (req, reply) => {
+      const preview = previewRemoveFromPrimary(db, walker, req.params.fileNodeId)
+      if ('error' in preview) return reply.status(404).send({ error: preview.error })
+      return reply.send(preview)
+    },
+  )
+
+  app.delete<{ Params: { fileNodeId: string }; Body: { confirm_local_delete?: boolean } }>(
+    '/pvfs/trees/primary/files/:fileNodeId',
+    async (req, reply) => {
+      const { confirm_local_delete } = req.body ?? {}
+      const result = await removeFromPrimary(
+        db, walker, req.params.fileNodeId, authorPubKey,
+        { confirmLocalDelete: confirm_local_delete },
+      )
+      if ('error' in result) return reply.status(404).send({ error: result.error })
+
+      return reply.send(result)
+    },
+  )
+
+  app.get('/pvfs/orphans', async (_req, reply) => {
+    const orphans = listPvfsFileOrphans(db, walker)
+    return reply.send({ orphans, count: orphans.length })
+  })
+
+  app.post<{ Body: { file_node_ids?: string[] } }>(
+    '/pvfs/orphans/purge',
+    async (req, reply) => {
+      const result = purgePvfsOrphans(db, walker, req.body?.file_node_ids)
+      return reply.send(result)
+    },
+  )
+
   app.get<{ Params: { nodeId: string } }>(
     '/pvfs/file/:nodeId',
     async (req, reply) => {
@@ -308,6 +474,7 @@ export function registerForestRoutes(
     async (req, reply) => {
       const node = await makeNode('pvfs.file', req.body.label, req.body.payload, Date.now())
       db.insertNode(node)
+      await linkFileToPrimary(db, walker, authorPubKey, privKeyHex, encKey, node.id, req.body.label)
       return reply.status(201).send(node)
     },
   )

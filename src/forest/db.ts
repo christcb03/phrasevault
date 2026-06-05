@@ -14,6 +14,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const MIGRATIONS: string[] = [
   readFileSync(join(__dirname, 'schema.sql'), 'utf8'),
+  `
+    CREATE TABLE IF NOT EXISTS pvfs_scan_jobs (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      dry_run INTEGER NOT NULL,
+      root_path TEXT NOT NULL,
+      found INTEGER NOT NULL DEFAULT 0,
+      new_count INTEGER,
+      already_ingested_count INTEGER,
+      ingested INTEGER,
+      failed INTEGER,
+      files_json TEXT,
+      failures_json TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pvfs_scan_jobs_started ON pvfs_scan_jobs(started_at DESC);
+  `,
 ]
 
 // ─── ForestDB ─────────────────────────────────────────────────────────────────
@@ -246,6 +265,126 @@ export class ForestDB {
     this.db.prepare(`
       DELETE FROM truth_links WHERE parent_id = ? AND removed_at IS NOT NULL
     `).run(nodeId)
+  }
+
+  hardDeleteLink(linkId: string): void {
+    this.db.transaction(() => {
+      const link = this.getLink(linkId)
+      if (link?.parent_id) {
+        this.updateSiblingOrder(link.parent_id, linkId, false)
+      }
+      this.db.prepare('DELETE FROM truth_links WHERE id = ?').run(linkId)
+    })()
+  }
+
+  hardDeleteAllLinksForNode(nodeId: string): void {
+    const ids = (this.db.prepare(
+      'SELECT id FROM truth_links WHERE child_id = ? OR parent_id = ?',
+    ).all(nodeId, nodeId) as { id: string }[]).map(r => r.id)
+    for (const id of ids) this.hardDeleteLink(id)
+  }
+
+  // ─── PVFS scan jobs (persistent) ────────────────────────────────────────────
+
+  insertScanJob(row: PvfsScanJobRow): void {
+    this.db.prepare(`
+      INSERT INTO pvfs_scan_jobs (
+        id, status, started_at, finished_at, dry_run, root_path, found,
+        new_count, already_ingested_count, ingested, failed,
+        files_json, failures_json, error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.id, row.status, row.started_at, row.finished_at ?? null,
+      row.dry_run ? 1 : 0, row.root_path, row.found,
+      row.new_count ?? null, row.already_ingested_count ?? null,
+      row.ingested ?? null, row.failed ?? null,
+      row.files_json ?? null, row.failures_json ?? null, row.error ?? null,
+    )
+  }
+
+  updateScanJob(id: string, patch: Partial<PvfsScanJobRow>): void {
+    const fields: string[] = []
+    const values: unknown[] = []
+    const set = (col: string, val: unknown) => { fields.push(`${col} = ?`); values.push(val) }
+
+    if (patch.status !== undefined) set('status', patch.status)
+    if (patch.finished_at !== undefined) set('finished_at', patch.finished_at)
+    if (patch.found !== undefined) set('found', patch.found)
+    if (patch.new_count !== undefined) set('new_count', patch.new_count)
+    if (patch.already_ingested_count !== undefined) set('already_ingested_count', patch.already_ingested_count)
+    if (patch.ingested !== undefined) set('ingested', patch.ingested)
+    if (patch.failed !== undefined) set('failed', patch.failed)
+    if (patch.files_json !== undefined) set('files_json', patch.files_json)
+    if (patch.failures_json !== undefined) set('failures_json', patch.failures_json)
+    if (patch.error !== undefined) set('error', patch.error)
+
+    if (fields.length === 0) return
+    values.push(id)
+    this.db.prepare(`UPDATE pvfs_scan_jobs SET ${fields.join(', ')} WHERE id = ?`).run(...values)
+  }
+
+  getScanJob(id: string): PvfsScanJobRow | null {
+    const row = this.db.prepare('SELECT * FROM pvfs_scan_jobs WHERE id = ?').get(id) as RawScanJob | undefined
+    return row ? deserializeScanJob(row) : null
+  }
+
+  listScanJobs(limit = 50): PvfsScanJobRow[] {
+    return (this.db.prepare(
+      'SELECT * FROM pvfs_scan_jobs ORDER BY started_at DESC LIMIT ?',
+    ).all(limit) as RawScanJob[]).map(deserializeScanJob)
+  }
+}
+
+export interface PvfsScanJobRow {
+  id: string
+  status: 'running' | 'done' | 'error'
+  started_at: number
+  finished_at?: number | null
+  dry_run: boolean
+  root_path: string
+  found: number
+  new_count?: number | null
+  already_ingested_count?: number | null
+  ingested?: number | null
+  failed?: number | null
+  files_json?: string | null
+  failures_json?: string | null
+  error?: string | null
+}
+
+interface RawScanJob {
+  id: string
+  status: string
+  started_at: number
+  finished_at: number | null
+  dry_run: number
+  root_path: string
+  found: number
+  new_count: number | null
+  already_ingested_count: number | null
+  ingested: number | null
+  failed: number | null
+  files_json: string | null
+  failures_json: string | null
+  error: string | null
+}
+
+function deserializeScanJob(row: RawScanJob): PvfsScanJobRow {
+  return {
+    id: row.id,
+    status: row.status as PvfsScanJobRow['status'],
+    started_at: row.started_at,
+    finished_at: row.finished_at,
+    dry_run: row.dry_run === 1,
+    root_path: row.root_path,
+    found: row.found,
+    new_count: row.new_count,
+    already_ingested_count: row.already_ingested_count,
+    ingested: row.ingested,
+    failed: row.failed,
+    files_json: row.files_json,
+    failures_json: row.failures_json,
+    error: row.error,
   }
 }
 

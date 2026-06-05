@@ -6,6 +6,7 @@ import { blake3 } from '@noble/hashes/blake3'
 import { bytesToHex } from '@noble/hashes/utils'
 import type { ForestDB } from './db.js'
 import type { ForestWalker } from './walker.js'
+import { linkFileToPrimary } from './pvfs-trees.js'
 import { createNode, createLink } from './signer.js'
 import { serializePayload } from './cipher.js'
 import type {
@@ -225,6 +226,11 @@ export class PVFSVerifier {
         created_at: now, author: this.authorPubKey,
       }, this.privKeyHex))
     }
+
+    await linkFileToPrimary(
+      this.db, this.walker, this.authorPubKey, this.privKeyHex, this.encKey,
+      fileNode.id, path.basename(localPath),
+    )
 
     return { fileNode, locationNode, contentHash }
   }

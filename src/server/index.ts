@@ -16,6 +16,7 @@ import {
   ForestDB, ForestWalker, PVFSVerifier, Pruner,
   registerForestRoutes, createNode, createLink,
   deriveForestEncKey, serializePayload, defaultVisibility,
+  ensurePrimaryRoot, backfillPrimaryTree,
 } from "../forest/index.js";
 import type { ConfigProviderPayload } from "../forest/types.js";
 
@@ -80,6 +81,11 @@ const pvfsVerifier = new PVFSVerifier(forestDb, forestWalker, pubKeyHex, privKey
 const pruner       = new Pruner(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
 
 await bootstrapForest(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+await ensurePrimaryRoot(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+const backfill = await backfillPrimaryTree(forestDb, forestWalker, pubKeyHex, privKeyHex, forestEncKey);
+if (backfill.linked > 0) {
+  console.info(`[PhraseVault] Linked ${backfill.linked} existing pvfs.file node(s) into primary tree`);
+}
 
 // ── Auth state ─────────────────────────────────────────────────────────────
 

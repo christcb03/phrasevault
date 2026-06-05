@@ -47,6 +47,7 @@ export type LinkType =
   | 'metadata'    // provider metadata blob attached to a media node
   | 'file'        // pvfs.file attached to a media node
   | 'member'      // collection membership (episode→season, season→series)
+  | 'pvfs_ref'    // user PVFS tree → file node on primary (or remote) inventory
 
 // ─── Core Structures ──────────────────────────────────────────────────────────
 
