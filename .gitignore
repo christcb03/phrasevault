@@ -1,3 +1,6 @@
+# Local archive of pre-refactor artifacts (not part of the build)
+old/
+
 # Rust
 /target/
 **/target/
