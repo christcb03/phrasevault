@@ -29,6 +29,10 @@ The design is captured as a reviewed, decision-by-decision record in [`docs/`](d
 
 The previous concept implementation (Python + TypeScript MediaForest/PVFS prototype) lives under [`v0.0-concept/`](v0.0-concept/) and is tagged `v0.0-concept`.
 
+## Test server
+
+Reset **presubuntu** (Proxmox VM 101) to a clean Ubuntu host for PVFS testing via the Homelab repo: [`infra/README.md`](infra/README.md) → `./scripts/presubuntu-reset.sh`.
+
 ## License
 
 See [`LICENSE`](LICENSE).
