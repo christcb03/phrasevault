@@ -1,11 +1,11 @@
 # PVFS — P0 Core Engine Buildable Spec (02)
 
-Status: **Draft for review — refine before coding**
+Status: **Ready to implement** (all §16 decisions settled)
 Date: 2026-06-07
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md)
 Scope: The exact, buildable specification for **P0** — encodings, schemas, projection rules, identity, and function signatures. Every foundational decision is already settled (design doc §9); this turns them into something we can implement without guesswork.
 
-> How to read this: each section is meant to be reviewed on its own. Nothing here is code yet. Where a detail is still genuinely open, it is called out as **[OPEN]** so we can settle it before building.
+> How to read this: each section is meant to be reviewed on its own. Nothing here is code yet. Pre-coding decisions are marked **Decided**; the checklist in §16 is complete.
 
 ---
 
@@ -70,7 +70,7 @@ Primitive rules:
 
 A composite value is the concatenation of its fields **in the fixed order given by its spec** — no field names, no separators, no padding. There is no map/dict type in any preimage (avoids key-ordering ambiguity).
 
-> [OPEN] String length cap. Propose rejecting any `string`/`bytes` longer than `2^32 - 1` (the prefix limit) and adding a sane soft cap on `label` (e.g. 4 KiB) at the API layer.
+> **Decided:** Hard cap any PCE `string`/`bytes` at **`2^32 - 1` bytes** — this is the u32 length-prefix limit in the encoding itself, not an extra arbitrary ceiling. Soft cap **`label` at 4 KiB** at the API layer. There is no practical drawback at this limit: metadata fields and URIs are tiny, and file *content* is never embedded in PCE (only hashes and pointers). Nothing in PVFS needs a single multi-gigabyte string field; large blobs live on storage backends and are referenced by hash/URI.
 
 ---
 
@@ -116,12 +116,11 @@ id = hex( BLAKE3_256(preimage) )
   size_bytes   : u64
   mime_type    : string
   original_name: string
-  locations    : list<string>   // URIs; list = u32 count prefix, then each string
   ```
-  P0 stores locations; resolving/reading them is P1.
-- **temp** — not a payload shape; `is_temp = true` on a `file` or `folder` (or, later, a module node).
+  **Locations are not in the payload or id preimage.** A file's identity (content hash + metadata) is separate from where its bytes live (ADR principle). Storage URIs are added/removed via **`FileLocationAdded` / `FileLocationRemoved` events** (§6), which replicate independently — a new replica is just another signed location event, not a new file node.
+- **temp** — not a payload shape; `is_temp = true` on a `file` or `folder` (or, later, a module node). Temp file locations follow the same event shape but are written only to `temp_*` projection tables (never logged).
 
-> [OPEN] Confirm the `file` payload field set for P0. `locations` could alternatively be modeled as separate child nodes later; for P0 inline is simpler.
+> **Decided:** Multiple locations per file from P0, via location events (not inline in the node payload). This matches replication (add URI without changing `file` node id) and soft-remove of individual replicas/locations.
 
 ### 4.4 Signing & verification
 
@@ -171,7 +170,7 @@ Deliberately **excludes** `author`, `order_key`, and the state band:
 - Insert-between: pick a key strictly between two neighbors (**fractional indexing** over a fixed alphabet).
 - Carried in the `LinkCreated` event (durable, replicated). Changing it emits `LinkReordered` (§6).
 
-> [OPEN] Pick the order_key alphabet/scheme. Propose Base62 fractional keys (digits+letters), midpoint between neighbors, with a documented rebalance fallback if keys get pathologically long. This can be a small isolated module with its own tests.
+> **Decided:** **Base62 fractional keys** (digits + upper/lowercase letters — pick one fixed alphabet and document it). Insert-at-end: append a key greater than the current max for that parent. Insert-between: midpoint between neighbors. If keys grow pathologically long, **rebalance** that parent's keys in one transaction (re-emit `LinkReordered` for affected links). Implement as a small isolated module with its own tests.
 
 ---
 
@@ -188,13 +187,20 @@ Each durable change is one event. Event bodies are PCE-encoded and stored in `lo
 | `LinkSuperseded` | `old_link_id: string`, `new_link_id: string` | mark a link replaced |
 | `LinkSuspended` | `link_id: string`, `suspended_at: u64` | block (e.g. integrity) |
 | `LinkUnsuspended` | `link_id: string` | clear suspension |
+| `FileLocationAdded` | `file_id: string`, `uri: string`, `added_at: u64`, `author: bytes`, `sig: bytes` | register a storage URI for a file node |
+| `FileLocationRemoved` | `file_id: string`, `uri: string`, `removed_at: u64`, `removed_by: bytes`, `removal_sig: bytes` | soft-remove one URI from a file |
 | `NodePurged` | `node_id: string`, `purged_at: u64` | hard-delete tombstone |
 
 Notes:
-- **Temp nodes/links never appear as events.** They exist only in `index.db` temp tables (§8). This is the whole point of the temp carve-out.
-- `removal_sig` / reorder `sig` are signatures over a defined message so a remove/reorder is itself attributable (message layout specified in the build-out, e.g. `BLAKE3("pvfs:linkremoved:v1:" + link_id + removed_at)`).
+- **Temp nodes/links/locations never appear as events.** They exist only in `index.db` temp tables (§8). This is the whole point of the temp carve-out.
+- Signed messages for mutable operations use domain-separated BLAKE3 preimages (signed with secp256k1 over the 32-byte digest, same as nodes/links):
 
-> [OPEN] Confirm the signed-message layout for `LinkRemoved` / `LinkReordered`. Propose domain-separated BLAKE3 over the mutated fields.
+| Operation | Message signed (`msg = BLAKE3(...)`) |
+|---|---|
+| `LinkRemoved` | `"pvfs:linkremoved:v1:" \|\| PCE(link_id, removed_at, removed_by)` |
+| `LinkReordered` | `"pvfs:linkreordered:v1:" \|\| PCE(link_id, new_order_key, author)` |
+| `FileLocationAdded` | `"pvfs:filelocationadded:v1:" \|\| PCE(file_id, uri, added_at, author)` |
+| `FileLocationRemoved` | `"pvfs:filelocationremoved:v1:" \|\| PCE(file_id, uri, removed_at, removed_by)` |
 
 ---
 
@@ -260,9 +266,19 @@ CREATE TABLE links (
   suspended_at  INTEGER
 );
 
--- Ephemeral, never logged or replicated (mirrors nodes/links shape):
+-- Storage URIs for file nodes (projected from FileLocation* events; NOT in node payload):
+CREATE TABLE file_locations (
+  file_id     TEXT NOT NULL,
+  uri         TEXT NOT NULL,
+  added_at    INTEGER NOT NULL,
+  removed_at  INTEGER,                 -- NULL = active
+  PRIMARY KEY (file_id, uri)
+);
+
+-- Ephemeral, never logged or replicated (mirrors nodes/links/locations shape):
 CREATE TABLE temp_nodes ( /* same columns as nodes */ );
 CREATE TABLE temp_links ( /* same columns as links */ );
+CREATE TABLE temp_file_locations ( /* same columns as file_locations */ );
 
 -- Replay / integrity bookkeeping (key/value):
 CREATE TABLE projection_meta (
@@ -278,6 +294,7 @@ CREATE TABLE projection_meta (
 CREATE INDEX idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
 CREATE INDEX idx_nodes_type         ON nodes(node_type);
+CREATE INDEX idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
 CREATE INDEX idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
 ```
@@ -315,7 +332,9 @@ If the process dies before COMMIT, neither side changed (atomic). If it dies aft
 | `LinkSuperseded` | `UPDATE links SET superseded_by=? WHERE id=?` |
 | `LinkSuspended` | `UPDATE links SET suspended_at=? WHERE id=?` |
 | `LinkUnsuspended` | `UPDATE links SET suspended_at=NULL WHERE id=?` |
-| `NodePurged` | `DELETE FROM nodes WHERE id=?` (links to/from it already removed) |
+| `FileLocationAdded` | `INSERT OR IGNORE INTO file_locations(...)`, `removed_at = NULL` |
+| `FileLocationRemoved` | `UPDATE file_locations SET removed_at=? WHERE file_id=? AND uri=?` |
+| `NodePurged` | `DELETE FROM nodes WHERE id=?`; `DELETE FROM file_locations WHERE file_id=?` |
 
 ### 9.3 Startup integrity check & recovery
 
@@ -323,7 +342,7 @@ Run on **every** `Engine::open`, before serving any request. It is cheap on the 
 
 **Step 1 — structural check.** `PRAGMA quick_check` on both files.
 - `index.db` unreadable/corrupt ⇒ discard it and go to **full rebuild** (Step 5). The index is disposable, so this is always safe.
-- `log.db` unreadable/corrupt ⇒ this is the truth; do **not** improvise. Return a fatal `Corruption { db: "log.db", .. }` error telling the operator to restore from backup/replica. (See §16 open item on partial-log salvage.)
+- `log.db` unreadable/corrupt or chain broken ⇒ **stop** (Step 6). Do not auto-truncate or silently repair the truth log.
 
 **Step 2 — read positions.**
 - From `index.db`: `last_applied_seq` (`Si`), `last_applied_chain_hash` (`Hi`), `clean_shutdown`.
@@ -334,7 +353,7 @@ Run on **every** `Engine::open`, before serving any request. It is cheap on the 
 - If `Si > Sl` (index ahead of the truth — only possible via corruption or a restored-older log) ⇒ **full rebuild**.
 
 **Step 4 — catch up (normal post-crash path).**
-- If `Si < Sl`: replay events `Si+1 .. Sl` through the fold rules, recomputing and **verifying `chain_hash` at each step**. If a recomputed chain hash ever disagrees with the stored one, the log is internally broken ⇒ fatal `Corruption { db: "log.db", seq }`.
+- If `Si < Sl`: replay events `Si+1 .. Sl` through the fold rules, recomputing and **verifying `chain_hash` at each step**. If a recomputed chain hash ever disagrees with the stored one, the log is internally broken ⇒ fatal `Corruption { db: "log.db", seq }` → **Step 6** (operator recovery).
 - If `Si == Sl` and chains matched in Step 3: the projection is current — done (fast path, O(1)).
 
 **Step 5 — full rebuild.** Drop and recreate the `index.db` schema; replay all events `1 .. Sl`, verifying the chain from the genesis seed (§7.1). Temp tables start empty (temp never survives a rebuild, by design). Set `clean_shutdown = 0`.
@@ -342,6 +361,19 @@ Run on **every** `Engine::open`, before serving any request. It is cheap on the 
 **Crash flag.** On successful open, set `clean_shutdown = 0`; on graceful `close()`, set it to `1`. If it was already `0` at open (previous run crashed), force the chain verification in Steps 3–4 even on the `Si == Sl` fast path, so an unclean shutdown always triggers a full agreement check rather than trusting positions alone.
 
 **Optional deep verify.** A `verify_full` mode (CLI flag / periodic) rebuilds into a throwaway index and asserts it matches the live one, and re-verifies every node/link signature. Not run on every startup (cost), but available for paranoia / audits.
+
+**Step 6 — operator recovery when `log.db` is corrupt (never automatic).**
+
+When Step 1 or Step 4 detects log corruption (`Corruption` / `LogChainBroken`), the engine **refuses to open** and returns a fatal error listing recovery options in order of preference. The operator chooses explicitly; nothing destructive runs without confirmation:
+
+| Priority | Action | History preserved? |
+|---|---|---|
+| 1 | **Restore from backup** — replace `log.db` (and optionally `index.db`) from a known-good backup, then reopen | Yes (to backup point) |
+| 2 | **Restore from replica** (P4) — pull events from a peer instance that shares a valid prefix | Yes (merged from peer) |
+| 3 | **Salvage prefix** — explicit `--salvage-log --up-to-seq N` after operator verifies the last good event; truncates tail only | Partial (prefix only) |
+| 4 | **Filesystem rebuild** — explicit `--recover-from-filesystem <bound-folder>…` as **last resort**: scan bound folders on disk, create a fresh tree with new file nodes + `FileLocationAdded` events; archives or replaces the corrupted log | **No** — prior log history is lost |
+
+Filesystem rebuild requires a strong confirmation phrase (similar to factory reset). It is for catastrophic loss when backups and replicas are unavailable — the tree can be reconstructed from what still exists on disk, but signatures, cross-links, module metadata, and historical events are gone unless recovered elsewhere.
 
 ---
 
@@ -362,7 +394,7 @@ pubKey  = secp256k1 compressed public key (33 bytes)  // this is `author`
 - Same passphrase ⇒ same `author` on any machine ⇒ replication and recovery work.
 - **Handling:** passphrase enters at startup (P1 decides UX: prompt/env/protected file); `privKey` is derived once and held in memory for signing; the passphrase reference is then dropped. Optionally cache `privKey` in the data dir mode `0600` to skip re-derivation on restart (cache, not source of truth).
 
-> [OPEN] Confirm Argon2id parameters (64 MiB / t=3 / p=1). These match prior practice and are a sound default; raising memory increases brute-force cost but also startup time on low-RAM devices.
+> **Decided:** Argon2id **64 MiB / t=3 / p=1** — memory-hard default suitable for desktop/server; ~1–2 s derivation on typical hardware.
 
 ---
 
@@ -397,6 +429,11 @@ impl Engine {
     pub fn remove_link(&mut self, link: &LinkId) -> Result<()>;  // triggers temp-purge check
     pub fn reorder_link(&mut self, link: &LinkId, new_key: &OrderKey) -> Result<()>;
 
+    // File locations (separate from node id; supports multiple URIs + replication):
+    pub fn add_location(&mut self, file: &NodeId, uri: &str) -> Result<()>;
+    pub fn remove_location(&mut self, file: &NodeId, uri: &str) -> Result<()>;  // soft-remove
+    pub fn locations(&self, file: &NodeId) -> Result<Vec<String>>;               // active URIs only
+
     // Reads (served from the projection):
     pub fn get_node(&self, id: &NodeId) -> Result<Option<Node>>;
     pub fn children(&self, parent: &NodeId) -> Result<Vec<Node>>;     // ordered
@@ -419,7 +456,7 @@ impl Engine {
 - `walk(root)`: pre-order traversal. Visit root, then for each child in `order_key` order, recurse if it is a `folder` (or has children). Yields `(node, depth)`.
 - A tree may mix durable and temp nodes; the walk reads both tables and merges by `order_key`.
 
-> [OPEN] Cycle safety. `contains` links should form a DAG; the engine should refuse to create a `contains` link that would introduce a cycle (check that `child` is not an ancestor of `parent`). Confirm this guard for P0.
+> **Decided:** **Cycle guard in P0.** Before creating a `contains` link (`parent → child`), walk ancestors of `parent`; reject if `child` is already an ancestor (would create a loop). Applies only to `link_type = "contains"`, not to `ref` cross-links.
 
 ---
 
@@ -463,7 +500,7 @@ pub enum PvfsError {
     #[error("log chain broken at seq {seq}: expected {expected}, got {actual}")]
     LogChainBroken { seq: u64, expected: String, actual: String },
 
-    #[error("corruption in {db}: {detail} — restore from backup/replica")]
+    #[error("corruption in {db}: {detail} — see recovery options (backup, replica, salvage, filesystem rebuild)")]
     Corruption { db: String, detail: String, seq: Option<u64> },
 
     #[error("cycle detected: linking {child} under {parent} would create a loop via {path}")]
@@ -493,7 +530,7 @@ pub type Result<T> = std::result::Result<T, PvfsError>;
 - **SQLite `BUSY`/`LOCKED`** is retried with bounded backoff; if it persists it surfaces as `Busy { retries }` rather than a raw driver error.
 - **Encoding** failures report *which* field and *byte offset* failed to decode — invaluable for diagnosing a malformed event body.
 - **Transactions** roll back on any error inside the write path (§9.1); a failed durable write never leaves a half-applied projection.
-- **`Corruption` / `LogChainBroken`** are fatal and refuse to silently "fix" the truth log; they instruct recovery from backup/replica.
+- **`Corruption` / `LogChainBroken`** are fatal and refuse to silently "fix" the truth log; they print the **Step 6 recovery ladder** (§9.3) and require explicit operator action.
 
 ### 13.4 CLI surface
 
@@ -515,8 +552,10 @@ The kernel is fully testable with no I/O beyond temp dirs. Minimum P0 tests:
 8. **Walk order** — children come back in `order_key` order; insert-between lands in the right place; large-fanout walk uses the index (no full scan).
 9. **Orphans/purge** — orphan detection correct; purge writes tombstone and removes from projection.
 10. **Cycle guard** — creating a cycle via `contains` is rejected.
-11. **Startup integrity check (§9.3)** — happy path is a no-op when positions/chains agree; an index lagging the log is caught up by replay; a corrupted/dropped/edited event breaks the chain and triggers full rebuild (or fatal `LogChainBroken` if the log itself is internally inconsistent); an unclean `clean_shutdown` flag forces a full agreement check; a corrupt `index.db` is rebuilt from the log.
+11. **Startup integrity check (§9.3)** — happy path is a no-op when positions/chains agree; an index lagging the log is caught up by replay; a corrupted/dropped/edited event breaks the chain and triggers full rebuild (or fatal `LogChainBroken` / Step 6 recovery ladder if the log itself is internally inconsistent); an unclean `clean_shutdown` flag forces a full agreement check; a corrupt `index.db` is rebuilt from the log.
 12. **Error contract** — verification reports expected-vs-actual; encoding errors report field + offset; SQLite BUSY retries then surfaces `Busy`; a failed durable write rolls back leaving no half-applied projection; no panic on malformed input/data.
+13. **File locations** — add two URIs to one file node (two events); file node id unchanged; soft-remove one URI; replication scenario = second instance applies same `FileLocationAdded` events.
+14. **Recovery ladder** — corrupt log refuses open with recovery options listed; `--salvage-log` and `--recover-from-filesystem` require explicit confirmation and produce expected outcomes (filesystem rebuild creates fresh tree, history not preserved).
 
 ---
 
@@ -528,16 +567,14 @@ Two P1 contracts are already settled (design doc §6.3 and §8.5) so the P0 mode
 
 ---
 
-## 16. Open items to settle before coding
+## 16. Pre-coding checklist — all settled
 
-These are the **[OPEN]** flags above, collected:
+All items below are **decided**; this spec is ready to implement:
 
-1. §3 — string/bytes length caps (and a `label` soft cap).
-2. §4.3 — confirm the `file` payload field set for P0 (inline `locations` vs child nodes).
-3. §5.3 — order_key scheme (propose Base62 fractional indexing + rebalance fallback).
-4. §6 — signed-message layout for `LinkRemoved` / `LinkReordered`.
-5. §10 — Argon2id parameters (propose 64 MiB / t=3 / p=1).
-6. §12 — confirm the cycle guard on `contains` links for P0.
-7. §9.3 — policy when `log.db` itself is corrupt (chain broken / unreadable): propose **salvage up to the last valid seq** and stop with a fatal error requiring explicit operator action (rather than auto-truncating the truth). Confirm.
-
-Once these six are agreed, this becomes the implementation checklist and coding can begin.
+1. §3 — PCE hard cap at u32 max length; **4 KiB** soft cap on `label`.
+2. §4.3 / §6 — file identity excludes locations; **multiple URIs via `FileLocationAdded` / `FileLocationRemoved` events** (replication-ready from P0).
+3. §5.3 — **Base62 fractional `order_key`** + rebalance fallback.
+4. §6 — signed-message layouts for link remove/reorder and file location add/remove (table in §6).
+5. §10 — Argon2id **64 MiB / t=3 / p=1**.
+6. §12 — **`contains` cycle guard** in P0.
+7. §9.3 Step 6 — log corruption: **stop**; recovery ladder (backup → replica → salvage → filesystem rebuild last).

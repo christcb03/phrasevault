@@ -105,7 +105,7 @@ struct Node {
 ### 3.2 Base node type semantics
 
 - **folder** — a container. May be the **root node** of a tree. Has child nodes via `contains` links. Payload is minimal (e.g. display metadata).
-- **file** — a leaf describing one file. Payload carries `content_hash` (BLAKE3 of the bytes, may be empty until lazily computed), `size_bytes`, `mime_type`, `original_filename`, and one or more **location** URIs describing where the bytes live. In P0 we *store* locations; *resolving/reading* them is P1.
+- **file** — a leaf describing one file. Payload carries `content_hash` (BLAKE3 of the bytes, may be empty until lazily computed), `size_bytes`, `mime_type`, and `original_filename`. **Storage URIs are not in the payload** — they are separate signed events (`FileLocationAdded` / `FileLocationRemoved`) so a file keeps the same node id when replicas or paths are added (replication-ready from P0). In P0 we *store* locations in the projection; *resolving/reading* bytes is P1.
 - **temp** — **decided: `temp` is a flag, not a standalone type.** Any node — `file`, `folder`, or a module node type — can be marked temp. A temp node has the special lifecycle in §6 (immediate purge instead of orphan retention). Modeling it as a flag is what lets it compose as a sub-type onto any module's node (e.g. a `media.preview` that is also temp, or a transient cache entry). The flag is part of the node's content-addressed identity (see §4.1) so it cannot be silently toggled.
 
 ### 3.3 Link
@@ -320,7 +320,7 @@ All foundational decisions are now settled:
 4. **Sibling order representation** (§3.4) — **decided:** per-parent sortable `order_key` (indexed by `(parent_id, order_key)`), not prev/next pointers.
 5. **Canonical encoding** (§4.1) — **decided:** strict length-prefixed binary, for byte-identical ids across languages (P2 WASM modules).
 6. **Identity source** (§7) — **decided:** passphrase-derived (Argon2id → secp256k1), so the same identity reproduces across machines for replication and recovery.
+7. **File locations** (§3.2, spec §4.3/§6) — **decided:** URIs are **not** in the file node id preimage; multiple locations per file via **`FileLocationAdded` / `FileLocationRemoved` events** (replication adds URIs without changing file node id).
+8. **Log corruption recovery** (spec §9.3 Step 6) — **decided:** stop on corrupt log; operator ladder: backup → replica → salvage → filesystem rebuild (last resort, history lost).
 
-With these settled, the next step is to expand this design into the buildable **P0 spec** — exact binary encoding, the full event schema, the `index.db` projection rules, and final function signatures — after which implementation can begin.
-
-Once these five are settled, this doc expands into the buildable P0 spec (exact encodings, schema, and function signatures) and implementation can begin.
+With these settled, the P0 spec ([02-p0-core-engine-spec.md](02-p0-core-engine-spec.md)) is the implementation checklist.
