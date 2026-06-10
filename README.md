@@ -1,127 +1,34 @@
-# PhraseVault
+# PVFS — PhraseVault File System
 
-A distributed encrypted knowledge network where a passphrase is simultaneously
-the storage address, the encryption key, and the namespace for your data.
+PVFS is a standalone, cross-platform command-line service that provides a **real filesystem abstraction layer** over any accessible storage. Data is organized as a **forest** of **trees** of content-addressed, signed **nodes**. A small core engine handles identity, integrity, and traversal; all domain behavior (encryption, media, configuration, search, …) is added through sandboxed **WASM extension modules**.
 
-No accounts. No servers. No cloud dependency. Your passphrase is the only secret.
+This is a ground-up implementation. It is designed to run as a single binary on Windows, Linux, and macOS — no container or language runtime required.
 
-## Core idea
+## Status
 
-```
-passphrase → BLAKE3   → storage address  (fast, for lookup)
-passphrase → Argon2id → encryption key   (slow, memory-hard, for security)
-```
+**Version `0.1` — in development.** Currently in the design/spec phase for the P0 core engine. No application code yet.
 
-Data is stored as RDF-style triplets `(subject, predicate, object)` in a local
-SQLite database. Entries are chain-linked — inserting or reordering entries
-breaks every subsequent address. Transfer between instances uses `.pvx` bundles
-with integrity verification.
+See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 
-The confidence scoring system rates certainty. Lower score = more certain.
-`0.0` = tautology. Approaching `1.0` = practically impossible.
-`impossibility_measure = -log(1 - confidence)`.
+## Documentation
 
-## Cryptographic primitives
+The design is captured as a reviewed, decision-by-decision record in [`docs/`](docs/):
 
-- **BLAKE3** — address derivation, chain linking, forest fingerprinting
-- **Argon2id** — memory-hard key derivation (64 MB, 3 iterations)
-- **XSalsa20-Poly1305** — authenticated encryption via PyNaCl SecretBox
+- [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) — foundational concepts, the WASM-first module model, and the architecture decisions (language, core vs. modules, base node types).
+- [`docs/01-core-engine-design.md`](docs/01-core-engine-design.md) — the core-engine design: data model, event-log source of truth, identity, lifecycle.
+- [`docs/02-p0-core-engine-spec.md`](docs/02-p0-core-engine-spec.md) — the buildable P0 spec: exact encodings, schemas, projection rules, integrity checks, error model, and test plan.
 
-All algorithms are public. Security comes entirely from your passphrase.
-See [SECURITY.md](SECURITY.md) for the full threat model.
+## Core ideas
 
-## Install
+- **Forest → trees → nodes/links.** A root node is the base of a tree; trees are walked link by link.
+- **Content-addressed + signed.** Every node's id is a BLAKE3 hash of its contents; nodes and links are signed (secp256k1). Tampering is structurally detectable.
+- **Append-only event log is the source of truth**, with SQLite as a rebuildable, queryable projection. The log is tamper-evident via a hash chain, and the index self-heals from the log on startup.
+- **Base node types** (`file`, `folder`, plus a `temp` flag) are the only types built into the core. Everything else is a WASM module.
 
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
+## Archive
 
-## Quick start
-
-```python
-from phrasevault.vault import Vault
-
-vault = Vault("my_knowledge.db")
-
-vault.store_triplet(
-    passphrase="correct horse battery staple",
-    subject="water",
-    predicate="boils_at",
-    object="100C at sea level"
-)
-
-result = vault.retrieve_triplet(
-    passphrase="correct horse battery staple",
-    chain_position=0
-)
-print(result)
-```
-
-## CLI
-
-```bash
-export PHRASEVAULT_PASS="your passphrase here"
-phrasevault store --subject water --predicate boils_at --object "100C"
-phrasevault get --position 0
-phrasevault export --out transfer.pvx
-phrasevault import --file transfer.pvx
-```
-
-The passphrase is read from `PHRASEVAULT_PASS` or prompted securely —
-never passed as a CLI argument.
-
-## Forest (knowledge graph)
-
-```python
-from phrasevault.forest import import_forest_to_db, verify_file
-
-result = import_forest_to_db("examples/example_forest.json", "knowledge.db")
-print(result["fingerprint"])  # deterministic 64-char BLAKE3 hex
-
-report = verify_file("proposed.json", "knowledge.db")
-print(report["passed"])
-```
-
-## Project structure
-
-```
-phrasevault/
-  crypto.py    — pure crypto primitives, zero I/O
-  store.py     — SQLite schema and raw DB operations
-  vault.py     — store_triplet / retrieve_triplet pipeline
-  transfer.py  — .pvx export/import/verify
-  forest.py    — import/export/verify/fingerprint
-  cli.py       — command-line interface
-examples/
-  example_forest.json
-tests/
-SECURITY.md
-```
-
-## Local Auth Agent (Companion)
-
-The `agent/` directory contains the companion app for MediaForest. It holds your identity key in memory and signs logins automatically — once running, opening MediaForest logs you in with no password prompt.
-
-**Quick install (macOS/Linux):**
-
-```bash
-git clone https://github.com/christcb03/phrasevault.git ~/phrasevault-repo
-bash ~/phrasevault-repo/agent/install.sh
-```
-
-The install script sets up autostart (launchd on macOS, systemd on Linux) and runs the setup wizard. The wizard asks for your passphrase and server URL, and can register a new account on the server right there if you don't have one yet.
-
-See **[agent/INSTALL.md](agent/INSTALL.md)** for the full guide.
-
-**Common commands:**
-
-```bash
-node agent/companion.mjs --status   # is it running?
-node agent/companion.mjs --stop     # stop it
-node agent/companion.mjs --setup    # reconfigure (add server, change passphrase)
-```
+The previous concept implementation (Python + TypeScript MediaForest/PVFS prototype) lives under [`v0.0-concept/`](v0.0-concept/) and is tagged `v0.0-concept`.
 
 ## License
 
-GNU General Public License v3 or later. See [LICENSE](LICENSE).
+See [`LICENSE`](LICENSE).
