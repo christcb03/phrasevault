@@ -1,6 +1,6 @@
 # PVFS — P1 Storage Backends & Core FS Ops Spec (04)
 
-Status: **Draft for review — open decisions marked [OPEN]**
+Status: **Ready to implement** (all §11 decisions settled)
 Date: 2026-06-11
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 Scope: Phase **P1** — reading/resolving actual bytes, scanning real storage into trees, bound-folder auto-indexing, read-path integrity, and the managed-temp spool. Builds strictly on the P0 kernel; **no P0 encoding or schema changes**.
@@ -60,14 +60,15 @@ Binding descriptor fields:
 | `hash_policy` | string | `lazy` (default) \| `on_add` \| `never` |
 | `on_disk_delete` | string | `soft` (only value in P1) |
 
-> **[OPEN-1] Where does the binding live?** Design doc §8.5 said "in the folder's
-> payload", but payload is part of the node's content-addressed id — editing a
-> binding (e.g. adding an extension filter) would change the folder's id and
-> orphan its subtree. Proposal: **bindings are events**, like file locations:
-> `FolderBound { folder_id, descriptor…, author, sig }` /
-> `FolderUnbound { folder_id, … }`, projected to a `folder_bindings` table.
-> Same pattern already proven for locations; folder id stays stable across
-> re-binding; replicates cleanly. Folder payload stays reserved-empty.
+> **Decided — bindings are events** (supersedes design doc §8.5's
+> payload note): `FolderBound { folder_id, source_uri, recursive, auto_index,
+> extensions, hash_policy, bound_at, author, sig }` and
+> `FolderUnbound { folder_id, unbound_at, author, sig }`, signed like every
+> mutable event (domain prefixes `pvfs:folderbound:v1:` /
+> `pvfs:folderunbound:v1:`), projected to the `folder_bindings` table (§8).
+> Re-binding = `FolderUnbound` + new `FolderBound`; the folder's id never
+> changes; bindings replicate and survive rebuilds. Folder payload stays
+> reserved-empty.
 
 Constraints (either way): one active binding per folder; one binding per
 `source_uri` per forest (two folders bound to the same directory would fight);
@@ -89,7 +90,23 @@ For each on-disk file passing the filter:
    mirrored folder path (subfolders become child `folder` nodes, created on
    demand, one per on-disk directory).
 3. **Unchanged file** (same size + mtime as recorded) ⇒ no-op.
-4. **Changed file** (size or mtime differs) ⇒ see **[OPEN-2]**.
+4. **Changed file** (size or mtime differs) ⇒ **Decided: flag, don't auto-resolve.**
+   The node is marked **`invalid: changed-on-disk`** in the local
+   `pending_changes` table (§8). While flagged, the changed location is **not
+   served** (`cat` skips it — the recorded fingerprint no longer vouches for
+   those bytes, which may be a legitimate edit *or tampering*). The operator
+   resolves explicitly via `pvfs resolve` (§9):
+   - **`--replace`** — accept the new contents: create a new file node for
+     them, move the location, and supersede the old home link
+     (`LinkSuperseded`); the old node is kept as a reviewable orphan with its
+     history.
+   - **`--delete`** — treat it as untrusted: soft-remove the old node's links
+     and locations (orphan it for review); with `--purge`, hard-delete it via
+     the P0 purge protocol in the same step. The on-disk file is **never**
+     touched (PVFS does not own external bytes).
+   A binding-level auto-resolution policy (e.g. `on_change: replace` for
+   media libraries that re-encode constantly) is a future option; P1 is
+   manual-only.
 5. **Disk-deleted file** (node has an active location under this binding but
    the path is gone) ⇒ **soft**: `FileLocationRemoved` for that URI. If that
    was the node's last active location, the node is additionally flagged
@@ -132,14 +149,15 @@ Scan stats are returned and printed: `added / unchanged / changed / removed / sk
    node? — no: hash lives in the payload… see [OPEN-2]; under the proposed
    event model `hash` creates the successor node exactly like a changed file).
 
-> **[OPEN-3] What does a failed integrity check do, concretely?** Proposal:
-> a **local quarantine table** (`location_quarantine(file_id, uri, reason,
-> detected_at)`, projection-local, not an event — the byte corruption is a
-> local observation, not forest history). Quarantined locations are skipped by
-> resolution and shown by `stat`. `pvfs loc verify <file>` re-checks and lifts
-> quarantine when bytes match again. Alternative: suspend via the existing
-> signed `LinkSuspended`-style event — durable and replicated, but writes
-> forest history for what may be a single bad disk.
+> **Decided — local quarantine.** A failed check writes to the local
+> `location_quarantine` table (§8) — corruption is an observation about *this*
+> machine's view of the bytes, not forest history, so it is never a log event.
+> Quarantined locations are skipped by resolution and surfaced by `stat` and
+> `pvfs changes`. `pvfs loc verify <file>` re-hashes and lifts the quarantine
+> when the bytes match again (e.g. after restoring from backup). An index
+> rebuild clears the table; the next read/verify re-discovers any persisting
+> corruption. (A future tiered escalation to a signed event for
+> operator-confirmed tampering can layer on without model changes.)
 
 ---
 
@@ -187,6 +205,16 @@ CREATE TABLE folder_bindings (
 );
 
 -- local observations (NOT folded from events; survive rebuild = re-observed):
+CREATE TABLE pending_changes (   -- "invalid: changed-on-disk", awaiting resolve (§4.4)
+  file_id     TEXT NOT NULL,
+  uri         TEXT NOT NULL,
+  old_size    INTEGER NOT NULL,
+  old_mtime   INTEGER NOT NULL,
+  new_size    INTEGER NOT NULL,
+  new_mtime   INTEGER NOT NULL,
+  detected_at INTEGER NOT NULL,
+  PRIMARY KEY (file_id, uri)
+);
 CREATE TABLE location_quarantine (
   file_id     TEXT NOT NULL,
   uri         TEXT NOT NULL,
@@ -220,6 +248,8 @@ pvfs stat <node-id>            # node + locations + availability + quarantine
 pvfs cat <node-id> [--range A-B] [-o FILE]
 pvfs hash <node-id>            # fill lazy content_hash
 pvfs loc verify <file-id>      # re-check quarantined/all locations
+pvfs changes                   # list nodes flagged invalid: changed-on-disk
+pvfs resolve <node-id> --replace | --delete [--purge]   # operator decision (§4.4)
 pvfs serve [--reconcile-interval 1h] [--debounce 2s]
 ```
 
@@ -239,8 +269,11 @@ location) maps to exit 3 (not-found family).
    copied; node id stable across location changes (P0 §14.13 extended).
 4. **Disk deletion** — file removed on disk ⇒ location soft-removed, node kept,
    flagged unavailable; file restored ⇒ location re-added, flag clears.
-5. **Changed file** — per [OPEN-2] resolution; old node retained for review;
-   links updated; locations moved.
+5. **Changed file** — modification flags the node (`pending_changes`) and the
+   stale location is not served; `pvfs changes` lists it; `resolve --replace`
+   creates the successor node + `LinkSuperseded` trail and clears the flag;
+   `resolve --delete` orphans the old node (`--purge` hard-deletes); the
+   on-disk file is never modified by either path.
 6. **Read path** — cat streams correct bytes; corrupted bytes detected
    (hash mismatch) ⇒ error + quarantine per [OPEN-3]; quarantined location
    skipped on next read; `loc verify` lifts quarantine after repair; range
@@ -256,11 +289,15 @@ location) maps to exit 3 (not-found family).
 
 ---
 
-## 11. Open decisions to settle before coding
+## 11. Open decisions
 
-1. **[OPEN-1]** Folder binding storage: **events + projection table** (proposed)
-   vs payload (breaks id-stability on re-bind).
-2. **[OPEN-2]** Changed-file semantics: **new node + LinkSuperseded trail**
-   (proposed) vs plain delete+add.
-3. **[OPEN-3]** Integrity-failure handling: **local quarantine table**
-   (proposed) vs signed suspend events in the log.
+1. ~~[OPEN-1]~~ **Decided:** folder bindings are signed events
+   (`FolderBound` / `FolderUnbound`) + `folder_bindings` projection (§3).
+2. ~~[OPEN-2]~~ **Decided:** changed files are **flagged invalid, never
+   auto-resolved**; operator chooses `resolve --replace` (successor node +
+   `LinkSuperseded` trail) or `resolve --delete [--purge]` (§4.4). New files
+   are simply indexed into the tree position mirroring their on-disk location.
+3. ~~[OPEN-3]~~ **Decided:** hash-mismatch on read ⇒ **local quarantine**
+   (§5), never a log event; `pvfs loc verify` lifts it when bytes are repaired.
+
+**All P1 decisions settled — this spec is ready to implement.**
