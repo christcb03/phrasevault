@@ -6,7 +6,12 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 
 ## Status
 
-**Version `0.1` — in development.** Currently in the design/spec phase for the P0 core engine. No application code yet.
+**Version `0.1` — in development.** The P0 core engine is implemented as a Rust workspace:
+
+- [`crates/pvfs-core`](crates/pvfs-core) — the kernel library (PCE encoding, nodes/links, event log + hash chain, projection + startup recovery, BIP39/BIP32 identity with device certificates, engine API).
+- [`crates/pvfs-cli`](crates/pvfs-cli) — the `pvfs` CLI (`init`, `recover`, `tree`, `add`, `link`, `ls`, `walk`, `loc`, `verify`, `orphans`, `purge`, `device`, `--json`, scriptable exit codes).
+
+Build and test locally with `cargo test --workspace`, or run the full build/test/deploy pipeline against the presubuntu test server: [`deploy/ansible/`](deploy/ansible/).
 
 See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 

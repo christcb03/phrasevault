@@ -1,0 +1,553 @@
+//! index.db — the projection (spec §8), fold rules (§9.2), and the startup
+//! integrity check & recovery (§9.3).
+
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+
+use crate::error::{map_db, PvfsError, Result};
+use crate::event::Event;
+use crate::log_store;
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+pub const INDEX_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS nodes (
+  id             TEXT PRIMARY KEY,
+  node_type      TEXT NOT NULL,
+  label          TEXT NOT NULL,
+  visibility     TEXT NOT NULL DEFAULT 'public',
+  payload        BLOB NOT NULL,
+  creation_nonce INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL,
+  author         BLOB NOT NULL,
+  sig            BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS links (
+  id            TEXT PRIMARY KEY,
+  parent_id     TEXT,
+  child_id      TEXT NOT NULL,
+  link_type     TEXT NOT NULL,
+  link_nonce    INTEGER NOT NULL,
+  order_key     TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  author        BLOB NOT NULL,
+  sig           BLOB NOT NULL,
+  removed_at    INTEGER,
+  superseded_by TEXT,
+  suspended_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS file_locations (
+  file_id    TEXT NOT NULL,
+  uri        TEXT NOT NULL,
+  added_at   INTEGER NOT NULL,
+  removed_at INTEGER,
+  PRIMARY KEY (file_id, uri)
+);
+
+CREATE TABLE IF NOT EXISTS device_keys (
+  device_pubkey BLOB PRIMARY KEY,
+  device_index  INTEGER NOT NULL,
+  authorized_at INTEGER NOT NULL,
+  revoked_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS temp_nodes (
+  id             TEXT PRIMARY KEY,
+  node_type      TEXT NOT NULL,
+  label          TEXT NOT NULL,
+  visibility     TEXT NOT NULL DEFAULT 'public',
+  payload        BLOB NOT NULL,
+  creation_nonce INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL,
+  author         BLOB NOT NULL,
+  sig            BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS temp_links (
+  id            TEXT PRIMARY KEY,
+  parent_id     TEXT,
+  child_id      TEXT NOT NULL,
+  link_type     TEXT NOT NULL,
+  link_nonce    INTEGER NOT NULL,
+  order_key     TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  author        BLOB NOT NULL,
+  sig           BLOB NOT NULL,
+  removed_at    INTEGER,
+  superseded_by TEXT,
+  suspended_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS temp_file_locations (
+  file_id    TEXT NOT NULL,
+  uri        TEXT NOT NULL,
+  added_at   INTEGER NOT NULL,
+  removed_at INTEGER,
+  PRIMARY KEY (file_id, uri)
+);
+
+CREATE TABLE IF NOT EXISTS projection_meta (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_nodes_type         ON nodes(node_type);
+CREATE INDEX IF NOT EXISTS idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
+";
+
+const MAIN_OBJECTS: &[&str] = &[
+    "nodes",
+    "links",
+    "file_locations",
+    "device_keys",
+    "temp_nodes",
+    "temp_links",
+    "temp_file_locations",
+    "projection_meta",
+];
+
+// ---- meta helpers -----------------------------------------------------------
+
+pub fn meta_get(conn: &Connection, k: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT v FROM projection_meta WHERE k = ?1",
+        params![k],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(map_db("read projection_meta"))
+}
+
+pub fn meta_set(conn: &Connection, k: &str, v: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO projection_meta (k, v) VALUES (?1, ?2)
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![k, v],
+    )
+    .map_err(map_db("write projection_meta"))?;
+    Ok(())
+}
+
+pub fn create_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INDEX_SCHEMA)
+        .map_err(map_db("create index schema"))?;
+    if meta_get(conn, "schema_version")?.is_none() {
+        meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
+        meta_set(conn, "last_applied_seq", "0")?;
+        meta_set(conn, "last_applied_chain_hash", "")?;
+        meta_set(conn, "clean_shutdown", "1")?;
+    }
+    Ok(())
+}
+
+// ---- fold rules (spec §9.2) -------------------------------------------------
+
+pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
+    let m = map_db("fold event");
+    match event {
+        Event::ForestCreated {
+            instance_id,
+            forest_id,
+            root_node_id,
+            author,
+            ..
+        } => {
+            for (k, v) in [
+                ("instance_id", instance_id.as_str()),
+                ("forest_id", forest_id.as_str()),
+                ("forest_root_node_id", root_node_id.as_str()),
+            ] {
+                tx.execute(
+                    "INSERT INTO projection_meta (k, v) VALUES (?1, ?2)
+                     ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    params![k, v],
+                )
+                .map_err(&m)?;
+            }
+            tx.execute(
+                "INSERT INTO projection_meta (k, v) VALUES ('identity_root_pubkey', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![hex::encode(author)],
+            )
+            .map_err(&m)?;
+        }
+        Event::DeviceAuthorized {
+            device_pubkey,
+            device_index,
+            authorized_at,
+            ..
+        } => {
+            tx.execute(
+                "INSERT OR IGNORE INTO device_keys (device_pubkey, device_index, authorized_at, revoked_at)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params![device_pubkey, *device_index as i64, *authorized_at as i64],
+            )
+            .map_err(&m)?;
+        }
+        Event::DeviceRevoked {
+            device_pubkey,
+            revoked_at,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE device_keys SET revoked_at = ?1 WHERE device_pubkey = ?2",
+                params![*revoked_at as i64, device_pubkey],
+            )
+            .map_err(&m)?;
+        }
+        Event::NodeCreated(n) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO nodes
+                 (id, node_type, label, visibility, payload, creation_nonce, created_at, author, sig)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    n.id,
+                    n.node_type,
+                    n.label,
+                    n.visibility,
+                    n.payload,
+                    n.creation_nonce as i64,
+                    n.created_at as i64,
+                    n.author,
+                    n.sig
+                ],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkCreated(l) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO links
+                 (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,
+                  removed_at, superseded_by, suspended_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL)",
+                params![
+                    l.id,
+                    l.parent_id,
+                    l.child_id,
+                    l.link_type,
+                    l.link_nonce as i64,
+                    l.order_key,
+                    l.created_at as i64,
+                    l.author,
+                    l.sig
+                ],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkRemoved {
+            link_id, removed_at, ..
+        } => {
+            tx.execute(
+                "UPDATE links SET removed_at = ?1 WHERE id = ?2",
+                params![*removed_at as i64, link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkReordered {
+            link_id,
+            new_order_key,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE links SET order_key = ?1 WHERE id = ?2",
+                params![new_order_key, link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkSuperseded {
+            old_link_id,
+            new_link_id,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE links SET superseded_by = ?1 WHERE id = ?2",
+                params![new_link_id, old_link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkSuspended {
+            link_id,
+            suspended_at,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE links SET suspended_at = ?1 WHERE id = ?2",
+                params![*suspended_at as i64, link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::LinkUnsuspended { link_id, .. } => {
+            tx.execute(
+                "UPDATE links SET suspended_at = NULL WHERE id = ?1",
+                params![link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::FileLocationAdded {
+            file_id,
+            uri,
+            added_at,
+            ..
+        } => {
+            tx.execute(
+                "INSERT OR IGNORE INTO file_locations (file_id, uri, added_at, removed_at)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params![file_id, uri, *added_at as i64],
+            )
+            .map_err(&m)?;
+        }
+        Event::FileLocationRemoved {
+            file_id,
+            uri,
+            removed_at,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE file_locations SET removed_at = ?1 WHERE file_id = ?2 AND uri = ?3",
+                params![*removed_at as i64, file_id, uri],
+            )
+            .map_err(&m)?;
+        }
+        Event::NodePurged { node_id, .. } => {
+            tx.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
+                .map_err(&m)?;
+            tx.execute(
+                "DELETE FROM file_locations WHERE file_id = ?1",
+                params![node_id],
+            )
+            .map_err(&m)?;
+        }
+    }
+    Ok(())
+}
+
+// ---- startup integrity check & recovery (spec §9.3) -------------------------
+
+pub struct ForestIdentity {
+    pub instance_id: String,
+    pub forest_id: String,
+    pub root_node_id: String,
+    pub root_pubkey: Vec<u8>,
+}
+
+fn decode_genesis(conn: &Connection) -> Result<ForestIdentity> {
+    let row = log_store::read_event(conn, 1)?.ok_or_else(|| PvfsError::Corruption {
+        db: "log.db".into(),
+        detail: "log has no genesis event (seq 1 missing)".into(),
+        seq: Some(1),
+    })?;
+    if row.kind != crate::event::K_FOREST_CREATED {
+        return Err(PvfsError::Corruption {
+            db: "log.db".into(),
+            detail: format!("first event is {:?}, expected ForestCreated", row.kind),
+            seq: Some(1),
+        });
+    }
+    let ev = Event::decode(&row.kind, &row.body)?;
+    ev.verify_sig()?;
+    match ev {
+        Event::ForestCreated {
+            instance_id,
+            forest_id,
+            root_node_id,
+            author,
+            ..
+        } => Ok(ForestIdentity {
+            instance_id,
+            forest_id,
+            root_node_id,
+            root_pubkey: author,
+        }),
+        _ => unreachable!("kind checked above"),
+    }
+}
+
+fn quick_check(conn: &Connection, db: &str) -> Result<bool> {
+    let res: std::result::Result<String, rusqlite::Error> = conn.query_row(
+        &format!("PRAGMA {db}.quick_check"),
+        [],
+        |r| r.get(0),
+    );
+    match res {
+        Ok(s) => Ok(s == "ok"),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Verify the per-event signature and the root-only rule for device events,
+/// then fold. Used by both catch-up replay and full rebuild.
+fn replay_one(
+    tx: &Transaction<'_>,
+    identity: &ForestIdentity,
+    row: &log_store::EventRow,
+    prev_chain: &[u8; 32],
+) -> Result<[u8; 32]> {
+    // chain verification (spec §9.3 step 4)
+    let expect = log_store::chain_step(prev_chain, row.seq, &row.kind, &row.body, row.written_at);
+    if expect.as_slice() != row.chain_hash.as_slice() {
+        return Err(PvfsError::LogChainBroken {
+            seq: row.seq,
+            expected: hex::encode(expect),
+            actual: hex::encode(&row.chain_hash),
+        });
+    }
+    let ev = Event::decode(&row.kind, &row.body)?;
+    ev.verify_sig()?;
+    match &ev {
+        Event::ForestCreated { .. } if row.seq != 1 => {
+            return Err(PvfsError::Corruption {
+                db: "log.db".into(),
+                detail: "second ForestCreated event".into(),
+                seq: Some(row.seq),
+            })
+        }
+        Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
+            if author != &identity.root_pubkey {
+                return Err(PvfsError::Integrity {
+                    kind: "event",
+                    id: format!("seq {}", row.seq),
+                    reason: crate::error::IntegrityReason::UnknownAuthor,
+                });
+            }
+        }
+        _ => {}
+    }
+    fold(tx, &ev)?;
+    Ok(expect)
+}
+
+/// Replay events `from..=to` inside one transaction, updating meta at the end.
+fn replay_range(
+    conn: &mut Connection,
+    identity: &ForestIdentity,
+    mut chain: [u8; 32],
+    from: u64,
+    to: u64,
+) -> Result<[u8; 32]> {
+    let tx = conn.transaction().map_err(map_db("begin replay"))?;
+    for seq in from..=to {
+        let row = log_store::read_event(&tx, seq)?.ok_or_else(|| PvfsError::Corruption {
+            db: "log.db".into(),
+            detail: format!("missing event at seq {seq}"),
+            seq: Some(seq),
+        })?;
+        chain = replay_one(&tx, identity, &row, &chain)?;
+    }
+    tx.execute(
+        "INSERT INTO projection_meta (k, v) VALUES ('last_applied_seq', ?1)
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![to.to_string()],
+    )
+    .map_err(map_db("update meta"))?;
+    tx.execute(
+        "INSERT INTO projection_meta (k, v) VALUES ('last_applied_chain_hash', ?1)
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![hex::encode(chain)],
+    )
+    .map_err(map_db("update meta"))?;
+    tx.commit().map_err(map_db("commit replay"))?;
+    Ok(chain)
+}
+
+/// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
+/// replay everything from the genesis seed. Temp tables start empty.
+pub fn full_rebuild(conn: &mut Connection) -> Result<ForestIdentity> {
+    let identity = decode_genesis(conn)?;
+    for t in MAIN_OBJECTS {
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))
+            .map_err(map_db("drop projection table"))?;
+    }
+    create_schema(conn)?;
+    let top = log_store::max_seq(conn)?;
+    let genesis = log_store::genesis_seed(&identity.instance_id, &identity.forest_id);
+    replay_range(conn, &identity, genesis, 1, top)?;
+    meta_set(conn, "clean_shutdown", "0")?;
+    Ok(identity)
+}
+
+/// The §9.3 startup check. Runs on every open, after both files are attached.
+/// Returns the forest identity on success.
+pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
+    // Step 1 — structural check.
+    if !quick_check(conn, "log")? {
+        return Err(PvfsError::Corruption {
+            db: "log.db".into(),
+            detail: "PRAGMA quick_check failed".into(),
+            seq: None,
+        });
+    }
+    let index_ok = quick_check(conn, "main")?;
+    if !index_ok {
+        return full_rebuild(conn);
+    }
+    create_schema(conn)?; // ensure tables exist on first open of a fresh index
+
+    let identity = decode_genesis(conn)?;
+    let genesis = log_store::genesis_seed(&identity.instance_id, &identity.forest_id);
+
+    // Step 2 — positions.
+    let sl = log_store::max_seq(conn)?;
+    let si: u64 = meta_get(conn, "last_applied_seq")?
+        .unwrap_or_else(|| "0".into())
+        .parse()
+        .unwrap_or(0);
+    let hi = meta_get(conn, "last_applied_chain_hash")?.unwrap_or_default();
+    let clean = meta_get(conn, "clean_shutdown")?.unwrap_or_else(|| "1".into());
+
+    let version: u32 = meta_get(conn, "schema_version")?
+        .unwrap_or_else(|| SCHEMA_VERSION.to_string())
+        .parse()
+        .unwrap_or(SCHEMA_VERSION);
+    if version != SCHEMA_VERSION {
+        return Err(PvfsError::SchemaVersion {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
+    // Step 3 — verify the index agrees with the log at its applied point.
+    if si > sl {
+        return full_rebuild(conn);
+    }
+    if si > 0 {
+        match log_store::read_event(conn, si)? {
+            Some(row) if hex::encode(&row.chain_hash) == hi => {}
+            _ => return full_rebuild(conn),
+        }
+    }
+
+    // Unclean shutdown forces a full agreement check (spec §9.3 crash flag).
+    if clean != "1" {
+        return full_rebuild(conn);
+    }
+
+    // Step 4 — catch up.
+    if si < sl {
+        let chain = if si == 0 {
+            genesis
+        } else {
+            let row = log_store::read_event(conn, si)?.ok_or_else(|| PvfsError::Corruption {
+                db: "log.db".into(),
+                detail: format!("missing event at seq {si}"),
+                seq: Some(si),
+            })?;
+            let mut a = [0u8; 32];
+            if row.chain_hash.len() != 32 {
+                return Err(PvfsError::Corruption {
+                    db: "log.db".into(),
+                    detail: "chain hash wrong length".into(),
+                    seq: Some(si),
+                });
+            }
+            a.copy_from_slice(&row.chain_hash);
+            a
+        };
+        replay_range(conn, &identity, chain, si + 1, sl)?;
+    }
+    Ok(identity)
+}

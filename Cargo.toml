@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/pvfs-core", "crates/pvfs-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+blake3 = "1.5"
+k256 = "0.13"
+bip39 = { version = "2.1", features = ["rand"] }
+bip32 = "0.5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+hex = "0.4"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4.4", features = ["derive"] }
+tempfile = "3"

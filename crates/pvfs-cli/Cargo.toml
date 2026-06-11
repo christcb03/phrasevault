@@ -1,0 +1,15 @@
+[package]
+name = "pvfs-cli"
+description = "Thin CLI over pvfs-core (spec §13.4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pvfs"
+path = "src/main.rs"
+
+[dependencies]
+pvfs-core = { path = "../pvfs-core" }
+clap.workspace = true
+hex.workspace = true

@@ -1,0 +1,148 @@
+---
+# PVFS build/test/deploy pipeline for the presubuntu test server.
+#
+# Stages (tags): prepare → deploy → build → test → smoke → install → report
+#
+#   ansible-playbook -i inventory.ini pipeline.yml
+#   ansible-playbook -i inventory.ini pipeline.yml --tags test,smoke   # re-run checks only
+#
+# The pipeline FAILS if `cargo test` fails or any CLI smoke test fails.
+# Test logs are fetched back to ./artifacts/<host>/ on the control machine.
+
+- name: PVFS pipeline — build, test, deploy
+  hosts: "{{ target_hosts | default('presubuntu') }}"
+  gather_facts: true
+
+  vars:
+    pvfs_src: /opt/pvfs/src
+    pvfs_bin: /usr/local/bin/pvfs
+    cargo_env:
+      PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+      CARGO_TERM_COLOR: never
+
+  tasks:
+    # ---- prepare ------------------------------------------------------------
+    - name: Install build prerequisites
+      become: true
+      ansible.builtin.apt:
+        name: [build-essential, pkg-config, curl, git, rsync, python3]
+        state: present
+        update_cache: true
+      tags: [prepare]
+
+    - name: Check for rustup
+      ansible.builtin.stat:
+        path: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+      register: cargo_stat
+      tags: [prepare]
+
+    - name: Install Rust toolchain (rustup, stable)
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain stable --profile minimal
+      args:
+        executable: /bin/bash
+      when: not cargo_stat.stat.exists
+      tags: [prepare]
+
+    # ---- deploy ---------------------------------------------------------------
+    - name: Create source directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ pvfs_src }}"
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        mode: "0755"
+      tags: [deploy]
+
+    - name: Sync repository to {{ pvfs_src }}
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ pvfs_src }}/"
+        delete: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=old/"
+          - "--exclude=v0.0-concept/"
+          - "--exclude=target/"
+          - "--exclude=.pvfs/"
+          - "--exclude=artifacts/"
+      tags: [deploy]
+
+    # ---- build ------------------------------------------------------------------
+    - name: Build (release)
+      ansible.builtin.command:
+        cmd: cargo build --release --workspace
+        chdir: "{{ pvfs_src }}"
+      environment: "{{ cargo_env }}"
+      register: build_out
+      changed_when: true
+      tags: [build]
+
+    # ---- test (cargo unit + integration suite, spec §14) -------------------------
+    - name: Run cargo test suite
+      ansible.builtin.shell: |
+        set -o pipefail
+        cargo test --workspace 2>&1 | tee /tmp/pvfs-test-results.txt
+      args:
+        chdir: "{{ pvfs_src }}"
+        executable: /bin/bash
+      environment: "{{ cargo_env }}"
+      register: test_out
+      changed_when: false
+      tags: [test]
+
+    # ---- smoke (every CLI function end-to-end) ------------------------------------
+    - name: Upload CLI smoke test
+      ansible.builtin.copy:
+        src: files/smoke-test.sh
+        dest: /tmp/pvfs-smoke-test.sh
+        mode: "0755"
+      tags: [smoke]
+
+    - name: Run CLI smoke tests
+      ansible.builtin.shell: |
+        set -o pipefail
+        PVFS_BIN={{ pvfs_src }}/target/release/pvfs /tmp/pvfs-smoke-test.sh 2>&1 \
+          | tee /tmp/pvfs-smoke-results.txt
+      args:
+        executable: /bin/bash
+      register: smoke_out
+      changed_when: false
+      tags: [smoke]
+
+    # ---- install -------------------------------------------------------------------
+    - name: Install pvfs binary to {{ pvfs_bin }}
+      become: true
+      ansible.builtin.copy:
+        src: "{{ pvfs_src }}/target/release/pvfs"
+        dest: "{{ pvfs_bin }}"
+        mode: "0755"
+        remote_src: true
+      tags: [install]
+
+    - name: Verify installed binary runs
+      ansible.builtin.command: "{{ pvfs_bin }} --version"
+      register: version_out
+      changed_when: false
+      tags: [install]
+
+    # ---- report ----------------------------------------------------------------------
+    - name: Fetch test results to control machine
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ playbook_dir }}/artifacts/"
+      loop:
+        - /tmp/pvfs-test-results.txt
+        - /tmp/pvfs-smoke-results.txt
+      tags: [report]
+
+    - name: Pipeline summary
+      ansible.builtin.debug:
+        msg:
+          - "build   : ok"
+          - "tests   : {{ test_out.stdout_lines[-1] | default('see artifacts') }}"
+          - "smoke   : {{ smoke_out.stdout_lines[-1] | default('see artifacts') }}"
+          - "binary  : {{ version_out.stdout | default('n/a') }}"
+      tags: [report]
