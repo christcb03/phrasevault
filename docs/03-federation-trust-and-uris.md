@@ -35,7 +35,7 @@ Each forest has:
 - Prefix chain comparison verifies: "this replica matches the owner's history up to seq *N*."
 - There is **no multi-master CRDT merge** on a shared log.
 
-P0 implements **one owned forest** per data directory with `instance_id` + `forest_id` metadata. P4 adds additional owned forests and replica forests on the same host.
+P0 implements **one owned forest** per data directory. **Decided:** the forest's identity (`instance_id`, `forest_id`, `root_node_id`) is recorded durably as a signed **`ForestCreated` genesis event at seq 1** of the log, and the chain genesis seed binds `instance_id` + `forest_id` (spec §6, §7.1) — the `projection_meta` copies are a rebuildable cache. P4 adds additional owned forests and replica forests on the same host.
 
 ### 1.3 Sharing modes (P4)
 
@@ -176,7 +176,11 @@ Detects row reordering and timestamp tampering cheaply.
 
 ### 3.5 secp256k1 signature malleability
 
-Keep **secp256k1** for passphrase-derived identity continuity. Verifier **must enforce low-s** (reject malleable signatures). Document in spec §4.4.
+Keep **secp256k1** — it is the curve the BIP39/BIP32 identity scheme (spec §10) and the wider wallet ecosystem use. Verifier **must enforce low-s** (reject malleable signatures). Document in spec §4.4.
+
+### 3.6 Identity root & device keys
+
+Identity is a **BIP39 generated seed phrase** → **BIP32 hardened HD key tree** (spec §10): an **identity root key** (signs `ForestCreated` and device certificates only) and **per-device signing keys** (the everyday `author`). `DeviceAuthorized` / `DeviceRevoked` events in the forest log tie device keys to the root and provide stolen-device containment. This changes nothing about the sync model — replication copies signed events verbatim and accepts foreign authors — but it gives remote-append authorization (§6 item 4) its natural rule: *accept appends from device keys currently certified under the owner's identity root.*
 
 ---
 
@@ -210,7 +214,7 @@ The sync/file-server layer (version `1.0.#`) implements transport, auth, and tai
 1. **`instance_id` assignment** — How is it chosen at first init (hostname slug, UUID, operator config)? How do peers discover `instance_id` → network address?
 2. **`forest_id` format** — UUID vs human slug; whether compound `<instance_id>:<slug>` is ever used vs always two path segments in URIs.
 3. **Failover writer** — If owner instance is down, can a replica be promoted to append? (Requires explicit protocol; default is **no**.)
-4. **Remote append auth** — Which keys may request `FileLocationAdded` on A's forest (B's identity, shared token, module policy)? Specified in sync layer `1.0.#`.
+4. **Remote append auth** — *Model decided (§3.6):* the owner accepts appends from device keys certified under its identity root; cross-instance grants (e.g. letting B's identity request `FileLocationAdded` on A's forest) still need a grant mechanism. Wire protocol in sync layer `1.0.#`.
 5. **Selective log subscription** — Subset-of-forest event stream vs full forest only for Mode B imports.
 6. **Content-hash URI** — Whether to add `pvfs:…/file/<hash>` read shortcut in P4 (optional optimization).
 

@@ -115,10 +115,10 @@ A link is a typed, signed, directed edge. Its `id` is content-addressed, but a s
 
 | Field | Meaning |
 |---|---|
-| `id` | BLAKE3 over `(type, label, visibility, payload, is_temp, creation_nonce, created_at, author)`. |
+| `id` | BLAKE3 over `(parent_id, child_id, link_type, link_nonce)` — the **logical edge id** (spec §5.2). |
 | `parent_id` | Source node, or `null` when the child is a tree root. |
 | `child_id` | Target node. |
-| `link_type` | Core: `contains` (hierarchy), `ref` (cross-reference). Modules may add their own. |
+| `link_type` | Core: `contains` (hierarchy), `ref` (cross-reference). Modules may add their own. **Decided — one home:** a node may have at most **one active `contains` parent** at a time (the root link counts as the root's home). All other placements — other trees, playlists, collections — use `ref` links. Moving a node = remove its home link + create the new one in one transaction. |
 | `link_nonce` | Disambiguates multiple edges with same `(parent, child, type)`; default `0`. |
 | `created_at`, `author`, `sig` | `created_at` is audit-only (not in link id). Same trust fields as a node. |
 | *state band* | `removed_at`, `superseded_by`, `suspended_at` — mutable; not part of `id`. |
@@ -185,6 +185,8 @@ CREATE TABLE events (
 
 ### SQLite projection schema (illustrative, not final)
 
+> **Superseded:** the authoritative schema is spec [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md) §7 (`log.db`, incl. `chain_hash`) and §8 (`index.db`, incl. `file_locations`). The sketch below predates those and is kept only to illustrate the shape — do not implement from it.
+
 ```sql
 -- Durable, projected from the log:
 CREATE TABLE nodes (
@@ -241,17 +243,17 @@ Queries that walk a tree read from both the durable and temp tables (a tree can 
 ### 6.1 Soft-delete & orphans (durable nodes)
 
 - "Deleting" a connection appends a `LinkRemoved` event; the projection sets `removed_at`. The node and link history are never erased.
-- A node is **orphaned** when it has no active inbound links.
+- A node is **orphaned** when it has no active inbound links — counted across **both** `links` and `temp_links` (one orphan definition everywhere, same as §6.2). A durable node referenced only by a temp link is therefore *not* orphaned while that link lives, but will surface on the orphan review list after an index rebuild drops temp data — correct, since its last reference is gone.
 - Orphans are retained for review; hard delete (purge) appends a `NodePurged` tombstone event and is a separate, explicit, opt-in operation.
+- **Decided — purge requires orphan + auto-tidies outbound links.** `purge()` is refused (`NotOrphan` error) unless the node has zero active inbound links. In the same transaction, purge appends a `LinkRemoved` event for each of the node's still-active *outbound* links, then the `NodePurged` tombstone — so no active link ever references a missing node. Children unlinked this way become orphans in turn (temp children purge immediately per §6.2); deleting a whole subtree is therefore an explicit orphan→purge cycle per level (a recursive convenience command can layer on top later).
 
 ### 6.2 Temp purge (the exception)
 
 - A temp node (`is_temp = true`) is **never retained as an orphan** and **never touches the log**.
-- The moment its only remaining active link is the one to its tree root (i.e. nothing else references it), the engine **purges it immediately** — a direct `DELETE` of its `temp_nodes` / `temp_links` rows. No event is written.
-- This runs as part of link removal: whenever a link is removed, the engine checks whether any affected temp node now hangs only off its root, and deletes it in the same SQLite transaction.
+- **Decided — purge on orphan, same definition as §6.1:** the moment a temp node has **no active inbound links** (from either `links` or `temp_links`), the engine **purges it immediately** — a direct `DELETE` of its `temp_nodes` / `temp_links` rows. No event is written. There is no special case for the tree root: a link from the root counts like any other reference, so a temp node parked directly under a root stays until it is explicitly unlinked.
+- The check runs as part of link removal: whenever a link pointing at a temp node is removed (or superseded), the engine re-counts that node's active inbound links and deletes it in the same SQLite transaction if none remain. Creation can never trigger a purge (a node is created *with* its link).
+- **Cascade:** purging a temp node deletes its outbound `temp_links` too, which may orphan further temp children — the check cascades to them in the same transaction. (A temp folder's temp children vanish with it; durable nodes are never affected, since a durable node cannot depend on a temp node — §2.)
 - Because temp purges are plain local deletes (not events), heavy temp churn imposes no cost on the canonical log.
-
-> Open: define precisely "linked to nothing except its tree root." Proposed: the node has exactly one active inbound link and that link's parent is a tree root, or the node itself is a direct child of the root with no other inbound refs.
 
 ### 6.3 Managed temp bytes & crash/rebuild cleanup (P1+ contract)
 
@@ -265,14 +267,19 @@ P0 does not write file bytes at all (byte I/O is P1), so there is nothing on dis
 
 ---
 
-## 7. Identity — DECIDED: passphrase-derived
+## 7. Identity — DECIDED: generated seed phrase (BIP39) + HD key tree (BIP32)
 
-The signing identity is **derived deterministically from a passphrase**, not randomly generated per instance.
+The identity is rooted in a **PVFS-generated recovery phrase**, following the established wallet standards, **not** a human-chosen passphrase. (A passphrase-derived scheme was considered and rejected: deriving the salt from the passphrase itself enables a precomputed global dictionary attack — the documented failure mode of Bitcoin-era "brain wallets.")
 
-- **Derivation:** `identityPrivKey = Argon2id(passphrase, salt = BLAKE3("pvfs:identity:v1:" + passphrase))`, then `authorPubKey = secp256k1.publicKey(identityPrivKey)`. Argon2id is **memory-hard** (deliberately slow and RAM-heavy) so the long-term signing key resists brute force. The domain-separation prefix (`pvfs:identity:v1:`) ensures this key can never collide with a key derived for some other purpose.
-- **Why passphrase-derived:** the same passphrase reproduces the **same identity on any machine**. This is what makes replication (P4) and recovery work — a user can stand up a new instance, enter their passphrase, and it authors nodes under the same identity. A random per-instance key could not be recovered or matched across machines.
-- **Handling:** the passphrase is taken at startup (prompt, env var, or a protected config file — exact UX is a P1 concern), the key is derived once, and the passphrase reference is cleared from memory. The derived private key may be cached in the data dir (owner-readable only, mode 0600) to avoid re-deriving on every start; this is a convenience cache, not the source.
-- This key is the `author` of every node/link the instance creates and the signer for them. Multi-user / per-tenant identities can layer on later without changing the node model (an author is just a public key).
+- **Generation:** at init, PVFS generates 256 bits of randomness and presents it once as a **24-word BIP39 mnemonic**. The user stores it; PVFS never persists the phrase. The standard BIP39 seed derivation is used (compatible with existing tooling; an optional BIP39 passphrase — the "25th word" — is supported for defense in depth).
+- **One seed, many keys (BIP32, hardened only):** all keys derive deterministically from the seed down fixed, documented, **hardened** paths under a PVFS-specific purpose prefix:
+  - **Identity root key** — defines *who you are*. Used only to sign device certificates (and, at init, the `ForestCreated` event). Derived transiently, never stored.
+  - **Device signing keys** — one per device (`device 0, 1, 2 …`). The everyday `author` of nodes/links/events on that device. Only this key is cached on the device (mode 0600), so a compromised machine exposes one device key, never the root or the phrase.
+  - **Encryption branch** — reserved for the `secure` module (P3) so encryption keys derive from the same seed but can never collide with signing keys (separate hardened path).
+- **Device certificates:** the identity root signs a small statement "device pubkey X is authorized under root R," recorded in the log as a `DeviceAuthorized` event (spec §6). `DeviceRevoked` is the corresponding kill switch: a revoked device key is no longer accepted for **new** appends, while history it wrote while valid remains verifiable. This is the damage-limitation story for a stolen device.
+- **Why this still syncs (federation model, doc 03):** replication copies signed events **verbatim**, and logs accept foreign authors — so records signed by different device keys replicate unchanged. The remote-append authorization question (03 §6 item 4) becomes "accept appends from device keys certified under the owner's identity root."
+- **Recovery:** the phrase regenerates the root and every device/encryption key on any machine. Losing the phrase loses the identity (and, once the secure module exists, encrypted data) — this is the deliberate trade for making the secret unguessable.
+- Multi-user / per-tenant identities still layer on later without changing the node model (an author is just a public key).
 
 ---
 
@@ -321,9 +328,11 @@ All foundational decisions are now settled:
 3. **Log on-disk format** (§5) — **decided:** an append-only `events` table in a separate SQLite file (`log.db`), distinct from the disposable projection (`index.db`); free crash-safety and atomic append-and-project.
 4. **Sibling order representation** (§3.4) — **decided:** per-parent sortable `order_key` (indexed by `(parent_id, order_key)`), not prev/next pointers.
 5. **Canonical encoding** (§4.1) — **decided:** strict length-prefixed binary, for byte-identical ids across languages (P2 WASM modules).
-6. **Identity source** (§7) — **decided:** passphrase-derived (Argon2id → secp256k1), so the same identity reproduces across machines for replication and recovery.
+6. **Identity source** (§7) — **decided:** generated **BIP39 24-word phrase** → **BIP32 hardened HD keys** (secp256k1): identity root + per-device signing keys + reserved encryption branch; device certificates (`DeviceAuthorized`/`DeviceRevoked`) tie device keys to the root. Supersedes the earlier passphrase-derived (Argon2id) scheme.
 7. **File locations** (§3.2, spec §4.3/§6) — **decided:** URIs are **not** in the file node id preimage; multiple locations per file via **`FileLocationAdded` / `FileLocationRemoved` events** (replication adds URIs without changing file node id).
 8. **Log corruption recovery** (spec §9.3 Step 6) — **decided:** stop on corrupt log; operator ladder: backup → replica → salvage → filesystem rebuild (last resort, history lost).
 9. **Federation & trust** — **decided:** forest ownership, log sync as immutable copy, PVFS URI grammar, sign all mutable events, logical link id, node `creation_nonce`, strengthened chain binding, low-s. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md).
+10. **Temp purge trigger** (§6.2) — **decided:** purge the moment a temp node is orphaned (zero active inbound links; the root link counts like any other reference — no special case). Checked on link removal, cascades through temp children, never fires at creation.
+11. **One home per node** (§3.3) — **decided:** at most one active `contains` parent per node; every other placement is a `ref` link. The `contains` hierarchy is a strict tree, so a full walk can never reach a node twice via `contains`; `ref` links are listed but not descended (spec §12).
 
 With these settled, the P0 spec ([02-p0-core-engine-spec.md](02-p0-core-engine-spec.md)) is the implementation checklist.

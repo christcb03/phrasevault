@@ -42,7 +42,7 @@ pvfs/
         event.rs             # §6  Event enum + encode/decode
         log_store.rs         # §7  log.db (append-only events)
         projection.rs        # §8/§9 index.db schema + fold rules
-        identity.rs          # §10 passphrase -> keypair
+        identity.rs          # §10 BIP39 mnemonic -> BIP32 HD keys (root, device, enc branch)
         engine.rs            # §11 public API (the facade)
         walk.rs              # §12 tree traversal
         error.rs             # §13 error type
@@ -50,7 +50,7 @@ pvfs/
       src/main.rs
 ```
 
-Key dependencies (pinned later): `blake3`, `k256` (secp256k1 ECDSA), `argon2`, `rusqlite` (bundled SQLite), `thiserror`. No async in P0.
+Key dependencies (pinned later): `blake3`, `k256` (secp256k1 ECDSA), `bip39`, `bip32` (HD identity, §10), `rusqlite` (bundled SQLite), `thiserror`. (`argon2` is no longer a P0 dependency — see §10; it returns with the secure module in P3.) No async in P0.
 
 ---
 
@@ -169,6 +169,8 @@ Deliberately **excludes** `author`, `created_at`, `order_key`, and the state ban
 - **Logical link id** — replaying the same edge from an owner log onto a replica yields the same id (idempotent sync);
 - excluding `order_key` and the state band lets a link be reordered, removed, suspended, or superseded **without changing its identity**.
 
+> **Decided — one home per node (design doc §3.3, §9 item 11).** A node may have at most **one active `contains` parent** at a time; the root link (`parent_id = none`) counts as the root node's home. Creating a `contains` link to a child that already has an active home is rejected with **`AlreadyContained { child, existing_parent }`**. Every other placement — other trees, playlists, collections — is a `ref` (or module) link. **Move** = `LinkRemoved`(old home) + `LinkCreated`(new home) in one transaction. Enforced at the API; replay assumes the owner enforced it.
+
 ### 5.3 order_key
 
 - An opaque sortable string. Children of a parent are listed by `ORDER BY order_key`.
@@ -186,6 +188,9 @@ Each durable change is one event. Event bodies are PCE-encoded and stored in `lo
 
 | Kind | Body fields | Meaning |
 |---|---|---|
+| `ForestCreated` | `instance_id: string`, `forest_id: string`, `root_node_id: string`, `created_at: u64`, `author: bytes`, `sig: bytes` | **genesis event — always `seq = 1`, exactly once per log.** Signed by the **identity root key**; its `author` is the forest's owner root. Records the forest's permanent identity in the truth log (decided: not only in the disposable projection) |
+| `DeviceAuthorized` | `device_pubkey: bytes`, `device_index: u64`, `authorized_at: u64`, `author: bytes` (identity root), `sig: bytes` | device certificate: root authorizes a device signing key (§10) |
+| `DeviceRevoked` | `device_pubkey: bytes`, `revoked_at: u64`, `author: bytes` (identity root), `sig: bytes` | revoke a device key for **new** appends; its valid history stands |
 | `NodeCreated` | full node record (all §4.1 fields incl. `sig`) | a durable node was created |
 | `LinkCreated` | full link record incl. `order_key` (state band = none) | a durable link was created |
 | `LinkRemoved` | `link_id: string`, `removed_at: u64`, `removed_by: bytes`, `removal_sig: bytes` | soft-remove a link |
@@ -203,6 +208,9 @@ Notes:
 
 | Operation | Message signed (`msg = BLAKE3(...)`) |
 |---|---|
+| `ForestCreated` | `"pvfs:forestcreated:v1:" \|\| PCE(instance_id, forest_id, root_node_id, created_at, author)` |
+| `DeviceAuthorized` | `"pvfs:deviceauthorized:v1:" \|\| PCE(device_pubkey, device_index, authorized_at, author)` |
+| `DeviceRevoked` | `"pvfs:devicerevoked:v1:" \|\| PCE(device_pubkey, revoked_at, author)` |
 | `LinkRemoved` | `"pvfs:linkremoved:v1:" \|\| PCE(link_id, removed_at, removed_by)` |
 | `LinkReordered` | `"pvfs:linkreordered:v1:" \|\| PCE(link_id, new_order_key, author)` |
 | `LinkSuperseded` | `"pvfs:linksuperseded:v1:" \|\| PCE(old_link_id, new_link_id, author)` |
@@ -213,6 +221,10 @@ Notes:
 | `NodePurged` | `"pvfs:nodepurged:v1:" \|\| PCE(node_id, purged_at, author)` |
 
 > **Decided:** every mutable event is signed. Replicas and replay **reject** events that fail signature verification. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §3.
+
+> **Decided — forest identity lives in the log (genesis event).** `init` runs as one transaction: generate the mnemonic and derive keys (§10), choose `instance_id` (config/env) and `forest_id` (UUID), compute the root folder node's id, then append `ForestCreated` (seq 1, signed by the identity root), `DeviceAuthorized` for device 0 (seq 2, signed by the identity root), `NodeCreated` for the root folder (seq 3), and the root `LinkCreated` with `parent_id = NULL` (seq 4). The root node id is content-addressed, so it is computable before any row is written. A log whose first event is not a valid `ForestCreated`, or that contains more than one, is corrupt (§9.3 Step 6).
+>
+> **Device-key acceptance rule:** events appended via the **local API** must be authored by a currently authorized, unrevoked device key of this forest (or the identity root itself). Events arriving by **replay/sync/import** keep their original foreign authors and are accepted on signature validity alone — *authorization* of remote appends is the P4 sync layer's job (federation doc §6 item 4: "keys certified under the owner's identity root").
 
 ---
 
@@ -233,7 +245,9 @@ CREATE TABLE events (
 - **Append-only:** only `INSERT`. Rows are never updated or deleted in P0 (compaction is P4-adjacent).
 - `seq` provides the **local total order** for this forest's log (one write leader per forest; see [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)).
 - **Idempotency (replay/sync):** before appending `NodeCreated`/`LinkCreated`, if the projection already contains the id with identical content, skip append (no-op). On replay, `INSERT OR IGNORE` into projection.
-- **Idempotency (API):** `add_node` / `link` return **`AlreadyExists { id }`** if the id exists with **different** content; return **`Ok(id)`** if bytes match exactly. Never report success for a distinct create that was silently dropped.
+- **Idempotency (API):** `add_node` / `link` return **`AlreadyExists { id }`** if the id exists with **different** record content; return **`Ok(id)`** if the records match exactly. Never report success for a distinct create that was silently dropped.
+  - For **nodes** this conflict is structurally near-impossible (any field change changes the id); the check is a cheap invariant guard. The case that actually occurs is for **links**: the logical id `(parent_id, child_id, link_type, link_nonce)` can collide while `created_at` / `author` / `order_key` differ — that is the `AlreadyExists` case implementers must test (callers retry with a higher `link_nonce` if they truly want a second parallel edge).
+- **Foreign authors are valid.** A log may contain events whose `author` is **not** this instance's identity key — this is how replica sync and selective import (federation doc §1.3 Mode B) work: an import copies the original **signed record verbatim** (preserving the original author, `creation_nonce`, `created_at`, and `sig`), it does not re-create the node under the local identity. P0 verification is already author-generic; *authorization* (which authors may append) is a P4 sync-layer concern.
 
 ### 7.1 Hash chain (tamper / corruption evidence)
 
@@ -241,8 +255,10 @@ Each event stores a rolling hash that binds it to all prior events:
 
 ```
 chain_hash[seq] = BLAKE3( chain_hash[seq-1] || PCE(seq, kind, body, written_at) )
-chain_hash[0]   = BLAKE3( "pvfs:log:v1" )      // genesis seed, before any event
+chain_hash[0]   = BLAKE3( "pvfs:log:v1:" || PCE(instance_id, forest_id) )  // genesis seed
 ```
+
+The genesis seed is **forest-specific** (it binds `instance_id` + `forest_id`, which are fixed at init before any event is written). Combined with the `ForestCreated` event at seq 1, this means one forest's log can never be spliced into, or passed off as, another forest's — the chain would not verify.
 
 Because every event's hash depends on the entire history before it, **any silently altered, dropped, or reordered event breaks the chain** from that point forward. This is what lets the startup check (§9.3) detect corruption rather than just "is the index behind." For **replicas**, prefix chain comparison verifies an exact copy of the **owner forest's** history — not multi-writer merge ([03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §4).
 
@@ -288,6 +304,14 @@ CREATE TABLE file_locations (
   PRIMARY KEY (file_id, uri)
 );
 
+-- Device certificates (projected from DeviceAuthorized / DeviceRevoked events):
+CREATE TABLE device_keys (
+  device_pubkey BLOB PRIMARY KEY,
+  device_index  INTEGER NOT NULL,
+  authorized_at INTEGER NOT NULL,
+  revoked_at    INTEGER                -- NULL = active
+);
+
 -- Ephemeral, never logged or replicated (mirrors nodes/links/locations shape):
 CREATE TABLE temp_nodes ( /* same columns as nodes */ );
 CREATE TABLE temp_links ( /* same columns as links */ );
@@ -303,9 +327,11 @@ CREATE TABLE projection_meta (
 --   'last_applied_chain_hash' -> the log's chain_hash at last_applied_seq (hex)
 --   'clean_shutdown'          -> '1' set on graceful close, '0' set on open (crash flag)
 --   'schema_version'          -> projection schema version (for migrations)
---   'instance_id'             -> owner instance id for this data dir (P0: one owned forest)
---   'forest_id'               -> forest id on the owner (UUID or slug)
---   'forest_root_node_id'     -> canonical root node id of the primary tree
+--   'instance_id'             -> CACHE, projected from the ForestCreated genesis event (§6)
+--   'forest_id'               -> CACHE, projected from ForestCreated
+--   'forest_root_node_id'     -> CACHE, projected from ForestCreated
+--   (the durable source of forest identity is the ForestCreated event in log.db;
+--    these keys are repopulated on every rebuild like any other projected state)
 
 CREATE INDEX idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
@@ -327,8 +353,11 @@ Both files are opened on one `rusqlite` connection with `log.db` ATTACHed, so a 
 
 ```
 BEGIN IMMEDIATE;
+  -- seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM log.events)
+  --   assigned explicitly inside the transaction: chain_hash needs seq *before*
+  --   the insert, so do not rely on AUTOINCREMENT to pick it
   -- compute chain_hash = BLAKE3(prev_chain_hash || PCE(seq, kind, body, written_at))
-  INSERT INTO log.events(seq, kind, body, chain_hash, written_at) VALUES (...);  -- seq from AUTOINCREMENT
+  INSERT INTO log.events(seq, kind, body, chain_hash, written_at) VALUES (...);
   <apply fold rules below to index tables>                                  -- update projection
   UPDATE projection_meta SET v = <new seq>     WHERE k='last_applied_seq';
   UPDATE projection_meta SET v = <chain_hash>  WHERE k='last_applied_chain_hash';
@@ -341,6 +370,9 @@ If the process dies before COMMIT, neither side changed (atomic). If it dies aft
 
 | Event | Index mutation |
 |---|---|
+| `ForestCreated` | `UPDATE projection_meta` — set `instance_id`, `forest_id`, `forest_root_node_id` |
+| `DeviceAuthorized` | `INSERT OR IGNORE INTO device_keys(...)`, `revoked_at = NULL` |
+| `DeviceRevoked` | `UPDATE device_keys SET revoked_at=? WHERE device_pubkey=?` |
 | `NodeCreated` | `INSERT OR IGNORE INTO nodes(...)` |
 | `LinkCreated` | `INSERT OR IGNORE INTO links(...)`, `removed_at/superseded_by/suspended_at = NULL` |
 | `LinkRemoved` | `UPDATE links SET removed_at=? WHERE id=?` |
@@ -351,6 +383,8 @@ If the process dies before COMMIT, neither side changed (atomic). If it dies aft
 | `FileLocationAdded` | `INSERT OR IGNORE INTO file_locations(...)`, `removed_at = NULL` |
 | `FileLocationRemoved` | `UPDATE file_locations SET removed_at=? WHERE file_id=? AND uri=?` |
 | `NodePurged` | `DELETE FROM nodes WHERE id=?`; `DELETE FROM file_locations WHERE file_id=?` |
+
+> **Decided — purge protocol (design doc §6.1):** `purge()` refuses with `NotOrphan` unless the node has zero active inbound links. It then appends, in one transaction: a `LinkRemoved` event for each still-active **outbound** link of the node, followed by the `NodePurged` tombstone. The fold rules above need no link handling for `NodePurged` itself because the preceding `LinkRemoved` events already soft-removed every active edge — no active link can reference a missing node. Historical (already-removed) link rows referencing the purged id remain as inert history.
 
 ### 9.3 Startup integrity check & recovery
 
@@ -393,24 +427,32 @@ Filesystem rebuild requires a strong confirmation phrase (similar to factory res
 
 ---
 
-## 10. Identity (passphrase-derived)
+## 10. Identity (generated seed phrase + HD key tree)
+
+**Decided (supersedes the earlier Argon2id passphrase scheme):** identity follows the established wallet standards — **BIP39** mnemonic + **BIP32** hierarchical deterministic derivation on secp256k1, all paths **hardened**.
 
 ```
-salt    = BLAKE3_256("pvfs:identity:v1:" + passphrase)         // 32 bytes
-seed    = Argon2id(password = passphrase, salt = salt,
-                   m = 65536 KiB (64 MiB), t = 3, p = 1, out = 32 bytes)
-privKey = secp256k1 scalar from seed
-          (if seed >= curve order or == 0 — astronomically rare —
-           re-derive with seed = BLAKE3(seed) and retry)
-pubKey  = secp256k1 compressed public key (33 bytes)  // this is `author`
+entropy   = 256 random bits (OS CSPRNG)
+mnemonic  = BIP39_encode(entropy)                  // 24 words, shown ONCE at init, never stored
+seed      = BIP39_seed(mnemonic, bip39_passphrase) // standard PBKDF2; optional "25th word", default ""
+master    = BIP32_master(seed)                     // secp256k1
+
+root_key    = derive(master, m/43'/PVFS'/0')       // identity root — signs device certs + ForestCreated
+device_key  = derive(master, m/43'/PVFS'/1'/n')    // device n's signing key — everyday `author`
+enc_branch  =                m/43'/PVFS'/2'/...    // RESERVED for the secure module (P3)
 ```
 
-- Argon2id is memory-hard (64 MiB, 3 passes) so the long-term key resists brute force.
-- The domain prefix `pvfs:identity:v1:` keeps this key separate from any future derived key.
-- Same passphrase ⇒ same `author` on any machine ⇒ replication and recovery work.
-- **Handling:** passphrase enters at startup (P1 decides UX: prompt/env/protected file); `privKey` is derived once and held in memory for signing; the passphrase reference is then dropped. Optionally cache `privKey` in the data dir mode `0600` to skip re-derivation on restart (cache, not source of truth).
+`PVFS'` is one fixed, documented purpose index (pick once, document in code; BIP43 purpose-field style). All derivation is **hardened** so no key can be related to another without the seed.
 
-> **Decided:** Argon2id **64 MiB / t=3 / p=1** — memory-hard default suitable for desktop/server; ~1–2 s derivation on typical hardware.
+- **Init flow:** generate mnemonic → display once (require confirmation) → derive `root_key` transiently → sign `ForestCreated` and `DeviceAuthorized`(device 0) → discard `root_key` and mnemonic from memory → cache only `device_key` in the data dir (mode 0600).
+- **Authoring:** every node/link/mutable event on this machine is signed by its **device key**. The identity root never signs ordinary records.
+- **Adding a device (P4 UX, model fixed now):** enter the mnemonic on the new machine (or on an existing trusted one), derive `device_key n+1`, root signs a `DeviceAuthorized` event on the owner forest.
+- **Compromise containment:** a stolen machine yields only its device key; `DeviceRevoked` stops new appends from it. The phrase and root are never on disk.
+- **Recovery:** the mnemonic deterministically regenerates root and all device/encryption keys. Loss of the mnemonic = loss of the identity (deliberate trade for an unguessable secret).
+- **Argon2id is no longer used for identity** (the seed has full 256-bit entropy; there is nothing to brute-force). It remains in the toolbox for the secure module's password-based features (P3).
+- **Never reuse a money-wallet phrase.** PVFS generates its own. The PVFS-specific purpose path guarantees no key collision with coin wallets even if a user ignores this advice.
+
+> **Decided:** BIP39 **24 words** / BIP32 **hardened-only** / fixed PVFS purpose path / device certs in the log. Crates: `bip39`, `bip32` (or `coins-bip32`) alongside `k256`.
 
 ---
 
@@ -426,12 +468,20 @@ pub struct NodeSpec {            // caller-provided inputs; engine fills id/sig/
     pub label: String,
     pub payload: Vec<u8>,        // already PCE-encoded for the type
     pub is_temp: bool,
-    pub creation_nonce: u64,     // 0 = let engine assign random if caller doesn't care
+    pub creation_nonce: Option<u64>, // None = engine assigns random; Some(n) = caller-chosen
+                                     // (Option, not a 0-sentinel, so nonce 0 stays usable)
 }
 
 impl Engine {
-    // Open or create the data dir (log.db, index.db), derive identity, run recovery.
-    pub fn open(data_dir: &Path, passphrase: &str) -> Result<Engine>;
+    // First-time setup: generate mnemonic + keys, write genesis events (§6), return
+    // the mnemonic for one-time display. Caller must confirm the user stored it.
+    pub fn init(data_dir: &Path) -> Result<(Engine, Mnemonic)>;
+
+    // Open an existing data dir using the cached device key; run recovery (§9.3).
+    pub fn open(data_dir: &Path) -> Result<Engine>;
+
+    // Recover onto a fresh machine from the mnemonic (re-derives device key).
+    pub fn recover(data_dir: &Path, mnemonic: &Mnemonic, device_index: u64) -> Result<Engine>;
 
     // Create a tree: makes a root folder node + a root link (parent_id = None).
     pub fn create_tree(&mut self, label: &str) -> Result<NodeId>;
@@ -459,8 +509,11 @@ impl Engine {
     pub fn verify(&self, id: &NodeId) -> Result<bool>;               // recompute id + sig
 
     // Lifecycle:
-    pub fn list_orphans(&self) -> Result<Vec<Node>>;
-    pub fn purge(&mut self, ids: &[NodeId]) -> Result<()>;           // explicit hard delete
+    pub fn list_orphans(&self) -> Result<Vec<Node>>;                 // zero active inbound links,
+                                                                     // counted across links AND temp_links
+    pub fn purge(&mut self, ids: &[NodeId]) -> Result<()>;           // explicit hard delete;
+                                                                     // NotOrphan if any id still
+                                                                     // has active inbound links (§9.2)
 }
 ```
 
@@ -470,11 +523,12 @@ impl Engine {
 
 ## 12. Tree walk
 
-- `children(parent)`: query the right table(s) — `links` and `temp_links` — `WHERE parent_id = ? AND removed_at IS NULL AND suspended_at IS NULL ORDER BY order_key`, resolve `child_id` to nodes, return in order.
-- `walk(root)`: pre-order traversal. Visit root, then for each child in `order_key` order, recurse if it is a `folder` (or has children). Yields `(node, depth)`.
+- `children(parent)`: query the right table(s) — `links` and `temp_links` — `WHERE parent_id = ? AND removed_at IS NULL AND suspended_at IS NULL ORDER BY order_key`, resolve `child_id` to nodes, return in order. Returns **both `contains` and `ref` children** merged by `order_key`, each tagged with its link type, so a collection tree's ref entries list naturally alongside contained items.
+- `walk(root)`: pre-order traversal. Visit root, then for each child in `order_key` order, **recurse only through `contains` links**; `ref` children are yielded but **never descended**. Yields `(node, depth, link_type)`.
+- Because every node has exactly one home (§5.2 one-home rule), the `contains` hierarchy is a strict tree: a walk can never reach the same node twice, needs no visited-set, and its cost is exactly the tree's size. Not descending refs is what keeps this true (and prevents ref loops from hanging the walk).
 - A tree may mix durable and temp nodes; the walk reads both tables and merges by `order_key`.
 
-> **Decided:** **Cycle guard in P0.** Before creating a `contains` link (`parent → child`), walk ancestors of `parent`; reject if `child` is already an ancestor (would create a loop). Applies only to `link_type = "contains"`, not to `ref` cross-links.
+> **Decided:** **Cycle guard in P0.** Before creating a `contains` link (`parent → child`), walk ancestors of `parent`; reject if `child` is already an ancestor (would create a loop). Applies only to `link_type = "contains"`, not to `ref` cross-links. Still required despite the one-home rule: an orphaned ancestor can otherwise be re-homed under its own descendant (e.g. orphan `A` still containing `B`, then `B → contains → A` would form a detached ring).
 
 ---
 
@@ -528,10 +582,16 @@ pub enum PvfsError {
     Identity { detail: String },
 
     #[error("invalid input for {field}: {reason}")]
-    BadInput { field: String, reason: String }, // empty passphrase, oversized label, bad URI, ...
+    BadInput { field: String, reason: String }, // invalid mnemonic, oversized label, bad URI, ...
 
     #[error("{kind} already exists: {id}")]
     AlreadyExists { kind: &'static str, id: String }, // API create when id taken by different content
+
+    #[error("cannot purge {id}: {active_inbound} active inbound link(s) still reference it")]
+    NotOrphan { id: String, active_inbound: u64 },    // purge precondition (§9.2)
+
+    #[error("{child} already has a home under {existing_parent}; use a ref link or move it")]
+    AlreadyContained { child: String, existing_parent: String }, // one-home rule (§5.2)
 
     #[error("schema version mismatch: store is v{found}, engine supports v{supported}")]
     SchemaVersion { found: u32, supported: u32 },
@@ -566,12 +626,12 @@ The kernel is fully testable with no I/O beyond temp dirs. Minimum P0 tests:
 1. **Encoding determinism** — PCE of a value is byte-stable across runs; round-trips encode→decode.
 2. **ID stability** — a fixed node/link input always yields the same id; changing any preimage field changes the id; changing `order_key`/state band does **not** change a link id.
 3. **Sign/verify** — valid sig verifies; tampering payload (without re-id) is caught; wrong author fails.
-4. **Identity determinism** — same passphrase ⇒ same pubkey; different passphrase ⇒ different.
+4. **Identity determinism** — same mnemonic ⇒ same root + device keys (test against published BIP39/BIP32 vectors); different mnemonic ⇒ different; device keys for indexes n ≠ m differ; encryption-branch path never collides with signing paths.
 5. **Projection fold** — each event kind produces the expected index state.
 6. **Atomic write + recovery** — kill between append and project (simulated) leaves a consistent state; replay catches the projection up; full rebuild reproduces identical projection.
-7. **Temp lifecycle** — temp node/link never produce events; temp purges immediately when only root-linked; rebuild drops temp; durable node cannot depend on temp.
-8. **Walk order** — children come back in `order_key` order; insert-between lands in the right place; large-fanout walk uses the index (no full scan).
-9. **Orphans/purge** — orphan detection correct; purge writes tombstone and removes from projection.
+7. **Temp lifecycle** — temp node/link never produce events; temp purges immediately when orphaned (zero active inbound links — root link counts as a reference, design doc §6.2); purge cascades through temp children in one transaction; creation never triggers purge; rebuild drops temp; durable node cannot depend on temp.
+8. **Walk order** — children come back in `order_key` order; insert-between lands in the right place; large-fanout walk uses the index (no full scan); `ref` children are listed but not descended; walk visits each node exactly once.
+9. **Orphans/purge** — orphan detection correct; purge refuses with `NotOrphan` while active inbound links exist; purge of an orphan emits `LinkRemoved` for each active outbound link then `NodePurged`; no active link ever references a missing node afterward; children become orphans (temp children purge immediately).
 10. **Cycle guard** — creating a cycle via `contains` is rejected.
 11. **Startup integrity check (§9.3)** — happy path is a no-op when positions/chains agree; an index lagging the log is caught up by replay; a corrupted/dropped/edited event breaks the chain and triggers full rebuild (or fatal `LogChainBroken` / Step 6 recovery ladder if the log itself is internally inconsistent); an unclean `clean_shutdown` flag forces a full agreement check; a corrupt `index.db` is rebuilt from the log.
 12. **Error contract** — verification reports expected-vs-actual; encoding errors report field + offset; SQLite BUSY retries then surfaces `Busy`; a failed durable write rolls back leaving no half-applied projection; no panic on malformed input/data.
@@ -581,6 +641,9 @@ The kernel is fully testable with no I/O beyond temp dirs. Minimum P0 tests:
 16. **Link logical id** — same `(parent, child, type, link_nonce)` replays to same link id without `created_at` in preimage.
 17. **Node creation_nonce** — distinct nodes never collide silently; API returns `AlreadyExists` on conflict.
 18. **PVFS URI parse** — canonical and shorthand forms from [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §2.2 round-trip parse (no network fetch in P0).
+19. **Forest identity survives rebuild** — init writes `ForestCreated` at seq 1; full rebuild repopulates `instance_id` / `forest_id` / `forest_root_node_id` in `projection_meta`; a log missing `ForestCreated` (or with a second one, or a mismatched genesis seed) refuses to open.
+20. **One-home rule** — second `contains` link to a homed child is rejected with `AlreadyContained`; `ref` links to the same child from any number of parents succeed; move (remove home + create new home in one transaction) preserves the child's subtree; orphan re-homing under its own descendant is caught by the cycle guard.
+21. **Device certificates** — init writes `DeviceAuthorized` (device 0) at seq 2 signed by the identity root; local API rejects events authored by unauthorized or revoked device keys; `DeviceRevoked` blocks new appends but already-replayed history still verifies; `recover()` from the mnemonic reproduces the device key and reopens the forest.
 
 ---
 
@@ -603,9 +666,13 @@ All items below are **decided**; this spec is ready to implement:
 5. §5.3 — **Base62 fractional `order_key`** + rebalance fallback.
 6. §6 — **all mutable events signed** (table in §6).
 7. §7.1 — **chain binds `seq`, `kind`, `body`, `written_at`**; one write leader per forest log.
-8. §10 — Argon2id **64 MiB / t=3 / p=1**; **low-s** enforced on verify.
+8. §10 — **BIP39 24-word generated mnemonic + BIP32 hardened HD keys** (identity root / per-device signing keys / reserved encryption branch); device certificates in the log; **low-s** enforced on verify. (Supersedes Argon2id passphrase derivation.)
 9. §12 — **`contains` cycle guard** in P0.
 10. §9.3 Step 6 — log corruption: **stop**; recovery ladder (backup → replica → salvage → filesystem rebuild last).
 11. [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) — forest ownership, sync modes, **PVFS URI grammar**, P0/P4 split.
+12. §6 / §7.1 — **forest identity in the log:** `ForestCreated` genesis event at seq 1; forest-specific chain genesis seed; `projection_meta` copies are cache only.
+13. Design doc §6.2 — **temp purge = immediate purge on orphan** (zero active inbound links; root link counts; checked on link removal; cascades through temp children).
+14. §9.2 — **purge protocol:** orphans only (`NotOrphan` otherwise); auto-emits `LinkRemoved` for active outbound links before `NodePurged`; no dangling active links.
+15. §5.2 / §12 — **one home per node:** at most one active `contains` parent (`AlreadyContained` otherwise); all other placement via `ref`; walk descends `contains` only and visits each node once; cycle guard retained for the orphan re-homing case.
 
 **Outstanding (not blocking P0):** see [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §6.
