@@ -888,13 +888,28 @@ impl Engine {
             let (f, u) = (file.clone(), uri.to_string());
             return self.temp_write(|tx| {
                 tx.execute(
-                    "INSERT OR IGNORE INTO temp_file_locations (file_id, uri, added_at, removed_at)
-                     VALUES (?1, ?2, ?3, NULL)",
+                    "INSERT INTO temp_file_locations (file_id, uri, added_at, removed_at)
+                     VALUES (?1, ?2, ?3, NULL)
+                     ON CONFLICT(file_id, uri) DO UPDATE SET
+                       added_at = excluded.added_at, removed_at = NULL",
                     params![f, u, t as i64],
                 )
                 .map_err(map_db("add temp location"))?;
                 Ok(())
             });
+        }
+        // idempotent: already-active location is a no-op (no junk event)
+        let already: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM file_locations WHERE file_id = ?1 AND uri = ?2 AND removed_at IS NULL",
+                params![file, uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("location lookup"))?;
+        if already.is_some() {
+            return Ok(());
         }
         let me = self.device.pubkey();
         let sig = crypto::sign_digest(

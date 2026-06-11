@@ -7,9 +7,7 @@ use std::path::PathBuf;
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::engine::{
-    active_home, bad, fetch_node, fetch_link, max_order_key, now_ms, Engine,
-};
+use crate::engine::{active_home, bad, fetch_link, fetch_node, now_ms, Engine};
 use crate::error::{map_db, IntegrityReason, PvfsError, Result};
 use crate::event::{self, Event};
 use crate::link::{Link, LINK_CONTAINS};
@@ -1111,8 +1109,10 @@ impl Engine {
         let t = now_ms() as i64;
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO temp_file_locations (file_id, uri, added_at, removed_at)
-                 VALUES (?1, ?2, ?3, NULL)",
+                "INSERT INTO temp_file_locations (file_id, uri, added_at, removed_at)
+                 VALUES (?1, ?2, ?3, NULL)
+                 ON CONFLICT(file_id, uri) DO UPDATE SET
+                   added_at = excluded.added_at, removed_at = NULL",
                 params![id, uri, t],
             )
             .map_err(map_db("temp location"))?;

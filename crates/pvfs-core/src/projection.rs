@@ -337,9 +337,13 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             added_at,
             ..
         } => {
+            // Re-adding a previously soft-removed location must REACTIVATE it
+            // (a plain INSERT OR IGNORE would leave removed_at set forever).
             tx.execute(
-                "INSERT OR IGNORE INTO file_locations (file_id, uri, added_at, removed_at)
-                 VALUES (?1, ?2, ?3, NULL)",
+                "INSERT INTO file_locations (file_id, uri, added_at, removed_at)
+                 VALUES (?1, ?2, ?3, NULL)
+                 ON CONFLICT(file_id, uri) DO UPDATE SET
+                   added_at = excluded.added_at, removed_at = NULL",
                 params![file_id, uri, *added_at as i64],
             )
             .map_err(&m)?;

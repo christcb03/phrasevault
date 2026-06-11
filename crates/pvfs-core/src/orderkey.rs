@@ -66,7 +66,9 @@ impl OrderKey {
         }
         let mut out = String::new();
         let mut i = 0usize;
-        let mut upper_unbounded = b.is_none();
+        // Never reassigned: once the inner loop below is entered (the only
+        // place an unbounded upper would matter), it always returns.
+        let upper_unbounded = b.is_none();
         let b_str = b.map(|k| k.0.as_str()).unwrap_or("");
         loop {
             let da = digit_at(a_str, i);
