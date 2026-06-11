@@ -1,11 +1,11 @@
 # PVFS — P0 Core Engine Buildable Spec (02)
 
-Status: **Ready to implement** (all §16 decisions settled)
+Status: **Implemented** — normative reference for `pvfs-core` / `pvfs-cli` (see [INSTALL.md](INSTALL.md))
 Date: 2026-06-07
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
-Scope: The exact, buildable specification for **P0** — encodings, schemas, projection rules, identity, and function signatures. Every foundational decision is already settled (design doc §9); this turns them into something we can implement without guesswork.
+Scope: The exact specification for **P0** — encodings, schemas, projection rules, identity, and function signatures.
 
-> How to read this: each section is meant to be reviewed on its own. Nothing here is code yet. Pre-coding decisions are marked **Decided**; the checklist in §16 is complete.
+> How to read this: each section is meant to be reviewed on its own. **Decided** items are locked; the checklist in §16 matches the implementation. To build or test, start with [INSTALL.md](INSTALL.md).
 
 ---
 

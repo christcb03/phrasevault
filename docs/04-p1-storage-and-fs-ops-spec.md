@@ -1,9 +1,9 @@
 # PVFS — P1 Storage Backends & Core FS Ops Spec (04)
 
-Status: **Ready to implement** (all §11 decisions settled)
+Status: **Implemented** — normative reference for P1 storage layer (see [INSTALL.md](INSTALL.md))
 Date: 2026-06-11
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
-Scope: Phase **P1** — reading/resolving actual bytes, scanning real storage into trees, bound-folder auto-indexing, read-path integrity, and the managed-temp spool. Builds strictly on the P0 kernel; **no P0 encoding or schema changes**.
+Scope: Phase **P1** — reading/resolving actual bytes, scanning real storage into trees, bound-folder auto-indexing, read-path integrity, and the managed-temp spool. Builds on the P0 kernel; **no P0 encoding or schema changes**.
 
 ---
 
@@ -289,7 +289,7 @@ location) maps to exit 3 (not-found family).
 
 ---
 
-## 11. Open decisions
+## 11. Decisions (all settled)
 
 1. ~~[OPEN-1]~~ **Decided:** folder bindings are signed events
    (`FolderBound` / `FolderUnbound`) + `folder_bindings` projection (§3).

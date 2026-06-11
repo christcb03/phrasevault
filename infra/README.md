@@ -1,22 +1,29 @@
 # Test server (presubuntu)
 
-Full VM reset and bootstrap live in the **Homelab** repo — presubuntu is already defined there as Proxmox VM **101** via Terraform.
+Full VM reset lives in the **Homelab** repo. Installing and testing PVFS on that host is documented in **[docs/INSTALL.md](../docs/INSTALL.md)** (Option B).
 
-## Reset presubuntu to a clean PVFS test host
+## Reset to a clean Ubuntu host
 
 ```bash
 cd ~/Projects/Homelab
 ./scripts/presubuntu-reset.sh
 ```
 
-That script:
+Type `presubuntu` when prompted. This recreates Proxmox VM 101 (fresh Ubuntu 24.04, user `chris`, no legacy Docker stack).
 
-1. Terraform **destroy + apply** on `proxmox_virtual_environment_vm.prodlab_pres_ubuntu` (fresh Ubuntu 24.04)
-2. Waits for SSH on `presubuntu-vpn` (`192.168.0.184`)
-3. Runs Ansible `playbooks/presubuntu_reset.yml` — `/opt/pvfs/data`, Rust toolchain, **no Docker / no legacy stack**
+Prerequisites: VPN to `192.168.0.184`, Terraform `.env.terraform` on Homelab — see [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md).
 
-See [Homelab/docs/PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md) for prerequisites (Terraform `.env.terraform`, VPN, DHCP reservation).
+## After reset — install PVFS
 
-## Legacy Docker stack
+```bash
+cd ~/Projects/phrasevault/deploy/ansible
+cp inventory.example.ini inventory.ini
+ansible-galaxy collection install ansible.posix
+ansible-playbook -i inventory.ini pipeline.yml
+```
 
-The v0.0 concept PhraseVault + MediaForest deploy is under `v0.0-concept/`. To put that back on presubuntu after a reset, use Homelab `playbooks/presubuntu.yml` — separate from the PVFS reset flow.
+Then SSH in and follow the manual test section in [docs/INSTALL.md](../docs/INSTALL.md).
+
+## Legacy stack
+
+The v0.0 Docker prototype is under `v0.0-concept/`. Do not redeploy it unless you intentionally want the old MediaForest stack.

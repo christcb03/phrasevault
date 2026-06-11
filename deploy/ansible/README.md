@@ -1,8 +1,10 @@
 # PVFS pipeline — presubuntu
 
-Build → test → smoke → install pipeline for the **presubuntu** test server
-(Proxmox VM 101; reset to clean Ubuntu via the Homelab repo's
-`./scripts/presubuntu-reset.sh`).
+Automated **build → test → smoke → install** for the presubuntu test server.
+
+**Start here for humans:** [docs/INSTALL.md](../../docs/INSTALL.md) (Option B) — reset VM, run this pipeline, manual SSH tests.
+
+**Reset VM first** (Homelab repo): `./scripts/presubuntu-reset.sh`
 
 ## One-time setup
 
