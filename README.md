@@ -17,6 +17,7 @@ The design is captured as a reviewed, decision-by-decision record in [`docs/`](d
 - [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) — foundational concepts, the WASM-first module model, and the architecture decisions (language, core vs. modules, base node types).
 - [`docs/01-core-engine-design.md`](docs/01-core-engine-design.md) — the core-engine design: data model, event-log source of truth, identity, lifecycle.
 - [`docs/02-p0-core-engine-spec.md`](docs/02-p0-core-engine-spec.md) — the buildable P0 spec: exact encodings, schemas, projection rules, integrity checks, error model, and test plan.
+- [`docs/03-federation-trust-and-uris.md`](docs/03-federation-trust-and-uris.md) — forest ownership, federation sync modes, PVFS URI grammar, and P0 trust fixes.
 
 ## Core ideas
 

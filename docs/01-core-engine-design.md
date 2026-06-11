@@ -41,10 +41,10 @@ Guiding directive: **correct, solid architecture over speed to production.**
 
 - Every durable change is recorded as an immutable **event** appended to the log: `NodeCreated`, `LinkCreated`, `LinkRemoved`, `LinkSuperseded`, `LinkSuspended`, `NodePurged`. History is never edited — even a removal is a new event. The log itself is stored as an append-only `events` table in its own SQLite file (`log.db`), so we get crash-safety for free (see §5).
 - **The projection is a second SQLite file (`index.db`).** It is built by replaying the log and folding events into current state. It can be deleted and fully regenerated at any time; it is a cache for fast queries, not the truth.
-- Because nodes and links are immutable and content-addressed, the log is conflict-free to replicate later (P4): syncing is just shipping events between instances.
+- Because nodes and links are immutable and content-addressed, **replaying** an owner's event stream onto a replica is idempotent (same ids, signed events verified). **Sync** (P4) is copying/following that stream — **not** merging two independent writers into one log. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md).
 - The log is **tamper-evident**: each event carries a rolling hash chained to all prior events, so any dropped, reordered, or altered event is detectable. On every startup the engine verifies the projection agrees with the log and rebuilds it from the log if they diverge (e.g. after a crash or corruption). See spec [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md) §7.1 and §9.3.
 
-This is the most robust foundation and makes the hardest future feature — multi-instance sync — nearly free. It matches the project directive (correct, solid architecture over speed).
+This is the right foundation for **single-writer-per-forest replication** (owner → replica). Cross-forest sharing uses **storage URIs** and **PVFS catalog URIs** ([03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §2).
 
 ### The temp exception (solves log churn)
 
@@ -82,6 +82,7 @@ A node is the immutable, content-addressed unit of information.
 | `visibility` | `public` by default. Part of the id preimage. Encryption semantics belong to the `secure` module; the core just stores the value. |
 | `payload` | Type-specific data. Plaintext bytes/JSON for base types; opaque (possibly module-encrypted) bytes otherwise. |
 | `is_temp` | Temp flag (see §6.2). Part of the id preimage, so it is immutable like every other field. |
+| `creation_nonce` | Disambiguates creates; part of id preimage (spec §4.2). |
 | `created_at` | Creation timestamp (unix ms). |
 | `author` | secp256k1 public key (hex) of the creator. |
 | `sig` | secp256k1 signature over `id`. |
@@ -114,11 +115,12 @@ A link is a typed, signed, directed edge. Its `id` is content-addressed, but a s
 
 | Field | Meaning |
 |---|---|
-| `id` | BLAKE3 over `(parent_id, child_id, link_type, created_at)`. |
+| `id` | BLAKE3 over `(type, label, visibility, payload, is_temp, creation_nonce, created_at, author)`. |
 | `parent_id` | Source node, or `null` when the child is a tree root. |
 | `child_id` | Target node. |
 | `link_type` | Core: `contains` (hierarchy), `ref` (cross-reference). Modules may add their own. |
-| `created_at`, `author`, `sig` | Same trust fields as a node. |
+| `link_nonce` | Disambiguates multiple edges with same `(parent, child, type)`; default `0`. |
+| `created_at`, `author`, `sig` | `created_at` is audit-only (not in link id). Same trust fields as a node. |
 | *state band* | `removed_at`, `superseded_by`, `suspended_at` — mutable; not part of `id`. |
 
 ### 3.4 Sibling order — DECIDED: per-parent `order_key`
@@ -144,7 +146,7 @@ Per the ADR, the root does not link to every node. Children of one parent are or
 The node `id` must be reproducible byte-for-byte on any platform, so the preimage encoding has to be canonical.
 
 ```
-id = BLAKE3( canonical_encode(type, label, visibility, payload, is_temp, created_at, author) )
+id = BLAKE3( canonical_encode(type, label, visibility, payload, is_temp, creation_nonce, created_at, author) )
 ```
 
 - **Decided: strict length-prefixed binary encoding** (not JSON). `canonical_encode` is a deterministic serialization with fixed field order, fixed-width little-endian integers, and length-prefixed UTF-8 strings — exactly one valid byte sequence per node.
@@ -322,5 +324,6 @@ All foundational decisions are now settled:
 6. **Identity source** (§7) — **decided:** passphrase-derived (Argon2id → secp256k1), so the same identity reproduces across machines for replication and recovery.
 7. **File locations** (§3.2, spec §4.3/§6) — **decided:** URIs are **not** in the file node id preimage; multiple locations per file via **`FileLocationAdded` / `FileLocationRemoved` events** (replication adds URIs without changing file node id).
 8. **Log corruption recovery** (spec §9.3 Step 6) — **decided:** stop on corrupt log; operator ladder: backup → replica → salvage → filesystem rebuild (last resort, history lost).
+9. **Federation & trust** — **decided:** forest ownership, log sync as immutable copy, PVFS URI grammar, sign all mutable events, logical link id, node `creation_nonce`, strengthened chain binding, low-s. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md).
 
 With these settled, the P0 spec ([02-p0-core-engine-spec.md](02-p0-core-engine-spec.md)) is the implementation checklist.

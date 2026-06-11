@@ -155,7 +155,7 @@ flowchart TD
 
 - **Forest** — the top-level container; holds one or more trees and owns the index + storage registry.
 - **Tree** — a DAG (Directed Acyclic Graph) with a single named **root node**. A node may be a branch of multiple trees.
-- **Node** — content-addressed identity: `id = BLAKE3(canonical(type, label, visibility, payload, created_at, author))`. Immutable. Carries a signature over its id.
+- **Node** — content-addressed identity: `id = BLAKE3(canonical(type, label, visibility, payload, is_temp, creation_nonce, created_at, author))`. Immutable. Carries a signature over its id.
 - **Link** — a typed, signed, directed edge. Content-addressed id, but a *mutable* state band (`removed_at`, `superseded_by`, `suspended_at`) lives outside the id preimage. Soft-delete only.
 
 ### How a tree is structured and walked
@@ -286,7 +286,7 @@ This restates the principles from §2 with engineering precision and adds the cr
 | **P1 — Storage backends + core FS ops** | `StorageBackend` trait + local/NAS backend; `init`, `tree create`, `scan`, `add`, `ls`, `stat`, `cat`; content-hash verification on the read path; **bound folders with auto-indexing** (live watcher + reconciliation scan; soft-remove on disk deletion); managed-temp spool + startup cleanup sweep. See [01-core-engine-design.md](01-core-engine-design.md) §6.3 / §8.5. |
 | **P2 — WASM module host + module contract** | WASM component host (`wasmtime`); the module interface as a component-model (WIT) definition; host functions exposed to modules; load/validate/run sandboxed modules; **config** shipped as the first WASM module. |
 | **P3 — More modules + index/search/serve** | **secure** and **media** modules (WASM); module-driven indexing + search dispatch; serve/stream path; optional HTTP adapter. |
-| **P4 — Mount + remote backends** | Native mount (FUSE/WinFsp/ProjFS) over the VFS; remote/peer storage backends; P2P protocol spec (separate doc). |
+| **P4 — Mount + remote backends + federation** | Native mount (FUSE/WinFsp/ProjFS); forest log replica sync; remote append to owner forests; PVFS catalog URI resolution. Protocol details in sync layer (`1.0.#`). Model: [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md). |
 
 Each phase will get its own detailed engineering spec once this ADR is approved. Because modules are WASM from the start, the module host (P2) lands before any domain behavior — no compiled-in module path is ever built.
 
@@ -295,10 +295,11 @@ Each phase will get its own detailed engineering spec once this ADR is approved.
 ## 8. Open Questions
 
 1. **Native mount priority.** Which OS mount target ships first (FUSE on Linux vs macFUSE vs WinFsp)? Each has distinct packaging/permission constraints.
-2. **Identity model.** For a standalone PVFS instance, is identity a single instance keypair, per-user keypairs, or passphrase-derived (Argon2id)? Drives the secure module and any future sync.
+2. **Identity model.** *Resolved:* passphrase-derived (Argon2id → secp256k1). See [01-core-engine-design.md](01-core-engine-design.md) §7.
 3. **Search engine.** SQLite FTS5 vs an embedded index (e.g. Tantivy) for module-driven search at scale. FTS5 is simplest; Tantivy scales better for large media libraries.
 4. **Daemon access control.** Loopback-only socket vs token-authenticated local API vs OS keyring integration for `pvfs serve`.
-5. **Canonical log vs SQLite.** *Resolved in the core-engine design ([01-core-engine-design.md](01-core-engine-design.md) §2):* an append-only event log is the source of truth; SQLite is a rebuildable projection. Temp data is the deliberate exception — SQLite-only, never logged or replicated — which also prevents temp churn from bloating the log.
+5. **Canonical log vs SQLite.** *Resolved:* append-only event log + SQLite projection; temp exception. See [01-core-engine-design.md](01-core-engine-design.md) §2.
+6. **Federation & sync.** *Resolved (model):* forest ownership, log sync as immutable copy, URI grammar, trust fixes. Wire protocols deferred to sync layer P4 / `1.0.#`. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md). **Still open:** instance discovery, failover writer, remote-append auth — see that doc §6.
 
 ---
 

@@ -2,7 +2,7 @@
 
 Status: **Ready to implement** (all §16 decisions settled)
 Date: 2026-06-07
-Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md)
+Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 Scope: The exact, buildable specification for **P0** — encodings, schemas, projection rules, identity, and function signatures. Every foundational decision is already settled (design doc §9); this turns them into something we can implement without guesswork.
 
 > How to read this: each section is meant to be reviewed on its own. Nothing here is code yet. Pre-coding decisions are marked **Decided**; the checklist in §16 is complete.
@@ -86,7 +86,8 @@ A composite value is the concatenation of its fields **in the fixed order given 
 | `visibility` | string | `"public"` in P0. Reserved for the secure module later. |
 | `payload` | bytes | type-specific (§4.3). |
 | `is_temp` | bool | temp lifecycle flag. |
-| `created_at` | u64 | unix ms. |
+| `creation_nonce` | u64 | disambiguates same-ms creates (§4.2); API-supplied or engine-random. |
+| `created_at` | u64 | unix ms (audit/display; part of id preimage). |
 | `author` | bytes | secp256k1 compressed public key, 33 bytes. |
 | `sig` | bytes | signature over `id` (§4.4), 64 bytes. |
 
@@ -94,16 +95,19 @@ A composite value is the concatenation of its fields **in the fixed order given 
 
 ```
 preimage = PCE(
-  node_type : string,
-  label     : string,
-  visibility: string,
-  payload   : bytes,
-  is_temp   : bool,
-  created_at: u64,
-  author    : bytes,      // 33-byte compressed pubkey
+  node_type      : string,
+  label          : string,
+  visibility     : string,
+  payload        : bytes,
+  is_temp        : bool,
+  creation_nonce : u64,
+  created_at     : u64,
+  author         : bytes,      // 33-byte compressed pubkey
 )
 id = hex( BLAKE3_256(preimage) )
 ```
+
+> **Decided:** `creation_nonce` prevents distinct nodes from colliding when all other fields match in the same millisecond. **`add_node`** returns `AlreadyExists` if the id exists with different content; identical replay/sync is idempotent (§7, §11).
 
 `id` excludes `sig` (you can't hash a signature of the thing you're hashing). Any change to any preimage field yields a different `id` — immutability is structural.
 
@@ -126,6 +130,7 @@ id = hex( BLAKE3_256(preimage) )
 
 - **Sign:** `sig = secp256k1_ECDSA_sign(identityPrivKey, id_bytes)` where `id_bytes` is the 32-byte BLAKE3 digest (signed as a pre-hashed message, deterministic nonces per RFC 6979). Compact 64-byte `r||s`.
 - **Verify:** recompute `id` from the stored fields; if it differs from the stored `id`, reject (tampered). Then check `sig` against `author` over `id_bytes`. Either failure ⇒ invalid.
+- **Low-s:** reject signatures with `s` above half the curve order (anti-malleability). Required on all verify paths.
 
 ---
 
@@ -139,8 +144,9 @@ id = hex( BLAKE3_256(preimage) )
 | `parent_id` | option<string> | `none` ⇒ child is a tree root. |
 | `child_id` | string | target node id. |
 | `link_type` | string | `"contains"`, `"ref"`, or `"<module>.<name>"`. |
+| `link_nonce` | u64 | disambiguates multiple edges with same `(parent, child, type)`; default `0`. |
 | `order_key` | string | per-parent sort key (§5.3). **Not** in the id preimage. |
-| `created_at` | u64 | unix ms. |
+| `created_at` | u64 | unix ms (audit; **not** in id preimage). |
 | `author` | bytes | 33-byte pubkey. |
 | `sig` | bytes | signature over `id`. |
 | `removed_at` | option<u64> | mutable state band (projection only). |
@@ -151,16 +157,16 @@ id = hex( BLAKE3_256(preimage) )
 
 ```
 preimage = PCE(
-  parent_id : option<string>,
-  child_id  : string,
-  link_type : string,
-  created_at: u64,
+  parent_id  : option<string>,
+  child_id   : string,
+  link_type  : string,
+  link_nonce : u64,
 )
 id = hex( BLAKE3_256(preimage) )
 ```
 
-Deliberately **excludes** `author`, `order_key`, and the state band:
-- excluding `author` makes the same logical link dedupable across authors (idempotent);
+Deliberately **excludes** `author`, `created_at`, `order_key`, and the state band:
+- **Logical link id** — replaying the same edge from an owner log onto a replica yields the same id (idempotent sync);
 - excluding `order_key` and the state band lets a link be reordered, removed, suspended, or superseded **without changing its identity**.
 
 ### 5.3 order_key
@@ -184,12 +190,12 @@ Each durable change is one event. Event bodies are PCE-encoded and stored in `lo
 | `LinkCreated` | full link record incl. `order_key` (state band = none) | a durable link was created |
 | `LinkRemoved` | `link_id: string`, `removed_at: u64`, `removed_by: bytes`, `removal_sig: bytes` | soft-remove a link |
 | `LinkReordered` | `link_id: string`, `new_order_key: string`, `author: bytes`, `sig: bytes` | change sibling order |
-| `LinkSuperseded` | `old_link_id: string`, `new_link_id: string` | mark a link replaced |
-| `LinkSuspended` | `link_id: string`, `suspended_at: u64` | block (e.g. integrity) |
-| `LinkUnsuspended` | `link_id: string` | clear suspension |
+| `LinkSuperseded` | `old_link_id: string`, `new_link_id: string`, `author: bytes`, `sig: bytes` | mark a link replaced |
+| `LinkSuspended` | `link_id: string`, `suspended_at: u64`, `author: bytes`, `sig: bytes` | block (e.g. integrity) |
+| `LinkUnsuspended` | `link_id: string`, `author: bytes`, `sig: bytes` | clear suspension |
 | `FileLocationAdded` | `file_id: string`, `uri: string`, `added_at: u64`, `author: bytes`, `sig: bytes` | register a storage URI for a file node |
 | `FileLocationRemoved` | `file_id: string`, `uri: string`, `removed_at: u64`, `removed_by: bytes`, `removal_sig: bytes` | soft-remove one URI from a file |
-| `NodePurged` | `node_id: string`, `purged_at: u64` | hard-delete tombstone |
+| `NodePurged` | `node_id: string`, `purged_at: u64`, `author: bytes`, `sig: bytes` | hard-delete tombstone |
 
 Notes:
 - **Temp nodes/links/locations never appear as events.** They exist only in `index.db` temp tables (§8). This is the whole point of the temp carve-out.
@@ -199,8 +205,14 @@ Notes:
 |---|---|
 | `LinkRemoved` | `"pvfs:linkremoved:v1:" \|\| PCE(link_id, removed_at, removed_by)` |
 | `LinkReordered` | `"pvfs:linkreordered:v1:" \|\| PCE(link_id, new_order_key, author)` |
+| `LinkSuperseded` | `"pvfs:linksuperseded:v1:" \|\| PCE(old_link_id, new_link_id, author)` |
+| `LinkSuspended` | `"pvfs:linksuspended:v1:" \|\| PCE(link_id, suspended_at, author)` |
+| `LinkUnsuspended` | `"pvfs:linkunsuspended:v1:" \|\| PCE(link_id, author)` |
 | `FileLocationAdded` | `"pvfs:filelocationadded:v1:" \|\| PCE(file_id, uri, added_at, author)` |
 | `FileLocationRemoved` | `"pvfs:filelocationremoved:v1:" \|\| PCE(file_id, uri, removed_at, removed_by)` |
+| `NodePurged` | `"pvfs:nodepurged:v1:" \|\| PCE(node_id, purged_at, author)` |
+
+> **Decided:** every mutable event is signed. Replicas and replay **reject** events that fail signature verification. See [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §3.
 
 ---
 
@@ -219,19 +231,20 @@ CREATE TABLE events (
 ```
 
 - **Append-only:** only `INSERT`. Rows are never updated or deleted in P0 (compaction is P4-adjacent).
-- `seq` provides the authoritative total order used for replay and (later) replication.
-- Idempotency: before appending `NodeCreated`/`LinkCreated`, the engine checks the projection for the id; re-creating an existing id is a no-op (no duplicate event).
+- `seq` provides the **local total order** for this forest's log (one write leader per forest; see [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)).
+- **Idempotency (replay/sync):** before appending `NodeCreated`/`LinkCreated`, if the projection already contains the id with identical content, skip append (no-op). On replay, `INSERT OR IGNORE` into projection.
+- **Idempotency (API):** `add_node` / `link` return **`AlreadyExists { id }`** if the id exists with **different** content; return **`Ok(id)`** if bytes match exactly. Never report success for a distinct create that was silently dropped.
 
 ### 7.1 Hash chain (tamper / corruption evidence)
 
 Each event stores a rolling hash that binds it to all prior events:
 
 ```
-chain_hash[seq] = BLAKE3( chain_hash[seq-1] || kind || body )
+chain_hash[seq] = BLAKE3( chain_hash[seq-1] || PCE(seq, kind, body, written_at) )
 chain_hash[0]   = BLAKE3( "pvfs:log:v1" )      // genesis seed, before any event
 ```
 
-Because every event's hash depends on the entire history before it, **any silently altered, dropped, or reordered event breaks the chain** from that point forward. This is what lets the startup check (§9.3) detect corruption rather than just "is the index behind." The chain also gives replication a cheap way to confirm two instances share the same prefix of history (P4).
+Because every event's hash depends on the entire history before it, **any silently altered, dropped, or reordered event breaks the chain** from that point forward. This is what lets the startup check (§9.3) detect corruption rather than just "is the index behind." For **replicas**, prefix chain comparison verifies an exact copy of the **owner forest's** history — not multi-writer merge ([03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §4).
 
 ---
 
@@ -290,6 +303,9 @@ CREATE TABLE projection_meta (
 --   'last_applied_chain_hash' -> the log's chain_hash at last_applied_seq (hex)
 --   'clean_shutdown'          -> '1' set on graceful close, '0' set on open (crash flag)
 --   'schema_version'          -> projection schema version (for migrations)
+--   'instance_id'             -> owner instance id for this data dir (P0: one owned forest)
+--   'forest_id'               -> forest id on the owner (UUID or slug)
+--   'forest_root_node_id'     -> canonical root node id of the primary tree
 
 CREATE INDEX idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
@@ -311,8 +327,8 @@ Both files are opened on one `rusqlite` connection with `log.db` ATTACHed, so a 
 
 ```
 BEGIN IMMEDIATE;
-  -- compute chain_hash = BLAKE3(prev_chain_hash || kind || body)
-  INSERT INTO log.events(kind, body, chain_hash, written_at) VALUES (...);  -- append truth
+  -- compute chain_hash = BLAKE3(prev_chain_hash || PCE(seq, kind, body, written_at))
+  INSERT INTO log.events(seq, kind, body, chain_hash, written_at) VALUES (...);  -- seq from AUTOINCREMENT
   <apply fold rules below to index tables>                                  -- update projection
   UPDATE projection_meta SET v = <new seq>     WHERE k='last_applied_seq';
   UPDATE projection_meta SET v = <chain_hash>  WHERE k='last_applied_chain_hash';
@@ -410,6 +426,7 @@ pub struct NodeSpec {            // caller-provided inputs; engine fills id/sig/
     pub label: String,
     pub payload: Vec<u8>,        // already PCE-encoded for the type
     pub is_temp: bool,
+    pub creation_nonce: u64,     // 0 = let engine assign random if caller doesn't care
 }
 
 impl Engine {
@@ -424,7 +441,8 @@ impl Engine {
 
     // Add an explicit link (e.g. a `ref` cross-link).
     pub fn link(&mut self, parent: &NodeId, child: &NodeId,
-                link_type: &str, order: Option<&OrderKey>) -> Result<LinkId>;
+                link_type: &str, order: Option<&OrderKey>,
+                link_nonce: u64) -> Result<LinkId>;
 
     pub fn remove_link(&mut self, link: &LinkId) -> Result<()>;  // triggers temp-purge check
     pub fn reorder_link(&mut self, link: &LinkId, new_key: &OrderKey) -> Result<()>;
@@ -512,6 +530,9 @@ pub enum PvfsError {
     #[error("invalid input for {field}: {reason}")]
     BadInput { field: String, reason: String }, // empty passphrase, oversized label, bad URI, ...
 
+    #[error("{kind} already exists: {id}")]
+    AlreadyExists { kind: &'static str, id: String }, // API create when id taken by different content
+
     #[error("schema version mismatch: store is v{found}, engine supports v{supported}")]
     SchemaVersion { found: u32, supported: u32 },
 }
@@ -556,12 +577,16 @@ The kernel is fully testable with no I/O beyond temp dirs. Minimum P0 tests:
 12. **Error contract** — verification reports expected-vs-actual; encoding errors report field + offset; SQLite BUSY retries then surfaces `Busy`; a failed durable write rolls back leaving no half-applied projection; no panic on malformed input/data.
 13. **File locations** — add two URIs to one file node (two events); file node id unchanged; soft-remove one URI; replication scenario = second instance applies same `FileLocationAdded` events.
 14. **Recovery ladder** — corrupt log refuses open with recovery options listed; `--salvage-log` and `--recover-from-filesystem` require explicit confirmation and produce expected outcomes (filesystem rebuild creates fresh tree, history not preserved).
+15. **Signed mutable events** — all mutable event kinds verify; unsigned/tampered events fail replay and replica import.
+16. **Link logical id** — same `(parent, child, type, link_nonce)` replays to same link id without `created_at` in preimage.
+17. **Node creation_nonce** — distinct nodes never collide silently; API returns `AlreadyExists` on conflict.
+18. **PVFS URI parse** — canonical and shorthand forms from [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §2.2 round-trip parse (no network fetch in P0).
 
 ---
 
 ## 15. Out of scope for P0 (reaffirmed)
 
-Storage-backend byte reads (P1), WASM module host (P2), search/serve/HTTP (P3), native mount, remote/peer backends, sync/replication, and log compaction (P4). The spec is structured so none of these require revisiting the data model.
+Storage-backend byte reads (P1), WASM module host (P2), search/serve/HTTP (P3), native mount, remote/peer backends, **forest replica sync + remote append RPC** (P4), and log compaction (P4-adjacent). Federation **ownership model, URI grammar, and trust rules** are decided in [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md); P0 implements trust fixes and metadata hooks so P4 does not revisit encodings.
 
 Two P1 contracts are already settled (design doc §6.3 and §8.5) so the P0 model accommodates them without change: the **managed-temp spool + startup cleanup sweep** (prevents orphaned temp bytes on disk after a crash/rebuild), and **bound-folder auto-indexing** (live watcher + reconciliation scan; new files indexed as pointers; soft-remove when a tracked file is deleted on disk).
 
@@ -572,9 +597,15 @@ Two P1 contracts are already settled (design doc §6.3 and §8.5) so the P0 mode
 All items below are **decided**; this spec is ready to implement:
 
 1. §3 — PCE hard cap at u32 max length; **4 KiB** soft cap on `label`.
-2. §4.3 / §6 — file identity excludes locations; **multiple URIs via `FileLocationAdded` / `FileLocationRemoved` events** (replication-ready from P0).
-3. §5.3 — **Base62 fractional `order_key`** + rebalance fallback.
-4. §6 — signed-message layouts for link remove/reorder and file location add/remove (table in §6).
-5. §10 — Argon2id **64 MiB / t=3 / p=1**.
-6. §12 — **`contains` cycle guard** in P0.
-7. §9.3 Step 6 — log corruption: **stop**; recovery ladder (backup → replica → salvage → filesystem rebuild last).
+2. §4.3 / §6 — file identity excludes locations; **multiple URIs via `FileLocationAdded` / `FileLocationRemoved` events**.
+3. §5.2 — **logical link id** `(parent, child, type, link_nonce)`; `created_at` not in preimage.
+4. §4.2 — **`creation_nonce`** on nodes; API **`AlreadyExists`** vs idempotent replay.
+5. §5.3 — **Base62 fractional `order_key`** + rebalance fallback.
+6. §6 — **all mutable events signed** (table in §6).
+7. §7.1 — **chain binds `seq`, `kind`, `body`, `written_at`**; one write leader per forest log.
+8. §10 — Argon2id **64 MiB / t=3 / p=1**; **low-s** enforced on verify.
+9. §12 — **`contains` cycle guard** in P0.
+10. §9.3 Step 6 — log corruption: **stop**; recovery ladder (backup → replica → salvage → filesystem rebuild last).
+11. [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) — forest ownership, sync modes, **PVFS URI grammar**, P0/P4 split.
+
+**Outstanding (not blocking P0):** see [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) §6.
