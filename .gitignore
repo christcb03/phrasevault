@@ -62,3 +62,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Pipeline artifacts (fetched test logs)
+deploy/ansible/artifacts/
+deploy/ansible/inventory.ini
