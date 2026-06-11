@@ -263,7 +263,7 @@ HTTP/network access is an optional adapter that calls the same core API the CLI 
 
 This restates the principles from §2 with engineering precision and adds the cryptographic specifics.
 
-- **Content addressing (BLAKE3).** A node's id is a BLAKE3 hash over a canonical preimage of `(type, label, visibility, payload, created_at, author)`. Identity is immutable; changing any field yields a new node.
+- **Content addressing (BLAKE3).** A node's id is a BLAKE3 hash over a canonical preimage of `(type, label, visibility, payload, is_temp, creation_nonce, created_at, author)`. Identity is immutable; changing any field yields a new node.
 - **Signing (secp256k1).** Nodes and links are signed by their author. Verification is independent of any server.
 - **Immutable nodes, mutable link state.** The node log is append-only. Links carry an out-of-preimage state band for soft-delete / supersede / suspend.
 - **Soft-delete + orphan model.** Links are never physically removed by default; a node is *orphaned* when it has no active inbound links. Hard delete (prune/purge) is an explicit, separate, opt-in operation. **Exception — `temp` nodes:** when a `temp` node's only remaining link is to its tree root, it is purged immediately instead of being retained for review. This is driven by the `temp` module's `on_orphan` lifecycle hook (§5.2).
