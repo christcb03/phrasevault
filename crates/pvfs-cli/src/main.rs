@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use pvfs_core::{
-    identity, Engine, FilePayload, NodeSpec, OrderKey, PvfsError, TYPE_FILE, TYPE_FOLDER,
+    identity, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey, PvfsError,
+    ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
 };
 
 #[derive(Parser)]
@@ -96,6 +97,57 @@ enum Cmd {
     /// Device certificate operations
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Bind a folder node to a real directory (P1)
+    Bind {
+        folder: String,
+        dir: PathBuf,
+        #[arg(long)]
+        no_recursive: bool,
+        #[arg(long)]
+        no_auto_index: bool,
+        #[arg(long, default_value = "")]
+        extensions: String,
+        #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
+        hash_policy: String,
+    },
+    /// Remove a folder's directory binding
+    Unbind { folder: String },
+    /// Scan bound folders against their directories
+    Scan { folder: Option<String> },
+    /// Node + per-location availability
+    Stat { id: String },
+    /// Stream a file node's bytes (verifies full reads)
+    Cat {
+        id: String,
+        /// byte range START-END (END exclusive; END optional)
+        #[arg(long)]
+        range: Option<String>,
+        /// write to FILE instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Fill a lazy content hash (creates a successor node — prints new id)
+    Hash { id: String },
+    /// List nodes flagged invalid: changed-on-disk
+    Changes,
+    /// Resolve a flagged node: accept the new contents or remove the node
+    Resolve {
+        id: String,
+        #[arg(long, conflicts_with = "delete")]
+        replace: bool,
+        #[arg(long)]
+        delete: bool,
+        /// with --delete: hard-delete instead of leaving an orphan
+        #[arg(long, requires = "delete")]
+        purge: bool,
+    },
+    /// Run the watcher daemon (live indexing + scheduled reconciliation)
+    Serve {
+        #[arg(long, default_value_t = 3600)]
+        reconcile_secs: u64,
+        #[arg(long, default_value_t = 2000)]
+        debounce_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,6 +161,8 @@ enum LocCmd {
     Add { file: String, uri: String },
     Rm { file: String, uri: String },
     Ls { file: String },
+    /// Re-hash locations; lift quarantine where bytes match again
+    Verify { file: String },
 }
 
 #[derive(Subcommand)]
@@ -473,6 +527,40 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         }
                     }
                 }
+                LocCmd::Verify { file } => {
+                    let results = engine.loc_verify(&file)?;
+                    let mut bad = 0;
+                    for (uri, outcome) in &results {
+                        let s = match outcome {
+                            VerifyOutcome::Ok => "ok",
+                            VerifyOutcome::Mismatch => {
+                                bad += 1;
+                                "MISMATCH (quarantined)"
+                            }
+                            VerifyOutcome::Missing => "missing",
+                        };
+                        if json {
+                            println!(
+                                "{{\"uri\":\"{}\",\"outcome\":\"{}\"}}",
+                                json_escape(uri),
+                                s
+                            );
+                        } else {
+                            println!("{s:<24} {uri}");
+                        }
+                    }
+                    if bad > 0 {
+                        engine.close()?;
+                        return Err(PvfsError::Integrity {
+                            kind: "location",
+                            id: file,
+                            reason: pvfs_core::IntegrityReason::IdMismatch {
+                                expected: "recorded content hash".into(),
+                                actual: format!("{bad} location(s) mismatched"),
+                            },
+                        });
+                    }
+                }
             }
             engine.close()
         }
@@ -556,7 +644,374 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
+        Cmd::Bind {
+            folder,
+            dir: bind_dir,
+            no_recursive,
+            no_auto_index,
+            extensions,
+            hash_policy,
+        } => {
+            let mut engine = Engine::open(&dir)?;
+            let abs = std::fs::canonicalize(&bind_dir)
+                .map_err(|e| PvfsError::io("canonicalize dir", e))?;
+            let source_uri = pvfs_core::storage::path_to_uri(&abs)?;
+            engine.bind_folder(
+                &folder,
+                BindSpec {
+                    source_uri: source_uri.clone(),
+                    recursive: !no_recursive,
+                    auto_index: !no_auto_index,
+                    extensions,
+                    hash_policy: HashPolicy::parse(&hash_policy)?,
+                },
+            )?;
+            if json {
+                println!("{{\"bound\":true,\"source_uri\":\"{}\"}}", json_escape(&source_uri));
+            } else {
+                println!("bound {folder} -> {source_uri}");
+            }
+            engine.close()
+        }
+        Cmd::Unbind { folder } => {
+            let mut engine = Engine::open(&dir)?;
+            engine.unbind_folder(&folder)?;
+            if json {
+                println!("{{\"unbound\":true}}");
+            } else {
+                println!("unbound {folder}");
+            }
+            engine.close()
+        }
+        Cmd::Scan { folder } => {
+            let mut engine = Engine::open(&dir)?;
+            let reports = engine.scan(folder.as_ref())?;
+            if json {
+                let items: Vec<String> = reports
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{}}}",
+                            r.folder_id,
+                            r.stats.added,
+                            r.stats.unchanged,
+                            r.stats.changed,
+                            r.stats.removed,
+                            r.stats.skipped
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else {
+                for r in &reports {
+                    println!(
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped",
+                        r.folder_id,
+                        r.stats.added,
+                        r.stats.unchanged,
+                        r.stats.changed,
+                        r.stats.removed,
+                        r.stats.skipped
+                    );
+                }
+                let changed: u64 = reports.iter().map(|r| r.stats.changed).sum();
+                if changed > 0 {
+                    eprintln!("note: {changed} file(s) flagged changed — review with `pvfs changes`");
+                }
+            }
+            engine.close()
+        }
+        Cmd::Stat { id } => {
+            let mut engine = Engine::open(&dir)?;
+            let st = engine.stat_node(&id)?;
+            if json {
+                let locs: Vec<String> = st
+                    .locations
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{{\"uri\":\"{}\",\"exists\":{},\"size\":{},\"quarantined\":{},\"pending_change\":{}}}",
+                            json_escape(&l.uri),
+                            l.exists,
+                            l.size,
+                            l.quarantined
+                                .as_ref()
+                                .map(|q| format!("\"{}\"", json_escape(q)))
+                                .unwrap_or_else(|| "null".into()),
+                            l.pending_change
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"id\":\"{}\",\"label\":\"{}\",\"type\":\"{}\",\"unavailable\":{},\"locations\":[{}]}}",
+                    st.node.id,
+                    json_escape(&st.node.label),
+                    json_escape(&st.node.node_type),
+                    st.unavailable,
+                    locs.join(",")
+                );
+            } else {
+                println!("id    : {}", st.node.id);
+                println!("label : {}", st.node.label);
+                println!("type  : {}", st.node.node_type);
+                if st.unavailable {
+                    println!("state : UNAVAILABLE (no readable, trusted location)");
+                }
+                for l in &st.locations {
+                    let mut flags = Vec::new();
+                    if !l.exists {
+                        flags.push("missing".to_string());
+                    }
+                    if let Some(q) = &l.quarantined {
+                        flags.push(format!("quarantined: {q}"));
+                    }
+                    if l.pending_change {
+                        flags.push("changed-on-disk (pvfs resolve)".to_string());
+                    }
+                    println!(
+                        "loc   : {} ({} bytes){}",
+                        l.uri,
+                        l.size,
+                        if flags.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", flags.join("; "))
+                        }
+                    );
+                }
+            }
+            engine.close()
+        }
+        Cmd::Cat { id, range, output } => {
+            let mut engine = Engine::open(&dir)?;
+            let range = match range {
+                None => None,
+                Some(r) => Some(parse_range(&r)?),
+            };
+            let written = match output {
+                Some(path) => {
+                    let mut f = std::fs::File::create(&path)
+                        .map_err(|e| PvfsError::io("create output", e))?;
+                    engine.cat(&id, range, &mut f)?
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    engine.cat(&id, range, &mut lock)?
+                }
+            };
+            if json {
+                eprintln!("{{\"bytes\":{written}}}");
+            }
+            engine.close()
+        }
+        Cmd::Hash { id } => {
+            let mut engine = Engine::open(&dir)?;
+            let new_id = engine.hash_node(&id)?;
+            if json {
+                println!(
+                    "{{\"node_id\":\"{new_id}\",\"re_identified\":{}}}",
+                    new_id != id
+                );
+            } else if new_id != id {
+                println!("{new_id}");
+                eprintln!("note: hashing re-identified the node (successor created; old id orphaned)");
+            } else {
+                println!("{new_id}");
+            }
+            engine.close()
+        }
+        Cmd::Changes => {
+            let engine = Engine::open(&dir)?;
+            let changes = engine.changes()?;
+            if json {
+                let items: Vec<String> = changes
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{{\"id\":\"{}\",\"label\":\"{}\",\"uri\":\"{}\",\"old_size\":{},\"new_size\":{}}}",
+                            c.file_id,
+                            json_escape(&c.label),
+                            json_escape(&c.uri),
+                            c.old_size,
+                            c.new_size
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else {
+                for c in &changes {
+                    println!(
+                        "{}  {}  {} -> {} bytes  {}",
+                        c.file_id, c.label, c.old_size, c.new_size, c.uri
+                    );
+                }
+                if !changes.is_empty() {
+                    eprintln!(
+                        "resolve with: pvfs resolve <id> --replace   (accept new contents)");
+                    eprintln!(
+                        "          or: pvfs resolve <id> --delete [--purge]   (treat as untrusted)");
+                }
+            }
+            engine.close()
+        }
+        Cmd::Resolve {
+            id,
+            replace,
+            delete,
+            purge,
+        } => {
+            if replace == delete {
+                return Err(PvfsError::BadInput {
+                    field: "action".into(),
+                    reason: "pass exactly one of --replace / --delete".into(),
+                });
+            }
+            let mut engine = Engine::open(&dir)?;
+            let action = if replace {
+                ResolveAction::Replace
+            } else {
+                ResolveAction::Delete { purge }
+            };
+            let result = engine.resolve(&id, action)?;
+            if json {
+                println!("{{\"resolved\":\"{result}\"}}");
+            } else if replace {
+                println!("{result}");
+                eprintln!("replaced — new node id above; old node kept as reviewable orphan");
+            } else {
+                println!("resolved (deleted{})", if purge { ", purged" } else { "" });
+            }
+            engine.close()
+        }
+        Cmd::Serve {
+            reconcile_secs,
+            debounce_ms,
+        } => serve(&dir, json, reconcile_secs, debounce_ms),
     }
+}
+
+fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
+    let (a, b) = s.split_once('-').ok_or_else(|| PvfsError::BadInput {
+        field: "range".into(),
+        reason: "expected START-END".into(),
+    })?;
+    let start: u64 = a.parse().map_err(|_| PvfsError::BadInput {
+        field: "range".into(),
+        reason: "bad start".into(),
+    })?;
+    let end = if b.is_empty() {
+        None
+    } else {
+        Some(b.parse().map_err(|_| PvfsError::BadInput {
+            field: "range".into(),
+            reason: "bad end".into(),
+        })?)
+    };
+    Ok(ByteRange { start, end })
+}
+
+/// Minimal P1 daemon: live watcher + scheduled reconciliation (doc 04 §6).
+fn serve(dir: &PathBuf, json: bool, reconcile_secs: u64, debounce_ms: u64) -> Result<(), PvfsError> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let lock_path = dir.join("serve.lock");
+    let _lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|e| PvfsError::BadInput {
+            field: "serve".into(),
+            reason: format!(
+                "another daemon may be running ({}): {e} — delete the file if stale",
+                lock_path.display()
+            ),
+        })?;
+
+    let result = (|| {
+        let mut engine = Engine::open(dir)?;
+        // initial reconciliation
+        let reports = engine.scan(None)?;
+        if !json {
+            for r in &reports {
+                println!(
+                    "reconciled {}: +{} ~{} !{} -{}",
+                    r.folder_id, r.stats.added, r.stats.unchanged, r.stats.changed, r.stats.removed
+                );
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(tx).map_err(|e| PvfsError::BadInput {
+            field: "watcher".into(),
+            reason: e.to_string(),
+        })?;
+        let mut watching = 0usize;
+        for b in engine.bindings()? {
+            if !b.auto_index {
+                continue;
+            }
+            let path = pvfs_core::storage::uri_to_path(&b.source_uri)?;
+            notify::Watcher::watch(
+                &mut watcher,
+                &path,
+                if b.recursive {
+                    notify::RecursiveMode::Recursive
+                } else {
+                    notify::RecursiveMode::NonRecursive
+                },
+            )
+            .map_err(|e| PvfsError::BadInput {
+                field: "watcher".into(),
+                reason: format!("{}: {e}", path.display()),
+            })?;
+            watching += 1;
+        }
+        if !json {
+            println!("serving: watching {watching} bound folder(s); reconcile every {reconcile_secs}s; Ctrl-C to stop");
+        }
+
+        let debounce = Duration::from_millis(debounce_ms);
+        let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
+        let mut dirty_since: Option<Instant> = None;
+        let mut last_reconcile = Instant::now();
+
+        loop {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Ok(_event)) => dirty_since = Some(Instant::now()),
+                Ok(Err(_)) => dirty_since = Some(Instant::now()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            let due_debounce = dirty_since
+                .map(|t| t.elapsed() >= debounce)
+                .unwrap_or(false);
+            let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
+            if due_debounce || due_reconcile {
+                dirty_since = None;
+                last_reconcile = Instant::now();
+                match engine.scan(None) {
+                    Ok(reports) => {
+                        if !json {
+                            for r in reports.iter().filter(|r| {
+                                r.stats.added + r.stats.changed + r.stats.removed > 0
+                            }) {
+                                println!(
+                                    "ingested {}: +{} !{} -{}",
+                                    r.folder_id, r.stats.added, r.stats.changed, r.stats.removed
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("scan error: {e}"),
+                }
+            }
+        }
+        engine.close()
+    })();
+    let _ = std::fs::remove_file(&lock_path);
+    result
 }
 
 fn emit_id(json: bool, key: &str, id: &str) {

@@ -20,6 +20,8 @@ pub const K_LINK_UNSUSPENDED: &str = "LinkUnsuspended";
 pub const K_FILE_LOCATION_ADDED: &str = "FileLocationAdded";
 pub const K_FILE_LOCATION_REMOVED: &str = "FileLocationRemoved";
 pub const K_NODE_PURGED: &str = "NodePurged";
+pub const K_FOLDER_BOUND: &str = "FolderBound";
+pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -92,6 +94,23 @@ pub enum Event {
     NodePurged {
         node_id: String,
         purged_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    FolderBound {
+        folder_id: String,
+        source_uri: String,
+        recursive: bool,
+        auto_index: bool,
+        extensions: String,
+        hash_policy: String,
+        bound_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    FolderUnbound {
+        folder_id: String,
+        unbound_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -188,6 +207,35 @@ pub fn msg_node_purged(node_id: &str, purged_at: u64, author: &[u8]) -> [u8; 32]
     crypto::domain_digest("pvfs:nodepurged:v1:", &e.finish())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn msg_folder_bound(
+    folder_id: &str,
+    source_uri: &str,
+    recursive: bool,
+    auto_index: bool,
+    extensions: &str,
+    hash_policy: &str,
+    bound_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(folder_id)
+        .string(source_uri)
+        .boolean(recursive)
+        .boolean(auto_index)
+        .string(extensions)
+        .string(hash_policy)
+        .u64(bound_at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:folderbound:v1:", &e.finish())
+}
+
+pub fn msg_folder_unbound(folder_id: &str, unbound_at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(folder_id).u64(unbound_at).bytes(author);
+    crypto::domain_digest("pvfs:folderunbound:v1:", &e.finish())
+}
+
 // ---- encode / decode --------------------------------------------------------
 
 impl Event {
@@ -206,6 +254,8 @@ impl Event {
             Event::FileLocationAdded { .. } => K_FILE_LOCATION_ADDED,
             Event::FileLocationRemoved { .. } => K_FILE_LOCATION_REMOVED,
             Event::NodePurged { .. } => K_NODE_PURGED,
+            Event::FolderBound { .. } => K_FOLDER_BOUND,
+            Event::FolderUnbound { .. } => K_FOLDER_UNBOUND,
         }
     }
 
@@ -336,6 +386,35 @@ impl Event {
             } => {
                 e.string(node_id).u64(*purged_at).bytes(author).bytes(sig);
             }
+            Event::FolderBound {
+                folder_id,
+                source_uri,
+                recursive,
+                auto_index,
+                extensions,
+                hash_policy,
+                bound_at,
+                author,
+                sig,
+            } => {
+                e.string(folder_id)
+                    .string(source_uri)
+                    .boolean(*recursive)
+                    .boolean(*auto_index)
+                    .string(extensions)
+                    .string(hash_policy)
+                    .u64(*bound_at)
+                    .bytes(author)
+                    .bytes(sig);
+            }
+            Event::FolderUnbound {
+                folder_id,
+                unbound_at,
+                author,
+                sig,
+            } => {
+                e.string(folder_id).u64(*unbound_at).bytes(author).bytes(sig);
+            }
         }
         e.finish()
     }
@@ -436,6 +515,23 @@ impl Event {
             K_NODE_PURGED => Event::NodePurged {
                 node_id: d.string()?,
                 purged_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_FOLDER_BOUND => Event::FolderBound {
+                folder_id: d.string()?,
+                source_uri: d.string()?,
+                recursive: d.boolean()?,
+                auto_index: d.boolean()?,
+                extensions: d.string()?,
+                hash_policy: d.string()?,
+                bound_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_FOLDER_UNBOUND => Event::FolderUnbound {
+                folder_id: d.string()?,
+                unbound_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -560,6 +656,40 @@ impl Event {
                 author,
                 sig,
             } => crypto::verify_digest(author, &msg_node_purged(node_id, *purged_at, author), sig),
+            Event::FolderBound {
+                folder_id,
+                source_uri,
+                recursive,
+                auto_index,
+                extensions,
+                hash_policy,
+                bound_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_folder_bound(
+                    folder_id,
+                    source_uri,
+                    *recursive,
+                    *auto_index,
+                    extensions,
+                    hash_policy,
+                    *bound_at,
+                    author,
+                ),
+                sig,
+            ),
+            Event::FolderUnbound {
+                folder_id,
+                unbound_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_folder_unbound(folder_id, *unbound_at, author),
+                sig,
+            ),
         }
     }
 }

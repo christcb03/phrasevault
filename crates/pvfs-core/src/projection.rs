@@ -87,6 +87,45 @@ CREATE TABLE IF NOT EXISTS temp_file_locations (
   PRIMARY KEY (file_id, uri)
 );
 
+CREATE TABLE IF NOT EXISTS folder_bindings (
+  folder_id   TEXT PRIMARY KEY,
+  source_uri  TEXT NOT NULL,
+  recursive   INTEGER NOT NULL,
+  auto_index  INTEGER NOT NULL,
+  extensions  TEXT NOT NULL,
+  hash_policy TEXT NOT NULL,
+  bound_at    INTEGER NOT NULL,
+  unbound_at  INTEGER
+);
+
+-- Local observations (P1 spec §8): never folded from events; cleared by a
+-- rebuild and re-discovered by the next scan/verify.
+CREATE TABLE IF NOT EXISTS pending_changes (
+  file_id     TEXT NOT NULL,
+  uri         TEXT NOT NULL,
+  old_size    INTEGER NOT NULL,
+  old_mtime   INTEGER NOT NULL,
+  new_size    INTEGER NOT NULL,
+  new_mtime   INTEGER NOT NULL,
+  detected_at INTEGER NOT NULL,
+  PRIMARY KEY (file_id, uri)
+);
+
+CREATE TABLE IF NOT EXISTS location_quarantine (
+  file_id     TEXT NOT NULL,
+  uri         TEXT NOT NULL,
+  reason      TEXT NOT NULL,
+  detected_at INTEGER NOT NULL,
+  PRIMARY KEY (file_id, uri)
+);
+
+CREATE TABLE IF NOT EXISTS scan_state (
+  uri        TEXT PRIMARY KEY,
+  size_bytes INTEGER NOT NULL,
+  mtime_ms   INTEGER NOT NULL,
+  file_id    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS projection_meta (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
@@ -108,6 +147,10 @@ const MAIN_OBJECTS: &[&str] = &[
     "temp_nodes",
     "temp_links",
     "temp_file_locations",
+    "folder_bindings",
+    "pending_changes",
+    "location_quarantine",
+    "scan_state",
     "projection_meta",
 ];
 
@@ -319,6 +362,51 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             tx.execute(
                 "DELETE FROM file_locations WHERE file_id = ?1",
                 params![node_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::FolderBound {
+            folder_id,
+            source_uri,
+            recursive,
+            auto_index,
+            extensions,
+            hash_policy,
+            bound_at,
+            ..
+        } => {
+            tx.execute(
+                "INSERT INTO folder_bindings
+                 (folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, unbound_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                 ON CONFLICT(folder_id) DO UPDATE SET
+                   source_uri = excluded.source_uri,
+                   recursive = excluded.recursive,
+                   auto_index = excluded.auto_index,
+                   extensions = excluded.extensions,
+                   hash_policy = excluded.hash_policy,
+                   bound_at = excluded.bound_at,
+                   unbound_at = NULL",
+                params![
+                    folder_id,
+                    source_uri,
+                    *recursive as i64,
+                    *auto_index as i64,
+                    extensions,
+                    hash_policy,
+                    *bound_at as i64
+                ],
+            )
+            .map_err(&m)?;
+        }
+        Event::FolderUnbound {
+            folder_id,
+            unbound_at,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE folder_bindings SET unbound_at = ?1 WHERE folder_id = ?2",
+                params![*unbound_at as i64, folder_id],
             )
             .map_err(&m)?;
         }

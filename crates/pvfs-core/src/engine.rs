@@ -42,21 +42,21 @@ pub struct ChildEntry {
 }
 
 pub struct Engine {
-    conn: Connection,
-    data_dir: PathBuf,
-    device: DeviceKeyCache,
+    pub(crate) conn: Connection,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) device: DeviceKeyCache,
     pub identity: ForestIdentity,
-    closed: bool,
+    pub(crate) closed: bool,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-fn bad(field: &str, reason: &str) -> PvfsError {
+pub(crate) fn bad(field: &str, reason: &str) -> PvfsError {
     PvfsError::BadInput {
         field: field.into(),
         reason: reason.into(),
@@ -81,7 +81,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
 }
 
 /// Fetch a node from either table. Returns `(node, is_temp_table)`.
-fn fetch_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
+pub(crate) fn fetch_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
     for (table, is_temp) in [("nodes", false), ("temp_nodes", true)] {
         let got = conn
             .query_row(
@@ -114,7 +114,7 @@ fn fetch_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
     Ok(None)
 }
 
-fn active_inbound_count(conn: &Connection, id: &str) -> Result<u64> {
+pub(crate) fn active_inbound_count(conn: &Connection, id: &str) -> Result<u64> {
     let n: i64 = conn
         .query_row(
             "SELECT (SELECT COUNT(*) FROM links WHERE child_id = ?1 AND removed_at IS NULL)
@@ -127,7 +127,7 @@ fn active_inbound_count(conn: &Connection, id: &str) -> Result<u64> {
 }
 
 /// The node's active `contains` home, if any: `(link_id, parent_id)`.
-fn active_home(conn: &Connection, child: &str) -> Result<Option<(String, Option<String>)>> {
+pub(crate) fn active_home(conn: &Connection, child: &str) -> Result<Option<(String, Option<String>)>> {
     for table in ["links", "temp_links"] {
         let got = conn
             .query_row(
@@ -147,7 +147,7 @@ fn active_home(conn: &Connection, child: &str) -> Result<Option<(String, Option<
     Ok(None)
 }
 
-fn max_order_key(conn: &Connection, parent: &str) -> Result<Option<OrderKey>> {
+pub(crate) fn max_order_key(conn: &Connection, parent: &str) -> Result<Option<OrderKey>> {
     let v: Option<String> = conn
         .query_row(
             "SELECT MAX(order_key) FROM (
@@ -318,7 +318,7 @@ impl Engine {
         let mut conn = open_connection(data_dir)?;
         let identity = projection::startup_check(&mut conn)?;
         projection::meta_set(&conn, "clean_shutdown", "0")?;
-        let engine = Engine {
+        let mut engine = Engine {
             conn,
             data_dir: data_dir.to_path_buf(),
             device,
@@ -326,6 +326,7 @@ impl Engine {
             closed: false,
         };
         engine.ensure_device_active()?;
+        engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
         Ok(engine)
     }
 
@@ -372,6 +373,7 @@ impl Engine {
         engine.device.save(data_dir)?;
         projection::meta_set(&engine.conn, "clean_shutdown", "0")?;
         engine.ensure_device_active()?;
+        engine.sweep_temp_spool()?; // doc 04 §7 — rebuild empties temp ⇒ spool emptied
         Ok(engine)
     }
 
@@ -407,7 +409,7 @@ impl Engine {
 
     /// Local API events must be authored by an authorized, unrevoked device
     /// key (spec §6 device-key acceptance rule).
-    fn ensure_device_active(&self) -> Result<()> {
+    pub(crate) fn ensure_device_active(&self) -> Result<()> {
         let pk = self.device.pubkey();
         let active: Option<i64> = self
             .conn
@@ -430,7 +432,7 @@ impl Engine {
 
     /// Append durable events + fold, atomically (spec §9.1), with optional
     /// extra temp-table work in the same transaction.
-    fn append_durable_with(
+    pub(crate) fn append_durable_with(
         &mut self,
         events: Vec<Event>,
         temp_ops: impl FnOnce(&Transaction<'_>) -> Result<()>,
@@ -482,25 +484,25 @@ impl Engine {
         Ok(())
     }
 
-    fn append_durable(&mut self, events: Vec<Event>) -> Result<()> {
+    pub(crate) fn append_durable(&mut self, events: Vec<Event>) -> Result<()> {
         self.append_durable_with(events, |_| Ok(()))
     }
 
     /// Run only temp-table work in one transaction (no events, no log touch).
-    fn temp_write(&mut self, ops: impl FnOnce(&Transaction<'_>) -> Result<()>) -> Result<()> {
+    pub(crate) fn temp_write(&mut self, ops: impl FnOnce(&Transaction<'_>) -> Result<()>) -> Result<()> {
         let tx = self.conn.transaction().map_err(map_db("begin temp write"))?;
         ops(&tx)?;
         tx.commit().map_err(map_db("commit temp write"))
     }
 
-    fn sign_node(&self, mut n: Node) -> Result<Node> {
+    pub(crate) fn sign_node(&self, mut n: Node) -> Result<Node> {
         let digest = n.id_digest();
         n.id = hex::encode(digest);
         n.sig = crypto::sign_digest(&self.device.signing_key, &digest)?;
         Ok(n)
     }
 
-    fn sign_link(&self, mut l: Link) -> Result<Link> {
+    pub(crate) fn sign_link(&self, mut l: Link) -> Result<Link> {
         let digest = l.id_digest();
         l.id = hex::encode(digest);
         l.sig = crypto::sign_digest(&self.device.signing_key, &digest)?;
@@ -533,7 +535,7 @@ impl Engine {
     /// Immediate temp purge with cascade (design doc §6.2): delete every temp
     /// node in `candidates` that now has zero active inbound links, cascading
     /// through its temp children, all inside the caller's transaction.
-    fn temp_purge_cascade(tx: &Transaction<'_>, candidates: Vec<String>) -> Result<()> {
+    pub(crate) fn temp_purge_cascade(tx: &Transaction<'_>, candidates: Vec<String>) -> Result<()> {
         let mut queue = candidates;
         while let Some(id) = queue.pop() {
             let is_temp: Option<i64> = tx
@@ -628,7 +630,7 @@ impl Engine {
         Ok(id)
     }
 
-    fn validate_label(&self, label: &str) -> Result<()> {
+    pub(crate) fn validate_label(&self, label: &str) -> Result<()> {
         if label.is_empty() {
             return Err(bad("label", "must not be empty"));
         }
@@ -1275,7 +1277,7 @@ fn link_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
 const LINK_COLS: &str = "id, parent_id, child_id, link_type, link_nonce, order_key, created_at,
                          author, sig, removed_at, superseded_by, suspended_at";
 
-fn fetch_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
+pub(crate) fn fetch_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
     conn.query_row(
         &format!("SELECT {LINK_COLS} FROM links WHERE id = ?1"),
         params![id],
@@ -1285,7 +1287,7 @@ fn fetch_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
     .map_err(map_db("fetch link"))
 }
 
-fn fetch_temp_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
+pub(crate) fn fetch_temp_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
     conn.query_row(
         &format!("SELECT {LINK_COLS} FROM temp_links WHERE id = ?1"),
         params![id],
@@ -1295,7 +1297,7 @@ fn fetch_temp_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
     .map_err(map_db("fetch temp link"))
 }
 
-fn insert_temp_node(tx: &Transaction<'_>, n: &Node) -> Result<()> {
+pub(crate) fn insert_temp_node(tx: &Transaction<'_>, n: &Node) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO temp_nodes
          (id, node_type, label, visibility, payload, creation_nonce, created_at, author, sig)
@@ -1316,7 +1318,7 @@ fn insert_temp_node(tx: &Transaction<'_>, n: &Node) -> Result<()> {
     Ok(())
 }
 
-fn insert_temp_link(tx: &Transaction<'_>, l: &Link) -> Result<()> {
+pub(crate) fn insert_temp_link(tx: &Transaction<'_>, l: &Link) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO temp_links
          (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,

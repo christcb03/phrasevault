@@ -13,3 +13,4 @@ path = "src/main.rs"
 pvfs-core = { path = "../pvfs-core" }
 clap.workspace = true
 hex.workspace = true
+notify = "6"

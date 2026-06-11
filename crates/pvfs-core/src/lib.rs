@@ -16,18 +16,25 @@ pub mod encoding;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod fs;
 pub mod identity;
 pub mod link;
 pub mod log_store;
 pub mod node;
 pub mod orderkey;
 pub mod projection;
+pub mod storage;
 pub mod walk;
 
 pub use engine::{ChildEntry, Engine, NodeSpec};
 pub use error::{IntegrityReason, PvfsError, Result};
+pub use fs::{
+    BindSpec, Binding, HashPolicy, NodeStat, PendingChange, ResolveAction, ScanReport, ScanStats,
+    VerifyOutcome,
+};
 pub use identity::Mnemonic;
 pub use link::{Link, LinkId, LINK_CONTAINS, LINK_REF};
 pub use node::{FilePayload, Node, NodeId, TYPE_FILE, TYPE_FOLDER};
 pub use orderkey::OrderKey;
+pub use storage::ByteRange;
 pub use walk::{TreeWalk, WalkEntry};

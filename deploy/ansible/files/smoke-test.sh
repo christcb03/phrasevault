@@ -129,6 +129,66 @@ $PVFS walk "$ROOT" | grep -q second-tree || true # walk only walks one tree
 $PVFS info >/dev/null && ok "index rebuilt from log"
 $PVFS ls "$TREE2" | grep -q fifth-element && ok "rebuilt projection has ref links"
 
+say "P1: bind / scan / stat / cat"
+LIB="$DATA/library"
+mkdir -p "$LIB/movies"
+printf 'alpha-bytes' > "$LIB/movies/alpha.mkv"
+printf 'hello notes' > "$LIB/notes.txt"
+LFOLDER="$($PVFS add "$ROOT" --kind folder --label library)"
+$PVFS bind "$LFOLDER" "$LIB" --hash-policy on_add >/dev/null && ok "bind"
+$PVFS --json scan "$LFOLDER" | grep -q '"added":2' && ok "scan indexed 2 files"
+$PVFS --json scan "$LFOLDER" | grep -q '"unchanged":2' && ok "rescan no-op"
+MOVIES="$($PVFS --json ls "$LFOLDER" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "movies": print(e["id"])')"
+ALPHA="$($PVFS --json ls "$MOVIES" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "alpha.mkv": print(e["id"])')"
+[ "$($PVFS cat "$ALPHA")" = "alpha-bytes" ] && ok "cat verified read"
+$PVFS stat "$ALPHA" | grep -q "file://" && ok "stat shows location"
+
+say "P1: changed file -> flag -> resolve"
+printf 'alpha-bytes-changed-longer' > "$LIB/movies/alpha.mkv"
+$PVFS --json scan "$LFOLDER" | grep -q '"changed":1' && ok "change flagged"
+$PVFS changes | grep -q "$ALPHA" && ok "changes lists flagged node"
+assert_rc 3 "flagged location not served → 3" -- $PVFS cat "$ALPHA"
+NEW_ALPHA="$($PVFS resolve "$ALPHA" --replace)"
+[ ${#NEW_ALPHA} -eq 64 ] && ok "resolve --replace returns successor"
+[ "$($PVFS cat "$NEW_ALPHA")" = "alpha-bytes-changed-longer" ] && ok "successor serves new bytes"
+$PVFS orphans | grep -q "$ALPHA" && ok "old node kept as orphan"
+
+say "P1: disk deletion is soft"
+rm "$LIB/notes.txt"
+$PVFS --json scan "$LFOLDER" | grep -q '"removed":1' && ok "deletion soft-removed location"
+NOTES="$($PVFS --json ls "$LFOLDER" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "notes.txt": print(e["id"])')"
+$PVFS stat "$NOTES" | grep -q UNAVAILABLE && ok "node kept, marked unavailable"
+
+say "P1: lazy hash fill"
+printf 'lazy-content' > "$LIB/movies/lazy.bin"
+$PVFS scan "$LFOLDER" >/dev/null
+LAZY="$($PVFS --json ls "$MOVIES" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "lazy.bin": print(e["id"])')"
+HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
+[ ${#HASHED} -eq 64 ] && [ "$HASHED" != "$LAZY" ] && ok "hash created successor node"
+[ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified"
+
+say "P1: serve daemon (watcher)"
+$PVFS serve --debounce-ms 300 >/dev/null 2>&1 &
+SERVE_PID=$!
+sleep 2
+printf 'watched-file' > "$LIB/movies/watched.mkv"
+sleep 3
+kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
+rm -f "$PVFS_DATA_DIR/serve.lock"
+$PVFS ls "$MOVIES" | grep -q watched.mkv && ok "watcher ingested new file"
+
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
 
