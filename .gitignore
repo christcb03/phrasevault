@@ -63,6 +63,6 @@ Thumbs.db
 *.swp
 *.swo
 
-# Pipeline artifacts (fetched test logs)
-deploy/ansible/artifacts/
+# Ansible — local inventory (copy from inventory.example.ini; never commit)
 deploy/ansible/inventory.ini
+deploy/ansible/inventory.local.ini
