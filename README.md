@@ -20,7 +20,7 @@ Build locally with `cargo test --workspace`, or deploy to the **presubuntu** tes
 
 **On your machine:** clone repo → install [Rust](https://rustup.rs) → `cargo build --release` → `target/release/pvfs`.
 
-**On presubuntu:** reset VM (Homelab) → run Ansible pipeline from `deploy/ansible/` — full steps in **[docs/INSTALL.md](docs/INSTALL.md)**.
+**On presubuntu:** SSH in, clone repo, `cargo build --release` — **[docs/INSTALL.md](docs/INSTALL.md) Option B**.
 
 ## Code layout
 

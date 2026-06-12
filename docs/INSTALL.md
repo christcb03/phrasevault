@@ -11,7 +11,7 @@ This guide is for someone comfortable with a terminal, SSH, and copying commands
 | Platform | Requirements |
 |----------|----------------|
 | **Linux or macOS** (local dev) | Git, a C compiler (`build-essential` / Xcode CLI tools), `curl`, `pkg-config`, **Rust** (via [rustup](https://rustup.rs)) |
-| **presubuntu test server** | VPN to the home lab (see below), SSH key, Ansible on your laptop |
+| **presubuntu test server** | VPN to the home lab, SSH to `192.168.0.184` as `chris` (Rust + build tools installed by Homelab bootstrap) |
 
 There is no Docker image for the new PVFS — you build one native binary from source.
 
@@ -85,84 +85,83 @@ PVFS_BIN=target/release/pvfs bash deploy/ansible/files/smoke-test.sh
 
 ---
 
-## Option B — presubuntu test server (recommended for “real server” testing)
+## Option B — presubuntu (manual build + manual tests)
 
-**presubuntu** is a clean Ubuntu VM (Proxmox VM 101) used to build, test, and install PVFS the same way every time.
+**presubuntu** is the Ubuntu test VM (Proxmox VM 101). Bootstrap (Rust, `build-essential`, `/opt/pvfs/data`) comes from the Homelab reset — see [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md) if you need a fresh host.
 
 | Item | Value |
 |------|--------|
 | Host (on VPN) | `192.168.0.184` |
-| SSH user | `chris` (your SSH key from Terraform cloud-init) |
-| Installed binary | `/usr/local/bin/pvfs` |
-| Source copy on server | `/opt/pvfs/src` |
+| SSH user | `chris` |
+| Forest data (suggested) | `/opt/pvfs/data/my-forest` |
 
-You need **VPN access** to the prodlab network before SSH or Ansible will work.
-
-### Step 1 — Reset the VM to a clean Ubuntu host (when starting fresh)
-
-From the **Homelab** repo (not phrasevault):
-
-```bash
-cd ~/Projects/Homelab
-./scripts/presubuntu-reset.sh
-```
-
-Type `presubuntu` when prompted. This destroys VM 101 and recreates it from Terraform, then bootstraps Rust and `/opt/pvfs/data` — **no old Docker stack**.
-
-Prerequisites: `terraform/proxmox/.env.terraform` exists (see Homelab `docs/PRESUBUNTU_RESET.md`).
-
-### Step 2 — Deploy, test, and install PVFS from your laptop
-
-From the **phrasevault** repo:
-
-```bash
-cd ~/Projects/phrasevault/deploy/ansible
-cp inventory.example.ini inventory.ini   # edit if your SSH alias differs
-ansible-galaxy collection install ansible.posix
-
-ansible-playbook -i inventory.ini pipeline.yml
-```
-
-The pipeline will:
-
-1. Install build tools and Rust (if missing)
-2. Rsync the repo to `/opt/pvfs/src`
-3. `cargo build --release` and `cargo test --workspace`
-4. Run the CLI smoke script
-5. Install `pvfs` to `/usr/local/bin/pvfs`
-
-Test logs are copied to `deploy/ansible/artifacts/<host>/` on your machine.
-
-To redeploy after code changes without rebuilding the VM:
-
-```bash
-ansible-playbook -i inventory.ini pipeline.yml --tags deploy,build,test,smoke,install
-```
-
-### Step 3 — Manual tests over SSH
+### 1. SSH in
 
 ```bash
 ssh chris@192.168.0.184
+```
 
+### 2. Clone and build (on the server)
+
+```bash
+git clone https://github.com/christcb03/phrasevault.git
+cd phrasevault
+git pull   # if the directory already exists
+
+source "$HOME/.cargo/env"
+cargo build --release --workspace
+```
+
+Binary: `target/release/pvfs`. Either call it by path or install system-wide:
+
+```bash
+sudo install -m 755 target/release/pvfs /usr/local/bin/pvfs
+pvfs --help
+```
+
+Optional — run the smoke script before manual tests:
+
+```bash
+PVFS_BIN=target/release/pvfs bash deploy/ansible/files/smoke-test.sh
+```
+
+### 3. Manual tests
+
+```bash
 export PVFS_DATA_DIR=/opt/pvfs/data/my-forest
 pvfs init
 ROOT=$(pvfs info | awk '/root_node_id/ { print $2 }')
 
-# Bind a real directory (P1): index files without copying them
-pvfs bind "$ROOT" /home/chris/some-folder --recursive
+mkdir -p ~/test-data && echo hello > ~/test-data/sample.txt
 
-# One-shot scan + reconcile
-pvfs scan "$ROOT" /home/chris/some-folder
+pvfs bind "$ROOT" ~/test-data --recursive
+pvfs scan "$ROOT" ~/test-data
 
-# Read a file through PVFS (verifies hash if set)
+pvfs ls "$ROOT"
+pvfs walk "$ROOT"
+
+# use a node id from ls/walk output
 pvfs stat <node-id>
 pvfs cat <node-id>
 
-# Background watcher (optional)
-pvfs serve --bind "$ROOT" /home/chris/some-folder
+# optional background watcher
+pvfs serve --bind "$ROOT" ~/test-data
 ```
 
 Use `pvfs --help` and `pvfs <command> --help` for all subcommands.
+
+### Alternative — Ansible pipeline from your laptop
+
+If you prefer rsync + build + test + install in one shot from your machine:
+
+```bash
+cd ~/Projects/phrasevault/deploy/ansible
+cp inventory.example.ini inventory.ini
+ansible-galaxy collection install ansible.posix
+ansible-playbook -i inventory.ini pipeline.yml
+```
+
+Details: [deploy/ansible/README.md](../deploy/ansible/README.md).
 
 ---
 
@@ -180,8 +179,8 @@ Use `pvfs --help` and `pvfs <command> --help` for all subcommands.
 | Problem | What to try |
 |---------|-------------|
 | `cargo: command not found` | Run `source "$HOME/.cargo/env"` or open a new terminal after rustup. |
-| SSH to presubuntu times out | Connect to VPN; ping `192.168.0.184`. |
-| Ansible “permission denied” | User must be `chris`; key at `~/.ssh/id_ed25519`. |
+| SSH to presubuntu times out | VPN up? `ping 192.168.0.184`. After a VM rebuild, IP or host key may have changed — see Homelab [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md). |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | `ssh-keygen -R 192.168.0.184` then reconnect. |
 | `pvfs init` says forest exists | Use a new `PVFS_DATA_DIR` or remove the old directory (destroys data). |
 | Pipeline tests fail | Read `artifacts/presubuntu/pvfs-test-results.txt`; fix locally with `cargo test` first. |
 
