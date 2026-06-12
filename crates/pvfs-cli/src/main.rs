@@ -345,7 +345,7 @@ fn engine_and_node(
 ) -> Result<(Engine, String), PvfsError> {
     if is_node_id(target) {
         let dir = ctx?;
-        Ok((Engine::open(&ctx?)?, target.to_string()))
+        Ok((Engine::open(&dir)?, target.to_string()))
     } else {
         let t = mount::resolve_target(&Registry::system(), target)?;
         let engine = mount::open_mount(&t.mount)?;
