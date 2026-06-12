@@ -1,5 +1,5 @@
 ---
-# PVFS build/test/deploy pipeline for the presubuntu test server.
+# PVFS build/test/deploy pipeline.
 #
 # Stages (tags): prepare → deploy → build → test → smoke → install → report
 #
@@ -10,7 +10,7 @@
 # Test logs are fetched back to ./artifacts/<host>/ on the control machine.
 
 - name: PVFS pipeline — build, test, deploy
-  hosts: "{{ target_hosts | default('presubuntu') }}"
+  hosts: "{{ target_hosts | default('pvfs_hosts') }}"
   gather_facts: true
 
   vars:

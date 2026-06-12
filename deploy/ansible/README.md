@@ -1,15 +1,13 @@
-# PVFS pipeline — presubuntu
+# PVFS Ansible pipeline
 
-Automated **build → test → smoke → install** for the presubuntu test server.
+Automated **build → test → smoke → install** for a remote Linux host.
 
-**Start here for humans:** [docs/INSTALL.md](../../docs/INSTALL.md) (Option B) — reset VM, run this pipeline, manual SSH tests.
-
-**Reset VM first** (Homelab repo): `./scripts/presubuntu-reset.sh`
+**Manual install on a server:** [docs/INSTALL.md](../../docs/INSTALL.md) Option B.
 
 ## One-time setup
 
 ```sh
-cp inventory.example.ini inventory.ini   # adjust host/user if needed
+cp inventory.example.ini inventory.ini   # set <host> and <user>
 ansible-galaxy collection install ansible.posix
 ```
 

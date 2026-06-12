@@ -45,6 +45,6 @@ The **rightmost** component is always the PVFS major version required. Reading r
 ## Current status
 
 - **PVFS: `0.1` (implemented, under validation).** P0 core engine and P1 storage/FS ops are implemented in Rust (`crates/pvfs-core`, `crates/pvfs-cli`). See [docs/INSTALL.md](docs/INSTALL.md) to build and test.
-- **Target for `0.1` complete:** P0+P1 tests and smoke suite pass on presubuntu; install docs validated.
+- **Target for `0.1` complete:** P0+P1 tests and smoke suite pass on a representative Linux host; install docs validated.
 - **`1.0`** remains the first release ready to host the sync/file-server layer above PVFS.
 - The previous Python + TypeScript prototype is archived under `v0.0-concept/` and tagged `v0.0-concept`.

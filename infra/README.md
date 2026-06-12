@@ -1,29 +1,10 @@
-# Test server (presubuntu)
+# Optional deployment helpers
 
-Full VM reset lives in the **Homelab** repo. Installing and testing PVFS on that host is documented in **[docs/INSTALL.md](../docs/INSTALL.md)** (Option B).
+This directory points at tooling for provisioning a **remote Linux test host**. It is not required to build or run PVFS locally.
 
-## Reset to a clean Ubuntu host
-
-```bash
-cd ~/Projects/Homelab
-./scripts/presubuntu-reset.sh
-```
-
-Type `presubuntu` when prompted. This recreates Proxmox VM 101 (fresh Ubuntu 24.04, user `chris`, no legacy Docker stack).
-
-Prerequisites: VPN to `192.168.0.184`, Terraform `.env.terraform` on Homelab — see [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md).
-
-## After reset — install PVFS
-
-```bash
-cd ~/Projects/phrasevault/deploy/ansible
-cp inventory.example.ini inventory.ini
-ansible-galaxy collection install ansible.posix
-ansible-playbook -i inventory.ini pipeline.yml
-```
-
-Then SSH in and follow the manual test section in [docs/INSTALL.md](../docs/INSTALL.md).
+- **Install and manual testing:** [docs/INSTALL.md](../docs/INSTALL.md)
+- **Automated build/test/install:** [deploy/ansible/README.md](../deploy/ansible/README.md)
 
 ## Legacy stack
 
-The v0.0 Docker prototype is under `v0.0-concept/`. Do not redeploy it unless you intentionally want the old MediaForest stack.
+The v0.0 Docker prototype is under `v0.0-concept/`. It is archived and not part of the 0.1 Rust implementation.

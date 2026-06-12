@@ -4,6 +4,8 @@ This guide is for someone comfortable with a terminal, SSH, and copying commands
 
 **PVFS** is a single command-line program (`pvfs`) plus a data directory (SQLite log + index). Version **0.1** today includes the **P0 core engine** (forest, signed nodes/links, event log) and **P1 storage ops** (bind real folders, scan, read files with hash verification, background watcher).
 
+Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
+
 ---
 
 ## What you need
@@ -11,7 +13,7 @@ This guide is for someone comfortable with a terminal, SSH, and copying commands
 | Platform | Requirements |
 |----------|----------------|
 | **Linux or macOS** (local dev) | Git, a C compiler (`build-essential` / Xcode CLI tools), `curl`, `pkg-config`, **Rust** (via [rustup](https://rustup.rs)) |
-| **presubuntu test server** | VPN to the home lab, SSH to `192.168.0.184` as `chris` (Rust + build tools installed by Homelab bootstrap) |
+| **Remote Linux server** (optional) | SSH access, same build deps (or use the [Ansible pipeline](../deploy/ansible/README.md)) |
 
 There is no Docker image for the new PVFS — you build one native binary from source.
 
@@ -22,7 +24,7 @@ There is no Docker image for the new PVFS — you build one native binary from s
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/christcb03/phrasevault.git
+git clone <repository-url>
 cd phrasevault
 ```
 
@@ -85,26 +87,34 @@ PVFS_BIN=target/release/pvfs bash deploy/ansible/files/smoke-test.sh
 
 ---
 
-## Option B — presubuntu (manual build + manual tests)
+## Option B — Remote Linux server (manual build + manual tests)
 
-**presubuntu** is the Ubuntu test VM (Proxmox VM 101). Bootstrap (Rust, `build-essential`, `/opt/pvfs/data`) comes from the Homelab reset — see [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md) if you need a fresh host.
+Use any Linux host where you have SSH and can install Rust (Ubuntu/Debian examples below).
 
-| Item | Value |
-|------|--------|
-| Host (on VPN) | `192.168.0.184` |
-| SSH user | `chris` |
-| Forest data (suggested) | `/opt/pvfs/data/my-forest` |
+| Item | Example |
+|------|---------|
+| SSH | `<user>@<host>` |
+| Forest data | `$HOME/pvfs-data/my-forest` or `/var/lib/pvfs/my-forest` |
 
 ### 1. SSH in
 
 ```bash
-ssh chris@192.168.0.184
+ssh <user>@<host>
 ```
 
 ### 2. Clone and build (on the server)
 
+Install build dependencies once (Debian/Ubuntu):
+
 ```bash
-git clone https://github.com/christcb03/phrasevault.git
+sudo apt update
+sudo apt install -y build-essential pkg-config curl git
+```
+
+Install Rust if needed — see [rustup.rs](https://rustup.rs) — then:
+
+```bash
+git clone <repository-url>
 cd phrasevault
 git pull   # if the directory already exists
 
@@ -128,7 +138,7 @@ PVFS_BIN=target/release/pvfs bash deploy/ansible/files/smoke-test.sh
 ### 3. Manual tests
 
 ```bash
-export PVFS_DATA_DIR=/opt/pvfs/data/my-forest
+export PVFS_DATA_DIR="$HOME/pvfs-data/my-forest"
 pvfs init
 ROOT=$(pvfs info | awk '/root_node_id/ { print $2 }')
 
@@ -152,11 +162,10 @@ Use `pvfs --help` and `pvfs <command> --help` for all subcommands.
 
 ### Alternative — Ansible pipeline from your laptop
 
-If you prefer rsync + build + test + install in one shot from your machine:
+If you prefer rsync + build + test + install in one shot from your machine, copy [`deploy/ansible/inventory.example.ini`](../deploy/ansible/inventory.example.ini) to `inventory.ini`, set your host and user, then:
 
 ```bash
-cd ~/Projects/phrasevault/deploy/ansible
-cp inventory.example.ini inventory.ini
+cd deploy/ansible
 ansible-galaxy collection install ansible.posix
 ansible-playbook -i inventory.ini pipeline.yml
 ```
@@ -179,10 +188,10 @@ Details: [deploy/ansible/README.md](../deploy/ansible/README.md).
 | Problem | What to try |
 |---------|-------------|
 | `cargo: command not found` | Run `source "$HOME/.cargo/env"` or open a new terminal after rustup. |
-| SSH to presubuntu times out | VPN up? `ping 192.168.0.184`. After a VM rebuild, IP or host key may have changed — see Homelab [PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md). |
-| `REMOTE HOST IDENTIFICATION HAS CHANGED` | `ssh-keygen -R 192.168.0.184` then reconnect. |
+| SSH connection fails | Check VPN/firewall, correct `<host>`, and that your key is authorized for `<user>`. |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | The server was reinstalled or keys rotated. `ssh-keygen -R <host>` then reconnect. |
 | `pvfs init` says forest exists | Use a new `PVFS_DATA_DIR` or remove the old directory (destroys data). |
-| Pipeline tests fail | Read `artifacts/presubuntu/pvfs-test-results.txt`; fix locally with `cargo test` first. |
+| Pipeline tests fail | Read `deploy/ansible/artifacts/<hostname>/` logs; fix locally with `cargo test` first. |
 
 ---
 
@@ -191,4 +200,3 @@ Details: [deploy/ansible/README.md](../deploy/ansible/README.md).
 - Design specs: [00](00-architecture-decisions.md) · [01](01-core-engine-design.md) · [02](02-p0-core-engine-spec.md) · [03](03-federation-trust-and-uris.md) · [04](04-p1-storage-and-fs-ops-spec.md)
 - Version scheme: [VERSIONING.md](../VERSIONING.md)
 - Ansible pipeline: [deploy/ansible/README.md](../deploy/ansible/README.md)
-- VM reset: [Homelab PRESUBUNTU_RESET.md](https://github.com/christcb03/Homelab/blob/main/docs/PRESUBUNTU_RESET.md)
