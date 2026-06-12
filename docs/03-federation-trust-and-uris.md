@@ -115,6 +115,8 @@ pvfs:<instance_id>/<forest_id>/node/<node_id>
 
 **Optional P4 optimization (deferred):** content-hash routed alias `pvfs:…/file/<content_hash>` for "read from any replica" — not primary identity; node id remains canonical.
 
+**Operator mount URIs** (local CLI: `pvfs://alias@local/tree/path`, registry in `/etc/pvfs/`) are specified separately in [05-instance-registry-and-mounts.md](05-instance-registry-and-mounts.md). Do not conflate them with node catalog URIs below.
+
 ### 2.3 Read resolution order (P4)
 
 1. Local storage URIs on the node (`file://…` on this instance).

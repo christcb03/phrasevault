@@ -41,6 +41,7 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [02-p0-core-engine-spec.md](docs/02-p0-core-engine-spec.md) | P0 normative spec (implemented) |
 | [03-federation-trust-and-uris.md](docs/03-federation-trust-and-uris.md) | Forest ownership, sync model, URIs, trust |
 | [04-p1-storage-and-fs-ops-spec.md](docs/04-p1-storage-and-fs-ops-spec.md) | P1 storage & FS ops spec (implemented) |
+| [05-instance-registry-and-mounts.md](docs/05-instance-registry-and-mounts.md) | Mount layout (`.pvfs/`), `/etc/pvfs/` registry, mount URIs, CLI |
 
 ## Core ideas
 
