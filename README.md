@@ -12,6 +12,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 |-------|------|--------|
 | **P0** | Core engine — event log, projection, nodes/links, locations, BIP39/BIP32 identity + device certs | Implemented, spec tests in `crates/pvfs-core/tests/p0_spec.rs` |
 | **P1** | Storage — bind folders, scan/reconcile, verified reads, quarantine, `serve` watcher, temp spool | Implemented, tests in `p1_storage.rs` |
+| **P1.5** | Mounts & registry ([doc 05](docs/05-instance-registry-and-mounts.md)) — `<mount>/.pvfs/` layout, `pvfs forest init/register/unregister/info`, `/etc/pvfs` registry (`PVFS_REGISTRY_DIR` override), `pvfs://alias@local/tree/path` + path shorthand, portable forests | Implemented, tests in `p15_mounts.rs` |
 | **P2+** | WASM modules, HTTP, mount, federation sync | Specified; not built yet |
 
 Build locally with `cargo test --workspace`, or on a remote Linux host — see **[Install guide](docs/INSTALL.md)**.

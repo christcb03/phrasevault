@@ -9,16 +9,21 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use pvfs_core::{
-    identity, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey, PvfsError,
-    ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
+    identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey,
+    PvfsError, Registry, ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
 };
 
 #[derive(Parser)]
-#[command(name = "pvfs", version, about = "PVFS — PhraseVault File System (P0 core)")]
+#[command(name = "pvfs", version, about = "PVFS — PhraseVault File System")]
 struct Cli {
-    /// Data directory (default: $PVFS_DATA_DIR or ./.pvfs)
+    /// Low-level state-dir override for tests/scripts (or $PVFS_DATA_DIR).
+    /// Interactive use: run inside a mount or pass --forest.
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+
+    /// Forest context: registered alias or mount path
+    #[arg(long, global = true)]
+    forest: Option<String>,
 
     /// Emit machine-readable JSON
     #[arg(long, global = true)]
@@ -30,7 +35,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize a new forest (prints the recovery phrase ONCE)
+    /// Forest lifecycle: init, register, unregister, info
+    #[command(subcommand)]
+    Forest(ForestCmd),
+    /// Low-level: initialize a forest at the raw state dir (prefer `pvfs forest init`)
     Init,
     /// Recover onto this machine from a recovery phrase
     Recover {
@@ -79,12 +87,13 @@ enum Cmd {
         #[arg(long)]
         key: String,
     },
-    /// List a node's children in order
-    Ls { node: String },
-    /// Pre-order walk of a tree
-    Walk { root: String },
-    /// Show one node
-    Node { id: String },
+    /// No target: list registered forests. With target (pvfs:// URI, absolute
+    /// path under a mount, or node id): list that location's children.
+    Ls { target: Option<String> },
+    /// Pre-order walk of a tree (target: URI / path / node id)
+    Walk { target: String },
+    /// Show one node (target: URI / path / node id)
+    Node { target: String },
     /// File location operations
     #[command(subcommand)]
     Loc(LocCmd),
@@ -114,11 +123,11 @@ enum Cmd {
     Unbind { folder: String },
     /// Scan bound folders against their directories
     Scan { folder: Option<String> },
-    /// Node + per-location availability
-    Stat { id: String },
+    /// Node + per-location availability (target: URI / path / node id)
+    Stat { target: String },
     /// Stream a file node's bytes (verifies full reads)
     Cat {
-        id: String,
+        target: String,
         /// byte range START-END (END exclusive; END optional)
         #[arg(long)]
         range: Option<String>,
@@ -127,7 +136,7 @@ enum Cmd {
         output: Option<PathBuf>,
     },
     /// Fill a lazy content hash (creates a successor node — prints new id)
-    Hash { id: String },
+    Hash { target: String },
     /// List nodes flagged invalid: changed-on-disk
     Changes,
     /// Resolve a flagged node: accept the new contents or remove the node
@@ -154,6 +163,35 @@ enum Cmd {
 enum TreeCmd {
     /// Create a new tree (root folder node)
     Create { label: String },
+}
+
+#[derive(Subcommand)]
+enum ForestCmd {
+    /// Create a forest at a mount directory (state in <mount>/.pvfs/);
+    /// imports the directory's existing tree unless --no-import
+    Init {
+        /// Mount directory (default: current directory)
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        /// Skip binding + scanning the mount's own tree
+        #[arg(long)]
+        no_import: bool,
+        /// Register with this alias after init
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
+        hash_policy: String,
+    },
+    /// Add an existing mount to this host's registry
+    Register {
+        mount: PathBuf,
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Remove a forest from the registry (never deletes .pvfs/)
+    Unregister { name: String },
+    /// Show a forest's identity (default: current context)
+    Info { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -253,7 +291,8 @@ fn print_error(e: &PvfsError, json: bool) {
     }
 }
 
-fn data_dir(cli: &Cli) -> PathBuf {
+/// Old-style state dir for the low-level `init` / `recover` commands.
+fn legacy_state_dir(cli: &Cli) -> PathBuf {
     cli.data_dir.clone().unwrap_or_else(|| {
         std::env::var("PVFS_DATA_DIR")
             .map(PathBuf::from)
@@ -261,12 +300,67 @@ fn data_dir(cli: &Cli) -> PathBuf {
     })
 }
 
+/// Forest context for node-id commands (doc 05 §6.4):
+/// --data-dir > --forest (alias or mount path) > $PVFS_DATA_DIR > enclosing mount of CWD.
+fn context_state_dir(cli: &Cli) -> Result<PathBuf, PvfsError> {
+    if let Some(d) = &cli.data_dir {
+        return Ok(d.clone());
+    }
+    if let Some(f) = &cli.forest {
+        if let Some(reg) = Registry::system().find(f)? {
+            return Ok(mount::state_dir(&reg.mount));
+        }
+        let p = PathBuf::from(f);
+        if mount::is_mount(&p) {
+            return Ok(mount::state_dir(&p));
+        }
+        return Err(PvfsError::NotFound {
+            kind: "forest",
+            id: f.clone(),
+        });
+    }
+    if let Ok(d) = std::env::var("PVFS_DATA_DIR") {
+        return Ok(PathBuf::from(d));
+    }
+    let cwd = std::env::current_dir().map_err(|e| PvfsError::io("getcwd", e))?;
+    if let Some(m) = mount::enclosing_mount(&cwd) {
+        return Ok(mount::state_dir(&m));
+    }
+    Err(PvfsError::BadInput {
+        field: "forest".into(),
+        reason: "no forest context — run inside a mount, pass --forest <alias|mount>, or set PVFS_DATA_DIR"
+            .into(),
+    })
+}
+
+fn is_node_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Resolve a command target: bare node id (uses forest context) or a
+/// pvfs:// URI / absolute path under a mount (doc 05 §4).
+fn engine_and_node(
+    ctx: Result<PathBuf, PvfsError>,
+    target: &str,
+) -> Result<(Engine, String), PvfsError> {
+    if is_node_id(target) {
+        let dir = ctx?;
+        Ok((Engine::open(&ctx?)?, target.to_string()))
+    } else {
+        let t = mount::resolve_target(&Registry::system(), target)?;
+        let engine = mount::open_mount(&t.mount)?;
+        let node = mount::node_at_path(&engine, &t.segments)?;
+        Ok((engine, node))
+    }
+}
+
 fn run(cli: Cli) -> Result<(), PvfsError> {
-    let dir = data_dir(&cli);
+    let legacy = legacy_state_dir(&cli);
+    let ctx = context_state_dir(&cli);
     let json = cli.json;
     match cli.cmd {
         Cmd::Init => {
-            let (engine, mnemonic) = Engine::init(&dir)?;
+            let (engine, mnemonic) = Engine::init(&legacy)?;
             if json {
                 println!(
                     "{{\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"mnemonic\":\"{}\"}}",
@@ -276,7 +370,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     json_escape(&mnemonic.to_string()),
                 );
             } else {
-                println!("Forest initialized in {}", dir.display());
+                println!("Forest initialized in {}", legacy.display());
                 println!("  instance_id : {}", engine.identity.instance_id);
                 println!("  forest_id   : {}", engine.identity.forest_id);
                 println!("  root node   : {}", engine.identity.root_node_id);
@@ -293,7 +387,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             device_index,
         } => {
             let m = identity::parse_mnemonic(&mnemonic)?;
-            let engine = Engine::recover(&dir, &m, device_index)?;
+            let engine = Engine::recover(&legacy, &m, device_index)?;
             if json {
                 println!(
                     "{{\"recovered\":true,\"device_index\":{},\"device_pubkey\":\"{}\"}}",
@@ -310,7 +404,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Info => {
-            let engine = Engine::open(&dir)?;
+            let engine = Engine::open(&ctx?)?;
             if json {
                 println!(
                     "{{\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"device_pubkey\":\"{}\"}}",
@@ -328,7 +422,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Tree(TreeCmd::Create { label }) => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let id = engine.create_tree(&label)?;
             emit_id(json, "root_node_id", &id);
             engine.close()
@@ -343,7 +437,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             mime,
             content_hash,
         } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let (node_type, payload) = if kind == "file" {
                 (
                     TYPE_FILE.to_string(),
@@ -377,13 +471,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             link_type,
             nonce,
         } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let id = engine.link(&parent, &child, &link_type, None, nonce)?;
             emit_id(json, "link_id", &id);
             engine.close()
         }
         Cmd::Unlink { link_id } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             engine.remove_link(&link_id)?;
             if json {
                 println!("{{\"removed\":true}}");
@@ -393,7 +487,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Reorder { link_id, key } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let key = OrderKey::parse(&key)?;
             engine.reorder_link(&link_id, &key)?;
             if json {
@@ -403,8 +497,54 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Ls { node } => {
-            let engine = Engine::open(&dir)?;
+        Cmd::Ls { target: None } => {
+            // forest inventory (doc 05 §6.1)
+            let forests = Registry::system().list()?;
+            if json {
+                let items: Vec<String> = forests
+                    .iter()
+                    .map(|f| {
+                        let identity = mount::peek_identity(&f.mount).ok();
+                        format!(
+                            "{{\"alias\":{},\"mount\":\"{}\",\"enabled\":{},\"instance_id\":{},\"forest_id\":{}}}",
+                            f.alias
+                                .as_ref()
+                                .map(|a| format!("\"{}\"", json_escape(a)))
+                                .unwrap_or_else(|| "null".into()),
+                            json_escape(&f.mount.to_string_lossy()),
+                            f.enabled,
+                            identity
+                                .as_ref()
+                                .map(|i| format!("\"{}\"", json_escape(&i.instance_id)))
+                                .unwrap_or_else(|| "null".into()),
+                            identity
+                                .as_ref()
+                                .map(|i| format!("\"{}\"", json_escape(&i.forest_id)))
+                                .unwrap_or_else(|| "null".into()),
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else if forests.is_empty() {
+                println!("no registered forests (see `pvfs forest init` / `pvfs forest register`)");
+            } else {
+                for f in forests {
+                    let identity = mount::peek_identity(&f.mount);
+                    println!(
+                        "{:<16} {}  {}{}",
+                        f.alias.as_deref().unwrap_or("-"),
+                        f.mount.display(),
+                        identity
+                            .map(|i| format!("{} / {}", i.instance_id, i.forest_id))
+                            .unwrap_or_else(|_| "(unreadable)".into()),
+                        if f.enabled { "" } else { "  [disabled]" }
+                    );
+                }
+            }
+            Ok(())
+        }
+        Cmd::Ls { target: Some(target) } => {
+            let (engine, node) = engine_and_node(ctx, &target)?;
             let kids = engine.children(&node)?;
             if json {
                 let items: Vec<String> = kids
@@ -436,8 +576,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Walk { root } => {
-            let engine = Engine::open(&dir)?;
+        Cmd::Walk { target } => {
+            let (engine, root) = engine_and_node(ctx, &target)?;
             let walk = engine.walk(&root)?;
             if json {
                 let items: Vec<String> = walk
@@ -466,8 +606,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Node { id } => {
-            let engine = Engine::open(&dir)?;
+        Cmd::Node { target } => {
+            let (engine, id) = engine_and_node(ctx, &target)?;
             match engine.get_node(&id)? {
                 None => {
                     engine.close()?;
@@ -497,7 +637,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Loc(loc) => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             match loc {
                 LocCmd::Add { file, uri } => {
                     engine.add_location(&file, &uri)?;
@@ -565,7 +705,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Verify { id } => {
-            let engine = Engine::open(&dir)?;
+            let engine = Engine::open(&ctx?)?;
             let ok = engine.verify(&id)?;
             if json {
                 println!("{{\"valid\":{ok}}}");
@@ -575,7 +715,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Orphans => {
-            let engine = Engine::open(&dir)?;
+            let engine = Engine::open(&ctx?)?;
             let orphans = engine.list_orphans()?;
             if json {
                 let items: Vec<String> = orphans
@@ -604,7 +744,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     reason: "at least one node id required".into(),
                 });
             }
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             engine.purge(&ids)?;
             if json {
                 println!("{{\"purged\":{}}}", ids.len());
@@ -614,7 +754,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Device(dev) => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             match dev {
                 DeviceCmd::Authorize { mnemonic, index } => {
                     let m = identity::parse_mnemonic(&mnemonic)?;
@@ -652,7 +792,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             extensions,
             hash_policy,
         } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let abs = std::fs::canonicalize(&bind_dir)
                 .map_err(|e| PvfsError::io("canonicalize dir", e))?;
             let source_uri = pvfs_core::storage::path_to_uri(&abs)?;
@@ -674,7 +814,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Unbind { folder } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             engine.unbind_folder(&folder)?;
             if json {
                 println!("{{\"unbound\":true}}");
@@ -684,7 +824,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Scan { folder } => {
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let reports = engine.scan(folder.as_ref())?;
             if json {
                 let items: Vec<String> = reports
@@ -721,8 +861,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Stat { id } => {
-            let mut engine = Engine::open(&dir)?;
+        Cmd::Stat { target } => {
+            let (mut engine, id) = engine_and_node(ctx, &target)?;
             let st = engine.stat_node(&id)?;
             if json {
                 let locs: Vec<String> = st
@@ -782,8 +922,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Cat { id, range, output } => {
-            let mut engine = Engine::open(&dir)?;
+        Cmd::Cat { target, range, output } => {
+            let (mut engine, id) = engine_and_node(ctx, &target)?;
             let range = match range {
                 None => None,
                 Some(r) => Some(parse_range(&r)?),
@@ -805,8 +945,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Hash { id } => {
-            let mut engine = Engine::open(&dir)?;
+        Cmd::Hash { target } => {
+            let (mut engine, id) = engine_and_node(ctx, &target)?;
             let new_id = engine.hash_node(&id)?;
             if json {
                 println!(
@@ -822,7 +962,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Changes => {
-            let engine = Engine::open(&dir)?;
+            let engine = Engine::open(&ctx?)?;
             let changes = engine.changes()?;
             if json {
                 let items: Vec<String> = changes
@@ -867,7 +1007,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     reason: "pass exactly one of --replace / --delete".into(),
                 });
             }
-            let mut engine = Engine::open(&dir)?;
+            let mut engine = Engine::open(&ctx?)?;
             let action = if replace {
                 ResolveAction::Replace
             } else {
@@ -887,7 +1027,135 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         Cmd::Serve {
             reconcile_secs,
             debounce_ms,
-        } => serve(&dir, json, reconcile_secs, debounce_ms),
+        } => serve(&ctx?, json, reconcile_secs, debounce_ms),
+        Cmd::Forest(cmd) => forest_cmd(cmd, ctx, json),
+    }
+}
+
+fn forest_cmd(
+    cmd: ForestCmd,
+    ctx: Result<PathBuf, PvfsError>,
+    json: bool,
+) -> Result<(), PvfsError> {
+    match cmd {
+        ForestCmd::Init {
+            mount: mount_arg,
+            no_import,
+            alias,
+            hash_policy,
+        } => {
+            let target = match mount_arg {
+                Some(m) => m,
+                None => std::env::current_dir().map_err(|e| PvfsError::io("getcwd", e))?,
+            };
+            if let Some(a) = &alias {
+                Registry::validate_alias(a)?;
+            }
+            let (engine, mnemonic, report) =
+                mount::init_forest(&target, !no_import, HashPolicy::parse(&hash_policy)?)?;
+            let registered = match &alias {
+                Some(a) => {
+                    Registry::system().register(&target, Some(a))?;
+                    true
+                }
+                None => false,
+            };
+            if json {
+                println!(
+                    "{{\"mount\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"imported\":{},\"registered\":{},\"mnemonic\":\"{}\"}}",
+                    json_escape(&target.to_string_lossy()),
+                    json_escape(&engine.identity.instance_id),
+                    json_escape(&engine.identity.forest_id),
+                    json_escape(&engine.identity.root_node_id),
+                    report.is_some(),
+                    registered,
+                    json_escape(&mnemonic.to_string()),
+                );
+            } else {
+                println!("Forest created at {}", target.display());
+                println!("  instance_id : {}", engine.identity.instance_id);
+                println!("  forest_id   : {}", engine.identity.forest_id);
+                println!("  root node   : {}", engine.identity.root_node_id);
+                if let Some(r) = &report {
+                    println!(
+                        "  imported    : {} file(s) from the mount tree",
+                        r.stats.added
+                    );
+                }
+                if registered {
+                    println!("  registered  : alias {}", alias.as_deref().unwrap_or("-"));
+                } else {
+                    println!("  portable    : register later with `pvfs forest register`");
+                }
+                println!();
+                println!("RECOVERY PHRASE — write this down now; it is shown ONCE and never stored:");
+                println!();
+                println!("  {mnemonic}");
+                println!();
+            }
+            engine.close()
+        }
+        ForestCmd::Register { mount: m, alias } => {
+            let f = Registry::system().register(&m, alias.as_deref())?;
+            if json {
+                println!(
+                    "{{\"registered\":true,\"mount\":\"{}\",\"alias\":{}}}",
+                    json_escape(&f.mount.to_string_lossy()),
+                    f.alias
+                        .as_ref()
+                        .map(|a| format!("\"{}\"", json_escape(a)))
+                        .unwrap_or_else(|| "null".into()),
+                );
+            } else {
+                println!(
+                    "registered {} ({})",
+                    f.mount.display(),
+                    f.alias.as_deref().unwrap_or("no alias")
+                );
+            }
+            Ok(())
+        }
+        ForestCmd::Unregister { name } => {
+            Registry::system().unregister(&name)?;
+            if json {
+                println!("{{\"unregistered\":true}}");
+            } else {
+                println!("unregistered {name} (mount and .pvfs/ untouched)");
+            }
+            Ok(())
+        }
+        ForestCmd::Info { target } => {
+            let (mount_path, state) = match target {
+                Some(t) => {
+                    let r = mount::resolve_target(&Registry::system(), &t)?;
+                    (Some(r.mount.clone()), mount::state_dir(&r.mount))
+                }
+                None => (None, ctx?),
+            };
+            let engine = Engine::open(&state)?;
+            if json {
+                println!(
+                    "{{\"mount\":{},\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"device_pubkey\":\"{}\"}}",
+                    mount_path
+                        .as_ref()
+                        .map(|m| format!("\"{}\"", json_escape(&m.to_string_lossy())))
+                        .unwrap_or_else(|| "null".into()),
+                    json_escape(&engine.identity.instance_id),
+                    json_escape(&engine.identity.forest_id),
+                    json_escape(&engine.identity.root_node_id),
+                    hex::encode(engine.device_pubkey()),
+                );
+            } else {
+                if let Some(m) = &mount_path {
+                    println!("mount       : {}", m.display());
+                }
+                println!("instance_id : {}", engine.identity.instance_id);
+                println!("forest_id   : {}", engine.identity.forest_id);
+                println!("root node   : {}", engine.identity.root_node_id);
+                println!("device key  : {}", hex::encode(engine.device_pubkey()));
+            }
+            engine.close()
+        }
     }
 }
 

@@ -7,6 +7,7 @@ set -euo pipefail
 PVFS="${PVFS_BIN:-pvfs}"
 DATA="$(mktemp -d /tmp/pvfs-smoke.XXXXXX)"
 export PVFS_DATA_DIR="$DATA/forest"
+export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
 PASS=0
 FAIL=0
 
@@ -188,6 +189,33 @@ sleep 3
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
 $PVFS ls "$MOVIES" | grep -q watched.mkv && ok "watcher ingested new file"
+
+say "P1.5: forest init / registry / mount URIs"
+MOUNT="$DATA/workspace"
+mkdir -p "$MOUNT/docs"
+printf 'mount notes' > "$MOUNT/docs/readme.txt"
+FINIT="$($PVFS --json forest init --mount "$MOUNT" --alias smokehome)"
+echo "$FINIT" | grep -q '"imported":true' && ok "forest init imported mount tree"
+[ -f "$MOUNT/.pvfs/log.db" ] && ok "state lives under .pvfs/"
+$PVFS ls | grep -q smokehome && ok "pvfs ls lists registered forest"
+$PVFS ls "pvfs://smokehome@local/docs" | grep -q readme.txt && ok "ls by alias URI"
+$PVFS ls "$MOUNT/docs" | grep -q readme.txt && ok "ls by absolute path shorthand"
+$PVFS cat "pvfs://smokehome/docs/readme.txt" | grep -q "mount notes" && ok "cat by tree path"
+$PVFS forest info "pvfs://smokehome@local/" | grep -q instance_id && ok "forest info by URI"
+if $PVFS ls "$MOUNT" | grep -q "\.pvfs"; then
+  fail ".pvfs leaked into the indexed tree"
+else
+  ok ".pvfs not indexed into the tree"
+fi
+
+say "P1.5: portable forest (no registry)"
+PORT="$DATA/usb-project"
+cp -r "$MOUNT" "$PORT"
+$PVFS ls "$PORT/docs" | grep -q readme.txt && ok "portable mount opens by path"
+$PVFS forest unregister smokehome >/dev/null && ok "unregister"
+[ -f "$MOUNT/.pvfs/log.db" ] && ok "unregister keeps .pvfs/"
+assert_rc 3 "unknown alias → 3" -- $PVFS ls "pvfs://smokehome/docs"
+$PVFS ls "$MOUNT/docs" | grep -q readme.txt && ok "unregistered mount still opens by path"
 
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
