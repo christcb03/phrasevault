@@ -109,7 +109,88 @@ pub fn init_forest(
     } else {
         None
     };
+    ensure_mount_owned_by_operator(&mount)?;
     Ok((engine, mnemonic, report))
+}
+
+/// UID/GID that should own a mount's `.pvfs/` tree: real user when invoked via
+/// `sudo`, otherwise the current process credentials.
+#[cfg(unix)]
+pub fn mount_owner_credentials() -> Result<(u32, u32)> {
+    use nix::unistd::{geteuid, getgid, getuid};
+
+    if geteuid().is_root() {
+        if let (Ok(su), Ok(sg)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+            let uid: u32 = su
+                .parse()
+                .map_err(|_| bad("SUDO_UID", format!("{su:?} is not a uid")))?;
+            let gid: u32 = sg
+                .parse()
+                .map_err(|_| bad("SUDO_GID", format!("{sg:?} is not a gid")))?;
+            return Ok((uid, gid));
+        }
+        return Err(bad(
+            "user",
+            "refusing to create forest data as root — run `pvfs forest init` as your user, \
+             then `sudo pvfs forest register` for system-wide listing"
+                .into(),
+        ));
+    }
+    Ok((getuid().as_raw(), getgid().as_raw()))
+}
+
+#[cfg(not(unix))]
+pub fn mount_owner_credentials() -> Result<(u32, u32)> {
+    Err(bad(
+        "platform",
+        "mount ownership is only supported on Unix".into(),
+    ))
+}
+
+/// Recursively chown a path (used for `<mount>/.pvfs/` after init or repair).
+#[cfg(unix)]
+pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    use nix::unistd::{chown, Gid, Uid};
+
+    let u = Uid::from_raw(uid);
+    let g = Gid::from_raw(gid);
+    fn recurse(p: &Path, u: Uid, g: Gid) -> Result<()> {
+        chown(p, Some(u), Some(g)).map_err(|e| PvfsError::io("chown", std::io::Error::from(e)))?;
+        if p.is_dir() {
+            for entry in std::fs::read_dir(p).map_err(|e| PvfsError::io("read dir", e))? {
+                recurse(&entry.map_err(|e| PvfsError::io("read dir", e))?.path(), u, g)?;
+            }
+        }
+        Ok(())
+    }
+    recurse(path, u, g)
+}
+
+#[cfg(not(unix))]
+pub fn chown_tree(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Ensure `.pvfs/` (and the mount dir if it is root-owned) belong to the operator.
+pub fn ensure_mount_owned_by_operator(mount: &Path) -> Result<()> {
+    let mount = std::fs::canonicalize(mount).map_err(|e| PvfsError::io("canonicalize mount", e))?;
+    let sd = state_dir(&mount);
+    if !sd.is_dir() {
+        return Err(PvfsError::NotFound {
+            kind: "mount",
+            id: mount.to_string_lossy().into_owned(),
+        });
+    }
+    let (uid, gid) = mount_owner_credentials()?;
+    chown_tree(&sd, uid, gid)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if mount.metadata().map(|m| m.uid()).unwrap_or(0) == 0 {
+            chown_tree(&mount, uid, gid)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn open_mount(mount: &Path) -> Result<Engine> {

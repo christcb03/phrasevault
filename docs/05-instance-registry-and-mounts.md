@@ -145,7 +145,18 @@ Run from the directory that will become the **mount** (or specify `--mount`).
 3. Prompt: **Import this directory’s tree into the forest?** (bind + scan of `<mount>/`, excluding `.pvfs/`).
 4. Prompt: **Friendly alias?** (optional; stored only on register, or in local `.pvfs/manifest.json` as hint).
 
-Does **not** require `/etc/pvfs/` write. Produces a **portable** forest until registered.
+Does **not** write `/etc/pvfs/` or require root. Produces a **portable** forest until registered.
+
+**Ownership:** always run **`pvfs forest init` as your normal user** (never `sudo init`). Engine state in `<mount>/.pvfs/` is owned by you. System-wide listing is a separate step:
+
+```bash
+pvfs forest init                    # as your user, in or under the mount directory
+sudo pvfs forest register /path/to/mount --alias myforest
+```
+
+`register` may run under `sudo` (writes `/etc/pvfs/` only). It also **repairs ownership** if `.pvfs/` was created root-owned by mistake.
+
+Recovery: `sudo pvfs forest fix-permissions /path/to/mount` (reassigns `.pvfs/` to your user via `SUDO_UID`).
 
 ### 5.2 `pvfs forest register`
 
@@ -178,8 +189,9 @@ Flags (future): `--portable` scan paths; `--json`.
 ### 6.2 Forest lifecycle
 
 ```text
-pvfs forest init [--mount PATH] [--no-import] [--alias NAME]
-pvfs forest register <mount-path> [--alias NAME]
+pvfs forest init [--mount PATH] [--no-import] [--alias NAME]   # alias is a hint only; does not register
+pvfs forest register <mount-path> [--alias NAME]               # sudo for /etc/pvfs/
+pvfs forest fix-permissions [--mount PATH]                     # sudo if .pvfs/ is root-owned
 pvfs forest unregister <alias|mount-path>
 pvfs forest info [<mount-uri>]
 ```

@@ -176,7 +176,7 @@ enum ForestCmd {
         /// Skip binding + scanning the mount's own tree
         #[arg(long)]
         no_import: bool,
-        /// Register with this alias after init
+        /// Suggested alias for a later `pvfs forest register --alias` (does not register)
         #[arg(long)]
         alias: Option<String>,
         #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
@@ -190,6 +190,12 @@ enum ForestCmd {
     },
     /// Remove a forest from the registry (never deletes .pvfs/)
     Unregister { name: String },
+    /// Fix `.pvfs/` ownership after a mistaken `sudo forest init` (or run via sudo register)
+    FixPermissions {
+        /// Mount directory (default: current directory if it is a mount)
+        #[arg(long)]
+        mount: Option<PathBuf>,
+    },
     /// Show a forest's identity (default: current context)
     Info { target: Option<String> },
 }
@@ -1044,6 +1050,7 @@ fn forest_cmd(
             alias,
             hash_policy,
         } => {
+            mount::mount_owner_credentials()?; // fail before creating state as raw root
             let target = match mount_arg {
                 Some(m) => m,
                 None => std::env::current_dir().map_err(|e| PvfsError::io("getcwd", e))?,
@@ -1053,26 +1060,24 @@ fn forest_cmd(
             }
             let (engine, mnemonic, report) =
                 mount::init_forest(&target, !no_import, HashPolicy::parse(&hash_policy)?)?;
-            let registered = match &alias {
-                Some(a) => {
-                    Registry::system().register(&target, Some(a))?;
-                    true
-                }
-                None => false,
-            };
+            let mount = std::fs::canonicalize(&target)
+                .map_err(|e| PvfsError::io("canonicalize mount", e))?;
             if json {
                 println!(
-                    "{{\"mount\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"imported\":{},\"registered\":{},\"mnemonic\":\"{}\"}}",
-                    json_escape(&target.to_string_lossy()),
+                    "{{\"mount\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"imported\":{},\"registered\":false,\"suggested_alias\":{},\"mnemonic\":\"{}\"}}",
+                    json_escape(&mount.to_string_lossy()),
                     json_escape(&engine.identity.instance_id),
                     json_escape(&engine.identity.forest_id),
                     json_escape(&engine.identity.root_node_id),
                     report.is_some(),
-                    registered,
+                    alias
+                        .as_ref()
+                        .map(|a| format!("\"{}\"", json_escape(a)))
+                        .unwrap_or_else(|| "null".into()),
                     json_escape(&mnemonic.to_string()),
                 );
             } else {
-                println!("Forest created at {}", target.display());
+                println!("Forest created at {}", mount.display());
                 println!("  instance_id : {}", engine.identity.instance_id);
                 println!("  forest_id   : {}", engine.identity.forest_id);
                 println!("  root node   : {}", engine.identity.root_node_id);
@@ -1082,10 +1087,15 @@ fn forest_cmd(
                         r.stats.added
                     );
                 }
-                if registered {
-                    println!("  registered  : alias {}", alias.as_deref().unwrap_or("-"));
+                println!("  portable    : register for system-wide listing:");
+                if let Some(a) = &alias {
+                    println!(
+                        "    sudo pvfs forest register {} --alias {}",
+                        mount.display(),
+                        a
+                    );
                 } else {
-                    println!("  portable    : register later with `pvfs forest register`");
+                    println!("    sudo pvfs forest register {}", mount.display());
                 }
                 println!();
                 println!("RECOVERY PHRASE — write this down now; it is shown ONCE and never stored:");
@@ -1096,6 +1106,11 @@ fn forest_cmd(
             engine.close()
         }
         ForestCmd::Register { mount: m, alias } => {
+            if let Some(a) = &alias {
+                Registry::validate_alias(a)?;
+            }
+            let m = std::fs::canonicalize(&m).map_err(|e| PvfsError::io("canonicalize mount", e))?;
+            mount::ensure_mount_owned_by_operator(&m)?;
             let f = Registry::system().register(&m, alias.as_deref())?;
             if json {
                 println!(
@@ -1121,6 +1136,27 @@ fn forest_cmd(
                 println!("{{\"unregistered\":true}}");
             } else {
                 println!("unregistered {name} (mount and .pvfs/ untouched)");
+            }
+            Ok(())
+        }
+        ForestCmd::FixPermissions { mount: m } => {
+            let target = match m {
+                Some(p) => p,
+                None => std::env::current_dir().map_err(|e| PvfsError::io("getcwd", e))?,
+            };
+            mount::ensure_mount_owned_by_operator(&target)?;
+            if json {
+                println!(
+                    "{{\"fixed\":true,\"mount\":\"{}\"}}",
+                    json_escape(&target.to_string_lossy())
+                );
+            } else {
+                let canon = std::fs::canonicalize(&target)
+                    .map_err(|e| PvfsError::io("canonicalize mount", e))?;
+                println!(
+                    "fixed ownership of {} (and .pvfs/) for your user",
+                    canon.display()
+                );
             }
             Ok(())
         }
