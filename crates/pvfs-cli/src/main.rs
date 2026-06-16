@@ -837,13 +837,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{},\"unreadable\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
                             r.stats.changed,
                             r.stats.removed,
-                            r.stats.skipped
+                            r.stats.skipped,
+                            r.stats.unreadable
                         )
                     })
                     .collect();
@@ -851,18 +852,23 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 for r in &reports {
                     println!(
-                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped",
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped, {} unreadable",
                         r.folder_id,
                         r.stats.added,
                         r.stats.unchanged,
                         r.stats.changed,
                         r.stats.removed,
-                        r.stats.skipped
+                        r.stats.skipped,
+                        r.stats.unreadable
                     );
                 }
                 let changed: u64 = reports.iter().map(|r| r.stats.changed).sum();
                 if changed > 0 {
                     eprintln!("note: {changed} file(s) flagged changed — review with `pvfs changes`");
+                }
+                let unreadable: u64 = reports.iter().map(|r| r.stats.unreadable).sum();
+                if unreadable > 0 {
+                    eprintln!("note: {unreadable} path(s) skipped — not readable by your user");
                 }
             }
             engine.close()
@@ -1086,6 +1092,12 @@ fn forest_cmd(
                         "  imported    : {} file(s) from the mount tree",
                         r.stats.added
                     );
+                    if r.stats.unreadable > 0 {
+                        println!(
+                            "  skipped     : {} path(s) you cannot read (not imported)",
+                            r.stats.unreadable
+                        );
+                    }
                 }
                 println!("  portable    : register for system-wide listing:");
                 if let Some(a) = &alias {

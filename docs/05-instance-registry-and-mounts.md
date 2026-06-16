@@ -44,7 +44,7 @@ Portable forests are **first-class**: the CLI opens them by **mount path** in a 
 
 ## 3. System registry (`/etc/pvfs/`)
 
-Owned by the **PVFS daemon** (future). CLI writes via root/polkit helper.
+A host-wide **inventory** of which mounts exist, written via root (`sudo`) / polkit helper. It only **points at** mounts; it grants no access to them. Each registered forest is **served by its owner's own daemon** running as that user (P2) — registration makes a forest discoverable in `pvfs ls`, it does not hand it to a privileged shared service. The registry entry is root-owned; the forest data it points at stays owned by the user (§5.4). A per-user registry (`$PVFS_REGISTRY_DIR`, e.g. under `$XDG_CONFIG_HOME`) is supported for rootless setups and tests.
 
 ```text
 /etc/pvfs/
@@ -147,14 +147,14 @@ Run from the directory that will become the **mount** (or specify `--mount`).
 
 Does **not** write `/etc/pvfs/` or require root. Produces a **portable** forest until registered.
 
-**Ownership:** always run **`pvfs forest init` as your normal user** (never `sudo init`). Engine state in `<mount>/.pvfs/` is owned by you. System-wide listing is a separate step:
+**Ownership:** run **`pvfs forest init` as the normal user who will own the forest** — that user ends up owning `<mount>/.pvfs/` and is the account that later runs the forest's daemon (P2). Raw-root init (root with no `sudo`) is **refused** so forest data is never created as `root:root`. If you do `sudo pvfs forest init` anyway, ownership of `.pvfs/` (and the mount dir entry, if it was created during init) is **reassigned to `$SUDO_UID`** automatically. System-wide listing is a separate step:
 
 ```bash
 pvfs forest init                    # as your user, in or under the mount directory
 sudo pvfs forest register /path/to/mount --alias myforest
 ```
 
-`register` may run under `sudo` (writes `/etc/pvfs/` only). It also **repairs ownership** if `.pvfs/` was created root-owned by mistake.
+`register` may run under `sudo` (writes `/etc/pvfs/` only). It also **repairs `.pvfs/` ownership** if it was created root-owned by mistake.
 
 Recovery: `sudo pvfs forest fix-permissions /path/to/mount` (reassigns `.pvfs/` to your user via `SUDO_UID`).
 
@@ -171,6 +171,16 @@ Idempotent update if mount already registered. **`unregister`** removes registry
 - Copy entire `<mount>/` including `.pvfs/`.
 - On any machine: `pvfs ls /media/usb/project/docs/` or `pvfs://…` with full mount path — **no register required**.
 - Optional: `pvfs forest register /media/usb/project` when the stick should appear in `pvfs ls` inventory on that host.
+
+### 5.4 Ownership, permissions & sharing
+
+PVFS follows ordinary POSIX filesystem semantics rather than inventing its own access model:
+
+- **Owner.** The user who runs `forest init` owns the forest: they own and can write `<mount>/` and `<mount>/.pvfs/`, and they run any daemon that serves it. There is **one daemon per owning user** (P2) — no shared system service reaches across users' forests.
+- **Import honors read permission.** `init`/`scan` never index a file the owner cannot read. Unreadable files and untraversable directories are skipped (reported as `unreadable`), not imported and not fatal. So a forest never references content its owner can't actually open.
+- **Engine state permissions.** `.pvfs/` and `log.db`/`index.db` are created under the owner's umask — normal files. `device.key` is always `0600` (a per-device signing secret, never group-shared). PVFS does **not** force `.pvfs/` to `0700`; tighten with your umask if you want owner-only forests.
+- **Sharing is group-based, like any directory.** To share a forest with a group, give the mount (and, if collaborators need engine access, `.pvfs/`) the desired group and group mode — `chgrp`, `chmod g+rwX`, setgid dirs for inheritance — exactly as you would for any shared project tree. `device.key` stays owner-only regardless.
+- **Ownership repair is narrow.** `register` and `fix-permissions` only ever fix the **owner** of `.pvfs/` (recursively) and the **mount directory entry** (single entry). They never recursively rewrite ownership or permissions of the workspace files — your `chgrp`/`chmod` choices there are left intact. Both operations are symlink-safe (they never follow a symlink while chowning).
 
 ---
 

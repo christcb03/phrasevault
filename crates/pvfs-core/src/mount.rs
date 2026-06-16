@@ -89,6 +89,9 @@ pub fn init_forest(
     import: bool,
     hash_policy: HashPolicy,
 ) -> Result<(Engine, Mnemonic, Option<ScanReport>)> {
+    // Refuse raw-root creation up front — before any state exists on disk —
+    // so a library caller can't leave a half-created root-owned `.pvfs/` behind.
+    mount_owner_credentials()?;
     std::fs::create_dir_all(mount).map_err(|e| PvfsError::io("create mount", e))?;
     let mount = std::fs::canonicalize(mount).map_err(|e| PvfsError::io("canonicalize mount", e))?;
     let (mut engine, mnemonic) = Engine::init(&state_dir(&mount))?;
@@ -141,29 +144,47 @@ pub fn mount_owner_credentials() -> Result<(u32, u32)> {
 
 #[cfg(not(unix))]
 pub fn mount_owner_credentials() -> Result<(u32, u32)> {
-    Err(bad(
-        "platform",
-        "mount ownership is only supported on Unix".into(),
-    ))
+    // No POSIX ownership model off Unix; ownership repair is a no-op there.
+    Ok((0, 0))
 }
 
 /// Recursively chown a path (used for `<mount>/.pvfs/` after init or repair).
+///
+/// **Symlink-safe:** never chowns *through* a symlink and never descends into a
+/// symlinked directory, so a planted symlink can't redirect a root-run repair at
+/// an arbitrary target (the classic `chown -R` escalation). Entries already owned
+/// by the target uid/gid are skipped, making this a cheap no-op in the common
+/// case where state is already operator-owned (and avoiding needless `EPERM`).
 #[cfg(unix)]
 pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
     use nix::unistd::{chown, Gid, Uid};
+    use std::os::unix::fs::MetadataExt;
 
     let u = Uid::from_raw(uid);
     let g = Gid::from_raw(gid);
-    fn recurse(p: &Path, u: Uid, g: Gid) -> Result<()> {
-        chown(p, Some(u), Some(g)).map_err(|e| PvfsError::io("chown", std::io::Error::from(e)))?;
-        if p.is_dir() {
+    fn recurse(p: &Path, u: Uid, g: Gid, uid: u32, gid: u32) -> Result<()> {
+        let md = std::fs::symlink_metadata(p).map_err(|e| PvfsError::io("stat", e))?;
+        if md.file_type().is_symlink() {
+            return Ok(()); // skip symlinks entirely — never follow them
+        }
+        if md.uid() != uid || md.gid() != gid {
+            chown(p, Some(u), Some(g))
+                .map_err(|e| PvfsError::io("chown", std::io::Error::from(e)))?;
+        }
+        if md.is_dir() {
             for entry in std::fs::read_dir(p).map_err(|e| PvfsError::io("read dir", e))? {
-                recurse(&entry.map_err(|e| PvfsError::io("read dir", e))?.path(), u, g)?;
+                recurse(
+                    &entry.map_err(|e| PvfsError::io("read dir", e))?.path(),
+                    u,
+                    g,
+                    uid,
+                    gid,
+                )?;
             }
         }
         Ok(())
     }
-    recurse(path, u, g)
+    recurse(path, u, g, uid, gid)
 }
 
 #[cfg(not(unix))]
@@ -171,8 +192,19 @@ pub fn chown_tree(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Ensure `.pvfs/` (and the mount dir if it is root-owned) belong to the operator.
+/// Repair ownership so the operator owns the **engine state** (`<mount>/.pvfs/`),
+/// plus the mount **directory entry** itself if some other account (e.g. a
+/// mistaken `sudo init`) created it.
+///
+/// Deliberately scoped: it recurses only into `.pvfs/` (small, engine-controlled)
+/// and touches the mount only as a single directory entry. It never recursively
+/// rewrites the workspace files under the mount — those follow ordinary
+/// filesystem ownership and are managed with ordinary tools (see doc 05 §5.4).
+#[cfg(unix)]
 pub fn ensure_mount_owned_by_operator(mount: &Path) -> Result<()> {
+    use nix::unistd::{chown, Gid, Uid};
+    use std::os::unix::fs::MetadataExt;
+
     let mount = std::fs::canonicalize(mount).map_err(|e| PvfsError::io("canonicalize mount", e))?;
     let sd = state_dir(&mount);
     if !sd.is_dir() {
@@ -182,15 +214,28 @@ pub fn ensure_mount_owned_by_operator(mount: &Path) -> Result<()> {
         });
     }
     let (uid, gid) = mount_owner_credentials()?;
+    // Engine state — recurse, but only here.
     chown_tree(&sd, uid, gid)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if mount.metadata().map(|m| m.uid()).unwrap_or(0) == 0 {
-            chown_tree(&mount, uid, gid)?;
+    // The mount directory entry only (so the operator can write `.pvfs/` into it),
+    // never its contents. Skip symlinks and anything already correctly owned.
+    if let Ok(md) = std::fs::symlink_metadata(&mount) {
+        if !md.file_type().is_symlink() && md.uid() != uid {
+            chown(&mount, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+                .map_err(|e| PvfsError::io("chown mount", std::io::Error::from(e)))?;
         }
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn ensure_mount_owned_by_operator(mount: &Path) -> Result<()> {
+    if !state_dir(mount).is_dir() {
+        return Err(PvfsError::NotFound {
+            kind: "mount",
+            id: mount.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(()) // no POSIX ownership model off Unix
 }
 
 pub fn open_mount(mount: &Path) -> Result<Engine> {

@@ -120,6 +120,54 @@ fn extension_filter() {
     assert!(find_by_label(&engine, &folder, "b.txt").is_none());
 }
 
+// import never references a file the operator cannot read (doc 05 §5.1)
+#[cfg(unix)]
+#[test]
+fn unreadable_file_is_not_imported() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_data, mut engine, _m) = new_forest();
+    let fixture = tempfile::tempdir().unwrap();
+    write_file(&fixture.path().join("readable.txt"), b"ok");
+    let secret = fixture.path().join("secret.txt");
+    write_file(&secret, b"nope");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // If this process can still open a 000 file (running as root / CAP_DAC_OVERRIDE),
+    // access(2) is a no-op and there is nothing to enforce — assert accordingly.
+    let enforced = fs::File::open(&secret).is_err();
+
+    let root = engine.identity.root_node_id.clone();
+    let folder = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FOLDER.into(),
+                label: "lib".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    engine
+        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::Lazy))
+        .unwrap();
+
+    let r = engine.scan(Some(&folder)).unwrap();
+    assert!(find_by_label(&engine, &folder, "readable.txt").is_some());
+    if enforced {
+        assert_eq!(r[0].stats.added, 1, "only the readable file is imported");
+        assert_eq!(r[0].stats.unreadable, 1, "the 000 file is reported unreadable");
+        assert!(find_by_label(&engine, &folder, "secret.txt").is_none());
+    } else {
+        assert_eq!(r[0].stats.added, 2);
+    }
+
+    // restore perms so the tempdir can be cleaned up
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 // §10.4 — disk deletion soft-removes; restore re-attaches the same node
 #[test]
 fn disk_delete_and_restore() {

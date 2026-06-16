@@ -72,7 +72,10 @@ pub struct ScanStats {
     pub unchanged: u64,
     pub changed: u64,
     pub removed: u64,
+    /// Intentionally not indexed (dotfile, or filtered by the binding's extensions).
     pub skipped: u64,
+    /// Present on disk but the operator can't read it, so it was not imported.
+    pub unreadable: u64,
 }
 
 #[derive(Debug)]
@@ -1231,11 +1234,18 @@ fn walk_disk(
             stats.skipped += 1;
             continue;
         }
+        let child = dir.join(&entry.name);
         if entry.is_dir {
             if recursive {
+                // Skip directories the operator can't traverse/read rather than
+                // aborting the whole import — never index what you can't read.
+                if !is_accessible(&child, true) {
+                    stats.unreadable += 1;
+                    continue;
+                }
                 let mut sub = rel.clone();
                 sub.push(entry.name.clone());
-                walk_disk(&dir.join(&entry.name), sub, recursive, visited, files, stats, b)?;
+                walk_disk(&child, sub, recursive, visited, files, stats, b)?;
             }
             continue;
         }
@@ -1251,13 +1261,40 @@ fn walk_disk(
                 continue;
             }
         }
+        // Never import a file the operator cannot read.
+        if !is_accessible(&child, false) {
+            stats.unreadable += 1;
+            continue;
+        }
         files.push(DiskFile {
             rel_dirs: rel.clone(),
             name: entry.name.clone(),
             size: entry.size,
             mtime_ms: entry.mtime_ms,
-            path: dir.join(&entry.name),
+            path: child,
         });
     }
     Ok(())
+}
+
+/// Whether the running user can read (and, for dirs, also traverse) `path`.
+///
+/// Uses `access(2)`, which checks the process's **real** uid/gid — matching the
+/// intended model where the forest owner runs `init`/scans (and later their own
+/// daemon) as themselves. Files that fail this are left out of the forest so it
+/// never references content the owner can't actually read. Off Unix there is no
+/// such check, so assume accessible.
+#[cfg(unix)]
+fn is_accessible(path: &std::path::Path, need_exec: bool) -> bool {
+    use nix::unistd::{access, AccessFlags};
+    let mut flags = AccessFlags::R_OK;
+    if need_exec {
+        flags |= AccessFlags::X_OK;
+    }
+    access(path, flags).is_ok()
+}
+
+#[cfg(not(unix))]
+fn is_accessible(_path: &std::path::Path, _need_exec: bool) -> bool {
+    true
 }
