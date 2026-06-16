@@ -172,3 +172,10 @@ Integration (public API): set/ls/check happy path + bad principal/rights guards.
   6 open questions (Q-C1..Q-C6: wire format, two-phase signed writes, uid↔key binding location,
   concurrency model, crate name, member identity). **Did not implement the daemon** — those
   decisions are the user's; build starts once they're answered.
+- 2026-06-16: **All six Phase-C questions decided** (doc 07 now "Decided"): JSON envelope +
+  hex-PCE preimage; two-phase member-signed writes; key-based **challenge-response** auth (no
+  uid→key file); split control/data-plane concurrency (no tokio); `pvfsd` + `pvfs-client` + admin
+  CLI; generated standalone client identity. Added a **`public` ACL tier** (anyone, even
+  unauthenticated) alongside `any` (authorized members) and `key:` — `effective_rights` rewritten
+  to the three tiers; `pvfs acl set <node> public r`. Updated decisions Q1/2 default #1 (principals
+  now public/any/key). Verified on presubuntu.

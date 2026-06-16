@@ -86,7 +86,7 @@ Access is controlled per **node** (a folder or file in the tree). An ACL entry b
 
 | Field | Values |
 |-------|--------|
-| principal | a member **pubkey**; or a **named group** (a server group resolved by the daemon); or the wildcard **`*` (any authorized member)** |
+| principal | **`public`** (anyone, even unauthenticated); **`any`** (any authorized member); or **`key:<pubkey>`** (one member). `public ⊇ any ⊇ key`. Named groups deferred. |
 | rights | any of `r` (read), `w` (write/modify children & payload), `a` (admin: grant/revoke ACLs on this subtree) |
 | scope | the node it is set on, **inherited by descendants** unless overridden |
 
@@ -117,6 +117,11 @@ We considered storing `mode`/owner/group on each node. Named-user/named-group gr
 ---
 
 ## 5. The daemon
+
+> **Superseded by [07-daemon-protocol.md](07-daemon-protocol.md).** The §5 sketch below
+> predates the Phase-C decisions. The authoritative model is doc 07: **challenge-response auth**
+> (the key is the principal — *no* uid→key binding), JSON transport, two-phase member-signed
+> writes, and a split control/data-plane concurrency model. Read doc 07 for §5.x details.
 
 ### 5.1 Responsibilities
 

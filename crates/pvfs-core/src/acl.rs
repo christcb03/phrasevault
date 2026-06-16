@@ -21,28 +21,31 @@ pub const ACL_RWA: u8 = ACL_R | ACL_W | ACL_A;
 /// two without a new event field. Owner devices have implicit full rights.
 pub const MEMBER_DEVICE_INDEX: u64 = u64::MAX;
 
-/// Who an ACL entry is about.
+/// Who an ACL entry is about (doc 06 §4 / doc 07 §4). Three tiers:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    /// Any authorized member of the forest (filesystem "other-but-authenticated").
+    /// Anyone, including unauthenticated callers (filesystem "other").
+    Public,
+    /// Any authorized member of the forest (holds an authorized, unrevoked key).
     Any,
     /// A specific device/member public key (33-byte compressed secp256k1).
     Key(Vec<u8>),
 }
 
 impl Principal {
-    /// Wire/table discriminant: 0 = Any, 1 = Key.
+    /// Wire/table discriminant: 0 = Any, 1 = Key, 2 = Public.
     pub fn kind(&self) -> u64 {
         match self {
             Principal::Any => 0,
             Principal::Key(_) => 1,
+            Principal::Public => 2,
         }
     }
 
-    /// Wire/table identity bytes (pubkey for `Key`, empty for `Any`).
+    /// Wire/table identity bytes (pubkey for `Key`, empty otherwise).
     pub fn id(&self) -> &[u8] {
         match self {
-            Principal::Any => &[],
+            Principal::Any | Principal::Public => &[],
             Principal::Key(k) => k,
         }
     }
@@ -55,6 +58,7 @@ impl Principal {
                 crate::crypto::validate_pubkey(&id)?;
                 Ok(Principal::Key(id))
             }
+            2 => Ok(Principal::Public),
             other => Err(PvfsError::BadInput {
                 field: "principal_kind".into(),
                 reason: format!("unknown principal kind {other}"),
@@ -62,8 +66,11 @@ impl Principal {
         }
     }
 
-    /// Parse the CLI form: `any` or `key:<hex>`.
+    /// Parse the CLI form: `public`, `any`, or `key:<hex>`.
     pub fn parse(s: &str) -> Result<Principal> {
+        if s == "public" {
+            return Ok(Principal::Public);
+        }
         if s == "any" {
             return Ok(Principal::Any);
         }
@@ -77,13 +84,14 @@ impl Principal {
         }
         Err(PvfsError::BadInput {
             field: "principal".into(),
-            reason: format!("{s:?} — expected `any` or `key:<hex>`"),
+            reason: format!("{s:?} — expected `public`, `any`, or `key:<hex>`"),
         })
     }
 
     /// CLI/display form, the inverse of [`Principal::parse`].
     pub fn display(&self) -> String {
         match self {
+            Principal::Public => "public".into(),
             Principal::Any => "any".into(),
             Principal::Key(k) => format!("key:{}", hex::encode(k)),
         }
@@ -147,6 +155,7 @@ mod tests {
 
     #[test]
     fn principal_parse() {
+        assert_eq!(Principal::parse("public").unwrap(), Principal::Public);
         assert_eq!(Principal::parse("any").unwrap(), Principal::Any);
         assert!(Principal::parse("key:zz").is_err());
         assert!(Principal::parse("bogus").is_err());

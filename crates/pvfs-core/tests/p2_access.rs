@@ -139,3 +139,37 @@ fn can_and_readable_children() {
     assert_eq!(engine.readable_children(&owner, &root).unwrap().len(), 2);
     engine.close().unwrap();
 }
+
+// doc 07 §4 — the three tiers: `public` reaches everyone; `any` only members
+#[test]
+fn acl_public_vs_any_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let shared = engine.add_node(&root, folder("shared")).unwrap();
+    let members_only = engine.add_node(&root, folder("members-only")).unwrap();
+
+    let member = foreign_pubkey();
+    engine.authorize_member(&m, &member).unwrap();
+    let memberp = acl::Principal::Key(member);
+    let stranger = acl::Principal::Key(foreign_pubkey()); // never authorized
+
+    // `public` read on `shared` reaches everyone — even an unauthorized/unknown key
+    engine.set_acl(&shared, &acl::Principal::Public, acl::ACL_R).unwrap();
+    assert!(engine.can(&acl::Principal::Public, &shared, acl::ACL_R).unwrap());
+    assert!(engine.can(&memberp, &shared, acl::ACL_R).unwrap());
+    assert!(engine.can(&stranger, &shared, acl::ACL_R).unwrap());
+    assert!(!engine.can(&acl::Principal::Public, &root, acl::ACL_R).unwrap());
+
+    // `any` read on `members-only` reaches authorized members only
+    engine
+        .set_acl(&members_only, &acl::Principal::Any, acl::ACL_R)
+        .unwrap();
+    assert!(engine.can(&memberp, &members_only, acl::ACL_R).unwrap());
+    assert!(!engine.can(&acl::Principal::Public, &members_only, acl::ACL_R).unwrap());
+    assert!(
+        !engine.can(&stranger, &members_only, acl::ACL_R).unwrap(),
+        "an unauthorized key is not a member"
+    );
+    engine.close().unwrap();
+}

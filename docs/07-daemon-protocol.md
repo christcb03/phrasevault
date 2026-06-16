@@ -1,161 +1,169 @@
 # PVFS — the per-user daemon & client protocol (07)
 
-Status: **Draft for review** — design + open questions; not yet implemented
-Date: 2026-06-15
+Status: **Decided** — implementation pending (`pvfsd` + `pvfs-client`); design locked 2026-06-16
 Depends on: [06-access-control-and-daemon.md](06-access-control-and-daemon.md)
 
-Phase C of doc 06. This pins *how* another user's process talks to a forest it doesn't own:
-the transport, authentication, the read and (member-signed) write flows, and where host-local
-config lives. **Several decisions below are genuinely yours — they're marked `❓Q-Cn` and listed
-in §8.** I wrote this so the build can start the moment those are answered; I did **not**
-implement the daemon, because the wrong protocol choice is expensive to undo.
+Phase C of doc 06: how another user's process talks to a forest it doesn't own. All six open
+questions (Q-C1…Q-C6) are now resolved — see §8 for the decisions and rationale.
 
 ---
 
 ## 1. Shape
 
 ```
-member's app ──unix socket──▶  owner's pvfs daemon  ──▶ <mount>/.pvfs/ (single engine)
-   (holds member key)            (runs as the owner,        log.db / index.db
-                                  peer-cred auth, ACL)
+app ──unix socket──▶  pvfsd (owner's daemon, runs as owner)
+ (holds identity key)   ├─ control plane: serialized writer + read-only conn pool (SQLite)
+                        └─ data plane:   concurrent thread-per-transfer (bytes, no engine)
+                                          └▶ <mount>/.pvfs/  +  file storage
 ```
 
-- **One daemon per owning user**, one engine handle per forest it serves (SQLite is single-writer;
-  the daemon serializes). The daemon is the only writer of the log on the host.
-- Clients reach it over a **Unix-domain socket** whose path is published in the registry
-  (`socket = …`, doc 06 §7). Same-uid callers may keep using the library directly (doc 06 §5.3).
-- The daemon authenticates each connection by **peer credentials** and enforces per-node ACLs
-  (Phase B `effective_rights`) on every request.
+- **One `pvfsd` per owning user**, serving that user's forests. The daemon is the only writer of
+  the log on the host; same-uid callers may still use the library directly (doc 06 §5.3).
+- Clients reach it over a **Unix-domain socket** (path published in the registry, §7), mode `0666`
+  — reachability is gated by **ACL**, not socket bits.
+- Three light pieces: **`pvfsd`** (daemon) · **`pvfs-client`** (Rust lib apps link) · **`pvfs`**
+  (admin CLI, run on the server). The JSON protocol (§3) is itself the language-agnostic API, so a
+  non-Rust app can speak it directly.
 
 ---
 
-## 2. Authentication — peer credentials
+## 2. Authentication — challenge-response (key is the identity)
 
-On `accept()`, read the connecting peer's uid from the kernel:
-- Linux: `getsockopt(SO_PEERCRED)`; macOS: `getpeereid()` / `LOCAL_PEERCRED`.
-The uid is kernel-supplied and unforgeable, so no passwords. The daemon maps **uid → principal
-(member key)** via host-local config (§4). An unmapped uid is treated as `Principal::Any` if it is
-an authorized member, else denied — **TBD by ❓Q-C2**.
+No uid→key table. The connecting **key** is the principal, proven cryptographically:
 
----
+1. Client connects; daemon sends a fresh random **nonce**.
+2. Client signs `PCE(nonce, forest_id, expiry)` with its **identity key** and returns `{pubkey, sig}`.
+3. Daemon verifies → principal = that key. It then resolves the principal's tier (§4).
 
-## 3. Transport & framing
+- The signed blob includes `forest_id` (a signature for forest A can't be replayed to forest B) and
+  a short `expiry`; the nonce is single-use. Standard replay protection.
+- A client that **skips** the handshake (or presents an unauthorized/unknown key) is **`Public`**
+  (§4) — anonymous read of public-shared nodes only.
+- Peer-cred uid (`SO_PEERCRED`/`getpeereid`) is **optional** defense-in-depth ("must be a local
+  login"), no longer load-bearing for authorization.
+- **Why this and not uid-mapping:** the same handshake works over the network, so it extends to
+  federation (doc 03, P4) and torrent-like peering with **no rework**; uid-mapping dead-ends at the
+  local socket. It also deletes a config file and keeps "the key is the identity" uniform with the
+  rest of PVFS.
 
-A connection carries length-delimited request/response messages. Each message:
-`u32 length (LE) || PCE-encoded body`, mirroring the on-disk encoding (`encoding.rs`).
-One in-flight request per connection (pipelining deferred).
-
-Request kinds (v1): `Info`, `Ls{node}`, `Stat{node}`, `Cat{node,range}`, and the write trio
-`PrepareWrite{op}` / `Commit{prepared_id, signature}` (§5). Responses are typed results or a
-typed error (reusing `PvfsError` codes).
-
-> ❓**Q-C1 — wire format.** Length-prefixed **PCE** (consistent with the kernel, compact, but
-> bespoke) vs **newline-delimited JSON** (trivially debuggable, language-agnostic for non-Rust
-> clients). I lean PCE for parity; JSON is friendlier if you foresee third-party clients.
-
----
-
-## 4. uid → principal binding (host-local, owner-managed)
-
-A uid↔member-key mapping is **host-specific and not portable**, so it must NOT be a forest event
-(those are federated) and NOT the root-owned registry. It is the owner's local daemon config:
-
-```
-~/.config/pvfs/<forest_id>/peers.toml      # owned 0600 by the owner
-[[peer]]
-uid    = 1003
-member = "key:<B-pubkey-hex>"              # must already be authorized in the forest
-read_default = true                         # optional convenience
-```
-
-The owner edits this (or via `pvfs forest peer add --uid … --member …`), having first run
-`pvfs device authorize-member` (Phase A) and granted ACLs (Phase B). The daemon trusts the
-peer-cred uid and attributes the connection to the bound member key.
-
-> ❓**Q-C3 — binding location.** `~/.config/pvfs/<forest_id>/peers.toml` (XDG, per-forest) vs
-> `<mount>/.pvfs/peers.toml` (travels with the mount, but then it's inside the 0700 state dir and
-> only meaningful on this host). I lean XDG since the binding is host-local, not forest data.
+### Member identity
+A member holds a generated standalone key at `~/.config/pvfs/identity.key` (0600, created on first
+run; `pvfs whoami` prints the pubkey to hand to a forest owner). A member need **not** own a forest.
+Lost key → owner re-authorizes a new one; stolen key → owner revokes (`DeviceRevoked`, Phase A).
 
 ---
 
-## 5. Writes must be signed by the member (the hard part)
+## 3. Transport & framing — JSON envelope
 
-Doc 06 §3 requires the **writer's own key** to sign — the daemon must not forge. But a valid event
-needs kernel-allocated bits the client can't compute alone (content-addressed node id, sibling
-**order key**, server timestamp), and appends must be **serialized** to avoid order-key races. So a
-write is **two phases**:
+Each message is `u32 length (LE) || JSON body`. JSON is debuggable and trivial for non-Rust
+clients; PVFS identifiers are already hex strings, so the usual JSON binary/precision traps barely
+apply. The one thing that must be **canonical** — the write preimage a client signs (§5) — is
+carried as **hex-encoded PCE bytes** inside the JSON, so signing stays on the kernel's canonical
+encoding. (u64 sizes/seqs are sent as JSON strings to dodge the 2⁵³ issue.)
+
+Requests (v1): `Hello`/`Auth` (handshake, §2), `Info`, `Ls{node}`, `Stat{node}`, `Cat{node,range}`,
+and the write pair `PrepareWrite{op}` / `Commit{prepared_id, signature}` (§5). Responses are typed
+results or a typed error reusing `PvfsError` codes.
+
+---
+
+## 4. Principals & tiers (extends doc 06 §4)
+
+| Principal | Who | Resolved from |
+|-----------|-----|---------------|
+| `Public` | **anyone**, even unauthenticated | the default when no key is proven |
+| `Any` | any **authorized member** (holds an authorized, unrevoked key) | a proven authorized key |
+| `Key(pk)` | one specific member | a proven specific key |
+
+Evaluation (implemented in `projection::effective_rights`): an **owner device** (HD index, not the
+member sentinel) is full-rights. Otherwise, walking the node and its `contains`-ancestors, a caller
+gets the union of: **`Public` grants always**; **`Any` grants if they are an authorized member**;
+and **`Key(pk)` grants for their own key**. Grant-only inheritance flows down the tree.
+
+- **Forest existence is public** via the registry (world-readable entries) — listing registered
+  forests needs no ACL. A forest's **contents** stay private unless the owner sets a `Public` (or
+  `Any`/`Key`) grant on specific nodes.
+
+---
+
+## 5. Writes — two-phase, member-signed
+
+The writer's own key signs (the daemon never forges), but the kernel allocates ids/order-keys/time
+and must serialize appends — so a write is two phases:
 
 1. `PrepareWrite{op}` — client sends a high-level intent (e.g. *create folder `media` under `P`*).
    The daemon checks the caller's ACL (`w` on the parent), builds the **canonical event preimage**
-   (assigns id/order-key/timestamp), and returns the exact bytes-to-sign + a `prepared_id`.
-2. Client signs the preimage with the **member key** and returns `Commit{prepared_id, signature}`.
-3. The daemon assembles the event with `author = member key` + that signature, re-checks ACL, and
-   appends. Replay-time enforcement (Phase A/B) independently re-verifies author-authorization and
-   admin, so a buggy daemon still can't smuggle in an unauthorized write.
+   (id digest, order key, timestamp), and returns the bytes-to-sign (hex-PCE) + a `prepared_id`
+   (TTL'd).
+2. `Commit{prepared_id, signature}` — client signs the preimage with its key; the daemon assembles
+   the event (`author` = the member key + that signature), re-checks ACL, and appends.
 
-This keeps authorship faithful at the cost of one round-trip and a short-lived prepared-state.
+Replay-time enforcement (Phases A/B) independently re-verifies author-authorization and admin, so a
+buggy/bypassed daemon still cannot inject an unauthorized write. Thin clients only ever "sign these
+bytes" — no kernel logic in the client (essential for non-Rust clients).
 
-> ❓**Q-C2 — confirm the two-phase model** (and whether an unmapped-but-authorized uid may write,
-> or only read). The alternative — daemon signs on the member's behalf — was explicitly rejected
-> by you, so two-phase is the path unless you want to revisit.
->
-> ❓**Q-C6 — member identity.** The member needs a keypair to be authorized and to sign. Is it the
-> key from *their own* forest's `.pvfs/`, or a purpose-made "client identity" we generate and store
-> at `~/.config/pvfs/identity.key`? The latter is cleaner (a member need not own a forest).
+An **unauthorized/Public** caller cannot write at all (no key to sign with) — at most `Public` reads.
 
 ---
 
-## 6. Concurrency & lifecycle
+## 6. Concurrency — split control & data planes
 
-Simplest correct model: the daemon owns **one engine per forest** and runs a **single worker**
-that serializes all ops (reads and writes) through it; connection handlers hand requests to the
-worker over a channel and await replies. Reads could later use separate read-only SQLite
-connections for parallelism, but v1 keeps one writer + one reader path for safety.
+The two planes have opposite needs, so they're built differently:
 
-Lifecycle: started on demand or via systemd `--user`; socket at a well-known per-forest path;
-clean shutdown checkpoints the engine (existing `clean_shutdown` flag).
+- **Control plane (metadata):** `ls`/`stat`/ACL checks/tree mutations hit SQLite (`rusqlite` is
+  blocking and `!Sync`). One **serialized writer** connection + a **pool of read-only connections**
+  (WAL allows many concurrent readers). So metadata reads run concurrently; only the cheap, rare
+  mutations serialize. No async runtime.
+- **Data plane (bytes):** once the control plane authorizes a read and resolves the node → storage
+  location, streaming the bytes **never touches the engine**. So transfers run **concurrent,
+  thread-per-transfer** — and this is exactly where **torrent-like chunk serving** lives later
+  (many peers × many chunks, fully parallel, no SQLite involvement).
 
-> ❓**Q-C4 — concurrency.** Single-worker + channel (simplest, safe) vs async (tokio) with a
-> mutex-guarded engine. I lean single-worker threads (no async runtime dependency in the kernel
-> path); say the word if you'd rather standardize on tokio.
+**tokio:** not used now. It earns its place only if a torrent *swarm* reaches a scale where
+thread-per-transfer hurts — a later, **data-plane-only** optimization, isolated from the sync
+control plane. Threads carry personal/small-team (and early swarm) loads fine.
 
-> ❓**Q-C5 — crate.** New workspace binary crate name: `pvfsd` (daemon) + client support folded
-> into the existing `pvfs` CLI (`pvfs --forest <alias> ls` dials the socket when the forest is
-> remote-to-this-uid). Confirm the name.
+Lifecycle: started on demand or systemd `--user`; clean shutdown checkpoints the engine.
 
 ---
 
 ## 7. Registry additions (doc 06 §7)
 
 `forests.d/<slug>.toml` gains `owner = "<user>"` and `socket = "<path>"`, written at
-`sudo pvfs forest register` time. `pvfs ls`/resolve use them to find a shared forest's daemon.
-Identity (`instance_id`/`forest_id`) is cached in the entry so listing never reads a peer's 0700
-`.pvfs/`.
+`sudo pvfs forest register`. `pvfs ls`/resolve use them to find a shared forest's daemon; cached
+identity means listing never reads a peer's `0700` `.pvfs/`.
 
 ---
 
-## 8. Open questions (consolidated — please answer inline)
+## 8. Decisions (was: open questions)
 
-- ❓**Q-C1** wire format: PCE (lean) vs JSON.
-- ❓**Q-C2** confirm two-phase member-signed writes; may an authorized-but-unmapped uid write or only read?
-- ❓**Q-C3** uid↔key binding location: `~/.config/pvfs/<forest_id>/peers.toml` (lean) vs in `.pvfs/`.
-- ❓**Q-C4** concurrency: single-worker threads (lean) vs tokio.
-- ❓**Q-C5** crate name `pvfsd` + client in the `pvfs` CLI.
-- ❓**Q-C6** member identity: reuse their own forest key vs a generated client identity key.
+- **C1 — wire format:** JSON envelope, length-prefixed; signable preimages as hex-PCE.
+- **C2 — writes & anon:** two-phase member-signed writes; an unauthenticated caller gets **`Public`**
+  reads only (and a new `Public` ACL tier was added, §4).
+- **C3 — uid↔key binding:** *eliminated* by choosing key-based auth (C6).
+- **C4 — concurrency:** split planes — serialized writer + read-pool (control) and concurrent
+  thread-per-transfer (data); tokio deferred to a possible data-plane-only swarm optimization.
+- **C5 — crates:** `pvfsd` + `pvfs-client` (apps) + `pvfs` admin CLI.
+- **C6 — identity/auth:** generated standalone client identity + challenge-response; the key is the
+  principal (federation-ready).
 
 ---
 
-## 9. What already exists for C to build on (Phases A–B, landed & tested)
+## 9. Foundation already in place (Phases A–B, landed & tested)
 
-- `authorize_member` / revoke (root-signed) + **replay-time author-authorization** — only authorized
-  keys can ever appear in the log.
-- `AclSet` events + `acl` table + `effective_rights(principal, node)` + admin-checked grants.
-- `.pvfs/` is `0700` (owner-private); all cross-user access must go through the daemon.
-- Enforcement primitives (`Engine::can`, `Engine::readable_children`) — the per-request checks the
-  daemon calls. (See §10.)
+- `authorize_member`/revoke (root-signed) + **replay-time author-authorization**.
+- `AclSet` events + `acl` table + `effective_rights` (Public/Any/Key tiers) + admin-checked grants.
+- `.pvfs/` is `0700`; all cross-user access goes through the daemon.
+- Enforcement primitives `Engine::can` / `Engine::readable_children` — the per-request checks the
+  daemon calls.
 
-## 10. Enforcement primitives (added ahead of C, pure-core, tested)
+## 10. Build order for Phase C
 
-- `Engine::can(principal, node, right) -> bool` — `effective_rights & right == right`.
-- `Engine::readable_children(principal, node) -> Vec<ChildEntry>` — children filtered to those the
-  principal may read (doc 06 §4.2). The daemon composes these; the owner-context engine is unchanged.
+1. `Public` principal tier in the ACL model (small, additive — done first, ahead of the daemon).
+2. `pvfs-client` crate: JSON envelope types + framing + the challenge-response handshake client.
+3. `pvfsd`: socket listener, handshake/auth, control-plane worker (writer + read-pool), request
+   dispatch using `effective_rights`/`readable_children`, two-phase write handling.
+4. Data-plane transfer threads for `Cat`.
+5. `pvfs` CLI: `whoami`, transparent remoting (`pvfs --forest <alias> ls` dials the socket), and
+   registry `owner`/`socket` fields at register time.
+6. Federation/torrent hooks (later).

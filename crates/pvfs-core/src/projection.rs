@@ -590,34 +590,37 @@ fn author_is_active(tx: &Transaction<'_>, author: &[u8]) -> Result<bool> {
 
 // ---- ACL evaluation (doc 06 §4.2) -------------------------------------------------
 
-/// Effective rights for `principal` on `node_id`: an authorized, unrevoked **owner**
-/// device (HD index, not the member sentinel) gets full rights; otherwise the union
-/// of grants for the principal and the `any` wildcard on the node and each of its
-/// `contains`-ancestors (grant-only inheritance — grants flow down the tree).
-/// Accepts `&Connection`; a `&Transaction` derefs to it, so replay can call it too.
+/// Effective rights for `principal` on `node_id` (doc 06 §4.2 / doc 07 §4). An
+/// authorized, unrevoked **owner** device (HD index, not the member sentinel) gets
+/// full rights. Otherwise, walking the node and its `contains`-ancestors, the union
+/// of: **`Public` grants always**; **`Any` grants iff the caller is an authorized
+/// member**; and **`Key(pk)` grants for the caller's own key**. Grant-only — grants
+/// flow down the tree. Accepts `&Connection`; a `&Transaction` derefs to it, so
+/// replay can call it too.
 pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str) -> Result<u8> {
-    if let Principal::Key(pk) = principal {
-        let idx: Option<i64> = conn
-            .query_row(
-                "SELECT device_index FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL",
-                params![pk],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(map_db("acl owner-device check"))?;
-        if let Some(i) = idx {
-            if (i as u64) != acl::MEMBER_DEVICE_INDEX {
+    // Is this caller an authorized member (so `Any` grants apply)? Owner devices
+    // short-circuit to full rights.
+    let is_member = match principal {
+        Principal::Public => false,
+        Principal::Any => true,
+        Principal::Key(pk) => {
+            let (authorized, is_owner) = device_status(conn, pk)?;
+            if is_owner {
                 return Ok(acl::ACL_RWA);
             }
+            authorized
         }
-    }
+    };
     let mut rights = 0u8;
     let mut cur = Some(node_id.to_string());
     let mut guard = 0u32;
     while let Some(n) = cur {
-        rights |= grant_for(conn, &n, principal.kind(), principal.id())?;
-        if !matches!(principal, Principal::Any) {
-            rights |= grant_for(conn, &n, 0, &[])?; // the `any` wildcard
+        rights |= grant_for(conn, &n, 2, &[])?; // Public — applies to everyone
+        if is_member {
+            rights |= grant_for(conn, &n, 0, &[])?; // Any — authorized members
+        }
+        if let Principal::Key(pk) = principal {
+            rights |= grant_for(conn, &n, 1, pk)?; // this specific key
         }
         if rights & acl::ACL_RWA == acl::ACL_RWA {
             break; // already maximal — stop walking
@@ -629,6 +632,22 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
         }
     }
     Ok(rights)
+}
+
+/// `(authorized_and_unrevoked, is_owner_device)` for a key in `device_keys`.
+fn device_status(conn: &Connection, pubkey: &[u8]) -> Result<(bool, bool)> {
+    let idx: Option<i64> = conn
+        .query_row(
+            "SELECT device_index FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL",
+            params![pubkey],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("acl device status"))?;
+    match idx {
+        Some(i) => Ok((true, (i as u64) != acl::MEMBER_DEVICE_INDEX)),
+        None => Ok((false, false)),
+    }
 }
 
 fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8]) -> Result<u8> {
