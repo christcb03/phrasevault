@@ -54,6 +54,38 @@ fn init_creates_state_under_dot_pvfs_and_imports() {
     assert_eq!(id.root_node_id.len(), 64);
 }
 
+// doc 06 §2/§8 — engine state is private (0700) to its creator
+#[cfg(unix)]
+#[test]
+fn state_dir_is_private_to_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, mount) = make_mount();
+    let mode = fs::metadata(state_dir(&mount)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "`.pvfs/` must be owner-only (doc 06)");
+}
+
+// doc 05 §5.4 — ownership repair is idempotent and never rewrites workspace files
+#[test]
+fn ensure_owned_is_idempotent_and_leaves_workspace_alone() {
+    let (_dir, mount) = make_mount();
+    let notes = mount.join("docs/notes.txt");
+    let before = fs::metadata(&notes).unwrap();
+
+    // Already operator-owned (make_mount ran init as us): repeated calls are no-ops.
+    mount::ensure_mount_owned_by_operator(&mount).unwrap();
+    mount::ensure_mount_owned_by_operator(&mount).unwrap();
+
+    assert!(is_mount(&mount));
+    assert_eq!(fs::read(&notes).unwrap(), b"some notes", "content untouched");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let after = fs::metadata(&notes).unwrap();
+        assert_eq!(before.uid(), after.uid(), "workspace uid unchanged");
+        assert_eq!(before.gid(), after.gid(), "workspace gid unchanged");
+    }
+}
+
 // doc 05 §3/§5.2 — registry register/list/find/unregister
 #[test]
 fn registry_lifecycle() {

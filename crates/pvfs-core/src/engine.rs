@@ -172,6 +172,15 @@ impl Engine {
     /// the genesis events. Returns the mnemonic for ONE-TIME display.
     pub fn init(data_dir: &Path) -> Result<(Engine, Mnemonic)> {
         std::fs::create_dir_all(data_dir).map_err(|e| PvfsError::io("create data dir", e))?;
+        // Engine state is private to its creator: an unshared forest is reachable
+        // only through the owner's own daemon (doc 06 §2). Cross-user sharing is
+        // ACL-enforced over the socket, never via file-permission bits on `.pvfs/`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| PvfsError::io("chmod state dir", e))?;
+        }
         if data_dir.join(LOG_FILE).exists() {
             return Err(PvfsError::AlreadyExists {
                 kind: "forest",
