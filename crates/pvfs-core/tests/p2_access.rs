@@ -107,3 +107,35 @@ fn acl_inheritance_wildcard_and_rebuild() {
     );
     engine.close().unwrap();
 }
+
+// doc 06 §4.2 / doc 07 §10 — enforcement primitives the daemon will call
+#[test]
+fn can_and_readable_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let public = engine.add_node(&root, folder("public")).unwrap();
+    let _secret = engine.add_node(&root, folder("secret")).unwrap();
+
+    let member = foreign_pubkey();
+    engine.authorize_member(&m, &member).unwrap();
+    let p = acl::Principal::Key(member);
+    engine.set_acl(&public, &p, acl::ACL_R).unwrap(); // read on `public` only
+
+    assert!(engine.can(&p, &public, acl::ACL_R).unwrap());
+    assert!(!engine.can(&p, &_secret, acl::ACL_R).unwrap());
+    assert!(!engine.can(&p, &public, acl::ACL_W).unwrap());
+
+    let visible: Vec<String> = engine
+        .readable_children(&p, &root)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.node.id)
+        .collect();
+    assert_eq!(visible, vec![public], "member sees only the granted child");
+
+    // the owner device sees every child
+    let owner = acl::Principal::Key(engine.device_pubkey());
+    assert_eq!(engine.readable_children(&owner, &root).unwrap().len(), 2);
+    engine.close().unwrap();
+}

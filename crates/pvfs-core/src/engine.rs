@@ -1392,6 +1392,32 @@ impl Engine {
         }
         Ok(out)
     }
+
+    /// Whether `principal` holds every bit in `right` on `node_id` (doc 06 §4.2).
+    pub fn can(
+        &self,
+        principal: &crate::acl::Principal,
+        node_id: &NodeId,
+        right: u8,
+    ) -> Result<bool> {
+        Ok(self.effective_rights(principal, node_id)? & right == right)
+    }
+
+    /// Children of `node_id` that `principal` may read — what the daemon (Phase C)
+    /// returns when a non-owner caller lists a folder.
+    pub fn readable_children(
+        &self,
+        principal: &crate::acl::Principal,
+        node_id: &NodeId,
+    ) -> Result<Vec<ChildEntry>> {
+        let mut out = Vec::new();
+        for c in self.children(node_id)? {
+            if self.effective_rights(principal, &c.node.id)? & crate::acl::ACL_R != 0 {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for Engine {

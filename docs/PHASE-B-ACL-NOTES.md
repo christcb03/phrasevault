@@ -160,7 +160,15 @@ Integration (public API): set/ls/check happy path + bad principal/rights guards.
     so existing forests gain it on next open without a migration/version error.
 
 ### Remaining for later phases (not Phase B)
-- ☐ Read-path filtering by caller (Phase C / daemon) — `children()`/`cat` stay owner-context.
 - ☐ Named groups; explicit deny (doc 06 §11).
 - ☐ A dedicated `Forbidden` error (set_acl currently returns `BadInput` when a device lacks
   admin — only reachable for non-owners, which arrive with the daemon).
+
+- 2026-06-15: **Enforcement primitives added** (ahead of Phase C, pure-core, tested):
+  `Engine::can(principal, node, right)` and `Engine::readable_children(principal, node)`
+  (children filtered to readable). 56 tests pass, smoke green. The owner-context engine is
+  unchanged; these are what the daemon will call per connected caller.
+- 2026-06-15: **Phase C design drafted** in [07-daemon-protocol.md](07-daemon-protocol.md) with
+  6 open questions (Q-C1..Q-C6: wire format, two-phase signed writes, uid↔key binding location,
+  concurrency model, crate name, member identity). **Did not implement the daemon** — those
+  decisions are the user's; build starts once they're answered.
