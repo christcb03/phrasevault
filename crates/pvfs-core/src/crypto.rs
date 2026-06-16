@@ -55,6 +55,17 @@ pub fn verify_digest(author: &[u8], digest: &[u8; 32], sig: &[u8]) -> Result<()>
         })
 }
 
+/// Validate that `bytes` is a well-formed compressed secp256k1 public key
+/// (33-byte SEC1). Used when admitting an externally-supplied member key.
+pub fn validate_pubkey(bytes: &[u8]) -> Result<()> {
+    VerifyingKey::from_sec1_bytes(bytes)
+        .map(|_| ())
+        .map_err(|_| PvfsError::BadInput {
+            field: "member_pubkey".into(),
+            reason: "not a valid compressed secp256k1 public key (expect 33-byte SEC1 hex)".into(),
+        })
+}
+
 /// BLAKE3 of a domain prefix concatenated with a PCE body (spec §6 table).
 pub fn domain_digest(prefix: &str, pce_body: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();

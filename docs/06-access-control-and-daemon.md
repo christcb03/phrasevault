@@ -60,13 +60,13 @@ Today device keys are all derived from the owner's one mnemonic (`m/43'/20566'/1
 
 ### 3.3 Kernel addition required: enforce author-authorization at **replay**
 
-Writes are already gated locally (`ensure_device_active`). But `replay_one` — which runs on rebuild and will run on every synced replica (P4) — currently verifies only that an event's signature is valid **for whatever author it names**; it does **not** check that the author was an *authorized, non-revoked* device. A tampered or hostile log could thus carry validly-self-signed events from a key the forest never authorized. Replay must reject a mutating event unless
+Writes are already gated locally (`ensure_device_active`). But `replay_one` — which runs on rebuild and will run on every synced replica (P4) — currently verifies only that an event's signature is valid **for whatever author it names**; it does **not** check that the author was an *authorized, non-revoked* device. A tampered or hostile log could thus carry validly-self-signed events from a key the forest never authorized. **Implemented:** replay now rejects any non-genesis, non-device-certificate event whose author is not present-and-unrevoked in `device_keys`:
 
 ```
-author ∈ device_keys  AND  authorized_at ≤ event_time  AND  (revoked_at IS NULL OR event_time < revoked_at)
+author ∈ device_keys  AND  revoked_at IS NULL    (evaluated as folded up to this event)
 ```
 
-evaluated against the `device_keys` state **as folded up to that event** (the fold is in seq order, so the table already reflects every prior `DeviceAuthorized`).
+Because the fold runs in seq order, "present" already means "a `DeviceAuthorized` for this key was folded at an earlier seq" (i.e. authorized before this event), and "unrevoked at this point" means "no `DeviceRevoked` has been folded yet" — so the rule needs **no trust in author-supplied timestamps**. It is the exact rule `ensure_device_active` uses for local writes, now also enforced on replay.
 
 **Ordering (confirmed favorable):** `init` emits `ForestCreated` (seq 1) → `DeviceAuthorized` device 0 (seq 2) → root `NodeCreated` (seq 3) → `LinkCreated` (seq 4). Device 0 is authorized *before* the first device-authored event, so in-order folding already has it in `device_keys` when the genesis node/link are checked. `ForestCreated` and `DeviceAuthorized` are root-authored and keep their existing special-casing. Enforcement is therefore low-risk — but because it is the one change that *could* break replay of existing forests, it still ships **behind a rebuild/replay test** (init a forest, full-rebuild, assert identical projection) rather than blind.
 

@@ -1242,6 +1242,48 @@ impl Engine {
         Ok(device_pub)
     }
 
+    /// Authorize an externally-supplied **member key** (another user's device)
+    /// as a writer under this forest's identity root (doc 06 §3). The member
+    /// signs their own events; this only admits their public key. Requires the
+    /// recovery phrase, since only the identity root may authorize devices.
+    pub fn authorize_member(&mut self, mnemonic: &Mnemonic, member_pubkey: &[u8]) -> Result<()> {
+        crypto::validate_pubkey(member_pubkey)?;
+        let root_key = identity::root_key(mnemonic, "")?;
+        let root_pub = crypto::pubkey_bytes(&root_key);
+        if root_pub != self.identity.root_pubkey {
+            return Err(PvfsError::Identity {
+                detail: "mnemonic does not match this forest's identity root".into(),
+            });
+        }
+        if member_pubkey == self.identity.root_pubkey.as_slice() {
+            return Err(PvfsError::BadInput {
+                field: "member_pubkey".into(),
+                reason: "refusing to authorize the identity root as a device".into(),
+            });
+        }
+        if self.device_known(member_pubkey)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "device",
+                id: hex::encode(member_pubkey),
+            });
+        }
+        let t = now_ms();
+        // External members are not HD-derived from this forest's seed; record a
+        // reserved index that HD logic ignores.
+        let device_index = u64::MAX;
+        let sig = crypto::sign_digest(
+            &root_key,
+            &event::msg_device_authorized(member_pubkey, device_index, t, &root_pub),
+        )?;
+        self.append_durable(vec![Event::DeviceAuthorized {
+            device_pubkey: member_pubkey.to_vec(),
+            device_index,
+            authorized_at: t,
+            author: root_pub,
+            sig,
+        }])
+    }
+
     /// Revoke a device key for new appends (its valid history stands).
     pub fn revoke_device(&mut self, mnemonic: &Mnemonic, device_pubkey: &[u8]) -> Result<()> {
         let root_key = identity::root_key(mnemonic, "")?;

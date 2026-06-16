@@ -218,7 +218,17 @@ enum DeviceCmd {
         #[arg(long)]
         index: u64,
     },
-    /// Revoke a device key for new appends (requires the recovery phrase)
+    /// Authorize an external member's device key by public key (doc 06 §3;
+    /// requires the recovery phrase). The member signs their own writes.
+    AuthorizeMember {
+        #[arg(long)]
+        mnemonic: String,
+        /// The member's compressed secp256k1 public key, hex (33-byte SEC1)
+        #[arg(long)]
+        pubkey: String,
+    },
+    /// Revoke a device or member key for new appends (requires the recovery
+    /// phrase). Its already-signed history stays valid.
     Revoke {
         #[arg(long)]
         mnemonic: String,
@@ -772,6 +782,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         );
                     } else {
                         println!("authorized device {index}: {}", hex::encode(pk));
+                    }
+                }
+                DeviceCmd::AuthorizeMember { mnemonic, pubkey } => {
+                    let m = identity::parse_mnemonic(&mnemonic)?;
+                    let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
+                        field: "pubkey".into(),
+                        reason: "must be hex".into(),
+                    })?;
+                    engine.authorize_member(&m, &pk)?;
+                    if json {
+                        println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
+                    } else {
+                        println!("authorized member {pubkey}");
                     }
                 }
                 DeviceCmd::Revoke { mnemonic, pubkey } => {

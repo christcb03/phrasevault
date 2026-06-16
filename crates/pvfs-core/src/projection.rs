@@ -498,19 +498,47 @@ fn replay_one(
                 seq: Some(row.seq),
             })
         }
+        // Genesis and device certificates are signed by the identity root.
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
             if author != &identity.root_pubkey {
-                return Err(PvfsError::Integrity {
-                    kind: "event",
-                    id: format!("seq {}", row.seq),
-                    reason: crate::error::IntegrityReason::UnknownAuthor,
-                });
+                return Err(unauthorized(row.seq, ev.kind()));
             }
         }
-        _ => {}
+        Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
+        // Every other event is device-authored: its author must be an authorized,
+        // unrevoked device *as of this point* in the in-order replay. Because the
+        // fold runs in seq order, `device_keys` already reflects every prior
+        // DeviceAuthorized/DeviceRevoked — so presence-and-unrevoked is exactly
+        // "authorized before, not yet revoked" without trusting event timestamps.
+        _ => {
+            if !author_is_active(tx, ev.author())? {
+                return Err(unauthorized(row.seq, ev.kind()));
+            }
+        }
     }
     fold(tx, &ev)?;
     Ok(expect)
+}
+
+fn unauthorized(seq: u64, kind: &str) -> PvfsError {
+    PvfsError::Integrity {
+        kind: "event",
+        id: format!("seq {seq} ({kind})"),
+        reason: crate::error::IntegrityReason::UnknownAuthor,
+    }
+}
+
+/// Whether `author` is a currently-authorized (present, unrevoked) device in the
+/// projection as folded so far. Same rule as `Engine::ensure_device_active`.
+fn author_is_active(tx: &Transaction<'_>, author: &[u8]) -> Result<bool> {
+    let exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL)",
+            params![author],
+            |r| r.get(0),
+        )
+        .map_err(map_db("device authorization check"))?;
+    Ok(exists != 0)
 }
 
 /// Replay events `from..=to` inside one transaction, updating meta at the end.
@@ -642,4 +670,135 @@ pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
         replay_range(conn, &identity, chain, si + 1, sl)?;
     }
     Ok(identity)
+}
+
+// ---- replay-time author-authorization enforcement (doc 06 §3.3) -------------------
+#[cfg(test)]
+mod enforcement_tests {
+    // `super::*` already brings params!, Connection, Event, PvfsError, log_store, …
+    use super::*;
+    use crate::engine::Engine;
+    use crate::error::IntegrityReason;
+    use crate::{crypto, identity, node};
+    use k256::ecdsa::SigningKey;
+
+    /// A validly-self-signed `NodeCreated` authored by `author_key`.
+    fn forge_node_event(author_key: &SigningKey, label: &str) -> Event {
+        let author = crypto::pubkey_bytes(author_key);
+        let payload = node::folder_payload();
+        let t = 1_000_000;
+        let digest = node::compute_id_digest(
+            node::TYPE_FOLDER,
+            label,
+            node::VISIBILITY_PUBLIC,
+            &payload,
+            false,
+            0,
+            t,
+            &author,
+        );
+        Event::NodeCreated(node::Node {
+            id: hex::encode(digest),
+            node_type: node::TYPE_FOLDER.into(),
+            label: label.into(),
+            visibility: node::VISIBILITY_PUBLIC.into(),
+            payload,
+            is_temp: false,
+            creation_nonce: 0,
+            created_at: t,
+            author,
+            sig: crypto::sign_digest(author_key, &digest).unwrap(),
+        })
+    }
+
+    /// Append a properly-chained event straight to `<dir>/log.db`, bypassing the
+    /// engine — simulating a tampered/hostile log.
+    fn append_to_log(dir: &std::path::Path, ev: &Event) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS log",
+            params![dir.join("log.db").to_str().unwrap()],
+        )
+        .unwrap();
+        let max = log_store::max_seq(&conn).unwrap();
+        let last = log_store::read_event(&conn, max).unwrap().unwrap();
+        let prev = <[u8; 32]>::try_from(last.chain_hash.as_slice()).unwrap();
+        let tx = conn.transaction().unwrap();
+        log_store::append_event(&tx, &prev, max + 1, ev, 2_000_000).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn foreign_key() -> SigningKey {
+        identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap()
+    }
+
+    #[test]
+    fn replay_rejects_event_from_unauthorized_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _m) = Engine::init(dir.path()).unwrap();
+        engine.close().unwrap();
+
+        append_to_log(dir.path(), &forge_node_event(&foreign_key(), "intruder"));
+
+        // Reopen → catch-up replay hits the forged event → rejected.
+        // `.map(drop)` discards the Ok(Engine) (which isn't Debug) so we can
+        // assert/print on the Result.
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected UnknownAuthor, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn replay_accepts_event_from_authorized_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let member = foreign_key();
+        engine
+            .authorize_member(&m, &crypto::pubkey_bytes(&member))
+            .unwrap();
+        engine.close().unwrap();
+
+        append_to_log(dir.path(), &forge_node_event(&member, "guest"));
+
+        // Member is authorized → replay accepts; forest opens cleanly.
+        Engine::open(dir.path())
+            .expect("authorized member's event must replay")
+            .close()
+            .unwrap();
+    }
+
+    #[test]
+    fn revoked_member_cannot_author_after_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let member = foreign_key();
+        let member_pub = crypto::pubkey_bytes(&member);
+        engine.authorize_member(&m, &member_pub).unwrap();
+        engine.revoke_device(&m, &member_pub).unwrap(); // revoke last
+        engine.close().unwrap();
+
+        // Event authored after the revocation (later seq) must be rejected.
+        append_to_log(dir.path(), &forge_node_event(&member, "after-revoke"));
+        // `.map(drop)` discards the Ok(Engine) (which isn't Debug) so we can
+        // assert/print on the Result.
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected UnknownAuthor, got {outcome:?}"
+        );
+    }
 }

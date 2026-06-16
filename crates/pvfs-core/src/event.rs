@@ -259,6 +259,30 @@ impl Event {
         }
     }
 
+    /// The public key whose signature authorizes this event. For removal events
+    /// the authorizing key is `removed_by`; for genesis and device certificates
+    /// it is the identity root. Used by replay to enforce author-authorization.
+    pub fn author(&self) -> &[u8] {
+        match self {
+            Event::ForestCreated { author, .. }
+            | Event::DeviceAuthorized { author, .. }
+            | Event::DeviceRevoked { author, .. }
+            | Event::LinkReordered { author, .. }
+            | Event::LinkSuperseded { author, .. }
+            | Event::LinkSuspended { author, .. }
+            | Event::LinkUnsuspended { author, .. }
+            | Event::FileLocationAdded { author, .. }
+            | Event::NodePurged { author, .. }
+            | Event::FolderBound { author, .. }
+            | Event::FolderUnbound { author, .. } => author,
+            Event::NodeCreated(n) => &n.author,
+            Event::LinkCreated(l) => &l.author,
+            Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
+                removed_by
+            }
+        }
+    }
+
     pub fn encode_body(&self) -> Vec<u8> {
         let mut e = Enc::new();
         match self {
