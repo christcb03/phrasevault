@@ -11,6 +11,7 @@
 //! - Identity: generated BIP39 mnemonic → BIP32 hardened HD keys with
 //!   per-device signing keys and device certificates in the log.
 
+pub mod acl;
 pub mod crypto;
 pub mod encoding;
 pub mod engine;
@@ -27,6 +28,7 @@ pub mod projection;
 pub mod storage;
 pub mod walk;
 
+pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
 pub use engine::{ChildEntry, Engine, NodeSpec};
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use fs::{

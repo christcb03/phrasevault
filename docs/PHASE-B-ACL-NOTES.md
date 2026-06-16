@@ -143,3 +143,24 @@ Integration (public API): set/ls/check happy path + bad principal/rights guards.
 
 ## 8. Progress log
 - 2026-06-15: Plan written (this doc). Starting implementation.
+- 2026-06-15: **Phase B implemented and verified on presubuntu — 55 tests pass, smoke green.**
+  - ☑ `acl.rs`: `Principal`, rights consts/parse/format, `MEMBER_DEVICE_INDEX`.
+  - ☑ `AclSet` event (kind/author/encode/decode/verify, `msg_acl_set`).
+  - ☑ `acl` table + `MAIN_OBJECTS` + fold (insert/replace; rights 0 → delete).
+  - ☑ `projection::effective_rights` + `grant_for` + `contains_parent`; owner short-circuit.
+  - ☑ `replay_one` apply check: `AclSet` author must be authorized **and** hold `a` on the node.
+  - ☑ Engine `set_acl` / `effective_rights` / `acl_entries`.
+  - ☑ CLI `pvfs acl set|ls|check`.
+  - ☑ Tests: rights/principal parse, forged non-admin `AclSet` rejected, inheritance + `any`
+    wildcard + owner-full + clear + rebuild.
+  - **Decision deviation (noted):** CLI takes a **node id** (64-hex), not a path — consistent
+    with the rest of the low-level CLI (`add`, `loc`, `ref` all take node ids). Path/URI
+    resolution for `acl` is a later nicety. Updated doc 06 §10.
+  - **No SCHEMA_VERSION bump:** the `acl` table is additive via `CREATE TABLE IF NOT EXISTS`,
+    so existing forests gain it on next open without a migration/version error.
+
+### Remaining for later phases (not Phase B)
+- ☐ Read-path filtering by caller (Phase C / daemon) — `children()`/`cat` stay owner-context.
+- ☐ Named groups; explicit deny (doc 06 §11).
+- ☐ A dedicated `Forbidden` error (set_acl currently returns `BadInput` when a device lacks
+  admin — only reachable for non-owners, which arrive with the daemon).

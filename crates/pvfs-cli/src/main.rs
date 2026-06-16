@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use pvfs_core::{
-    identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey,
+    acl, identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey,
     PvfsError, Registry, ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
 };
 
@@ -106,6 +106,9 @@ enum Cmd {
     /// Device certificate operations
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Access-control list operations (doc 06 §4)
+    #[command(subcommand)]
+    Acl(AclCmd),
     /// Bind a folder node to a real directory (P1)
     Bind {
         folder: String,
@@ -234,6 +237,31 @@ enum DeviceCmd {
         mnemonic: String,
         #[arg(long)]
         pubkey: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCmd {
+    /// Set (or clear) a principal's rights on a node
+    Set {
+        /// Node id (64-hex)
+        node: String,
+        /// Principal: `any` or `key:<hex>`
+        principal: String,
+        /// Rights: letters from r,w,a (e.g. `rw`), or `-`/`none` to clear
+        rights: String,
+    },
+    /// List the direct ACL grants on a node
+    Ls {
+        /// Node id (64-hex)
+        node: String,
+    },
+    /// Show a principal's effective rights on a node (incl. inheritance)
+    Check {
+        /// Node id (64-hex)
+        node: String,
+        /// Principal: `any` or `key:<hex>`
+        principal: String,
     },
 }
 
@@ -808,6 +836,72 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{{\"revoked\":true}}");
                     } else {
                         println!("revoked {pubkey}");
+                    }
+                }
+            }
+            engine.close()
+        }
+        Cmd::Acl(a) => {
+            let mut engine = Engine::open(&ctx?)?;
+            match a {
+                AclCmd::Set {
+                    node,
+                    principal,
+                    rights,
+                } => {
+                    let p = acl::Principal::parse(&principal)?;
+                    let r = acl::parse_rights(&rights)?;
+                    engine.set_acl(&node, &p, r)?;
+                    if json {
+                        println!(
+                            "{{\"node\":\"{}\",\"principal\":\"{}\",\"rights\":\"{}\"}}",
+                            json_escape(&node),
+                            json_escape(&p.display()),
+                            acl::rights_to_str(r)
+                        );
+                    } else {
+                        println!("set {} on {} = {}", p.display(), node, acl::rights_to_str(r));
+                    }
+                }
+                AclCmd::Ls { node } => {
+                    let entries = engine.acl_entries(&node)?;
+                    if json {
+                        let items: Vec<String> = entries
+                            .iter()
+                            .map(|(p, r)| {
+                                format!(
+                                    "{{\"principal\":\"{}\",\"rights\":\"{}\"}}",
+                                    json_escape(&p.display()),
+                                    acl::rights_to_str(*r)
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", items.join(","));
+                    } else if entries.is_empty() {
+                        println!("(no direct grants on {node})");
+                    } else {
+                        for (p, r) in entries {
+                            println!("{:>3}  {}", acl::rights_to_str(r), p.display());
+                        }
+                    }
+                }
+                AclCmd::Check { node, principal } => {
+                    let p = acl::Principal::parse(&principal)?;
+                    let r = engine.effective_rights(&p, &node)?;
+                    if json {
+                        println!(
+                            "{{\"node\":\"{}\",\"principal\":\"{}\",\"effective\":\"{}\"}}",
+                            json_escape(&node),
+                            json_escape(&p.display()),
+                            acl::rights_to_str(r)
+                        );
+                    } else {
+                        println!(
+                            "{} effective on {} = {}",
+                            p.display(),
+                            node,
+                            acl::rights_to_str(r)
+                        );
                     }
                 }
             }

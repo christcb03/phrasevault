@@ -22,6 +22,7 @@ pub const K_FILE_LOCATION_REMOVED: &str = "FileLocationRemoved";
 pub const K_NODE_PURGED: &str = "NodePurged";
 pub const K_FOLDER_BOUND: &str = "FolderBound";
 pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
+pub const K_ACL_SET: &str = "AclSet";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -111,6 +112,16 @@ pub enum Event {
     FolderUnbound {
         folder_id: String,
         unbound_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Set (or, with rights 0, clear) one principal's rights on a node (doc 06 §4).
+    AclSet {
+        node_id: String,
+        principal_kind: u64,
+        principal_id: Vec<u8>,
+        rights: u64,
+        set_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -236,6 +247,24 @@ pub fn msg_folder_unbound(folder_id: &str, unbound_at: u64, author: &[u8]) -> [u
     crypto::domain_digest("pvfs:folderunbound:v1:", &e.finish())
 }
 
+pub fn msg_acl_set(
+    node_id: &str,
+    principal_kind: u64,
+    principal_id: &[u8],
+    rights: u64,
+    set_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id)
+        .u64(principal_kind)
+        .bytes(principal_id)
+        .u64(rights)
+        .u64(set_at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:aclset:v1:", &e.finish())
+}
+
 // ---- encode / decode --------------------------------------------------------
 
 impl Event {
@@ -256,6 +285,7 @@ impl Event {
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
             Event::FolderUnbound { .. } => K_FOLDER_UNBOUND,
+            Event::AclSet { .. } => K_ACL_SET,
         }
     }
 
@@ -274,7 +304,8 @@ impl Event {
             | Event::FileLocationAdded { author, .. }
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
-            | Event::FolderUnbound { author, .. } => author,
+            | Event::FolderUnbound { author, .. }
+            | Event::AclSet { author, .. } => author,
             Event::NodeCreated(n) => &n.author,
             Event::LinkCreated(l) => &l.author,
             Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
@@ -439,6 +470,23 @@ impl Event {
             } => {
                 e.string(folder_id).u64(*unbound_at).bytes(author).bytes(sig);
             }
+            Event::AclSet {
+                node_id,
+                principal_kind,
+                principal_id,
+                rights,
+                set_at,
+                author,
+                sig,
+            } => {
+                e.string(node_id)
+                    .u64(*principal_kind)
+                    .bytes(principal_id)
+                    .u64(*rights)
+                    .u64(*set_at)
+                    .bytes(author)
+                    .bytes(sig);
+            }
         }
         e.finish()
     }
@@ -556,6 +604,15 @@ impl Event {
             K_FOLDER_UNBOUND => Event::FolderUnbound {
                 folder_id: d.string()?,
                 unbound_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_ACL_SET => Event::AclSet {
+                node_id: d.string()?,
+                principal_kind: d.u64()?,
+                principal_id: d.bytes()?,
+                rights: d.u64()?,
+                set_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -712,6 +769,19 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_folder_unbound(folder_id, *unbound_at, author),
+                sig,
+            ),
+            Event::AclSet {
+                node_id,
+                principal_kind,
+                principal_id,
+                rights,
+                set_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_acl_set(node_id, *principal_kind, principal_id, *rights, *set_at, author),
                 sig,
             ),
         }

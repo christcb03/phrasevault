@@ -1268,9 +1268,9 @@ impl Engine {
             });
         }
         let t = now_ms();
-        // External members are not HD-derived from this forest's seed; record a
-        // reserved index that HD logic ignores.
-        let device_index = u64::MAX;
+        // External members are not HD-derived from this forest's seed; record the
+        // reserved index that marks a member (ACL-gated, not an owner device).
+        let device_index = crate::acl::MEMBER_DEVICE_INDEX;
         let sig = crypto::sign_digest(
             &root_key,
             &event::msg_device_authorized(member_pubkey, device_index, t, &root_pub),
@@ -1310,6 +1310,87 @@ impl Engine {
             author: root_pub,
             sig,
         }])
+    }
+
+    // ---- access control (doc 06 §4) ------------------------------------------------
+
+    /// Set (or, with `rights == 0`, clear) one principal's rights on `node_id`.
+    /// Authored by the local device, which must hold admin (`a`) on the node —
+    /// owner devices always do. The principal signs their *own* writes later
+    /// (Phase C); this only records the grant.
+    pub fn set_acl(
+        &mut self,
+        node_id: &NodeId,
+        principal: &crate::acl::Principal,
+        rights: u8,
+    ) -> Result<()> {
+        self.ensure_device_active()?;
+        if fetch_node(&self.conn, node_id)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: node_id.clone(),
+            });
+        }
+        let me = crate::acl::Principal::Key(self.device_pubkey());
+        if projection::effective_rights(&self.conn, &me, node_id)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::BadInput {
+                field: "acl".into(),
+                reason: "this device lacks admin (a) on the node".into(),
+            });
+        }
+        let t = now_ms();
+        let kind = principal.kind();
+        let id = principal.id().to_vec();
+        let author = self.device_pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_acl_set(node_id, kind, &id, rights as u64, t, &author),
+        )?;
+        self.append_durable(vec![Event::AclSet {
+            node_id: node_id.clone(),
+            principal_kind: kind,
+            principal_id: id,
+            rights: rights as u64,
+            set_at: t,
+            author,
+            sig,
+        }])
+    }
+
+    /// Effective rights for `principal` on `node_id` (doc 06 §4.2) — what the
+    /// daemon (Phase C) will consult per connected caller.
+    pub fn effective_rights(
+        &self,
+        principal: &crate::acl::Principal,
+        node_id: &NodeId,
+    ) -> Result<u8> {
+        projection::effective_rights(&self.conn, principal, node_id)
+    }
+
+    /// Direct ACL grants on `node_id` (not inherited), for `acl ls`.
+    pub fn acl_entries(&self, node_id: &NodeId) -> Result<Vec<(crate::acl::Principal, u8)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT principal_kind, principal_id, rights FROM acl WHERE node_id = ?1
+                 ORDER BY principal_kind, principal_id",
+            )
+            .map_err(map_db("prepare acl list"))?;
+        let rows = stmt
+            .query_map(params![node_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)? as u8,
+                ))
+            })
+            .map_err(map_db("query acl list"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, id, rights) = row.map_err(map_db("read acl row"))?;
+            out.push((crate::acl::Principal::from_wire(kind, id)?, rights));
+        }
+        Ok(out)
     }
 }
 

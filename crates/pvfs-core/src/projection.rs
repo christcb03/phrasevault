@@ -3,6 +3,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+use crate::acl::{self, Principal};
 use crate::error::{map_db, PvfsError, Result};
 use crate::event::Event;
 use crate::log_store;
@@ -50,6 +51,15 @@ CREATE TABLE IF NOT EXISTS device_keys (
   device_index  INTEGER NOT NULL,
   authorized_at INTEGER NOT NULL,
   revoked_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS acl (
+  node_id        TEXT    NOT NULL,
+  principal_kind INTEGER NOT NULL,   -- 0=any, 1=key
+  principal_id   BLOB    NOT NULL,   -- pubkey for key; empty for any
+  rights         INTEGER NOT NULL,   -- bitmask r=1 w=2 a=4; row absent => none
+  set_at         INTEGER NOT NULL,
+  PRIMARY KEY (node_id, principal_kind, principal_id)
 );
 
 CREATE TABLE IF NOT EXISTS temp_nodes (
@@ -144,6 +154,7 @@ const MAIN_OBJECTS: &[&str] = &[
     "links",
     "file_locations",
     "device_keys",
+    "acl",
     "temp_nodes",
     "temp_links",
     "temp_file_locations",
@@ -242,6 +253,31 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                 params![*revoked_at as i64, device_pubkey],
             )
             .map_err(&m)?;
+        }
+        Event::AclSet {
+            node_id,
+            principal_kind,
+            principal_id,
+            rights,
+            set_at,
+            ..
+        } => {
+            if *rights == 0 {
+                tx.execute(
+                    "DELETE FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3",
+                    params![node_id, *principal_kind as i64, principal_id],
+                )
+                .map_err(&m)?;
+            } else {
+                tx.execute(
+                    "INSERT INTO acl (node_id, principal_kind, principal_id, rights, set_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(node_id, principal_kind, principal_id)
+                     DO UPDATE SET rights = excluded.rights, set_at = excluded.set_at",
+                    params![node_id, *principal_kind as i64, principal_id, *rights as i64, *set_at as i64],
+                )
+                .map_err(&m)?;
+            }
         }
         Event::NodeCreated(n) => {
             tx.execute(
@@ -505,6 +541,17 @@ fn replay_one(
             }
         }
         Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
+        // An ACL change must come from an authorized device that holds admin (`a`)
+        // on the target node (owner devices always do). Checked here so a tampered
+        // log can't grant access it had no right to (doc 06 §4.3).
+        Event::AclSet { node_id, author, .. } => {
+            if !author_is_active(tx, author)? {
+                return Err(unauthorized(row.seq, ev.kind()));
+            }
+            if effective_rights(tx, &Principal::Key(author.clone()), node_id)? & acl::ACL_A == 0 {
+                return Err(unauthorized(row.seq, ev.kind()));
+            }
+        }
         // Every other event is device-authored: its author must be an authorized,
         // unrevoked device *as of this point* in the in-order replay. Because the
         // fold runs in seq order, `device_keys` already reflects every prior
@@ -539,6 +586,74 @@ fn author_is_active(tx: &Transaction<'_>, author: &[u8]) -> Result<bool> {
         )
         .map_err(map_db("device authorization check"))?;
     Ok(exists != 0)
+}
+
+// ---- ACL evaluation (doc 06 §4.2) -------------------------------------------------
+
+/// Effective rights for `principal` on `node_id`: an authorized, unrevoked **owner**
+/// device (HD index, not the member sentinel) gets full rights; otherwise the union
+/// of grants for the principal and the `any` wildcard on the node and each of its
+/// `contains`-ancestors (grant-only inheritance — grants flow down the tree).
+/// Accepts `&Connection`; a `&Transaction` derefs to it, so replay can call it too.
+pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str) -> Result<u8> {
+    if let Principal::Key(pk) = principal {
+        let idx: Option<i64> = conn
+            .query_row(
+                "SELECT device_index FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL",
+                params![pk],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("acl owner-device check"))?;
+        if let Some(i) = idx {
+            if (i as u64) != acl::MEMBER_DEVICE_INDEX {
+                return Ok(acl::ACL_RWA);
+            }
+        }
+    }
+    let mut rights = 0u8;
+    let mut cur = Some(node_id.to_string());
+    let mut guard = 0u32;
+    while let Some(n) = cur {
+        rights |= grant_for(conn, &n, principal.kind(), principal.id())?;
+        if !matches!(principal, Principal::Any) {
+            rights |= grant_for(conn, &n, 0, &[])?; // the `any` wildcard
+        }
+        if rights & acl::ACL_RWA == acl::ACL_RWA {
+            break; // already maximal — stop walking
+        }
+        cur = contains_parent(conn, &n)?;
+        guard += 1;
+        if guard > 100_000 {
+            break; // defensive: never loop forever on a malformed graph
+        }
+    }
+    Ok(rights)
+}
+
+fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8]) -> Result<u8> {
+    let r: Option<i64> = conn
+        .query_row(
+            "SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3",
+            params![node_id, kind as i64, id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("acl lookup"))?;
+    Ok(r.unwrap_or(0) as u8)
+}
+
+/// The node's `contains` (home) parent, or `None` at the root / for an orphan.
+fn contains_parent(conn: &Connection, node_id: &str) -> Result<Option<String>> {
+    let p: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_id FROM links WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
+            params![node_id, crate::link::LINK_CONTAINS],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("acl parent walk"))?;
+    Ok(p.flatten())
 }
 
 /// Replay events `from..=to` inside one transaction, updating meta at the end.
@@ -799,6 +914,51 @@ mod enforcement_tests {
                 })
             ),
             "expected UnknownAuthor, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_aclset_from_non_admin_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let root = engine.identity.root_node_id.clone();
+        let member = foreign_key();
+        let member_pub = crypto::pubkey_bytes(&member);
+        engine.authorize_member(&m, &member_pub).unwrap(); // authorized, but no admin
+        engine.close().unwrap();
+
+        // Forge an AclSet on the root authored by the member: the author IS an
+        // authorized device but lacks admin (`a`) on root → apply must reject.
+        let t = 1_500_000;
+        let (kind, id, rights) = (0u64, Vec::<u8>::new(), acl::ACL_R as u64); // grant `any` read
+        let sig = crypto::sign_digest(
+            &member,
+            &crate::event::msg_acl_set(&root, kind, &id, rights, t, &member_pub),
+        )
+        .unwrap();
+        append_to_log(
+            dir.path(),
+            &Event::AclSet {
+                node_id: root,
+                principal_kind: kind,
+                principal_id: id,
+                rights,
+                set_at: t,
+                author: member_pub,
+                sig,
+            },
+        );
+
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected UnknownAuthor (no admin), got {outcome:?}"
         );
     }
 }

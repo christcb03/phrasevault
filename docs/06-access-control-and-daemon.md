@@ -201,7 +201,7 @@ enabled = true
 | Phase | Deliverable |
 |-------|-------------|
 | **A — foundation** | **`.pvfs/` `0700` (done)**; `authorize_member(pubkey)` + `forest authorize <member-pubkey>` / `forest revoke` CLI (root-signed, over the existing `DeviceAuthorized`/`DeviceRevoked` events); replay-time author-authorization enforcement (§3.3) shipped **behind a rebuild test**. *No protocol yet — proves the multi-writer kernel.* |
-| **B — ACLs** | `AclSet` event + `acl` projection table + inheritance/evaluation in core; `forest grant/revoke --read/--write <principal> <path>`; reads/writes consult ACLs. |
+| **B — ACLs (done)** | `AclSet` event + `acl` projection table + inheritance/evaluation in core (`effective_rights`); apply-time admin check; `Engine::set_acl/effective_rights/acl_entries`; CLI `pvfs acl set|ls|check <node-id> …`. Read/write *enforcement* by caller arrives with the daemon (C). |
 | **C — daemon** | per-user daemon, Unix socket, peer-cred auth, uid→principal binding, member-signed write protocol; registry gains `owner`/`socket`; client connects to shared forests. |
 | **D — FUSE** | `sudo` system mount mapping nodes/ACLs to a real filesystem. |
 
