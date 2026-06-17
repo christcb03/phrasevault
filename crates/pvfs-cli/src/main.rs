@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use pvfs_client::Client;
 use pvfs_core::{
-    acl, identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec, OrderKey,
-    PvfsError, Registry, ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
+    acl, crypto, identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec,
+    OrderKey, PvfsError, Registry, ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
 };
 
 #[derive(Parser)]
@@ -109,6 +110,19 @@ enum Cmd {
     /// Access-control list operations (doc 06 §4)
     #[command(subcommand)]
     Acl(AclCmd),
+    /// Print this machine's PVFS client identity pubkey (doc 07 §2)
+    Whoami,
+    /// Talk to a forest's daemon over its Unix socket (doc 07)
+    Remote {
+        /// Path to the daemon's Unix socket
+        #[arg(long)]
+        socket: PathBuf,
+        /// Connect as `public` instead of proving the client identity
+        #[arg(long)]
+        anon: bool,
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
     /// Bind a folder node to a real directory (P1)
     Bind {
         folder: String,
@@ -263,6 +277,63 @@ enum AclCmd {
         /// Principal: `any` or `key:<hex>`
         principal: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Forest identity behind the socket
+    Info,
+    /// List a node's children visible to you
+    Ls { node: String },
+    /// Show a node's metadata + your effective rights
+    Stat { node: String },
+}
+
+/// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
+fn pvfs_config_dir() -> Result<PathBuf, PvfsError> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| PvfsError::BadInput {
+            field: "config".into(),
+            reason: "set XDG_CONFIG_HOME or HOME".into(),
+        })?;
+    Ok(base.join("pvfs"))
+}
+
+/// Load (or create on first use) this machine's client identity (doc 07 §2),
+/// stored as a recovery phrase at `<config>/identity.phrase` (mode 0600). The
+/// signing key is `device_key(0)` of that phrase.
+fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
+    let path = pvfs_config_dir()?.join("identity.phrase");
+    if path.exists() {
+        let phrase = std::fs::read_to_string(&path).map_err(|e| PvfsError::io("read identity", e))?;
+        return identity::parse_mnemonic(phrase.trim());
+    }
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
+    let mn = identity::generate_mnemonic()?;
+    let f = std::fs::File::create(&path).map_err(|e| PvfsError::io("create identity", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| PvfsError::io("chmod identity", e))?;
+    }
+    {
+        use std::io::Write as _;
+        (&f).write_all(format!("{mn}\n").as_bytes())
+            .map_err(|e| PvfsError::io("write identity", e))?;
+    }
+    Ok(mn)
+}
+
+fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
+    PvfsError::BadInput {
+        field: "remote".into(),
+        reason: e.to_string(),
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -906,6 +977,87 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
             engine.close()
+        }
+        Cmd::Whoami => {
+            let mn = client_identity_mnemonic()?;
+            let key = identity::device_key(&mn, "", 0)?;
+            let pubkey = hex::encode(crypto::pubkey_bytes(&key));
+            if json {
+                println!("{{\"pubkey\":\"{pubkey}\"}}");
+            } else {
+                println!("client identity : key:{pubkey}");
+                println!("authorize it on a forest with:");
+                println!("  pvfs device authorize-member --mnemonic <owner-phrase> --pubkey {pubkey}");
+            }
+            Ok(())
+        }
+        Cmd::Remote { socket, anon, cmd } => {
+            let mut client = if anon {
+                Client::connect_public(&socket).map_err(remote_err)?
+            } else {
+                let mn = client_identity_mnemonic()?;
+                let key = identity::device_key(&mn, "", 0)?;
+                let pubkey = crypto::pubkey_bytes(&key);
+                Client::connect_signed(&socket, &pubkey, |d| {
+                    crypto::sign_digest(&key, d).unwrap_or_default()
+                })
+                .map_err(remote_err)?
+            };
+            match cmd {
+                RemoteCmd::Info => {
+                    let i = client.info().map_err(remote_err)?;
+                    if json {
+                        println!(
+                            "{{\"principal\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root\":\"{}\"}}",
+                            json_escape(&client.principal),
+                            json_escape(&i.instance_id),
+                            json_escape(&i.forest_id),
+                            json_escape(&i.root)
+                        );
+                    } else {
+                        println!("principal   : {}", client.principal);
+                        println!("instance_id : {}", i.instance_id);
+                        println!("forest_id   : {}", i.forest_id);
+                        println!("root node   : {}", i.root);
+                    }
+                }
+                RemoteCmd::Ls { node } => {
+                    let kids = client.ls(&node).map_err(remote_err)?;
+                    if json {
+                        let items: Vec<String> = kids
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{{\"id\":\"{}\",\"label\":\"{}\",\"node_type\":\"{}\"}}",
+                                    json_escape(&c.id),
+                                    json_escape(&c.label),
+                                    json_escape(&c.node_type)
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", items.join(","));
+                    } else {
+                        for c in kids {
+                            println!("{}  {}  {}", c.id, c.node_type, c.label);
+                        }
+                    }
+                }
+                RemoteCmd::Stat { node } => {
+                    let n = client.stat(&node).map_err(remote_err)?;
+                    if json {
+                        println!(
+                            "{{\"id\":\"{}\",\"label\":\"{}\",\"node_type\":\"{}\",\"rights\":\"{}\"}}",
+                            json_escape(&n.id),
+                            json_escape(&n.label),
+                            json_escape(&n.node_type),
+                            json_escape(&n.rights)
+                        );
+                    } else {
+                        println!("{}  {}  {}  [{}]", n.id, n.node_type, n.label, n.rights);
+                    }
+                }
+            }
+            Ok(())
         }
         Cmd::Bind {
             folder,

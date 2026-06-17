@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
+pvfs-client = { path = "../pvfs-client" }
 clap.workspace = true
 hex.workspace = true
 notify = "6"

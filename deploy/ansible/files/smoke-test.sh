@@ -5,13 +5,16 @@
 set -euo pipefail
 
 PVFS="${PVFS_BIN:-pvfs}"
+PVFSD="${PVFSD_BIN:-$(dirname "$PVFS")/pvfsd}"
 DATA="$(mktemp -d /tmp/pvfs-smoke.XXXXXX)"
 export PVFS_DATA_DIR="$DATA/forest"
 export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
+export XDG_CONFIG_HOME="$DATA/config"       # keep the client identity out of $HOME
 PASS=0
 FAIL=0
+DPID=""
 
-cleanup() { rm -rf "$DATA"; }
+cleanup() { [ -n "$DPID" ] && kill "$DPID" 2>/dev/null; rm -rf "$DATA"; }
 trap cleanup EXIT
 
 say()  { printf '%s\n' "== $*"; }
@@ -217,6 +220,34 @@ $PVFS forest unregister smokehome >/dev/null && ok "unregister"
 [ -f "$MOUNT/.pvfs/log.db" ] && ok "unregister keeps .pvfs/"
 assert_rc 3 "unknown alias → 3" -- $PVFS ls "pvfs://smokehome/docs"
 $PVFS ls "$MOUNT/docs" | grep -q readme.txt && ok "unregistered mount still opens by path"
+
+say "P2: daemon + remote client (doc 07)"
+DMOUNT="$DATA/served"
+mkdir -p "$DMOUNT/albums"
+printf 'hi' > "$DMOUNT/albums/a.txt"
+DINIT="$($PVFS --json forest init --mount "$DMOUNT")"
+DROOT="$(jget "$DINIT" root_node_id)"
+DFID="$(jget "$DINIT" forest_id)"
+# grant public read on the root so anonymous clients can list it
+$PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" public r >/dev/null \
+  && ok "acl set public r on root"
+
+SOCK="$DATA/served.sock"
+"$PVFSD" --mount "$DMOUNT" --socket "$SOCK" >/dev/null 2>&1 &
+DPID=$!
+for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+[ -S "$SOCK" ] && ok "pvfsd listening on socket" || fail "pvfsd socket missing"
+
+$PVFS --json remote --socket "$SOCK" --anon info | grep -q "\"forest_id\":\"$DFID\"" \
+  && ok "remote info (anonymous)"
+$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | grep -q albums \
+  && ok "remote ls root (anon via public grant)"
+$PVFS whoami | grep -q "key:" && ok "whoami prints client identity"
+$PVFS --json remote --socket "$SOCK" info | grep -q '"principal":"key:' \
+  && ok "remote info (signed client identity)"
+
+kill "$DPID" 2>/dev/null || true
+DPID=""
 
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"

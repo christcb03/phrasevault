@@ -165,8 +165,11 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
 4. ☑ `pvfsd`: socket listener, handshake/auth, request dispatch via `effective_rights`/
    `readable_children`. **End-to-end ACL-enforced reads verified** (public + member clients over a
    real socket). *Engine shared behind a `Mutex` for now; read-pool optimization deferred.*
-5. ☐ Two-phase member-signed writes (`PrepareWrite`/`Commit`).
-6. ☐ Data-plane transfer threads for `Cat`.
-7. ☐ `pvfs` CLI: `whoami`, transparent remoting (`pvfs --forest <alias> ls` dials the socket),
-   registry `owner`/`socket` fields at register time.
+5. ◑ `pvfs` CLI client: `pvfs whoami` (generated client identity at
+   `$XDG_CONFIG_HOME/pvfs/identity.phrase`) + `pvfs remote --socket <path> [--anon] info|ls|stat`.
+   **Verified via the smoke suite** (owner grants `public r`, starts `pvfsd`, anon + signed clients
+   read). Remaining: transparent remoting (`pvfs --forest <alias>` dials the socket) + registry
+   `owner`/`socket` fields at register time.
+6. ☐ Two-phase member-signed writes (`PrepareWrite`/`Commit`).
+7. ☐ Data-plane transfer threads for `Cat`.
 8. ☐ Federation/torrent hooks (later).
