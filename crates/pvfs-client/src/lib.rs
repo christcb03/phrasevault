@@ -50,6 +50,13 @@ impl From<io::Error> for ClientError {
 
 type Result<T> = std::result::Result<T, ClientError>;
 
+/// The server's parsed challenge: a nonce bound to the forest, with an expiry.
+struct Challenge {
+    nonce: Vec<u8>,
+    forest_id: String,
+    expiry_ms: u64,
+}
+
 /// A connected, authenticated session with a forest's daemon.
 pub struct Client {
     stream: UnixStream,
@@ -60,7 +67,7 @@ pub struct Client {
 impl Client {
     /// Connect and authenticate as `public` (no key proven).
     pub fn connect_public(path: &Path) -> Result<Client> {
-        let (mut stream, _digest_inputs) = Self::open(path)?;
+        let (mut stream, _challenge) = Self::open(path)?;
         write_msg(&mut stream, &ClientMsg::Anonymous)?;
         Self::finish(stream)
     }
@@ -71,8 +78,8 @@ impl Client {
     where
         F: FnOnce(&[u8; 32]) -> Vec<u8>,
     {
-        let (mut stream, (nonce, forest_id, expiry_ms)) = Self::open(path)?;
-        let digest = auth_digest(&nonce, &forest_id, expiry_ms);
+        let (mut stream, ch) = Self::open(path)?;
+        let digest = auth_digest(&ch.nonce, &ch.forest_id, ch.expiry_ms);
         write_msg(
             &mut stream,
             &ClientMsg::Auth {
@@ -83,8 +90,8 @@ impl Client {
         Self::finish(stream)
     }
 
-    /// Connect and read the challenge, returning the stream + `(nonce, forest_id, expiry)`.
-    fn open(path: &Path) -> Result<(UnixStream, (Vec<u8>, String, u64))> {
+    /// Connect and read the server's challenge.
+    fn open(path: &Path) -> Result<(UnixStream, Challenge)> {
         let mut stream = UnixStream::connect(path)?;
         match read_msg::<_, ServerMsg>(&mut stream)? {
             Some(ServerMsg::Challenge {
@@ -93,9 +100,16 @@ impl Client {
                 expiry_ms,
                 ..
             }) => {
-                let n = hex::decode(&nonce)
+                let nonce = hex::decode(&nonce)
                     .map_err(|_| ClientError::Protocol("challenge nonce not hex".into()))?;
-                Ok((stream, (n, forest_id, expiry_ms)))
+                Ok((
+                    stream,
+                    Challenge {
+                        nonce,
+                        forest_id,
+                        expiry_ms,
+                    },
+                ))
             }
             Some(other) => Err(unexpected("Challenge", &other)),
             None => Err(ClientError::Protocol("closed before challenge".into())),
