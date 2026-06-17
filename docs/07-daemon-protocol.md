@@ -159,11 +159,14 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
 
 ## 10. Build order for Phase C
 
-1. `Public` principal tier in the ACL model (small, additive — done first, ahead of the daemon).
-2. `pvfs-client` crate: JSON envelope types + framing + the challenge-response handshake client.
-3. `pvfsd`: socket listener, handshake/auth, control-plane worker (writer + read-pool), request
-   dispatch using `effective_rights`/`readable_children`, two-phase write handling.
-4. Data-plane transfer threads for `Cat`.
-5. `pvfs` CLI: `whoami`, transparent remoting (`pvfs --forest <alias> ls` dials the socket), and
+1. ☑ `Public` principal tier in the ACL model (additive — landed ahead of the daemon).
+2. ☑ `pvfs-proto`: JSON frames + `auth_digest` + message types (unit-tested).
+3. ☑ `pvfs-client`: connect + challenge-response handshake + `info`/`ls`/`stat`.
+4. ☑ `pvfsd`: socket listener, handshake/auth, request dispatch via `effective_rights`/
+   `readable_children`. **End-to-end ACL-enforced reads verified** (public + member clients over a
+   real socket). *Engine shared behind a `Mutex` for now; read-pool optimization deferred.*
+5. ☐ Two-phase member-signed writes (`PrepareWrite`/`Commit`).
+6. ☐ Data-plane transfer threads for `Cat`.
+7. ☐ `pvfs` CLI: `whoami`, transparent remoting (`pvfs --forest <alias> ls` dials the socket),
    registry `owner`/`socket` fields at register time.
-6. Federation/torrent hooks (later).
+8. ☐ Federation/torrent hooks (later).

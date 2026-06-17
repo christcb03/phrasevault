@@ -401,6 +401,11 @@ impl Engine {
         self.device.pubkey()
     }
 
+    /// Fetch a durable node's metadata by id, or `None` if it doesn't exist.
+    pub fn node(&self, id: &NodeId) -> Result<Option<Node>> {
+        fetch_node(&self.conn, id)
+    }
+
     // ---- internal helpers ------------------------------------------------------
 
     fn device_known(&self, pubkey: &[u8]) -> Result<bool> {

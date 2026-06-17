@@ -1,0 +1,25 @@
+[package]
+name = "pvfsd"
+description = "PVFS per-user daemon — serves a forest over a Unix socket (doc 07)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pvfsd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pvfsd"
+path = "src/main.rs"
+
+[dependencies]
+pvfs-core = { path = "../pvfs-core" }
+pvfs-proto = { path = "../pvfs-proto" }
+hex.workspace = true
+rand.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+pvfs-client = { path = "../pvfs-client" }
+tempfile.workspace = true

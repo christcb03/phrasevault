@@ -1,0 +1,12 @@
+[package]
+name = "pvfs-proto"
+description = "PVFS daemon/client wire protocol — JSON frames + challenge-response (doc 07)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pvfs-core = { path = "../pvfs-core" }
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true

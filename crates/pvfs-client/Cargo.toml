@@ -1,0 +1,11 @@
+[package]
+name = "pvfs-client"
+description = "PVFS daemon client — connect to a forest's pvfsd over a Unix socket (doc 07)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pvfs-core = { path = "../pvfs-core" }
+pvfs-proto = { path = "../pvfs-proto" }
+hex.workspace = true
