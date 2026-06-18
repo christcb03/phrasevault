@@ -5,26 +5,39 @@
 //! is shared behind a `Mutex`, so ops serialize; a read-only connection pool and
 //! the data plane (`Cat`, two-phase writes) land in later slices.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pvfs_core::acl::{self, Principal};
-use pvfs_core::{crypto, Engine, NodeId, PvfsError};
+use pvfs_core::{crypto, Engine, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FOLDER};
 use pvfs_proto::{
-    auth_digest, read_msg, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg, PROTO_VERSION,
+    auth_digest, read_msg, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg, WriteOp,
+    PROTO_VERSION,
 };
 use rand::RngCore;
 
 /// How long a challenge stays valid.
 const CHALLENGE_TTL_MS: u64 = 30_000;
+/// How long a prepared (phase-1) write awaits its signatures.
+const PREPARE_TTL_MS: u64 = 30_000;
 
-/// One forest served by the daemon: the engine plus its forest id (for the
-/// challenge binding).
+/// A phase-1 write held server-side until the member sends signatures.
+struct PreparedState {
+    author_pub: Vec<u8>,
+    events: Vec<PreparedEvent>,
+    result_id: String,
+    expiry_ms: u64,
+}
+
+/// One forest served by the daemon: the engine, its forest id (challenge
+/// binding), and in-flight prepared writes.
 pub struct Daemon {
     engine: Mutex<Engine>,
     forest_id: String,
+    prepared: Mutex<HashMap<String, PreparedState>>,
 }
 
 impl Daemon {
@@ -33,6 +46,7 @@ impl Daemon {
         Daemon {
             engine: Mutex::new(engine),
             forest_id,
+            prepared: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -135,10 +149,99 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Ok(node) => ServerMsg::Stat { node },
             Err(msg) => msg,
         },
+        ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
+        ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         ClientMsg::Auth { .. } | ClientMsg::Anonymous => {
             err("bad_input", "already past handshake")
         }
     }
+}
+
+/// Phase 1: build the signable events for `op` and stash them under a fresh id.
+fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> ServerMsg {
+    let author = match principal {
+        Principal::Key(pk) => pk.clone(),
+        _ => return err("forbidden", "writes require an authenticated identity"),
+    };
+    let prepared = {
+        let e = daemon.engine.lock().unwrap();
+        match op {
+            WriteOp::Mkdir { parent, label } => e.prepare_add_node(
+                &author,
+                &parent,
+                NodeSpec {
+                    node_type: TYPE_FOLDER.into(),
+                    label,
+                    payload: Vec::new(),
+                    is_temp: false,
+                    creation_nonce: None,
+                },
+            ),
+        }
+    };
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(e) => return err_from(e),
+    };
+    let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
+    let result_id = prepared.result_id.clone();
+    let prepared_id = random_id();
+    daemon.prepared.lock().unwrap().insert(
+        prepared_id.clone(),
+        PreparedState {
+            author_pub: author,
+            events: prepared.events,
+            result_id: result_id.clone(),
+            expiry_ms: now_ms() + PREPARE_TTL_MS,
+        },
+    );
+    ServerMsg::Prepared {
+        prepared_id,
+        preimages,
+        result_id,
+    }
+}
+
+/// Phase 2: attach the member's signatures to the stashed events and append.
+fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Vec<String>) -> ServerMsg {
+    let author = match principal {
+        Principal::Key(pk) => pk,
+        _ => return err("forbidden", "writes require an authenticated identity"),
+    };
+    let state = match daemon.prepared.lock().unwrap().remove(prepared_id) {
+        Some(s) => s,
+        None => return err("not_found", "no such prepared write (expired?)"),
+    };
+    if now_ms() > state.expiry_ms {
+        return err("bad_input", "prepared write expired");
+    }
+    if &state.author_pub != author {
+        return err("forbidden", "prepared write belongs to another principal");
+    }
+    if sigs.len() != state.events.len() {
+        return err("bad_input", "wrong number of signatures");
+    }
+    let mut events = Vec::with_capacity(state.events.len());
+    for (pe, sig_hex) in state.events.into_iter().zip(sigs) {
+        let sig = match hex::decode(&sig_hex) {
+            Ok(s) => s,
+            Err(_) => return err("bad_input", "signature not hex"),
+        };
+        let mut ev = pe.event;
+        ev.set_author_sig(sig);
+        events.push(ev);
+    }
+    let mut e = daemon.engine.lock().unwrap();
+    match e.commit_member_write(events) {
+        Ok(()) => ServerMsg::Committed { id: state.result_id },
+        Err(e) => err_from(e),
+    }
+}
+
+fn random_id() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
 }
 
 fn do_ls(daemon: &Daemon, principal: &Principal, node: &str) -> Result<Vec<ChildInfo>, ServerMsg> {
@@ -192,6 +295,7 @@ fn err_from(e: PvfsError) -> ServerMsg {
     let code = match &e {
         PvfsError::NotFound { .. } => "not_found",
         PvfsError::BadInput { .. } => "bad_input",
+        PvfsError::Forbidden { .. } => "forbidden",
         PvfsError::Integrity { .. } => "integrity",
         _ => "internal",
     };

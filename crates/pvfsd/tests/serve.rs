@@ -79,3 +79,53 @@ fn daemon_serves_reads_with_acl_enforcement() {
 fn forbidden<T>(r: Result<T, ClientError>) -> bool {
     matches!(r, Err(ClientError::Server { code, .. }) if code == "forbidden")
 }
+
+// doc 07 §5 — a member creates a folder through the daemon (two-phase, signed)
+#[test]
+fn daemon_member_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let dropbox = engine.add_node(&root, folder("dropbox")).unwrap();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(
+            &dropbox,
+            &Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+
+    // create a folder under dropbox (member has write there)
+    let new_id = member
+        .mkdir(&dropbox, "uploads", |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })
+        .unwrap();
+    assert_eq!(member.stat(&new_id).unwrap().label, "uploads");
+    assert!(labels(&member.ls(&dropbox).unwrap()).contains(&"uploads".to_string()));
+
+    // but not under root (no write there)
+    assert!(forbidden(member.mkdir(&root, "nope", |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })));
+}

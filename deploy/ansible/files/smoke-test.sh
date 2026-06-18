@@ -228,9 +228,17 @@ printf 'hi' > "$DMOUNT/albums/a.txt"
 DINIT="$($PVFS --json forest init --mount "$DMOUNT")"
 DROOT="$(jget "$DINIT" root_node_id)"
 DFID="$(jget "$DINIT" forest_id)"
-# grant public read on the root so anonymous clients can list it
+DMN="$(jget "$DINIT" mnemonic)"
+CLIENTKEY="$(jget "$($PVFS --json whoami)" pubkey)"
+[ -n "$CLIENTKEY" ] && ok "whoami prints client identity"
+
+# Owner setup happens BEFORE serving (the daemon opens a snapshot of the log).
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" public r >/dev/null \
   && ok "acl set public r on root"
+$PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --mnemonic "$DMN" --pubkey "$CLIENTKEY" \
+  >/dev/null && ok "authorize client identity as member"
+$PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" "key:$CLIENTKEY" rw >/dev/null \
+  && ok "grant member rw on root"
 
 SOCK="$DATA/served.sock"
 "$PVFSD" --mount "$DMOUNT" --socket "$SOCK" >/dev/null 2>&1 &
@@ -242,9 +250,16 @@ $PVFS --json remote --socket "$SOCK" --anon info | grep -q "\"forest_id\":\"$DFI
   && ok "remote info (anonymous)"
 $PVFS remote --socket "$SOCK" --anon ls "$DROOT" | grep -q albums \
   && ok "remote ls root (anon via public grant)"
-$PVFS whoami | grep -q "key:" && ok "whoami prints client identity"
 $PVFS --json remote --socket "$SOCK" info | grep -q '"principal":"key:' \
   && ok "remote info (signed client identity)"
+
+# member write: create a folder through the daemon, signed by the client identity
+NEWID="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" uploaded)" created)"
+[ ${#NEWID} -eq 64 ] && ok "member created a folder via the daemon" || fail "member mkdir: $NEWID"
+$PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q uploaded && ok "member's folder is visible"
+# an anonymous client cannot write (no identity to sign with) → bad input (2)
+assert_rc 2 "anon write refused (needs identity)" -- \
+  $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky
 
 kill "$DPID" 2>/dev/null || true
 DPID=""

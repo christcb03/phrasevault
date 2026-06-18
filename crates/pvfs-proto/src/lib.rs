@@ -37,8 +37,24 @@ pub enum ServerMsg {
     },
     Ls { children: Vec<ChildInfo> },
     Stat { node: NodeInfo },
+    /// Phase 1 of a write: the digests to sign (hex), plus the id the write yields.
+    Prepared {
+        prepared_id: String,
+        preimages: Vec<String>,
+        result_id: String,
+    },
+    /// Phase 2 result: the committed write's id.
+    Committed { id: String },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
+}
+
+/// A high-level write intent the daemon turns into signable events (doc 07 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WriteOp {
+    /// Create a folder named `label` under `parent`.
+    Mkdir { parent: String, label: String },
 }
 
 /// Client → server messages.
@@ -52,6 +68,13 @@ pub enum ClientMsg {
     Info,
     Ls { node: String },
     Stat { node: String },
+    /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
+    PrepareWrite { op: WriteOp },
+    /// Phase 2: return one signature (hex) per preimage, in order.
+    Commit {
+        prepared_id: String,
+        sigs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

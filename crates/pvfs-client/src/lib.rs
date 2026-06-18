@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use pvfs_proto::{auth_digest, read_msg, write_msg, ClientMsg, ServerMsg};
+use pvfs_proto::{auth_digest, read_msg, write_msg, ClientMsg, ServerMsg, WriteOp};
 
 pub use pvfs_proto::{ChildInfo, NodeInfo};
 
@@ -161,6 +161,42 @@ impl Client {
         match self.request(ClientMsg::Stat { node: node.into() })? {
             ServerMsg::Stat { node } => Ok(node),
             other => Err(unexpected("Stat", &other)),
+        }
+    }
+
+    /// Create a folder named `label` under `parent` (two-phase, doc 07 §5). `sign`
+    /// produces a signature over each 32-byte preimage with the member's key.
+    /// Returns the new node id.
+    pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        let (prepared_id, preimages) = match self.request(ClientMsg::PrepareWrite {
+            op: WriteOp::Mkdir {
+                parent: parent.into(),
+                label: label.into(),
+            },
+        })? {
+            ServerMsg::Prepared {
+                prepared_id,
+                preimages,
+                ..
+            } => (prepared_id, preimages),
+            other => return Err(unexpected("Prepared", &other)),
+        };
+        let mut sigs = Vec::with_capacity(preimages.len());
+        for preimage in &preimages {
+            let bytes = hex::decode(preimage)
+                .map_err(|_| ClientError::Protocol("preimage not hex".into()))?;
+            let digest: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::Protocol("preimage not 32 bytes".into()))?;
+            sigs.push(hex::encode(sign(&digest)));
+        }
+        match self.request(ClientMsg::Commit { prepared_id, sigs })? {
+            ServerMsg::Committed { id } => Ok(id),
+            other => Err(unexpected("Committed", &other)),
         }
     }
 }

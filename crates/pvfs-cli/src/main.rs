@@ -287,6 +287,8 @@ enum RemoteCmd {
     Ls { node: String },
     /// Show a node's metadata + your effective rights
     Stat { node: String },
+    /// Create a folder under a parent node (requires your client identity)
+    Mkdir { parent: String, label: String },
 }
 
 /// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
@@ -994,16 +996,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             Ok(())
         }
         Cmd::Remote { socket, anon, cmd } => {
-            let mut client = if anon {
-                Client::connect_public(&socket).map_err(remote_err)?
+            let identity_key = if anon {
+                None
             } else {
                 let mn = client_identity_mnemonic()?;
-                let key = identity::device_key(&mn, "", 0)?;
-                let pubkey = crypto::pubkey_bytes(&key);
-                Client::connect_signed(&socket, &pubkey, |d| {
-                    crypto::sign_digest(&key, d).unwrap_or_default()
-                })
-                .map_err(remote_err)?
+                Some(identity::device_key(&mn, "", 0)?)
+            };
+            let mut client = match &identity_key {
+                None => Client::connect_public(&socket).map_err(remote_err)?,
+                Some(key) => {
+                    let pubkey = crypto::pubkey_bytes(key);
+                    Client::connect_signed(&socket, &pubkey, |d| {
+                        crypto::sign_digest(key, d).unwrap_or_default()
+                    })
+                    .map_err(remote_err)?
+                }
             };
             match cmd {
                 RemoteCmd::Info => {
@@ -1056,6 +1063,22 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         );
                     } else {
                         println!("{}  {}  {}  [{}]", n.id, n.node_type, n.label, n.rights);
+                    }
+                }
+                RemoteCmd::Mkdir { parent, label } => {
+                    let key = identity_key.as_ref().ok_or_else(|| PvfsError::BadInput {
+                        field: "remote".into(),
+                        reason: "writes require your client identity — do not pass --anon".into(),
+                    })?;
+                    let id = client
+                        .mkdir(&parent, &label, |d| {
+                            crypto::sign_digest(key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                    if json {
+                        println!("{{\"created\":\"{}\"}}", json_escape(&id));
+                    } else {
+                        println!("created {id}");
                     }
                 }
             }
