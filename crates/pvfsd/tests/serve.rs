@@ -129,3 +129,49 @@ fn daemon_member_write() {
         crypto::sign_digest(&member_key, d).unwrap()
     })));
 }
+
+// doc 07 §5 — a member adds a file then removes it through the daemon
+#[test]
+fn daemon_member_add_file_and_rm() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let dropbox = engine.add_node(&root, folder("dropbox")).unwrap();
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(
+            &dropbox,
+            &Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let mut m = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+
+    let file_id = m
+        .add_file(&dropbox, "clip.mkv", 1234, "video/x-matroska", |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })
+        .unwrap();
+    assert_eq!(m.stat(&file_id).unwrap().node_type, "file");
+    assert!(labels(&m.ls(&dropbox).unwrap()).contains(&"clip.mkv".to_string()));
+
+    m.rm(&file_id, |d| crypto::sign_digest(&member_key, d).unwrap())
+        .unwrap();
+    assert!(!labels(&m.ls(&dropbox).unwrap()).contains(&"clip.mkv".to_string()));
+}

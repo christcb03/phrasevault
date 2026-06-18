@@ -257,6 +257,15 @@ $PVFS --json remote --socket "$SOCK" info | grep -q '"principal":"key:' \
 NEWID="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" uploaded)" created)"
 [ ${#NEWID} -eq 64 ] && ok "member created a folder via the daemon" || fail "member mkdir: $NEWID"
 $PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q uploaded && ok "member's folder is visible"
+# member adds a file then removes it via the daemon
+FILEID="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" clip.mkv --size 99 --mime video/x-matroska)" created)"
+[ ${#FILEID} -eq 64 ] && ok "member added a file via the daemon" || fail "add-file: $FILEID"
+$PVFS remote --socket "$SOCK" rm "$FILEID" >/dev/null && ok "member removed a node via the daemon"
+if $PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q clip.mkv; then
+  fail "removed file still listed"
+else
+  ok "removed file is gone"
+fi
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky

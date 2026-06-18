@@ -164,19 +164,58 @@ impl Client {
         }
     }
 
-    /// Create a folder named `label` under `parent` (two-phase, doc 07 §5). `sign`
-    /// produces a signature over each 32-byte preimage with the member's key.
-    /// Returns the new node id.
+    /// Create a folder named `label` under `parent`. Returns the new node id.
     pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
     where
         F: Fn(&[u8; 32]) -> Vec<u8>,
     {
-        let (prepared_id, preimages) = match self.request(ClientMsg::PrepareWrite {
-            op: WriteOp::Mkdir {
+        self.write_op(
+            WriteOp::Mkdir {
                 parent: parent.into(),
                 label: label.into(),
             },
-        })? {
+            sign,
+        )
+    }
+
+    /// Create a file node named `label` under `parent` (metadata). Returns its id.
+    pub fn add_file<F>(
+        &mut self,
+        parent: &str,
+        label: &str,
+        size: u64,
+        mime: &str,
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::AddFile {
+                parent: parent.into(),
+                label: label.into(),
+                size,
+                mime: mime.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Unlink `node` from its home parent. Returns the removed link id.
+    pub fn rm<F>(&mut self, node: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(WriteOp::Rm { node: node.into() }, sign)
+    }
+
+    /// The two-phase write flow (doc 07 §5): prepare → sign each preimage → commit.
+    /// `sign` produces a signature over each 32-byte preimage with the member's key.
+    fn write_op<F>(&mut self, op: WriteOp, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        let (prepared_id, preimages) = match self.request(ClientMsg::PrepareWrite { op })? {
             ServerMsg::Prepared {
                 prepared_id,
                 preimages,

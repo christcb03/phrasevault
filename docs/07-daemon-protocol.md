@@ -174,6 +174,7 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
    `commit_member_write`, the daemon's prepared-state, `pvfs-client::mkdir`, and
    `pvfs remote mkdir`. Authorization (author authorized + write-on-parent) is shared between live
    commit and replay (`projection::check_member_event`). **Verified end-to-end** (Rust + smoke).
-7. ☐ More write ops (add file + locations, mkdir → rmdir/mv, `set_acl` over the daemon).
-8. ☐ Data-plane transfer threads for `Cat`.
+7. ◑ More write ops on the same machinery: ☑ `add-file` (file node), ☑ `rm` (unlink from home).
+   Remaining: file **locations** (record bytes), `mv` (re-home), and `set_acl` over the daemon.
+8. ☐ Data-plane transfer threads for `Cat` (stream file bytes).
 9. ☐ Federation/torrent hooks (later).

@@ -55,6 +55,16 @@ pub enum ServerMsg {
 pub enum WriteOp {
     /// Create a folder named `label` under `parent`.
     Mkdir { parent: String, label: String },
+    /// Create a file node named `label` under `parent` (metadata only; bytes are
+    /// recorded separately by a location).
+    AddFile {
+        parent: String,
+        label: String,
+        size: u64,
+        mime: String,
+    },
+    /// Unlink `node` from its home parent (soft remove).
+    Rm { node: String },
 }
 
 /// Client → server messages.

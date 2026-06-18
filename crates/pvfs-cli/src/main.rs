@@ -289,6 +289,17 @@ enum RemoteCmd {
     Stat { node: String },
     /// Create a folder under a parent node (requires your client identity)
     Mkdir { parent: String, label: String },
+    /// Create a file node under a parent (requires your client identity)
+    AddFile {
+        parent: String,
+        label: String,
+        #[arg(long, default_value_t = 0)]
+        size: u64,
+        #[arg(long, default_value = "application/octet-stream")]
+        mime: String,
+    },
+    /// Remove a node from its home parent (requires your client identity)
+    Rm { node: String },
 }
 
 /// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
@@ -335,6 +346,21 @@ fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
     PvfsError::BadInput {
         field: "remote".into(),
         reason: e.to_string(),
+    }
+}
+
+fn needs_identity() -> PvfsError {
+    PvfsError::BadInput {
+        field: "remote".into(),
+        reason: "writes require your client identity — do not pass --anon".into(),
+    }
+}
+
+fn print_created(id: &str, json: bool) {
+    if json {
+        println!("{{\"created\":\"{}\"}}", json_escape(id));
+    } else {
+        println!("created {id}");
     }
 }
 
@@ -1066,19 +1092,37 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Mkdir { parent, label } => {
-                    let key = identity_key.as_ref().ok_or_else(|| PvfsError::BadInput {
-                        field: "remote".into(),
-                        reason: "writes require your client identity — do not pass --anon".into(),
-                    })?;
+                    let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
                         .mkdir(&parent, &label, |d| {
                             crypto::sign_digest(key, d).unwrap_or_default()
                         })
                         .map_err(remote_err)?;
+                    print_created(&id, json);
+                }
+                RemoteCmd::AddFile {
+                    parent,
+                    label,
+                    size,
+                    mime,
+                } => {
+                    let key = identity_key.as_ref().ok_or_else(needs_identity)?;
+                    let id = client
+                        .add_file(&parent, &label, size, &mime, |d| {
+                            crypto::sign_digest(key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                    print_created(&id, json);
+                }
+                RemoteCmd::Rm { node } => {
+                    let key = identity_key.as_ref().ok_or_else(needs_identity)?;
+                    let removed = client
+                        .rm(&node, |d| crypto::sign_digest(key, d).unwrap_or_default())
+                        .map_err(remote_err)?;
                     if json {
-                        println!("{{\"created\":\"{}\"}}", json_escape(&id));
+                        println!("{{\"removed_link\":\"{}\"}}", json_escape(&removed));
                     } else {
-                        println!("created {id}");
+                        println!("removed (link {removed})");
                     }
                 }
             }

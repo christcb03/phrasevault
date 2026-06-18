@@ -600,6 +600,30 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
                 }
             }
         }
+        Event::LinkRemoved { link_id, .. } => {
+            // Unlinking needs write on the removed link's parent (admin on the node
+            // itself for a root link). A link that's already gone ⇒ no-op, allowed.
+            let row: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT parent_id, child_id FROM links WHERE id = ?1",
+                    params![link_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(map_db("acl link lookup"))?;
+            if let Some((parent, child)) = row {
+                let (target, needed) = match parent {
+                    Some(p) => (p, acl::ACL_W),
+                    None => (child, acl::ACL_A),
+                };
+                if effective_rights(conn, &Principal::Key(author.to_vec()), &target)? & needed == 0 {
+                    return Err(PvfsError::Forbidden {
+                        action: "remove link".into(),
+                        reason: format!("author lacks rights on {target}"),
+                    });
+                }
+            }
+        }
         _ => {}
     }
     Ok(())

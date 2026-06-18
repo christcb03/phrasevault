@@ -222,6 +222,8 @@ pvfs remote --socket … mkdir <node-id> my-folder
 | `pvfs whoami` | Print this machine's client identity pubkey. |
 | `pvfs remote --socket <path> [--anon] info\|ls\|stat …` | Read a forest via its daemon. |
 | `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |
+| `pvfs remote --socket <path> add-file <parent> <label> [--size N --mime M]` | Create a file node via the daemon. |
+| `pvfs remote --socket <path> rm <node>` | Unlink a node from its home via the daemon. |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a

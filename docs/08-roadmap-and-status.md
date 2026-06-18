@@ -17,8 +17,8 @@ live in docs 02–07; this is the index + the honest "what's not done yet."
 | **P2-A** | Multi-writer kernel: `authorize_member`, replay-time author-authorization | ✅ shipped (doc 06 §3) |
 | **P2-B** | Per-node ACLs: `AclSet` events, `public/any/key` tiers, `effective_rights`, `pvfs acl` | ✅ shipped (doc 06 §4) |
 | **P2-C** | Daemon **read** path: `pvfs-proto`, `pvfsd`, `pvfs-client`, challenge-response auth, `pvfs remote`/`whoami` | ✅ shipped (doc 07 §1–4) |
-| **P2-C (writes)** | Two-phase member-signed writes through the daemon (`mkdir`); shared live/replay authorization | ✅ shipped (doc 07 §5) |
-| **P2-C (more writes)** | More write ops (add file/locations, rmdir/mv, `set_acl` over the daemon) | ☐ next |
+| **P2-C (writes)** | Two-phase member writes through the daemon: `mkdir`, `add-file`, `rm`; shared live/replay authorization | ✅ shipped (doc 07 §5) |
+| **P2-C (more writes)** | Remaining write ops (file locations, `mv`, `set_acl` over the daemon) | ☐ next |
 | **P2-C (data)** | `Cat` over the data plane; concurrent transfer threads | ☐ planned (doc 07 §6) |
 | **P2-C (UX)** | Transparent remoting (`pvfs --forest <alias>` dials the socket); registry `owner`/`socket` | ☐ planned |
 | **P3** | Encryption-at-rest (reserved key path `m/43'/20566'/2'`), secure module | ☐ future |

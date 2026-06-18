@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pvfs_core::acl::{self, Principal};
-use pvfs_core::{crypto, Engine, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FOLDER};
+use pvfs_core::{
+    crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
+};
 use pvfs_proto::{
     auth_digest, read_msg, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg, WriteOp,
     PROTO_VERSION,
@@ -177,6 +179,32 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
                     creation_nonce: None,
                 },
             ),
+            WriteOp::AddFile {
+                parent,
+                label,
+                size,
+                mime,
+            } => {
+                let payload = FilePayload {
+                    content_hash: String::new(),
+                    size_bytes: size,
+                    mime_type: mime,
+                    original_name: label.clone(),
+                }
+                .encode();
+                e.prepare_add_node(
+                    &author,
+                    &parent,
+                    NodeSpec {
+                        node_type: TYPE_FILE.into(),
+                        label,
+                        payload,
+                        is_temp: false,
+                        creation_nonce: None,
+                    },
+                )
+            }
+            WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
         }
     };
     let prepared = match prepared {

@@ -1548,6 +1548,51 @@ impl Engine {
         }
         self.append_durable(events)
     }
+
+    /// Phase 1 of a member remove: build the unsigned `LinkRemoved` that unlinks
+    /// `node_id` from its home (`contains`) parent. The author must hold write on
+    /// that parent (re-checked at commit and replay). Returns the removed link id.
+    pub fn prepare_remove_node(&self, author_pub: &[u8], node_id: &NodeId) -> Result<PreparedWrite> {
+        let home: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, parent_id FROM links
+                 WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
+                params![node_id, LINK_CONTAINS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("find home link"))?;
+        let (link_id, parent_id) = home.ok_or(PvfsError::NotFound {
+            kind: "home link",
+            id: node_id.clone(),
+        })?;
+        let parent = parent_id.ok_or_else(|| PvfsError::Forbidden {
+            action: "remove".into(),
+            reason: "cannot remove the forest root".into(),
+        })?;
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, &parent)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "remove".into(),
+                reason: format!("you lack write (w) on {parent}"),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_link_removed(&link_id, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: link_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::LinkRemoved {
+                    link_id,
+                    removed_at: t,
+                    removed_by: author_pub.to_vec(),
+                    removal_sig: Vec::new(),
+                },
+            }],
+        })
+    }
 }
 
 impl Drop for Engine {
