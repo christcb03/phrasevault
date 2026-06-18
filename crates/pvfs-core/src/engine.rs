@@ -41,6 +41,23 @@ pub struct ChildEntry {
     pub order_key: String,
 }
 
+/// One event awaiting a member's signature (doc 07 §5): the assembled, unsigned
+/// event and the 32-byte digest its author must sign.
+#[derive(Debug, Clone)]
+pub struct PreparedEvent {
+    pub event: Event,
+    pub digest: [u8; 32],
+}
+
+/// A two-phase member write prepared by the daemon for the member to sign.
+#[derive(Debug, Clone)]
+pub struct PreparedWrite {
+    /// Events to sign, in order; the member returns one signature per event.
+    pub events: Vec<PreparedEvent>,
+    /// The id the committed write yields (e.g. the new node id).
+    pub result_id: String,
+}
+
 pub struct Engine {
     pub(crate) conn: Connection,
     pub(crate) data_dir: PathBuf,
@@ -1422,6 +1439,114 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    // ---- two-phase member writes (doc 07 §5) ---------------------------------------
+
+    /// Phase 1: build the unsigned events to create a node under `parent`, authored
+    /// by `author_pub`. The author must be an authorized member holding write (`w`)
+    /// on `parent` — re-checked at commit and at replay. The daemon returns the
+    /// digests for the member to sign; the engine state is not changed.
+    pub fn prepare_add_node(
+        &self,
+        author_pub: &[u8],
+        parent: &NodeId,
+        spec: NodeSpec,
+    ) -> Result<PreparedWrite> {
+        self.validate_label(&spec.label)?;
+        if spec.node_type.is_empty() {
+            return Err(bad("node_type", "must not be empty"));
+        }
+        let parent_node = fetch_node(&self.conn, parent)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: parent.clone(),
+        })?;
+        if parent_node.is_temp {
+            return Err(bad("parent", "cannot place a member node under a temp parent"));
+        }
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "create node".into(),
+                reason: format!("you lack write (w) on {parent}"),
+            });
+        }
+        let creation_nonce = spec.creation_nonce.unwrap_or_else(|| {
+            let mut b = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut b);
+            u64::from_le_bytes(b)
+        });
+        let t = now_ms();
+        let mut node = Node {
+            id: String::new(),
+            node_type: spec.node_type.clone(),
+            label: spec.label.clone(),
+            visibility: VISIBILITY_PUBLIC.into(),
+            payload: spec.payload.clone(),
+            is_temp: false,
+            creation_nonce,
+            created_at: t,
+            author: author_pub.to_vec(),
+            sig: Vec::new(),
+        };
+        let node_digest = node.id_digest();
+        node.id = hex::encode(node_digest);
+
+        let order = OrderKey::after(max_order_key(&self.conn, parent)?.as_ref())?;
+        let mut link = Link {
+            id: String::new(),
+            parent_id: Some(parent.clone()),
+            child_id: node.id.clone(),
+            link_type: LINK_CONTAINS.into(),
+            link_nonce: 0,
+            order_key: order.as_str().into(),
+            created_at: t,
+            author: author_pub.to_vec(),
+            sig: Vec::new(),
+            removed_at: None,
+            superseded_by: None,
+            suspended_at: None,
+        };
+        let link_digest = link.id_digest();
+        link.id = hex::encode(link_digest);
+
+        Ok(PreparedWrite {
+            result_id: node.id.clone(),
+            events: vec![
+                PreparedEvent {
+                    digest: node_digest,
+                    event: Event::NodeCreated(node),
+                },
+                PreparedEvent {
+                    digest: link_digest,
+                    event: Event::LinkCreated(link),
+                },
+            ],
+        })
+    }
+
+    /// Phase 2: verify each member-signed event (signature valid, author authorized,
+    /// ACL satisfied) and append atomically. The events must already carry the
+    /// member's signatures (see [`Event::set_author_sig`]).
+    pub fn commit_member_write(&mut self, events: Vec<Event>) -> Result<()> {
+        for ev in &events {
+            ev.verify_sig()?;
+            projection::check_member_event(&self.conn, ev)?;
+        }
+        // Idempotent double-commit of the same prepared node ⇒ success, no re-append.
+        if let Some(Event::NodeCreated(n)) = events.first() {
+            if let Some(existing) = fetch_node(&self.conn, &n.id)? {
+                return if &existing == n {
+                    Ok(())
+                } else {
+                    Err(PvfsError::AlreadyExists {
+                        kind: "node",
+                        id: n.id.clone(),
+                    })
+                };
+            }
+        }
+        self.append_durable(events)
     }
 }
 

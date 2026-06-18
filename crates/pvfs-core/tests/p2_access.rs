@@ -140,6 +140,63 @@ fn can_and_readable_children() {
     engine.close().unwrap();
 }
 
+// doc 07 §5 — two-phase member write: prepare (daemon) → member signs → commit
+#[test]
+fn member_write_two_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let dropbox = engine.add_node(&root, folder("dropbox")).unwrap();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(
+            &dropbox,
+            &acl::Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+
+    // no write on root → prepare is refused
+    assert!(matches!(
+        engine.prepare_add_node(&member_pub, &root, folder("nope")),
+        Err(PvfsError::Forbidden { .. })
+    ));
+
+    // prepare under dropbox (has w) → the member signs each digest → commit
+    let prep = engine
+        .prepare_add_node(&member_pub, &dropbox, folder("hello"))
+        .unwrap();
+    let signed: Vec<_> = prep
+        .events
+        .into_iter()
+        .map(|pe| {
+            let mut ev = pe.event;
+            ev.set_author_sig(crypto::sign_digest(&member_key, &pe.digest).unwrap());
+            ev
+        })
+        .collect();
+    engine.commit_member_write(signed).unwrap();
+
+    // the new node exists under dropbox and is authored by the member, not the owner
+    let kids = engine.children(&dropbox).unwrap();
+    let hello = kids
+        .iter()
+        .find(|c| c.node.label == "hello")
+        .expect("member created the node");
+    assert_eq!(hello.node.author, member_pub);
+    let hello_id = hello.node.id.clone();
+    engine.close().unwrap();
+
+    // the member write replays through a full rebuild (member had w when created)
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    assert!(engine.node(&hello_id).unwrap().is_some());
+    engine.close().unwrap();
+}
+
 // doc 07 §4 — the three tiers: `public` reaches everyone; `any` only members
 #[test]
 fn acl_public_vs_any_tiers() {

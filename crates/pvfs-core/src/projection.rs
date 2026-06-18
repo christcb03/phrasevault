@@ -541,27 +541,10 @@ fn replay_one(
             }
         }
         Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
-        // An ACL change must come from an authorized device that holds admin (`a`)
-        // on the target node (owner devices always do). Checked here so a tampered
-        // log can't grant access it had no right to (doc 06 §4.3).
-        Event::AclSet { node_id, author, .. } => {
-            if !author_is_active(tx, author)? {
-                return Err(unauthorized(row.seq, ev.kind()));
-            }
-            if effective_rights(tx, &Principal::Key(author.clone()), node_id)? & acl::ACL_A == 0 {
-                return Err(unauthorized(row.seq, ev.kind()));
-            }
-        }
-        // Every other event is device-authored: its author must be an authorized,
-        // unrevoked device *as of this point* in the in-order replay. Because the
-        // fold runs in seq order, `device_keys` already reflects every prior
-        // DeviceAuthorized/DeviceRevoked — so presence-and-unrevoked is exactly
-        // "authorized before, not yet revoked" without trusting event timestamps.
-        _ => {
-            if !author_is_active(tx, ev.author())? {
-                return Err(unauthorized(row.seq, ev.kind()));
-            }
-        }
+        // Every other event is device-authored: enforce the same author + ACL
+        // rules used by live member writes, so a tampered or synced log can't
+        // carry an event its author had no right to (doc 06 §4.3, doc 07 §5).
+        _ => check_member_event(tx, &ev).map_err(|_| unauthorized(row.seq, ev.kind()))?,
     }
     fold(tx, &ev)?;
     Ok(expect)
@@ -575,17 +558,51 @@ fn unauthorized(seq: u64, kind: &str) -> PvfsError {
     }
 }
 
-/// Whether `author` is a currently-authorized (present, unrevoked) device in the
-/// projection as folded so far. Same rule as `Engine::ensure_device_active`.
-fn author_is_active(tx: &Transaction<'_>, author: &[u8]) -> Result<bool> {
-    let exists: i64 = tx
+/// Authorization for a device-authored event (not genesis / device certificate):
+/// the author must be an authorized, unrevoked device **and** hold the rights the
+/// event requires — admin (`a`) for an `AclSet`, write (`w`) on the parent for a
+/// placing `LinkCreated`. Shared by replay (rebuild/sync) and the live member-write
+/// commit, so the replicated and live rules can never drift. Owner devices have
+/// implicit full rights (via `effective_rights`), so existing forests are unaffected.
+pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
+    let author = ev.author();
+    let active: i64 = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL)",
             params![author],
             |r| r.get(0),
         )
         .map_err(map_db("device authorization check"))?;
-    Ok(exists != 0)
+    if active == 0 {
+        return Err(PvfsError::Integrity {
+            kind: "event",
+            id: ev.kind().into(),
+            reason: crate::error::IntegrityReason::UnknownAuthor,
+        });
+    }
+    match ev {
+        Event::AclSet { node_id, .. } => {
+            if effective_rights(conn, &Principal::Key(author.to_vec()), node_id)? & acl::ACL_A == 0 {
+                return Err(PvfsError::Forbidden {
+                    action: "set acl".into(),
+                    reason: format!("author lacks admin (a) on {node_id}"),
+                });
+            }
+        }
+        Event::LinkCreated(l) => {
+            if let Some(parent) = &l.parent_id {
+                if effective_rights(conn, &Principal::Key(author.to_vec()), parent)? & acl::ACL_W == 0
+                {
+                    return Err(PvfsError::Forbidden {
+                        action: "create link".into(),
+                        reason: format!("author lacks write (w) on parent {parent}"),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // ---- ACL evaluation (doc 06 §4.2) -------------------------------------------------
@@ -813,7 +830,7 @@ mod enforcement_tests {
     use super::*;
     use crate::engine::Engine;
     use crate::error::IntegrityReason;
-    use crate::{crypto, identity, node};
+    use crate::{crypto, identity, link, node};
     use k256::ecdsa::SigningKey;
 
     /// A validly-self-signed `NodeCreated` authored by `author_key`.
@@ -978,6 +995,69 @@ mod enforcement_tests {
                 })
             ),
             "expected UnknownAuthor (no admin), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_member_link_without_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let root = engine.identity.root_node_id.clone();
+        let member = foreign_key();
+        let member_pub = crypto::pubkey_bytes(&member);
+        engine.authorize_member(&m, &member_pub).unwrap(); // authorized, but no write grant
+        engine.close().unwrap();
+
+        // Forge a node (fine — an orphan) and a link placing it under root, both
+        // signed by the member, who has no write on root.
+        let t = 1_500_000;
+        let mut n = node::Node {
+            id: String::new(),
+            node_type: node::TYPE_FOLDER.into(),
+            label: "intruder".into(),
+            visibility: node::VISIBILITY_PUBLIC.into(),
+            payload: node::folder_payload(),
+            is_temp: false,
+            creation_nonce: 7,
+            created_at: t,
+            author: member_pub.clone(),
+            sig: Vec::new(),
+        };
+        let nd = n.id_digest();
+        n.id = hex::encode(nd);
+        n.sig = crypto::sign_digest(&member, &nd).unwrap();
+        append_to_log(dir.path(), &Event::NodeCreated(n.clone()));
+
+        let mut l = link::Link {
+            id: String::new(),
+            parent_id: Some(root),
+            child_id: n.id.clone(),
+            link_type: link::LINK_CONTAINS.into(),
+            link_nonce: 0,
+            order_key: "n".into(),
+            created_at: t,
+            author: member_pub,
+            sig: Vec::new(),
+            removed_at: None,
+            superseded_by: None,
+            suspended_at: None,
+        };
+        let ld = l.id_digest();
+        l.id = hex::encode(ld);
+        l.sig = crypto::sign_digest(&member, &ld).unwrap();
+        append_to_log(dir.path(), &Event::LinkCreated(l));
+
+        // Replay: the orphan node is accepted; placing it under root is rejected.
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected rejection of a no-write member link, got {outcome:?}"
         );
     }
 }

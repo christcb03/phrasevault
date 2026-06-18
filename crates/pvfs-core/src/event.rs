@@ -314,6 +314,21 @@ impl Event {
         }
     }
 
+    /// Attach an author signature to an as-yet-unsigned event (member-write
+    /// commit, doc 07 §5). Only the member-signable kinds are handled; genesis
+    /// and device-certificate events are root-signed and never go this path.
+    pub fn set_author_sig(&mut self, sig: Vec<u8>) {
+        match self {
+            Event::NodeCreated(n) => n.sig = sig,
+            Event::LinkCreated(l) => l.sig = sig,
+            Event::AclSet { sig: s, .. }
+            | Event::FileLocationAdded { sig: s, .. }
+            | Event::LinkRemoved { removal_sig: s, .. }
+            | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
+            _ => {}
+        }
+    }
+
     pub fn encode_body(&self) -> Vec<u8> {
         let mut e = Enc::new();
         match self {

@@ -86,6 +86,9 @@ pub enum PvfsError {
     #[error("invalid input for {field}: {reason}")]
     BadInput { field: String, reason: String },
 
+    #[error("forbidden: {action} — {reason}")]
+    Forbidden { action: String, reason: String },
+
     #[error("{kind} already exists: {id}")]
     AlreadyExists { kind: &'static str, id: String },
 

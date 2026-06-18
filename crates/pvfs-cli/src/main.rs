@@ -362,6 +362,7 @@ fn exit_code_for(e: &PvfsError) -> u8 {
         | PvfsError::CycleDetected { .. } => 4,
         PvfsError::Integrity { .. }
         | PvfsError::Identity { .. }
+        | PvfsError::Forbidden { .. }
         | PvfsError::SchemaVersion { .. } => 5,
         PvfsError::Corruption { .. } | PvfsError::LogChainBroken { .. } => 6,
         _ => 1,
@@ -381,6 +382,7 @@ fn variant_name(e: &PvfsError) -> &'static str {
         PvfsError::CycleDetected { .. } => "CycleDetected",
         PvfsError::Identity { .. } => "Identity",
         PvfsError::BadInput { .. } => "BadInput",
+        PvfsError::Forbidden { .. } => "Forbidden",
         PvfsError::AlreadyExists { .. } => "AlreadyExists",
         PvfsError::NotOrphan { .. } => "NotOrphan",
         PvfsError::AlreadyContained { .. } => "AlreadyContained",
