@@ -170,6 +170,10 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
    **Verified via the smoke suite** (owner grants `public r`, starts `pvfsd`, anon + signed clients
    read). Remaining: transparent remoting (`pvfs --forest <alias>` dials the socket) + registry
    `owner`/`socket` fields at register time.
-6. ☐ Two-phase member-signed writes (`PrepareWrite`/`Commit`).
-7. ☐ Data-plane transfer threads for `Cat`.
-8. ☐ Federation/torrent hooks (later).
+6. ☑ Two-phase member-signed writes (`PrepareWrite`/`Commit`) — `Engine::prepare_add_node` /
+   `commit_member_write`, the daemon's prepared-state, `pvfs-client::mkdir`, and
+   `pvfs remote mkdir`. Authorization (author authorized + write-on-parent) is shared between live
+   commit and replay (`projection::check_member_event`). **Verified end-to-end** (Rust + smoke).
+7. ☐ More write ops (add file + locations, mkdir → rmdir/mv, `set_acl` over the daemon).
+8. ☐ Data-plane transfer threads for `Cat`.
+9. ☐ Federation/torrent hooks (later).

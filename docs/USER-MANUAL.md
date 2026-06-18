@@ -121,7 +121,7 @@ file permissions; collaborators never get your keys.
 | `any` | any authorized member of the forest |
 | `key:<hex>` | one specific member |
 
-Rights are `r` (read), `w` (write — *coming*, see Roadmap), `a` (admin: manage ACLs on a subtree).
+Rights are `r` (read), `w` (write — create/modify children), `a` (admin: manage ACLs on a subtree).
 Grants **inherit down** the tree. You (the owner) always have full rights.
 
 ### 7.2 Grant read access — step by step
@@ -170,6 +170,24 @@ pvfs remote --socket … --anon ls <node-id>
 
 The daemon checks the caller's rights on every request and returns only what they may read.
 
+### 7.5 Members writing (creating folders)
+
+A member granted **`w`** on a subtree can create folders there over the daemon. Each change is
+**signed by the member's own key** — the daemon never signs on their behalf:
+
+```bash
+# owner: grant write (set this BEFORE starting pvfsd — see note)
+pvfs acl set <node-id> key:028f... rw
+
+# member: create a folder under that node
+pvfs remote --socket … mkdir <node-id> my-folder
+#   → created <new-node-id>
+```
+
+> **Note:** `pvfsd` serves a snapshot of the forest as of when it started. Set authorizations and
+> ACL grants **before** launching `pvfsd` (or restart it after changing them). Writes made *through*
+> the daemon are seen immediately.
+
 ---
 
 ## 8. Recovery & devices
@@ -203,6 +221,7 @@ The daemon checks the caller's rights on every request and returns only what the
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
 | `pvfs whoami` | Print this machine's client identity pubkey. |
 | `pvfs remote --socket <path> [--anon] info\|ls\|stat …` | Read a forest via its daemon. |
+| `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
@@ -212,12 +231,13 @@ mount to set the forest context for tree commands.
 
 ## 10. Roadmap
 
-Available now: forest management, import, the full ACL model, and **read-only** daemon sharing.
+Available now: forest management, import, the full ACL model, daemon sharing (reads **and** member
+folder-creation with `pvfs remote mkdir`).
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **Member writes through the daemon** — authorized members modifying a forest, with each change
-  signed by their own key.
+- **More write operations over the daemon** — adding files, removing/moving nodes, managing ACLs
+  remotely (the two-phase, member-signed machinery already generalizes).
 - **Streaming file content** (`cat`) over the daemon, with concurrent transfers.
 - **Transparent remoting** — `pvfs --forest <alias> …` automatically using the daemon, no `--socket`.
 - **Encryption at rest** and **federation / network sharing** (including torrent-like distribution).
