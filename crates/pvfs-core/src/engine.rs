@@ -1593,6 +1593,49 @@ impl Engine {
             }],
         })
     }
+
+    /// Phase 1 of a member location-add: build the unsigned `FileLocationAdded`
+    /// recording where a file node's bytes live. The author must hold write on
+    /// the file (re-checked at commit and replay).
+    pub fn prepare_add_location(
+        &self,
+        author_pub: &[u8],
+        file: &NodeId,
+        uri: &str,
+    ) -> Result<PreparedWrite> {
+        if uri.is_empty() {
+            return Err(bad("uri", "must not be empty"));
+        }
+        let n = fetch_node(&self.conn, file)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: file.clone(),
+        })?;
+        if n.node_type != node::TYPE_FILE {
+            return Err(bad("file", "locations can only be added to file nodes"));
+        }
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, file)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "add location".into(),
+                reason: format!("you lack write (w) on {file}"),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_file_location_added(file, uri, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: file.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::FileLocationAdded {
+                    file_id: file.clone(),
+                    uri: uri.to_string(),
+                    added_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
 }
 
 impl Drop for Engine {

@@ -581,23 +581,10 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         });
     }
     match ev {
-        Event::AclSet { node_id, .. } => {
-            if effective_rights(conn, &Principal::Key(author.to_vec()), node_id)? & acl::ACL_A == 0 {
-                return Err(PvfsError::Forbidden {
-                    action: "set acl".into(),
-                    reason: format!("author lacks admin (a) on {node_id}"),
-                });
-            }
-        }
+        Event::AclSet { node_id, .. } => require_right(conn, author, node_id, acl::ACL_A, "set acl")?,
         Event::LinkCreated(l) => {
             if let Some(parent) = &l.parent_id {
-                if effective_rights(conn, &Principal::Key(author.to_vec()), parent)? & acl::ACL_W == 0
-                {
-                    return Err(PvfsError::Forbidden {
-                        action: "create link".into(),
-                        reason: format!("author lacks write (w) on parent {parent}"),
-                    });
-                }
+                require_right(conn, author, parent, acl::ACL_W, "create link")?;
             }
         }
         Event::LinkRemoved { link_id, .. } => {
@@ -616,15 +603,24 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
                     Some(p) => (p, acl::ACL_W),
                     None => (child, acl::ACL_A),
                 };
-                if effective_rights(conn, &Principal::Key(author.to_vec()), &target)? & needed == 0 {
-                    return Err(PvfsError::Forbidden {
-                        action: "remove link".into(),
-                        reason: format!("author lacks rights on {target}"),
-                    });
-                }
+                require_right(conn, author, &target, needed, "remove link")?;
             }
         }
+        Event::FileLocationAdded { file_id, .. } => {
+            require_right(conn, author, file_id, acl::ACL_W, "add location")?
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Require that `author` holds every bit in `right` on `node`, else `Forbidden`.
+fn require_right(conn: &Connection, author: &[u8], node: &str, right: u8, action: &str) -> Result<()> {
+    if effective_rights(conn, &Principal::Key(author.to_vec()), node)? & right != right {
+        return Err(PvfsError::Forbidden {
+            action: action.into(),
+            reason: format!("author lacks the required right on {node}"),
+        });
     }
     Ok(())
 }

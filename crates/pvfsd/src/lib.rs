@@ -235,6 +235,7 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
                 )
             }
             WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
+            WriteOp::AddLocation { file, uri } => e.prepare_add_location(&author, &file, &uri),
         }
     };
     let prepared = match prepared {

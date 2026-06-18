@@ -18,7 +18,8 @@ live in docs 02–07; this is the index + the honest "what's not done yet."
 | **P2-B** | Per-node ACLs: `AclSet` events, `public/any/key` tiers, `effective_rights`, `pvfs acl` | ✅ shipped (doc 06 §4) |
 | **P2-C** | Daemon **read** path: `pvfs-proto`, `pvfsd`, `pvfs-client`, challenge-response auth, `pvfs remote`/`whoami` | ✅ shipped (doc 07 §1–4) |
 | **P2-C (writes)** | Two-phase member writes through the daemon: `mkdir`, `add-file`, `rm`; shared live/replay authorization | ✅ shipped (doc 07 §5) |
-| **P2-C (more writes)** | Remaining write ops (file locations, `mv`, `set_acl` over the daemon) | ☐ next |
+| **P2-C (more writes)** | `add-file`, `rm`, `add-location` over the daemon (member-signed) | ✅ shipped |
+| **P2-C (writes todo)** | `mv` (re-home) and `set_acl` over the daemon | ☐ next |
 | **P2-C (read content)** | `Cat` — read file bytes via the daemon (`pvfs remote cat`), ACL-checked, ranged chunks | ✅ shipped (basic) |
 | **P2-C (data plane)** | Dedicated concurrent transfer threads + raw byte stream + streaming verify | ☐ planned (doc 07 §6) |
 | **P2-C (UX)** | Transparent remoting (`pvfs --forest <alias>` dials the socket); registry `owner`/`socket` | ☐ planned |

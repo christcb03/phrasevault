@@ -302,6 +302,8 @@ enum RemoteCmd {
     },
     /// Remove a node from its home parent (requires your client identity)
     Rm { node: String },
+    /// Record where a file's bytes live (requires your client identity)
+    AddLocation { file: String, uri: String },
 }
 
 /// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
@@ -1119,6 +1121,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         })
                         .map_err(remote_err)?;
                     print_created(&id, json);
+                }
+                RemoteCmd::AddLocation { file, uri } => {
+                    let key = identity_key.as_ref().ok_or_else(needs_identity)?;
+                    let id = client
+                        .add_location(&file, &uri, |d| {
+                            crypto::sign_digest(key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                    if json {
+                        println!("{{\"file\":\"{}\"}}", json_escape(&id));
+                    } else {
+                        println!("added location to {id}");
+                    }
                 }
                 RemoteCmd::Rm { node } => {
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;

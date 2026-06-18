@@ -272,6 +272,13 @@ ALBUMS_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DROOT")" album
 ATXT_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$ALBUMS_ID")" a.txt)"
 [ "$($PVFS remote --socket "$SOCK" cat "$ATXT_ID")" = "hi" ] \
   && ok "member reads file bytes via daemon (cat)" || fail "cat mismatch"
+# member adds its own file + a location, then reads the bytes back
+printf 'member-bytes' > "$DMOUNT/uploaded-blob"
+MFILE="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" blob.bin --size 12)" created)"
+$PVFS remote --socket "$SOCK" add-location "$MFILE" "file://$DMOUNT/uploaded-blob" >/dev/null \
+  && ok "member added a file location"
+[ "$($PVFS remote --socket "$SOCK" cat "$MFILE")" = "member-bytes" ] \
+  && ok "member reads back its own file content" || fail "member cat mismatch"
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky

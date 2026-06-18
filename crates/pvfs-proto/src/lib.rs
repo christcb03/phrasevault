@@ -67,6 +67,8 @@ pub enum WriteOp {
     },
     /// Unlink `node` from its home parent (soft remove).
     Rm { node: String },
+    /// Record where a file node's bytes live.
+    AddLocation { file: String, uri: String },
 }
 
 /// Client → server messages.

@@ -235,6 +235,20 @@ impl Client {
         self.write_op(WriteOp::Rm { node: node.into() }, sign)
     }
 
+    /// Record where a file node's bytes live. Returns the file id.
+    pub fn add_location<F>(&mut self, file: &str, uri: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::AddLocation {
+                file: file.into(),
+                uri: uri.into(),
+            },
+            sign,
+        )
+    }
+
     /// The two-phase write flow (doc 07 §5): prepare → sign each preimage → commit.
     /// `sign` produces a signature over each 32-byte preimage with the member's key.
     fn write_op<F>(&mut self, op: WriteOp, sign: F) -> Result<String>
