@@ -266,6 +266,12 @@ if $PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q clip.mkv; then
 else
   ok "removed file is gone"
 fi
+# member reads a file's bytes over the daemon (the imported albums/a.txt = "hi")
+pick_id() { python3 -c 'import json,sys; print(next((c["id"] for c in json.loads(sys.argv[1]) if c["label"]==sys.argv[2]),""))' "$1" "$2"; }
+ALBUMS_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DROOT")" albums)"
+ATXT_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$ALBUMS_ID")" a.txt)"
+[ "$($PVFS remote --socket "$SOCK" cat "$ATXT_ID")" = "hi" ] \
+  && ok "member reads file bytes via daemon (cat)" || fail "cat mismatch"
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky

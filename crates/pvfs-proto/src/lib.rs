@@ -45,6 +45,8 @@ pub enum ServerMsg {
     },
     /// Phase 2 result: the committed write's id.
     Committed { id: String },
+    /// A chunk of file bytes (hex); `eof` once the file is exhausted.
+    CatData { data: String, eof: bool },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
 }
@@ -78,6 +80,8 @@ pub enum ClientMsg {
     Info,
     Ls { node: String },
     Stat { node: String },
+    /// Read up to `len` bytes of a file node starting at `offset`.
+    Cat { node: String, offset: u64, len: u64 },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },
     /// Phase 2: return one signature (hex) per preimage, in order.

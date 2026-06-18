@@ -176,5 +176,8 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
    commit and replay (`projection::check_member_event`). **Verified end-to-end** (Rust + smoke).
 7. ◑ More write ops on the same machinery: ☑ `add-file` (file node), ☑ `rm` (unlink from home).
    Remaining: file **locations** (record bytes), `mv` (re-home), and `set_acl` over the daemon.
-8. ☐ Data-plane transfer threads for `Cat` (stream file bytes).
+8. ◑ `Cat` (read file bytes) — `pvfs remote cat`, ACL-checked, delivered as ranged hex chunks over
+   the control protocol; the engine lock is held only per chunk, so requests interleave. Remaining:
+   dedicated concurrent **data-plane** threads (raw byte stream, no hex overhead) and streaming hash
+   verification on read (doc 06 §6).
 9. ☐ Federation/torrent hooks (later).

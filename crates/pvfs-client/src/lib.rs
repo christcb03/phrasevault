@@ -164,6 +164,32 @@ impl Client {
         }
     }
 
+    /// Stream a file node's bytes to `out`, chunk by chunk. Returns the total
+    /// number of bytes written.
+    pub fn cat(&mut self, node: &str, out: &mut dyn std::io::Write) -> Result<u64> {
+        const CHUNK: u64 = 1 << 20; // 1 MiB per request
+        let mut offset = 0u64;
+        loop {
+            match self.request(ClientMsg::Cat {
+                node: node.into(),
+                offset,
+                len: CHUNK,
+            })? {
+                ServerMsg::CatData { data, eof } => {
+                    let bytes = hex::decode(&data)
+                        .map_err(|_| ClientError::Protocol("cat data not hex".into()))?;
+                    out.write_all(&bytes).map_err(ClientError::Io)?;
+                    offset += bytes.len() as u64;
+                    if eof || bytes.is_empty() {
+                        break;
+                    }
+                }
+                other => return Err(unexpected("CatData", &other)),
+            }
+        }
+        Ok(offset)
+    }
+
     /// Create a folder named `label` under `parent`. Returns the new node id.
     pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
     where

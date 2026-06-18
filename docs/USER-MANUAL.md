@@ -224,6 +224,7 @@ pvfs remote --socket … mkdir <node-id> my-folder
 | `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |
 | `pvfs remote --socket <path> add-file <parent> <label> [--size N --mime M]` | Create a file node via the daemon. |
 | `pvfs remote --socket <path> rm <node>` | Unlink a node from its home via the daemon. |
+| `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
@@ -233,13 +234,15 @@ mount to set the forest context for tree commands.
 
 ## 10. Roadmap
 
-Available now: forest management, import, the full ACL model, daemon sharing (reads **and** member
-folder-creation with `pvfs remote mkdir`).
+Available now: forest management, import, the full ACL model, and daemon sharing — members can
+**read** listings and file content (`pvfs remote ls`/`stat`/`cat`) and **write** (`pvfs remote
+mkdir`/`add-file`/`rm`), each change signed by their own key.
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **More write operations over the daemon** — adding files, removing/moving nodes, managing ACLs
-  remotely (the two-phase, member-signed machinery already generalizes).
-- **Streaming file content** (`cat`) over the daemon, with concurrent transfers.
+- **More write operations over the daemon** — file locations, moving nodes, managing ACLs remotely
+  (the two-phase, member-signed machinery already generalizes).
+- **A dedicated data plane** for `cat` — concurrent raw-byte transfers (and the seam for torrent-like
+  distribution), instead of today's ranged-chunk delivery.
 - **Transparent remoting** — `pvfs --forest <alias> …` automatically using the daemon, no `--socket`.
 - **Encryption at rest** and **federation / network sharing** (including torrent-like distribution).

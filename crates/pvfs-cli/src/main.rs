@@ -287,6 +287,8 @@ enum RemoteCmd {
     Ls { node: String },
     /// Show a node's metadata + your effective rights
     Stat { node: String },
+    /// Stream a file node's bytes to stdout
+    Cat { node: String },
     /// Create a folder under a parent node (requires your client identity)
     Mkdir { parent: String, label: String },
     /// Create a file node under a parent (requires your client identity)
@@ -1090,6 +1092,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         println!("{}  {}  {}  [{}]", n.id, n.node_type, n.label, n.rights);
                     }
+                }
+                RemoteCmd::Cat { node } => {
+                    let mut stdout = std::io::stdout().lock();
+                    client.cat(&node, &mut stdout).map_err(remote_err)?;
                 }
                 RemoteCmd::Mkdir { parent, label } => {
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;

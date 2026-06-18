@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pvfs_client::{Client, ClientError};
 use pvfs_core::acl::{self, Principal};
-use pvfs_core::{crypto, identity, Engine, NodeSpec, TYPE_FOLDER};
+use pvfs_core::{crypto, identity, Engine, FilePayload, NodeSpec, TYPE_FILE, TYPE_FOLDER};
 use pvfsd::{serve, Daemon};
 
 fn folder(label: &str) -> NodeSpec {
@@ -174,4 +174,69 @@ fn daemon_member_add_file_and_rm() {
     m.rm(&file_id, |d| crypto::sign_digest(&member_key, d).unwrap())
         .unwrap();
     assert!(!labels(&m.ls(&dropbox).unwrap()).contains(&"clip.mkv".to_string()));
+}
+
+// doc 07 §6 — read a file's bytes over the daemon, ACL-checked
+#[test]
+fn daemon_cat_reads_file_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    // a real file on disk + a file node that points at it
+    let file_path = dir.path().join("hello.txt");
+    std::fs::write(&file_path, b"hello pvfs").unwrap();
+    let file_node = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FILE.into(),
+                label: "hello.txt".into(),
+                payload: FilePayload {
+                    content_hash: String::new(),
+                    size_bytes: 10,
+                    mime_type: "text/plain".into(),
+                    original_name: "hello.txt".into(),
+                }
+                .encode(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    engine
+        .add_location(&file_node, &format!("file://{}", file_path.display()))
+        .unwrap();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(&root, &Principal::Key(member_pub.clone()), acl::ACL_R)
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    // the member can read the bytes
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+    let mut buf = Vec::new();
+    member.cat(&file_node, &mut buf).unwrap();
+    assert_eq!(buf, b"hello pvfs");
+
+    // an anonymous client (no public grant) is refused
+    let mut anon = Client::connect_public(&sock).unwrap();
+    let mut empty = Vec::new();
+    assert!(forbidden(anon.cat(&file_node, &mut empty)));
 }

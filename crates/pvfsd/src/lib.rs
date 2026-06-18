@@ -151,11 +151,41 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Ok(node) => ServerMsg::Stat { node },
             Err(msg) => msg,
         },
+        ClientMsg::Cat {
+            node,
+            offset,
+            len,
+        } => do_cat(daemon, principal, &node, offset, len),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         ClientMsg::Auth { .. } | ClientMsg::Anonymous => {
             err("bad_input", "already past handshake")
         }
+    }
+}
+
+/// Stream one chunk of a file's bytes (ACL-checked). The engine lock is held only
+/// for this chunk, so concurrent requests interleave between chunks.
+fn do_cat(daemon: &Daemon, principal: &Principal, node: &str, offset: u64, len: u64) -> ServerMsg {
+    let id: NodeId = node.to_string();
+    let mut e = daemon.engine.lock().unwrap();
+    match e.effective_rights(principal, &id) {
+        Ok(r) if r & acl::ACL_R != 0 => {}
+        Ok(_) => return forbidden(),
+        Err(err) => return err_from(err),
+    }
+    let range = pvfs_core::ByteRange {
+        start: offset,
+        end: Some(offset.saturating_add(len)),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    if let Err(err) = e.cat(&id, Some(range), &mut buf) {
+        return err_from(err);
+    }
+    let eof = (buf.len() as u64) < len;
+    ServerMsg::CatData {
+        data: hex::encode(&buf),
+        eof,
     }
 }
 
