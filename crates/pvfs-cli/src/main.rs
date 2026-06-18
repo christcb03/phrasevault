@@ -4,7 +4,7 @@
 //! 3 not found · 4 conflict (exists/contained/not-orphan/cycle) ·
 //! 5 integrity/identity · 6 corruption (recovery ladder).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -1497,7 +1497,7 @@ fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
 }
 
 /// Minimal P1 daemon: live watcher + scheduled reconciliation (doc 04 §6).
-fn serve(dir: &PathBuf, json: bool, reconcile_secs: u64, debounce_ms: u64) -> Result<(), PvfsError> {
+fn serve(dir: &Path, json: bool, reconcile_secs: u64, debounce_ms: u64) -> Result<(), PvfsError> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 

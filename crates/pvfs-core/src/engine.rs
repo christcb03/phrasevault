@@ -1459,7 +1459,7 @@ pub(crate) fn fetch_link(conn: &Connection, id: &str) -> Result<Option<Link>> {
     conn.query_row(
         &format!("SELECT {LINK_COLS} FROM links WHERE id = ?1"),
         params![id],
-        |r| link_from_row(r),
+        link_from_row,
     )
     .optional()
     .map_err(map_db("fetch link"))
@@ -1469,7 +1469,7 @@ pub(crate) fn fetch_temp_link(conn: &Connection, id: &str) -> Result<Option<Link
     conn.query_row(
         &format!("SELECT {LINK_COLS} FROM temp_links WHERE id = ?1"),
         params![id],
-        |r| link_from_row(r),
+        link_from_row,
     )
     .optional()
     .map_err(map_db("fetch temp link"))

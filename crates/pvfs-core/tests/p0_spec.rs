@@ -268,7 +268,7 @@ fn orphans_and_purge() {
     let b = engine.add_node(&a, file_spec("b", false)).unwrap();
 
     // purging a linked node is refused
-    match engine.purge(&[a.clone()]) {
+    match engine.purge(std::slice::from_ref(&a)) {
         Err(PvfsError::NotOrphan { active_inbound, .. }) => assert_eq!(active_inbound, 1),
         other => panic!("expected NotOrphan, got {other:?}"),
     }
@@ -289,7 +289,7 @@ fn orphans_and_purge() {
         .collect();
     assert!(orphans.contains(&a));
 
-    engine.purge(&[a.clone()]).unwrap();
+    engine.purge(std::slice::from_ref(&a)).unwrap();
     assert!(engine.get_node(&a).unwrap().is_none());
     let orphans: Vec<String> = engine
         .list_orphans()

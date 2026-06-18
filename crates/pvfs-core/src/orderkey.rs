@@ -95,7 +95,7 @@ impl OrderKey {
                     out.push(ALPHABET[dn] as char);
                     i += 1;
                 } else {
-                    out.push(ALPHABET[(dn + BASE + 1) / 2] as char);
+                    out.push(ALPHABET[(dn + BASE).div_ceil(2)] as char);
                     return Ok(OrderKey(out));
                 }
             }
