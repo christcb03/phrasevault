@@ -55,11 +55,18 @@ CREATE TABLE IF NOT EXISTS device_keys (
 
 CREATE TABLE IF NOT EXISTS acl (
   node_id        TEXT    NOT NULL,
-  principal_kind INTEGER NOT NULL,   -- 0=any, 1=key
-  principal_id   BLOB    NOT NULL,   -- pubkey for key; empty for any
+  principal_kind INTEGER NOT NULL,   -- 0=any, 1=key, 2=public, 3=tag
+  principal_id   BLOB    NOT NULL,   -- pubkey for key; tag name for tag; empty for any/public
   rights         INTEGER NOT NULL,   -- bitmask r=1 w=2 a=4; row absent => none
   set_at         INTEGER NOT NULL,
   PRIMARY KEY (node_id, principal_kind, principal_id)
+);
+
+CREATE TABLE IF NOT EXISTS member_tags (
+  member_pubkey BLOB NOT NULL,
+  tag           TEXT NOT NULL,
+  set_at        INTEGER NOT NULL,
+  PRIMARY KEY (member_pubkey, tag)
 );
 
 CREATE TABLE IF NOT EXISTS temp_nodes (
@@ -155,6 +162,7 @@ const MAIN_OBJECTS: &[&str] = &[
     "file_locations",
     "device_keys",
     "acl",
+    "member_tags",
     "temp_nodes",
     "temp_links",
     "temp_file_locations",
@@ -275,6 +283,28 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                      ON CONFLICT(node_id, principal_kind, principal_id)
                      DO UPDATE SET rights = excluded.rights, set_at = excluded.set_at",
                     params![node_id, *principal_kind as i64, principal_id, *rights as i64, *set_at as i64],
+                )
+                .map_err(&m)?;
+            }
+        }
+        Event::MemberTagged {
+            member_pubkey,
+            tag,
+            granted,
+            set_at,
+            ..
+        } => {
+            if *granted {
+                tx.execute(
+                    "INSERT INTO member_tags (member_pubkey, tag, set_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(member_pubkey, tag) DO UPDATE SET set_at = excluded.set_at",
+                    params![member_pubkey, tag, *set_at as i64],
+                )
+                .map_err(&m)?;
+            } else {
+                tx.execute(
+                    "DELETE FROM member_tags WHERE member_pubkey = ?1 AND tag = ?2",
+                    params![member_pubkey, tag],
                 )
                 .map_err(&m)?;
             }
@@ -609,6 +639,17 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         Event::FileLocationAdded { file_id, .. } => {
             require_right(conn, author, file_id, acl::ACL_W, "add location")?
         }
+        Event::MemberTagged { .. } => {
+            // Managing membership tags requires admin on the forest root.
+            let root: String = conn
+                .query_row(
+                    "SELECT v FROM projection_meta WHERE k = 'forest_root_node_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(map_db("root lookup"))?;
+            require_right(conn, author, &root, acl::ACL_A, "tag member")?;
+        }
         _ => {}
     }
     Ok(())
@@ -635,29 +676,47 @@ fn require_right(conn: &Connection, author: &[u8], node: &str, right: u8, action
 /// flow down the tree. Accepts `&Connection`; a `&Transaction` derefs to it, so
 /// replay can call it too.
 pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str) -> Result<u8> {
-    // Is this caller an authorized member (so `Any` grants apply)? Owner devices
-    // short-circuit to full rights.
-    let is_member = match principal {
-        Principal::Public => false,
-        Principal::Any => true,
+    // An owner device short-circuits to full rights. Otherwise determine whether
+    // the caller is an authorized member (so `Any` grants apply) and, for a member
+    // key, which tags they hold (so the node's `tag:` grants apply).
+    let (is_member, member_tags): (bool, Vec<String>) = match principal {
+        Principal::Public | Principal::Tag(_) => (false, Vec::new()),
+        Principal::Any => (true, Vec::new()),
         Principal::Key(pk) => {
             let (authorized, is_owner) = device_status(conn, pk)?;
             if is_owner {
                 return Ok(acl::ACL_RWA);
             }
-            authorized
+            if authorized {
+                (true, member_tags_of(conn, pk)?)
+            } else {
+                (false, Vec::new())
+            }
         }
     };
+    // A `Tag` query reports only that tag's grants (no `public` floor).
+    let include_public = !matches!(principal, Principal::Tag(_));
     let mut rights = 0u8;
     let mut cur = Some(node_id.to_string());
     let mut guard = 0u32;
     while let Some(n) = cur {
-        rights |= grant_for(conn, &n, 2, &[])?; // Public — applies to everyone
+        if include_public {
+            rights |= grant_for(conn, &n, 2, &[])?; // Public — applies to everyone
+        }
         if is_member {
             rights |= grant_for(conn, &n, 0, &[])?; // Any — authorized members
         }
-        if let Principal::Key(pk) = principal {
-            rights |= grant_for(conn, &n, 1, pk)?; // this specific key
+        match principal {
+            Principal::Key(pk) => {
+                rights |= grant_for(conn, &n, 1, pk)?; // this specific key
+                for t in &member_tags {
+                    rights |= grant_for(conn, &n, 3, t.as_bytes())?; // tags the member holds
+                }
+            }
+            Principal::Tag(t) => {
+                rights |= grant_for(conn, &n, 3, t.as_bytes())?; // the tag's own grants
+            }
+            _ => {}
         }
         if rights & acl::ACL_RWA == acl::ACL_RWA {
             break; // already maximal — stop walking
@@ -669,6 +728,20 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
         }
     }
     Ok(rights)
+}
+
+fn member_tags_of(conn: &Connection, pubkey: &[u8]) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT tag FROM member_tags WHERE member_pubkey = ?1")
+        .map_err(map_db("prepare member tags"))?;
+    let rows = stmt
+        .query_map(params![pubkey], |r| r.get::<_, String>(0))
+        .map_err(map_db("query member tags"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(map_db("read member tag"))?);
+    }
+    Ok(out)
 }
 
 /// `(authorized_and_unrevoked, is_owner_device)` for a key in `device_keys`.
@@ -1078,6 +1151,48 @@ mod enforcement_tests {
                 })
             ),
             "expected rejection of a no-write member link, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_member_tagged_from_non_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let member = foreign_key();
+        let member_pub = crypto::pubkey_bytes(&member);
+        engine.authorize_member(&m, &member_pub).unwrap(); // authorized, not admin
+        engine.close().unwrap();
+
+        // forge a MemberTagged signed by a member who lacks admin on the root
+        let t = 1_500_000;
+        let (tag, granted) = ("sneaky", true);
+        let sig = crypto::sign_digest(
+            &member,
+            &crate::event::msg_member_tagged(&member_pub, tag, granted, t, &member_pub),
+        )
+        .unwrap();
+        append_to_log(
+            dir.path(),
+            &Event::MemberTagged {
+                member_pubkey: member_pub.clone(),
+                tag: tag.into(),
+                granted,
+                set_at: t,
+                author: member_pub,
+                sig,
+            },
+        );
+
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected rejection of a non-admin tag, got {outcome:?}"
         );
     }
 }

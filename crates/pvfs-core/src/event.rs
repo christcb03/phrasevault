@@ -23,6 +23,7 @@ pub const K_NODE_PURGED: &str = "NodePurged";
 pub const K_FOLDER_BOUND: &str = "FolderBound";
 pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
 pub const K_ACL_SET: &str = "AclSet";
+pub const K_MEMBER_TAGGED: &str = "MemberTagged";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -121,6 +122,15 @@ pub enum Event {
         principal_kind: u64,
         principal_id: Vec<u8>,
         rights: u64,
+        set_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Grant (`granted`) or remove a tag from a member key (doc 09 §1).
+    MemberTagged {
+        member_pubkey: Vec<u8>,
+        tag: String,
+        granted: bool,
         set_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
@@ -265,6 +275,22 @@ pub fn msg_acl_set(
     crypto::domain_digest("pvfs:aclset:v1:", &e.finish())
 }
 
+pub fn msg_member_tagged(
+    member_pubkey: &[u8],
+    tag: &str,
+    granted: bool,
+    set_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.bytes(member_pubkey)
+        .string(tag)
+        .boolean(granted)
+        .u64(set_at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:membertagged:v1:", &e.finish())
+}
+
 // ---- encode / decode --------------------------------------------------------
 
 impl Event {
@@ -286,6 +312,7 @@ impl Event {
             Event::FolderBound { .. } => K_FOLDER_BOUND,
             Event::FolderUnbound { .. } => K_FOLDER_UNBOUND,
             Event::AclSet { .. } => K_ACL_SET,
+            Event::MemberTagged { .. } => K_MEMBER_TAGGED,
         }
     }
 
@@ -305,7 +332,8 @@ impl Event {
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
-            | Event::AclSet { author, .. } => author,
+            | Event::AclSet { author, .. }
+            | Event::MemberTagged { author, .. } => author,
             Event::NodeCreated(n) => &n.author,
             Event::LinkCreated(l) => &l.author,
             Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
@@ -322,6 +350,7 @@ impl Event {
             Event::NodeCreated(n) => n.sig = sig,
             Event::LinkCreated(l) => l.sig = sig,
             Event::AclSet { sig: s, .. }
+            | Event::MemberTagged { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -502,6 +531,21 @@ impl Event {
                     .bytes(author)
                     .bytes(sig);
             }
+            Event::MemberTagged {
+                member_pubkey,
+                tag,
+                granted,
+                set_at,
+                author,
+                sig,
+            } => {
+                e.bytes(member_pubkey)
+                    .string(tag)
+                    .boolean(*granted)
+                    .u64(*set_at)
+                    .bytes(author)
+                    .bytes(sig);
+            }
         }
         e.finish()
     }
@@ -627,6 +671,14 @@ impl Event {
                 principal_kind: d.u64()?,
                 principal_id: d.bytes()?,
                 rights: d.u64()?,
+                set_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_MEMBER_TAGGED => Event::MemberTagged {
+                member_pubkey: d.bytes()?,
+                tag: d.string()?,
+                granted: d.boolean()?,
                 set_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
@@ -797,6 +849,18 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_acl_set(node_id, *principal_kind, principal_id, *rights, *set_at, author),
+                sig,
+            ),
+            Event::MemberTagged {
+                member_pubkey,
+                tag,
+                granted,
+                set_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_member_tagged(member_pubkey, tag, *granted, *set_at, author),
                 sig,
             ),
         }

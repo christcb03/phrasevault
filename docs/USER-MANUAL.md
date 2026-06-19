@@ -119,6 +119,7 @@ file permissions; collaborators never get your keys.
 |-----------|---------------|
 | `public` | anyone, even unauthenticated — use for "share to everyone" |
 | `any` | any authorized member of the forest |
+| `tag:<name>` | any member holding that **tag** (e.g. `tag:media_users`) — see §7.6 |
 | `key:<hex>` | one specific member |
 
 Rights are `r` (read), `w` (write — create/modify children), `a` (admin: manage ACLs on a subtree).
@@ -186,7 +187,20 @@ pvfs remote --socket … mkdir <node-id> my-folder
 
 > **Note:** `pvfsd` serves a snapshot of the forest as of when it started. Set authorizations and
 > ACL grants **before** launching `pvfsd` (or restart it after changing them). Writes made *through*
-> the daemon are seen immediately.
+> the daemon are seen immediately. (Live admin over the daemon is on the roadmap.)
+
+### 7.6 Tags (sharing with a group)
+
+Instead of granting every friend individually, share content with a **tag** and give people the
+tag. Two independent dials:
+
+- **Share a node with a tag:** `pvfs acl set <node> tag:media_users r`
+- **Give a member the tag:** `pvfs tag add <member-pubkey> media_users`
+
+Now everyone holding `media_users` can read anything tagged `media_users` (with inheritance down
+the tree). A new friend? `pvfs tag add <their-key> media_users` — done. Un-share? Remove the node's
+tag grant, or drop the member's tag with `pvfs tag rm <key> media_users`. Inspect with
+`pvfs tag ls <key>`. Assigning tags requires admin on the forest (you, the owner, always have it).
 
 ---
 
@@ -217,8 +231,9 @@ pvfs remote --socket … mkdir <node-id> my-folder
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs device authorize-member --pubkey <hex> --mnemonic …` | Authorize a member's key. |
 | `pvfs device revoke --pubkey <hex> --mnemonic …` | Revoke a device/member key. |
-| `pvfs acl set <node> public\|any\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
+| `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
+| `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |
 | `pvfs whoami` | Print this machine's client identity pubkey. |
 | `pvfs remote --socket <path> [--anon] info\|ls\|stat …` | Read a forest via its daemon. |
 | `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |

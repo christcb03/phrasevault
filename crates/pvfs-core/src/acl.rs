@@ -21,32 +21,36 @@ pub const ACL_RWA: u8 = ACL_R | ACL_W | ACL_A;
 /// two without a new event field. Owner devices have implicit full rights.
 pub const MEMBER_DEVICE_INDEX: u64 = u64::MAX;
 
-/// Who an ACL entry is about (doc 06 §4 / doc 07 §4). Three tiers:
+/// Who an ACL entry is about (doc 06 §4 / doc 09 §1). `public ⊇ any ⊇ tag ⊇ key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     /// Anyone, including unauthenticated callers (filesystem "other").
     Public,
     /// Any authorized member of the forest (holds an authorized, unrevoked key).
     Any,
+    /// A named tag — members holding this tag match it (doc 09 §1).
+    Tag(String),
     /// A specific device/member public key (33-byte compressed secp256k1).
     Key(Vec<u8>),
 }
 
 impl Principal {
-    /// Wire/table discriminant: 0 = Any, 1 = Key, 2 = Public.
+    /// Wire/table discriminant: 0 = Any, 1 = Key, 2 = Public, 3 = Tag.
     pub fn kind(&self) -> u64 {
         match self {
             Principal::Any => 0,
             Principal::Key(_) => 1,
             Principal::Public => 2,
+            Principal::Tag(_) => 3,
         }
     }
 
-    /// Wire/table identity bytes (pubkey for `Key`, empty otherwise).
+    /// Wire/table identity bytes (pubkey for `Key`, the name for `Tag`, else empty).
     pub fn id(&self) -> &[u8] {
         match self {
             Principal::Any | Principal::Public => &[],
             Principal::Key(k) => k,
+            Principal::Tag(t) => t.as_bytes(),
         }
     }
 
@@ -59,6 +63,14 @@ impl Principal {
                 Ok(Principal::Key(id))
             }
             2 => Ok(Principal::Public),
+            3 => {
+                let name = String::from_utf8(id).map_err(|_| PvfsError::BadInput {
+                    field: "tag".into(),
+                    reason: "tag name is not valid UTF-8".into(),
+                })?;
+                validate_tag(&name)?;
+                Ok(Principal::Tag(name))
+            }
             other => Err(PvfsError::BadInput {
                 field: "principal_kind".into(),
                 reason: format!("unknown principal kind {other}"),
@@ -66,13 +78,17 @@ impl Principal {
         }
     }
 
-    /// Parse the CLI form: `public`, `any`, or `key:<hex>`.
+    /// Parse the CLI form: `public`, `any`, `tag:<name>`, or `key:<hex>`.
     pub fn parse(s: &str) -> Result<Principal> {
         if s == "public" {
             return Ok(Principal::Public);
         }
         if s == "any" {
             return Ok(Principal::Any);
+        }
+        if let Some(name) = s.strip_prefix("tag:") {
+            validate_tag(name)?;
+            return Ok(Principal::Tag(name.to_string()));
         }
         if let Some(hexstr) = s.strip_prefix("key:") {
             let bytes = hex::decode(hexstr).map_err(|_| PvfsError::BadInput {
@@ -84,7 +100,7 @@ impl Principal {
         }
         Err(PvfsError::BadInput {
             field: "principal".into(),
-            reason: format!("{s:?} — expected `public`, `any`, or `key:<hex>`"),
+            reason: format!("{s:?} — expected `public`, `any`, `tag:<name>`, or `key:<hex>`"),
         })
     }
 
@@ -93,8 +109,31 @@ impl Principal {
         match self {
             Principal::Public => "public".into(),
             Principal::Any => "any".into(),
+            Principal::Tag(t) => format!("tag:{t}"),
             Principal::Key(k) => format!("key:{}", hex::encode(k)),
         }
+    }
+}
+
+/// Tag names use the alias charset: `[a-z0-9][a-z0-9_-]{0,63}`.
+pub fn validate_tag(tag: &str) -> Result<()> {
+    let ok = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .bytes()
+            .next()
+            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .unwrap_or(false)
+        && tag
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(PvfsError::BadInput {
+            field: "tag".into(),
+            reason: format!("{tag:?} — use lowercase [a-z0-9][a-z0-9_-]{{0,63}}"),
+        })
     }
 }
 

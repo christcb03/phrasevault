@@ -22,6 +22,8 @@ live in docs 02–07; this is the index + the honest "what's not done yet."
 | **P2-C (writes todo)** | `mv` (re-home) and `set_acl` over the daemon | ☐ next |
 | **P2-C (read content)** | `Cat` — read file bytes via the daemon (`pvfs remote cat`), ACL-checked, ranged chunks | ✅ shipped (basic) |
 | **P2-C (data plane)** | Dedicated concurrent transfer threads + raw byte stream + streaming verify | ☐ planned (doc 07 §6) |
+| **P2-D (tags)** | Tag-based sharing: `tag:` ACL principal + member tags, evaluated with inheritance | ✅ shipped (doc 09 §1) |
+| **P2-D (live daemon)** | Admin/ACL/tag ops routed *through* the running daemon (single instance, live changes) | ☐ next (doc 09 §2) |
 | **P2-C (UX)** | Transparent remoting (`pvfs --forest <alias>` dials the socket); registry `owner`/`socket` | ☐ planned |
 | **P3** | Encryption-at-rest (reserved key path `m/43'/20566'/2'`), secure module | ☐ future |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm** sharing | ☐ future (doc 03) |

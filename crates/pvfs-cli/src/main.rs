@@ -110,6 +110,9 @@ enum Cmd {
     /// Access-control list operations (doc 06 §4)
     #[command(subcommand)]
     Acl(AclCmd),
+    /// Membership tag operations (doc 09 §1)
+    #[command(subcommand)]
+    Tag(TagCmd),
     /// Print this machine's PVFS client identity pubkey (doc 07 §2)
     Whoami,
     /// Talk to a forest's daemon over its Unix socket (doc 07)
@@ -277,6 +280,16 @@ enum AclCmd {
         /// Principal: `any` or `key:<hex>`
         principal: String,
     },
+}
+
+#[derive(Subcommand)]
+enum TagCmd {
+    /// Grant a tag to a member (by pubkey hex)
+    Add { member: String, tag: String },
+    /// Remove a tag from a member
+    Rm { member: String, tag: String },
+    /// List a member's tags
+    Ls { member: String },
 }
 
 #[derive(Subcommand)]
@@ -1007,6 +1020,48 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             node,
                             acl::rights_to_str(r)
                         );
+                    }
+                }
+            }
+            engine.close()
+        }
+        Cmd::Tag(t) => {
+            let mut engine = Engine::open(&ctx?)?;
+            let decode_member = |m: &str| -> Result<Vec<u8>, PvfsError> {
+                hex::decode(m).map_err(|_| PvfsError::BadInput {
+                    field: "member".into(),
+                    reason: "member must be a hex pubkey".into(),
+                })
+            };
+            match t {
+                TagCmd::Add { member, tag } => {
+                    engine.set_member_tag(&decode_member(&member)?, &tag, true)?;
+                    if json {
+                        println!("{{\"tagged\":true,\"tag\":\"{}\"}}", json_escape(&tag));
+                    } else {
+                        println!("tagged {member} with {tag}");
+                    }
+                }
+                TagCmd::Rm { member, tag } => {
+                    engine.set_member_tag(&decode_member(&member)?, &tag, false)?;
+                    if json {
+                        println!("{{\"tagged\":false,\"tag\":\"{}\"}}", json_escape(&tag));
+                    } else {
+                        println!("removed tag {tag} from {member}");
+                    }
+                }
+                TagCmd::Ls { member } => {
+                    let tags = engine.member_tags(&decode_member(&member)?)?;
+                    if json {
+                        let items: Vec<String> =
+                            tags.iter().map(|t| format!("\"{}\"", json_escape(t))).collect();
+                        println!("[{}]", items.join(","));
+                    } else if tags.is_empty() {
+                        println!("(no tags)");
+                    } else {
+                        for t in tags {
+                            println!("{t}");
+                        }
                     }
                 }
             }

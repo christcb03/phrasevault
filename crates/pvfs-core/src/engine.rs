@@ -1415,6 +1415,57 @@ impl Engine {
         Ok(out)
     }
 
+    /// Assign (`granted = true`) or remove a membership tag from a member key
+    /// (doc 09 §1). Authored by the local device, which must hold admin (`a`) on
+    /// the forest root (owner devices always do).
+    pub fn set_member_tag(
+        &mut self,
+        member_pubkey: &[u8],
+        tag: &str,
+        granted: bool,
+    ) -> Result<()> {
+        self.ensure_device_active()?;
+        crate::acl::validate_tag(tag)?;
+        let root = self.identity.root_node_id.clone();
+        let me = crate::acl::Principal::Key(self.device_pubkey());
+        if projection::effective_rights(&self.conn, &me, &root)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "tag member".into(),
+                reason: "this device lacks admin (a) on the forest root".into(),
+            });
+        }
+        let t = now_ms();
+        let author = self.device_pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_member_tagged(member_pubkey, tag, granted, t, &author),
+        )?;
+        self.append_durable(vec![Event::MemberTagged {
+            member_pubkey: member_pubkey.to_vec(),
+            tag: tag.to_string(),
+            granted,
+            set_at: t,
+            author,
+            sig,
+        }])
+    }
+
+    /// The membership tags a member key currently holds.
+    pub fn member_tags(&self, member_pubkey: &[u8]) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM member_tags WHERE member_pubkey = ?1 ORDER BY tag")
+            .map_err(map_db("prepare member tags"))?;
+        let rows = stmt
+            .query_map(params![member_pubkey], |r| r.get::<_, String>(0))
+            .map_err(map_db("query member tags"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_db("read member tag"))?);
+        }
+        Ok(out)
+    }
+
     /// Whether `principal` holds every bit in `right` on `node_id` (doc 06 §4.2).
     pub fn can(
         &self,

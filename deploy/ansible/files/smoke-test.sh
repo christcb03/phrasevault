@@ -239,6 +239,10 @@ $PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --mnemonic "$DMN" --pub
   >/dev/null && ok "authorize client identity as member"
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" "key:$CLIENTKEY" rw >/dev/null \
   && ok "grant member rw on root"
+# tags (doc 09): CLI wiring — tag a member, list it, share a node to a tag
+$PVFS --data-dir "$DMOUNT/.pvfs" tag add "$CLIENTKEY" testers >/dev/null && ok "tag add"
+$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q testers && ok "tag ls"
+$PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" tag:testers r >/dev/null && ok "acl set tag principal"
 
 SOCK="$DATA/served.sock"
 "$PVFSD" --mount "$DMOUNT" --socket "$SOCK" >/dev/null 2>&1 &

@@ -197,6 +197,55 @@ fn member_write_two_phase() {
     engine.close().unwrap();
 }
 
+// doc 09 §1 — tag-based sharing: a node grants `tag:X`; members holding X get it
+#[test]
+fn member_tags_grant_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let media = engine.add_node(&root, folder("media")).unwrap();
+
+    let member = foreign_pubkey();
+    engine.authorize_member(&m, &member).unwrap();
+    let p = acl::Principal::Key(member.clone());
+
+    // share /media with the `media_users` tag (read)
+    engine
+        .set_acl(&media, &acl::Principal::Tag("media_users".into()), acl::ACL_R)
+        .unwrap();
+
+    // a member without the tag sees nothing
+    assert_eq!(engine.effective_rights(&p, &media).unwrap(), 0);
+
+    // grant the tag → access (and it inherits down the tree)
+    engine.set_member_tag(&member, "media_users", true).unwrap();
+    assert!(engine
+        .member_tags(&member)
+        .unwrap()
+        .contains(&"media_users".to_string()));
+    assert_eq!(engine.effective_rights(&p, &media).unwrap(), acl::ACL_R);
+    let clip = engine.add_node(&media, folder("clip")).unwrap();
+    assert_eq!(engine.effective_rights(&p, &clip).unwrap(), acl::ACL_R);
+    // querying the tag principal reports the share grant itself
+    assert_eq!(
+        engine
+            .effective_rights(&acl::Principal::Tag("media_users".into()), &media)
+            .unwrap(),
+        acl::ACL_R
+    );
+    engine.close().unwrap();
+
+    // both the share grant and the member's tag survive a full rebuild
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let mut engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.effective_rights(&p, &media).unwrap(), acl::ACL_R);
+
+    // dropping the tag revokes access on the fly
+    engine.set_member_tag(&member, "media_users", false).unwrap();
+    assert_eq!(engine.effective_rights(&p, &media).unwrap(), 0);
+    engine.close().unwrap();
+}
+
 // doc 07 §4 — the three tiers: `public` reaches everyone; `any` only members
 #[test]
 fn acl_public_vs_any_tiers() {
