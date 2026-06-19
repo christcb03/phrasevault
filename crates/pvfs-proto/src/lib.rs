@@ -71,6 +71,23 @@ pub enum WriteOp {
     AddLocation { file: String, uri: String },
     /// Re-home `node` under `new_parent`.
     Mv { node: String, new_parent: String },
+    /// Set a principal's rights on a node. `principal` = `public`|`any`|`tag:<name>`|
+    /// `key:<hex>`; `rights` = `rwa` letters or `-` to clear.
+    SetAcl {
+        node: String,
+        principal: String,
+        rights: String,
+    },
+    /// Grant (`granted`) or remove a membership tag from a member key (hex).
+    TagMember {
+        member: String,
+        tag: String,
+        granted: bool,
+    },
+    /// Admit a member's key (hex).
+    AuthorizeMember { pubkey: String },
+    /// Revoke a device/member key (hex).
+    Revoke { pubkey: String },
 }
 
 /// Client → server messages.

@@ -138,7 +138,7 @@ it does not block the live-daemon work.
 | **2** | ☑ `mv` (re-home a node, member-signed over the daemon). |
 | **3a** | **Device certs = "root or admin device"** (replay rule + engine `authorize_member`/`revoke` by an admin device, phrase-free) — the kernel foundation. |
 | **3b** | ☑ Conventional per-forest socket (`$PVFS_SOCKET_DIR/<forest_id>.sock`); `pvfsd` binds it by default; `pvfs remote --forest <alias\|mount>` resolves it (no manual socket path). |
-| **3c** | Admin ops over the daemon (`set_acl`/`tag`/`authorize`/`revoke`) on the two-phase rails, with a **pluggable signer** seam (device key now; companion later). |
+| **3c** | ☑ Admin ops over the daemon — `SetAcl`/`TagMember`/`AuthorizeMember`/`Revoke` `WriteOp`s; engine `prepare_*` + a commit that routes device certs through `check_device_cert`; `pvfs-client` `set_acl`/`tag_member`/`authorize_member`/`revoke`. Owner does **live admin over the socket** (authorize a member + grant → member writes immediately, no restart). Pluggable-signer seam (device key now; companion later). |
 | **3d** | CLI **always auto-routes**: any forest op looks for a daemon serving that forest → submit to it; else write directly. No flags, no phrase. |
 | **4** | Raw data plane for `cat`. |
 | **5** | Companion app (§6): root custodian + localhost identity agent / auto-login. Its own track. |

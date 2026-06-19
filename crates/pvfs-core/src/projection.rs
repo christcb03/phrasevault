@@ -564,22 +564,11 @@ fn replay_one(
                 seq: Some(row.seq),
             })
         }
-        // Device certificates are signed by the identity root OR by a device
-        // holding admin (`a`) on the forest root (doc 09 §2.2) — so an admin
-        // device can admit/revoke members without the recovery phrase. Genesis's
+        // Device certificates: root- or admin-device-signed (doc 09 §2.2). Genesis's
         // device-0 cert is root-signed (no admin device exists yet).
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
-            let by_root = author == &identity.root_pubkey;
-            let by_admin = !by_root
-                && effective_rights(
-                    tx,
-                    &Principal::Key(author.clone()),
-                    &identity.root_node_id,
-                )? & acl::ACL_A
-                    != 0;
-            if !by_root && !by_admin {
-                return Err(unauthorized(row.seq, ev.kind()));
-            }
+            check_device_cert(tx, &identity.root_pubkey, &identity.root_node_id, author)
+                .map_err(|_| unauthorized(row.seq, ev.kind()))?;
         }
         Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
         // Every other event is device-authored: enforce the same author + ACL
@@ -664,6 +653,29 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// A device certificate (`DeviceAuthorized`/`DeviceRevoked`) is valid when signed
+/// by the identity root **or** by a device holding admin (`a`) on the forest root
+/// (doc 09 §2.2). Shared by replay and the live admin-op commit.
+pub fn check_device_cert(
+    conn: &Connection,
+    root_pubkey: &[u8],
+    root_node_id: &str,
+    author: &[u8],
+) -> Result<()> {
+    let by_root = author == root_pubkey;
+    let by_admin = !by_root
+        && effective_rights(conn, &Principal::Key(author.to_vec()), root_node_id)? & acl::ACL_A != 0;
+    if by_root || by_admin {
+        Ok(())
+    } else {
+        Err(PvfsError::Integrity {
+            kind: "event",
+            id: "device certificate".into(),
+            reason: crate::error::IntegrityReason::UnknownAuthor,
+        })
+    }
 }
 
 /// Require that `author` holds every bit in `right` on `node`, else `Forbidden`.

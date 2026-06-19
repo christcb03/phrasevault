@@ -351,6 +351,8 @@ impl Event {
             Event::LinkCreated(l) => l.sig = sig,
             Event::AclSet { sig: s, .. }
             | Event::MemberTagged { sig: s, .. }
+            | Event::DeviceAuthorized { sig: s, .. }
+            | Event::DeviceRevoked { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,

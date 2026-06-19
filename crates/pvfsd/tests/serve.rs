@@ -241,6 +241,60 @@ fn daemon_cat_reads_file_bytes() {
     assert!(forbidden(anon.cat(&file_node, &mut empty)));
 }
 
+// doc 09 §3c — live admin through the socket: the owner authorizes a member and
+// grants access over the daemon, and the member can immediately write (no restart)
+#[test]
+fn daemon_live_admin_through_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let owner_key = identity::device_key(&owner_mn, "", 0).unwrap(); // device 0 = admin
+    let owner_pub = crypto::pubkey_bytes(&owner_key);
+    assert_eq!(owner_pub, engine.device_pubkey());
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    // a brand-new member identity, not yet known to the forest
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    let member_hex = hex::encode(&member_pub);
+
+    // OWNER connects (admin) and live-admins entirely over the socket
+    let mut owner = Client::connect_signed(&sock, &owner_pub, |d| {
+        crypto::sign_digest(&owner_key, d).unwrap()
+    })
+    .unwrap();
+    owner
+        .authorize_member(&member_hex, |d| crypto::sign_digest(&owner_key, d).unwrap())
+        .unwrap();
+    owner
+        .set_acl(&root, &format!("key:{member_hex}"), "rw", |d| {
+            crypto::sign_digest(&owner_key, d).unwrap()
+        })
+        .unwrap();
+
+    // the MEMBER connects and writes immediately — the changes took effect live
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+    member
+        .mkdir(&root, "by-member", |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })
+        .unwrap();
+    assert!(labels(&member.ls(&root).unwrap()).contains(&"by-member".to_string()));
+}
+
 // doc 09 §4 — a member moves a node between folders through the daemon
 #[test]
 fn daemon_member_move() {

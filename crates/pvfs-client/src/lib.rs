@@ -263,6 +263,53 @@ impl Client {
         )
     }
 
+    /// Set a principal's rights on a node (admin op, doc 09 §3c). `principal` =
+    /// `public`|`any`|`tag:<name>`|`key:<hex>`; `rights` = `rwa` letters or `-`.
+    pub fn set_acl<F>(&mut self, node: &str, principal: &str, rights: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::SetAcl {
+                node: node.into(),
+                principal: principal.into(),
+                rights: rights.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Grant (`granted`) or remove a membership tag from a member key (hex).
+    pub fn tag_member<F>(&mut self, member: &str, tag: &str, granted: bool, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::TagMember {
+                member: member.into(),
+                tag: tag.into(),
+                granted,
+            },
+            sign,
+        )
+    }
+
+    /// Admit a member's key (hex). Signed by an admin device.
+    pub fn authorize_member<F>(&mut self, pubkey: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(WriteOp::AuthorizeMember { pubkey: pubkey.into() }, sign)
+    }
+
+    /// Revoke a device/member key (hex). Signed by an admin device.
+    pub fn revoke<F>(&mut self, pubkey: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(WriteOp::Revoke { pubkey: pubkey.into() }, sign)
+    }
+
     /// The two-phase write flow (doc 07 §5): prepare → sign each preimage → commit.
     /// `sign` produces a signature over each 32-byte preimage with the member's key.
     fn write_op<F>(&mut self, op: WriteOp, sign: F) -> Result<String>

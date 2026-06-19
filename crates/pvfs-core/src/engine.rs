@@ -1654,7 +1654,19 @@ impl Engine {
     pub fn commit_member_write(&mut self, events: Vec<Event>) -> Result<()> {
         for ev in &events {
             ev.verify_sig()?;
-            projection::check_member_event(&self.conn, ev)?;
+            match ev {
+                // Device certs follow the root-or-admin rule (doc 09 §2.2); every
+                // other event follows the member/ACL rules.
+                Event::DeviceAuthorized { .. } | Event::DeviceRevoked { .. } => {
+                    projection::check_device_cert(
+                        &self.conn,
+                        &self.identity.root_pubkey,
+                        &self.identity.root_node_id,
+                        ev.author(),
+                    )?;
+                }
+                _ => projection::check_member_event(&self.conn, ev)?,
+            }
         }
         // Idempotent double-commit of the same prepared node ⇒ success, no re-append.
         if let Some(Event::NodeCreated(n)) = events.first() {
@@ -1839,6 +1851,152 @@ impl Engine {
                     event: Event::LinkCreated(link),
                 },
             ],
+        })
+    }
+
+    // ---- admin ops over the daemon (doc 09 §3c), all prepared for an external
+    //      admin signer (the owner's device, or root via the companion) ----------
+
+    fn require_admin_on_root(&self, author_pub: &[u8], action: &'static str) -> Result<()> {
+        let root = self.identity.root_node_id.clone();
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, &root)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: action.into(),
+                reason: "you lack admin (a) on the forest root".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Phase 1: build an unsigned `AclSet`. The author must hold admin on the node.
+    pub fn prepare_set_acl(
+        &self,
+        author_pub: &[u8],
+        node_id: &NodeId,
+        principal: &crate::acl::Principal,
+        rights: u8,
+    ) -> Result<PreparedWrite> {
+        if fetch_node(&self.conn, node_id)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: node_id.clone(),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, node_id)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "set acl".into(),
+                reason: format!("you lack admin (a) on {node_id}"),
+            });
+        }
+        let t = now_ms();
+        let (kind, id) = (principal.kind(), principal.id().to_vec());
+        let digest = event::msg_acl_set(node_id, kind, &id, rights as u64, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: node_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::AclSet {
+                    node_id: node_id.clone(),
+                    principal_kind: kind,
+                    principal_id: id,
+                    rights: rights as u64,
+                    set_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1: build an unsigned `MemberTagged`. The author must hold admin on root.
+    pub fn prepare_set_member_tag(
+        &self,
+        author_pub: &[u8],
+        member_pubkey: &[u8],
+        tag: &str,
+        granted: bool,
+    ) -> Result<PreparedWrite> {
+        crate::acl::validate_tag(tag)?;
+        self.require_admin_on_root(author_pub, "tag member")?;
+        let t = now_ms();
+        let digest = event::msg_member_tagged(member_pubkey, tag, granted, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(member_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::MemberTagged {
+                    member_pubkey: member_pubkey.to_vec(),
+                    tag: tag.to_string(),
+                    granted,
+                    set_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1: build an unsigned `DeviceAuthorized` admitting `member_pubkey`. The
+    /// author must hold admin on root (or be the root — see `check_device_cert`).
+    pub fn prepare_authorize_member(
+        &self,
+        author_pub: &[u8],
+        member_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        crypto::validate_pubkey(member_pubkey)?;
+        self.require_admin_on_root(author_pub, "authorize member")?;
+        if self.device_known(member_pubkey)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "device",
+                id: hex::encode(member_pubkey),
+            });
+        }
+        let t = now_ms();
+        let idx = crate::acl::MEMBER_DEVICE_INDEX;
+        let digest = event::msg_device_authorized(member_pubkey, idx, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(member_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::DeviceAuthorized {
+                    device_pubkey: member_pubkey.to_vec(),
+                    device_index: idx,
+                    authorized_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1: build an unsigned `DeviceRevoked`. The author must hold admin on root.
+    pub fn prepare_revoke(
+        &self,
+        author_pub: &[u8],
+        device_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        self.require_admin_on_root(author_pub, "revoke device")?;
+        if !self.device_known(device_pubkey)? {
+            return Err(PvfsError::NotFound {
+                kind: "device",
+                id: hex::encode(device_pubkey),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_device_revoked(device_pubkey, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(device_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::DeviceRevoked {
+                    device_pubkey: device_pubkey.to_vec(),
+                    revoked_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
         })
     }
 }

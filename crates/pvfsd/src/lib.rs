@@ -237,6 +237,30 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
             WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
             WriteOp::AddLocation { file, uri } => e.prepare_add_location(&author, &file, &uri),
             WriteOp::Mv { node, new_parent } => e.prepare_move_node(&author, &node, &new_parent),
+            WriteOp::SetAcl {
+                node,
+                principal,
+                rights,
+            } => match (Principal::parse(&principal), acl::parse_rights(&rights)) {
+                (Ok(p), Ok(r)) => e.prepare_set_acl(&author, &node, &p, r),
+                (Err(err), _) | (_, Err(err)) => Err(err),
+            },
+            WriteOp::TagMember {
+                member,
+                tag,
+                granted,
+            } => match hex::decode(&member) {
+                Ok(pk) => e.prepare_set_member_tag(&author, &pk, &tag, granted),
+                Err(_) => Err(bad_hex("member")),
+            },
+            WriteOp::AuthorizeMember { pubkey } => match hex::decode(&pubkey) {
+                Ok(pk) => e.prepare_authorize_member(&author, &pk),
+                Err(_) => Err(bad_hex("pubkey")),
+            },
+            WriteOp::Revoke { pubkey } => match hex::decode(&pubkey) {
+                Ok(pk) => e.prepare_revoke(&author, &pk),
+                Err(_) => Err(bad_hex("pubkey")),
+            },
         }
     };
     let prepared = match prepared {
@@ -344,6 +368,13 @@ fn err(code: &str, message: &str) -> ServerMsg {
     ServerMsg::Error {
         code: code.into(),
         message: message.into(),
+    }
+}
+
+fn bad_hex(field: &str) -> PvfsError {
+    PvfsError::BadInput {
+        field: field.into(),
+        reason: "must be hex".into(),
     }
 }
 
