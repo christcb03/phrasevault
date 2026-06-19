@@ -10,6 +10,7 @@ DATA="$(mktemp -d /tmp/pvfs-smoke.XXXXXX)"
 export PVFS_DATA_DIR="$DATA/forest"
 export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
 export XDG_CONFIG_HOME="$DATA/config"       # keep the client identity out of $HOME
+export PVFS_SOCKET_DIR="$DATA/sockets"      # per-forest daemon sockets (doc 09 §3b)
 PASS=0
 FAIL=0
 DPID=""
@@ -244,11 +245,15 @@ $PVFS --data-dir "$DMOUNT/.pvfs" tag add "$CLIENTKEY" testers >/dev/null && ok "
 $PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q testers && ok "tag ls"
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" tag:testers r >/dev/null && ok "acl set tag principal"
 
-SOCK="$DATA/served.sock"
-"$PVFSD" --mount "$DMOUNT" --socket "$SOCK" >/dev/null 2>&1 &
+# pvfsd binds its conventional per-forest socket ($PVFS_SOCKET_DIR/<forest_id>.sock)
+SOCK="$PVFS_SOCKET_DIR/$DFID.sock"
+"$PVFSD" --mount "$DMOUNT" >/dev/null 2>&1 &
 DPID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
-[ -S "$SOCK" ] && ok "pvfsd listening on socket" || fail "pvfsd socket missing"
+[ -S "$SOCK" ] && ok "pvfsd binds its conventional socket" || fail "pvfsd socket missing"
+# the client finds the socket by forest (mount path) without --socket
+$PVFS --json remote --forest "$DMOUNT" --anon info | grep -q "\"forest_id\":\"$DFID\"" \
+  && ok "remote --forest resolves the daemon socket"
 
 $PVFS --json remote --socket "$SOCK" --anon info | grep -q "\"forest_id\":\"$DFID\"" \
   && ok "remote info (anonymous)"

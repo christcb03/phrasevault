@@ -117,9 +117,12 @@ enum Cmd {
     Whoami,
     /// Talk to a forest's daemon over its Unix socket (doc 07)
     Remote {
-        /// Path to the daemon's Unix socket
+        /// Explicit socket path (otherwise resolved from --forest)
         #[arg(long)]
-        socket: PathBuf,
+        socket: Option<PathBuf>,
+        /// Forest (alias or mount path) — finds the daemon's conventional socket
+        #[arg(long)]
+        forest: Option<String>,
         /// Connect as `public` instead of proving the client identity
         #[arg(long)]
         anon: bool,
@@ -367,6 +370,27 @@ fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
         field: "remote".into(),
         reason: e.to_string(),
     }
+}
+
+/// Resolve the daemon socket: explicit `--socket`, else the conventional path for
+/// the forest named by `--forest` (an alias or a mount path).
+fn resolve_remote_socket(
+    socket: Option<PathBuf>,
+    forest: Option<String>,
+) -> Result<PathBuf, PvfsError> {
+    if let Some(s) = socket {
+        return Ok(s);
+    }
+    let forest = forest.ok_or_else(|| PvfsError::BadInput {
+        field: "remote".into(),
+        reason: "pass --socket <path> or --forest <alias|mount>".into(),
+    })?;
+    let mount = match Registry::system().find(&forest)? {
+        Some(f) => f.mount,
+        None => PathBuf::from(&forest),
+    };
+    let forest_id = mount::peek_identity(&mount)?.forest_id;
+    Ok(mount::daemon_socket_path(&forest_id))
 }
 
 fn needs_identity() -> PvfsError {
@@ -1087,7 +1111,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Remote { socket, anon, cmd } => {
+        Cmd::Remote {
+            socket,
+            forest,
+            anon,
+            cmd,
+        } => {
+            let socket = resolve_remote_socket(socket, forest)?;
             let identity_key = if anon {
                 None
             } else {

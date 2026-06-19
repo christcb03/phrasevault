@@ -137,7 +137,7 @@ it does not block the live-daemon work.
 | **1** | ☑ Tags: `Tag` principal, `MemberTagged` event + `member_tags` table, `effective_rights` extension; local CLI. |
 | **2** | ☑ `mv` (re-home a node, member-signed over the daemon). |
 | **3a** | **Device certs = "root or admin device"** (replay rule + engine `authorize_member`/`revoke` by an admin device, phrase-free) — the kernel foundation. |
-| **3b** | `pvfsd` publishes its `owner`/`socket` in the registry on startup. |
+| **3b** | ☑ Conventional per-forest socket (`$PVFS_SOCKET_DIR/<forest_id>.sock`); `pvfsd` binds it by default; `pvfs remote --forest <alias\|mount>` resolves it (no manual socket path). |
 | **3c** | Admin ops over the daemon (`set_acl`/`tag`/`authorize`/`revoke`) on the two-phase rails, with a **pluggable signer** seam (device key now; companion later). |
 | **3d** | CLI **always auto-routes**: any forest op looks for a daemon serving that forest → submit to it; else write directly. No flags, no phrase. |
 | **4** | Raw data plane for `cat`. |

@@ -152,22 +152,25 @@ pvfs acl set <node-id> public r
 
 ### 7.3 Serve the forest
 
-Run the daemon as yourself:
+Run the daemon as yourself — it binds a conventional socket automatically
+(`$PVFS_SOCKET_DIR/<forest_id>.sock`, default `/tmp/pvfs/…`):
 ```bash
-pvfsd --mount ~/media --socket /run/user/$UID/pvfs-media.sock
+pvfsd --mount ~/media          # (--socket <path> to override)
 ```
 
 ### 7.4 The member reads it
 
+Point at the forest with `--forest` (an alias or mount path) — no socket path needed:
 ```bash
 # authenticated as their identity (signs a challenge):
-pvfs remote --socket /run/user/1000/pvfs-media.sock ls   <photos-node-id>
-pvfs remote --socket /run/user/1000/pvfs-media.sock stat <node-id>
-pvfs remote --socket /run/user/1000/pvfs-media.sock info
+pvfs remote --forest media ls   <photos-node-id>
+pvfs remote --forest media stat <node-id>
+pvfs remote --forest media info
 
 # or anonymously (only sees `public` grants):
-pvfs remote --socket … --anon ls <node-id>
+pvfs remote --forest media --anon ls <node-id>
 ```
+(`--socket <path>` still works for an explicit socket.)
 
 The daemon checks the caller's rights on every request and returns only what they may read.
 

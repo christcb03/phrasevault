@@ -22,6 +22,23 @@ use crate::storage::path_to_uri;
 
 pub const STATE_DIR: &str = ".pvfs";
 pub const DEFAULT_REGISTRY: &str = "/etc/pvfs";
+/// Default directory for per-forest daemon sockets (world-traversable so other
+/// users can reach a served forest). Override with `$PVFS_SOCKET_DIR`.
+pub const DEFAULT_SOCKET_DIR: &str = "/tmp/pvfs";
+
+/// The directory daemon sockets live in (`$PVFS_SOCKET_DIR` or [`DEFAULT_SOCKET_DIR`]).
+pub fn daemon_socket_dir() -> PathBuf {
+    std::env::var_os("PVFS_SOCKET_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_DIR))
+}
+
+/// The conventional socket path for a forest's daemon: `<socket-dir>/<forest_id>.sock`.
+/// Both `pvfsd` (to bind) and clients (to find a running daemon) derive it.
+pub fn daemon_socket_path(forest_id: &str) -> PathBuf {
+    daemon_socket_dir().join(format!("{forest_id}.sock"))
+}
 
 fn bad(field: &str, reason: String) -> PvfsError {
     PvfsError::BadInput {
