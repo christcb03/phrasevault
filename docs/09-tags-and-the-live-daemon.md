@@ -63,13 +63,21 @@ direction (the key is the identity; the socket — and later the network — is 
 - No running daemon → falls back to opening the engine directly (current behavior), for setup,
   scripting, and recovery.
 
-### 2.2 Privilege of admin ops over the socket (two-phase, same as member writes)
-- **ACL grant / tag assign / mv / member writes** — signed by a device that holds the needed right
-  (`a` for ACL/tag, `w` for writes). The **owner's device** qualifies for all of them, so the owner
-  connects with their device identity and signs.
-- **authorize-member** — admits a new identity, so it must be signed by the **identity root**. The
-  owner's client signs the prepared `DeviceAuthorized` with the root key (from the recovery phrase);
-  the daemon appends it. Replay re-verifies (root-signed) as today.
+### 2.2 Privilege of admin ops — a pluggable signer, no recovery phrase
+All admin ops ride the existing two-phase rails (`prepare → sign → commit`); the only question is
+**who signs**, which is abstracted as a *signer* (the CLI's device key today, the companion §6 later):
+
+- **ACL grant / tag assign / mv / member writes** — signed by a device holding the needed right
+  (`a` for ACL/tag, `w` for writes). The owner's device qualifies, so these are **device-signed,
+  phrase-free**.
+- **authorize-member / revoke** (admit/remove an identity) — **device certificates**. The rule is
+  loosened from "root-only" to **"root **or** an admin device"** (a device holding `a` on the forest
+  root, which the owner's device does). So an admin device admits members **phrase-free**; the root
+  path remains for the strongest setups (signed by the companion, §6). Genesis stays root-signed
+  (no admin device exists yet at that instant). Re-verified on replay with the same rule.
+
+**The recovery phrase is for recovery only** — restoring keys on a new machine, or as the deep anchor
+if every admin device is lost. No day-to-day op asks for it.
 
 ### 2.3 Live config
 Because all changes flow through the daemon, there is no reload step: ACLs, tags, and memberships
@@ -96,14 +104,44 @@ remove+add). Member-signed; requires `w` on **both** the old and new parent. Fit
 
 ---
 
-## 5. Implementation phasing
+## 6. The companion app (local signing agent)
+
+An optional desktop **companion** is the strongest home for the **root key**: it is generated and
+kept locally and **never leaves the desktop** — not over the wire, not to disk-in-the-clear, not
+typed. It plays the role of a hardware wallet / `ssh-agent` / passkey authenticator for PVFS, with
+two jobs:
+
+1. **Root custodian / authorizer.** When the daemon prepares a `DeviceAuthorized` (admit a machine or
+   member), it asks the companion to sign it. The companion signs with the root (with a user
+   approval, like a passkey tap) and returns only the signature — the daemon appends it. This is just
+   another **signer** behind the two-phase flow (§2.2), so it needs no new kernel path. Result:
+   root-strength authorization with no phrase.
+2. **Identity agent / auto-login.** The companion exposes a **localhost** endpoint. A PVFS-backed web
+   app (e.g. a media-forest app) authenticates by having the companion sign the daemon's
+   challenge-response (doc 07 §2) with the user's device key — so the app logs the user in with no
+   password and no phrase ("Sign in with PVFS"). While the companion runs, any PVFS-backed site the
+   user has authorized logs in automatically.
+
+**Security to design in:** the localhost endpoint must gate **which web origins** may request a
+signature (per-app "connect" approval, like a wallet), and the root should be encrypted at rest and
+unlocked only while the companion runs. The companion is its **own application track** (key vault +
+localhost web API + approval UI); the daemon/protocol are built to accept it as a drop-in signer, so
+it does not block the live-daemon work.
+
+---
+
+## 7. Implementation phasing
 
 | Phase | Deliverable |
 |-------|-------------|
-| **1** | Tags: `Tag` principal, `MemberTagged` event + `member_tags` table + fold + replay check, `effective_rights` extension; local CLI (`pvfs tag member …`, `pvfs acl set <node> tag:<name> …`). |
-| **2** | ☑ `mv` (re-home a node, member-signed over the daemon). `set_acl`/tag *over the daemon* fold into Phase 3. |
-| **3** | Single-instance routing: admin ops over the daemon (incl. root-signed `authorize-member`); CLI auto-detects the socket and submits; direct-engine fallback when no daemon. |
+| **1** | ☑ Tags: `Tag` principal, `MemberTagged` event + `member_tags` table, `effective_rights` extension; local CLI. |
+| **2** | ☑ `mv` (re-home a node, member-signed over the daemon). |
+| **3a** | **Device certs = "root or admin device"** (replay rule + engine `authorize_member`/`revoke` by an admin device, phrase-free) — the kernel foundation. |
+| **3b** | `pvfsd` publishes its `owner`/`socket` in the registry on startup. |
+| **3c** | Admin ops over the daemon (`set_acl`/`tag`/`authorize`/`revoke`) on the two-phase rails, with a **pluggable signer** seam (device key now; companion later). |
+| **3d** | CLI **always auto-routes**: any forest op looks for a daemon serving that forest → submit to it; else write directly. No flags, no phrase. |
 | **4** | Raw data plane for `cat`. |
+| **5** | Companion app (§6): root custodian + localhost identity agent / auto-login. Its own track. |
 
 Kernel encodings unchanged except the additive `MemberTagged` event + `member_tags` table (no
 schema-version bump; additive table via `CREATE TABLE IF NOT EXISTS`).

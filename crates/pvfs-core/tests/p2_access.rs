@@ -246,6 +246,49 @@ fn member_tags_grant_access() {
     engine.close().unwrap();
 }
 
+// doc 09 §2.2 — an admin device admits a member with no recovery phrase
+#[test]
+fn admin_device_authorizes_member_without_phrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    // owner's device (admin) authorizes a member — no mnemonic
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member_by_device(&member_pub).unwrap();
+
+    // grant write and let the member create a node signed with their own key
+    let dropbox = engine.add_node(&root, folder("dropbox")).unwrap();
+    engine
+        .set_acl(
+            &dropbox,
+            &acl::Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+    let prep = engine
+        .prepare_add_node(&member_pub, &dropbox, folder("hi"))
+        .unwrap();
+    let signed: Vec<_> = prep
+        .events
+        .into_iter()
+        .map(|pe| {
+            let mut ev = pe.event;
+            ev.set_author_sig(crypto::sign_digest(&member_key, &pe.digest).unwrap());
+            ev
+        })
+        .collect();
+    engine.commit_member_write(signed).unwrap();
+    engine.close().unwrap();
+
+    // the admin-device-signed cert AND the member write replay through a rebuild
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.children(&dropbox).unwrap().len(), 1);
+    engine.close().unwrap();
+}
+
 // doc 07 §4 — the three tiers: `public` reaches everyone; `any` only members
 #[test]
 fn acl_public_vs_any_tiers() {

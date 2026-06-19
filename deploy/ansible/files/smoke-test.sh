@@ -235,8 +235,8 @@ CLIENTKEY="$(jget "$($PVFS --json whoami)" pubkey)"
 # Owner setup happens BEFORE serving (the daemon opens a snapshot of the log).
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" public r >/dev/null \
   && ok "acl set public r on root"
-$PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --mnemonic "$DMN" --pubkey "$CLIENTKEY" \
-  >/dev/null && ok "authorize client identity as member"
+$PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --pubkey "$CLIENTKEY" \
+  >/dev/null && ok "authorize member (admin device, no recovery phrase)"
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" "key:$CLIENTKEY" rw >/dev/null \
   && ok "grant member rw on root"
 # tags (doc 09): CLI wiring — tag a member, list it, share a node to a tag

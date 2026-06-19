@@ -134,8 +134,8 @@ pvfs whoami            # prints: client identity : key:028f...
 
 **On your machine** (the owner), authorize that key and grant rights:
 ```bash
-# 1. authorize the member's key (needs your recovery phrase — only the owner may authorize)
-pvfs device authorize-member --mnemonic "<your 24 words>" --pubkey 028f...
+# 1. authorize the member's key — signed by your admin device, no recovery phrase
+pvfs device authorize-member --pubkey 028f...
 
 # 2. grant them read on a subtree (by node id)
 pvfs acl set <photos-node-id> key:028f... r
@@ -209,8 +209,11 @@ tag grant, or drop the member's tag with `pvfs tag rm <key> media_users`. Inspec
 - Your **recovery phrase** (shown once at `forest init`) regenerates your keys. Store it safely.
 - Move a forest to a new machine: copy the whole mount (including `.pvfs/`), then
   `pvfs recover --mnemonic "<phrase>"` to re-derive this machine's device key.
-- Revoke a lost/compromised key: `pvfs device revoke --mnemonic "<phrase>" --pubkey <hex>`
-  (its already-signed history stays valid; it just can't sign new changes).
+- Revoke a lost/compromised key: `pvfs device revoke --pubkey <hex>` (signed by your admin device;
+  add `--mnemonic "<phrase>"` to root-sign). Its already-signed history stays valid.
+
+Your **recovery phrase** is needed only for recovery — admitting/revoking members is signed by your
+everyday admin device, not the phrase (doc 09 §2.2).
 
 ---
 
@@ -229,8 +232,8 @@ tag grant, or drop the member's tag with `pvfs tag rm <key> media_users`. Inspec
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
-| `pvfs device authorize-member --pubkey <hex> --mnemonic …` | Authorize a member's key. |
-| `pvfs device revoke --pubkey <hex> --mnemonic …` | Revoke a device/member key. |
+| `pvfs device authorize-member --pubkey <hex>` | Authorize a member's key (admin device; no phrase). |
+| `pvfs device revoke --pubkey <hex>` | Revoke a device/member key (admin device; no phrase). |
 | `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
 | `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |

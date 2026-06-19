@@ -1334,6 +1334,78 @@ impl Engine {
         }])
     }
 
+    /// Authorize an external member key signed by the **local device** — no
+    /// recovery phrase (doc 09 §2.2). The local device must hold admin (`a`) on
+    /// the forest root (owner devices do).
+    pub fn authorize_member_by_device(&mut self, member_pubkey: &[u8]) -> Result<()> {
+        self.ensure_device_active()?;
+        crypto::validate_pubkey(member_pubkey)?;
+        if member_pubkey == self.identity.root_pubkey.as_slice() {
+            return Err(bad(
+                "member_pubkey",
+                "refusing to authorize the identity root as a device",
+            ));
+        }
+        self.require_local_admin("authorize member")?;
+        if self.device_known(member_pubkey)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "device",
+                id: hex::encode(member_pubkey),
+            });
+        }
+        let t = now_ms();
+        let author = self.device_pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_device_authorized(member_pubkey, crate::acl::MEMBER_DEVICE_INDEX, t, &author),
+        )?;
+        self.append_durable(vec![Event::DeviceAuthorized {
+            device_pubkey: member_pubkey.to_vec(),
+            device_index: crate::acl::MEMBER_DEVICE_INDEX,
+            authorized_at: t,
+            author,
+            sig,
+        }])
+    }
+
+    /// Revoke a device/member key signed by the **local device** — no recovery
+    /// phrase. The local device must hold admin (`a`) on the forest root.
+    pub fn revoke_by_device(&mut self, device_pubkey: &[u8]) -> Result<()> {
+        self.ensure_device_active()?;
+        self.require_local_admin("revoke device")?;
+        if !self.device_known(device_pubkey)? {
+            return Err(PvfsError::NotFound {
+                kind: "device",
+                id: hex::encode(device_pubkey),
+            });
+        }
+        let t = now_ms();
+        let author = self.device_pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_device_revoked(device_pubkey, t, &author),
+        )?;
+        self.append_durable(vec![Event::DeviceRevoked {
+            device_pubkey: device_pubkey.to_vec(),
+            revoked_at: t,
+            author,
+            sig,
+        }])
+    }
+
+    /// Require the local device to hold admin (`a`) on the forest root.
+    fn require_local_admin(&self, action: &'static str) -> Result<()> {
+        let root = self.identity.root_node_id.clone();
+        let me = crate::acl::Principal::Key(self.device_pubkey());
+        if projection::effective_rights(&self.conn, &me, &root)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: action.into(),
+                reason: "this device lacks admin (a) on the forest root".into(),
+            });
+        }
+        Ok(())
+    }
+
     // ---- access control (doc 06 §4) ------------------------------------------------
 
     /// Set (or, with `rights == 0`, clear) one principal's rights on `node_id`.

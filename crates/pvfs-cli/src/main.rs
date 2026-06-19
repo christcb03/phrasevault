@@ -238,20 +238,21 @@ enum DeviceCmd {
         #[arg(long)]
         index: u64,
     },
-    /// Authorize an external member's device key by public key (doc 06 §3;
-    /// requires the recovery phrase). The member signs their own writes.
+    /// Authorize an external member's device key by public key (doc 09 §2.2).
+    /// Signed by your admin device (no phrase); pass --mnemonic to root-sign.
     AuthorizeMember {
+        /// Optional recovery phrase — root-signs instead of device-signing
         #[arg(long)]
-        mnemonic: String,
+        mnemonic: Option<String>,
         /// The member's compressed secp256k1 public key, hex (33-byte SEC1)
         #[arg(long)]
         pubkey: String,
     },
-    /// Revoke a device or member key for new appends (requires the recovery
-    /// phrase). Its already-signed history stays valid.
+    /// Revoke a device or member key for new appends. Signed by your admin
+    /// device (no phrase); pass --mnemonic to root-sign. History stays valid.
     Revoke {
         #[arg(long)]
-        mnemonic: String,
+        mnemonic: Option<String>,
         #[arg(long)]
         pubkey: String,
     },
@@ -933,12 +934,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 DeviceCmd::AuthorizeMember { mnemonic, pubkey } => {
-                    let m = identity::parse_mnemonic(&mnemonic)?;
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
-                    engine.authorize_member(&m, &pk)?;
+                    match mnemonic {
+                        Some(mn) => engine.authorize_member(&identity::parse_mnemonic(&mn)?, &pk)?,
+                        None => engine.authorize_member_by_device(&pk)?,
+                    }
                     if json {
                         println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
                     } else {
@@ -946,12 +949,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 DeviceCmd::Revoke { mnemonic, pubkey } => {
-                    let m = identity::parse_mnemonic(&mnemonic)?;
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
-                    engine.revoke_device(&m, &pk)?;
+                    match mnemonic {
+                        Some(mn) => engine.revoke_device(&identity::parse_mnemonic(&mn)?, &pk)?,
+                        None => engine.revoke_by_device(&pk)?,
+                    }
                     if json {
                         println!("{{\"revoked\":true}}");
                     } else {

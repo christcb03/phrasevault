@@ -564,9 +564,20 @@ fn replay_one(
                 seq: Some(row.seq),
             })
         }
-        // Genesis and device certificates are signed by the identity root.
+        // Device certificates are signed by the identity root OR by a device
+        // holding admin (`a`) on the forest root (doc 09 §2.2) — so an admin
+        // device can admit/revoke members without the recovery phrase. Genesis's
+        // device-0 cert is root-signed (no admin device exists yet).
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
-            if author != &identity.root_pubkey {
+            let by_root = author == &identity.root_pubkey;
+            let by_admin = !by_root
+                && effective_rights(
+                    tx,
+                    &Principal::Key(author.clone()),
+                    &identity.root_node_id,
+                )? & acl::ACL_A
+                    != 0;
+            if !by_root && !by_admin {
                 return Err(unauthorized(row.seq, ev.kind()));
             }
         }
@@ -1193,6 +1204,48 @@ mod enforcement_tests {
                 })
             ),
             "expected rejection of a non-admin tag, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_device_cert_from_non_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let member = foreign_key();
+        let member_pub = crypto::pubkey_bytes(&member);
+        engine.authorize_member(&m, &member_pub).unwrap(); // authorized, not admin
+        engine.close().unwrap();
+
+        // a non-admin member forges a DeviceAuthorized admitting some other key
+        let victim = crypto::pubkey_bytes(&foreign_key());
+        let t = 1_500_000;
+        let idx = acl::MEMBER_DEVICE_INDEX;
+        let sig = crypto::sign_digest(
+            &member,
+            &crate::event::msg_device_authorized(&victim, idx, t, &member_pub),
+        )
+        .unwrap();
+        append_to_log(
+            dir.path(),
+            &Event::DeviceAuthorized {
+                device_pubkey: victim,
+                device_index: idx,
+                authorized_at: t,
+                author: member_pub,
+                sig,
+            },
+        );
+
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(
+                outcome,
+                Err(PvfsError::Integrity {
+                    reason: IntegrityReason::UnknownAuthor,
+                    ..
+                })
+            ),
+            "expected rejection of a non-admin device cert, got {outcome:?}"
         );
     }
 }
