@@ -21,5 +21,5 @@ jobs:
         continue-on-error: true
       - name: CLI smoke suite
         run: |
-          cargo build --release -p pvfs-cli
+          cargo build --release -p pvfs-cli -p pvfsd
           PVFS_BIN="$PWD/target/release/pvfs" bash deploy/ansible/files/smoke-test.sh
