@@ -257,15 +257,18 @@ mount to set the forest context for tree commands.
 
 ## 10. Roadmap
 
-Available now: forest management, import, the full ACL model, and daemon sharing — members can
-**read** listings and file content (`pvfs remote ls`/`stat`/`cat`) and **write** (`pvfs remote
-mkdir`/`add-file`/`rm`), each change signed by their own key.
+Available now: forests & import, the full ACL model **with tags**, phrase-free member admin, and
+daemon sharing — members **read** (`ls`/`stat`/`cat`) and **write**
+(`mkdir`/`add-file`/`add-location`/`rm`/`mv`), each change signed by their own key, and the owner
+does **live admin** (authorize/grant/tag) through the running daemon. Reach a forest's daemon with
+`pvfs remote --forest <alias|mount>` (no socket path needed).
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **More write operations over the daemon** — file locations, moving nodes, managing ACLs remotely
-  (the two-phase, member-signed machinery already generalizes).
+- **Seamless CLI** — plain `pvfs acl set` / `tag add` automatically use a running daemon (no
+  `remote` prefix); direct when none runs.
 - **A dedicated data plane** for `cat` — concurrent raw-byte transfers (and the seam for torrent-like
   distribution), instead of today's ranged-chunk delivery.
-- **Transparent remoting** — `pvfs --forest <alias> …` automatically using the daemon, no `--socket`.
-- **Encryption at rest** and **federation / network sharing** (including torrent-like distribution).
+- **A companion app** — a local custodian for your root key that also auto-logs you in to
+  PVFS-backed web apps.
+- **Encryption at rest** and **federation / network sharing**.
