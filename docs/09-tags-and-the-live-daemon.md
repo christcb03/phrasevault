@@ -101,7 +101,7 @@ remove+add). Member-signed; requires `w` on **both** the old and new parent. Fit
 | Phase | Deliverable |
 |-------|-------------|
 | **1** | Tags: `Tag` principal, `MemberTagged` event + `member_tags` table + fold + replay check, `effective_rights` extension; local CLI (`pvfs tag member …`, `pvfs acl set <node> tag:<name> …`). |
-| **2** | `mv` (re-home) + `set_acl`/tag ops as daemon `WriteOp`s. |
+| **2** | ☑ `mv` (re-home a node, member-signed over the daemon). `set_acl`/tag *over the daemon* fold into Phase 3. |
 | **3** | Single-instance routing: admin ops over the daemon (incl. root-signed `authorize-member`); CLI auto-detects the socket and submits; direct-engine fallback when no daemon. |
 | **4** | Raw data plane for `cat`. |
 

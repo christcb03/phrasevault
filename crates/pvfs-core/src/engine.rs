@@ -1687,6 +1687,88 @@ impl Engine {
             }],
         })
     }
+
+    /// Phase 1 of a member move: re-home `node_id` under `new_parent` by removing
+    /// its current `contains` link and creating a new one. The author must hold
+    /// write on **both** the old and the new parent (enforced live and on replay).
+    pub fn prepare_move_node(
+        &self,
+        author_pub: &[u8],
+        node_id: &NodeId,
+        new_parent: &NodeId,
+    ) -> Result<PreparedWrite> {
+        let home: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, parent_id FROM links
+                 WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
+                params![node_id, LINK_CONTAINS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("find home link"))?;
+        let (old_link_id, old_parent) = home.ok_or(PvfsError::NotFound {
+            kind: "home link",
+            id: node_id.clone(),
+        })?;
+        let old_parent = old_parent.ok_or_else(|| PvfsError::Forbidden {
+            action: "move".into(),
+            reason: "cannot move the forest root".into(),
+        })?;
+        if fetch_node(&self.conn, new_parent)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: new_parent.clone(),
+            });
+        }
+        self.check_no_cycle(new_parent, node_id)?;
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        for parent in [&old_parent, new_parent] {
+            if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
+                return Err(PvfsError::Forbidden {
+                    action: "move".into(),
+                    reason: format!("you lack write (w) on {parent}"),
+                });
+            }
+        }
+        let t = now_ms();
+        let rm_digest = event::msg_link_removed(&old_link_id, t, author_pub);
+        let order = OrderKey::after(max_order_key(&self.conn, new_parent)?.as_ref())?;
+        let mut link = Link {
+            id: String::new(),
+            parent_id: Some(new_parent.clone()),
+            child_id: node_id.clone(),
+            link_type: LINK_CONTAINS.into(),
+            link_nonce: 0,
+            order_key: order.as_str().into(),
+            created_at: t,
+            author: author_pub.to_vec(),
+            sig: Vec::new(),
+            removed_at: None,
+            superseded_by: None,
+            suspended_at: None,
+        };
+        let link_digest = link.id_digest();
+        link.id = hex::encode(link_digest);
+        Ok(PreparedWrite {
+            result_id: node_id.clone(),
+            events: vec![
+                PreparedEvent {
+                    digest: rm_digest,
+                    event: Event::LinkRemoved {
+                        link_id: old_link_id,
+                        removed_at: t,
+                        removed_by: author_pub.to_vec(),
+                        removal_sig: Vec::new(),
+                    },
+                },
+                PreparedEvent {
+                    digest: link_digest,
+                    event: Event::LinkCreated(link),
+                },
+            ],
+        })
+    }
 }
 
 impl Drop for Engine {

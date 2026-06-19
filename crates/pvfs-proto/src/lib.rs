@@ -69,6 +69,8 @@ pub enum WriteOp {
     Rm { node: String },
     /// Record where a file node's bytes live.
     AddLocation { file: String, uri: String },
+    /// Re-home `node` under `new_parent`.
+    Mv { node: String, new_parent: String },
 }
 
 /// Client → server messages.

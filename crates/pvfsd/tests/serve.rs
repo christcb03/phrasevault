@@ -240,3 +240,44 @@ fn daemon_cat_reads_file_bytes() {
     let mut empty = Vec::new();
     assert!(forbidden(anon.cat(&file_node, &mut empty)));
 }
+
+// doc 09 §4 — a member moves a node between folders through the daemon
+#[test]
+fn daemon_member_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let a = engine.add_node(&root, folder("a")).unwrap();
+    let b = engine.add_node(&root, folder("b")).unwrap();
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(&root, &Principal::Key(member_pub.clone()), acl::ACL_R | acl::ACL_W)
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let mut m = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+
+    let node = m
+        .mkdir(&a, "item", |d| crypto::sign_digest(&member_key, d).unwrap())
+        .unwrap();
+    assert!(labels(&m.ls(&a).unwrap()).contains(&"item".to_string()));
+
+    m.mv(&node, &b, |d| crypto::sign_digest(&member_key, d).unwrap())
+        .unwrap();
+    assert!(!labels(&m.ls(&a).unwrap()).contains(&"item".to_string()));
+    assert!(labels(&m.ls(&b).unwrap()).contains(&"item".to_string()));
+}

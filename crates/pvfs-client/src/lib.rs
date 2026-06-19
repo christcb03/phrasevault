@@ -249,6 +249,20 @@ impl Client {
         )
     }
 
+    /// Re-home `node` under `new_parent`. Returns the node id.
+    pub fn mv<F>(&mut self, node: &str, new_parent: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::Mv {
+                node: node.into(),
+                new_parent: new_parent.into(),
+            },
+            sign,
+        )
+    }
+
     /// The two-phase write flow (doc 07 §5): prepare → sign each preimage → commit.
     /// `sign` produces a signature over each 32-byte preimage with the member's key.
     fn write_op<F>(&mut self, op: WriteOp, sign: F) -> Result<String>

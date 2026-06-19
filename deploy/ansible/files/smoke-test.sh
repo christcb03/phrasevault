@@ -283,6 +283,12 @@ $PVFS remote --socket "$SOCK" add-location "$MFILE" "file://$DMOUNT/uploaded-blo
   && ok "member added a file location"
 [ "$($PVFS remote --socket "$SOCK" cat "$MFILE")" = "member-bytes" ] \
   && ok "member reads back its own file content" || fail "member cat mismatch"
+# member moves the "uploaded" folder under a new "archive" folder
+DEST="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" archive)" created)"
+UPLOADED_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DROOT")" uploaded)"
+$PVFS remote --socket "$SOCK" mv "$UPLOADED_ID" "$DEST" >/dev/null && ok "member moved a node"
+[ -n "$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DEST")" uploaded)" ] \
+  && ok "moved node is under its new parent" || fail "mv target missing"
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky

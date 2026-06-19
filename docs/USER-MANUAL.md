@@ -239,6 +239,7 @@ tag grant, or drop the member's tag with `pvfs tag rm <key> media_users`. Inspec
 | `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |
 | `pvfs remote --socket <path> add-file <parent> <label> [--size N --mime M]` | Create a file node via the daemon. |
 | `pvfs remote --socket <path> rm <node>` | Unlink a node from its home via the daemon. |
+| `pvfs remote --socket <path> mv <node> <new-parent>` | Re-home a node under a new parent. |
 | `pvfs remote --socket <path> add-location <file> <uri>` | Record where a file's bytes live. |
 | `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
