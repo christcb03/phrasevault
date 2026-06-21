@@ -65,6 +65,28 @@ For backup / redundancy, the **same content-addressed node id** is used on owner
 
 The node id identifies the **logical file**; locations identify **where bytes live**.
 
+### 1.5 Sub-forest (tree/region) granularity (P4 — PVOS-driven)
+
+**Design input — recorded 2026-06-20.** PVOS hosts many apps in one forest, so federation must be
+able to **replicate, share, and host at tree/region granularity** — a *subtree* of a forest — not
+only whole forests (§1.3 modes A–C are whole-forest or single-node-pointer). Driving needs: **per-app
+backup** (replicate just one app's region), **peer-hosting** (another host serves one app's subtree),
+and **"linked-in isolated app" cross-host access** (one app's region reachable from another host
+without exposing the rest of the forest).
+
+To spec with the P4 protocols (not yet designed):
+
+- **Region identity** — a `(forest_id, subtree_root_node_id)` pair (the catalog URI already addresses
+  a node, §2.2), with the region defined as the `contains`-closure under that root.
+- **Selective log subscription** — the replica follows only events touching the region's nodes
+  (extends §6 Q5). The owner keeps the single canonical linear log; a region replica holds a
+  verifiable **filtered** view — but a region tail is **not** a simple chain prefix, so it needs a
+  per-region accumulator or filtered-proof scheme (a P4 design question, §6 Q7).
+- **Authority scoping** — pairs with per-key tags (P2-G, doc 10 §9): a region typically maps to one
+  app authority, so "replicate app A's region" ≈ "replicate the nodes A controls."
+
+Detailed spec lands with the P4 federation/sync work; recorded here as a requirement.
+
 ---
 
 ## 2. URI classes
@@ -219,5 +241,13 @@ The sync/file-server layer (version `1.0.#`) implements transport, auth, and tai
 4. **Remote append auth** — *Model decided (§3.6):* the owner accepts appends from device keys certified under its identity root; cross-instance grants (e.g. letting B's identity request `FileLocationAdded` on A's forest) still need a grant mechanism. Wire protocol in sync layer `1.0.#`.
 5. **Selective log subscription** — Subset-of-forest event stream vs full forest only for Mode B imports.
 6. **Content-hash URI** — Whether to add `pvfs:…/file/<hash>` read shortcut in P4 (optional optimization).
+7. **Sub-forest replication proof** — how a region (subtree) tail is verified against the owner's
+   single linear chain: per-region accumulator vs. filtered prefix proof. See §1.5. (P4, PVOS-driven.)
+8. **Compaction / checkpoint replication** — if an owner compacts a forest (signed snapshot
+   re-genesis to shrink the log), the chain gets a **new genesis anchor**, so a replica holding the
+   old history can no longer prefix-verify across the cut. *Design in [doc 11](11-compaction-and-verifiable-snapshots.md):*
+   the signed checkpoint binds the pre-snapshot chain tip + a Merkle state-root, and a **sealed,
+   content-addressed archive** of the old log lets a replica re-derive and verify the compaction
+   (faithful + authored) or trust the signature for the cheap path. Pairs with §1.5 region scope.
 
 P0 coding may proceed with defaults: `instance_id` from config/env at init, `forest_id` = UUID, single owned forest, no remote append.

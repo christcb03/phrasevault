@@ -122,6 +122,15 @@ two jobs:
    password and no phrase ("Sign in with PVFS"). While the companion runs, any PVFS-backed site the
    user has authorized logs in automatically.
 
+**Why the companion is also the tag-authority home (per-key tags, doc 10 §9).** Because the companion
+reproduces the *same* identity key from the phrase on any machine, that key — **not a per-machine
+device key** — is the stable **authority** behind a human's direct tag grants and memberships. This
+is what makes per-key tags work for a human across devices (one authority, not one-per-machine).
+Apps sign with their own key; device keys are never the tag authority. The cost of using one stable
+key instead of per-device keys — you can't revoke a single machine without rotating the shared key —
+is paid by the companion's posture below (encrypted at rest, unlocked only while running, signs
+per-approval), which is strictly stronger than a device key cached on disk.
+
 **Security to design in:** the localhost endpoint must gate **which web origins** may request a
 signature (per-app "connect" approval, like a wallet), and the root should be encrypted at rest and
 unlocked only while the companion runs. The companion is its **own application track** (key vault +

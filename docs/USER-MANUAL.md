@@ -270,5 +270,10 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 - **A dedicated data plane** for `cat` — concurrent raw-byte transfers (and the seam for torrent-like
   distribution), instead of today's ranged-chunk delivery.
 - **A companion app** — a local custodian for your root key that also auto-logs you in to
-  PVFS-backed web apps.
+  PVFS-backed web apps. It reproduces your identity key from your phrase on any machine, so your
+  sharing works the same everywhere.
+- **Permission audit** — `pvfs audit` to scan a forest for stale/revoked permissions and clean them
+  up (warnings optional), alongside `pvfs verify` for content integrity.
+- **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
+  and speed up rebuilds (signed by you; trades away old history).
 - **Encryption at rest** and **federation / network sharing**.
