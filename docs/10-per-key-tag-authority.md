@@ -1,6 +1,6 @@
 # PVFS — Per-key tag authority (multi-tenant tags) (10)
 
-Status: **Proposed change — for review**
+Status: **Implemented** (`SCHEMA_VERSION` 2; doc 08 P2-G) — proposed 2026-06-20, landed 2026-06-21
 Date: 2026-06-20
 Depends on: [02 (P0 spec)](02-p0-core-engine-spec.md), [06 (ACLs & daemon)](06-access-control-and-daemon.md), [09 (tags & live daemon)](09-tags-and-the-live-daemon.md)
 Motivation: PVOS hosts **many apps in one forest**. The current tag model assumes a single administrative domain per forest and breaks under multi-tenancy.
@@ -53,8 +53,8 @@ So matching changes from *"member holds tag name N"* to *"member holds tag name 
 ## 5. Why this is cheap (impact analysis)
 
 - **Event wire encodings: UNCHANGED.** Every event already carries `author` + `sig`; the authority *is* the author. No new event fields, no PCE preimage or digest-domain changes, no signing changes.
-- **Projection:** add an `authority` column to `member_tags` (populated from the `MemberTagged` author). The `acl` table already stores `author`, so node-grant authority is already present.
-- **`effective_rights`:** when gathering a member's tags, gather `(authority, name)`; when ORing a node's tag grant, require the grant row's `author` to equal the membership authority. (A small change to `member_tags_of` and the `grant_for` tag branch.)
+- **Projection:** add an `authority` column to **`member_tags` and `acl`**, both populated from the event author. *(Correction, as built: the `acl` table did **not** previously store the author — this draft assumed it did — so the column was added to both tables. The author was always present in the event, so still no wire change.)* For a tag grant `authority` = the `AclSet` author; for `public`/`any`/`key` grants `authority` is empty, so those rows behave exactly as before. The primary keys gain `authority`.
+- **`effective_rights`:** when gathering a member's tags, gather `(authority, name)` **filtered to authorities still active** (liveness, §9.2); when ORing a node's tag grant, require the grant row's `authority` to equal the membership authority. (Implemented in `member_tags_of` and a new `authority` parameter on `grant_for`, plus `grant_for_tag_any_authority` for `acl check` inspection.)
 - **Authorization:** change the `MemberTagged` gate in `check_member_event` from "root `ACL_A`" to "author asserts its own authority" (+ owner override).
 - **Schema:** this is **non-additive** (member_tags key/columns + matching semantics), so **bump `SCHEMA_VERSION`**. The projection self-heals from the log on rebuild, so no data migration script is needed beyond the rebuild.
 

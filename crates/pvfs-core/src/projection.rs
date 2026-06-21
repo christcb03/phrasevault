@@ -8,7 +8,10 @@ use crate::error::{map_db, PvfsError, Result};
 use crate::event::Event;
 use crate::log_store;
 
-pub const SCHEMA_VERSION: u32 = 1;
+// v2 (doc 10): per-key tag authority — `acl`/`member_tags` carry an `authority`
+// column and tag matching is scoped to `(authority, name)`. Non-additive, so the
+// projection (a pure cache of the log) is dropped and replayed on upgrade.
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -57,16 +60,18 @@ CREATE TABLE IF NOT EXISTS acl (
   node_id        TEXT    NOT NULL,
   principal_kind INTEGER NOT NULL,   -- 0=any, 1=key, 2=public, 3=tag
   principal_id   BLOB    NOT NULL,   -- pubkey for key; tag name for tag; empty for any/public
+  authority      BLOB    NOT NULL,   -- (doc 10) tag grants: the AclSet author; empty for non-tag
   rights         INTEGER NOT NULL,   -- bitmask r=1 w=2 a=4; row absent => none
   set_at         INTEGER NOT NULL,
-  PRIMARY KEY (node_id, principal_kind, principal_id)
+  PRIMARY KEY (node_id, principal_kind, principal_id, authority)
 );
 
 CREATE TABLE IF NOT EXISTS member_tags (
   member_pubkey BLOB NOT NULL,
   tag           TEXT NOT NULL,
+  authority     BLOB NOT NULL,       -- (doc 10) the MemberTagged author = the tag authority
   set_at        INTEGER NOT NULL,
-  PRIMARY KEY (member_pubkey, tag)
+  PRIMARY KEY (member_pubkey, tag, authority)
 );
 
 CREATE TABLE IF NOT EXISTS temp_nodes (
@@ -268,21 +273,26 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             principal_id,
             rights,
             set_at,
+            author,
             ..
         } => {
+            // A tag grant is scoped to the key that authored it (doc 10 §3); other
+            // principals (public/any/key) carry an empty authority, so their rows
+            // collapse on `(node, kind, id)` exactly as before.
+            let authority: &[u8] = if *principal_kind == 3 { author.as_slice() } else { &[] };
             if *rights == 0 {
                 tx.execute(
-                    "DELETE FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3",
-                    params![node_id, *principal_kind as i64, principal_id],
+                    "DELETE FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3 AND authority = ?4",
+                    params![node_id, *principal_kind as i64, principal_id, authority],
                 )
                 .map_err(&m)?;
             } else {
                 tx.execute(
-                    "INSERT INTO acl (node_id, principal_kind, principal_id, rights, set_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(node_id, principal_kind, principal_id)
+                    "INSERT INTO acl (node_id, principal_kind, principal_id, authority, rights, set_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(node_id, principal_kind, principal_id, authority)
                      DO UPDATE SET rights = excluded.rights, set_at = excluded.set_at",
-                    params![node_id, *principal_kind as i64, principal_id, *rights as i64, *set_at as i64],
+                    params![node_id, *principal_kind as i64, principal_id, authority, *rights as i64, *set_at as i64],
                 )
                 .map_err(&m)?;
             }
@@ -292,19 +302,22 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             tag,
             granted,
             set_at,
+            author,
             ..
         } => {
+            // The author is the tag's authority (doc 10 §3): a membership only
+            // satisfies a node's tag grant authored by the same key.
             if *granted {
                 tx.execute(
-                    "INSERT INTO member_tags (member_pubkey, tag, set_at) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(member_pubkey, tag) DO UPDATE SET set_at = excluded.set_at",
-                    params![member_pubkey, tag, *set_at as i64],
+                    "INSERT INTO member_tags (member_pubkey, tag, authority, set_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(member_pubkey, tag, authority) DO UPDATE SET set_at = excluded.set_at",
+                    params![member_pubkey, tag, author, *set_at as i64],
                 )
                 .map_err(&m)?;
             } else {
                 tx.execute(
-                    "DELETE FROM member_tags WHERE member_pubkey = ?1 AND tag = ?2",
-                    params![member_pubkey, tag],
+                    "DELETE FROM member_tags WHERE member_pubkey = ?1 AND tag = ?2 AND authority = ?3",
+                    params![member_pubkey, tag, author],
                 )
                 .map_err(&m)?;
             }
@@ -640,15 +653,13 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
             require_right(conn, author, file_id, acl::ACL_W, "add location")?
         }
         Event::MemberTagged { .. } => {
-            // Managing membership tags requires admin on the forest root.
-            let root: String = conn
-                .query_row(
-                    "SELECT v FROM projection_meta WHERE k = 'forest_root_node_id'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(map_db("root lookup"))?;
-            require_right(conn, author, &root, acl::ACL_A, "tag member")?;
+            // Per-key tags (doc 10 §4): any authorized member may assign a tag under
+            // its **own** authority — and the authority *is* the signed author, so a
+            // member cannot forge a tag under another key. The active-author check at
+            // the top of this function is therefore sufficient; the old "admin on the
+            // forest root" requirement was over-broad (it existed only because tags
+            // were unscoped) and is dropped. A key-scoped membership only unlocks
+            // nodes whose `Tag` grant that same key authored — i.e. nodes it controls.
         }
         _ => {}
     }
@@ -702,7 +713,7 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
     // An owner device short-circuits to full rights. Otherwise determine whether
     // the caller is an authorized member (so `Any` grants apply) and, for a member
     // key, which tags they hold (so the node's `tag:` grants apply).
-    let (is_member, member_tags): (bool, Vec<String>) = match principal {
+    let (is_member, member_tags): (bool, Vec<(Vec<u8>, String)>) = match principal {
         Principal::Public | Principal::Tag(_) => (false, Vec::new()),
         Principal::Any => (true, Vec::new()),
         Principal::Key(pk) => {
@@ -724,20 +735,24 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
     let mut guard = 0u32;
     while let Some(n) = cur {
         if include_public {
-            rights |= grant_for(conn, &n, 2, &[])?; // Public — applies to everyone
+            rights |= grant_for(conn, &n, 2, &[], &[])?; // Public — applies to everyone
         }
         if is_member {
-            rights |= grant_for(conn, &n, 0, &[])?; // Any — authorized members
+            rights |= grant_for(conn, &n, 0, &[], &[])?; // Any — authorized members
         }
         match principal {
             Principal::Key(pk) => {
-                rights |= grant_for(conn, &n, 1, pk)?; // this specific key
-                for t in &member_tags {
-                    rights |= grant_for(conn, &n, 3, t.as_bytes())?; // tags the member holds
+                rights |= grant_for(conn, &n, 1, pk, &[])?; // this specific key
+                // A tag the member holds unlocks only the node's `Tag` grants
+                // authored by the *same* authority (doc 10 §3).
+                for (authority, t) in &member_tags {
+                    rights |= grant_for(conn, &n, 3, t.as_bytes(), authority)?;
                 }
             }
             Principal::Tag(t) => {
-                rights |= grant_for(conn, &n, 3, t.as_bytes())?; // the tag's own grants
+                // Inspection (`acl check tag:<name>`): report this name's grants
+                // across every authority that set one.
+                rights |= grant_for_tag_any_authority(conn, &n, t.as_bytes())?;
             }
             _ => {}
         }
@@ -753,12 +768,23 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
     Ok(rights)
 }
 
-fn member_tags_of(conn: &Connection, pubkey: &[u8]) -> Result<Vec<String>> {
+/// The `(authority, tag)` memberships a key holds whose **authority is still an
+/// active, unrevoked member** (doc 10 §9.2 liveness). A tag granted by a revoked
+/// authority is masked here — counted by no node — so access drops immediately;
+/// the dead row itself is cleaned up later by the signed sweep (doc 08 §4 item 13).
+fn member_tags_of(conn: &Connection, pubkey: &[u8]) -> Result<Vec<(Vec<u8>, String)>> {
     let mut stmt = conn
-        .prepare("SELECT tag FROM member_tags WHERE member_pubkey = ?1")
+        .prepare(
+            "SELECT mt.authority, mt.tag FROM member_tags mt
+             WHERE mt.member_pubkey = ?1
+               AND EXISTS (SELECT 1 FROM device_keys dk
+                           WHERE dk.device_pubkey = mt.authority AND dk.revoked_at IS NULL)",
+        )
         .map_err(map_db("prepare member tags"))?;
     let rows = stmt
-        .query_map(params![pubkey], |r| r.get::<_, String>(0))
+        .query_map(params![pubkey], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+        })
         .map_err(map_db("query member tags"))?;
     let mut out = Vec::new();
     for r in rows {
@@ -783,16 +809,33 @@ fn device_status(conn: &Connection, pubkey: &[u8]) -> Result<(bool, bool)> {
     }
 }
 
-fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8]) -> Result<u8> {
+fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8], authority: &[u8]) -> Result<u8> {
     let r: Option<i64> = conn
         .query_row(
-            "SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3",
-            params![node_id, kind as i64, id],
+            "SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3 AND authority = ?4",
+            params![node_id, kind as i64, id, authority],
             |r| r.get(0),
         )
         .optional()
         .map_err(map_db("acl lookup"))?;
     Ok(r.unwrap_or(0) as u8)
+}
+
+/// Union of a tag name's grants on `node_id` across **every** authority that set
+/// one — for inspection only (`acl check tag:<name>`), never for an access
+/// decision (those resolve a specific `(authority, name)` via `grant_for`).
+fn grant_for_tag_any_authority(conn: &Connection, node_id: &str, name: &[u8]) -> Result<u8> {
+    let mut stmt = conn
+        .prepare("SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = 3 AND principal_id = ?2")
+        .map_err(map_db("prepare tag grants"))?;
+    let rows = stmt
+        .query_map(params![node_id, name], |r| r.get::<_, i64>(0))
+        .map_err(map_db("query tag grants"))?;
+    let mut rights = 0u8;
+    for r in rows {
+        rights |= r.map_err(map_db("read tag grant"))? as u8;
+    }
+    Ok(rights)
 }
 
 /// The node's `contains` (home) parent, or `None` at the root / for an orphan.
@@ -891,6 +934,13 @@ pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
         .parse()
         .unwrap_or(SCHEMA_VERSION);
     if version != SCHEMA_VERSION {
+        // The projection is a pure, rebuildable cache of the log. An **older** schema
+        // self-heals: drop the projection and replay under the current schema (doc 10
+        // §6 — `full_rebuild` recreates `projection_meta`, so the version is reset to
+        // current). A **newer** schema than this binary understands is a hard stop.
+        if version < SCHEMA_VERSION {
+            return full_rebuild(conn);
+        }
         return Err(PvfsError::SchemaVersion {
             found: version,
             supported: SCHEMA_VERSION,
@@ -1177,8 +1227,11 @@ mod enforcement_tests {
         );
     }
 
+    // Per-key tags (doc 10 §4): an authorized member may assign a tag under its own
+    // authority *without* admin on the root — it only ever unlocks nodes that key
+    // already controls. Replay accepts it.
     #[test]
-    fn replay_rejects_member_tagged_from_non_admin() {
+    fn replay_accepts_member_tagged_under_own_authority() {
         let dir = tempfile::tempdir().unwrap();
         let (mut engine, m) = Engine::init(dir.path()).unwrap();
         let member = foreign_key();
@@ -1186,9 +1239,8 @@ mod enforcement_tests {
         engine.authorize_member(&m, &member_pub).unwrap(); // authorized, not admin
         engine.close().unwrap();
 
-        // forge a MemberTagged signed by a member who lacks admin on the root
         let t = 1_500_000;
-        let (tag, granted) = ("sneaky", true);
+        let (tag, granted) = ("friends", true);
         let sig = crypto::sign_digest(
             &member,
             &crate::event::msg_member_tagged(&member_pub, tag, granted, t, &member_pub),
@@ -1206,6 +1258,39 @@ mod enforcement_tests {
             },
         );
 
+        // a non-admin member's own-authority tag replays cleanly
+        Engine::open(dir.path()).expect("own-authority MemberTagged must replay");
+    }
+
+    // But an author who is *not* an authorized member at all is still rejected
+    // (the active-author check at the top of `check_member_event`).
+    #[test]
+    fn replay_rejects_member_tagged_from_unauthorized_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _m) = Engine::init(dir.path()).unwrap();
+        engine.close().unwrap();
+
+        let stranger = foreign_key();
+        let stranger_pub = crypto::pubkey_bytes(&stranger);
+        let t = 1_500_000;
+        let (tag, granted) = ("sneaky", true);
+        let sig = crypto::sign_digest(
+            &stranger,
+            &crate::event::msg_member_tagged(&stranger_pub, tag, granted, t, &stranger_pub),
+        )
+        .unwrap();
+        append_to_log(
+            dir.path(),
+            &Event::MemberTagged {
+                member_pubkey: stranger_pub.clone(),
+                tag: tag.into(),
+                granted,
+                set_at: t,
+                author: stranger_pub,
+                sig,
+            },
+        );
+
         let outcome = Engine::open(dir.path()).map(drop);
         assert!(
             matches!(
@@ -1215,7 +1300,7 @@ mod enforcement_tests {
                     ..
                 })
             ),
-            "expected rejection of a non-admin tag, got {outcome:?}"
+            "expected rejection of a tag from a non-member, got {outcome:?}"
         );
     }
 

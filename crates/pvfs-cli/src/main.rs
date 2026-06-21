@@ -408,6 +408,16 @@ fn print_created(id: &str, json: bool) {
     }
 }
 
+/// ` (by <short-hex>)` for a non-empty tag authority (doc 10), else empty. Lets
+/// `acl ls` / `tag ls` show *which key* scopes a `tag:` grant or membership.
+fn authority_suffix(authority: &[u8]) -> String {
+    if authority.is_empty() {
+        String::new()
+    } else {
+        format!(" (by {})", hex::encode(&authority[..authority.len().min(4)]))
+    }
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -1017,10 +1027,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     if json {
                         let items: Vec<String> = entries
                             .iter()
-                            .map(|(p, r)| {
+                            .map(|(p, authority, r)| {
                                 format!(
-                                    "{{\"principal\":\"{}\",\"rights\":\"{}\"}}",
+                                    "{{\"principal\":\"{}\",\"authority\":\"{}\",\"rights\":\"{}\"}}",
                                     json_escape(&p.display()),
+                                    hex::encode(authority),
                                     acl::rights_to_str(*r)
                                 )
                             })
@@ -1029,8 +1040,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else if entries.is_empty() {
                         println!("(no direct grants on {node})");
                     } else {
-                        for (p, r) in entries {
-                            println!("{:>3}  {}", acl::rights_to_str(r), p.display());
+                        for (p, authority, r) in entries {
+                            println!(
+                                "{:>3}  {}{}",
+                                acl::rights_to_str(r),
+                                p.display(),
+                                authority_suffix(&authority)
+                            );
                         }
                     }
                 }
@@ -1084,14 +1100,22 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 TagCmd::Ls { member } => {
                     let tags = engine.member_tags(&decode_member(&member)?)?;
                     if json {
-                        let items: Vec<String> =
-                            tags.iter().map(|t| format!("\"{}\"", json_escape(t))).collect();
+                        let items: Vec<String> = tags
+                            .iter()
+                            .map(|(authority, t)| {
+                                format!(
+                                    "{{\"tag\":\"{}\",\"authority\":\"{}\"}}",
+                                    json_escape(t),
+                                    hex::encode(authority)
+                                )
+                            })
+                            .collect();
                         println!("[{}]", items.join(","));
                     } else if tags.is_empty() {
                         println!("(no tags)");
                     } else {
-                        for t in tags {
-                            println!("{t}");
+                        for (authority, t) in tags {
+                            println!("{t}{}", authority_suffix(&authority));
                         }
                     }
                 }

@@ -1461,13 +1461,18 @@ impl Engine {
         projection::effective_rights(&self.conn, principal, node_id)
     }
 
-    /// Direct ACL grants on `node_id` (not inherited), for `acl ls`.
-    pub fn acl_entries(&self, node_id: &NodeId) -> Result<Vec<(crate::acl::Principal, u8)>> {
+    /// Direct ACL grants on `node_id` (not inherited), for `acl ls`. Each entry is
+    /// `(principal, authority, rights)`; `authority` is the granting key for `tag:`
+    /// grants (doc 10) and empty for `public`/`any`/`key` grants.
+    pub fn acl_entries(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Vec<(crate::acl::Principal, Vec<u8>, u8)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT principal_kind, principal_id, rights FROM acl WHERE node_id = ?1
-                 ORDER BY principal_kind, principal_id",
+                "SELECT principal_kind, principal_id, authority, rights FROM acl WHERE node_id = ?1
+                 ORDER BY principal_kind, principal_id, authority",
             )
             .map_err(map_db("prepare acl list"))?;
         let rows = stmt
@@ -1475,14 +1480,15 @@ impl Engine {
                 Ok((
                     r.get::<_, i64>(0)? as u64,
                     r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, i64>(2)? as u8,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, i64>(3)? as u8,
                 ))
             })
             .map_err(map_db("query acl list"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, id, rights) = row.map_err(map_db("read acl row"))?;
-            out.push((crate::acl::Principal::from_wire(kind, id)?, rights));
+            let (kind, id, authority, rights) = row.map_err(map_db("read acl row"))?;
+            out.push((crate::acl::Principal::from_wire(kind, id)?, authority, rights));
         }
         Ok(out)
     }
@@ -1496,16 +1502,11 @@ impl Engine {
         tag: &str,
         granted: bool,
     ) -> Result<()> {
+        // Per-key tags (doc 10 §4): any authorized member may assign a tag under its
+        // own authority — the local device signs as itself, so `ensure_device_active`
+        // is the whole requirement. (Was: admin on the forest root.)
         self.ensure_device_active()?;
         crate::acl::validate_tag(tag)?;
-        let root = self.identity.root_node_id.clone();
-        let me = crate::acl::Principal::Key(self.device_pubkey());
-        if projection::effective_rights(&self.conn, &me, &root)? & crate::acl::ACL_A == 0 {
-            return Err(PvfsError::Forbidden {
-                action: "tag member".into(),
-                reason: "this device lacks admin (a) on the forest root".into(),
-            });
-        }
         let t = now_ms();
         let author = self.device_pubkey();
         let sig = crypto::sign_digest(
@@ -1522,14 +1523,20 @@ impl Engine {
         }])
     }
 
-    /// The membership tags a member key currently holds.
-    pub fn member_tags(&self, member_pubkey: &[u8]) -> Result<Vec<String>> {
+    /// The membership tags a member key currently holds, as `(authority, tag)`
+    /// pairs (doc 10): the same name held under two authorities is two memberships.
+    pub fn member_tags(&self, member_pubkey: &[u8]) -> Result<Vec<(Vec<u8>, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT tag FROM member_tags WHERE member_pubkey = ?1 ORDER BY tag")
+            .prepare(
+                "SELECT authority, tag FROM member_tags WHERE member_pubkey = ?1
+                 ORDER BY tag, authority",
+            )
             .map_err(map_db("prepare member tags"))?;
         let rows = stmt
-            .query_map(params![member_pubkey], |r| r.get::<_, String>(0))
+            .query_map(params![member_pubkey], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(map_db("query member tags"))?;
         let mut out = Vec::new();
         for r in rows {
@@ -1869,6 +1876,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Require that `author_pub` is a currently authorized, unrevoked member (doc 10
+    /// §4 — the bar for assigning a tag under one's own authority).
+    fn require_active_member(&self, author_pub: &[u8], action: &'static str) -> Result<()> {
+        let active: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL",
+                params![author_pub],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("member check"))?;
+        if active.is_none() {
+            return Err(PvfsError::Forbidden {
+                action: action.into(),
+                reason: "not an authorized member of this forest".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Phase 1: build an unsigned `AclSet`. The author must hold admin on the node.
     pub fn prepare_set_acl(
         &self,
@@ -1910,7 +1938,9 @@ impl Engine {
         })
     }
 
-    /// Phase 1: build an unsigned `MemberTagged`. The author must hold admin on root.
+    /// Phase 1: build an unsigned `MemberTagged`. Per-key tags (doc 10 §4): any
+    /// authorized member may assign a tag under its own authority, so the author need
+    /// only be an active member (not an admin). Re-checked on commit/replay.
     pub fn prepare_set_member_tag(
         &self,
         author_pub: &[u8],
@@ -1919,7 +1949,7 @@ impl Engine {
         granted: bool,
     ) -> Result<PreparedWrite> {
         crate::acl::validate_tag(tag)?;
-        self.require_admin_on_root(author_pub, "tag member")?;
+        self.require_active_member(author_pub, "tag member")?;
         let t = now_ms();
         let digest = event::msg_member_tagged(member_pubkey, tag, granted, t, author_pub);
         Ok(PreparedWrite {

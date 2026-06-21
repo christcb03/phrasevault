@@ -22,7 +22,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E live daemon** | Phrase-free admin (root-or-admin-device), conventional socket discovery, **admin ops over the daemon** | ✅ shipped 3a–3c (doc 09 §2–3) |
 | **P2-E (3d)** | CLI **auto-routes** plain commands (`acl`/`tag`/`authorize`) to a running daemon; direct-engine fallback | ☐ next (doc 09 §3d) |
 | **P2-F data plane** | Raw byte stream for `cat` + concurrent transfer threads (today: ranged hex chunks) | ☐ next (doc 07 §6) |
-| **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching — lets one forest host many apps' tag namespaces | ☐ proposed (doc 10) |
+| **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
 | **Companion** | Local root custodian + localhost identity agent ("Sign in with PVFS" auto-login) | ☐ future (doc 09 §6) |
 | **Maintenance** | Forest-wide **rights audit** (`pvfs audit`) + **orphaned-tag sweep**: find grants/memberships under revoked authorities and remove them with signed events (`effective_rights` masks them live; the sweep cleans up) | ☐ future (doc 08 §4 items 13–14) |
 | **P3** | Encryption-at-rest (reserved key path `m/43'/20566'/2'`), secure module | ☐ future |
@@ -31,14 +31,16 @@ docs 02–09; this is the index + the honest "what's not done yet."
 
 ---
 
-## 2. What works end-to-end today (verified by 71 Rust tests + 86 smoke checks, clippy-clean)
+## 2. What works end-to-end today (verified by 74 Rust tests + 86 smoke checks, clippy-clean)
 
 - **Forests & ownership:** `forest init` (owner-owned `.pvfs/` at `0700`, raw-root refused), import a
   tree (skipping unreadable files), `sudo forest register` for host-wide listing, ownership repair.
 - **Tree & content:** add/move/link/remove nodes, bind+scan real folders, verified reads, `cat`.
 - **Access control:** authorize a member (admin device, **no recovery phrase**); grant per-node
   rights to `public`/`any`/`tag:<name>`/`key:<hex>` with inheritance; **tags** (tag content, tag
-  people, access follows).
+  people, access follows). **Per-key tag authority (P2-G):** a tag is `(authority, name)`, so one
+  forest hosts many apps' namespaces without collision; any member may tag under its own authority;
+  revoking an authority masks its tags immediately.
 - **Cross-user over the daemon** (`pvfsd` runs as the owner; conventional socket at
   `$PVFS_SOCKET_DIR/<forest_id>.sock`; clients dial via `pvfs remote --forest <alias|mount>`):
   - **Reads:** `ls`/`stat`/`cat`, ACL-filtered per caller, authenticated by challenge-response (or
@@ -124,28 +126,29 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
    unit for production; `$PVFS_REGISTRY_DIR` already gives a rootless registry variant. By design,
    not a code bug.
 
-10. **Schema is still `SCHEMA_VERSION` 1 (additive tables only).** `acl`/`member_tags` were added via
-    `CREATE TABLE IF NOT EXISTS`.
-    → **Fix (P2-G — first non-additive change):** P2-G's `(authority, name)` matching is non-additive,
-    so it bumps `SCHEMA_VERSION` and ships behind a rebuild/replay parity test (doc 10 §5–6, mirroring
-    doc 06 §3.3). This concern resolves when P2-G lands.
+10. **Schema versioning. ✅ RESOLVED at `SCHEMA_VERSION` 2 (P2-G).** P2-G added the `authority` column
+    to `acl`/`member_tags` (non-additive), so the version bumped to 2. Older projections **self-heal**:
+    `startup_check` now drops and replays the projection from the log when it finds an older schema
+    (it's a pure cache), while a *newer*-than-supported schema is still a hard stop. Note: doc 10 §5
+    assumed `acl` already stored the author — it did not, so the work added the column to **both**
+    tables (still no event wire change; the author was always in the event).
 
-11. **P2-G — tag authority granularity. ✓ DECIDED (doc 10 §9.1).** Authority is the **identity key**
-    (phrase-derived, reproduced by the companion on any machine), never a per-machine device key; apps
-    sign with their own key. So a human has one authority across all devices and "a tag namespace =
-    one authority key" holds automatically — the multi-device mismatch is gone. Rejected normalizing
-    to the certifying root (would collapse app authorities into the owner). Tradeoff: no per-device
-    revocation for a human's own authority, covered by the companion's at-rest encryption + per-sig
-    approval (doc 09 §6). *Implement under P2-G.*
+11. **P2-G — tag authority granularity. ✅ SHIPPED (doc 10 §9.1).** Tag matching is scoped to
+    `(authority, name)` where the authority is the event author; apps sign with their own key, so one
+    forest hosts many app namespaces without collision. The companion (doc 09 §6) makes a human's
+    authority a stable phrase-derived identity key across devices; until then the author is the
+    signing device key (documented multi-device caveat). Implemented: `authority` column on
+    `acl`/`member_tags`, scoped `grant_for`, relaxed `MemberTagged` gate, `SCHEMA_VERSION` 2.
 
-12. **P2-G — authority liveness. ✓ DECIDED (doc 10 §9.2).** A `(authority, name)` match counts only
-    while the authority key is a currently authorized, unrevoked member. `effective_rights` **masks**
-    grants/memberships under a revoked authority on the read path (no write); actual removal is a
-    **signed sweep** (items 13–14), not a read-path write. Key rotation orphans an app's grants until
-    re-issued (v1). *Implement under P2-G:* the masking check + the revoked-authority denial test.
+12. **P2-G — authority liveness. ✅ SHIPPED (doc 10 §9.2).** `effective_rights` counts a
+    `(authority, name)` match only while the authority is a currently authorized, unrevoked member —
+    `member_tags_of` masks memberships under a revoked authority on the read path (no write), so
+    revoking an app drops its tags immediately. Verified by `revoking_tag_authority_denies_access`
+    (live + across rebuild). Key rotation orphans an app's grants until re-issued (v1).
 
-13. **Orphaned-tag cleanup routine** (P2-G follow-on). When `effective_rights` masks a tag whose
-    authority is revoked, the dead `acl`/`member_tags` rows should be **removed**, not just ignored.
+13. **Orphaned-tag cleanup *sweep*** (P2-G follow-on — masking shipped, removal pending). The read
+    path already **masks** tags under a revoked authority (item 12); the dead `acl`/`member_tags` rows
+    are still physically present.
     → **Plan:** a daemon-side **signed sweep** — the daemon (acting as the owner) appends the removal
     events (`AclSet` clear / `MemberTagged{granted:false}`) for orphaned grants/memberships it
     encounters. Removal is a *write* and needs a signer, so it must **not** run on the read path
