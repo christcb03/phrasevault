@@ -580,6 +580,30 @@ fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+/// Connect to the daemon if one is running for this forest, authenticated as
+/// the local client identity (doc 09 §3d auto-routing). Returns `None` when no
+/// daemon socket exists, signalling the caller to fall back to direct engine
+/// access. The returned closure is the per-mutation signer for the connected key.
+fn daemon_client(
+    state_dir: &std::path::Path,
+) -> Result<Option<(Client, Box<dyn Fn(&[u8; 32]) -> Vec<u8>>)>, PvfsError> {
+    let Some(sock) = try_daemon_socket(state_dir) else {
+        return Ok(None);
+    };
+    let mn = client_identity_mnemonic()?;
+    let key = identity::device_key(&mn, "", 0)?;
+    let pubkey = crypto::pubkey_bytes(&key);
+    // FnOnce borrow of key ends when connect_signed returns (NLL).
+    let client = Client::connect_signed(&sock, &pubkey, |d| {
+        crypto::sign_digest(&key, d).unwrap_or_default()
+    })
+    .map_err(remote_err)?;
+    // key is free to move: the FnOnce above was consumed inside connect_signed.
+    let sign: Box<dyn Fn(&[u8; 32]) -> Vec<u8>> =
+        Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
+    Ok(Some((client, sign)))
+}
+
 fn run(cli: Cli) -> Result<(), PvfsError> {
     let legacy = legacy_state_dir(&cli);
     let ctx = context_state_dir(&cli);
@@ -980,11 +1004,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Device(dev) => {
-            let mut engine = Engine::open(&ctx?)?;
+            let state_dir = ctx?;
             match dev {
                 DeviceCmd::Authorize { mnemonic, index } => {
+                    // Root-signed — must go direct (phrase needed, can't proxy).
+                    let mut engine = Engine::open(&state_dir)?;
                     let m = identity::parse_mnemonic(&mnemonic)?;
                     let pk = engine.authorize_device(&m, index)?;
+                    engine.close()?;
                     if json {
                         println!(
                             "{{\"authorized\":true,\"device_index\":{index},\"device_pubkey\":\"{}\"}}",
@@ -993,39 +1020,75 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         println!("authorized device {index}: {}", hex::encode(pk));
                     }
+                    Ok(())
                 }
                 DeviceCmd::AuthorizeMember { mnemonic, pubkey } => {
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
+                    // Device-signed (no phrase): auto-route through daemon (doc 09 §3d).
+                    // Root-signed (phrase given): must go direct.
+                    if mnemonic.is_none() {
+                        if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                            client
+                                .authorize_member(&pubkey, |d| sign(d))
+                                .map_err(remote_err)?;
+                            if json {
+                                println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
+                            } else {
+                                println!("authorized member {pubkey}");
+                            }
+                            return Ok(());
+                        }
+                    }
+                    let mut engine = Engine::open(&state_dir)?;
                     match mnemonic {
                         Some(mn) => engine.authorize_member(&identity::parse_mnemonic(&mn)?, &pk)?,
                         None => engine.authorize_member_by_device(&pk)?,
                     }
+                    engine.close()?;
                     if json {
                         println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
                     } else {
                         println!("authorized member {pubkey}");
                     }
+                    Ok(())
                 }
                 DeviceCmd::Revoke { mnemonic, pubkey } => {
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
+                    // Device-signed (no phrase): auto-route through daemon (doc 09 §3d).
+                    // Root-signed (phrase given): must go direct.
+                    if mnemonic.is_none() {
+                        if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                            client
+                                .revoke(&pubkey, |d| sign(d))
+                                .map_err(remote_err)?;
+                            if json {
+                                println!("{{\"revoked\":true}}");
+                            } else {
+                                println!("revoked {pubkey}");
+                            }
+                            return Ok(());
+                        }
+                    }
+                    let mut engine = Engine::open(&state_dir)?;
                     match mnemonic {
                         Some(mn) => engine.revoke_device(&identity::parse_mnemonic(&mn)?, &pk)?,
                         None => engine.revoke_by_device(&pk)?,
                     }
+                    engine.close()?;
                     if json {
                         println!("{{\"revoked\":true}}");
                     } else {
                         println!("revoked {pubkey}");
                     }
+                    Ok(())
                 }
             }
-            engine.close()
         }
         Cmd::Acl(a) => {
             match a {
@@ -1040,20 +1103,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let p = acl::Principal::parse(&principal)?;
                     let r = acl::parse_rights(&rights)?;
 
-                    // Auto-route: use daemon when one is serving this forest
-                    // (doc 09 §2.1); fall back to direct engine access (fix 3).
-                    if let Some(sock) = try_daemon_socket(&state_dir) {
-                        let mn = client_identity_mnemonic()?;
-                        let key = identity::device_key(&mn, "", 0)?;
-                        let pubkey = crypto::pubkey_bytes(&key);
-                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
-                            crypto::sign_digest(&key, d).unwrap_or_default()
-                        })
-                        .map_err(remote_err)?;
+                    // Auto-route through daemon when one is running (doc 09 §3d).
+                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
                         client
-                            .set_acl(&node_id, &p.display(), &acl::rights_to_str(r), |d| {
-                                crypto::sign_digest(&key, d).unwrap_or_default()
-                            })
+                            .set_acl(&node_id, &p.display(), &acl::rights_to_str(r), |d| sign(d))
                             .map_err(remote_err)?;
                     } else {
                         let mut engine = Engine::open(&state_dir)?;
@@ -1139,19 +1192,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let state_dir = ctx?;
                     let member_pk = decode_member(&member)?;
 
-                    // Auto-route through daemon when one is running (doc 09 §2.1).
-                    if let Some(sock) = try_daemon_socket(&state_dir) {
-                        let mn = client_identity_mnemonic()?;
-                        let key = identity::device_key(&mn, "", 0)?;
-                        let pubkey = crypto::pubkey_bytes(&key);
-                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
-                            crypto::sign_digest(&key, d).unwrap_or_default()
-                        })
-                        .map_err(remote_err)?;
+                    // Auto-route through daemon when one is running (doc 09 §3d).
+                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
                         client
-                            .tag_member(&hex::encode(&member_pk), &tag, true, |d| {
-                                crypto::sign_digest(&key, d).unwrap_or_default()
-                            })
+                            .tag_member(&hex::encode(&member_pk), &tag, true, |d| sign(d))
                             .map_err(remote_err)?;
                     } else {
                         let mut engine = Engine::open(&state_dir)?;
@@ -1169,19 +1213,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let state_dir = ctx?;
                     let member_pk = decode_member(&member)?;
 
-                    // Auto-route through daemon when one is running (doc 09 §2.1).
-                    if let Some(sock) = try_daemon_socket(&state_dir) {
-                        let mn = client_identity_mnemonic()?;
-                        let key = identity::device_key(&mn, "", 0)?;
-                        let pubkey = crypto::pubkey_bytes(&key);
-                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
-                            crypto::sign_digest(&key, d).unwrap_or_default()
-                        })
-                        .map_err(remote_err)?;
+                    // Auto-route through daemon when one is running (doc 09 §3d).
+                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
                         client
-                            .tag_member(&hex::encode(&member_pk), &tag, false, |d| {
-                                crypto::sign_digest(&key, d).unwrap_or_default()
-                            })
+                            .tag_member(&hex::encode(&member_pk), &tag, false, |d| sign(d))
                             .map_err(remote_err)?;
                     } else {
                         let mut engine = Engine::open(&state_dir)?;
