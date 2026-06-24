@@ -265,23 +265,23 @@ enum DeviceCmd {
 enum AclCmd {
     /// Set (or clear) a principal's rights on a node
     Set {
-        /// Node id (64-hex)
+        /// Node id (64-hex), pvfs:// URI, or absolute path under a mount
         node: String,
-        /// Principal: `any` or `key:<hex>`
+        /// Principal: `public`, `any`, `tag:<name>`, or `key:<hex>`
         principal: String,
         /// Rights: letters from r,w,a (e.g. `rw`), or `-`/`none` to clear
         rights: String,
     },
     /// List the direct ACL grants on a node
     Ls {
-        /// Node id (64-hex)
+        /// Node id (64-hex), pvfs:// URI, or absolute path under a mount
         node: String,
     },
     /// Show a principal's effective rights on a node (incl. inheritance)
     Check {
-        /// Node id (64-hex)
+        /// Node id (64-hex), pvfs:// URI, or absolute path under a mount
         node: String,
-        /// Principal: `any` or `key:<hex>`
+        /// Principal: `public`, `any`, `tag:<name>`, or `key:<hex>`
         principal: String,
     },
 }
@@ -550,6 +550,33 @@ fn engine_and_node(
         let engine = mount::open_mount(&t.mount)?;
         let node = mount::node_at_path(&engine, &t.segments)?;
         Ok((engine, node))
+    }
+}
+
+/// Resolve a target to a node id only, without keeping the engine open.
+/// Uses `engine_and_node` for the path walk, then drops the engine.
+fn resolve_node_id(ctx: Result<PathBuf, PvfsError>, target: &str) -> Result<String, PvfsError> {
+    let (engine, id) = engine_and_node(ctx, target)?;
+    engine.close()?;
+    Ok(id)
+}
+
+/// Find the daemon socket for the current forest context, if a daemon is
+/// running (doc 09 §2.1 auto-routing). Returns `None` when no socket exists,
+/// which signals the caller to fall back to direct engine access.
+fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
+    // Peek the forest identity to derive the conventional socket path.
+    // state_dir is <mount>/.pvfs/; its parent is the mount directory.
+    let parent = state_dir.parent().filter(|p| !p.as_os_str().is_empty())?;
+    // Canonicalize so that relative paths (PVFS_DATA_DIR=".pvfs") work too.
+    let mount = std::fs::canonicalize(parent).ok()?;
+    let identity = mount::peek_identity(&mount).ok()?;
+    let sock = mount::daemon_socket_path(&identity.forest_id);
+    // Only return the path if the socket file exists (daemon is running).
+    if sock.exists() {
+        Some(sock)
+    } else {
+        None
     }
 }
 
@@ -1001,29 +1028,54 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Acl(a) => {
-            let mut engine = Engine::open(&ctx?)?;
             match a {
                 AclCmd::Set {
                     node,
                     principal,
                     rights,
                 } => {
+                    // Resolve path/URI → node id (fix: was node-id only before).
+                    let state_dir = ctx?;
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
                     let p = acl::Principal::parse(&principal)?;
                     let r = acl::parse_rights(&rights)?;
-                    engine.set_acl(&node, &p, r)?;
+
+                    // Auto-route: use daemon when one is serving this forest
+                    // (doc 09 §2.1); fall back to direct engine access (fix 3).
+                    if let Some(sock) = try_daemon_socket(&state_dir) {
+                        let mn = client_identity_mnemonic()?;
+                        let key = identity::device_key(&mn, "", 0)?;
+                        let pubkey = crypto::pubkey_bytes(&key);
+                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
+                            crypto::sign_digest(&key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                        client
+                            .set_acl(&node_id, &p.display(), &acl::rights_to_str(r), |d| {
+                                crypto::sign_digest(&key, d).unwrap_or_default()
+                            })
+                            .map_err(remote_err)?;
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        engine.set_acl(&node_id, &p, r)?;
+                        engine.close()?;
+                    }
                     if json {
                         println!(
                             "{{\"node\":\"{}\",\"principal\":\"{}\",\"rights\":\"{}\"}}",
-                            json_escape(&node),
+                            json_escape(&node_id),
                             json_escape(&p.display()),
                             acl::rights_to_str(r)
                         );
                     } else {
-                        println!("set {} on {} = {}", p.display(), node, acl::rights_to_str(r));
+                        println!("set {} on {} = {}", p.display(), node_id, acl::rights_to_str(r));
                     }
+                    Ok(())
                 }
                 AclCmd::Ls { node } => {
-                    let entries = engine.acl_entries(&node)?;
+                    // Resolve path/URI → node id.
+                    let (engine, node_id) = engine_and_node(ctx, &node)?;
+                    let entries = engine.acl_entries(&node_id)?;
                     if json {
                         let items: Vec<String> = entries
                             .iter()
@@ -1038,7 +1090,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             .collect();
                         println!("[{}]", items.join(","));
                     } else if entries.is_empty() {
-                        println!("(no direct grants on {node})");
+                        println!("(no direct grants on {node_id})");
                     } else {
                         for (p, authority, r) in entries {
                             println!(
@@ -1049,14 +1101,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             );
                         }
                     }
+                    engine.close()
                 }
                 AclCmd::Check { node, principal } => {
+                    // Resolve path/URI → node id.
+                    let (engine, node_id) = engine_and_node(ctx, &node)?;
                     let p = acl::Principal::parse(&principal)?;
-                    let r = engine.effective_rights(&p, &node)?;
+                    let r = engine.effective_rights(&p, &node_id)?;
                     if json {
                         println!(
                             "{{\"node\":\"{}\",\"principal\":\"{}\",\"effective\":\"{}\"}}",
-                            json_escape(&node),
+                            json_escape(&node_id),
                             json_escape(&p.display()),
                             acl::rights_to_str(r)
                         );
@@ -1064,16 +1119,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!(
                             "{} effective on {} = {}",
                             p.display(),
-                            node,
+                            node_id,
                             acl::rights_to_str(r)
                         );
                     }
+                    engine.close()
                 }
             }
-            engine.close()
         }
         Cmd::Tag(t) => {
-            let mut engine = Engine::open(&ctx?)?;
             let decode_member = |m: &str| -> Result<Vec<u8>, PvfsError> {
                 hex::decode(m).map_err(|_| PvfsError::BadInput {
                     field: "member".into(),
@@ -1082,22 +1136,68 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             };
             match t {
                 TagCmd::Add { member, tag } => {
-                    engine.set_member_tag(&decode_member(&member)?, &tag, true)?;
+                    let state_dir = ctx?;
+                    let member_pk = decode_member(&member)?;
+
+                    // Auto-route through daemon when one is running (doc 09 §2.1).
+                    if let Some(sock) = try_daemon_socket(&state_dir) {
+                        let mn = client_identity_mnemonic()?;
+                        let key = identity::device_key(&mn, "", 0)?;
+                        let pubkey = crypto::pubkey_bytes(&key);
+                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
+                            crypto::sign_digest(&key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                        client
+                            .tag_member(&hex::encode(&member_pk), &tag, true, |d| {
+                                crypto::sign_digest(&key, d).unwrap_or_default()
+                            })
+                            .map_err(remote_err)?;
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        engine.set_member_tag(&member_pk, &tag, true)?;
+                        engine.close()?;
+                    }
                     if json {
                         println!("{{\"tagged\":true,\"tag\":\"{}\"}}", json_escape(&tag));
                     } else {
                         println!("tagged {member} with {tag}");
                     }
+                    Ok(())
                 }
                 TagCmd::Rm { member, tag } => {
-                    engine.set_member_tag(&decode_member(&member)?, &tag, false)?;
+                    let state_dir = ctx?;
+                    let member_pk = decode_member(&member)?;
+
+                    // Auto-route through daemon when one is running (doc 09 §2.1).
+                    if let Some(sock) = try_daemon_socket(&state_dir) {
+                        let mn = client_identity_mnemonic()?;
+                        let key = identity::device_key(&mn, "", 0)?;
+                        let pubkey = crypto::pubkey_bytes(&key);
+                        let mut client = Client::connect_signed(&sock, &pubkey, |d| {
+                            crypto::sign_digest(&key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                        client
+                            .tag_member(&hex::encode(&member_pk), &tag, false, |d| {
+                                crypto::sign_digest(&key, d).unwrap_or_default()
+                            })
+                            .map_err(remote_err)?;
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        engine.set_member_tag(&member_pk, &tag, false)?;
+                        engine.close()?;
+                    }
                     if json {
                         println!("{{\"tagged\":false,\"tag\":\"{}\"}}", json_escape(&tag));
                     } else {
                         println!("removed tag {tag} from {member}");
                     }
+                    Ok(())
                 }
                 TagCmd::Ls { member } => {
+                    // Read-only: open engine directly (no mutation, no race with daemon).
+                    let mut engine = Engine::open(&ctx?)?;
                     let tags = engine.member_tags(&decode_member(&member)?)?;
                     if json {
                         let items: Vec<String> = tags
@@ -1118,9 +1218,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             println!("{t}{}", authority_suffix(&authority));
                         }
                     }
+                    engine.close()
                 }
             }
-            engine.close()
         }
         Cmd::Whoami => {
             let mn = client_identity_mnemonic()?;
