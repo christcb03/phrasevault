@@ -1,10 +1,13 @@
 //! PVFS daemon/client wire protocol (doc 07).
 //!
-//! - Transport: length-prefixed JSON frames (`u32` LE length || JSON body).
+//! - Transport: length-prefixed frames.
+//!   - JSON control frames: `u32 LE length || JSON body`
+//!   - Binary data frames: `u32 LE length || raw bytes`  (used only for `Cat` data plane)
+//!     The frame format is identical; the receiver switches to `read_data_frame` after a
+//!     `CatStart` JSON message and back to `read_msg` after `CatDone`.
 //! - Auth: challenge-response — the daemon sends a nonce, the client signs
 //!   [`auth_digest`] with its identity key; the proven key is the principal.
-//! - Messages: [`ServerMsg`] / [`ClientMsg`]. The write path (PrepareWrite/Commit)
-//!   and `Cat` land in later slices; v1 here is the handshake + read ops.
+//! - Messages: [`ServerMsg`] / [`ClientMsg`].
 
 use std::io::{self, Read, Write};
 
@@ -13,9 +16,11 @@ use pvfs_core::encoding::Enc;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 /// Hard cap on a single control frame (bulk bytes use the data plane, not frames).
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
+/// Chunk size for binary data-plane frames (1 MiB).
+pub const DATA_CHUNK: usize = 1 << 20;
 
 /// Server → client messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,8 +50,10 @@ pub enum ServerMsg {
     },
     /// Phase 2 result: the committed write's id.
     Committed { id: String },
-    /// A chunk of file bytes (hex); `eof` once the file is exhausted.
-    CatData { data: String, eof: bool },
+    /// Data-plane cat: announces the file size; raw binary data frames follow.
+    CatStart { size: u64 },
+    /// Data-plane cat: all bytes sent; total written byte count.
+    CatDone { written: u64 },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
 }
@@ -101,8 +108,9 @@ pub enum ClientMsg {
     Info,
     Ls { node: String },
     Stat { node: String },
-    /// Read up to `len` bytes of a file node starting at `offset`.
-    Cat { node: String, offset: u64, len: u64 },
+    /// Stream a file node's bytes. Server responds: CatStart, then binary data
+    /// frames (`write_data_frame`), then CatDone.
+    Cat { node: String },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },
     /// Phase 2: return one signature (hex) per preimage, in order.
@@ -137,7 +145,7 @@ pub fn auth_digest(nonce: &[u8], forest_id: &str, expiry_ms: u64) -> [u8; 32] {
     crypto::domain_digest("pvfs:daemon-auth:v1:", &e.finish())
 }
 
-/// Write one length-prefixed JSON frame.
+/// Write one length-prefixed JSON control frame.
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = serde_json::to_vec(msg).map_err(invalid)?;
     let len = u32::try_from(body.len()).map_err(|_| invalid("frame too large"))?;
@@ -149,7 +157,7 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     w.flush()
 }
 
-/// Read one length-prefixed JSON frame; `Ok(None)` on a clean EOF.
+/// Read one length-prefixed JSON control frame; `Ok(None)` on a clean EOF.
 pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {
@@ -164,6 +172,36 @@ pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R) -> io::Resul
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
     serde_json::from_slice(&body).map(Some).map_err(invalid)
+}
+
+/// Write one raw binary data frame (data plane for Cat).
+/// Format: `u32 LE length || raw bytes` — same framing as JSON, but content is raw.
+pub fn write_data_frame<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
+    let len = u32::try_from(data.len()).map_err(|_| invalid("data frame too large"))?;
+    if len > MAX_FRAME {
+        return Err(invalid("data frame exceeds cap"));
+    }
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(data)?;
+    w.flush()
+}
+
+/// Read one raw binary data frame (data plane for Cat).
+/// Returns `Ok(None)` on a clean EOF.
+pub fn read_data_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match r.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME {
+        return Err(invalid("data frame exceeds cap"));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body)?;
+    Ok(Some(body))
 }
 
 fn invalid<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
@@ -191,6 +229,17 @@ mod tests {
         assert_eq!(got, msg);
         // a second read hits clean EOF
         assert!(read_msg::<_, ServerMsg>(&mut cur).unwrap().is_none());
+    }
+
+    #[test]
+    fn data_frame_roundtrip() {
+        let data = b"hello pvfs data plane";
+        let mut buf = Vec::new();
+        write_data_frame(&mut buf, data).unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        let got = read_data_frame(&mut cur).unwrap().unwrap();
+        assert_eq!(got, data);
+        assert!(read_data_frame(&mut cur).unwrap().is_none());
     }
 
     #[test]

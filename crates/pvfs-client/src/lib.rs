@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use pvfs_proto::{auth_digest, read_msg, write_msg, ClientMsg, ServerMsg, WriteOp};
+use pvfs_proto::{auth_digest, read_data_frame, read_msg, write_msg, ClientMsg, ServerMsg, WriteOp};
 
 pub use pvfs_proto::{ChildInfo, NodeInfo};
 
@@ -164,30 +164,35 @@ impl Client {
         }
     }
 
-    /// Stream a file node's bytes to `out`, chunk by chunk. Returns the total
-    /// number of bytes written.
+    /// Stream a file node's bytes to `out` using the raw binary data plane
+    /// (doc 07 §6, PROTO_VERSION 2). Returns the total number of bytes written.
     pub fn cat(&mut self, node: &str, out: &mut dyn std::io::Write) -> Result<u64> {
-        const CHUNK: u64 = 1 << 20; // 1 MiB per request
-        let mut offset = 0u64;
-        loop {
-            match self.request(ClientMsg::Cat {
-                node: node.into(),
-                offset,
-                len: CHUNK,
-            })? {
-                ServerMsg::CatData { data, eof } => {
-                    let bytes = hex::decode(&data)
-                        .map_err(|_| ClientError::Protocol("cat data not hex".into()))?;
-                    out.write_all(&bytes).map_err(ClientError::Io)?;
-                    offset += bytes.len() as u64;
-                    if eof || bytes.is_empty() {
-                        break;
-                    }
+        write_msg(&mut self.stream, &ClientMsg::Cat { node: node.into() })?;
+        // Server responds: CatStart (JSON) → binary data frames → CatDone (JSON).
+        let size = match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::CatStart { size }) => size,
+            Some(ServerMsg::Error { code, message }) => return Err(ClientError::Server { code, message }),
+            Some(other) => return Err(unexpected("CatStart", &other)),
+            None => return Err(ClientError::Protocol("connection closed before CatStart".into())),
+        };
+        let mut written: u64 = 0;
+        while written < size {
+            match read_data_frame(&mut self.stream)? {
+                Some(chunk) if chunk.is_empty() => break, // abort signal
+                Some(chunk) => {
+                    out.write_all(&chunk).map_err(ClientError::Io)?;
+                    written += chunk.len() as u64;
                 }
-                other => return Err(unexpected("CatData", &other)),
+                None => break,
             }
         }
-        Ok(offset)
+        // Read CatDone (JSON) to return the stream to control-plane state.
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::CatDone { written: w }) => Ok(w),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("CatDone", &other)),
+            None => Ok(written), // server closed cleanly after data
+        }
     }
 
     /// Create a folder named `label` under `parent`. Returns the new node id.

@@ -22,6 +22,15 @@ struct Cli {
     socket: Option<PathBuf>,
 }
 
+/// RAII guard: removes the socket file on any clean exit (normal return or unwind).
+/// Stale sockets from hard kills are cleared at the next startup.
+struct SocketGuard(PathBuf);
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
@@ -49,10 +58,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let daemon = Arc::new(Daemon::new(engine));
-    let _ = std::fs::remove_file(&socket); // clear a stale socket
+    let _ = std::fs::remove_file(&socket); // clear a stale socket from a previous hard kill
     let listener = UnixListener::bind(&socket)?;
     // World-connectable; the daemon enforces ACLs per request (doc 07 §1).
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
+
+    // Remove the socket on any clean exit (normal return, panic unwind, or error).
+    let _guard = SocketGuard(socket.clone());
+
     eprintln!(
         "pvfsd: serving {} on {}",
         cli.mount.display(),

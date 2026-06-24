@@ -1,0 +1,18 @@
+[Unit]
+Description=PVFS per-user daemon for forest %i
+Documentation=https://github.com/openclaw/phrasevault
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pvfsd --mount %h/pvfs-mounts/%i
+# Remove stale socket on stop (belt-and-suspenders; pvfsd does this itself on clean exit)
+ExecStopPost=/bin/rm -f ${PVFS_SOCKET_DIR:-%t/pvfs}/%i.sock
+Restart=on-failure
+RestartSec=5
+# Limit parallel restarts
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=default.target

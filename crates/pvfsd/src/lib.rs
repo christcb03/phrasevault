@@ -1,9 +1,10 @@
 //! PVFS per-user daemon (doc 07): serves one forest over a Unix socket with
 //! challenge-response auth (§2) and per-node ACL enforcement (§4).
 //!
-//! Control plane only in this slice — handshake + `Info`/`Ls`/`Stat`. The engine
-//! is shared behind a `Mutex`, so ops serialize; a read-only connection pool and
-//! the data plane (`Cat`, two-phase writes) land in later slices.
+//! Control plane (metadata): serialized writer behind a Mutex; reads serialize
+//! for now (WAL read-pool is a later optimization).
+//! Data plane (bytes): engine lock released before streaming raw bytes so
+//! concurrent cat transfers don't block each other (doc 07 §6).
 
 use std::collections::HashMap;
 use std::io;
@@ -16,8 +17,8 @@ use pvfs_core::{
     crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
 };
 use pvfs_proto::{
-    auth_digest, read_msg, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg, WriteOp,
-    PROTO_VERSION,
+    auth_digest, read_msg, write_data_frame, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg,
+    WriteOp, DATA_CHUNK, PROTO_VERSION,
 };
 use rand::RngCore;
 
@@ -59,7 +60,6 @@ pub fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> io::Result<()> {
         let stream = stream?;
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || {
-            // A broken connection is not fatal to the daemon.
             let _ = serve_connection(&d, stream);
         });
     }
@@ -109,6 +109,12 @@ pub fn serve_connection(daemon: &Daemon, mut stream: UnixStream) -> io::Result<(
 
     // 3. request loop
     while let Some(req) = read_msg::<_, ClientMsg>(&mut stream)? {
+        // Cat uses the data plane: it writes multiple frames to the stream
+        // directly rather than returning a single ServerMsg.
+        if let ClientMsg::Cat { node } = req {
+            do_cat(daemon, &principal, &mut stream, &node)?;
+            continue;
+        }
         let resp = handle(daemon, &principal, req);
         write_msg(&mut stream, &resp)?;
     }
@@ -151,42 +157,89 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Ok(node) => ServerMsg::Stat { node },
             Err(msg) => msg,
         },
-        ClientMsg::Cat {
-            node,
-            offset,
-            len,
-        } => do_cat(daemon, principal, &node, offset, len),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
-        ClientMsg::Auth { .. } | ClientMsg::Anonymous => {
-            err("bad_input", "already past handshake")
+        // Cat is handled above in serve_connection (data-plane path).
+        ClientMsg::Cat { .. } | ClientMsg::Auth { .. } | ClientMsg::Anonymous => {
+            err("bad_input", "unexpected message in request loop")
         }
     }
 }
 
-/// Stream one chunk of a file's bytes (ACL-checked). The engine lock is held only
-/// for this chunk, so concurrent requests interleave between chunks.
-fn do_cat(daemon: &Daemon, principal: &Principal, node: &str, offset: u64, len: u64) -> ServerMsg {
+/// Stream a file's bytes to the client (data plane, doc 07 §6).
+///
+/// 1. Hold the engine lock only for ACL check + path resolution (fast metadata ops).
+/// 2. Release the lock — the data transfer never touches the engine.
+/// 3. Stream raw binary data frames: CatStart → data frames → CatDone.
+///
+/// Concurrent cat transfers on separate connections therefore run truly in parallel
+/// (each on its own thread, engine lock free for the whole streaming phase).
+fn do_cat(daemon: &Daemon, principal: &Principal, stream: &mut UnixStream, node: &str) -> io::Result<()> {
     let id: NodeId = node.to_string();
-    let mut e = daemon.engine.lock().unwrap();
-    match e.effective_rights(principal, &id) {
-        Ok(r) if r & acl::ACL_R != 0 => {}
-        Ok(_) => return forbidden(),
-        Err(err) => return err_from(err),
-    }
-    let range = pvfs_core::ByteRange {
-        start: offset,
-        end: Some(offset.saturating_add(len)),
+
+    // --- control plane: ACL check + path resolution (lock held briefly) ---
+    let path = {
+        let e = daemon.engine.lock().unwrap();
+        // ACL: caller needs read access.
+        match e.effective_rights(principal, &id) {
+            Ok(r) if r & acl::ACL_R != 0 => {}
+            Ok(_) => {
+                write_msg(stream, &err("forbidden", "access denied"))?;
+                return Ok(());
+            }
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        }
+        // Resolve the first readable local path (no lock held during I/O).
+        match e.readable_path(&id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                write_msg(stream, &err("not_found", "no readable location for file"))?;
+                return Ok(());
+            }
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        }
+    }; // engine lock released here
+
+    // --- data plane: stream raw bytes, engine lock free ---
+    let size = match std::fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            write_msg(stream, &err("internal", &format!("stat failed: {e}")))?;
+            return Ok(());
+        }
     };
-    let mut buf: Vec<u8> = Vec::new();
-    if let Err(err) = e.cat(&id, Some(range), &mut buf) {
-        return err_from(err);
+    write_msg(stream, &ServerMsg::CatStart { size })?;
+
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            // CatStart already sent — write a zero-length frame to signal abort.
+            write_data_frame(stream, &[])?;
+            return Err(e);
+        }
+    };
+
+    let mut buf = vec![0u8; DATA_CHUNK];
+    let mut written: u64 = 0;
+    loop {
+        use std::io::Read as _;
+        let got = file.read(&mut buf).map_err(|e| {
+            io::Error::new(e.kind(), format!("cat read: {e}"))
+        })?;
+        if got == 0 {
+            break;
+        }
+        write_data_frame(stream, &buf[..got])?;
+        written += got as u64;
     }
-    let eof = (buf.len() as u64) < len;
-    ServerMsg::CatData {
-        data: hex::encode(&buf),
-        eof,
-    }
+    write_msg(stream, &ServerMsg::CatDone { written })?;
+    Ok(())
 }
 
 /// Phase 1: build the signable events for `op` and stash them under a fresh id.

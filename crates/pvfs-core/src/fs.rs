@@ -909,6 +909,20 @@ impl Engine {
         }
     }
 
+    /// Return the first readable local filesystem path for a file node (no ACL
+    /// check — callers must check ACL before calling). `None` if no readable
+    /// location exists. Used by the daemon data plane to resolve a path before
+    /// releasing the engine lock for concurrent streaming (doc 07 §6).
+    pub fn readable_path(&self, id: &NodeId) -> Result<Option<std::path::PathBuf>> {
+        let uri = match self.first_readable_location(id)? {
+            Some(u) => u,
+            None => return Ok(None),
+        };
+        let resolved = self.resolve_uri(&uri)?;
+        let path = uri_to_path(&resolved)?;
+        Ok(Some(path))
+    }
+
     fn first_readable_location(&self, id: &NodeId) -> Result<Option<String>> {
         let mut candidates = self.locations(id)?;
         candidates.sort(); // file:// before pvfs-tmp:// lexically — both local
