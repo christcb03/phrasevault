@@ -342,6 +342,41 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             .map_err(&m)?;
         }
         Event::LinkCreated(l) => {
+            // One-home invariant (spec §5.2): a node may have at most one active
+            // `contains` link at any time. Enforce at fold so a tampered or
+            // crafted log cannot violate the invariant on rebuild/replay — it is
+            // already checked live by `Engine::link`, but that guard is bypassed
+            // when replaying events written by another process or injected directly.
+            if l.link_type == crate::link::LINK_CONTAINS && l.parent_id.is_some() {
+                let already: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM links WHERE child_id = ?1
+                         AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
+                        params![l.child_id, l.link_type],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(&m)?;
+                if let Some(existing_id) = already {
+                    // Skip the event entirely rather than returning a hard error
+                    // so that a well-formed move sequence (LinkRemoved then
+                    // LinkCreated in the same batch) can still fold correctly.
+                    // A genuine double-home (two concurrent active links) is
+                    // only possible if a `LinkRemoved` is missing; surface it
+                    // as a corruption error.
+                    if existing_id != l.id {
+                        return Err(crate::error::PvfsError::Corruption {
+                            db: "log.db".into(),
+                            detail: format!(
+                                "one-home invariant violated: node {} already has contains \
+                                 home {} when applying link {}",
+                                l.child_id, existing_id, l.id
+                            ),
+                            seq: None,
+                        });
+                    }
+                }
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO links
                  (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,
@@ -1343,6 +1378,79 @@ mod enforcement_tests {
                 })
             ),
             "expected rejection of a non-admin device cert, got {outcome:?}"
+        );
+    }
+
+    /// One-home invariant (spec §5.2): replay rejects a second active `contains`
+    /// link for the same child if the first was never removed. A crafted or
+    /// corrupted log that tries to give a node two homes must be detected at
+    /// rebuild/replay even if both links pass signature and author checks.
+    #[test]
+    fn replay_rejects_double_home_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mnemonic) = Engine::init(dir.path()).unwrap();
+
+        // Derive the device key so we can sign the forged link with an
+        // authorized key (bypassing the UnknownAuthor check and reaching
+        // the one-home invariant check).
+        let device_key = identity::device_key(&mnemonic, "", 0).unwrap();
+        let device_pub = crypto::pubkey_bytes(&device_key);
+
+        // Add a child node and an alternative parent under root.
+        let root = engine.identity.root_node_id.clone();
+        let child_id = engine
+            .add_node(
+                &root,
+                crate::engine::NodeSpec {
+                    node_type: node::TYPE_FOLDER.into(),
+                    label: "child".into(),
+                    payload: node::folder_payload(),
+                    is_temp: false,
+                    creation_nonce: None,
+                },
+            )
+            .unwrap();
+        let alt_parent = engine
+            .add_node(
+                &root,
+                crate::engine::NodeSpec {
+                    node_type: node::TYPE_FOLDER.into(),
+                    label: "alt".into(),
+                    payload: node::folder_payload(),
+                    is_temp: false,
+                    creation_nonce: None,
+                },
+            )
+            .unwrap();
+        engine.close().unwrap();
+
+        // Forge a second `contains` link placing `child` under `alt_parent`
+        // *without* removing the first home link — one-home violation.
+        let t = 3_000_000u64;
+        let nonce = 99u64;
+        let link_digest =
+            link::compute_id_digest(Some(&alt_parent), &child_id, link::LINK_CONTAINS, nonce);
+        let bad_link = link::Link {
+            id: hex::encode(link_digest),
+            parent_id: Some(alt_parent.clone()),
+            child_id: child_id.clone(),
+            link_type: link::LINK_CONTAINS.into(),
+            link_nonce: nonce,
+            order_key: "z".into(),
+            created_at: t,
+            author: device_pub.clone(),
+            sig: crypto::sign_digest(&device_key, &link_digest).unwrap(),
+            removed_at: None,
+            superseded_by: None,
+            suspended_at: None,
+        };
+        append_to_log(dir.path(), &Event::LinkCreated(bad_link));
+
+        // Rebuild must detect the double-home as a Corruption error.
+        let outcome = Engine::open(dir.path()).map(drop);
+        assert!(
+            matches!(outcome, Err(PvfsError::Corruption { .. })),
+            "expected Corruption for double-home link, got {outcome:?}"
         );
     }
 }
