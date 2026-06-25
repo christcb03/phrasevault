@@ -31,14 +31,23 @@ charset (`[a-z0-9][a-z0-9_-]*`).
 
 ### 1.2 Member tags
 `MemberTagged { member_pubkey, tag, granted, set_at, author, sig }` — `granted=true` adds, `false`
-removes. **Authorizing a tag assignment requires admin (`a`) on the forest root** (owner devices
-qualify), checked live and on replay via `check_member_event`. Projected into
-`member_tags(member_pubkey, tag)`.
+removes, checked live and on replay via `check_member_event`. Projected into
+`member_tags(member_pubkey, tag, authority)`.
+
+> **Superseded by per-key tags (doc 10, P2-G — shipped).** A tag is now `(authority, name)`, where
+> the authority is the event author. Two changes from the original model below: (a) **any authorized
+> member** may assign a tag **under its own authority** — the old "admin on the forest root"
+> requirement is dropped, safe because a key-scoped membership only unlocks nodes that same key
+> already controls; (b) a node's tag grant and a member's membership combine **only when authored by
+> the same key**, so one forest hosts many apps' tag namespaces without collision.
 
 ### 1.3 Evaluation
-`effective_rights(Key(pk), node)` for a non-owner member now also unions, at each node up the tree,
-the grants for **every tag the member holds**. Owner devices still short-circuit to full rights.
-`effective_rights(Tag(t), node)` reports a tag's own grants (for inspection / `acl check`).
+`effective_rights(Key(pk), node)` for a non-owner member unions, at each node up the tree, the grants
+for **every tag the member holds — matched on `(authority, name)`** (doc 10): the membership and the
+node's `Tag` grant must share an authority, and that authority must still be an active member
+(revoked authorities are masked). Owner devices still short-circuit to full rights.
+`effective_rights(Tag(t), node)` reports that name's grants across all authorities (inspection /
+`acl check`).
 
 > **Scope (v1):** tags are **per-forest** (each forest's owner assigns them within that forest). A
 > host-level overlay so one tag set spans all of an owner's forests is a later option; per-forest is
@@ -145,12 +154,14 @@ it does not block the live-daemon work.
 |-------|-------------|
 | **1** | ☑ Tags: `Tag` principal, `MemberTagged` event + `member_tags` table, `effective_rights` extension; local CLI. |
 | **2** | ☑ `mv` (re-home a node, member-signed over the daemon). |
-| **3a** | **Device certs = "root or admin device"** (replay rule + engine `authorize_member`/`revoke` by an admin device, phrase-free) — the kernel foundation. |
+| **3a** | ☑ **Device certs = "root or admin device"** (replay rule + engine `authorize_member`/`revoke` by an admin device, phrase-free) — the kernel foundation. |
 | **3b** | ☑ Conventional per-forest socket (`$PVFS_SOCKET_DIR/<forest_id>.sock`); `pvfsd` binds it by default; `pvfs remote --forest <alias\|mount>` resolves it (no manual socket path). |
 | **3c** | ☑ Admin ops over the daemon — `SetAcl`/`TagMember`/`AuthorizeMember`/`Revoke` `WriteOp`s; engine `prepare_*` + a commit that routes device certs through `check_device_cert`; `pvfs-client` `set_acl`/`tag_member`/`authorize_member`/`revoke`. Owner does **live admin over the socket** (authorize a member + grant → member writes immediately, no restart). Pluggable-signer seam (device key now; companion later). |
-| **3d** | CLI **always auto-routes**: any forest op looks for a daemon serving that forest → submit to it; else write directly. No flags, no phrase. |
-| **4** | Raw data plane for `cat`. |
-| **5** | Companion app (§6): root custodian + localhost identity agent / auto-login. Its own track. |
+| **3d** | ☑ CLI **auto-routes**: `acl`/`tag`/`device` mutations look for a daemon serving that forest → submit to it (device-signed); else write directly. Path/URI args too. Root-signed (`--mnemonic`) stays direct (the daemon can't proxy the phrase). |
+| **4** | ☑ Raw binary data plane for `cat` (PROTO_VERSION 2; lock released before I/O → concurrent transfers). |
+| **5** | Companion app (§6): root custodian + localhost identity agent / auto-login. Its own track (1.0 scope TBD — doc 08 §3). |
 
-Kernel encodings unchanged except the additive `MemberTagged` event + `member_tags` table (no
-schema-version bump; additive table via `CREATE TABLE IF NOT EXISTS`).
+Kernel **event encodings** unchanged: the `MemberTagged` event was additive, and per-key tags
+(doc 10, P2-G) added no wire fields (the authority is the existing author). The **projection** schema
+did bump to `SCHEMA_VERSION` 2 for P2-G's `authority` columns — older projections self-heal by
+replaying from the log.

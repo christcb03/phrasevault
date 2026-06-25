@@ -180,7 +180,7 @@ A member granted **`w`** on a subtree can create folders there over the daemon. 
 **signed by the member's own key** — the daemon never signs on their behalf:
 
 ```bash
-# owner: grant write (set this BEFORE starting pvfsd — see note)
+# owner: grant write — while pvfsd runs, this auto-routes through it and takes effect live
 pvfs acl set <node-id> key:028f... rw
 
 # member: create a folder under that node
@@ -188,9 +188,9 @@ pvfs remote --socket … mkdir <node-id> my-folder
 #   → created <new-node-id>
 ```
 
-> **Note:** `pvfsd` serves a snapshot of the forest as of when it started. Set authorizations and
-> ACL grants **before** launching `pvfsd` (or restart it after changing them). Writes made *through*
-> the daemon are seen immediately. (Live admin over the daemon is on the roadmap.)
+> **Note:** Admin changes take effect **immediately**. While `pvfsd` is running, `pvfs acl set` /
+> `tag add` / `device authorize-member` auto-route through it, so the next request sees the new
+> grant — no restart needed. (When no daemon is running, they apply directly to the forest.)
 
 ### 7.6 Tags (sharing with a group)
 
@@ -203,7 +203,15 @@ tag. Two independent dials:
 Now everyone holding `media_users` can read anything tagged `media_users` (with inheritance down
 the tree). A new friend? `pvfs tag add <their-key> media_users` — done. Un-share? Remove the node's
 tag grant, or drop the member's tag with `pvfs tag rm <key> media_users`. Inspect with
-`pvfs tag ls <key>`. Assigning tags requires admin on the forest (you, the owner, always have it).
+`pvfs tag ls <key>`.
+
+**Tags belong to the key that sets them.** A tag is identified by *(who granted it, the name)*, not
+the name alone — so two apps can both use `friends` in the same forest without colliding, and a tag
+only opens a node when the **same key** granted both the node's tag and the member's tag. Any
+authorized member may manage tags under its own authority (you don't have to be a forest admin), and
+that authority can only widen access to nodes it already controls. If a member's key is revoked,
+every tag it granted stops working immediately. `acl ls` / `tag ls` show ` (by <key>)` so you can
+see which key a tag belongs to.
 
 ---
 
@@ -257,18 +265,17 @@ mount to set the forest context for tree commands.
 
 ## 10. Roadmap
 
-Available now: forests & import, the full ACL model **with tags**, phrase-free member admin, and
-daemon sharing — members **read** (`ls`/`stat`/`cat`) and **write**
+Available now: forests & import, the full ACL model **with per-key tags**, phrase-free member admin,
+and daemon sharing — members **read** (`ls`/`stat`/`cat`) and **write**
 (`mkdir`/`add-file`/`add-location`/`rm`/`mv`), each change signed by their own key, and the owner
 does **live admin** (authorize/grant/tag) through the running daemon. Reach a forest's daemon with
-`pvfs remote --forest <alias|mount>` (no socket path needed).
+`pvfs remote --forest <alias|mount>` (no socket path needed). Plain `pvfs acl set` / `tag add` /
+`device authorize-member` **auto-route** to a running daemon (no `remote` prefix), and `acl`/`tag`
+accept `pvfs://` URIs and paths. `cat` streams **raw bytes** with concurrent transfers, and `pvfsd`
+ships a `pvfsd@.service` systemd `--user` unit.
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **Seamless CLI** — plain `pvfs acl set` / `tag add` automatically use a running daemon (no
-  `remote` prefix); direct when none runs.
-- **A dedicated data plane** for `cat` — concurrent raw-byte transfers (and the seam for torrent-like
-  distribution), instead of today's ranged-chunk delivery.
 - **A companion app** — a local custodian for your root key that also auto-logs you in to
   PVFS-backed web apps. It reproduces your identity key from your phrase on any machine, so your
   sharing works the same everywhere.

@@ -161,9 +161,9 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
 
 > **Live status lives in [08-roadmap-and-status.md](08-roadmap-and-status.md); tags + the live
 > daemon in [09-tags-and-the-live-daemon.md](09-tags-and-the-live-daemon.md) §7.** The list below is
-> the original P2-C plan, kept for history — most items have shipped (reads, all member writes incl.
-> `mv`/`add-location`, `cat`, admin over the daemon). Remaining: CLI auto-routing (09 §3d) and the
-> raw data plane (§6).
+> the original P2-C plan, kept for history — it has **all shipped**: reads, all member writes
+> (incl. `mv`/`add-location`), `cat`, admin over the daemon, **CLI auto-routing (3d)**, and the
+> **raw binary data plane** (§6, PROTO_VERSION 2 — replaced the ranged hex chunks below).
 
 1. ☑ `Public` principal tier in the ACL model (additive — landed ahead of the daemon).
 2. ☑ `pvfs-proto`: JSON frames + `auth_digest` + message types (unit-tested).
