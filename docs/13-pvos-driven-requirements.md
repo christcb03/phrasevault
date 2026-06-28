@@ -18,6 +18,16 @@ PVFS today is **single-writer**: the daemon is the only writer and the log is on
 - **Q-A2:** If multi-writer: **conflict semantics** (PVOS D9) — last-writer-wins per entity (signed-time + node-id tiebreak), app-defined merge, CRDT, or single-writer-per-entity leases?
 - **Q-A3:** Is collaborative *concurrent editing of a shared region by multiple people* a real near-term need, or can it wait? (This is the main thing that truly requires multi-writer.)
 
+### A — Resolved direction (2026-06-21)
+
+- **Base / normal operations: single-writer.** The linear signed log is preserved for all normal use; replication = verified **log shipping**; read replicas; HA = **standby + failover**.
+- **Offline / multi-device divergence: app-level.** Offline editing and its merge/conflict resolution stay in the **app realm** (e.g. the Messenger blob), **not** in PVFS. PVFS does not do offline multi-master.
+- **Active-active cluster: a LATER, opt-in HA mode — *not* offline.** Two nodes on different devices that are **both online and participating in edits live**. If one drops, the other becomes **primary** (failover). On rejoin, the system **auto-merges**: **no conflicts → sync and resume dual-active; conflicts → an operator resolves them before dual-active resumes** (halt-and-resolve, *not* silent last-writer-wins).
+- **Consequence:** the genuinely hard multi-master merge is **deferred and well-scoped** (co-online only, operator-gated). The **near-term P4 foundation is just single-writer region replication + failover** — much more tractable. *(Resolves Q-A1/A2/A3; PVOS D9.)*
+- **Deferred sub-questions for the active-active mode (when built):** the live 2-node ordering/coordination (a small consensus while both connected); **split-brain detection / fencing** (never two primaries); and what precisely counts as a "conflict" at heal time.
+
+---
+
 ## B. Sub-forest (tree/region) replication mechanics (P4)
 
 PVOS needs replicate/share/host at **tree/region** granularity, not just whole forests (per-app backup, peer-hosting, isolated-app cross-host links).
