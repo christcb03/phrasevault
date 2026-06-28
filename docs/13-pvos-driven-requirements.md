@@ -1,6 +1,6 @@
 # PVFS — Requirements Driven by PVOS (13)
 
-Status: **Open questions / requirements brief** — the consolidated set of things PVFS must answer or change to be a complete foundation for PVOS. Written from the PVOS side so the PVFS work has one clear target. Goal: **finish the PVFS layer before PVOS goes deeper.**
+Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consolidated set of things PVFS must do for PVOS, now with a chosen direction for each. §G/P3 is tracked in doc 12; deferred *implementation* details are noted inline. Written from the PVOS side so the PVFS work has one clear target. Goal: **finish the PVFS layer before PVOS goes deeper.**
 Date: 2026-06-21
 Related: doc 03 (federation), doc 10 (per-key tags — done, P2-G), doc 11 (compaction), doc 12 (secure node — P3 proposal).
 
@@ -63,11 +63,24 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 - **Q-C1:** A per-node / per-blob **"do not replicate" (local-only)** policy — the Messenger's local secure blob is app-local and never PVFS-replicated. Extend the existing `temp`-node (local-only, never-replicated) semantics, or a new explicit flag on normal/secure nodes?
 - **Q-C2:** Secure blobs (P3) that *are* replicated travel as **ciphertext only** (the daemon has no key). Confirm the daemon replicates opaque bytes + the content-free hash-ledger.
 
+### C — Resolved (2026-06-21)
+- **Q-C1:** Add a per-node/per-region **`local_only` (no-replicate) flag.** A node — especially a **region root** — can be marked local-only; its region's log never replicates. Distinct from `temp` (which is *also* auto-purged when orphaned); `local_only` keeps the data, just never ships it. The Messenger's secure blob lives in a `local_only` region.
+- **Q-C2:** Confirmed — a replicated **secure** blob travels as **ciphertext + the content-free hash-ledger**; the daemon has no key and replicates opaque bytes.
+
+---
+
 ## D. Cross-forest access — isolated apps & sharing (P4)
 
 - **Q-D1:** **Local** cross-forest grant (authorize another forest's key into this forest with scoped ACLs/tags) — confirm this works today with the existing member-auth + ACL model (no change needed for same-host).
 - **Q-D2:** **Cross-host** cross-forest access — needs the federation transport + the scoped grant. Design (the "linked-in isolated app on another host," PVOS doc 00 §3.5).
 - **Q-D3:** **Peer-hosting / PVFS File Server** — one host serves another user's region. Trust model: for secure regions the host sees only ciphertext; for non-secure regions access is ACL-gated and the host *can* read — is that acceptable, or must hosted data always be encrypted-at-rest-to-the-owner?
+
+### D — Resolved (2026-06-21)
+- **Q-D1:** Confirmed — a **local** (same-host) cross-forest grant is just authorizing another forest's key as a member with scoped ACLs/tags; **works on today's model, no change.**
+- **Q-D2:** **Cross-host** cross-forest access = the same scoped grant carried over the **federation transport**; the granted key replicates/queries the granted **region** (§B). Detailed protocol lands with the federation build; the model is settled.
+- **Q-D3 (trust rule):** A peer host can **read any non-secure region it hosts** (plaintext, ACL-gated) but only sees **ciphertext** of secure regions. **Rule:** put **secure (encrypted) regions** on untrusted peer hosts; keep plaintext regions on your own/trusted hosts.
+
+---
 
 ## E. Identity & ACL additions
 
@@ -75,10 +88,23 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 - **Q-E2:** **Guest / anonymous / ephemeral identities** — sharing to a non-PVOS recipient (D16) needs a lightweight identity they can hold. Does PVFS want a guest-key notion, or is `public` + a capability link enough?
 - **Q-E3:** **Shared companion API (PVOS D7)** — the companion is partly a PVFS component (doc 09 §6). One agent must serve **PVFS root-signing + PVOS owner-signing + PVOS SSSO** (identity assertion + human-signature brokering). Agree the agent's API surface across both projects.
 
+### E — Resolved (2026-06-21)
+- **Q-E1:** **Add optional `expiry` to ACL grants** (`AclSet` gains an optional expiry; `effective_rights` treats an expired grant as inert). Small additive change; mirrors PVOS's capability TTL and powers public-links. *(Preferred over PVOS revoking on a timer.)*
+- **Q-E2:** **No new identity primitive.** A "guest" / public link = an **expiring `public`/`key` grant** (E1) + a shareable token; the recipient holds an ephemeral key. Covers non-PVOS sharing without a guest-identity type.
+- **Q-E3:** **One companion agent**, a superset API both consume: `get-identity/pubkey`, `sign(digest)` (with approval), plus PVOS's `sign-in challenge` and `sign-as-user(context)`. A small joint spec to write when the companion is built (PVFS doc 09 §6 + PVOS doc 10 §4.1).
+
+---
+
 ## F. Multi-user / per-user daemon
 
 - **Q-F1:** Confirm **one `pvfsd` (and `pvosd`) per OS user** as the multi-user-host model; how multiple users' forests relate on one host.
 - **Q-F2:** **Non-owner users (PVOS D18):** their identity = a PVFS member key; where their companion runs; how they reach **shared regions** they're granted (overlaps §D). Largely existing member model + §A/§D.
+
+### F — Resolved (2026-06-21)
+- **Q-F1:** Confirmed — **one `pvfsd` (+ `pvosd`) per OS user** (matches PVFS's existing per-user daemon). Cross-user access = cross-forest grants (§D).
+- **Q-F2:** A non-owner user is a **PVFS member key**; their companion runs per their chosen tier (PVOS D1); they reach **shared regions** via §D grants + §B region replication. The deeper non-owner *onboarding/UX* is PVOS D18 (deferred), but the PVFS mechanics are the existing **member + cross-forest + region-replication** composition — **no new PVFS primitive.**
+
+---
 
 ## G. Secure node type (P3) — open questions (from doc 12)
 
