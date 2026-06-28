@@ -37,6 +37,27 @@ PVOS needs replicate/share/host at **tree/region** granularity, not just whole f
 - **Q-B3:** Selective log subscription — a replica follows only events touching the region's nodes. Mechanism?
 - **Q-B4:** How do per-key tags / authorities (P2-G) and ACLs travel with a replicated region (a region usually maps to one app authority)?
 
+### B — Resolved design: a hash-linked tree of per-region logs (2026-06-21)
+
+**Chosen: per-region logs + forest manifest, with *markable, nestable* region boundaries.**
+
+- **Region boundary = a marked node.** Any node may be flagged a **region root**; the subtree beneath it — down to the next nested region boundary — is its region, with **its own append-only signed log**. Regions **nest** (an app can sub-divide its own area).
+- **A region's log** records events touching *its* nodes (creates, intra-region links, payload changes, region-scoped ACL/tag grants, secure-blob hash-states) — **excluding** events inside nested sub-regions, which live in *their* logs.
+- **Parent commits child head (the manifest, recursive).** Each region's log **commits the current head hash of every direct sub-region** (a signed "sub-region S head = H" entry). The forest is therefore a **hash-linked tree of logs**: the forest-root region is the top, and one root hash still attests the **entire** forest — PVFS's whole-forest tamper-evidence is preserved, just as a root over a tree of logs instead of one chain.
+- **Replicate a region** = ship its log **+ the path of parent head-commitments up to the forest root** (the "manifest proof" that this head is the pinned, current one). Ship its sub-region logs too to replicate the whole subtree; omit them to replicate just the region (sub-region heads stay pinned-but-unfetched, like Git submodules).
+- **Cross-region links** (the DAG spans regions) are authored in the **source** region's log, carrying the target node id + the **target region's head-hash-at-the-time**. If the target region isn't replicated, the link is **dangling-but-verifiable** (provable, unresolvable until you fetch that region).
+- **Falls out for free:** per-region **compaction** (doc 11) and **backup** (compact/replicate a region independently; the parent just commits the new head), and a clean unit for later **per-region active-active** (§A).
+- **Compatible with §A:** single-writer base unchanged — each region is written by the one writer; head-commitments are part of that flow.
+
+**Deferred implementation details (PVFS side):**
+- The **mark/unmark region-boundary** op (split a subtree into its own log / merge back) — a signed structural event in the parent log.
+- Cross-region **causal ordering** (a partial order via head-hash references; no global total order across independent regions — which is exactly what *enables* independent replication).
+- Where a cross-region **move** (re-home across a boundary) is authored and how both logs reflect it.
+
+This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, the PVFS foundation's hard decisions are made; §C–§F are confirmations / modest additions.
+
+---
+
 ## C. Replication policy / opt-out
 
 - **Q-C1:** A per-node / per-blob **"do not replicate" (local-only)** policy — the Messenger's local secure blob is app-local and never PVFS-replicated. Extend the existing `temp`-node (local-only, never-replicated) semantics, or a new explicit flag on normal/secure nodes?
