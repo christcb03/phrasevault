@@ -1493,6 +1493,16 @@ impl Engine {
         Ok(out)
     }
 
+    /// Whether a grant/membership **authority** is still a live (authorized,
+    /// unrevoked) member (doc 10 §9.2). An empty authority — the `public`/`any`/
+    /// `key` principals — is always active. A tag grant or membership whose
+    /// authority is inactive is **inert**: masked on the read path and cleaned up
+    /// by compaction (doc 11). Inspection commands (`acl ls`, `tag ls`) use this to
+    /// flag such rows for audit clarity.
+    pub fn authority_active(&self, authority: &[u8]) -> Result<bool> {
+        projection::authority_active(&self.conn, authority)
+    }
+
     /// Assign (`granted = true`) or remove a membership tag from a member key
     /// (doc 09 §1). Authored by the local device, which must hold admin (`a`) on
     /// the forest root (owner devices always do).

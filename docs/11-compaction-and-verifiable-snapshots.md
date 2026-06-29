@@ -31,6 +31,12 @@ Re-genesis a region from its **current** state into a fresh, smaller DAG:
   the **provenance history** (who/when/how the state was reached), not the current objects.
 - **Current authorization survives.** The snapshot carries the live ACLs, tags, memberships, and
   device-cert state, so access control is unchanged across the cut.
+  - **Inert rows are reclaimed for free.** Re-genesis materializes the *effective* current state, so
+    grants/memberships whose tag authority has been revoked — already masked on the read path and
+    flagged `[inert: authority revoked]` by `acl ls`/`tag ls` (doc 10 §9.2; doc 08 §4 item 13) — are
+    simply **not carried forward**. This is the physical cleanup that replaces the rejected
+    signed-removal sweep: no removal events, no wire change; the dead rows drop out when the region is
+    compacted.
 - **Scope is a region** (a subtree), not necessarily the whole forest — which dovetails with
   sub-forest replication (doc 03 §1.5): the region is the natural unit for both.
 

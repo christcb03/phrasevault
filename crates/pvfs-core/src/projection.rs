@@ -806,7 +806,8 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
 /// The `(authority, tag)` memberships a key holds whose **authority is still an
 /// active, unrevoked member** (doc 10 §9.2 liveness). A tag granted by a revoked
 /// authority is masked here — counted by no node — so access drops immediately;
-/// the dead row itself is cleaned up later by the signed sweep (doc 08 §4 item 13).
+/// the dead row stays put (inspection flags it inert via `authority_active`) and is
+/// physically removed by compaction's re-genesis (doc 11), not a signed sweep.
 fn member_tags_of(conn: &Connection, pubkey: &[u8]) -> Result<Vec<(Vec<u8>, String)>> {
     let mut stmt = conn
         .prepare(
@@ -826,6 +827,20 @@ fn member_tags_of(conn: &Connection, pubkey: &[u8]) -> Result<Vec<(Vec<u8>, Stri
         out.push(r.map_err(map_db("read member tag"))?);
     }
     Ok(out)
+}
+
+/// Whether a grant/membership **authority** is still live (doc 10 §9.2). An empty
+/// authority (the `public`/`any`/`key` principals carry none) is not key-scoped, so
+/// it is always "active"; a tag authority is active iff its key is a currently
+/// authorized, unrevoked member. Inspection commands use this to flag grants that
+/// have gone **inert** because their authority was revoked — the same condition
+/// `member_tags_of` masks on the read path. (Physical removal of the dead rows is
+/// left to compaction's re-genesis, doc 11.)
+pub fn authority_active(conn: &Connection, authority: &[u8]) -> Result<bool> {
+    if authority.is_empty() {
+        return Ok(true);
+    }
+    Ok(device_status(conn, authority)?.0)
 }
 
 /// `(authorized_and_unrevoked, is_owner_device)` for a key in `device_keys`.
@@ -856,12 +871,22 @@ fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8], authority: 
     Ok(r.unwrap_or(0) as u8)
 }
 
-/// Union of a tag name's grants on `node_id` across **every** authority that set
-/// one — for inspection only (`acl check tag:<name>`), never for an access
+/// Union of a tag name's grants on `node_id` across every **live** authority that
+/// set one — for inspection only (`acl check tag:<name>`), never for an access
 /// decision (those resolve a specific `(authority, name)` via `grant_for`).
+///
+/// Grants whose authority is a revoked member are **excluded** (same liveness mask
+/// as `member_tags_of`, doc 10 §9.2): such a grant is unsatisfiable — it can only be
+/// met by a membership under the *same* authority, which is itself masked — so it can
+/// never confer access. Excluding it keeps `acl check tag:` honest (effective, like
+/// `acl check key:`), while `acl ls` still lists the row and flags it `[inert]`.
 fn grant_for_tag_any_authority(conn: &Connection, node_id: &str, name: &[u8]) -> Result<u8> {
     let mut stmt = conn
-        .prepare("SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = 3 AND principal_id = ?2")
+        .prepare(
+            "SELECT a.rights FROM acl a WHERE a.node_id = ?1 AND a.principal_kind = 3 AND a.principal_id = ?2
+               AND EXISTS (SELECT 1 FROM device_keys dk
+                           WHERE dk.device_pubkey = a.authority AND dk.revoked_at IS NULL)",
+        )
         .map_err(map_db("prepare tag grants"))?;
     let rows = stmt
         .query_map(params![node_id, name], |r| r.get::<_, i64>(0))

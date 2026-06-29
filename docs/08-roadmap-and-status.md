@@ -24,7 +24,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
 | **Companion** | Local root custodian + localhost identity agent ("Sign in with PVFS" auto-login) | ☐ **1.0 (committed)** (doc 09 §6) |
-| **Maintenance** | Forest-wide **rights audit** (`pvfs audit`) + **orphaned-tag sweep**: find grants/memberships under revoked authorities and remove them with signed events (`effective_rights` masks them live; the sweep cleans up) | ☐ future (doc 08 §4 items 13–14) |
+| **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ☐ **1.0 (committed)** (doc 12) |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
@@ -82,8 +82,11 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
    admin **with `pvfsd` running** (new "P2-E 3d: auto-routed owner admin with the daemon RUNNING"
    section), which is decisive: pre-fix it signed with the member-level client identity and the daemon
    returned `forbidden`.
-1. **Orphaned-tag sweep** (§4 item 13) — masking ships; add the daemon-side **signed sweep** that
-   removes grants/memberships under revoked authorities. *Small; finishes P2-G.*
+1. **Orphaned-tag handling** (§4 item 13) — **decided: no signed sweep.** Masking already makes
+   revoked-authority grants/memberships inert on the read path, and the append-only log never shrinks,
+   so a signed-removal sweep buys nothing a rebuild wouldn't undo. **Done:** `acl ls` / `tag ls` now
+   flag such rows `[inert: authority revoked]` (read-only, `Engine::authority_active`). **Deferred:**
+   physical removal of the dead rows happens for free in **compaction's re-genesis** (doc 11). *Closed.*
 2. **`pvfs audit`** (§4 item 14) — forest-wide stale/revoked-permission scan + cleanup, warnings
    optional. The authorization counterpart to `pvfs verify`. *Small–medium.*
 3. **Graceful daemon shutdown** (§4 item 4) — on SIGTERM/SIGINT, checkpoint the WAL and exit cleanly
@@ -186,21 +189,32 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     revoking an app drops its tags immediately. Verified by `revoking_tag_authority_denies_access`
     (live + across rebuild). Key rotation orphans an app's grants until re-issued (v1).
 
-13. **Orphaned-tag cleanup *sweep*** (P2-G follow-on — masking shipped, removal pending). The read
-    path already **masks** tags under a revoked authority (item 12); the dead `acl`/`member_tags` rows
-    are still physically present.
-    → **Plan:** a daemon-side **signed sweep** — the daemon (acting as the owner) appends the removal
-    events (`AclSet` clear / `MemberTagged{granted:false}`) for orphaned grants/memberships it
-    encounters. Removal is a *write* and needs a signer, so it must **not** run on the read path
-    (a read can't sign, and the revoked authority can't sign its own cleanup) — it is triggered
-    opportunistically by the daemon and by item 14.
+13. **Orphaned-tag cleanup. ✅ RESOLVED (no signed sweep — decided 2026-06-29).** The read path already
+    **masks** tags under a revoked authority (item 12). A *signed-removal* sweep was considered and
+    **rejected**: it can't even be expressed cleanly (an owner-signed `AclSet`/`MemberTagged` folds to
+    `authority = owner`, so it can't target a *different* revoked authority's row without a wire-format
+    change), and it would buy nothing — the append-only log never shrinks, and a rebuilt projection
+    would just re-derive then re-mask the rows. So:
+    - **Masking** already guarantees correctness (item 12).
+    - **Inspection reports *effective* permissions, never a grant that isn't in force.** A grant whose
+      tag authority is revoked is inert, so `acl ls` shows its effective rights as `-` and moves the
+      stored value into an annotation: `- tag:crew (by a1b2)  [inert: authority revoked; granted r]`
+      (JSON: `"rights"` = effective, `"granted"` = stored, `"active": false`). `tag ls` flags inert
+      memberships the same way, and `acl check tag:<name>` excludes revoked-authority grants from its
+      union (they're unsatisfiable, so this never changes access — it just makes the check effective,
+      like `acl check key:`). This keeps a troubleshooter from reading a dead grant as live access.
+      Built on the read-only `Engine::authority_active` / `projection::authority_active`; covered by
+      `revoking_tag_authority_denies_access`.
+    - **Physical removal** is deferred to **compaction's re-genesis** (doc 11 §… / item 15): rebuilding
+      a region from current state simply doesn't carry inert rows forward — free cleanup, no new events.
 
-14. **Forest-wide rights audit / verify** (`pvfs audit`, future). A command that scans an entire
-    forest for **stale/revoked permissions** — grants/memberships whose authority key is no longer an
-    active member, ACLs referencing revoked keys, orphaned tags — and **cleans them up** via signed
-    removals, with per-item **warnings to the user optional** (`--quiet` to just fix, default to
-    report). Reuses the item-13 sweep over the whole tree. Pairs with `pvfs verify` (integrity) as the
-    *authorization* health check.
+14. **Forest-wide rights audit / verify** (`pvfs audit`, future). A **read-only** command that scans an
+    entire forest for **stale/revoked permissions** — grants/memberships whose authority key is no
+    longer an active member, ACLs referencing revoked keys, orphaned tags — and **reports** them
+    (the per-node `[inert: authority revoked]` flag from item 13, lifted to a whole-forest report).
+    No cleanup writes: masking already makes them inert, and physical removal is compaction's job
+    (item 15). Reuses `Engine::authority_active` over a tree walk. Pairs with `pvfs verify` (integrity)
+    as the *authorization* health check.
 
 15. **Log / DAG compaction (signed snapshot + sealed archive). → spec'd in [doc 11](11-compaction-and-verifiable-snapshots.md).**
     The log is strictly append-only and **never shrinks** — even `purge` appends a `NodePurged` event

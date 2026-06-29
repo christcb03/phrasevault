@@ -1143,28 +1143,52 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     // Resolve path/URI → node id.
                     let (engine, node_id) = engine_and_node(ctx, &node)?;
                     let entries = engine.acl_entries(&node_id)?;
+                    // Report **effective** rights, never the stored value of a grant
+                    // that isn't in force: a tag grant under a revoked authority is
+                    // inert (masked on the read path, doc 10 §9.2), so its effective
+                    // rights are none (`-`). We surface the *granted* value only in the
+                    // inert annotation, so a troubleshooter reading the rights column
+                    // never mistakes a dead grant for live access. Physical removal of
+                    // the row is left to compaction (doc 11).
+                    let mut rows = Vec::with_capacity(entries.len());
+                    for (p, authority, granted) in entries {
+                        let inert = !engine.authority_active(&authority)?;
+                        let effective = if inert { 0 } else { granted };
+                        rows.push((p, authority, granted, effective, inert));
+                    }
                     if json {
-                        let items: Vec<String> = entries
+                        let items: Vec<String> = rows
                             .iter()
-                            .map(|(p, authority, r)| {
+                            .map(|(p, authority, granted, effective, inert)| {
                                 format!(
-                                    "{{\"principal\":\"{}\",\"authority\":\"{}\",\"rights\":\"{}\"}}",
+                                    "{{\"principal\":\"{}\",\"authority\":\"{}\",\"rights\":\"{}\",\"granted\":\"{}\",\"active\":{}}}",
                                     json_escape(&p.display()),
                                     hex::encode(authority),
-                                    acl::rights_to_str(*r)
+                                    acl::rights_to_str(*effective),
+                                    acl::rights_to_str(*granted),
+                                    !*inert
                                 )
                             })
                             .collect();
                         println!("[{}]", items.join(","));
-                    } else if entries.is_empty() {
+                    } else if rows.is_empty() {
                         println!("(no direct grants on {node_id})");
                     } else {
-                        for (p, authority, r) in entries {
+                        for (p, authority, granted, effective, inert) in rows {
+                            let note = if inert {
+                                format!(
+                                    "  [inert: authority revoked; granted {}]",
+                                    acl::rights_to_str(granted)
+                                )
+                            } else {
+                                String::new()
+                            };
                             println!(
-                                "{:>3}  {}{}",
-                                acl::rights_to_str(r),
+                                "{:>3}  {}{}{}",
+                                acl::rights_to_str(effective),
                                 p.display(),
-                                authority_suffix(&authority)
+                                authority_suffix(&authority),
+                                note
                             );
                         }
                     }
@@ -1248,23 +1272,35 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     // Read-only: open engine directly (no mutation, no race with daemon).
                     let mut engine = Engine::open(&ctx?)?;
                     let tags = engine.member_tags(&decode_member(&member)?)?;
+                    // A membership under a revoked authority is **inert** — masked on
+                    // the read path (doc 10 §9.2). Flag it; compaction removes it.
+                    let mut rows = Vec::with_capacity(tags.len());
+                    for (authority, t) in tags {
+                        let inert = !engine.authority_active(&authority)?;
+                        rows.push((authority, t, inert));
+                    }
                     if json {
-                        let items: Vec<String> = tags
+                        let items: Vec<String> = rows
                             .iter()
-                            .map(|(authority, t)| {
+                            .map(|(authority, t, inert)| {
                                 format!(
-                                    "{{\"tag\":\"{}\",\"authority\":\"{}\"}}",
+                                    "{{\"tag\":\"{}\",\"authority\":\"{}\",\"active\":{}}}",
                                     json_escape(t),
-                                    hex::encode(authority)
+                                    hex::encode(authority),
+                                    !*inert
                                 )
                             })
                             .collect();
                         println!("[{}]", items.join(","));
-                    } else if tags.is_empty() {
+                    } else if rows.is_empty() {
                         println!("(no tags)");
                     } else {
-                        for (authority, t) in tags {
-                            println!("{t}{}", authority_suffix(&authority));
+                        for (authority, t, inert) in rows {
+                            println!(
+                                "{t}{}{}",
+                                authority_suffix(&authority),
+                                if inert { "  [inert: authority revoked]" } else { "" }
+                            );
                         }
                     }
                     engine.close()

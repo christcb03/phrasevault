@@ -435,6 +435,11 @@ fn revoking_tag_authority_denies_access() {
 
     let p = acl::Principal::Key(member.clone());
     assert_eq!(engine.effective_rights(&p, &node).unwrap(), acl::ACL_R);
+    // while the authority is live the grant is active (not inert)
+    assert!(engine.authority_active(&app_pub).unwrap());
+    // `acl check tag:crew` (Tag-principal inspection) reflects the live grant
+    let tag_p = acl::Principal::Tag("crew".into());
+    assert_eq!(engine.effective_rights(&tag_p, &node).unwrap(), acl::ACL_R);
 
     // revoke the app (the tag's authority) — access drops with no further events
     engine.revoke_by_device(&app_pub).unwrap();
@@ -443,11 +448,40 @@ fn revoking_tag_authority_denies_access() {
         0,
         "a tag from a revoked authority must not grant access"
     );
+    // the grant/membership now reports inert for audit (doc 10 §9.2): the row
+    // still exists but its authority is no longer a live member.
+    assert!(
+        !engine.authority_active(&app_pub).unwrap(),
+        "a grant under a revoked authority must report inert"
+    );
+    // it's the tag grant (not the owner-set `key:app` grant) that's keyed by this
+    // authority — confirm acl_entries still lists the now-inert tag row.
+    let tag_grant_inert = engine
+        .acl_entries(&node)
+        .unwrap()
+        .into_iter()
+        .any(|(pr, authority, _)| {
+            matches!(pr, acl::Principal::Tag(ref t) if t.as_str() == "crew")
+                && authority == app_pub
+                && !engine.authority_active(&authority).unwrap()
+        });
+    assert!(tag_grant_inert, "the tag:crew grant must be listed and inert");
+    // a still-live authority (the forest owner device) is never inert
+    assert!(engine.authority_active(&engine.device_pubkey()).unwrap());
+    // `acl check tag:crew` now also reads 0 — the inert grant is unsatisfiable, so
+    // the inspection union excludes it (consistent with `acl check key:`).
+    assert_eq!(
+        engine.effective_rights(&tag_p, &node).unwrap(),
+        0,
+        "acl check tag: must exclude grants under a revoked authority"
+    );
     engine.close().unwrap();
 
-    // and the masking is reproduced on a rebuild from the log
+    // and the masking + inert status are reproduced on a rebuild from the log
     std::fs::remove_file(dir.path().join("index.db")).unwrap();
     let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.effective_rights(&p, &node).unwrap(), 0);
+    assert_eq!(engine.effective_rights(&tag_p, &node).unwrap(), 0);
+    assert!(!engine.authority_active(&app_pub).unwrap());
     engine.close().unwrap();
 }
