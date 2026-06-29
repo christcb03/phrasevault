@@ -580,18 +580,32 @@ fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-/// Connect to the daemon if one is running for this forest, authenticated as
-/// the local client identity (doc 09 §3d auto-routing). Returns `None` when no
-/// daemon socket exists, signalling the caller to fall back to direct engine
+/// Connect to the daemon if one is running for this forest, authenticated with
+/// the best signing key available (doc 09 §3d auto-routing). Returns `None` when
+/// no daemon socket exists, signalling the caller to fall back to direct engine
 /// access. The returned closure is the per-mutation signer for the connected key.
+///
+/// **Signing identity (item 16 fix):** for *local owner* admin we must sign with
+/// the forest's **authorized admin device key**, cached at `<mount>/.pvfs/device.key`
+/// (`state_dir`) and authorized at `forest init`. The generic CLI client identity
+/// (`<config>/identity.phrase`) is *not* an authorized admin by default, so signing
+/// auto-routed `acl`/`tag`/`device` ops with it would be rejected by the daemon.
+/// We therefore prefer the forest device key whenever it is readable here (only the
+/// owner can read the `0600` `.pvfs/device.key`), and fall back to the client
+/// identity otherwise (e.g. a member auto-routing against a forest they don't own).
 fn daemon_client(
     state_dir: &std::path::Path,
 ) -> Result<Option<(Client, Box<dyn Fn(&[u8; 32]) -> Vec<u8>>)>, PvfsError> {
     let Some(sock) = try_daemon_socket(state_dir) else {
         return Ok(None);
     };
-    let mn = client_identity_mnemonic()?;
-    let key = identity::device_key(&mn, "", 0)?;
+    let key = match identity::DeviceKeyCache::load(state_dir) {
+        Ok(cache) => cache.signing_key,
+        Err(_) => {
+            let mn = client_identity_mnemonic()?;
+            identity::device_key(&mn, "", 0)?
+        }
+    };
     let pubkey = crypto::pubkey_bytes(&key);
     // FnOnce borrow of key ends when connect_signed returns (NLL).
     let client = Client::connect_signed(&sock, &pubkey, |d| {

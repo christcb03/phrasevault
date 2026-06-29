@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-06-25.
+Status: **Living document** — update as phases land. Last updated 2026-06-29.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–09; this is the index + the honest "what's not done yet."
@@ -23,9 +23,9 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E (3d)** | CLI **auto-routes** plain `acl`/`tag`/`device` mutations to a running daemon (path/URI args too); direct-engine fallback | ✅ shipped (doc 09 §3d) |
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
-| **Companion** | Local root custodian + localhost identity agent ("Sign in with PVFS" auto-login) | ☐ future (doc 09 §6) |
+| **Companion** | Local root custodian + localhost identity agent ("Sign in with PVFS" auto-login) | ☐ **1.0 (committed)** (doc 09 §6) |
 | **Maintenance** | Forest-wide **rights audit** (`pvfs audit`) + **orphaned-tag sweep**: find grants/memberships under revoked authorities and remove them with signed events (`effective_rights` masks them live; the sweep cleans up) | ☐ future (doc 08 §4 items 13–14) |
-| **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ☐ future (doc 12) |
+| **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ☐ **1.0 (committed)** (doc 12) |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
 
@@ -75,11 +75,13 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
 
 **Must-have for 1.0 (committed scope):**
 
-0. **⚠ Fix the auto-route admin signing identity** (§4 item 16) — the seamless `pvfs acl set` (3d)
-   signs with the CLI client identity, not the owner's authorized forest device key, so owner admin
-   through a running daemon can be rejected by default. Decide the model (sign local admin with the
-   `.pvfs/` device key, or auto-authorize the client identity at `forest init`) and **test it with a
-   daemon running**. *Most important — it's a gap in a shipped feature.*
+0. **Auto-route admin signing identity. ✅ RESOLVED (§4 item 16).** `daemon_client()` now signs
+   auto-routed `acl`/`tag`/`device` ops with the forest's **authorized admin device key** from
+   `<mount>/.pvfs/device.key` (model (a)), falling back to the generic client identity only when that
+   key isn't readable (a non-owner auto-routing). The smoke suite now exercises auto-routed owner
+   admin **with `pvfsd` running** (new "P2-E 3d: auto-routed owner admin with the daemon RUNNING"
+   section), which is decisive: pre-fix it signed with the member-level client identity and the daemon
+   returned `forbidden`.
 1. **Orphaned-tag sweep** (§4 item 13) — masking ships; add the daemon-side **signed sweep** that
    removes grants/memberships under revoked authorities. *Small; finishes P2-G.*
 2. **`pvfs audit`** (§4 item 14) — forest-wide stale/revoked-permission scan + cleanup, warnings
@@ -101,11 +103,13 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
 8. **Path/URI everywhere** — `remote` subcommands still take node ids (the `acl`/`tag` resolver
    landed in 3d); extend it. *Small.*
 
-**Scope decisions needed (these set the size of 1.0):**
+**Scope decisions (DECIDED 2026-06-29 — both committed to 1.0):**
 
-- **Companion app** (doc 09 §6) — ship 1.0 with device-key signing and make the companion 1.1, or
-  hold 1.0 for it? It's the strongest root-key story but its own application track.
-- **Encryption at rest** (P3) — in 1.0, or 1.1? The key path is reserved; the feature is unbuilt.
+- **Companion app** (doc 09 §6) — **in 1.0.** Local root custodian + localhost identity agent
+  ("Sign in with PVFS"). Its own application track; the strongest root-key story.
+- **Encryption at rest** (P3, doc 12) — **in 1.0.** Secure node type at reserved key path
+  `m/43'/20566'/2'`: opaque mutable encrypted blob + content-free signed hash-state log +
+  companion-gated decryption. Currently unbuilt.
 
 **Explicitly post-1.0:** federation + sub-forest replication (P4, doc 03), compaction (doc 11),
 single-use challenge nonce (only matters once the socket is network-proxied), arbitrary named groups
@@ -209,25 +213,26 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     prove the compaction is faithful *and* properly authored, or trusts the signature for the cheap
     path. Resolves doc 03 §6 Q8.
 
-16. **⚠ Auto-route admin signs with the *client identity*, not the forest device key (1.0 must-fix).**
-    `daemon_client()` signs auto-routed `acl`/`tag`/`device` ops with the CLI client identity
-    (`<config>/identity.phrase`, `device_key(0)`), which is a **different key** from the forest owner's
-    device key in `<mount>/.pvfs/device.key`. By default that client identity is **not** an authorized
-    admin, so when a daemon is running the "seamless" owner admin (`pvfs acl set …`) would be rejected
-    unless the owner first authorizes their own client identity and grants it admin. The smoke suite
-    doesn't catch this — its admin ops run with explicit `--data-dir` **before** `pvfsd` starts, so
-    they go direct (forest device key).
-    → **Decide + fix (1.0):** either (a) for **local owner** admin, have the CLI sign with the forest
-    device key it can read from `.pvfs/` (prefer the authorized admin device over the generic client
-    identity), or (b) make "the owner's client identity is an admin member" an explicit, `forest
-    init`-time step (auto-authorize the local client identity). Then add a test that exercises
-    auto-routed admin **with a daemon running** (ties into Road-to-1.0 item 4).
+16. **Auto-route admin signs with the forest device key. ✅ RESOLVED (model (a)).**
+    `daemon_client()` previously signed auto-routed `acl`/`tag`/`device` ops with the CLI client
+    identity (`<config>/identity.phrase`, `device_key(0)`) — a **different key** from the forest
+    owner's authorized device key in `<mount>/.pvfs/device.key` — so with a daemon running the
+    "seamless" owner admin (`pvfs acl set …`) was rejected as non-admin. **Fix:** `daemon_client()`
+    now loads the forest device key from `state_dir` (`<mount>/.pvfs/device.key`, mode `0600`, owner
+    only) and signs with that authorized admin device; it falls back to the generic client identity
+    only when that key isn't readable (a non-owner auto-routing against a forest it doesn't own).
+    **Test:** the smoke suite gained a "P2-E 3d: auto-routed owner admin with the daemon RUNNING"
+    section — it runs `pvfs acl set` / `tag add` with **no `--data-dir` and no `remote`** while
+    `pvfsd` is up; rc 0 is decisive because the old client-identity signer (a member, not an admin)
+    returned `forbidden`. This also covers the daemon-running half of Road-to-1.0 item 4.
 
 **Resolved since earlier drafts:** `PvfsError::Forbidden` now exists; the daemon socket is
 discoverable (conventional path, P2-E §3b); admit/revoke no longer need the recovery phrase (§3a);
 admin can be done live through the daemon (§3c); P2-G's tag-authority granularity and liveness are
 now **decided** and **shipped** (items 11–12, doc 10 §9); CLI auto-routing (3d), the raw data plane
-(P2-F), and one-home-at-replay all landed (items 1, 3, 5; §2).
+(P2-F), and one-home-at-replay all landed (items 1, 3, 5; §2); the auto-route admin signing identity
+is fixed and tested with a daemon running (item 16). **Scope decided (2026-06-29):** companion app
+and encryption-at-rest (P3) are both committed to 1.0.
 
 ---
 

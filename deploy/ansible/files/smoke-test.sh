@@ -298,6 +298,27 @@ $PVFS remote --socket "$SOCK" mv "$UPLOADED_ID" "$DEST" >/dev/null && ok "member
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky
 
+say "P2-E 3d: auto-routed owner admin with the daemon RUNNING (doc 08 item 16)"
+# Regression guard. Plain `acl set` / `tag add` — no --data-dir, no `remote` —
+# must auto-route to the running daemon AND sign with the forest's authorized
+# admin device key (<mount>/.pvfs/device.key), NOT the generic client identity.
+# The client identity here is an authorized *member* with rw (granted above) but
+# NOT admin, so before the fix these ops were rejected (forbidden, rc 5) — the
+# admin signer must be the forest device key. The earlier admin ops (lines above)
+# don't catch this: they run with --data-dir *before* pvfsd starts, so they go
+# direct (forest device key) and never exercise auto-routing.
+# rc 0 here is decisive: the daemon only returns 0 after it authorizes the author
+# as admin AND commits the event, so a rejected (unauthorized) signer would fail.
+assert_rc 0 "auto-routed acl set accepted (owner admin via running daemon)" -- \
+  $PVFS --forest "$DMOUNT" acl set "$DROOT" public rw
+assert_rc 0 "auto-routed tag add accepted (owner admin via running daemon)" -- \
+  $PVFS --forest "$DMOUNT" tag add "$CLIENTKEY" liveadmin
+assert_rc 0 "auto-routed acl set tag principal accepted" -- \
+  $PVFS --forest "$DMOUNT" acl set "$DROOT" tag:liveadmin r
+# daemon is still serving the same live forest after the auto-routed admin ops
+$PVFS --json remote --socket "$SOCK" info | grep -q "\"forest_id\":\"$DFID\"" \
+  && ok "daemon still serving after auto-routed admin"
+
 kill "$DPID" 2>/dev/null || true
 DPID=""
 
