@@ -80,6 +80,38 @@ fn forbidden<T>(r: Result<T, ClientError>) -> bool {
     matches!(r, Err(ClientError::Server { code, .. }) if code == "forbidden")
 }
 
+// doc 08 §4 item 4 — graceful shutdown: the accept loop serves normally, then
+// returns once the shutdown flag is set, and the engine can be checkpointed.
+#[test]
+fn serve_until_stops_on_shutdown_flag() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let daemon = Arc::new(Daemon::new(engine));
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let d = Arc::clone(&daemon);
+    let handle = std::thread::spawn(move || pvfsd::serve_until(listener, d, &s).unwrap());
+
+    // the daemon serves normally while the loop runs
+    let mut anon = Client::connect_public(&sock).unwrap();
+    assert_eq!(anon.info().unwrap().root, root);
+
+    // request shutdown — the loop must observe the flag and return promptly
+    shutdown.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+
+    // and the clean-shutdown checkpoint is callable afterward
+    daemon.shutdown_checkpoint().unwrap();
+}
+
 // doc 07 §5 — a member creates a folder through the daemon (two-phase, signed)
 #[test]
 fn daemon_member_write() {

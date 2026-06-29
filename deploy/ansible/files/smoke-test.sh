@@ -319,7 +319,15 @@ assert_rc 0 "auto-routed acl set tag principal accepted" -- \
 $PVFS --json remote --socket "$SOCK" info | grep -q "\"forest_id\":\"$DFID\"" \
   && ok "daemon still serving after auto-routed admin"
 
-kill "$DPID" 2>/dev/null || true
+say "P2-F: graceful shutdown on SIGTERM (doc 08 item 4)"
+# pvfsd traps SIGTERM, stops accepting, checkpoints the WAL, removes its socket.
+# Watchdog guards CI against a hang if the signal is ever mishandled.
+( sleep 10; kill -9 "$DPID" 2>/dev/null ) & WATCH=$!
+kill -TERM "$DPID"
+wait "$DPID" 2>/dev/null; SHUT_RC=$?
+kill "$WATCH" 2>/dev/null; wait "$WATCH" 2>/dev/null || true
+[ "$SHUT_RC" -eq 0 ] && ok "pvfsd exited 0 on SIGTERM (clean shutdown)" || fail "pvfsd exit $SHUT_RC on SIGTERM"
+[ -S "$SOCK" ] && fail "socket left behind after graceful shutdown" || ok "socket removed on graceful shutdown"
 DPID=""
 
 say "json error shape"

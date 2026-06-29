@@ -410,6 +410,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Flush the write-ahead logs and record a clean shutdown **without** consuming
+    /// the engine (doc 08 §4 item 4). The daemon holds its `Engine` behind a `Mutex`
+    /// and can't call `close(self)`, so on SIGTERM/SIGINT it calls this: it runs
+    /// `wal_checkpoint(TRUNCATE)` on the projection (`index.db`) and the attached
+    /// `log` db so no WAL frames are left pending, then sets `clean_shutdown = 1` so
+    /// the next startup takes the fast path. Idempotent and safe to call once at exit.
+    pub fn shutdown_checkpoint(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA log.wal_checkpoint(TRUNCATE);",
+            )
+            .map_err(map_db("wal checkpoint"))?;
+        projection::meta_set(&self.conn, "clean_shutdown", "1")?;
+        Ok(())
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

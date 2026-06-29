@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pvfs_core::acl::{self, Principal};
 use pvfs_core::{
@@ -52,16 +53,50 @@ impl Daemon {
             prepared: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Flush the WAL and record a clean shutdown (doc 08 §4 item 4). Called by the
+    /// daemon binary after the accept loop stops on SIGTERM/SIGINT, while in-flight
+    /// connection threads are best-effort allowed to finish.
+    pub fn shutdown_checkpoint(&self) -> Result<(), PvfsError> {
+        self.engine.lock().unwrap().shutdown_checkpoint()
+    }
 }
 
+/// How often the accept loop wakes to check the shutdown flag.
+const ACCEPT_POLL: Duration = Duration::from_millis(200);
+
 /// Accept connections until the listener closes — one thread per connection.
+/// Runs until the process is torn down; for a stoppable loop use [`serve_until`].
 pub fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> io::Result<()> {
-    for stream in listener.incoming() {
-        let stream = stream?;
-        let d = Arc::clone(&daemon);
-        std::thread::spawn(move || {
-            let _ = serve_connection(&d, stream);
-        });
+    // A flag that is never set: the loop runs until the process exits.
+    serve_until(listener, daemon, &AtomicBool::new(false))
+}
+
+/// Accept connections until `shutdown` flips true, then return so the caller can
+/// checkpoint and clean up (doc 08 §4 item 4). The listener is polled non-blocking
+/// every [`ACCEPT_POLL`] so a signal-driven flag is noticed promptly without a busy
+/// loop; accepted streams are handed to per-connection threads in blocking mode.
+pub fn serve_until(
+    listener: UnixListener,
+    daemon: Arc<Daemon>,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // Per-connection I/O is blocking; only the accept loop polls.
+                stream.set_nonblocking(false)?;
+                let d = Arc::clone(&daemon);
+                std::thread::spawn(move || {
+                    let _ = serve_connection(&d, stream);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }

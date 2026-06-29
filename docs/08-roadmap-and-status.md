@@ -89,8 +89,11 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
    physical removal of the dead rows happens for free in **compaction's re-genesis** (doc 11). *Closed.*
 2. **`pvfs audit`** (§4 item 14) — forest-wide stale/revoked-permission scan + cleanup, warnings
    optional. The authorization counterpart to `pvfs verify`. *Small–medium.*
-3. **Graceful daemon shutdown** (§4 item 4) — on SIGTERM/SIGINT, checkpoint the WAL and exit cleanly
-   (SocketGuard already removes the socket). *Small.*
+3. **Graceful daemon shutdown. ✅ DONE (§4 item 4).** `pvfsd` traps SIGTERM/SIGINT (a signal handler
+   sets an atomic flag), the accept loop (`serve_until`) polls it and returns, then the daemon runs
+   `Engine::shutdown_checkpoint` — `wal_checkpoint(TRUNCATE)` on the projection + attached log db plus
+   `clean_shutdown = 1` — and `SocketGuard` removes the socket. Tested by `serve_until_stops_on_shutdown_flag`
+   and a smoke check (SIGTERM → exit 0 + socket gone).
 4. **Multi-user / two-host end-to-end test** — a scenario test (owner + member, separate identities,
    over the socket) beyond the single-host smoke suite. *Medium.*
 5. **Release packaging** — `INSTALL.md` for the systemd path, `$PVFS_SOCKET_DIR=/run/pvfs` default in
@@ -140,10 +143,13 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
    daemon resolves the path under the lock then streams from the filesystem lock-free, so transfers
    run concurrently. This is also the torrent seam.
 
-4. **Daemon lifecycle. ◑ MOSTLY DONE (P2-F).** `SocketGuard` removes the socket on any clean exit;
-   `pvfsd@.service` is a systemd `--user` unit template.
-   → **Remaining (1.0):** a **graceful shutdown** that traps SIGTERM/SIGINT and checkpoints the WAL
-   before exit. Small.
+4. **Daemon lifecycle. ✅ RESOLVED.** `SocketGuard` removes the socket on any clean exit;
+   `pvfsd@.service` is a systemd `--user` unit template. **Graceful shutdown** now lands too: a
+   SIGTERM/SIGINT handler sets an atomic flag, the accept loop (`serve_until`, non-blocking poll every
+   200 ms) returns, and the daemon calls `Engine::shutdown_checkpoint` — `wal_checkpoint(TRUNCATE)` on
+   the projection + attached `log` db, then `clean_shutdown = 1` — before `SocketGuard` drops. In-flight
+   connection threads are best-effort (not joined) in v1. Covered by `serve_until_stops_on_shutdown_flag`
+   and a smoke check (SIGTERM → exit 0, socket removed).
 
 5. **One-home invariant at replay. ✅ RESOLVED.** `projection::fold` now rejects a `LinkCreated`
    `contains` link whose child already has an active home (idempotent-replay-safe), so a crafted or
