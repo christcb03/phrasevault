@@ -96,8 +96,15 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
    `Engine::shutdown_checkpoint` — `wal_checkpoint(TRUNCATE)` on the projection + attached log db plus
    `clean_shutdown = 1` — and `SocketGuard` removes the socket. Tested by `serve_until_stops_on_shutdown_flag`
    and a smoke check (SIGTERM → exit 0 + socket gone).
-4. **Multi-user / two-host end-to-end test** — a scenario test (owner + member, separate identities,
-   over the socket) beyond the single-host smoke suite. *Medium.*
+4. **Multi-user end-to-end test. ✅ DONE (single-host).** The smoke suite now runs a **two-identity**
+   scenario: a second client identity ("Bob", separate config) is authorized and granted rw on
+   `/shared` only — over the socket Bob reads/writes `/shared` and is denied `/private` (and an anon
+   client is denied too). A `pvfsd` test (`daemon_member_cannot_admin`) proves an rw member **cannot**
+   grant ACLs or authorize members. Also fixed: `pvfs remote` now maps daemon errors to real exit codes
+   (forbidden → 5, not_found → 3), so denials are scriptable. **Note:** true *cross-OS-user* isolation
+   (the `0600` `.pvfs/` boundary) and a genuine *two-host* run still need a second account/host in the
+   inventory — the single-OS-user smoke can't exercise the file-permission boundary. Left for the
+   federation track (P4).
 5. **Release packaging** — ◑ **partly done.** Shipped: `INSTALL.md` systemd user-service section,
    `$PVFS_SOCKET_DIR=/run/pvfs` in the unit + a `pvfs-tmpfiles.conf` (and `pvfsd` now leaves a
    root-managed socket dir's mode alone), refreshed top-level `README` status, `LICENSE` present.

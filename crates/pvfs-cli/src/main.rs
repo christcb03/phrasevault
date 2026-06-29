@@ -369,6 +369,26 @@ fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
 }
 
 fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
+    // Preserve the daemon's error semantics so `pvfs remote …` exit codes stay
+    // meaningful for scripts: a denied op exits 5 (Forbidden), a missing node 3
+    // (NotFound), bad input 2 — not a blanket 2 (spec §13.4 / exit_code_for).
+    if let pvfs_client::ClientError::Server { code, message } = &e {
+        match code.as_str() {
+            "forbidden" => {
+                return PvfsError::Forbidden {
+                    action: "remote".into(),
+                    reason: message.clone(),
+                }
+            }
+            "not_found" => {
+                return PvfsError::NotFound {
+                    kind: "remote",
+                    id: message.clone(),
+                }
+            }
+            _ => {}
+        }
+    }
     PvfsError::BadInput {
         field: "remote".into(),
         reason: e.to_string(),

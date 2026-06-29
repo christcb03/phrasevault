@@ -17,8 +17,13 @@ mkdir -p "$PVFS_SOCKET_DIR"
 PASS=0
 FAIL=0
 DPID=""
+U2PID=""
 
-cleanup() { [ -n "$DPID" ] && kill "$DPID" 2>/dev/null; rm -rf "$DATA"; }
+cleanup() {
+  [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
+  [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null
+  rm -rf "$DATA"
+}
 trap cleanup EXIT
 
 say()  { printf '%s\n' "== $*"; }
@@ -321,6 +326,45 @@ assert_rc 0 "auto-routed acl set tag principal accepted" -- \
 # daemon is still serving the same live forest after the auto-routed admin ops
 $PVFS --json remote --socket "$SOCK" info | grep -q "\"forest_id\":\"$DFID\"" \
   && ok "daemon still serving after auto-routed admin"
+
+say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
+# A second, independent forest served to a SECOND client identity ("Bob"), to
+# show per-identity ACL enforcement over the socket — not just the owner's own
+# client identity as in the section above.
+U2="$DATA/multiuser"
+mkdir -p "$U2/shared" "$U2/private"
+printf 'shared note' > "$U2/shared/note.txt"
+printf 'top secret' > "$U2/private/secret.txt"
+U2INIT="$($PVFS --json forest init --mount "$U2")"
+U2ROOT="$(jget "$U2INIT" root_node_id)"
+U2FID="$(jget "$U2INIT" forest_id)"
+# Bob = a separate config dir, hence a separate signing identity.
+BOB="$DATA/bob-config"
+bob() { XDG_CONFIG_HOME="$BOB" "$PVFS" "$@"; }
+BOBKEY="$(jget "$(bob --json whoami)" pubkey)"
+if [ -n "$BOBKEY" ] && [ "$BOBKEY" != "$CLIENTKEY" ]; then ok "Bob has a distinct client identity"; else fail "Bob identity not distinct"; fi
+# Owner sets up sharing directly (before serving): authorize Bob; grant rw on /shared only.
+SHARED_ID="$(pick_id "$($PVFS --json --data-dir "$U2/.pvfs" ls "$U2ROOT")" shared)"
+PRIVATE_ID="$(pick_id "$($PVFS --json --data-dir "$U2/.pvfs" ls "$U2ROOT")" private)"
+$PVFS --data-dir "$U2/.pvfs" device authorize-member --pubkey "$BOBKEY" >/dev/null && ok "owner authorized Bob as a member"
+$PVFS --data-dir "$U2/.pvfs" acl set "$SHARED_ID" "key:$BOBKEY" rw >/dev/null && ok "owner granted Bob rw on /shared"
+# Serve the multi-user forest.
+U2SOCK="$PVFS_SOCKET_DIR/$U2FID.sock"
+"$PVFSD" --mount "$U2" >/dev/null 2>&1 &
+U2PID=$!
+for _ in $(seq 1 50); do [ -S "$U2SOCK" ] && break; sleep 0.1; done
+[ -S "$U2SOCK" ] && ok "multi-user daemon serving" || fail "multi-user socket missing"
+# Bob, signing as himself over the socket, reads + writes /shared (granted)...
+bob remote --socket "$U2SOCK" ls "$SHARED_ID" | grep -q note.txt && ok "Bob reads /shared (granted)"
+BOBDIR="$(jget "$(bob --json remote --socket "$U2SOCK" mkdir "$SHARED_ID" bob-was-here)" created)"
+[ ${#BOBDIR} -eq 64 ] && ok "Bob writes under /shared (granted rw)" || fail "Bob mkdir under /shared: $BOBDIR"
+# ...but is denied /private (no grant) — denial now exits 5 (forbidden), not a generic 2.
+assert_rc 5 "Bob denied read on /private (no grant)" -- bob remote --socket "$U2SOCK" ls "$PRIVATE_ID"
+assert_rc 5 "Bob denied write on /private (no grant)" -- bob remote --socket "$U2SOCK" mkdir "$PRIVATE_ID" nope
+# An anonymous client (neither owner nor Bob) is denied the un-shared root too.
+assert_rc 5 "anon denied read on a private node" -- $PVFS remote --socket "$U2SOCK" --anon ls "$PRIVATE_ID"
+kill -TERM "$U2PID" 2>/dev/null || true; wait "$U2PID" 2>/dev/null || true
+U2PID=""
 
 say "P2-F: graceful shutdown on SIGTERM (doc 08 item 4)"
 # pvfsd traps SIGTERM, stops accepting, checkpoints the WAL, removes its socket.

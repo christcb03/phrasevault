@@ -367,3 +367,57 @@ fn daemon_member_move() {
     assert!(!labels(&m.ls(&a).unwrap()).contains(&"item".to_string()));
     assert!(labels(&m.ls(&b).unwrap()).contains(&"item".to_string()));
 }
+
+// doc 08 RtO #4 — multi-user isolation: an authorized member with rw can write,
+// but **cannot** perform admin (grant ACLs / authorize members) over the socket.
+#[test]
+fn daemon_member_cannot_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let dropbox = engine.add_node(&root, folder("dropbox")).unwrap();
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(&dropbox, &Principal::Key(member_pub.clone()), acl::ACL_R | acl::ACL_W)
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+
+    // the member can write where granted (sanity)
+    assert!(member
+        .mkdir(&dropbox, "ok", |d| crypto::sign_digest(&member_key, d).unwrap())
+        .is_ok());
+    // but rw is not admin: granting an ACL must be forbidden
+    assert!(
+        forbidden(member.set_acl(&dropbox, "public", "r", |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })),
+        "a non-admin member must not set ACLs over the socket"
+    );
+    // and authorizing a new member must be forbidden too
+    let other = crypto::pubkey_bytes(
+        &identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
+    );
+    assert!(
+        forbidden(member.authorize_member(&hex::encode(&other), |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })),
+        "a non-admin member must not authorize members over the socket"
+    );
+}
