@@ -11,6 +11,9 @@ export PVFS_DATA_DIR="$DATA/forest"
 export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
 export XDG_CONFIG_HOME="$DATA/config"       # keep the client identity out of $HOME
 export PVFS_SOCKET_DIR="$DATA/sockets"      # per-forest daemon sockets (doc 09 §3b)
+# Pre-create the socket dir so pvfsd exercises its "dir already exists → don't
+# chmod" path (the /run/pvfs systemd/tmpfiles case), not just first-use creation.
+mkdir -p "$PVFS_SOCKET_DIR"
 PASS=0
 FAIL=0
 DPID=""

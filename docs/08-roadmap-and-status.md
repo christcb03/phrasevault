@@ -98,8 +98,11 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
    and a smoke check (SIGTERM → exit 0 + socket gone).
 4. **Multi-user / two-host end-to-end test** — a scenario test (owner + member, separate identities,
    over the socket) beyond the single-host smoke suite. *Medium.*
-5. **Release packaging** — `INSTALL.md` for the systemd path, `$PVFS_SOCKET_DIR=/run/pvfs` default in
-   the unit, `LICENSE`, `CHANGELOG`, version tag, and a top-level `README`. *Medium.*
+5. **Release packaging** — ◑ **partly done.** Shipped: `INSTALL.md` systemd user-service section,
+   `$PVFS_SOCKET_DIR=/run/pvfs` in the unit + a `pvfs-tmpfiles.conf` (and `pvfsd` now leaves a
+   root-managed socket dir's mode alone), refreshed top-level `README` status, `LICENSE` present.
+   **Remaining:** `CHANGELOG` + a version tag — deferred until companion + encryption land so 1.0 is
+   tagged once feature-complete.
 6. **Docs/manual sweep** — bring `USER-MANUAL` and docs 06–11 fully current with 3d + P2-F + P2-G
    (this pass started it). *Small, ongoing.*
 

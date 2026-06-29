@@ -13,7 +13,8 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 | **P0** | Core engine — event log, projection, nodes/links, locations, BIP39/BIP32 identity + device certs | Implemented, spec tests in `crates/pvfs-core/tests/p0_spec.rs` |
 | **P1** | Storage — bind folders, scan/reconcile, verified reads, quarantine, `serve` watcher, temp spool | Implemented, tests in `p1_storage.rs` |
 | **P1.5** | Mounts & registry ([doc 05](docs/05-instance-registry-and-mounts.md)) — `<mount>/.pvfs/` layout, `pvfs forest init/register/unregister/info`, `/etc/pvfs` registry (`PVFS_REGISTRY_DIR` override), `pvfs://alias@local/tree/path` + path shorthand, portable forests | Implemented, tests in `p15_mounts.rs` |
-| **P2+** | WASM modules, HTTP, mount, federation sync | Specified; not built yet |
+| **P2 A–G** | Multi-user access ([docs 06–10](docs/06-access-control-and-daemon.md)) — per-node ACLs (`public`/`any`/`tag`/`key`, inheritance), per-key tag authority, member-signed writes + live admin over the `pvfsd` daemon, challenge-response auth, concurrent raw-bytes `cat`, seamless CLI auto-routing, `pvfs audit`, graceful daemon shutdown | Implemented, tests in `p2_access.rs` + `pvfsd` |
+| **P3 / P4** | Encryption-at-rest, companion app, federation & sub-forest replication, log compaction | Specified ([docs 11–13](docs/11-compaction-and-verifiable-snapshots.md)); not built yet |
 
 Build locally with `cargo test --workspace`, or on a remote Linux host — see **[Install guide](docs/INSTALL.md)**.
 
@@ -25,9 +26,12 @@ Build locally with `cargo test --workspace`, or on a remote Linux host — see *
 
 ## Code layout
 
-- [`crates/pvfs-core`](crates/pvfs-core) — kernel library (P0 + P1 storage layer)
+- [`crates/pvfs-core`](crates/pvfs-core) — kernel library (P0 + P1 storage + ACLs/tags)
 - [`crates/pvfs-cli`](crates/pvfs-cli) — `pvfs` CLI
-- [`deploy/ansible/`](deploy/ansible/) — optional remote build, test, smoke, install pipeline
+- [`crates/pvfs-proto`](crates/pvfs-proto) — daemon/client wire protocol
+- [`crates/pvfsd`](crates/pvfsd) — `pvfsd` per-user daemon (socket, auth, ACL-enforced serving)
+- [`crates/pvfs-client`](crates/pvfs-client) — client library for the daemon
+- [`deploy/ansible/`](deploy/ansible/) — optional remote build, test, smoke, install pipeline (+ `pvfsd@.service`, tmpfiles)
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — Rust CI on push
 
 See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
@@ -43,6 +47,10 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [03-federation-trust-and-uris.md](docs/03-federation-trust-and-uris.md) | Forest ownership, sync model, URIs, trust |
 | [04-p1-storage-and-fs-ops-spec.md](docs/04-p1-storage-and-fs-ops-spec.md) | P1 storage & FS ops spec (implemented) |
 | [05-instance-registry-and-mounts.md](docs/05-instance-registry-and-mounts.md) | Mount layout (`.pvfs/`), `/etc/pvfs/` registry, mount URIs, CLI |
+| [06–10](docs/06-access-control-and-daemon.md) | Access control & daemon, daemon protocol, tags & live daemon, per-key tag authority (P2, implemented) |
+| [**08-roadmap-and-status.md**](docs/08-roadmap-and-status.md) | **What's built, what's next, open concerns** — the honest status index |
+| [**USER-MANUAL.md**](docs/USER-MANUAL.md) | End-user guide: sharing, ACLs, tags, recovery, command reference |
+| [11–13](docs/11-compaction-and-verifiable-snapshots.md) | Compaction, secure (encrypted) node type, PVOS-driven requirements (specified) |
 
 ## Core ideas
 

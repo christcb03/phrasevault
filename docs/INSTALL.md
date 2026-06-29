@@ -2,7 +2,7 @@
 
 This guide is for someone comfortable with a terminal, SSH, and copying commands — you do not need to be a Rust developer.
 
-**PVFS** is a single command-line program (`pvfs`) plus a data directory (SQLite log + index). Version **0.1** today includes the **P0 core engine** (forest, signed nodes/links, event log) and **P1 storage ops** (bind real folders, scan, read files with hash verification, background watcher).
+**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`) and a data directory (SQLite log + index). Version **0.1** today includes the **P0 core engine** (forest, signed nodes/links, event log), **P1 storage ops** (bind real folders, scan, read files with hash verification, background watcher), **mounts & a host registry** (P1.5), and the **multi-user access layer** (P2): per-node ACLs, per-key tags, member-signed writes and live admin over the `pvfsd` daemon, a concurrent raw-bytes `cat`, an authorization audit (`pvfs audit`), and graceful daemon shutdown.
 
 Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
 
@@ -174,11 +174,68 @@ Details: [deploy/ansible/README.md](../deploy/ansible/README.md).
 
 ---
 
+## Option C — Run `pvfsd` as a systemd user service
+
+To share a forest with other users on a host, run the daemon (`pvfsd`) under
+systemd. The template unit and a tmpfiles snippet live in
+[`deploy/ansible/files/`](../deploy/ansible/files/).
+
+### 1. Install the binaries and the socket directory
+
+```bash
+install -m 755 target/release/pvfs  ~/.local/bin/pvfs
+install -m 755 target/release/pvfsd ~/.local/bin/pvfsd
+
+# Socket directory, created once by root (world-traversable + sticky, like /tmp).
+sudo install -m 644 deploy/ansible/files/pvfs-tmpfiles.conf /etc/tmpfiles.d/pvfs.conf
+sudo systemd-tmpfiles --create        # creates /run/pvfs (mode 1777)
+```
+
+Sockets are deliberately placed in a **shared, world-traversable** directory so
+other users can reach a served forest — access is gated by per-node **ACLs**, not
+by socket permissions (doc 06 §2). The unit sets `PVFS_SOCKET_DIR=/run/pvfs`;
+**clients must export the same value** to discover a running daemon (see below).
+
+### 2. Enable a per-forest instance
+
+The unit is templated on the mount directory name under `~/pvfs-mounts/`:
+
+```bash
+mkdir -p ~/pvfs-mounts
+ln -s /path/to/my-forest ~/pvfs-mounts/myforest    # or put the mount here directly
+
+install -m 644 deploy/ansible/files/pvfsd@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pvfsd@myforest
+
+systemctl --user status pvfsd@myforest
+```
+
+`pvfsd` traps `SIGTERM`/`SIGINT`, checkpoints its write-ahead log, and removes its
+socket on exit, so `systemctl --user stop pvfsd@myforest` is a clean shutdown.
+
+### 3. Reach the daemon as a client
+
+```bash
+export PVFS_SOCKET_DIR=/run/pvfs       # add to ~/.profile so it's always set
+pvfs remote --forest /path/to/my-forest info
+# or, with the forest registered:  pvfs remote --forest myforest ls <node>
+```
+
+For a quick test without systemd, run `PVFS_SOCKET_DIR=/run/pvfs pvfsd --mount
+/path/to/my-forest` in one terminal and the client (same env) in another. By
+default — with `PVFS_SOCKET_DIR` unset — both the daemon and clients fall back to
+`/tmp/pvfs`, which also works for cross-user sharing without any root setup.
+
+---
+
 ## Environment variables
 
 | Variable | Meaning |
 |----------|---------|
-| `PVFS_DATA_DIR` | Path to the forest data directory (`log.db`, `index.db`, device key). **Required** for every command except `init`. |
+| `PVFS_DATA_DIR` | Path to the forest data directory (`log.db`, `index.db`, device key). **Required** for the low-level `init`/`recover` flow; interactive use prefers `--forest` or running inside a mount. |
+| `PVFS_SOCKET_DIR` | Directory holding daemon sockets (`<forest_id>.sock`). The daemon binds here and clients look here; both default to `/tmp/pvfs`. Set the **same** value on both sides (e.g. `/run/pvfs`). |
+| `PVFS_REGISTRY_DIR` | Override the host forest registry (default `/etc/pvfs`, which needs `sudo` to write). A user-writable path gives a rootless registry. |
 | `PVFS_BIN` | Used only by `smoke-test.sh` — path to the `pvfs` binary to test. |
 
 ---

@@ -72,10 +72,15 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(s) => s.clone(),
         None => {
             let dir = mount::daemon_socket_dir();
-            std::fs::create_dir_all(&dir)?;
-            // World-traversable + sticky (like /tmp), so other users can reach the
-            // socket but can't delete each other's.
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+            // Create the socket dir on first use and make it world-traversable +
+            // sticky (like /tmp), so other users can reach the socket but can't
+            // delete each other's. If it already exists we leave its mode alone:
+            // a root-managed `/run/pvfs` (tmpfiles.d, mode 1777) is shared by all
+            // users' daemons, and a non-root daemon must not try to chmod it.
+            if !dir.exists() {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+            }
             mount::daemon_socket_path(&engine.identity.forest_id)
         }
     };
