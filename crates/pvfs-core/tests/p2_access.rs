@@ -485,3 +485,53 @@ fn revoking_tag_authority_denies_access() {
     assert!(!engine.authority_active(&app_pub).unwrap());
     engine.close().unwrap();
 }
+
+// doc 08 §4 item 14 — `pvfs audit`: forest-wide report of tag grants/memberships
+// whose authority has been revoked (inert). Clean while the authority is live;
+// both surface after revocation, and survive a rebuild.
+#[test]
+fn audit_reports_inert_grants_and_memberships() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let node = engine.add_node(&root, folder("shared")).unwrap();
+
+    let app = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let app_pub = crypto::pubkey_bytes(&app);
+    let member = foreign_pubkey();
+    engine.authorize_member(&m, &app_pub).unwrap();
+    engine.authorize_member(&m, &member).unwrap();
+    engine
+        .set_acl(&node, &acl::Principal::Key(app_pub.clone()), acl::ACL_A)
+        .unwrap();
+
+    let prep = engine
+        .prepare_set_acl(&app_pub, &node, &acl::Principal::Tag("crew".into()), acl::ACL_R)
+        .unwrap();
+    commit_with(&mut engine, prep, |d| crypto::sign_digest(&app, d).unwrap());
+    let prep = engine
+        .prepare_set_member_tag(&app_pub, &member, "crew", true)
+        .unwrap();
+    commit_with(&mut engine, prep, |d| crypto::sign_digest(&app, d).unwrap());
+
+    // live authority → audit is clean
+    assert!(engine.inert_tag_grants().unwrap().is_empty());
+    assert!(engine.inert_memberships().unwrap().is_empty());
+
+    // revoke the app authority → both grant and membership become inert findings
+    engine.revoke_by_device(&app_pub).unwrap();
+    let grants = engine.inert_tag_grants().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0], (node.clone(), "crew".to_string(), app_pub.clone(), acl::ACL_R));
+    let memberships = engine.inert_memberships().unwrap();
+    assert_eq!(memberships.len(), 1);
+    assert_eq!(memberships[0], (member.clone(), "crew".to_string(), app_pub.clone()));
+
+    // findings survive a rebuild from the log
+    engine.close().unwrap();
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.inert_tag_grants().unwrap().len(), 1);
+    assert_eq!(engine.inert_memberships().unwrap().len(), 1);
+    engine.close().unwrap();
+}

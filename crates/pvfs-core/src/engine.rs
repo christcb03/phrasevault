@@ -1519,6 +1519,21 @@ impl Engine {
         projection::authority_active(&self.conn, authority)
     }
 
+    /// Forest-wide authorization audit (doc 08 §4 item 14) — the `pvfs audit`
+    /// counterpart to `pvfs verify`. Returns every **tag grant** under a revoked
+    /// authority as `(node_id, tag_name, authority, rights)`. Read-only: these are
+    /// inert (masked, flagged `[inert]` by `acl ls`); cleanup is compaction's job.
+    pub fn inert_tag_grants(&self) -> Result<Vec<(String, String, Vec<u8>, u8)>> {
+        projection::inert_tag_grants(&self.conn)
+    }
+
+    /// Forest-wide audit: every tag **membership** under a revoked authority as
+    /// `(member_pubkey, tag, authority)`. The membership counterpart of
+    /// [`inert_tag_grants`](Self::inert_tag_grants).
+    pub fn inert_memberships(&self) -> Result<Vec<(Vec<u8>, String, Vec<u8>)>> {
+        projection::inert_memberships(&self.conn)
+    }
+
     /// Assign (`granted = true`) or remove a membership tag from a member key
     /// (doc 09 §1). Authored by the local device, which must hold admin (`a`) on
     /// the forest root (owner devices always do).

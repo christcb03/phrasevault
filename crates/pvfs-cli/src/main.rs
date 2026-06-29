@@ -100,6 +100,9 @@ enum Cmd {
     Loc(LocCmd),
     /// Recompute id + check signature
     Verify { id: String },
+    /// Authorization health check: list grants/memberships whose tag authority
+    /// has been revoked (inert — masked live, cleaned up by compaction)
+    Audit,
     /// List orphaned durable nodes
     Orphans,
     /// Hard-delete orphaned nodes (explicit)
@@ -975,6 +978,73 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!("{{\"valid\":{ok}}}");
             } else {
                 println!("valid");
+            }
+            engine.close()
+        }
+        Cmd::Audit => {
+            // Read-only authorization health check (doc 08 §4 item 14): tag grants
+            // and memberships whose authority is a revoked member. They're inert
+            // (masked live), so this never changes access — it surfaces dead grants
+            // a troubleshooter would otherwise have to hunt for. Compaction removes
+            // the rows; this only reports them.
+            let engine = Engine::open(&ctx?)?;
+            let grants = engine.inert_tag_grants()?;
+            let memberships = engine.inert_memberships()?;
+            if json {
+                let g: Vec<String> = grants
+                    .iter()
+                    .map(|(node, tag, authority, rights)| {
+                        format!(
+                            "{{\"node\":\"{}\",\"tag\":\"{}\",\"authority\":\"{}\",\"granted\":\"{}\"}}",
+                            json_escape(node),
+                            json_escape(tag),
+                            hex::encode(authority),
+                            acl::rights_to_str(*rights)
+                        )
+                    })
+                    .collect();
+                let m: Vec<String> = memberships
+                    .iter()
+                    .map(|(member, tag, authority)| {
+                        format!(
+                            "{{\"member\":\"{}\",\"tag\":\"{}\",\"authority\":\"{}\"}}",
+                            hex::encode(member),
+                            json_escape(tag),
+                            hex::encode(authority)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"inert_grants\":[{}],\"inert_memberships\":[{}]}}",
+                    g.join(","),
+                    m.join(",")
+                );
+            } else if grants.is_empty() && memberships.is_empty() {
+                println!("no stale authorizations: all tag grants and memberships have live authorities");
+            } else {
+                if !grants.is_empty() {
+                    println!("inert tag grants (authority revoked) — {}:", grants.len());
+                    for (node, tag, authority, rights) in &grants {
+                        println!(
+                            "  {}  tag:{}{}  (granted {})",
+                            node,
+                            tag,
+                            authority_suffix(authority),
+                            acl::rights_to_str(*rights)
+                        );
+                    }
+                }
+                if !memberships.is_empty() {
+                    println!("inert tag memberships (authority revoked) — {}:", memberships.len());
+                    for (member, tag, authority) in &memberships {
+                        println!(
+                            "  {}  tag:{}{}",
+                            hex::encode(member),
+                            tag,
+                            authority_suffix(authority)
+                        );
+                    }
+                }
             }
             engine.close()
         }

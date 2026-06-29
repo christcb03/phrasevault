@@ -330,6 +330,13 @@ kill "$WATCH" 2>/dev/null; wait "$WATCH" 2>/dev/null || true
 [ -S "$SOCK" ] && fail "socket left behind after graceful shutdown" || ok "socket removed on graceful shutdown"
 DPID=""
 
+say "item 14: authorization audit (read-only)"
+# DMOUNT has tag grants/memberships, all under live authorities → audit is clean.
+$PVFS --data-dir "$DMOUNT/.pvfs" audit | grep -q "no stale authorizations" \
+  && ok "audit reports a clean forest" || fail "audit clean-case text"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" audit | grep -q '"inert_grants":\[\],"inert_memberships":\[\]' \
+  && ok "audit json reports no inert rows" || fail "audit json shape"
+
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
 

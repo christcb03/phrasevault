@@ -87,8 +87,10 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
    so a signed-removal sweep buys nothing a rebuild wouldn't undo. **Done:** `acl ls` / `tag ls` now
    flag such rows `[inert: authority revoked]` (read-only, `Engine::authority_active`). **Deferred:**
    physical removal of the dead rows happens for free in **compaction's re-genesis** (doc 11). *Closed.*
-2. **`pvfs audit`** (§4 item 14) — forest-wide stale/revoked-permission scan + cleanup, warnings
-   optional. The authorization counterpart to `pvfs verify`. *Small–medium.*
+2. **`pvfs audit`. ✅ DONE (§4 item 14).** Read-only forest-wide scan: lists every tag grant and
+   membership under a revoked authority (inert rows), text or `--json`. The authorization counterpart
+   to `pvfs verify`. Reuses `inert_tag_grants` / `inert_memberships`; covered by
+   `audit_reports_inert_grants_and_memberships` and a smoke clean-case check.
 3. **Graceful daemon shutdown. ✅ DONE (§4 item 4).** `pvfsd` traps SIGTERM/SIGINT (a signal handler
    sets an atomic flag), the accept loop (`serve_until`) polls it and returns, then the daemon runs
    `Engine::shutdown_checkpoint` — `wal_checkpoint(TRUNCATE)` on the projection + attached log db plus
@@ -214,13 +216,17 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     - **Physical removal** is deferred to **compaction's re-genesis** (doc 11 §… / item 15): rebuilding
       a region from current state simply doesn't carry inert rows forward — free cleanup, no new events.
 
-14. **Forest-wide rights audit / verify** (`pvfs audit`, future). A **read-only** command that scans an
-    entire forest for **stale/revoked permissions** — grants/memberships whose authority key is no
-    longer an active member, ACLs referencing revoked keys, orphaned tags — and **reports** them
-    (the per-node `[inert: authority revoked]` flag from item 13, lifted to a whole-forest report).
-    No cleanup writes: masking already makes them inert, and physical removal is compaction's job
-    (item 15). Reuses `Engine::authority_active` over a tree walk. Pairs with `pvfs verify` (integrity)
-    as the *authorization* health check.
+14. **Forest-wide rights audit. ✅ SHIPPED (`pvfs audit`).** A **read-only** command that scans the
+    whole forest for **stale/revoked authorizations** — tag grants and memberships whose authority key
+    is no longer an active member (the per-node `[inert]` flag from item 13, lifted to a whole-forest
+    report). Text lists each finding (`<node> tag:<name> (by <auth>) (granted <rights>)` and
+    `<member> tag:<name> (by <auth>)`); `--json` emits `{inert_grants, inert_memberships}`. **No cleanup
+    writes** — masking already makes them inert and physical removal is compaction's job (item 15).
+    Implemented as `projection::inert_tag_grants` / `inert_memberships` (a direct `acl`/`member_tags`
+    scan with the same liveness predicate as `member_tags_of`), surfaced via `Engine`. Pairs with
+    `pvfs verify` (integrity) as the *authorization* health check. Covered by
+    `audit_reports_inert_grants_and_memberships` + a smoke clean-case check.
+    *Possible follow-on (post-1.0): also flag `key:` grants to revoked device keys.*
 
 15. **Log / DAG compaction (signed snapshot + sealed archive). → spec'd in [doc 11](11-compaction-and-verifiable-snapshots.md).**
     The log is strictly append-only and **never shrinks** — even `purge` appends a `NodePurged` event

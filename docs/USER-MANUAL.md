@@ -211,7 +211,9 @@ only opens a node when the **same key** granted both the node's tag and the memb
 authorized member may manage tags under its own authority (you don't have to be a forest admin), and
 that authority can only widen access to nodes it already controls. If a member's key is revoked,
 every tag it granted stops working immediately. `acl ls` / `tag ls` show ` (by <key>)` so you can
-see which key a tag belongs to.
+see which key a tag belongs to, and mark a now-dead grant `[inert: authority revoked]` (its rights
+read `-` — what's actually in effect). To sweep a whole forest for such dead grants, run
+`pvfs audit`.
 
 ---
 
@@ -243,6 +245,7 @@ everyday admin device, not the phrase (doc 09 §2.2).
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
+| `pvfs audit` | Authorization health check: list tag grants/memberships under a revoked authority. |
 | `pvfs device authorize-member --pubkey <hex>` | Authorize a member's key (admin device; no phrase). |
 | `pvfs device revoke --pubkey <hex>` | Revoke a device/member key (admin device; no phrase). |
 | `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
@@ -271,16 +274,16 @@ and daemon sharing — members **read** (`ls`/`stat`/`cat`) and **write**
 does **live admin** (authorize/grant/tag) through the running daemon. Reach a forest's daemon with
 `pvfs remote --forest <alias|mount>` (no socket path needed). Plain `pvfs acl set` / `tag add` /
 `device authorize-member` **auto-route** to a running daemon (no `remote` prefix), and `acl`/`tag`
-accept `pvfs://` URIs and paths. `cat` streams **raw bytes** with concurrent transfers, and `pvfsd`
-ships a `pvfsd@.service` systemd `--user` unit.
+accept `pvfs://` URIs and paths. `cat` streams **raw bytes** with concurrent transfers, `pvfsd`
+ships a `pvfsd@.service` systemd `--user` unit and shuts down cleanly on SIGTERM/SIGINT
+(checkpointing the WAL), and `pvfs audit` reports any tag grants/memberships left under a revoked
+authority.
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
 - **A companion app** — a local custodian for your root key that also auto-logs you in to
   PVFS-backed web apps. It reproduces your identity key from your phrase on any machine, so your
   sharing works the same everywhere.
-- **Permission audit** — `pvfs audit` to scan a forest for stale/revoked permissions and clean them
-  up (warnings optional), alongside `pvfs verify` for content integrity.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; trades away old history).
 - **Encryption at rest** and **federation / network sharing**.
