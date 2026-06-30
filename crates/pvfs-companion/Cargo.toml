@@ -9,9 +9,14 @@ rust-version.workspace = true
 name = "pvfs_companion"
 path = "src/lib.rs"
 
+[[bin]]
+name = "pvfs-companion"
+path = "src/main.rs"
+
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+clap.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 rand.workspace = true

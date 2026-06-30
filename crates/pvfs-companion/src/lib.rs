@@ -8,12 +8,14 @@
 //! and the loopback identity agent.
 
 mod agent;
+mod client;
 mod policy;
 mod proto;
 mod signer;
 mod vault;
 
 pub use agent::{serve, Agent};
+pub use client::request;
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{AgentRequest, AgentResponse};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};

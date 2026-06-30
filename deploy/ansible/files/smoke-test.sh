@@ -18,10 +18,12 @@ PASS=0
 FAIL=0
 DPID=""
 U2PID=""
+CPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
   [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null
+  [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -383,6 +385,33 @@ $PVFS --data-dir "$DMOUNT/.pvfs" audit | grep -q "no stale authorizations" \
   && ok "audit reports a clean forest" || fail "audit clean-case text"
 $PVFS --json --data-dir "$DMOUNT/.pvfs" audit | grep -q '"inert_grants":\[\],"inert_memberships":\[\]' \
   && ok "audit json reports no inert rows" || fail "audit json shape"
+
+say "companion: phrase-free admit via the signing agent (doc 14 phase 3)"
+COMPANION="${PVFS_COMPANION_BIN:-$(dirname "$PVFS")/pvfs-companion}"
+CMOUNT="$DATA/companion-forest"
+mkdir -p "$CMOUNT"
+CMN="$(jget "$($PVFS --json forest init --mount "$CMOUNT")" mnemonic)"
+CVAULT="$DATA/companion.vault"
+CSOCK="$DATA/companion.sock"
+# Seal the forest's owner seed into a companion vault (phrase on stdin, passphrase via env).
+printf '%s' "$CMN" | PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" init --vault "$CVAULT" >/dev/null 2>&1 \
+  && ok "companion sealed the owner seed" || fail "companion init"
+# Run the companion headless, root signing explicitly enabled.
+PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" serve --vault "$CVAULT" --socket "$CSOCK" --allow-root >/dev/null 2>&1 &
+CPID=$!
+for _ in $(seq 1 50); do [ -S "$CSOCK" ] && break; sleep 0.1; done
+[ -S "$CSOCK" ] && ok "companion serving" || fail "companion socket missing"
+# Admit a member with NO phrase typed — the companion root-signs the DeviceAuthorized.
+CMEMBER="$(jget "$($PVFS --json whoami)" pubkey)"
+$PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$CMEMBER" >/dev/null \
+  && ok "companion-signed authorize-member (no phrase)" || fail "companion authorize-member"
+# Re-admitting the same key now fails (already a member) — proves the cert landed.
+assert_rc 4 "member already authorized after companion admit" -- \
+  $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$CMEMBER"
+kill -TERM "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
+CPID=""
+# (The headless root-signing denial without --allow-root is covered by the
+#  pvfs-companion unit/integration tests, not the smoke suite.)
 
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"

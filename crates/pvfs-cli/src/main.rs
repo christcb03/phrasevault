@@ -245,7 +245,8 @@ enum DeviceCmd {
         index: u64,
     },
     /// Authorize an external member's device key by public key (doc 09 §2.2).
-    /// Signed by your admin device (no phrase); pass --mnemonic to root-sign.
+    /// Signed by your admin device (no phrase); pass --mnemonic to root-sign, or
+    /// --via-companion to root-sign through a running companion (doc 14).
     AuthorizeMember {
         /// Optional recovery phrase — root-signs instead of device-signing
         #[arg(long)]
@@ -253,6 +254,12 @@ enum DeviceCmd {
         /// The member's compressed secp256k1 public key, hex (33-byte SEC1)
         #[arg(long)]
         pubkey: String,
+        /// Root-sign via a running companion (no phrase typed); needs --companion-socket
+        #[arg(long)]
+        via_companion: bool,
+        /// Companion signer socket path (with --via-companion)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
     },
     /// Revoke a device or member key for new appends. Signed by your admin
     /// device (no phrase); pass --mnemonic to root-sign. History stays valid.
@@ -639,6 +646,59 @@ fn daemon_client(
     let sign: Box<dyn Fn(&[u8; 32]) -> Vec<u8>> =
         Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
     Ok(Some((client, sign)))
+}
+
+/// Ask a running companion (doc 14 §3) for the public key of `role` ("root" or
+/// "identity").
+fn companion_pubkey(socket: &Path, role: &str) -> Result<Vec<u8>, PvfsError> {
+    let bad = |reason: String| PvfsError::BadInput {
+        field: "companion".into(),
+        reason,
+    };
+    let resp = pvfs_companion::request(
+        socket,
+        &pvfs_companion::AgentRequest::GetPubkey { role: role.into() },
+    )
+    .map_err(|e| bad(e.to_string()))?;
+    match resp {
+        pvfs_companion::AgentResponse::Pubkey { pubkey } => {
+            hex::decode(&pubkey).map_err(|_| bad("companion returned bad pubkey hex".into()))
+        }
+        pvfs_companion::AgentResponse::Error { code, message } => Err(bad(format!("{code}: {message}"))),
+        _ => Err(bad("unexpected companion response".into())),
+    }
+}
+
+/// Ask a running companion to sign `digest` for a request type (doc 14 §3, §4).
+fn companion_sign(socket: &Path, request_type: &str, digest: &[u8; 32]) -> Result<Vec<u8>, PvfsError> {
+    let resp = pvfs_companion::request(
+        socket,
+        &pvfs_companion::AgentRequest::Sign {
+            request_type: request_type.into(),
+            digest: hex::encode(digest),
+            origin: Some("local".into()),
+        },
+    )
+    .map_err(|e| PvfsError::BadInput {
+        field: "companion".into(),
+        reason: e.to_string(),
+    })?;
+    match resp {
+        pvfs_companion::AgentResponse::Signature { sig } => {
+            hex::decode(&sig).map_err(|_| PvfsError::BadInput {
+                field: "companion".into(),
+                reason: "companion returned bad signature hex".into(),
+            })
+        }
+        pvfs_companion::AgentResponse::Error { code, message } => Err(PvfsError::Forbidden {
+            action: "companion sign".into(),
+            reason: format!("{code}: {message}"),
+        }),
+        _ => Err(PvfsError::BadInput {
+            field: "companion".into(),
+            reason: "unexpected companion response".into(),
+        }),
+    }
 }
 
 fn run(cli: Cli) -> Result<(), PvfsError> {
@@ -1126,11 +1186,43 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
-                DeviceCmd::AuthorizeMember { mnemonic, pubkey } => {
+                DeviceCmd::AuthorizeMember {
+                    mnemonic,
+                    pubkey,
+                    via_companion,
+                    companion_socket,
+                } => {
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
+                    // Companion root-signing (doc 14 §3): the companion holds the
+                    // seed; the CLI prepares the DeviceAuthorized, gets the root
+                    // pubkey + signature from the companion, and commits — no phrase.
+                    if via_companion {
+                        let sock = companion_socket.ok_or_else(|| PvfsError::BadInput {
+                            field: "companion-socket".into(),
+                            reason: "pass --companion-socket with --via-companion".into(),
+                        })?;
+                        let root_pub = companion_pubkey(&sock, "root")?;
+                        let mut engine = Engine::open(&state_dir)?;
+                        let prep = engine.prepare_authorize_member(&root_pub, &pk)?;
+                        let mut ev = prep
+                            .events
+                            .into_iter()
+                            .next()
+                            .expect("authorize prepares one event");
+                        let sig = companion_sign(&sock, "root_device_cert", &ev.digest)?;
+                        ev.event.set_author_sig(sig);
+                        engine.commit_member_write(vec![ev.event])?;
+                        engine.close()?;
+                        if json {
+                            println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
+                        } else {
+                            println!("authorized member {pubkey} (companion root-signed)");
+                        }
+                        return Ok(());
+                    }
                     // Device-signed (no phrase): auto-route through daemon (doc 09 §3d).
                     // Root-signed (phrase given): must go direct.
                     if mnemonic.is_none() {

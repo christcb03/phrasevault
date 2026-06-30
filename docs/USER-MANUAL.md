@@ -247,6 +247,8 @@ everyday admin device, not the phrase (doc 09 §2.2).
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs audit` | Authorization health check: list tag grants/memberships under a revoked authority. |
 | `pvfs device authorize-member --pubkey <hex>` | Authorize a member's key (admin device; no phrase). |
+| `pvfs device authorize-member --via-companion --companion-socket <p> --pubkey <hex>` | Root-sign the admit through a running companion — no phrase typed (doc 14). |
+| `pvfs-companion init --vault <p>` · `pvfs-companion serve --vault <p> --socket <s> [--allow-root]` | Seal your seed into a vault · run the local signing agent. |
 | `pvfs device revoke --pubkey <hex>` | Revoke a device/member key (admin device; no phrase). |
 | `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
