@@ -4,6 +4,7 @@
 //!   identity root : m/43'/20566'/0'
 //!   device keys   : m/43'/20566'/1'/n'
 //!   encryption    : m/43'/20566'/2'/...   (RESERVED — secure module, P3)
+//!   identity auth : m/43'/20566'/3'/<id>' (the human's stable tag authority, doc 14)
 //!
 //! 20566 = 0x5056 = ASCII "PV". The PVFS-specific path guarantees no key
 //! collision with coin wallets even if a user reuses a phrase (they should
@@ -69,6 +70,25 @@ pub fn device_key(mnemonic: &Mnemonic, bip39_passphrase: &str, index: u64) -> Re
         mnemonic,
         bip39_passphrase,
         &format!("m/{PVFS_PURPOSE}'/{PVFS_PATH_INDEX}'/1'/{index}'"),
+    )
+}
+
+/// Identity-authority key `id` (doc 10 §9.1, doc 14 §1) — the human's **stable,
+/// cross-device** key behind their own tag grants/memberships and identity
+/// assertions. A distinct hardened branch (`3'`) from per-machine device keys, so
+/// the same phrase reproduces the same authority on every machine. `id` selects
+/// among a person's identities (default `0`).
+pub fn identity_key(mnemonic: &Mnemonic, bip39_passphrase: &str, id: u64) -> Result<SigningKey> {
+    if id >= 0x8000_0000 {
+        return Err(PvfsError::BadInput {
+            field: "identity_id".into(),
+            reason: "must be < 2^31 (hardened BIP32 child index)".into(),
+        });
+    }
+    derive(
+        mnemonic,
+        bip39_passphrase,
+        &format!("m/{PVFS_PURPOSE}'/{PVFS_PATH_INDEX}'/3'/{id}'"),
     )
 }
 

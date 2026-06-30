@@ -10,6 +10,7 @@ name = "pvfs_companion"
 path = "src/lib.rs"
 
 [dependencies]
+pvfs-core = { path = "../pvfs-core" }
 thiserror.workspace = true
 hex.workspace = true
 rand.workspace = true

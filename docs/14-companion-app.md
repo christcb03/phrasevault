@@ -138,7 +138,8 @@ The PVFS build targets the PVFS subset first; the methods are named/shaped so PV
 ## 9. Build plan (phased, each pipeline-verifiable)
 
 1. ☑ **Vault core** — `pvfs-companion` crate: `Vault` seals/unseals the seed (Argon2id passphrase → XChaCha20-Poly1305), zeroizing secret, versioned `0600` JSON file. 7 unit tests (round-trip, wrong passphrase, ciphertext/nonce tamper, version reject, salt/nonce uniqueness, file mode).
-2. **Local signer socket** — `AF_UNIX` listener, `sign(digest, type, context)`, the §4 policy engine (headless/auto-policy first, prompts stubbed). Integration test: companion signs a `DeviceAuthorized` the daemon prepared, daemon commits.
+2a. ☑ **Signing core + policy** — `UnlockedSigner` (request type → root/identity key → signature; `identity_key` at `3'/<id>'`), the §4 `ApprovalPolicy` (tiered, headless-safe defaults), and the kernel fix so the **root may author a device cert via prepare** (`require_admin_on_root` accepts the root, matching `check_device_cert`). Integration test: the companion root-signs a prepared `DeviceAuthorized` and the engine commits it (phrase-free admit, end to end).
+2b. **Local signer socket** — wrap 2a in an `AF_UNIX` listener with a small request/response protocol (`sign`, `get-pubkey`), reusing the daemon's framing. Round-trip test over the socket.
 3. **CLI wiring** — `pvfs device authorize-member`/`revoke` and the human's tag ops can target the companion signer (auto-detect socket; `--signer` override). Smoke: phrase-free admit of a new admin device via the companion.
 4. **OS keychain backends** — macOS/Linux/Windows secret-store sealing behind the §5 abstraction; passphrase fallback retained.
 5. **Approval UI** — desktop prompt + terminal fallback; rate limit; signature audit log; idle-timeout lock.

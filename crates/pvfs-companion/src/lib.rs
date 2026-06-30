@@ -7,6 +7,10 @@
 //! add the OS-keychain sealing backend, the Unix-socket signer + approval policy,
 //! and the loopback identity agent.
 
+mod policy;
+mod signer;
 mod vault;
 
+pub use policy::{ApprovalPolicy, Decision, Origin};
+pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
 pub use vault::{KdfParams, Vault, VaultError};

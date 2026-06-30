@@ -1906,6 +1906,15 @@ impl Engine {
     //      admin signer (the owner's device, or root via the companion) ----------
 
     fn require_admin_on_root(&self, author_pub: &[u8], action: &'static str) -> Result<()> {
+        // The identity root may always author device certificates (doc 09 §2.2) —
+        // it isn't a device in the ACL table, so check it explicitly here, mirroring
+        // `projection::check_device_cert`'s root-or-admin rule used at commit/replay.
+        // This is the path the companion uses to root-sign a `DeviceAuthorized`
+        // (doc 14 §3); without it the prepare step would reject the root while the
+        // commit step accepts it.
+        if author_pub == self.identity.root_pubkey.as_slice() {
+            return Ok(());
+        }
         let root = self.identity.root_node_id.clone();
         let who = crate::acl::Principal::Key(author_pub.to_vec());
         if projection::effective_rights(&self.conn, &who, &root)? & crate::acl::ACL_A == 0 {

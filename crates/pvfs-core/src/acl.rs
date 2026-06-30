@@ -21,6 +21,14 @@ pub const ACL_RWA: u8 = ACL_R | ACL_W | ACL_A;
 /// two without a new event field. Owner devices have implicit full rights.
 pub const MEMBER_DEVICE_INDEX: u64 = u64::MAX;
 
+/// `device_index` sentinel marking the human **identity-authority** key (doc 14
+/// §1): an owner key derived at `m/43'/20566'/3'/<id>'` — the stable, cross-device
+/// authority behind a person's own tag grants/memberships and identity assertions.
+/// It is a *non*-`MEMBER_DEVICE_INDEX` value, so the projection treats it as an
+/// owner (full rights) exactly like a device, while the distinct sentinel tells
+/// `recover`/the companion to derive it from the `3'` branch, not `1'/n'`.
+pub const IDENTITY_DEVICE_INDEX: u64 = u64::MAX - 1;
+
 /// Who an ACL entry is about (doc 06 §4 / doc 09 §1). `public ⊇ any ⊇ tag ⊇ key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {

@@ -535,3 +535,27 @@ fn audit_reports_inert_grants_and_memberships() {
     assert_eq!(engine.inert_memberships().unwrap().len(), 1);
     engine.close().unwrap();
 }
+
+// doc 14 §3 — the identity root may author a device certificate via the prepare
+// path (matching `check_device_cert` at commit/replay): this is how the companion
+// root-signs a `DeviceAuthorized`. A random non-admin key is still rejected.
+#[test]
+fn root_may_prepare_device_cert() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, mn) = Engine::init(dir.path()).unwrap();
+    let root_pub = crypto::pubkey_bytes(&identity::root_key(&mn, "").unwrap());
+    let member = foreign_pubkey();
+
+    // root-authored prepare is allowed
+    assert!(engine.prepare_authorize_member(&root_pub, &member).is_ok());
+
+    // a stranger key (not root, not an admin device) is forbidden
+    let stranger = crypto::pubkey_bytes(
+        &identity::device_key(&identity::generate_mnemonic().unwrap(), "", 7).unwrap(),
+    );
+    assert!(matches!(
+        engine.prepare_authorize_member(&stranger, &member),
+        Err(PvfsError::Forbidden { .. })
+    ));
+    engine.close().unwrap();
+}
