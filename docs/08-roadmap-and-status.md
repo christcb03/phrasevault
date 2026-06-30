@@ -23,7 +23,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E (3d)** | CLI **auto-routes** plain `acl`/`tag`/`device` mutations to a running daemon (path/URI args too); direct-engine fallback | ✅ shipped (doc 09 §3d) |
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
-| **Companion** | Local root custodian + localhost identity agent ("Sign in with PVFS" auto-login) | ☐ **1.0 (committed)** (doc 09 §6) |
+| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ☐ **1.0 (committed)** — design in [doc 14](14-companion-app.md) |
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ☐ **1.0 (committed)** (doc 12) |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
@@ -123,8 +123,11 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
 
 **Scope decisions (DECIDED 2026-06-29 — both committed to 1.0):**
 
-- **Companion app** (doc 09 §6) — **in 1.0.** Local root custodian + localhost identity agent
-  ("Sign in with PVFS"). Its own application track; the strongest root-key story.
+- **Companion app** (doc 09 §6) — **in 1.0; full scope** (signer/custodian + identity agent). Design
+  settled in **[doc 14](14-companion-app.md)**: root+identity keys in an OS-keychain/passphrase vault,
+  a Unix-socket signer with request-type-tiered approval (root events always prompt; local owner-
+  initiated tag ops auto-sign while unlocked; web origins use per-origin connect), and a loopback
+  "Sign in with PVFS" agent. Device keys stay local for everyday writes. Build plan: doc 14 §9.
 - **Encryption at rest** (P3, doc 12) — **in 1.0.** Secure node type at reserved key path
   `m/43'/20566'/2'`: opaque mutable encrypted blob + content-free signed hash-state log +
   companion-gated decryption. Currently unbuilt.
@@ -261,6 +264,16 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     section — it runs `pvfs acl set` / `tag add` with **no `--data-dir` and no `remote`** while
     `pvfsd` is up; rc 0 is decisive because the old client-identity signer (a member, not an admin)
     returned `forbidden`. This also covers the daemon-running half of Road-to-1.0 item 4.
+
+17. **Owner / identity key replacement — REQUIRED follow-on (not yet built).** The companion (doc 14)
+    makes a human's identity **one stable key across devices** (doc 10 §9.1), whose accepted cost is
+    that you can't revoke a single lost machine's copy of the *identity* without rotating that key. That
+    is only acceptable if a clean **key-replacement** path exists. Three cases: replace a lost/compromised
+    **identity key** (re-issue its tag grants/memberships under the new key — they go inert until then,
+    via existing masking); replace an **owner device key** (mostly `device revoke` + authorize-new, to
+    confirm); rotate the **root key** (hardest — re-anchor `ForestCreated` to a new root while preserving
+    content-addressed ids; interacts with compaction re-genesis item 15 and federation trust doc 03).
+    → **Plan:** its own mini-spec (new doc) before companion §9 phase 7; see [doc 14 §11](14-companion-app.md).
 
 **Resolved since earlier drafts:** `PvfsError::Forbidden` now exists; the daemon socket is
 discoverable (conventional path, P2-E §3b); admit/revoke no longer need the recovery phrase (§3a);
