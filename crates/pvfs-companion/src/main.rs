@@ -1,10 +1,11 @@
 //! `pvfs-companion` — the local key vault + signing agent (doc 14).
 //!
 //! `init` seals a recovery phrase (read from stdin) into a vault; `serve` unlocks
-//! it and serves the signer socket. The vault passphrase comes from
-//! `$PVFS_COMPANION_PASSPHRASE` (phase 3; OS-keychain unlock and an interactive
-//! prompt are doc 14 §9 phases 4–5). Headless by default: a root device-cert
-//! signature is only auto-approved with `--allow-root`.
+//! it and serves the signer socket. Two sealings (doc 14 §5): `--keychain` holds
+//! the data key in the OS secret store (unlock needs nothing), otherwise the
+//! passphrase comes from `$PVFS_COMPANION_PASSPHRASE` (an interactive prompt is
+//! doc 14 §9 phase 5). Headless by default: a root device-cert signature is only
+//! auto-approved with `--allow-root`.
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -28,11 +29,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Seal a recovery phrase (read from stdin) into a new vault.
-    /// Passphrase from $PVFS_COMPANION_PASSPHRASE.
+    /// Seal a recovery phrase (read from stdin) into a new vault. Default:
+    /// passphrase-sealed from $PVFS_COMPANION_PASSPHRASE; pass --keychain to
+    /// hold the data key in the OS keychain instead (no passphrase at all).
     Init {
         #[arg(long)]
         vault: PathBuf,
+        /// Seal via the OS secret store (macOS Keychain / Secret Service /
+        /// Credential Manager) — doc 14 §5. Unlock then needs no env var.
+        #[arg(long)]
+        keychain: bool,
     },
     /// Unlock the vault and serve the signer socket. Passphrase from
     /// $PVFS_COMPANION_PASSPHRASE. `--allow-root` opts a headless agent into
@@ -90,10 +96,43 @@ fn passphrase() -> Result<String, String> {
         .map_err(|_| "set $PVFS_COMPANION_PASSPHRASE".to_string())
 }
 
+/// Seal into / unseal from the OS keychain — compiled out without `os-keychain`,
+/// where a keychain vault is a clear error instead (the passphrase path is
+/// always available; doc 14 §5 fallback).
+fn keychain_create(vault: &std::path::Path, phrase: &[u8]) -> Result<(), String> {
+    #[cfg(feature = "os-keychain")]
+    {
+        pvfs_companion::Vault::create_keychain(
+            vault,
+            phrase,
+            &pvfs_companion::OsKeychain::new(),
+        )
+        .map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "os-keychain"))]
+    {
+        let _ = (vault, phrase);
+        Err("this build has no os-keychain support (rebuild with the default features)".into())
+    }
+}
+
+fn keychain_unseal(vault: &pvfs_companion::Vault) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    #[cfg(feature = "os-keychain")]
+    {
+        vault
+            .unseal_keychain(&pvfs_companion::OsKeychain::new())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "os-keychain"))]
+    {
+        let _ = vault;
+        Err("vault is keychain-sealed but this build has no os-keychain support".into())
+    }
+}
+
 fn run() -> Result<(), String> {
     match Cli::parse().cmd {
-        Cmd::Init { vault } => {
-            let pass = passphrase()?;
+        Cmd::Init { vault, keychain } => {
             let mut phrase = String::new();
             std::io::stdin()
                 .read_to_string(&mut phrase)
@@ -102,8 +141,18 @@ fn run() -> Result<(), String> {
             if phrase.is_empty() {
                 return Err("no recovery phrase on stdin".into());
             }
-            Vault::create(&vault, phrase.as_bytes(), pass.as_bytes()).map_err(|e| e.to_string())?;
-            eprintln!("pvfs-companion: sealed vault at {}", vault.display());
+            if keychain {
+                keychain_create(&vault, phrase.as_bytes())?;
+                eprintln!(
+                    "pvfs-companion: sealed vault at {} (data key in the OS keychain)",
+                    vault.display()
+                );
+            } else {
+                let pass = passphrase()?;
+                Vault::create(&vault, phrase.as_bytes(), pass.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                eprintln!("pvfs-companion: sealed vault at {}", vault.display());
+            }
             Ok(())
         }
         Cmd::Serve {
@@ -111,11 +160,14 @@ fn run() -> Result<(), String> {
             socket,
             allow_root,
         } => {
-            let pass = passphrase()?;
-            let secret = Vault::open(&vault)
-                .map_err(|e| e.to_string())?
-                .unseal(pass.as_bytes())
-                .map_err(|e| e.to_string())?;
+            let v = Vault::open(&vault).map_err(|e| e.to_string())?;
+            let secret = match v.sealing() {
+                pvfs_companion::Sealing::Keychain => keychain_unseal(&v)?,
+                pvfs_companion::Sealing::Passphrase => {
+                    let pass = passphrase()?;
+                    v.unseal(pass.as_bytes()).map_err(|e| e.to_string())?
+                }
+            };
             let signer = UnlockedSigner::from_phrase(
                 std::str::from_utf8(&secret).map_err(|e| e.to_string())?,
             )

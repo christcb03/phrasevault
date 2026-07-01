@@ -33,7 +33,9 @@
     - name: Install build prerequisites
       become: true
       ansible.builtin.apt:
-        name: [build-essential, pkg-config, curl, git, rsync, python3]
+        # libdbus-1-dev: the Linux secret-service backend of pvfs-companion
+        # (feature os-keychain) links against libdbus at build time.
+        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev]
         state: present
         update_cache: true
       tags: [prepare]

@@ -6,9 +6,15 @@
 //! the ciphertext is authenticated, so flipping any byte fails `unseal`. Derived
 //! key material is held in `Zeroizing` buffers and wiped on drop.
 //!
-//! Phase 1 covers only the passphrase-sealed file (doc 14 §9 phase 1). The OS
-//! keychain backend (phase 4) will seal the same vault key behind the platform
-//! secret store; the file format carries a `version` for that evolution.
+//! Two sealings share that one AEAD code path (doc 14 §5) — they differ only in
+//! where the 32-byte key comes from:
+//!
+//! - **Passphrase** (version 1, the portable fallback): `passphrase --Argon2id-->
+//!   key`. No OS dependency.
+//! - **Keychain** (version 2, phase 4): a random **data key** held by the platform
+//!   secret store (see [`crate::keychain`]); the vault file names it by `key_id`
+//!   and holds no KDF material at all. Losing the keychain entry orphans the vault
+//!   — recovery is the 24-word phrase, exactly as before.
 
 use std::path::Path;
 
@@ -19,11 +25,14 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-/// Current on-disk vault format version.
+/// On-disk format version of a passphrase-sealed vault.
 const VAULT_VERSION: u32 = 1;
+/// On-disk format version of a keychain-sealed vault (doc 14 §5, phase 4).
+const VAULT_VERSION_KEYCHAIN: u32 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce
 const KEY_LEN: usize = 32;
+const KEY_ID_LEN: usize = 16; // random key-id bytes (hex on the wire)
 
 // Argon2id defaults for an interactive desktop unlock (~19 MiB, 2 passes, 1 lane).
 const DEFAULT_M_COST: u32 = 19_456; // KiB
@@ -61,6 +70,17 @@ pub enum VaultError {
     Unlock,
     #[error("kdf: {0}")]
     Kdf(String),
+    #[error("keychain: {0}")]
+    Keychain(String),
+}
+
+/// How a vault's data key is held (doc 14 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sealing {
+    /// Argon2id from a passphrase — the portable, no-OS-dependency fallback.
+    Passphrase,
+    /// A random data key in the platform secret store, named by the vault's key id.
+    Keychain,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,7 +95,15 @@ struct KdfWire {
 #[derive(Serialize, Deserialize)]
 struct VaultFile {
     version: u32,
-    kdf: KdfWire,
+    /// v2 only: "keychain". Absent in v1 (implicitly passphrase-sealed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealing: Option<String>,
+    /// v1 only: the Argon2id parameters. Absent in v2 (no KDF — random data key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kdf: Option<KdfWire>,
+    /// v2 only: names the data key in the OS secret store (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
     cipher: String,     // "xchacha20poly1305"
     nonce: String,      // hex
     ciphertext: String, // hex (sealed secret + AEAD tag)
@@ -103,24 +131,19 @@ impl Vault {
         let mut salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
         let key = derive_key(passphrase, &salt, params)?;
-
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let cipher = XChaCha20Poly1305::new_from_slice(&key[..])
-            .map_err(|_| VaultError::Kdf("bad key length".into()))?;
-        let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), secret)
-            .map_err(|_| VaultError::Format("encrypt failed".into()))?;
+        let (nonce, ciphertext) = seal(&key, secret)?;
 
         let file = VaultFile {
             version: VAULT_VERSION,
-            kdf: KdfWire {
+            sealing: None,
+            kdf: Some(KdfWire {
                 algo: "argon2id".into(),
                 salt: hex::encode(salt),
                 m_cost: params.m_cost,
                 t_cost: params.t_cost,
                 p_cost: params.p_cost,
-            },
+            }),
+            key_id: None,
             cipher: "xchacha20poly1305".into(),
             nonce: hex::encode(nonce),
             ciphertext: hex::encode(&ciphertext),
@@ -130,16 +153,63 @@ impl Vault {
         write_private(path, &json)
     }
 
-    /// Load (but do not unlock) a vault file.
+    /// Seal `secret` under a fresh random data key held by `store` (doc 14 §5,
+    /// phase 4) and write a version-2 vault file at `path` (mode `0600` on Unix).
+    /// The vault file gets a random `key_id` naming the store entry; no KDF, no
+    /// passphrase. If the store write fails, no vault file is written.
+    pub fn create_keychain(
+        path: &Path,
+        secret: &[u8],
+        store: &dyn crate::keychain::SecretStore,
+    ) -> Result<(), VaultError> {
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
+        rand::thread_rng().fill_bytes(&mut key[..]);
+        let mut key_id_bytes = [0u8; KEY_ID_LEN];
+        rand::thread_rng().fill_bytes(&mut key_id_bytes);
+        let key_id = hex::encode(key_id_bytes);
+
+        // Store the data key first: a vault file naming a missing key is an orphan.
+        store.set(&key_id, &key[..])?;
+        let (nonce, ciphertext) = seal(&key, secret)?;
+
+        let file = VaultFile {
+            version: VAULT_VERSION_KEYCHAIN,
+            sealing: Some("keychain".into()),
+            kdf: None,
+            key_id: Some(key_id),
+            cipher: "xchacha20poly1305".into(),
+            nonce: hex::encode(nonce),
+            ciphertext: hex::encode(&ciphertext),
+        };
+        let json =
+            serde_json::to_vec_pretty(&file).map_err(|e| VaultError::Format(e.to_string()))?;
+        write_private(path, &json)
+    }
+
+    /// Load (but do not unlock) a vault file — either sealing.
     pub fn open(path: &Path) -> Result<Vault, VaultError> {
         let bytes = std::fs::read(path).map_err(|e| VaultError::Io(e.to_string()))?;
         let file: VaultFile =
             serde_json::from_slice(&bytes).map_err(|e| VaultError::Format(e.to_string()))?;
-        if file.version != VAULT_VERSION {
-            return Err(VaultError::Version(file.version));
-        }
-        if file.kdf.algo != "argon2id" {
-            return Err(VaultError::Format(format!("unknown kdf {}", file.kdf.algo)));
+        match file.version {
+            VAULT_VERSION => {
+                let kdf = file
+                    .kdf
+                    .as_ref()
+                    .ok_or_else(|| VaultError::Format("v1 vault missing kdf".into()))?;
+                if kdf.algo != "argon2id" {
+                    return Err(VaultError::Format(format!("unknown kdf {}", kdf.algo)));
+                }
+            }
+            VAULT_VERSION_KEYCHAIN => {
+                if file.sealing.as_deref() != Some("keychain") {
+                    return Err(VaultError::Format("v2 vault missing keychain sealing".into()));
+                }
+                if file.key_id.is_none() {
+                    return Err(VaultError::Format("keychain vault missing key_id".into()));
+                }
+            }
+            v => return Err(VaultError::Version(v)),
         }
         if file.cipher != "xchacha20poly1305" {
             return Err(VaultError::Format(format!("unknown cipher {}", file.cipher)));
@@ -147,11 +217,64 @@ impl Vault {
         Ok(Vault { file })
     }
 
-    /// Unlock the vault: re-derive the key from `passphrase` and return the secret
-    /// in a zeroizing buffer (wiped on drop — "locking" is dropping it). Returns
-    /// [`VaultError::Unlock`] on a wrong passphrase or any tampering (AEAD failure).
+    /// How this vault's data key is held — lets a caller pick the unlock path.
+    pub fn sealing(&self) -> Sealing {
+        if self.file.version == VAULT_VERSION_KEYCHAIN {
+            Sealing::Keychain
+        } else {
+            Sealing::Passphrase
+        }
+    }
+
+    /// The OS-store entry name of a keychain-sealed vault's data key.
+    pub fn key_id(&self) -> Option<&str> {
+        self.file.key_id.as_deref()
+    }
+
+    /// Unlock a **passphrase-sealed** vault: re-derive the key from `passphrase`
+    /// and return the secret in a zeroizing buffer (wiped on drop — "locking" is
+    /// dropping it). Returns [`VaultError::Unlock`] on a wrong passphrase or any
+    /// tampering (AEAD failure); a keychain-sealed vault is a `Format` error —
+    /// use [`unseal_keychain`](Vault::unseal_keychain).
     pub fn unseal(&self, passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-        let salt = hex::decode(&self.file.kdf.salt).map_err(|_| VaultError::Format("salt hex".into()))?;
+        let kdf = self.file.kdf.as_ref().ok_or_else(|| {
+            VaultError::Format("keychain-sealed vault: unlock via the OS keychain".into())
+        })?;
+        let salt = hex::decode(&kdf.salt).map_err(|_| VaultError::Format("salt hex".into()))?;
+        let params = KdfParams {
+            m_cost: kdf.m_cost,
+            t_cost: kdf.t_cost,
+            p_cost: kdf.p_cost,
+        };
+        let key = derive_key(passphrase, &salt, params)?;
+        self.unseal_with_key(&key)
+    }
+
+    /// Unlock a **keychain-sealed** vault: fetch the data key named by `key_id`
+    /// from `store` and decrypt. A missing entry is a `Keychain` error (the vault
+    /// is orphaned — recover from the phrase); tampering is `Unlock` as usual.
+    pub fn unseal_keychain(
+        &self,
+        store: &dyn crate::keychain::SecretStore,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let key_id = self.file.key_id.as_deref().ok_or_else(|| {
+            VaultError::Format("passphrase-sealed vault: unlock with the passphrase".into())
+        })?;
+        let key = store.get(key_id)?;
+        if key.len() != KEY_LEN {
+            return Err(VaultError::Keychain("stored data key has wrong length".into()));
+        }
+        let mut k = Zeroizing::new([0u8; KEY_LEN]);
+        k.copy_from_slice(&key);
+        self.unseal_with_key(&k)
+    }
+
+    /// Shared decrypt path (doc 14 §5 "one code path"): both sealings converge on
+    /// XChaCha20-Poly1305 with a 32-byte key.
+    fn unseal_with_key(
+        &self,
+        key: &Zeroizing<[u8; KEY_LEN]>,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let nonce =
             hex::decode(&self.file.nonce).map_err(|_| VaultError::Format("nonce hex".into()))?;
         let ct = hex::decode(&self.file.ciphertext)
@@ -159,12 +282,6 @@ impl Vault {
         if nonce.len() != NONCE_LEN {
             return Err(VaultError::Format("bad nonce length".into()));
         }
-        let params = KdfParams {
-            m_cost: self.file.kdf.m_cost,
-            t_cost: self.file.kdf.t_cost,
-            p_cost: self.file.kdf.p_cost,
-        };
-        let key = derive_key(passphrase, &salt, params)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&key[..])
             .map_err(|_| VaultError::Kdf("bad key length".into()))?;
         let plaintext = cipher
@@ -172,6 +289,21 @@ impl Vault {
             .map_err(|_| VaultError::Unlock)?;
         Ok(Zeroizing::new(plaintext))
     }
+}
+
+/// Shared encrypt path: fresh random nonce, XChaCha20-Poly1305 under `key`.
+fn seal(
+    key: &Zeroizing<[u8; KEY_LEN]>,
+    secret: &[u8],
+) -> Result<([u8; NONCE_LEN], Vec<u8>), VaultError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(&key[..])
+        .map_err(|_| VaultError::Kdf("bad key length".into()))?;
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), secret)
+        .map_err(|_| VaultError::Format("encrypt failed".into()))?;
+    Ok((nonce, ciphertext))
 }
 
 /// `passphrase` + `salt` -> a 32-byte key via Argon2id, in a zeroizing buffer.
@@ -288,9 +420,103 @@ mod tests {
         let a: VaultFile = serde_json::from_slice(&std::fs::read(&p1).unwrap()).unwrap();
         let b: VaultFile = serde_json::from_slice(&std::fs::read(&p2).unwrap()).unwrap();
         // Same secret + passphrase must still seal to different bytes (random salt+nonce).
-        assert_ne!(a.kdf.salt, b.kdf.salt);
+        assert_ne!(a.kdf.as_ref().unwrap().salt, b.kdf.as_ref().unwrap().salt);
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
+    }
+
+    // ---- keychain sealing (doc 14 §5, phase 4) --------------------------------
+
+    use crate::keychain::{MemoryStore, SecretStore};
+
+    #[test]
+    fn keychain_seal_unseal_round_trip() {
+        let (_d, path) = vault_path();
+        let store = MemoryStore::new();
+        let secret = b"24-word seed phrase goes here";
+        Vault::create_keychain(&path, secret, &store).unwrap();
+        let v = Vault::open(&path).unwrap();
+        assert_eq!(v.sealing(), Sealing::Keychain);
+        let out = v.unseal_keychain(&store).unwrap();
+        assert_eq!(&out[..], secret);
+    }
+
+    #[test]
+    fn keychain_vault_holds_no_kdf_material() {
+        let (_d, path) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&path, b"seed", &store).unwrap();
+        let file: VaultFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.version, VAULT_VERSION_KEYCHAIN);
+        assert!(file.kdf.is_none());
+        assert_eq!(file.sealing.as_deref(), Some("keychain"));
+        assert!(file.key_id.is_some());
+    }
+
+    #[test]
+    fn keychain_missing_entry_is_orphaned_not_unlock() {
+        let (_d, path) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&path, b"seed", &store).unwrap();
+        let v = Vault::open(&path).unwrap();
+        store.delete(v.key_id().unwrap()).unwrap();
+        // A lost data key is a Keychain error (recover from the phrase), not Unlock.
+        assert!(matches!(v.unseal_keychain(&store), Err(VaultError::Keychain(_))));
+    }
+
+    #[test]
+    fn keychain_ciphertext_tamper_fails() {
+        let (_d, path) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&path, b"seed-secret", &store).unwrap();
+        let mut file: VaultFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut ct: Vec<u8> = hex::decode(&file.ciphertext).unwrap();
+        ct[0] ^= 0x01;
+        file.ciphertext = hex::encode(&ct);
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let v = Vault::open(&path).unwrap();
+        assert!(matches!(v.unseal_keychain(&store), Err(VaultError::Unlock)));
+    }
+
+    #[test]
+    fn wrong_unlock_path_is_a_clear_error() {
+        let (_d, p1) = vault_path();
+        let (_d2, p2) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&p1, b"seed", &store).unwrap();
+        Vault::create_with(&p2, b"seed", b"pw", fast()).unwrap();
+        // Passphrase on a keychain vault, and store on a passphrase vault: both
+        // are Format errors telling the caller which unlock path to use.
+        let kc = Vault::open(&p1).unwrap();
+        assert!(matches!(kc.unseal(b"pw"), Err(VaultError::Format(_))));
+        let pp = Vault::open(&p2).unwrap();
+        assert_eq!(pp.sealing(), Sealing::Passphrase);
+        assert!(matches!(pp.unseal_keychain(&store), Err(VaultError::Format(_))));
+    }
+
+    #[test]
+    fn distinct_key_ids_across_keychain_vaults() {
+        let (_d1, p1) = vault_path();
+        let (_d2, p2) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&p1, b"seed", &store).unwrap();
+        Vault::create_keychain(&p2, b"seed", &store).unwrap();
+        let a = Vault::open(&p1).unwrap();
+        let b = Vault::open(&p2).unwrap();
+        assert_ne!(a.key_id().unwrap(), b.key_id().unwrap());
+    }
+
+    #[test]
+    fn v2_without_sealing_field_rejected() {
+        let (_d, path) = vault_path();
+        let store = MemoryStore::new();
+        Vault::create_keychain(&path, b"seed", &store).unwrap();
+        let mut file: VaultFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file.sealing = None;
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(matches!(Vault::open(&path), Err(VaultError::Format(_))));
     }
 
     #[cfg(unix)]

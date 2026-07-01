@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "pvfs-companion"
 path = "src/main.rs"
 
+[features]
+default = ["os-keychain"]
+# OS secret-store sealing for the vault data key (doc 14 §5, phase 4):
+# macOS Keychain / Linux Secret Service / Windows Credential Manager.
+# The Linux backend needs libdbus at build time (apt: libdbus-1-dev) +
+# pkg-config; use --no-default-features for a passphrase-only build.
+os-keychain = ["dep:keyring"]
+
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
@@ -25,6 +33,11 @@ serde_json.workspace = true
 argon2.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
+keyring = { version = "3", optional = true, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true
