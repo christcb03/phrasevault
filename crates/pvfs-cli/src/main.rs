@@ -686,28 +686,25 @@ fn daemon_client(
 }
 
 /// Resolve the companion signer socket (doc 14 §9 phase 3 auto-detection):
-/// an explicit `--companion-socket` wins; else `$PVFS_COMPANION_SOCKET`; else
-/// the conventional `$XDG_RUNTIME_DIR/pvfs-companion.sock` if it exists.
+/// an explicit `--companion-socket` wins; otherwise the companion's own default
+/// ($PVFS_COMPANION_SOCKET, else $XDG_RUNTIME_DIR/pvfs-companion.sock, else a
+/// per-user /tmp path) — so a bare `pvfs-companion serve` and a bare
+/// `--via-companion` op always agree on the path.
 fn resolve_companion_socket(explicit: Option<PathBuf>) -> Result<PathBuf, PvfsError> {
     if let Some(p) = explicit {
         return Ok(p);
     }
-    if let Ok(p) = std::env::var("PVFS_COMPANION_SOCKET") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let p = Path::new(&dir).join("pvfs-companion.sock");
-        if p.exists() {
-            return Ok(p);
-        }
+    let p = pvfs_companion::default_socket_path();
+    if p.exists() {
+        return Ok(p);
     }
     Err(PvfsError::BadInput {
         field: "companion-socket".into(),
-        reason: "no companion socket found (pass --companion-socket, set \
-                 $PVFS_COMPANION_SOCKET, or serve on $XDG_RUNTIME_DIR/pvfs-companion.sock)"
-            .into(),
+        reason: format!(
+            "no companion running at {} — start it with `pvfs-companion serve` \
+             (or pass --companion-socket / set $PVFS_COMPANION_SOCKET)",
+            p.display()
+        ),
     })
 }
 

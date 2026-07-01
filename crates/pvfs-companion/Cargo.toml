@@ -33,6 +33,7 @@ serde_json.workspace = true
 argon2.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
+rpassword = "7"
 keyring = { version = "3", optional = true, features = [
     "apple-native",
     "windows-native",

@@ -398,6 +398,16 @@ CSOCK="$DATA/companion.sock"
 # Seal the forest's owner seed into a companion vault (phrase on stdin, passphrase via env).
 printf '%s' "$CMN" | PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" init --vault "$CVAULT" >/dev/null 2>&1 \
   && ok "companion sealed the owner seed" || fail "companion init"
+# init validates the phrase — garbage is refused and nothing is written.
+IRC=0
+printf 'these are not valid recovery words at all' \
+  | PVFS_COMPANION_PASSPHRASE=x "$COMPANION" init --vault "$DATA/bad.vault" >/dev/null 2>&1 || IRC=$?
+[ "$IRC" -eq 1 ] && [ ! -e "$DATA/bad.vault" ] \
+  && ok "init refuses an invalid phrase (nothing written)" || fail "invalid phrase rc=$IRC"
+# init refuses to clobber an existing vault.
+ERC=0
+printf '%s' "$CMN" | PVFS_COMPANION_PASSPHRASE=x "$COMPANION" init --vault "$CVAULT" >/dev/null 2>&1 || ERC=$?
+[ "$ERC" -eq 1 ] && ok "init refuses to overwrite an existing vault" || fail "vault overwrite rc=$ERC"
 # Run the companion headless, root signing explicitly enabled.
 PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" serve --vault "$CVAULT" --socket "$CSOCK" --allow-root >/dev/null 2>&1 &
 CPID=$!
@@ -438,8 +448,14 @@ assert_rc 3 "companion revoke of unknown key is NotFound" -- \
 assert_rc 2 "companion auto-detect fails cleanly when nothing is running" -- \
   env -u PVFS_COMPANION_SOCKET XDG_RUNTIME_DIR="$DATA/empty-runtime" \
   $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --pubkey "$CMEMBER"
+# status: flagless via env defaults — reports the sealing and the live agent.
+PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status > "$DATA/status.txt" 2>&1 || true
+grep -q "passphrase-sealed" "$DATA/status.txt" && ok "status reports the vault sealing" || fail "status sealing"
+grep -q "agent : running" "$DATA/status.txt" && ok "status sees the running agent" || fail "status agent up"
 kill -TERM "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
 CPID=""
+PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status 2>/dev/null | grep -q "agent : not running" \
+  && ok "status sees the stopped agent" || fail "status agent down"
 # (The headless root-signing denial without --allow-root is covered by the
 #  pvfs-companion unit/integration tests, not the smoke suite.)
 

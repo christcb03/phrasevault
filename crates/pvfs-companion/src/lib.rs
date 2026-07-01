@@ -11,6 +11,7 @@
 mod agent;
 mod client;
 pub mod keychain;
+mod paths;
 mod policy;
 mod proto;
 mod session;
@@ -24,6 +25,7 @@ pub use client::request;
 #[cfg(feature = "os-keychain")]
 pub use keychain::OsKeychain;
 pub use keychain::{MemoryStore, SecretStore};
+pub use paths::{default_socket_path, default_vault_path};
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{AgentRequest, AgentResponse};
 pub use session::{DeviceTrust, SessionError, Sessions};

@@ -229,6 +229,73 @@ default — with `PVFS_SOCKET_DIR` unset — both the daemon and clients fall ba
 
 ---
 
+## Option D — The companion: sign without ever typing your phrase again
+
+The companion (`pvfs-companion`) keeps your recovery phrase sealed on disk and
+signs high-authority operations for you — admitting or revoking devices and
+members, and your cross-machine identity (doc 14). Set it up once; no flags
+needed for normal use.
+
+### 1. Seal your phrase (one time)
+
+```bash
+pvfs-companion init
+```
+
+It prompts for your recovery phrase (the words shown once at `forest init`) and
+checks them — a typo is caught here, not later. Then it picks the safest place
+for the vault key available on your machine:
+
+- **Desktop (macOS/Linux/Windows):** the key goes into the **OS keychain** — no
+  passphrase to remember; your login session unlocks it.
+- **Headless server / no keychain:** it says so and asks you to **choose a vault
+  passphrase** instead (typed twice, never shown).
+
+The vault lands at `~/.config/pvfs/companion.vault`. Your phrase is still the
+real recovery — the vault is a convenience layer, not a new thing to back up.
+
+### 2. Run the agent
+
+```bash
+pvfs-companion serve
+```
+
+You'll see `serving on …/pvfs-companion.sock`. Keychain vaults unlock silently;
+passphrase vaults prompt once. Leave it running (a user systemd unit works the
+same way as `pvfsd@` — see Option C).
+
+### 3. Use it (no phrase, no flags)
+
+```bash
+pvfs device authorize-identity      # your one identity across machines
+pvfs device authorize-member --via-companion --pubkey <hex>
+pvfs device revoke --via-companion --pubkey <hex>
+pvfs tag add <member> <tag> --via-companion
+```
+
+The `pvfs` CLI finds the running companion automatically.
+
+### 4. Check on it
+
+```bash
+pvfs-companion status
+```
+
+Shows where the vault is and how it's sealed, whether the agent is running, and
+warns if a keychain-sealed vault's key has gone missing.
+
+### If something goes wrong
+
+| Problem | What it looks like | Recovery |
+|---------|--------------------|----------|
+| Typo'd phrase at `init` | `that is not a valid recovery phrase` | Re-run `init`; nothing was written. |
+| Forgot the vault passphrase | `unlock failed: wrong passphrase or corrupt vault` | Delete the vault file, re-run `init` with your written-down phrase. |
+| Keychain entry deleted / OS reinstalled | `status` warns the key is not retrievable | Delete the vault file, re-run `init` with your phrase. |
+| `no companion running at …` | Any `--via-companion` command | Start it: `pvfs-companion serve`. |
+| Machine died entirely | — | On the new machine: `pvfs recover --mnemonic "<phrase>"`, then `pvfs-companion init` with the same phrase. Your identity key derives identically, so memberships and tags carry over. |
+
+---
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -236,6 +303,9 @@ default — with `PVFS_SOCKET_DIR` unset — both the daemon and clients fall ba
 | `PVFS_DATA_DIR` | Path to the forest data directory (`log.db`, `index.db`, device key). **Required** for the low-level `init`/`recover` flow; interactive use prefers `--forest` or running inside a mount. |
 | `PVFS_SOCKET_DIR` | Directory holding daemon sockets (`<forest_id>.sock`). The daemon binds here and clients look here; both default to `/tmp/pvfs`. Set the **same** value on both sides (e.g. `/run/pvfs`). |
 | `PVFS_REGISTRY_DIR` | Override the host forest registry (default `/etc/pvfs`, which needs `sudo` to write). A user-writable path gives a rootless registry. |
+| `PVFS_COMPANION_VAULT` | Companion vault file (default `~/.config/pvfs/companion.vault`). For scripts; interactive use never needs it. |
+| `PVFS_COMPANION_SOCKET` | Companion signer socket (default `$XDG_RUNTIME_DIR/pvfs-companion.sock`). Both `pvfs-companion serve` and the `pvfs` CLI honor it. |
+| `PVFS_COMPANION_PASSPHRASE` | Vault passphrase for **non-interactive** use (pipelines, systemd). Interactive use prompts instead. |
 | `PVFS_BIN` | Used only by `smoke-test.sh` — path to the `pvfs` binary to test. |
 
 ---
