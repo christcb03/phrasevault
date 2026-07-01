@@ -10,6 +10,7 @@
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,4 +196,12 @@ fn serve_connection(agent: &TenantAgent, mut stream: UnixStream) -> io::Result<(
 
 fn parse_digest(hexs: &str) -> Option<[u8; 32]> {
     hex::decode(hexs).ok()?.try_into().ok()
+}
+
+/// Client: send one request to a multi-tenant custody agent and read its reply.
+pub fn tenant_request(socket: &Path, req: &TenantRequest) -> io::Result<TenantResponse> {
+    let mut stream = UnixStream::connect(socket)?;
+    write_msg(&mut stream, req)?;
+    read_msg::<_, TenantResponse>(&mut stream)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "companion closed the connection"))
 }

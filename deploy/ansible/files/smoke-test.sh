@@ -19,11 +19,13 @@ FAIL=0
 DPID=""
 U2PID=""
 CPID=""
+TPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
   [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null
   [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
+  [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -412,6 +414,31 @@ kill -TERM "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
 CPID=""
 # (The headless root-signing denial without --allow-root is covered by the
 #  pvfs-companion unit/integration tests, not the smoke suite.)
+
+say "companion: multi-tenant custody server (doc 14 §13)"
+TSTORE="$DATA/tenant-store"
+TSOCK="$DATA/tenant.sock"
+# Provision two app-users, each with their own seed + password.
+AMN="$(jget "$($PVFS --json forest init --mount "$DATA/tf-alice")" mnemonic)"
+BMN="$(jget "$($PVFS --json forest init --mount "$DATA/tf-bob")" mnemonic)"
+printf '%s' "$AMN" | PVFS_COMPANION_PASSPHRASE=alicepw "$COMPANION" tenant-init --store "$TSTORE" --user alice >/dev/null 2>&1 && ok "provisioned tenant alice"
+printf '%s' "$BMN" | PVFS_COMPANION_PASSPHRASE=bobpw "$COMPANION" tenant-init --store "$TSTORE" --user bob >/dev/null 2>&1 && ok "provisioned tenant bob"
+"$COMPANION" serve-tenant --store "$TSTORE" --socket "$TSOCK" >/dev/null 2>&1 &
+TPID=$!
+for _ in $(seq 1 50); do [ -S "$TSOCK" ] && break; sleep 0.1; done
+[ -S "$TSOCK" ] && ok "tenant custody serving" || fail "tenant socket missing"
+# alice's identity key over the socket: valid, deterministic, and distinct from bob's.
+APUB="$(PVFS_COMPANION_PASSPHRASE=alicepw "$COMPANION" tenant-pubkey --socket "$TSOCK" --user alice --role identity)"
+[ "${#APUB}" -eq 66 ] && ok "tenant get-pubkey returns a compressed key" || fail "tenant pubkey len ${#APUB}"
+APUB2="$(PVFS_COMPANION_PASSPHRASE=alicepw "$COMPANION" tenant-pubkey --socket "$TSOCK" --user alice --role identity)"
+[ "$APUB" = "$APUB2" ] && ok "tenant pubkey is deterministic" || fail "tenant pubkey not deterministic"
+BPUB="$(PVFS_COMPANION_PASSPHRASE=bobpw "$COMPANION" tenant-pubkey --socket "$TSOCK" --user bob --role identity)"
+[ -n "$BPUB" ] && [ "$APUB" != "$BPUB" ] && ok "tenant users have distinct keys (isolation)" || fail "tenant users not isolated"
+# Wrong password is refused.
+assert_rc 1 "tenant wrong password rejected" -- \
+  env PVFS_COMPANION_PASSPHRASE=wrong "$COMPANION" tenant-pubkey --socket "$TSOCK" --user alice --role identity
+kill "$TPID" 2>/dev/null || true; wait "$TPID" 2>/dev/null || true
+TPID=""
 
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
