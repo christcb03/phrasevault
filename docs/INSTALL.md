@@ -284,6 +284,23 @@ pvfs-companion status
 Shows where the vault is and how it's sealed, whether the agent is running, and
 warns if a keychain-sealed vault's key has gone missing.
 
+### 5. Approvals, locking, and the audit trail
+
+When something high-authority is requested (admitting or revoking a device),
+the companion **asks you first** — a dialog on desktops, a yes/no question in
+the `serve` terminal otherwise. Headless servers say no unless `serve` was
+started with `--allow-root` (an explicit automation opt-in).
+
+```bash
+pvfs-companion lock
+```
+
+drops your seed from the agent's memory right now; it also happens on its own
+after 15 idle minutes. The next operation re-unlocks it — silently from the OS
+keychain, or by prompting for the passphrase. Every signature and lock is
+recorded in `companion.audit.jsonl` next to the vault, so you can always see
+what was signed, when, and from where.
+
 ### If something goes wrong
 
 | Problem | What it looks like | Recovery |

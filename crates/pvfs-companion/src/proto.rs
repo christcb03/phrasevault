@@ -23,6 +23,9 @@ pub enum AgentRequest {
         #[serde(default)]
         origin: Option<String>,
     },
+    /// Drop the seed from memory (doc 14 §4 lock). The agent keeps serving; a
+    /// later request re-unlocks through the configured unlocker, or is refused.
+    Lock,
 }
 
 /// The agent's reply.
@@ -31,6 +34,7 @@ pub enum AgentRequest {
 pub enum AgentResponse {
     Pubkey { pubkey: String },
     Signature { sig: String },
+    Ok,
     Error { code: String, message: String },
 }
 

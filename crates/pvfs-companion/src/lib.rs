@@ -9,6 +9,8 @@
 //! (doc 14 §9) add the approval UI and the loopback identity agent.
 
 mod agent;
+pub mod approve;
+mod audit;
 mod client;
 pub mod keychain;
 mod paths;
@@ -20,7 +22,9 @@ mod store;
 mod tenant;
 mod vault;
 
-pub use agent::{serve, Agent};
+pub use agent::{serve, Agent, Unlocker};
+pub use approve::{auto_prompter, auto_prompter_labeled, DenyPrompter, Prompter};
+pub use audit::{AuditEntry, AuditLog};
 pub use client::request;
 #[cfg(feature = "os-keychain")]
 pub use keychain::OsKeychain;

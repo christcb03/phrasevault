@@ -448,6 +448,16 @@ assert_rc 3 "companion revoke of unknown key is NotFound" -- \
 assert_rc 2 "companion auto-detect fails cleanly when nothing is running" -- \
   env -u PVFS_COMPANION_SOCKET XDG_RUNTIME_DIR="$DATA/empty-runtime" \
   $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --pubkey "$CMEMBER"
+# lock: the seed drops; the next request re-unlocks from the serve env (doc 14 §4).
+"$COMPANION" lock --socket "$CSOCK" >/dev/null 2>&1 && ok "companion lock accepted" || fail "companion lock"
+assert_rc 4 "agent re-unlocks on demand after lock" -- \
+  $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-identity --companion-socket "$CSOCK"
+# audit log (next to the vault): signatures, the lock, and the re-unlock.
+CAUDIT="$DATA/companion.audit.jsonl"
+[ -s "$CAUDIT" ] && ok "audit log exists" || fail "audit log missing"
+grep -q '"decision":"approved"' "$CAUDIT" && ok "audit recorded approved signatures" || fail "audit signs"
+grep -q '"event":"lock"' "$CAUDIT" && ok "audit recorded the lock" || fail "audit lock"
+grep -q '"event":"unlock"' "$CAUDIT" && ok "audit recorded the re-unlock" || fail "audit unlock"
 # status: flagless via env defaults — reports the sealing and the live agent.
 PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status > "$DATA/status.txt" 2>&1 || true
 grep -q "passphrase-sealed" "$DATA/status.txt" && ok "status reports the vault sealing" || fail "status sealing"

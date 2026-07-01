@@ -56,6 +56,20 @@ enum Cmd {
         socket: Option<PathBuf>,
         #[arg(long)]
         allow_root: bool,
+        /// Drop the seed after this many idle seconds; it re-unlocks on demand
+        /// (keychain/env silently, terminal by prompt). 0 disables.
+        #[arg(long, default_value_t = 900)]
+        idle_lock_secs: u64,
+        /// Max signatures per minute (doc 14 §4 rate limit). 0 disables.
+        #[arg(long, default_value_t = 60)]
+        rate_limit: u32,
+    },
+    /// Lock a running agent now: the seed is dropped from memory. The next
+    /// request re-unlocks it (keychain/env/prompt) — or is refused if it can't.
+    Lock {
+        /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
     /// Show the vault and agent state: where the vault is and how it's sealed,
     /// whether the signing agent is running, and whether a keychain-sealed
@@ -172,6 +186,21 @@ fn unlock_passphrase() -> Result<String, String> {
 
 fn default_vault() -> Result<std::path::PathBuf, String> {
     pvfs_companion::default_vault_path()
+}
+
+/// Open + unseal the vault (either sealing) into a signer. Also the body of the
+/// agent's `Unlocker`, so a lock re-unlocks exactly the way `serve` unlocked.
+fn unseal_signer(vault: &std::path::Path) -> Result<UnlockedSigner, String> {
+    let v = Vault::open(vault).map_err(|e| e.to_string())?;
+    let secret = match v.sealing() {
+        pvfs_companion::Sealing::Keychain => keychain_unseal(&v)?,
+        pvfs_companion::Sealing::Passphrase => {
+            let pass = unlock_passphrase()?;
+            v.unseal(pass.as_bytes()).map_err(|e| e.to_string())?
+        }
+    };
+    UnlockedSigner::from_phrase(std::str::from_utf8(&secret).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
 }
 
 /// Seal into / unseal from the OS keychain — compiled out without `os-keychain`,
@@ -291,6 +320,8 @@ fn run() -> Result<(), String> {
             vault,
             socket,
             allow_root,
+            idle_lock_secs,
+            rate_limit,
         } => {
             let vault = match vault {
                 Some(p) => p,
@@ -303,23 +334,34 @@ fn run() -> Result<(), String> {
                 ));
             }
             let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
-            let v = Vault::open(&vault).map_err(|e| e.to_string())?;
-            let secret = match v.sealing() {
-                pvfs_companion::Sealing::Keychain => keychain_unseal(&v)?,
-                pvfs_companion::Sealing::Passphrase => {
-                    let pass = unlock_passphrase()?;
-                    v.unseal(pass.as_bytes()).map_err(|e| e.to_string())?
-                }
-            };
-            let signer = UnlockedSigner::from_phrase(
-                std::str::from_utf8(&secret).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            let signer = unseal_signer(&vault)?;
             let policy = ApprovalPolicy {
                 auto_root: allow_root,
                 ..Default::default()
             };
-            let agent = Arc::new(Agent::new(signer, policy));
+
+            // Phase 5 controls (doc 14 §4, §9): prompts, audit, rate limit, and
+            // lock with on-demand re-unlock (the unlocker retains no secrets —
+            // it re-opens the vault and unseals the same way serve just did).
+            let (prompter, prompt_label) = pvfs_companion::auto_prompter_labeled();
+            let audit_path = vault.with_extension("audit.jsonl");
+            let audit =
+                pvfs_companion::AuditLog::open(&audit_path).map_err(|e| e.to_string())?;
+            let unlock_vault = vault.clone();
+            let unlocker: pvfs_companion::Unlocker =
+                Box::new(move || unseal_signer(&unlock_vault));
+            let idle = match idle_lock_secs {
+                0 => None,
+                n => Some(Duration::from_secs(n)),
+            };
+            let agent = Arc::new(
+                Agent::new(signer, policy)
+                    .with_prompter(prompter)
+                    .with_audit(audit)
+                    .with_unlocker(unlocker)
+                    .with_idle_timeout(idle)
+                    .with_rate_limit(rate_limit),
+            );
 
             let _ = std::fs::remove_file(&socket); // clear a stale socket
             let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
@@ -327,8 +369,31 @@ fn run() -> Result<(), String> {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
             eprintln!("pvfs-companion: serving on {}", socket.display());
+            eprintln!(
+                "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
+                match idle_lock_secs {
+                    0 => "off".to_string(),
+                    n => format!("{n}s"),
+                },
+                audit_path.display()
+            );
             serve(listener, agent).map_err(|e| e.to_string())?;
             Ok(())
+        }
+        Cmd::Lock { socket } => {
+            let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
+            let resp = pvfs_companion::request(&socket, &pvfs_companion::AgentRequest::Lock)
+                .map_err(|e| format!("no companion at {} ({e})", socket.display()))?;
+            match resp {
+                pvfs_companion::AgentResponse::Ok => {
+                    eprintln!("pvfs-companion: locked (the seed is out of memory)");
+                    Ok(())
+                }
+                pvfs_companion::AgentResponse::Error { code, message } => {
+                    Err(format!("{code}: {message}"))
+                }
+                _ => Err("unexpected response".into()),
+            }
         }
         Cmd::Status { vault, socket } => {
             let vault_path = match vault {
