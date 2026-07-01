@@ -29,12 +29,19 @@ Stages (also usable as `--tags`):
 | `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure** |
 | `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts |
 | `install` | copy the release binary to `/usr/local/bin/pvfs` |
-| `report` | fetch `pvfs-test-results.txt` / `pvfs-smoke-results.txt` into `./artifacts/<host>/` |
+| `daemon` | run `pvfsd` as a **systemd user service** (INSTALL.md Option C, automated): installs `pvfs`/`pvfsd`/`pvfs-companion` to `~/.local/bin`, the `pvfsd@` user unit + `/run/pvfs` tmpfiles snippet, inits a test forest at `~/pvfs-mounts/smoke`, then proves the lifecycle — enable → client answers over `/run/pvfs` → clean stop (socket removed) → restart. **Leaves the service enabled + running** as a standing daemon testbed |
+| `report` | fetch `pvfs-test-results.txt` / `pvfs-smoke-results.txt` / `pvfsd-journal.txt` into `./artifacts/<host>/` |
 
 Re-run just the checks after a code change:
 
 ```sh
 ansible-playbook -i inventory.ini pipeline.yml --tags deploy,build,test,smoke,report
+```
+
+Re-test just the daemon service (redeploys the unit + binaries from the last build):
+
+```sh
+ansible-playbook -i inventory.ini pipeline.yml --tags daemon,report
 ```
 
 ## Notes
@@ -44,3 +51,9 @@ ansible-playbook -i inventory.ini pipeline.yml --tags deploy,build,test,smoke,re
 - The pipeline is idempotent: rustup is only installed if missing, rsync only
   ships changes, and install always reflects the binary that passed the tests
   in this run (tests run before install).
+- The `daemon` stage's test forest (`~/pvfs-mounts/smoke`) is disposable — its
+  recovery phrase is printed into the ansible log on first init, so never point
+  the stage at a real forest. Delete the directory to get a fresh one.
+- After the run, poke the daemon from the host with
+  `PVFS_SOCKET_DIR=/run/pvfs pvfs remote --forest ~/pvfs-mounts/smoke info`
+  or watch it with `journalctl --user -fu pvfsd@smoke`.

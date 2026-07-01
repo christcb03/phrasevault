@@ -1,7 +1,7 @@
 ---
 # PVFS build/test/deploy pipeline.
 #
-# Stages (tags): prepare → deploy → build → test → smoke → install → report
+# Stages (tags): prepare → deploy → build → test → smoke → install → daemon → report
 #
 #   ansible-playbook -i inventory.ini pipeline.yml
 #   ansible-playbook -i inventory.ini pipeline.yml --tags test,smoke   # re-run checks only
@@ -16,9 +16,17 @@
   vars:
     pvfs_src: /opt/pvfs/src
     pvfs_bin: /usr/local/bin/pvfs
+    pvfs_user_bin: "{{ ansible_env.HOME }}/.local/bin"
+    # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
+    daemon_forest: smoke
+    daemon_mount: "{{ ansible_env.HOME }}/pvfs-mounts/{{ daemon_forest }}"
     cargo_env:
       PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
       CARGO_TERM_COLOR: never
+    # systemctl --user over ssh needs the user manager's runtime dir + bus.
+    user_systemd_env:
+      XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts.user_uid }}/bus"
 
   tasks:
     # ---- prepare ------------------------------------------------------------
@@ -128,14 +136,152 @@
       changed_when: false
       tags: [install]
 
+    # ---- daemon (pvfsd as a systemd user service — INSTALL.md Option C, automated) ----
+    # Proves the *service* lifecycle on the target, not just the ad-hoc daemon the
+    # smoke suite spawns: install → enable → socket up in /run/pvfs → answers a
+    # client → clean stop (socket removed, doc 08 §4 item 4) → restart. The test
+    # forest lives in ~/pvfs-mounts/<name>; the service is left enabled + running
+    # so the host doubles as a standing daemon testbed.
+    - name: Ensure user bin / unit / mount directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ pvfs_user_bin }}"
+        - "{{ ansible_env.HOME }}/.config/systemd/user"
+        - "{{ daemon_mount }}"
+      tags: [daemon]
+
+    - name: Install user binaries (the unit runs %h/.local/bin/pvfsd)
+      ansible.builtin.copy:
+        src: "{{ pvfs_src }}/target/release/{{ item }}"
+        dest: "{{ pvfs_user_bin }}/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop: [pvfs, pvfsd, pvfs-companion]
+      tags: [daemon]
+
+    - name: Install the shared socket-dir tmpfiles snippet (doc 06 §2)
+      become: true
+      ansible.builtin.copy:
+        src: files/pvfs-tmpfiles.conf
+        dest: /etc/tmpfiles.d/pvfs.conf
+        mode: "0644"
+      tags: [daemon]
+
+    - name: Create /run/pvfs (1777) from the snippet
+      become: true
+      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pvfs.conf
+      changed_when: false
+      tags: [daemon]
+
+    - name: Enable lingering so the user manager (and pvfsd) survives logout
+      become: true
+      ansible.builtin.command: loginctl enable-linger {{ ansible_user_id }}
+      args:
+        creates: "/var/lib/systemd/linger/{{ ansible_user_id }}"
+      tags: [daemon]
+
+    - name: Install the pvfsd@ user unit
+      ansible.builtin.copy:
+        src: files/pvfsd@.service
+        dest: "{{ ansible_env.HOME }}/.config/systemd/user/pvfsd@.service"
+        mode: "0644"
+      tags: [daemon]
+
+    - name: Reload the user systemd manager
+      ansible.builtin.systemd:
+        scope: user
+        daemon_reload: true
+      environment: "{{ user_systemd_env }}"
+      tags: [daemon]
+
+    # A disposable test forest — its recovery phrase lands in the ansible log,
+    # which is fine here; never init a real forest this way.
+    - name: Initialize the daemon test forest (first run only)
+      ansible.builtin.command:
+        cmd: "{{ pvfs_user_bin }}/pvfs forest init --mount {{ daemon_mount }}"
+        creates: "{{ daemon_mount }}/.pvfs"
+      tags: [daemon]
+
+    - name: Enable and (re)start pvfsd@{{ daemon_forest }}
+      ansible.builtin.systemd:
+        scope: user
+        name: "pvfsd@{{ daemon_forest }}"
+        enabled: true
+        state: restarted
+      environment: "{{ user_systemd_env }}"
+      tags: [daemon]
+
+    - name: Daemon answers a client over the shared socket dir
+      ansible.builtin.command:
+        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+      environment:
+        PVFS_SOCKET_DIR: /run/pvfs
+      register: daemon_info
+      until: daemon_info.rc == 0
+      retries: 10
+      delay: 1
+      changed_when: false
+      tags: [daemon]
+
+    - name: Stop the service (graceful shutdown checkpoints + removes the socket)
+      ansible.builtin.systemd:
+        scope: user
+        name: "pvfsd@{{ daemon_forest }}"
+        state: stopped
+      environment: "{{ user_systemd_env }}"
+      tags: [daemon]
+
+    - name: Client cannot reach a stopped daemon (socket gone)
+      ansible.builtin.command:
+        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+      environment:
+        PVFS_SOCKET_DIR: /run/pvfs
+      register: daemon_down
+      failed_when: daemon_down.rc == 0
+      changed_when: false
+      tags: [daemon]
+
+    - name: Start the daemon again and leave it running
+      ansible.builtin.systemd:
+        scope: user
+        name: "pvfsd@{{ daemon_forest }}"
+        state: started
+      environment: "{{ user_systemd_env }}"
+      tags: [daemon]
+
+    - name: Daemon is back after the restart
+      ansible.builtin.command:
+        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+      environment:
+        PVFS_SOCKET_DIR: /run/pvfs
+      register: daemon_info2
+      until: daemon_info2.rc == 0
+      retries: 10
+      delay: 1
+      changed_when: false
+      tags: [daemon]
+
+    - name: Capture the daemon journal for the report
+      ansible.builtin.shell: |
+        journalctl --user -u pvfsd@{{ daemon_forest }} -n 100 --no-pager \
+          > /tmp/pvfsd-journal.txt 2>&1 || true
+      environment: "{{ user_systemd_env }}"
+      changed_when: false
+      tags: [daemon]
+
     # ---- report ----------------------------------------------------------------------
     - name: Fetch test results to control machine
       ansible.builtin.fetch:
         src: "{{ item }}"
         dest: "{{ playbook_dir }}/artifacts/"
+        fail_on_missing: false
       loop:
         - /tmp/pvfs-test-results.txt
         - /tmp/pvfs-smoke-results.txt
+        - /tmp/pvfsd-journal.txt
       tags: [report]
 
     - name: Pipeline summary
@@ -145,4 +291,5 @@
           - "tests   : {{ test_out.stdout_lines[-1] | default('see artifacts') }}"
           - "smoke   : {{ smoke_out.stdout_lines[-1] | default('see artifacts') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"
+          - "daemon  : {{ daemon_info2.stdout | default('not run') }}"
       tags: [report]
