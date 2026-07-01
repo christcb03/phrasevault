@@ -11,12 +11,16 @@ mod agent;
 mod client;
 mod policy;
 mod proto;
+mod session;
 mod signer;
+mod store;
 mod vault;
 
 pub use agent::{serve, Agent};
 pub use client::request;
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{AgentRequest, AgentResponse};
+pub use session::{DeviceTrust, SessionError, Sessions};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
+pub use store::{StoreError, VaultStore};
 pub use vault::{KdfParams, Vault, VaultError};

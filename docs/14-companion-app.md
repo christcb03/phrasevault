@@ -12,6 +12,7 @@ Motivation: give the **root/identity key** a strong home (a hardware-wallet / `s
 - **Key vault: OS keychain with a passphrase fallback** — prefer the platform secret store; fall back to a passphrase-derived key where none exists or the user opts out.
 - **Approval: tiered by request type** (not one global policy) — see §4. The companion only ever signs in response to something the owner did; the prompt exists so *high-authority* and *remotely-originated* requests can't be driven silently by local malware.
 - **Implementation: a Rust single binary** (`pvfs-companion`), a Unix-domain socket for the local signer protocol (same posture as `pvfsd`), and a loopback HTTP listener for the web agent.
+- **Server / multi-tenant custody** (decided 2026-06-29, §13) — the dominant multi-user case is *app-driven*: the companion also runs **server-side as a per-user custody service** the app calls on each user's behalf. Per-user encrypted vaults, app-driven on-demand unlock with a per-device "trusted/public" TTL, root ops always re-authenticate, self-custody as the opt-out.
 
 ---
 
@@ -141,6 +142,7 @@ The PVFS build targets the PVFS subset first; the methods are named/shaped so PV
 2a. ☑ **Signing core + policy** — `UnlockedSigner` (request type → root/identity key → signature; `identity_key` at `3'/<id>'`), the §4 `ApprovalPolicy` (tiered, headless-safe defaults), and the kernel fix so the **root may author a device cert via prepare** (`require_admin_on_root` accepts the root, matching `check_device_cert`). Integration test: the companion root-signs a prepared `DeviceAuthorized` and the engine commits it (phrase-free admit, end to end).
 2b. ☑ **Local signer socket** — `Agent` (signer + policy) served over an `AF_UNIX` listener; length-prefixed JSON protocol (`get_pubkey`, `sign`) reusing `pvfs_proto::{read_msg, write_msg}`; headless (a `Prompt` → deny, no UI yet). Round-trip test: get-pubkey, an approved sign whose signature verifies, and a policy denial.
 3. ◑ **CLI wiring** — ☑ a runnable `pvfs-companion` binary (`init` seals a phrase from stdin; `serve` unlocks via `$PVFS_COMPANION_PASSPHRASE` and serves, `--allow-root` to opt a headless agent into root signing) + a `request` client; ☑ `pvfs device authorize-member --via-companion --companion-socket <p>` root-signs through the companion (no phrase) and commits; smoke admits a member with no phrase typed and proves the cert landed. ☐ Remaining: `device revoke --via-companion` and the human's tag ops (same pattern), and socket auto-detection.
+3.5. **Server / multi-tenant custody core** (§13) — a per-user `VaultStore` (one sealed vault per app-user) and an on-demand **session manager**: unlock a user's key from their app-login secret, cache it for a per-device TTL (trusted) or sign once and drop (public), with **root request types always requiring a fresh unlock**. Library-level + unit tests first; multi-tenant socket/protocol wiring follows. This is the PVOS "sign-as-user" core.
 4. **OS keychain backends** — macOS/Linux/Windows secret-store sealing behind the §5 abstraction; passphrase fallback retained.
 5. **Approval UI** — desktop prompt + terminal fallback; rate limit; signature audit log; idle-timeout lock.
 6. **Identity agent** — loopback HTTP, origin connect/scope/revoke, "Sign in with PVFS" against a `pvfsd` challenge.
@@ -197,3 +199,51 @@ Design this as its own mini-spec (a new doc) before the companion's §9 phase 7.
   the local device key and the identity key are owners with full rights; confirm the CLI's default
   (prefer the local device key for speed; use the identity key only where authority/stability matters —
   tags, other forests, auto-login). Mostly a CLI policy, no kernel impact.
+
+---
+
+## 13. Server / multi-tenant custody (app-driven) — decided 2026-06-29
+
+The dominant multi-user case is **app-driven**: users act through a PVOS app and never log into the
+server. For them the companion also runs **server-side as a per-user custody service** the app calls on
+each user's behalf — the PVOS "sign-as-user" broker (doc 13 Q-E3). This is *additive* to the local
+companion (§1–§6), not a replacement.
+
+### 13.1 Model
+- **Per-user vault store.** Each app-user has their own encrypted vault on the server (the §5 `Vault`,
+  one per user). The app authenticates the user; that login supplies the **unlock secret**; the
+  companion unseals *that user's* key, signs, and re-locks.
+- **Self-custody opt-out.** A user who wants maximum safety keeps their key off the server on their own
+  device, and the app talks to that local companion (§6) instead. Server custody is the convenience;
+  self-custody is the stronger posture — a per-user choice.
+
+### 13.2 Threat model (operator's stance)
+A server-account compromise is **total** — own the account and the whole install is already lost, so
+there is no weaker layer worth defending. Encrypting each key to a secret **not stored on the server**
+is therefore sufficient. The single invariant: **the unlock secret is never persisted at rest** — it is
+supplied live by the operator's passphrase or the user's app login. (So unattended auto-unlock across
+reboots is out of scope: re-supply the secret after a restart.)
+
+### 13.3 Unlock lifetime — a per-device trust setting
+Like a website's "private vs public computer / remember me" at login. Since the key lives server-side,
+the flag governs **how long the server may hold a user's unlocked key for that device's session**:
+- **Trusted device** — a longer session TTL; the unlocked key is cached for the session, so everyday
+  signing is friction-free.
+- **Public device** — near-zero; the key is not cached beyond the immediate operation, each sensitive
+  action re-supplies the secret, and the session expires fast.
+
+**Composition with §4:** device trust governs the *identity* tier's friction only. **Root operations
+(admit/revoke a device) always re-authenticate** regardless of remember-me — changing *who is in the
+forest* always wants a fresh unlock. (On a local companion this re-auth *is* the approval prompt;
+server-side it is a fresh unlock secret.)
+
+### 13.4 Unlock secret (v1)
+Unlock with either the **recovery passphrase** PVFS already generates **or** a **password** the user
+picks at account creation — both feed the existing Argon2id → vault-key path (§5), so no new crypto.
+Passkeys (via the WebAuthn **PRF** extension, keeping the secret off the server) and other methods come
+later.
+
+### 13.5 What's new vs phases 1–3
+The `Vault` primitive is reused unchanged. New: a **per-user `VaultStore`**; an **on-demand unlock +
+session manager** (trusted vs public TTL, root-always-reauth); and a multi-tenant request shape (a
+request names the user and carries the unlock secret or a session token). Build target: §9 phase 3.5.
