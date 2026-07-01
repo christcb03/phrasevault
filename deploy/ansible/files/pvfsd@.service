@@ -2,6 +2,10 @@
 Description=PVFS per-user daemon for forest %i
 Documentation=https://github.com/openclaw/phrasevault
 After=network.target
+# Rate-limit restart storms. These keys belong in [Unit] — in [Service] systemd
+# ignores them with an "Unknown key name" warning (seen in the pipeline journal).
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -18,9 +22,6 @@ KillSignal=SIGTERM
 TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
-# Limit parallel restarts
-StartLimitIntervalSec=60
-StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
