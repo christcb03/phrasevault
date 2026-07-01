@@ -458,6 +458,24 @@ CAUDIT="$DATA/companion.audit.jsonl"
 grep -q '"decision":"approved"' "$CAUDIT" && ok "audit recorded approved signatures" || fail "audit signs"
 grep -q '"event":"lock"' "$CAUDIT" && ok "audit recorded the lock" || fail "audit lock"
 grep -q '"event":"unlock"' "$CAUDIT" && ok "audit recorded the re-unlock" || fail "audit unlock"
+# identity agent (doc 14 §6): port file + token gate + headless connect denial.
+CPORTF="${CSOCK%.sock}.http"
+[ -f "$CPORTF" ] && ok "identity agent port file exists" || fail "port file missing"
+WADDR="$(jget "$(cat "$CPORTF")" addr)"
+WTOK="$(jget "$(cat "$CPORTF")" token)"
+WPORT="${WADDR##*:}"
+http_status() { # http_status <method> <path> <token> — prints the status line
+  exec 3<>"/dev/tcp/127.0.0.1/$WPORT" || return 1
+  printf '%s %s HTTP/1.1\r\nHost: l\r\nOrigin: https://app.example\r\nX-PVFS-Token: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' \
+    "$1" "$2" "$3" >&3
+  head -n1 <&3
+  exec 3<&-
+}
+http_status POST /connect badtoken | grep -q " 401 " && ok "web: bad token refused" || fail "web 401"
+http_status POST /connect "$WTOK" | grep -q " 403 " && ok "web: headless connect denied" || fail "web connect gate"
+http_status GET /identity "$WTOK" | grep -q " 403 " && ok "web: unconnected origin blocked" || fail "web identity gate"
+"$COMPANION" origins --vault "$CVAULT" | grep -q "no connected origins" && ok "origins list empty" || fail "origins list"
+
 # status: flagless via env defaults — reports the sealing and the live agent.
 PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status > "$DATA/status.txt" 2>&1 || true
 grep -q "passphrase-sealed" "$DATA/status.txt" && ok "status reports the vault sealing" || fail "status sealing"

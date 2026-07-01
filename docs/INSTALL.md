@@ -301,6 +301,18 @@ keychain, or by prompting for the passphrase. Every signature and lock is
 recorded in `companion.audit.jsonl` next to the vault, so you can always see
 what was signed, when, and from where.
 
+### 6. "Sign in with PVFS" (web apps)
+
+While `serve` runs, PVFS-backed web apps can sign you in with no password: the
+first time an app asks, the companion shows a connect prompt naming the site —
+approve it once and sign-ins are automatic for 30 days. Only sign-in signatures
+are ever available to websites; nothing a site does can admit or revoke devices.
+
+```bash
+pvfs-companion origins                     # who's connected, and until when
+pvfs-companion origins revoke <origin>     # disconnect one immediately
+```
+
 ### If something goes wrong
 
 | Problem | What it looks like | Recovery |

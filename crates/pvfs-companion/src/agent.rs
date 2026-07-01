@@ -89,12 +89,16 @@ impl Agent {
     }
 
     fn audit_sign(&self, rt: &str, origin: Origin, decision: &str, digest: &str) {
+        let o = match origin {
+            Origin::Local => "local",
+            Origin::Web => "web",
+        };
+        self.audit_sign_str(rt, o, decision, digest);
+    }
+
+    fn audit_sign_str(&self, rt: &str, origin: &str, decision: &str, digest: &str) {
         if let Some(a) = &self.audit {
-            let o = match origin {
-                Origin::Local => "local",
-                Origin::Web => "web",
-            };
-            a.sign(rt, o, decision, digest);
+            a.sign(rt, origin, decision, digest);
         }
     }
 
@@ -157,6 +161,62 @@ impl Agent {
         }
         window.push(Instant::now());
         false
+    }
+
+    /// The wallet-style connect approval (doc 14 §6): ask the human whether
+    /// `origin` may sign in as them. Audited either way.
+    pub fn approve_connect(&self, origin: &str) -> bool {
+        let ok = self.prompter.approve_connect(origin);
+        if let Some(a) = &self.audit {
+            a.record(&crate::audit::AuditEntry {
+                ts_ms: 0,
+                event: "connect",
+                request_type: None,
+                origin: Some(origin),
+                decision: Some(if ok { "approved" } else { "denied" }),
+                digest: None,
+            });
+        }
+        ok
+    }
+
+    /// Sign an identity assertion for a **connected** web origin (doc 14 §6):
+    /// the standing connect grant is the approval, so there is no per-request
+    /// prompt — and no other request type exists on this path, so the web can
+    /// never reach a root event (doc 14 §4). Rate limit and lock still apply.
+    pub fn sign_connected_assertion(&self, origin: &str, digest: &[u8; 32]) -> AgentResponse {
+        let hexd = hex::encode(digest);
+        if self.rate_limited() {
+            self.audit_sign_str("identity_assertion", origin, "rate_limited", &hexd);
+            return AgentResponse::error("rate_limited", "too many signature requests");
+        }
+        match self.with_signer(|s| s.sign(RequestType::IdentityAssertion, digest)) {
+            Ok(Ok(sig)) => {
+                self.audit_sign_str("identity_assertion", origin, "approved", &hexd);
+                AgentResponse::Signature {
+                    sig: hex::encode(sig),
+                }
+            }
+            Ok(Err(e)) => {
+                self.audit_sign_str("identity_assertion", origin, "error", &hexd);
+                AgentResponse::error("sign", e.to_string())
+            }
+            Err(resp) => {
+                self.audit_sign_str("identity_assertion", origin, "locked", &hexd);
+                resp
+            }
+        }
+    }
+
+    /// The identity public key (for a connected origin's `/identity`).
+    pub fn identity_pubkey(&self) -> AgentResponse {
+        match self.with_signer(|s| s.pubkey(KeyRole::Identity)) {
+            Ok(Ok(pk)) => AgentResponse::Pubkey {
+                pubkey: hex::encode(pk),
+            },
+            Ok(Err(e)) => AgentResponse::error("sign", e.to_string()),
+            Err(resp) => resp,
+        }
     }
 
     /// Handle one request, applying the policy, prompter, rate limit, and lock.

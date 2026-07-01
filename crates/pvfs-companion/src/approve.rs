@@ -16,6 +16,12 @@ use crate::signer::RequestType;
 /// Ask the human to approve a signature the policy wouldn't auto-approve.
 pub trait Prompter: Send + Sync {
     fn approve(&self, request: RequestType, origin: Origin) -> bool;
+
+    /// The wallet-style connect (doc 14 §6): "allow `origin` to sign in as
+    /// you?". Default deny — a backend must opt in explicitly.
+    fn approve_connect(&self, _origin: &str) -> bool {
+        false
+    }
 }
 
 /// Headless: every prompt is a denial (never approve what nobody saw).
@@ -25,6 +31,13 @@ impl Prompter for DenyPrompter {
     fn approve(&self, _request: RequestType, _origin: Origin) -> bool {
         false
     }
+}
+
+fn describe_connect(origin: &str) -> String {
+    format!(
+        "pvfs-companion: allow \"{origin}\" to SIGN IN as you (identity assertions \
+         only, revocable with `pvfs-companion origins revoke`)?"
+    )
 }
 
 fn describe(request: RequestType, origin: Origin) -> String {
@@ -63,8 +76,8 @@ impl TerminalPrompter {
     }
 }
 
-impl Prompter for TerminalPrompter {
-    fn approve(&self, request: RequestType, origin: Origin) -> bool {
+impl TerminalPrompter {
+    fn ask(&self, question: &str) -> bool {
         let _one_at_a_time = self.tty.lock().expect("tty prompt poisoned");
         let Ok(mut tty) = std::fs::OpenOptions::new()
             .read(true)
@@ -73,7 +86,7 @@ impl Prompter for TerminalPrompter {
         else {
             return false;
         };
-        if write!(tty, "\n{}\nType yes to approve, anything else denies: ", describe(request, origin))
+        if write!(tty, "\n{question}\nType yes to approve, anything else denies: ")
             .and_then(|_| tty.flush())
             .is_err()
         {
@@ -85,6 +98,15 @@ impl Prompter for TerminalPrompter {
             return false;
         }
         line.trim().eq_ignore_ascii_case("yes")
+    }
+}
+
+impl Prompter for TerminalPrompter {
+    fn approve(&self, request: RequestType, origin: Origin) -> bool {
+        self.ask(&describe(request, origin))
+    }
+    fn approve_connect(&self, origin: &str) -> bool {
+        self.ask(&describe_connect(origin))
     }
 }
 
@@ -109,20 +131,28 @@ impl DesktopPrompter {
 
 impl Prompter for DesktopPrompter {
     fn approve(&self, request: RequestType, origin: Origin) -> bool {
-        let text = describe(request, origin);
+        self.dialog(&describe(request, origin))
+    }
+    fn approve_connect(&self, origin: &str) -> bool {
+        self.dialog(&describe_connect(origin))
+    }
+}
+
+impl DesktopPrompter {
+    fn dialog(&self, text: &str) -> bool {
         let status = if cfg!(target_os = "macos") {
             std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(format!(
                     "display dialog {} buttons {{\"Deny\", \"Approve\"}} \
                      default button \"Deny\" with icon caution",
-                    applescript_quote(&text)
+                    applescript_quote(text)
                 ))
                 .output()
                 .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("Approve"))
         } else {
             std::process::Command::new("zenity")
-                .args(["--question", "--title", "PVFS companion", "--text", &text])
+                .args(["--question", "--title", "PVFS companion", "--text", text])
                 .status()
                 .map(|s| s.success())
         };

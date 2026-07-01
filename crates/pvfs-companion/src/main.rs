@@ -71,6 +71,14 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// List the web origins connected for "Sign in with PVFS" — or revoke one.
+    Origins {
+        #[command(subcommand)]
+        cmd: Option<OriginsCmd>,
+        /// Vault file (grants live next to it; default: the usual vault path)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
     /// Show the vault and agent state: where the vault is and how it's sealed,
     /// whether the signing agent is running, and whether a keychain-sealed
     /// vault's data key is still present (an orphaned vault needs re-init).
@@ -110,6 +118,12 @@ enum Cmd {
         #[arg(long, default_value = "identity")]
         role: String,
     },
+}
+
+#[derive(Subcommand)]
+enum OriginsCmd {
+    /// Disconnect an origin — takes effect immediately, even while serving.
+    Revoke { origin: String },
 }
 
 fn main() -> std::process::ExitCode {
@@ -186,6 +200,22 @@ fn unlock_passphrase() -> Result<String, String> {
 
 fn default_vault() -> Result<std::path::PathBuf, String> {
     pvfs_companion::default_vault_path()
+}
+
+/// "expires in 29d" / "in 5h" / "in 12m" for the origins listing.
+fn fmt_expiry(expires_at_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let left = expires_at_ms.saturating_sub(now) / 1000;
+    if left >= 86_400 {
+        format!("in {}d", left / 86_400)
+    } else if left >= 3_600 {
+        format!("in {}h", left / 3_600)
+    } else {
+        format!("in {}m", left / 60)
+    }
 }
 
 /// Open + unseal the vault (either sealing) into a signer. Also the body of the
@@ -368,6 +398,22 @@ fn run() -> Result<(), String> {
             // Owner-only: the socket mode is the authentication (doc 14 §3).
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
+
+            // The loopback identity agent (doc 14 §6): ephemeral 127.0.0.1 port,
+            // per-launch token in a 0600 port file next to the socket.
+            let origins =
+                pvfs_companion::OriginRegistry::at(&vault.with_extension("origins.json"));
+            let web = Arc::new(pvfs_companion::WebAgent::new(Arc::clone(&agent), origins));
+            let http = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+            let addr = http.local_addr().map_err(|e| e.to_string())?.to_string();
+            let port_file = socket.with_extension("http");
+            web.write_port_file(&port_file, &addr)
+                .map_err(|e| e.to_string())?;
+            {
+                let w = Arc::clone(&web);
+                std::thread::spawn(move || w.serve(http));
+            }
+
             eprintln!("pvfs-companion: serving on {}", socket.display());
             eprintln!(
                 "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
@@ -376,6 +422,10 @@ fn run() -> Result<(), String> {
                     n => format!("{n}s"),
                 },
                 audit_path.display()
+            );
+            eprintln!(
+                "pvfs-companion: identity agent on http://{addr} (port file {})",
+                port_file.display()
             );
             serve(listener, agent).map_err(|e| e.to_string())?;
             Ok(())
@@ -434,6 +484,15 @@ fn run() -> Result<(), String> {
             ) {
                 Ok(pvfs_companion::AgentResponse::Pubkey { pubkey }) => {
                     println!("agent : running on {} (identity {pubkey})", socket.display());
+                    let port_file = socket.with_extension("http");
+                    if let Ok(s) = std::fs::read_to_string(&port_file) {
+                        let addr = s
+                            .split("\"addr\":\"")
+                            .nth(1)
+                            .and_then(|r| r.split('"').next())
+                            .unwrap_or("?");
+                        println!("web   : identity agent on http://{addr}");
+                    }
                 }
                 Ok(_) => println!(
                     "agent : running on {} (unexpected reply)",
@@ -444,7 +503,38 @@ fn run() -> Result<(), String> {
                     socket.display()
                 ),
             }
+            let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
+            let n = reg.list().len();
+            println!("origins: {n} connected for sign-in");
             Ok(())
+        }
+        Cmd::Origins { cmd, vault } => {
+            let vault_path = match vault {
+                Some(p) => p,
+                None => default_vault()?,
+            };
+            let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
+            match cmd {
+                None => {
+                    let grants = reg.list();
+                    if grants.is_empty() {
+                        println!("(no connected origins)");
+                    } else {
+                        for g in grants {
+                            println!("{}  expires {}", g.origin, fmt_expiry(g.expires_at_ms()));
+                        }
+                    }
+                    Ok(())
+                }
+                Some(OriginsCmd::Revoke { origin }) => {
+                    if reg.revoke(&origin)? {
+                        eprintln!("pvfs-companion: revoked {origin}");
+                        Ok(())
+                    } else {
+                        Err(format!("{origin} was not connected"))
+                    }
+                }
+            }
         }
         Cmd::TenantInit { store, user } => {
             let pass = passphrase()?;
