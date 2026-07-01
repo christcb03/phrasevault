@@ -45,6 +45,27 @@ impl RequestType {
             RequestType::IdentityTag | RequestType::IdentityAssertion => KeyRole::Identity,
         }
     }
+
+    /// Parse the wire string used in the socket protocols.
+    pub fn parse(s: &str) -> Option<RequestType> {
+        match s {
+            "root_device_cert" => Some(RequestType::RootDeviceCert),
+            "identity_tag" => Some(RequestType::IdentityTag),
+            "identity_assertion" => Some(RequestType::IdentityAssertion),
+            _ => None,
+        }
+    }
+}
+
+impl KeyRole {
+    /// Parse the wire string (`"root"` / `"identity"`).
+    pub fn parse(s: &str) -> Option<KeyRole> {
+        match s {
+            "root" => Some(KeyRole::Root),
+            "identity" => Some(KeyRole::Identity),
+            _ => None,
+        }
+    }
 }
 
 /// An unlocked signer: the seed is in memory (use only while the companion is

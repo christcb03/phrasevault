@@ -14,6 +14,7 @@ mod proto;
 mod session;
 mod signer;
 mod store;
+mod tenant;
 mod vault;
 
 pub use agent::{serve, Agent};
@@ -23,4 +24,5 @@ pub use proto::{AgentRequest, AgentResponse};
 pub use session::{DeviceTrust, SessionError, Sessions};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
 pub use store::{StoreError, VaultStore};
+pub use tenant::{serve_tenant, TenantAgent, TenantRequest, TenantResponse};
 pub use vault::{KdfParams, Vault, VaultError};

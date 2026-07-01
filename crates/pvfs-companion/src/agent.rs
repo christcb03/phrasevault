@@ -27,7 +27,7 @@ impl Agent {
     pub fn handle(&self, req: AgentRequest) -> AgentResponse {
         match req {
             AgentRequest::GetPubkey { role } => {
-                let Some(role) = parse_role(&role) else {
+                let Some(role) = KeyRole::parse(&role) else {
                     return AgentResponse::error("bad_input", "unknown role");
                 };
                 match self.signer.pubkey(role) {
@@ -42,7 +42,7 @@ impl Agent {
                 digest,
                 origin,
             } => {
-                let Some(rt) = parse_request_type(&request_type) else {
+                let Some(rt) = RequestType::parse(&request_type) else {
                     return AgentResponse::error("bad_input", "unknown request_type");
                 };
                 let origin = parse_origin(origin.as_deref());
@@ -87,23 +87,6 @@ fn serve_connection(agent: &Agent, mut stream: UnixStream) -> io::Result<()> {
         write_msg(&mut stream, &resp)?;
     }
     Ok(())
-}
-
-fn parse_role(s: &str) -> Option<KeyRole> {
-    match s {
-        "root" => Some(KeyRole::Root),
-        "identity" => Some(KeyRole::Identity),
-        _ => None,
-    }
-}
-
-fn parse_request_type(s: &str) -> Option<RequestType> {
-    match s {
-        "root_device_cert" => Some(RequestType::RootDeviceCert),
-        "identity_tag" => Some(RequestType::IdentityTag),
-        "identity_assertion" => Some(RequestType::IdentityAssertion),
-        _ => None,
-    }
 }
 
 fn parse_origin(s: Option<&str>) -> Origin {

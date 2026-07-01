@@ -67,6 +67,17 @@ impl Sessions {
         &self.store
     }
 
+    /// Unlock `user_id`, return the public key for `role`, drop the key.
+    pub fn pubkey_once(
+        &self,
+        user_id: &str,
+        passphrase: &[u8],
+        role: KeyRole,
+    ) -> Result<Vec<u8>, SessionError> {
+        let signer = self.unlock(user_id, passphrase)?;
+        Ok(signer.pubkey(role)?)
+    }
+
     /// Public-device path: unlock `user_id`, sign, and drop the key — no caching.
     pub fn sign_once(
         &self,
