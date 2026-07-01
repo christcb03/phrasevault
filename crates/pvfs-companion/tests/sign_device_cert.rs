@@ -69,3 +69,64 @@ fn companion_root_signs_device_authorized() {
     assert!(engine.authority_active(&member).unwrap());
     engine.close().unwrap();
 }
+
+/// Doc 14 §9 phase 3: the identity key is admitted as an owner
+/// (`IDENTITY_DEVICE_INDEX`), grants a tag under its own stable authority
+/// (doc 10 §9.1), and the root revokes a member — every op through the same
+/// prepare → companion-sign → commit shape the CLI uses.
+#[test]
+fn companion_identity_key_tags_and_root_revokes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root_pub = crypto::pubkey_bytes(&identity::root_key(&owner_mn, "").unwrap());
+
+    let vdir = tempfile::tempdir().unwrap();
+    let vpath = vdir.path().join("vault.json");
+    Vault::create_with(&vpath, owner_mn.to_string().as_bytes(), b"pw", fast()).unwrap();
+    let secret = Vault::open(&vpath).unwrap().unseal(b"pw").unwrap();
+    let signer = UnlockedSigner::from_phrase(std::str::from_utf8(&secret).unwrap()).unwrap();
+
+    // Shared shape: prepare one event, companion-sign it, commit.
+    let commit = |engine: &mut Engine, rt: RequestType, prep: pvfs_core::PreparedWrite| {
+        let mut ev = prep.events.into_iter().next().unwrap();
+        ev.event.set_author_sig(signer.sign(rt, &ev.digest).unwrap());
+        engine.commit_member_write(vec![ev.event]).unwrap();
+    };
+
+    // Admit the identity key (doc 14 §1) as an owner, root-signed.
+    let id_pub = signer.pubkey(KeyRole::Identity).unwrap();
+    let prep = engine.prepare_authorize_identity(&root_pub, &id_pub).unwrap();
+    commit(&mut engine, RequestType::RootDeviceCert, prep);
+    assert!(engine.authority_active(&id_pub).unwrap());
+
+    // Re-admitting the identity key is AlreadyExists — the cert landed.
+    assert!(engine.prepare_authorize_identity(&root_pub, &id_pub).is_err());
+
+    // Admit a member, then tag them under the identity key's authority.
+    let member = crypto::pubkey_bytes(
+        &identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
+    );
+    let prep = engine.prepare_authorize_member(&root_pub, &member).unwrap();
+    commit(&mut engine, RequestType::RootDeviceCert, prep);
+    let prep = engine
+        .prepare_set_member_tag(&id_pub, &member, "vip", true)
+        .unwrap();
+    commit(&mut engine, RequestType::IdentityTag, prep);
+    assert_eq!(
+        engine.member_tags(&member).unwrap(),
+        vec![(id_pub.clone(), "vip".to_string())]
+    );
+
+    // The identity key removes its own grant.
+    let prep = engine
+        .prepare_set_member_tag(&id_pub, &member, "vip", false)
+        .unwrap();
+    commit(&mut engine, RequestType::IdentityTag, prep);
+    assert!(engine.member_tags(&member).unwrap().is_empty());
+
+    // Root revokes the member through the same shape.
+    let prep = engine.prepare_revoke(&root_pub, &member).unwrap();
+    commit(&mut engine, RequestType::RootDeviceCert, prep);
+    assert!(!engine.authority_active(&member).unwrap());
+    engine.close().unwrap();
+}

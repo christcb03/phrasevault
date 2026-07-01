@@ -410,6 +410,34 @@ $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --compa
 # Re-admitting the same key now fails (already a member) — proves the cert landed.
 assert_rc 4 "member already authorized after companion admit" -- \
   $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$CMEMBER"
+
+say "companion: identity key, tag ops, revoke, auto-detect (doc 14 phase 3)"
+# Admit the human's identity key as an owner — fetched from and root-signed by the companion.
+IDJSON="$($PVFS --json --data-dir "$CMOUNT/.pvfs" device authorize-identity --companion-socket "$CSOCK")"
+IDPUB="$(jget "$IDJSON" identity_pubkey)"
+[ "${#IDPUB}" -eq 66 ] && ok "companion-signed authorize-identity" || fail "authorize-identity pubkey: $IDJSON"
+assert_rc 4 "identity key already authorized on re-run" -- \
+  $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-identity --companion-socket "$CSOCK"
+# Tag the member under the identity key's authority (doc 10 §9.1) — no device key involved.
+$PVFS --data-dir "$CMOUNT/.pvfs" tag add "$CMEMBER" vip --via-companion --companion-socket "$CSOCK" >/dev/null \
+  && ok "companion identity-signed tag add" || fail "companion tag add"
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | grep -q "\"tag\":\"vip\",\"authority\":\"$IDPUB\",\"active\":true" \
+  && ok "tag authority is the identity key (active)" || fail "tag ls authority"
+$PVFS --data-dir "$CMOUNT/.pvfs" tag rm "$CMEMBER" vip --via-companion --companion-socket "$CSOCK" >/dev/null \
+  && ok "companion identity-signed tag rm" || fail "companion tag rm"
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | grep -q '"tag":"vip"' \
+  && fail "tag rm did not land" || ok "tag removed"
+# Revoke the member via the companion — socket auto-detected from the env, no flag.
+PVFS_COMPANION_SOCKET="$CSOCK" $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --pubkey "$CMEMBER" >/dev/null \
+  && ok "companion-signed revoke (socket auto-detected)" || fail "companion revoke"
+# Revoking an unknown key is NotFound — proves prepare_revoke checks the registry.
+assert_rc 3 "companion revoke of unknown key is NotFound" -- \
+  $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --companion-socket "$CSOCK" \
+    --pubkey 02ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+# Missing socket (no flag, no env, no runtime dir) is a clean BadInput, not a hang.
+assert_rc 2 "companion auto-detect fails cleanly when nothing is running" -- \
+  env -u PVFS_COMPANION_SOCKET XDG_RUNTIME_DIR="$DATA/empty-runtime" \
+  $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --pubkey "$CMEMBER"
 kill -TERM "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
 CPID=""
 # (The headless root-signing denial without --allow-root is covered by the

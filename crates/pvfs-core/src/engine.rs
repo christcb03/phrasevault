@@ -2051,6 +2051,43 @@ impl Engine {
         })
     }
 
+    /// Phase 1: build an unsigned `DeviceAuthorized` admitting the human's
+    /// **identity key** (doc 14 §1) as an owner. The `IDENTITY_DEVICE_INDEX`
+    /// sentinel marks it as derived from the `3'/<id>'` branch (not `1'/n'`), while
+    /// the projection treats any non-member index as an owner: full rights and an
+    /// active membership, so the key's tag grants count for liveness (doc 10 §9.2).
+    /// The author must hold admin on root (or be the root).
+    pub fn prepare_authorize_identity(
+        &self,
+        author_pub: &[u8],
+        identity_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        crypto::validate_pubkey(identity_pubkey)?;
+        self.require_admin_on_root(author_pub, "authorize identity")?;
+        if self.device_known(identity_pubkey)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "device",
+                id: hex::encode(identity_pubkey),
+            });
+        }
+        let t = now_ms();
+        let idx = crate::acl::IDENTITY_DEVICE_INDEX;
+        let digest = event::msg_device_authorized(identity_pubkey, idx, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(identity_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::DeviceAuthorized {
+                    device_pubkey: identity_pubkey.to_vec(),
+                    device_index: idx,
+                    authorized_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
     /// Phase 1: build an unsigned `DeviceRevoked`. The author must hold admin on root.
     pub fn prepare_revoke(
         &self,

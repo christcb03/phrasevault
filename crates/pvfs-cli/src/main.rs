@@ -254,20 +254,36 @@ enum DeviceCmd {
         /// The member's compressed secp256k1 public key, hex (33-byte SEC1)
         #[arg(long)]
         pubkey: String,
-        /// Root-sign via a running companion (no phrase typed); needs --companion-socket
+        /// Root-sign via a running companion (no phrase typed)
         #[arg(long)]
         via_companion: bool,
-        /// Companion signer socket path (with --via-companion)
+        /// Companion signer socket path (with --via-companion; default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+    },
+    /// Authorize the human's **identity key** (doc 14 §1) as an owner: the key is
+    /// fetched from a running companion and its cert root-signed through the same
+    /// companion (no phrase typed). This is the stable cross-device authority
+    /// behind the owner's tag grants (doc 10 §9.1).
+    AuthorizeIdentity {
+        /// Companion signer socket path (default: auto-detect)
         #[arg(long)]
         companion_socket: Option<PathBuf>,
     },
     /// Revoke a device or member key for new appends. Signed by your admin
-    /// device (no phrase); pass --mnemonic to root-sign. History stays valid.
+    /// device (no phrase); pass --mnemonic to root-sign, or --via-companion to
+    /// root-sign through a running companion. History stays valid.
     Revoke {
         #[arg(long)]
         mnemonic: Option<String>,
         #[arg(long)]
         pubkey: String,
+        /// Root-sign via a running companion (no phrase typed)
+        #[arg(long)]
+        via_companion: bool,
+        /// Companion signer socket path (with --via-companion; default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
     },
 }
 
@@ -298,10 +314,31 @@ enum AclCmd {
 
 #[derive(Subcommand)]
 enum TagCmd {
-    /// Grant a tag to a member (by pubkey hex)
-    Add { member: String, tag: String },
-    /// Remove a tag from a member
-    Rm { member: String, tag: String },
+    /// Grant a tag to a member (by pubkey hex). Pass --via-companion to sign
+    /// with your **identity key** through a running companion (doc 14 §3), so
+    /// the grant's authority is stable across your machines (doc 10 §9.1).
+    Add {
+        member: String,
+        tag: String,
+        /// Sign with your identity key via a running companion
+        #[arg(long)]
+        via_companion: bool,
+        /// Companion signer socket path (with --via-companion; default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+    },
+    /// Remove a tag from a member. Pass --via-companion to sign with your
+    /// identity key through a running companion (doc 14 §3).
+    Rm {
+        member: String,
+        tag: String,
+        /// Sign with your identity key via a running companion
+        #[arg(long)]
+        via_companion: bool,
+        /// Companion signer socket path (with --via-companion; default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+    },
     /// List a member's tags
     Ls { member: String },
 }
@@ -646,6 +683,54 @@ fn daemon_client(
     let sign: Box<dyn Fn(&[u8; 32]) -> Vec<u8>> =
         Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
     Ok(Some((client, sign)))
+}
+
+/// Resolve the companion signer socket (doc 14 §9 phase 3 auto-detection):
+/// an explicit `--companion-socket` wins; else `$PVFS_COMPANION_SOCKET`; else
+/// the conventional `$XDG_RUNTIME_DIR/pvfs-companion.sock` if it exists.
+fn resolve_companion_socket(explicit: Option<PathBuf>) -> Result<PathBuf, PvfsError> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    if let Ok(p) = std::env::var("PVFS_COMPANION_SOCKET") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let p = Path::new(&dir).join("pvfs-companion.sock");
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err(PvfsError::BadInput {
+        field: "companion-socket".into(),
+        reason: "no companion socket found (pass --companion-socket, set \
+                 $PVFS_COMPANION_SOCKET, or serve on $XDG_RUNTIME_DIR/pvfs-companion.sock)"
+            .into(),
+    })
+}
+
+/// The shared shape of a companion-signed admin op (doc 14 §3): open the engine,
+/// prepare exactly one event, have the companion sign its digest for
+/// `request_type`, and commit through the member-write verifier.
+fn companion_commit(
+    state_dir: &Path,
+    socket: &Path,
+    request_type: &str,
+    prepare: impl FnOnce(&Engine) -> Result<pvfs_core::PreparedWrite, PvfsError>,
+) -> Result<(), PvfsError> {
+    let mut engine = Engine::open(state_dir)?;
+    let prep = prepare(&engine)?;
+    let mut ev = prep
+        .events
+        .into_iter()
+        .next()
+        .expect("companion ops prepare one event");
+    let sig = companion_sign(socket, request_type, &ev.digest)?;
+    ev.event.set_author_sig(sig);
+    engine.commit_member_write(vec![ev.event])?;
+    engine.close()
 }
 
 /// Ask a running companion (doc 14 §3) for the public key of `role` ("root" or
@@ -1200,22 +1285,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     // seed; the CLI prepares the DeviceAuthorized, gets the root
                     // pubkey + signature from the companion, and commits — no phrase.
                     if via_companion {
-                        let sock = companion_socket.ok_or_else(|| PvfsError::BadInput {
-                            field: "companion-socket".into(),
-                            reason: "pass --companion-socket with --via-companion".into(),
-                        })?;
+                        let sock = resolve_companion_socket(companion_socket)?;
                         let root_pub = companion_pubkey(&sock, "root")?;
-                        let mut engine = Engine::open(&state_dir)?;
-                        let prep = engine.prepare_authorize_member(&root_pub, &pk)?;
-                        let mut ev = prep
-                            .events
-                            .into_iter()
-                            .next()
-                            .expect("authorize prepares one event");
-                        let sig = companion_sign(&sock, "root_device_cert", &ev.digest)?;
-                        ev.event.set_author_sig(sig);
-                        engine.commit_member_write(vec![ev.event])?;
-                        engine.close()?;
+                        companion_commit(&state_dir, &sock, "root_device_cert", |engine| {
+                            engine.prepare_authorize_member(&root_pub, &pk)
+                        })?;
                         if json {
                             println!("{{\"authorized\":true,\"member_pubkey\":\"{pubkey}\"}}");
                         } else {
@@ -1251,11 +1325,47 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
-                DeviceCmd::Revoke { mnemonic, pubkey } => {
+                DeviceCmd::AuthorizeIdentity { companion_socket } => {
+                    // The companion holds both keys (doc 14 §1): fetch the identity
+                    // pubkey, then root-sign its owner cert — no phrase typed.
+                    let sock = resolve_companion_socket(companion_socket)?;
+                    let id_pub = companion_pubkey(&sock, "identity")?;
+                    let root_pub = companion_pubkey(&sock, "root")?;
+                    companion_commit(&state_dir, &sock, "root_device_cert", |engine| {
+                        engine.prepare_authorize_identity(&root_pub, &id_pub)
+                    })?;
+                    let id_hex = hex::encode(&id_pub);
+                    if json {
+                        println!("{{\"authorized\":true,\"identity_pubkey\":\"{id_hex}\"}}");
+                    } else {
+                        println!("authorized identity key {id_hex} (companion root-signed)");
+                    }
+                    Ok(())
+                }
+                DeviceCmd::Revoke {
+                    mnemonic,
+                    pubkey,
+                    via_companion,
+                    companion_socket,
+                } => {
                     let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
                         field: "pubkey".into(),
                         reason: "must be hex".into(),
                     })?;
+                    // Companion root-signing (doc 14 §3), same pattern as admit.
+                    if via_companion {
+                        let sock = resolve_companion_socket(companion_socket)?;
+                        let root_pub = companion_pubkey(&sock, "root")?;
+                        companion_commit(&state_dir, &sock, "root_device_cert", |engine| {
+                            engine.prepare_revoke(&root_pub, &pk)
+                        })?;
+                        if json {
+                            println!("{{\"revoked\":true}}");
+                        } else {
+                            println!("revoked {pubkey} (companion root-signed)");
+                        }
+                        return Ok(());
+                    }
                     // Device-signed (no phrase): auto-route through daemon (doc 09 §3d).
                     // Root-signed (phrase given): must go direct.
                     if mnemonic.is_none() {
@@ -1408,12 +1518,26 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 })
             };
             match t {
-                TagCmd::Add { member, tag } => {
+                TagCmd::Add {
+                    member,
+                    tag,
+                    via_companion,
+                    companion_socket,
+                } => {
                     let state_dir = ctx?;
                     let member_pk = decode_member(&member)?;
 
-                    // Auto-route through daemon when one is running (doc 09 §3d).
-                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                    // Identity-key signing via the companion (doc 14 §3): the grant's
+                    // authority is the human's stable identity key (doc 10 §9.1),
+                    // not this machine's device key.
+                    if via_companion {
+                        let sock = resolve_companion_socket(companion_socket)?;
+                        let id_pub = companion_pubkey(&sock, "identity")?;
+                        companion_commit(&state_dir, &sock, "identity_tag", |engine| {
+                            engine.prepare_set_member_tag(&id_pub, &member_pk, &tag, true)
+                        })?;
+                    } else if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                        // Auto-route through daemon when one is running (doc 09 §3d).
                         client
                             .tag_member(&hex::encode(&member_pk), &tag, true, |d| sign(d))
                             .map_err(remote_err)?;
@@ -1429,12 +1553,25 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
-                TagCmd::Rm { member, tag } => {
+                TagCmd::Rm {
+                    member,
+                    tag,
+                    via_companion,
+                    companion_socket,
+                } => {
                     let state_dir = ctx?;
                     let member_pk = decode_member(&member)?;
 
-                    // Auto-route through daemon when one is running (doc 09 §3d).
-                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                    // Identity-key signing via the companion (doc 14 §3) — the same
+                    // authority that granted the tag removes it.
+                    if via_companion {
+                        let sock = resolve_companion_socket(companion_socket)?;
+                        let id_pub = companion_pubkey(&sock, "identity")?;
+                        companion_commit(&state_dir, &sock, "identity_tag", |engine| {
+                            engine.prepare_set_member_tag(&id_pub, &member_pk, &tag, false)
+                        })?;
+                    } else if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                        // Auto-route through daemon when one is running (doc 09 §3d).
                         client
                             .tag_member(&hex::encode(&member_pk), &tag, false, |d| sign(d))
                             .map_err(remote_err)?;
