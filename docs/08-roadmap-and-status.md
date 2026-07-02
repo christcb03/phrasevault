@@ -274,6 +274,10 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     confirm); rotate the **root key** (hardest — re-anchor `ForestCreated` to a new root while preserving
     content-addressed ids; interacts with compaction re-genesis item 15 and federation trust doc 03).
     → **Plan:** its own mini-spec (new doc) before companion §9 phase 7; see [doc 14 §11](14-companion-app.md).
+    → **Drafted (2026-07-01):** [doc 15 — key replacement & rotation](15-key-replacement.md): identity-index
+    bump + root-signed swap + `reissue_authority` re-homing (case A), revoke/re-authorize composition (case B),
+    and a `RootRotated` **root lineage** with an optional offline **recovery key** so the forest survives full
+    seed compromise with `forest_id`/history intact (case C). Awaiting review; build plan in doc 15 §5.
 
 **Resolved since earlier drafts:** `PvfsError::Forbidden` now exists; the daemon socket is
 discoverable (conventional path, P2-E §3b); admit/revoke no longer need the recovery phrase (§3a);
