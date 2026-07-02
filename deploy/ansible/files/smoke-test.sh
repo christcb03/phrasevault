@@ -408,8 +408,10 @@ printf 'these are not valid recovery words at all' \
 ERC=0
 printf '%s' "$CMN" | PVFS_COMPANION_PASSPHRASE=x "$COMPANION" init --vault "$CVAULT" >/dev/null 2>&1 || ERC=$?
 [ "$ERC" -eq 1 ] && ok "init refuses to overwrite an existing vault" || fail "vault overwrite rc=$ERC"
-# Run the companion headless, root signing explicitly enabled.
-PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" serve --vault "$CVAULT" --socket "$CSOCK" --allow-root >/dev/null 2>&1 &
+# Run the companion headless: root signing explicitly enabled, prompts forced
+# to deny — a scripted agent must be deterministic even when the script runs
+# from a terminal (an auto-detected /dev/tty prompt would block forever).
+PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" serve --vault "$CVAULT" --socket "$CSOCK" --allow-root --prompt deny >/dev/null 2>&1 &
 CPID=$!
 for _ in $(seq 1 50); do [ -S "$CSOCK" ] && break; sleep 0.1; done
 [ -S "$CSOCK" ] && ok "companion serving" || fail "companion socket missing"

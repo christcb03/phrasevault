@@ -63,6 +63,10 @@ enum Cmd {
         /// Max signatures per minute (doc 14 §4 rate limit). 0 disables.
         #[arg(long, default_value_t = 60)]
         rate_limit: u32,
+        /// Approval prompt backend. `auto` picks desktop/terminal/deny; scripts
+        /// and services should pass `deny` so a prompt can never block them.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "deny", "terminal", "desktop"])]
+        prompt: String,
     },
     /// Lock a running agent now: the seed is dropped from memory. The next
     /// request re-unlocks it (keychain/env/prompt) — or is refused if it can't.
@@ -356,6 +360,7 @@ fn run() -> Result<(), String> {
             allow_root,
             idle_lock_secs,
             rate_limit,
+            prompt,
         } => {
             let vault = match vault {
                 Some(p) => p,
@@ -377,7 +382,21 @@ fn run() -> Result<(), String> {
             // Phase 5 controls (doc 14 §4, §9): prompts, audit, rate limit, and
             // lock with on-demand re-unlock (the unlocker retains no secrets —
             // it re-opens the vault and unseals the same way serve just did).
-            let (prompter, prompt_label) = pvfs_companion::auto_prompter_labeled();
+            // `--prompt deny` makes a scripted agent deterministic: a prompt can
+            // never block it (it denies instead), no matter what tty it holds.
+            let (prompter, prompt_label): (Box<dyn pvfs_companion::Prompter>, &str) =
+                match prompt.as_str() {
+                    "deny" => (Box::new(pvfs_companion::DenyPrompter), "deny (forced)"),
+                    "terminal" => match pvfs_companion::approve::TerminalPrompter::open() {
+                        Some(p) => (Box::new(p), "terminal (forced)"),
+                        None => return Err("--prompt terminal: no controlling terminal".into()),
+                    },
+                    "desktop" => match pvfs_companion::approve::DesktopPrompter::detect() {
+                        Some(p) => (Box::new(p), "desktop dialog (forced)"),
+                        None => return Err("--prompt desktop: no GUI session detected".into()),
+                    },
+                    _ => pvfs_companion::auto_prompter_labeled(),
+                };
             let audit_path = vault.with_extension("audit.jsonl");
             let audit =
                 pvfs_companion::AuditLog::open(&audit_path).map_err(|e| e.to_string())?;
