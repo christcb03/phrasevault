@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS member_tags (
 
 -- Secure-blob ledger heads (doc 12 §8.2): the CURRENT ciphertext hash per blob.
 -- Last write wins by design — the log keeps the content-free transition chain;
--- the projection keeps only "now". No content, ever.
+-- the projection keeps only the present state. No content, ever.
 CREATE TABLE IF NOT EXISTS secure_blobs (
   blob_id      TEXT PRIMARY KEY,
   content_hash BLOB    NOT NULL,     -- hash of the ciphertext bytes (doc 12 §8.4)
