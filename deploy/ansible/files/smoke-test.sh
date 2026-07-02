@@ -500,6 +500,30 @@ python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); h["replaced_at_ms"]
 assert_rc 5 "tampered handoff refused" -- \
   $PVFS --data-dir "$F2/.pvfs" member replace "$DATA/handoff-bad.json"
 
+# root lineage — case C (doc 15 §C): recovery key + root rotation.
+say "case C: root rotation & recovery key (doc 15)"
+RCF="$DATA/rotate-forest"; mkdir -p "$RCF"
+RCINIT="$($PVFS --json forest init --mount "$RCF")"
+RCMN="$(jget "$RCINIT" mnemonic)"
+# Register a rotation recovery key (authorized by the main phrase on stdin).
+RKJSON="$(printf '%s' "$RCMN" | $PVFS --json forest recovery-key --forest "$RCF")"
+RKPHRASE="$(jget "$RKJSON" recovery_phrase)"
+[ -n "$RKPHRASE" ] && ok "registered a rotation recovery key" || fail "recovery-key: $RKJSON"
+# Rotate the root using ONLY the recovery phrase (simulates seed compromise).
+RRJSON="$(printf '%s' "$RKPHRASE" | $PVFS --json forest rotate-root --forest "$RCF")"
+NEWMN="$(jget "$RRJSON" new_phrase)"
+NEWROOT="$(jget "$RRJSON" new_root_pubkey)"
+[ -n "$NEWMN" ] && [ -n "$NEWROOT" ] && ok "rotated the root via the recovery phrase" || fail "rotate: $RRJSON"
+# The OLD phrase no longer authorizes; the NEW phrase does.
+assert_rc 5 "old seed rejected after rotation" -- \
+  $PVFS --data-dir "$RCF/.pvfs" device authorize --mnemonic "$RCMN" --index 5
+$PVFS --data-dir "$RCF/.pvfs" device authorize --mnemonic "$NEWMN" --index 5 >/dev/null \
+  && ok "new seed authorizes after rotation" || fail "new seed authorize"
+# forest_id is unchanged across the rotation (identity is the log, not the key).
+RCFID="$(jget "$RCINIT" forest_id)"
+$PVFS --json --data-dir "$RCF/.pvfs" forest info | grep -q "\"forest_id\":\"$RCFID\"" \
+  && ok "forest_id survives the rotation" || fail "forest_id changed"
+
 # identity agent (doc 14 §6): port file + token gate + headless connect denial.
 CPORTF="${CSOCK%.sock}.http"
 [ -f "$CPORTF" ] && ok "identity agent port file exists" || fail "port file missing"

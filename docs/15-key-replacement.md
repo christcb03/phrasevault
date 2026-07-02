@@ -106,8 +106,18 @@ RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 1. ☑ **Re-issue core** — `prepare_replace_identity` (the atomic two-event swap) + `prepare_reissue_authority` (memberships, tag grants, `key:old → key:new`); integration test: member loses access at the swap, regains it identically after re-issue, re-running the swap refused.
 2. ☑ **Identity replace UX** — companion `identity_index` in the vault envelope; `RotateIdentity` agent op (root-tier gate: `--allow-root` or the rotation prompt; persist-then-swap; dual-signs the handoff with both keys before swapping); `pvfs identity replace` does rotate → swap → re-issue → prints the handoff. Smoke: grant re-homed to the new authority end to end.
 3. ☑ **Member handoff** — `identity::handoff_digest`/`verify_handoff` (domain-tagged, dual-signature) + `pvfs member replace <file|->` (verify, revoke old, admit new, re-grant tags — composing existing device-signed ops, no new events). Smoke: replace across a second forest; tampered handoff refused (rc 5).
-4. ☐ **Root lineage** — `RootRotated` + `RecoveryKeyRegistered`, projection/replay lineage, `pvfs forest rotate-root`, init's recovery-phrase prompt; smoke: rotate, old root rejected, history still replays.
-5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03 amendment); doc 08 item 17 closed.
+4. ☑ **Root lineage** — `RootRotated` + `RecoveryKeyRegistered` (full event plumbing); the projection's
+   `identity_root_pubkey` is the **current** lineage root (genesis seeds it, `RootRotated` updates it),
+   so `check_device_cert`/replay and every engine root-authority check consult `current_root()` — a
+   rotated-away seed is rejected, a new root accepted, all with replay/rebuild parity. `recovery_keys`
+   table; author rules (rotate = current root OR recovery key, first-valid wins; register = current
+   root only, phrase-authenticated). CLI `pvfs forest recovery-key` (register, phrase on stdin, prints
+   a paper recovery phrase) and `pvfs forest rotate-root` (rotate via current-or-recovery phrase,
+   prints the new phrase). Tests: `case_c_lineage.rs` (rotation moves authority + rebuild parity,
+   recovery-key rotation after total seed loss, stranger refused); smoke: register → rotate via
+   recovery phrase → old seed rejected, new accepted, `forest_id` survives.
+5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03
+   amendment); optional `forest rotate-root` mass re-admission of old-seed devices; doc 08 item 17 closed.
 
 ## 6. Resolved decisions (2026-07-02)
 

@@ -236,6 +236,23 @@ enum ForestCmd {
     },
     /// Show a forest's identity (default: current context)
     Info { target: Option<String> },
+    /// Register an offline **rotation recovery key** (doc 15 §C5) so you can
+    /// rotate the root even after total seed compromise. Reads your current
+    /// recovery phrase from stdin to authorize; prints a NEW recovery phrase to
+    /// store on paper (never typed into a machine except to rotate).
+    RecoveryKey {
+        #[arg(long)]
+        forest: Option<String>,
+    },
+    /// **Rotate the root key** (doc 15 §C, disaster recovery for a compromised
+    /// seed). Reads the authorizing phrase from stdin — your current recovery
+    /// phrase, or the rotation recovery phrase — and prints a fresh recovery
+    /// phrase. Re-anchors authority to the new root; `forest_id` and history are
+    /// unchanged. Afterwards, revoke and re-admit device keys from the old seed.
+    RotateRoot {
+        #[arg(long)]
+        forest: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2767,7 +2784,117 @@ fn forest_cmd(
             }
             engine.close()
         }
+        ForestCmd::RecoveryKey { forest } => {
+            let state = forest_state_dir(forest, ctx)?;
+            let auth_mn = read_phrase_stdin("current recovery phrase (to authorize)")?;
+            let root_key = identity::root_key(&auth_mn, "")?;
+            let root_pub = crypto::pubkey_bytes(&root_key);
+            // Fresh, independent recovery phrase — its root is the recovery key.
+            let rec_mn = identity::generate_mnemonic()?;
+            let rec_pub = crypto::pubkey_bytes(&identity::root_key(&rec_mn, "")?);
+            let mut engine = Engine::open(&state)?;
+            let prep = engine.prepare_register_recovery(&root_pub, &rec_pub)?;
+            commit_phrase_signed(&mut engine, prep, &root_key)?;
+            engine.close()?;
+            if json {
+                println!(
+                    "{{\"registered\":true,\"recovery_pubkey\":\"{}\",\"recovery_phrase\":\"{}\"}}",
+                    hex::encode(&rec_pub),
+                    json_escape(&rec_mn.to_string())
+                );
+            } else {
+                println!("registered recovery key {}", hex::encode(&rec_pub));
+                println!();
+                println!("ROTATION RECOVERY PHRASE — store on paper, never type into a machine");
+                println!("except to rotate your root. Anyone with it can rotate your forest:");
+                println!();
+                println!("  {rec_mn}");
+                println!();
+            }
+            Ok(())
+        }
+        ForestCmd::RotateRoot { forest } => {
+            let state = forest_state_dir(forest, ctx)?;
+            let auth_mn =
+                read_phrase_stdin("authorizing phrase (current recovery or rotation-recovery)")?;
+            let auth_key = identity::root_key(&auth_mn, "")?;
+            let auth_pub = crypto::pubkey_bytes(&auth_key);
+            // The new root is a fresh independent seed.
+            let new_mn = identity::generate_mnemonic()?;
+            let new_pub = crypto::pubkey_bytes(&identity::root_key(&new_mn, "")?);
+            let mut engine = Engine::open(&state)?;
+            let prep = engine.prepare_rotate_root(&auth_pub, &new_pub)?;
+            commit_phrase_signed(&mut engine, prep, &auth_key)?;
+            engine.close()?;
+            if json {
+                println!(
+                    "{{\"rotated\":true,\"new_root_pubkey\":\"{}\",\"new_phrase\":\"{}\"}}",
+                    hex::encode(&new_pub),
+                    json_escape(&new_mn.to_string())
+                );
+            } else {
+                println!("root rotated to {}", hex::encode(&new_pub));
+                println!("forest identity (forest_id, history) is unchanged.");
+                println!();
+                println!("NEW RECOVERY PHRASE — write it down; it replaces the old one:");
+                println!();
+                println!("  {new_mn}");
+                println!();
+                println!("Next: revoke and re-admit any device/identity keys derived from the");
+                println!("old (compromised) seed — they still work until you do.");
+            }
+            Ok(())
+        }
     }
+}
+
+/// Resolve a forest's state dir from an optional `--forest` (else the context).
+fn forest_state_dir(
+    forest: Option<String>,
+    ctx: Result<PathBuf, PvfsError>,
+) -> Result<PathBuf, PvfsError> {
+    match forest {
+        Some(t) => {
+            let r = mount::resolve_target(&Registry::system(), &t)?;
+            Ok(mount::state_dir(&r.mount))
+        }
+        None => ctx,
+    }
+}
+
+/// Read + validate a recovery phrase from stdin (piped or typed).
+fn read_phrase_stdin(what: &str) -> Result<pvfs_core::Mnemonic, PvfsError> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        eprintln!("Enter your {what}:");
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| PvfsError::io("read phrase", e))?;
+    let phrase = line.trim();
+    if phrase.is_empty() {
+        return Err(PvfsError::BadInput {
+            field: "phrase".into(),
+            reason: "no phrase provided".into(),
+        });
+    }
+    identity::parse_mnemonic(phrase)
+}
+
+/// Sign each event of a prepared write with a phrase-derived key and commit.
+fn commit_phrase_signed(
+    engine: &mut Engine,
+    prep: pvfs_core::PreparedWrite,
+    key: &identity::SigningKey,
+) -> Result<(), PvfsError> {
+    let mut events = Vec::new();
+    for pe in prep.events {
+        let mut ev = pe.event;
+        ev.set_author_sig(crypto::sign_digest(key, &pe.digest)?);
+        events.push(ev);
+    }
+    engine.commit_member_write(events)
 }
 
 fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {

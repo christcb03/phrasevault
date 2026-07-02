@@ -288,6 +288,27 @@ can't read).
 Your **recovery phrase** is needed only for recovery — admitting/revoking members is signed by your
 everyday admin device, not the phrase (doc 09 §2.2).
 
+**If your seed is compromised — rotating the root (doc 15).** Because your identity is the *log*, not
+the key, you can replace the root key while keeping your forest, its id, and all its history:
+
+```bash
+# one-time: register an offline recovery key so you can rotate even if every
+# machine is compromised. Authorize with your current phrase (typed/piped);
+# it prints a SECOND phrase to keep on paper.
+echo "<current recovery phrase>" | pvfs forest recovery-key --forest <alias|mount>
+
+# rotate the root: authorize with your current phrase OR the recovery phrase;
+# it prints a fresh recovery phrase and re-anchors authority to a new key.
+echo "<authorizing phrase>" | pvfs forest rotate-root --forest <alias|mount>
+```
+
+After a rotation the old seed can no longer authorize anything; device/identity keys derived from the
+old seed keep working until you revoke and re-admit them, so do that next in a compromise.
+
+A single lost identity key (not the whole seed) is cheaper: `pvfs identity replace` swaps it and
+re-issues your grants under the new key, printing a handoff for forests where you're a member (they
+run `pvfs member replace <file>`).
+
 ---
 
 ## 10. Command reference (summary)
@@ -315,6 +336,9 @@ everyday admin device, not the phrase (doc 09 §2.2).
 | `pvfs device authorize-member --via-companion --companion-socket <p> --pubkey <hex>` | Root-sign the admit through a running companion — no phrase typed (doc 14). |
 | `pvfs-companion init --vault <p>` · `pvfs-companion serve --vault <p> --socket <s> [--allow-root]` | Seal your seed into a vault · run the local signing agent. |
 | `pvfs device revoke --pubkey <hex>` | Revoke a device/member key (admin device; no phrase). |
+| `pvfs forest recovery-key [--forest F]` | Register an offline rotation recovery key (phrase on stdin; prints a paper phrase). |
+| `pvfs forest rotate-root [--forest F]` | Rotate the root after seed compromise (phrase on stdin; prints a new phrase). |
+| `pvfs identity replace` · `pvfs member replace <file>` | Replace a compromised identity key · adopt a member's replacement from a handoff. |
 | `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
 | `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |

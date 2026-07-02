@@ -132,8 +132,10 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
   type at the reserved `m/43'/20566'/2'` path: opaque mutable encrypted blob + content-free signed
   hash-state log + companion-gated decryption + on-the-fly create/update over the daemon.
 - **Key replacement** (doc 15) — the committed follow-on to "one identity everywhere" (§4 item 17).
-  **Built:** identity-key replacement + re-issue and the dual-signed member handoff (cases A/B).
-  Remaining: root rotation + recovery key (case C, draft awaiting review of doc 15 §6).
+  **Built (cases A/B/C):** identity-key replacement + re-issue, the dual-signed member handoff, and
+  **root rotation** with an offline **recovery key** (`RootRotated`/`RecoveryKeyRegistered` lineage;
+  `pvfs forest rotate-root` / `recovery-key`). §6 decisions resolved. Remaining edge: compaction must
+  embed the lineage (doc 11) and federation must pin genesis+lineage (doc 03) — folded into those tracks.
 
 **Explicitly post-1.0:** federation + sub-forest replication (P4, doc 03), compaction (doc 11),
 single-use challenge nonce (only matters once the socket is network-proxied), arbitrary named groups
