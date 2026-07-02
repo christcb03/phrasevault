@@ -25,6 +25,8 @@ pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
 pub const K_ACL_SET: &str = "AclSet";
 pub const K_MEMBER_TAGGED: &str = "MemberTagged";
 pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
+pub const K_ROOT_ROTATED: &str = "RootRotated";
+pub const K_RECOVERY_KEY_REGISTERED: &str = "RecoveryKeyRegistered";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -46,6 +48,24 @@ pub enum Event {
     DeviceRevoked {
         device_pubkey: Vec<u8>,
         revoked_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Re-anchor forest authority to a new root key (doc 15 §C2, seed rotation).
+    /// Valid iff `author` is the current root of the lineage or a registered
+    /// recovery key; first valid one in the log wins. `forest_id`/ids unchanged.
+    RootRotated {
+        new_root_pubkey: Vec<u8>,
+        rotated_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Register an offline recovery key that may author a `RootRotated`
+    /// (doc 15 §C5). `author` must be the current root (phrase-authenticated by
+    /// construction — the companion never signs this; §6 decision 4).
+    RecoveryKeyRegistered {
+        recovery_pubkey: Vec<u8>,
+        registered_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -165,6 +185,22 @@ pub fn msg_forest_created(
         .u64(created_at)
         .bytes(author);
     crypto::domain_digest("pvfs:forestcreated:v1:", &e.finish())
+}
+
+pub fn msg_root_rotated(new_root_pubkey: &[u8], rotated_at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.bytes(new_root_pubkey).u64(rotated_at).bytes(author);
+    crypto::domain_digest("pvfs:rootrotated:v1:", &e.finish())
+}
+
+pub fn msg_recovery_key_registered(
+    recovery_pubkey: &[u8],
+    registered_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.bytes(recovery_pubkey).u64(registered_at).bytes(author);
+    crypto::domain_digest("pvfs:recoverykey:v1:", &e.finish())
 }
 
 pub fn msg_device_authorized(
@@ -327,6 +363,8 @@ impl Event {
             Event::ForestCreated { .. } => K_FOREST_CREATED,
             Event::DeviceAuthorized { .. } => K_DEVICE_AUTHORIZED,
             Event::DeviceRevoked { .. } => K_DEVICE_REVOKED,
+            Event::RootRotated { .. } => K_ROOT_ROTATED,
+            Event::RecoveryKeyRegistered { .. } => K_RECOVERY_KEY_REGISTERED,
             Event::NodeCreated(_) => K_NODE_CREATED,
             Event::LinkCreated(_) => K_LINK_CREATED,
             Event::LinkRemoved { .. } => K_LINK_REMOVED,
@@ -353,6 +391,8 @@ impl Event {
             Event::ForestCreated { author, .. }
             | Event::DeviceAuthorized { author, .. }
             | Event::DeviceRevoked { author, .. }
+            | Event::RootRotated { author, .. }
+            | Event::RecoveryKeyRegistered { author, .. }
             | Event::LinkReordered { author, .. }
             | Event::LinkSuperseded { author, .. }
             | Event::LinkSuspended { author, .. }
@@ -384,6 +424,8 @@ impl Event {
             | Event::SecureBlobUpdated { sig: s, .. }
             | Event::DeviceAuthorized { sig: s, .. }
             | Event::DeviceRevoked { sig: s, .. }
+            | Event::RootRotated { sig: s, .. }
+            | Event::RecoveryKeyRegistered { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -429,6 +471,22 @@ impl Event {
                 sig,
             } => {
                 e.bytes(device_pubkey).u64(*revoked_at).bytes(author).bytes(sig);
+            }
+            Event::RootRotated {
+                new_root_pubkey,
+                rotated_at,
+                author,
+                sig,
+            } => {
+                e.bytes(new_root_pubkey).u64(*rotated_at).bytes(author).bytes(sig);
+            }
+            Event::RecoveryKeyRegistered {
+                recovery_pubkey,
+                registered_at,
+                author,
+                sig,
+            } => {
+                e.bytes(recovery_pubkey).u64(*registered_at).bytes(author).bytes(sig);
             }
             Event::NodeCreated(n) => {
                 e.string(&n.id)
@@ -622,6 +680,18 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
+            K_ROOT_ROTATED => Event::RootRotated {
+                new_root_pubkey: d.bytes()?,
+                rotated_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_RECOVERY_KEY_REGISTERED => Event::RecoveryKeyRegistered {
+                recovery_pubkey: d.bytes()?,
+                registered_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
             K_NODE_CREATED => Event::NodeCreated(Node {
                 id: d.string()?,
                 node_type: d.string()?,
@@ -785,6 +855,26 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_device_revoked(device_pubkey, *revoked_at, author),
+                sig,
+            ),
+            Event::RootRotated {
+                new_root_pubkey,
+                rotated_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_root_rotated(new_root_pubkey, *rotated_at, author),
+                sig,
+            ),
+            Event::RecoveryKeyRegistered {
+                recovery_pubkey,
+                registered_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_recovery_key_registered(recovery_pubkey, *registered_at, author),
                 sig,
             ),
             Event::NodeCreated(n) => n.verify(),

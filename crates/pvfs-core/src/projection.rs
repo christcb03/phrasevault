@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS member_tags (
   PRIMARY KEY (member_pubkey, tag, authority)
 );
 
+-- Registered rotation recovery keys (doc 15 §C5): each may author a RootRotated.
+CREATE TABLE IF NOT EXISTS recovery_keys (
+  recovery_pubkey BLOB PRIMARY KEY,
+  registered_at   INTEGER NOT NULL
+);
+
 -- Secure-blob ledger heads (doc 12 §8.2): the CURRENT ciphertext hash per blob.
 -- Last write wins by design — the log keeps the content-free transition chain;
 -- the projection keeps only the present state. No content, ever.
@@ -275,6 +281,31 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             tx.execute(
                 "UPDATE device_keys SET revoked_at = ?1 WHERE device_pubkey = ?2",
                 params![*revoked_at as i64, device_pubkey],
+            )
+            .map_err(&m)?;
+        }
+        Event::RootRotated {
+            new_root_pubkey, ..
+        } => {
+            // Re-anchor authority: `identity_root_pubkey` is the CURRENT root of
+            // the lineage (doc 15 §C2). Replay folds events in order, so every
+            // subsequent authorization check sees the new root; a full rebuild
+            // reconstructs the same head. `forest_id`/ids are untouched.
+            tx.execute(
+                "INSERT INTO projection_meta (k, v) VALUES ('identity_root_pubkey', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![hex::encode(new_root_pubkey)],
+            )
+            .map_err(&m)?;
+        }
+        Event::RecoveryKeyRegistered {
+            recovery_pubkey,
+            registered_at,
+            ..
+        } => {
+            tx.execute(
+                "INSERT OR IGNORE INTO recovery_keys (recovery_pubkey, registered_at) VALUES (?1, ?2)",
+                params![recovery_pubkey, *registered_at as i64],
             )
             .map_err(&m)?;
         }
@@ -643,10 +674,30 @@ fn replay_one(
             })
         }
         // Device certificates: root- or admin-device-signed (doc 09 §2.2). Genesis's
-        // device-0 cert is root-signed (no admin device exists yet).
+        // device-0 cert is root-signed (no admin device exists yet). The "root"
+        // is the CURRENT root of the lineage as of this position (doc 15 §C2), so
+        // certs signed by a post-rotation root validate on replay.
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
-            check_device_cert(tx, &identity.root_pubkey, &identity.root_node_id, author)
+            let root = current_root(tx, identity)?;
+            check_device_cert(tx, &root, &identity.root_node_id, author)
                 .map_err(|_| unauthorized(row.seq, ev.kind()))?;
+        }
+        // Root rotation (doc 15 §C2): author is the current root OR a registered
+        // recovery key. First valid one in the log wins (a later one fails here
+        // because the current root has moved on).
+        Event::RootRotated { author, .. } => {
+            let root = current_root(tx, identity)?;
+            if author.as_slice() != root.as_slice() && !is_recovery_key(tx, author)? {
+                return Err(unauthorized(row.seq, ev.kind()));
+            }
+        }
+        // Recovery-key registration (doc 15 §C5): author must be the current root.
+        // (Phrase-authenticated by construction — the companion never signs this.)
+        Event::RecoveryKeyRegistered { author, .. } => {
+            let root = current_root(tx, identity)?;
+            if author.as_slice() != root.as_slice() {
+                return Err(unauthorized(row.seq, ev.kind()));
+            }
         }
         Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
         // Every other event is device-authored: enforce the same author + ACL
@@ -734,6 +785,37 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// The **current** root of the lineage (doc 15 §C2): the latest `RootRotated`'s
+/// key, else the genesis root. Read from `identity_root_pubkey` in
+/// `projection_meta`, which the fold keeps current; falls back to the passed
+/// genesis identity for forests predating the lineage (never rotated).
+pub fn current_root(conn: &Connection, identity: &ForestIdentity) -> Result<Vec<u8>> {
+    let hexk: Option<String> = conn
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'identity_root_pubkey'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("read current root"))?;
+    match hexk.and_then(|h| hex::decode(h).ok()) {
+        Some(k) => Ok(k),
+        None => Ok(identity.root_pubkey.clone()),
+    }
+}
+
+/// Is `pubkey` a registered rotation recovery key (doc 15 §C5)?
+pub fn is_recovery_key(conn: &Connection, pubkey: &[u8]) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_keys WHERE recovery_pubkey = ?1)",
+            params![pubkey],
+            |r| r.get(0),
+        )
+        .map_err(map_db("recovery key check"))?;
+    Ok(n != 0)
 }
 
 /// A device certificate (`DeviceAuthorized`/`DeviceRevoked`) is valid when signed

@@ -1264,9 +1264,9 @@ impl Engine {
     pub fn authorize_device(&mut self, mnemonic: &Mnemonic, device_index: u64) -> Result<Vec<u8>> {
         let root_key = identity::root_key(mnemonic, "")?;
         let root_pub = crypto::pubkey_bytes(&root_key);
-        if root_pub != self.identity.root_pubkey {
+        if root_pub != self.current_root()? {
             return Err(PvfsError::Identity {
-                detail: "mnemonic does not match this forest's identity root".into(),
+                detail: "mnemonic does not match this forest's current identity root".into(),
             });
         }
         let device_key = identity::device_key(mnemonic, "", device_index)?;
@@ -1294,12 +1294,13 @@ impl Engine {
         crypto::validate_pubkey(member_pubkey)?;
         let root_key = identity::root_key(mnemonic, "")?;
         let root_pub = crypto::pubkey_bytes(&root_key);
-        if root_pub != self.identity.root_pubkey {
+        let current = self.current_root()?;
+        if root_pub != current {
             return Err(PvfsError::Identity {
-                detail: "mnemonic does not match this forest's identity root".into(),
+                detail: "mnemonic does not match this forest's current identity root".into(),
             });
         }
-        if member_pubkey == self.identity.root_pubkey.as_slice() {
+        if member_pubkey == current.as_slice() {
             return Err(PvfsError::BadInput {
                 field: "member_pubkey".into(),
                 reason: "refusing to authorize the identity root as a device".into(),
@@ -1332,9 +1333,9 @@ impl Engine {
     pub fn revoke_device(&mut self, mnemonic: &Mnemonic, device_pubkey: &[u8]) -> Result<()> {
         let root_key = identity::root_key(mnemonic, "")?;
         let root_pub = crypto::pubkey_bytes(&root_key);
-        if root_pub != self.identity.root_pubkey {
+        if root_pub != self.current_root()? {
             return Err(PvfsError::Identity {
-                detail: "mnemonic does not match this forest's identity root".into(),
+                detail: "mnemonic does not match this forest's current identity root".into(),
             });
         }
         if !self.device_known(device_pubkey)? {
@@ -1362,7 +1363,7 @@ impl Engine {
     pub fn authorize_member_by_device(&mut self, member_pubkey: &[u8]) -> Result<()> {
         self.ensure_device_active()?;
         crypto::validate_pubkey(member_pubkey)?;
-        if member_pubkey == self.identity.root_pubkey.as_slice() {
+        if member_pubkey == self.current_root()?.as_slice() {
             return Err(bad(
                 "member_pubkey",
                 "refusing to authorize the identity root as a device",
@@ -1706,18 +1707,39 @@ impl Engine {
     /// ACL satisfied) and append atomically. The events must already carry the
     /// member's signatures (see [`Event::set_author_sig`]).
     pub fn commit_member_write(&mut self, events: Vec<Event>) -> Result<()> {
+        let root = self.current_root()?;
         for ev in &events {
             ev.verify_sig()?;
             match ev {
-                // Device certs follow the root-or-admin rule (doc 09 §2.2); every
-                // other event follows the member/ACL rules.
+                // Device certs follow the root-or-admin rule (doc 09 §2.2), where
+                // "root" is the current lineage root (doc 15 §C2).
                 Event::DeviceAuthorized { .. } | Event::DeviceRevoked { .. } => {
                     projection::check_device_cert(
                         &self.conn,
-                        &self.identity.root_pubkey,
+                        &root,
                         &self.identity.root_node_id,
                         ev.author(),
                     )?;
+                }
+                // Root rotation: current root or a registered recovery key (§C2).
+                Event::RootRotated { author, .. } => {
+                    if author.as_slice() != root.as_slice()
+                        && !projection::is_recovery_key(&self.conn, author)?
+                    {
+                        return Err(PvfsError::Forbidden {
+                            action: "rotate root".into(),
+                            reason: "not the current root or a registered recovery key".into(),
+                        });
+                    }
+                }
+                // Recovery-key registration: current root only (§C5).
+                Event::RecoveryKeyRegistered { author, .. } => {
+                    if author.as_slice() != root.as_slice() {
+                        return Err(PvfsError::Forbidden {
+                            action: "register recovery key".into(),
+                            reason: "only the current root may register a recovery key".into(),
+                        });
+                    }
                 }
                 _ => projection::check_member_event(&self.conn, ev)?,
             }
@@ -1911,14 +1933,21 @@ impl Engine {
     // ---- admin ops over the daemon (doc 09 §3c), all prepared for an external
     //      admin signer (the owner's device, or root via the companion) ----------
 
+    /// The current root of the lineage (doc 15 §C2) — the latest `RootRotated`'s
+    /// key, else the genesis root. All root-authority checks use this, not the
+    /// fixed genesis key, so authority moves with a rotation.
+    pub fn current_root(&self) -> Result<Vec<u8>> {
+        projection::current_root(&self.conn, &self.identity)
+    }
+
     fn require_admin_on_root(&self, author_pub: &[u8], action: &'static str) -> Result<()> {
         // The identity root may always author device certificates (doc 09 §2.2) —
         // it isn't a device in the ACL table, so check it explicitly here, mirroring
         // `projection::check_device_cert`'s root-or-admin rule used at commit/replay.
         // This is the path the companion uses to root-sign a `DeviceAuthorized`
         // (doc 14 §3); without it the prepare step would reject the root while the
-        // commit step accepts it.
-        if author_pub == self.identity.root_pubkey.as_slice() {
+        // commit step accepts it. "Root" is the CURRENT lineage root (doc 15 §C2).
+        if author_pub == self.current_root()?.as_slice() {
             return Ok(());
         }
         let root = self.identity.root_node_id.clone();
@@ -2506,6 +2535,79 @@ impl Engine {
                 },
             }],
         })
+    }
+
+    /// Phase 1 (doc 15 §C2): build an unsigned `RootRotated` re-anchoring the
+    /// forest to `new_root_pubkey`. `author_pub` must be the **current** root or a
+    /// registered recovery key — re-checked at commit and replay. This is signed
+    /// with the OLD root (or the recovery key); the caller holds that key.
+    pub fn prepare_rotate_root(
+        &self,
+        author_pub: &[u8],
+        new_root_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        crypto::validate_pubkey(new_root_pubkey)?;
+        let current = self.current_root()?;
+        if author_pub != current.as_slice()
+            && !projection::is_recovery_key(&self.conn, author_pub)?
+        {
+            return Err(PvfsError::Forbidden {
+                action: "rotate root".into(),
+                reason: "only the current root or a registered recovery key may rotate".into(),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_root_rotated(new_root_pubkey, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(new_root_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::RootRotated {
+                    new_root_pubkey: new_root_pubkey.to_vec(),
+                    rotated_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1 (doc 15 §C5): build an unsigned `RecoveryKeyRegistered`.
+    /// `author_pub` must be the **current** root — and, per §6 decision 4, the
+    /// caller signs with the root key derived from the typed recovery phrase
+    /// (never the companion), so this has no mid-life companion-signable path.
+    pub fn prepare_register_recovery(
+        &self,
+        author_pub: &[u8],
+        recovery_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        crypto::validate_pubkey(recovery_pubkey)?;
+        if author_pub != self.current_root()?.as_slice() {
+            return Err(PvfsError::Forbidden {
+                action: "register recovery key".into(),
+                reason: "only the current root may register a recovery key".into(),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_recovery_key_registered(recovery_pubkey, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(recovery_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::RecoveryKeyRegistered {
+                    recovery_pubkey: recovery_pubkey.to_vec(),
+                    registered_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Read helpers for the CLI/status: the current root and the registered
+    /// recovery keys (doc 15 §C).
+    pub fn is_recovery_key(&self, pubkey: &[u8]) -> Result<bool> {
+        projection::is_recovery_key(&self.conn, pubkey)
     }
 }
 
