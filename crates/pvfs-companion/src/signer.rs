@@ -29,6 +29,9 @@ pub enum RequestType {
     IdentityTag,
     /// An identity assertion / daemon auth challenge for auto-login — **identity** key.
     IdentityAssertion,
+    /// Unwrap a secure-blob content key (doc 12 §8.5) — the **encryption** key
+    /// (`2'/<id>'`) does ECDH; the content key is returned, never the private key.
+    SecureUnwrap,
 }
 
 /// Which custodied key a request resolves to.
@@ -36,6 +39,8 @@ pub enum RequestType {
 pub enum KeyRole {
     Root,
     Identity,
+    /// The `2'/<id>'` decryption credential (doc 12 §8.5) — ECDH only, no signing.
+    Encryption,
 }
 
 impl RequestType {
@@ -43,6 +48,7 @@ impl RequestType {
         match self {
             RequestType::RootDeviceCert => KeyRole::Root,
             RequestType::IdentityTag | RequestType::IdentityAssertion => KeyRole::Identity,
+            RequestType::SecureUnwrap => KeyRole::Encryption,
         }
     }
 
@@ -52,17 +58,19 @@ impl RequestType {
             "root_device_cert" => Some(RequestType::RootDeviceCert),
             "identity_tag" => Some(RequestType::IdentityTag),
             "identity_assertion" => Some(RequestType::IdentityAssertion),
+            "secure_unwrap" => Some(RequestType::SecureUnwrap),
             _ => None,
         }
     }
 }
 
 impl KeyRole {
-    /// Parse the wire string (`"root"` / `"identity"`).
+    /// Parse the wire string (`"root"` / `"identity"` / `"encryption"`).
     pub fn parse(s: &str) -> Option<KeyRole> {
         match s {
             "root" => Some(KeyRole::Root),
             "identity" => Some(KeyRole::Identity),
+            "encryption" => Some(KeyRole::Encryption),
             _ => None,
         }
     }
@@ -110,24 +118,42 @@ impl UnlockedSigner {
         Ok((next, old, new))
     }
 
-    /// The compressed public key for a role — what a forest authorizes / verifies.
-    pub fn pubkey(&self, role: KeyRole) -> Result<Vec<u8>, SignerError> {
-        let key = match role {
+    fn key_for(&self, role: KeyRole) -> Result<k256::ecdsa::SigningKey, SignerError> {
+        match role {
             KeyRole::Root => identity::root_key(&self.mnemonic, ""),
             KeyRole::Identity => identity::identity_key(&self.mnemonic, "", self.identity_id),
+            KeyRole::Encryption => identity::encryption_key(&self.mnemonic, "", 0),
         }
-        .map_err(|e| SignerError::Identity(e.to_string()))?;
-        Ok(crypto::pubkey_bytes(&key))
+        .map_err(|e| SignerError::Identity(e.to_string()))
+    }
+
+    /// The compressed public key for a role — what a forest authorizes / verifies
+    /// (or, for `Encryption`, what an envelope wrap is addressed to).
+    pub fn pubkey(&self, role: KeyRole) -> Result<Vec<u8>, SignerError> {
+        Ok(crypto::pubkey_bytes(&self.key_for(role)?))
     }
 
     /// Sign `digest` with the key the request type calls for. The caller must have
-    /// already approved via [`crate::policy`].
+    /// already approved via [`crate::policy`]. (The encryption key never signs —
+    /// `SecureUnwrap` goes through [`unwrap_content_key`](Self::unwrap_content_key).)
     pub fn sign(&self, request: RequestType, digest: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
-        let key = match request.key_role() {
-            KeyRole::Root => identity::root_key(&self.mnemonic, ""),
-            KeyRole::Identity => identity::identity_key(&self.mnemonic, "", self.identity_id),
+        if request == RequestType::SecureUnwrap {
+            return Err(SignerError::Sign(
+                "secure_unwrap is not a signature request".into(),
+            ));
         }
-        .map_err(|e| SignerError::Identity(e.to_string()))?;
+        let key = self.key_for(request.key_role())?;
         crypto::sign_digest(&key, digest).map_err(|e| SignerError::Sign(e.to_string()))
+    }
+
+    /// Doc 12 §8.5: recover a secure-blob **content key** from an envelope wrap
+    /// with the encryption key (`2'/0'`). The private key never leaves here.
+    pub fn unwrap_content_key(
+        &self,
+        wrap: &pvfs_core::envelope::Wrap,
+    ) -> Result<[u8; 32], SignerError> {
+        let key = self.key_for(KeyRole::Encryption)?;
+        pvfs_core::envelope::unwrap_content_key(wrap, &key)
+            .map_err(|e| SignerError::Sign(e.to_string()))
     }
 }

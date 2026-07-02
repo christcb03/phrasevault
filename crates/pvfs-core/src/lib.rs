@@ -15,6 +15,7 @@ pub mod acl;
 pub mod crypto;
 pub mod encoding;
 pub mod engine;
+pub mod envelope;
 pub mod error;
 pub mod event;
 pub mod fs;

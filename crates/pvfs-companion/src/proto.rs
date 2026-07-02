@@ -30,6 +30,14 @@ pub enum AgentRequest {
     /// handoff assertion, swap the in-memory signer, persist the new index.
     /// Root-tier approval (prompt, or `--allow-root` for automation).
     RotateIdentity,
+    /// Unwrap a secure-blob content key (doc 12 §8.5): the wrap's fields (hex);
+    /// returns the recovered content key. Local, auto-while-unlocked tier — the
+    /// encryption key never leaves the companion.
+    SecureUnwrap {
+        ephemeral_pubkey: String,
+        nonce: String,
+        wrapped_key: String,
+    },
 }
 
 /// The agent's reply.
@@ -47,6 +55,8 @@ pub enum AgentResponse {
         sig_old: String,
         sig_new: String,
     },
+    /// A recovered secure-blob content key (hex), from `SecureUnwrap`.
+    ContentKey { content_key: String },
     Ok,
     Error { code: String, message: String },
 }

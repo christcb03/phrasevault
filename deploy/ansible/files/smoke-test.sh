@@ -20,12 +20,14 @@ DPID=""
 U2PID=""
 CPID=""
 TPID=""
+EPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
   [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null
   [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
   [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
+  [ -n "$EPID" ] && kill "$EPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -557,9 +559,39 @@ assert_rc 5 "tampered ciphertext refused at cat" -- $PVFS secure cat "$SNODE" --
 assert_rc 5 "tampered ciphertext fails verify" -- $PVFS secure verify "$SNODE"
 printf 'ct-v3' | $PVFS secure put "$SNODE" - --raw >/dev/null && ok "a fresh put repairs the blob" || fail "repair put"
 $PVFS secure verify "$SNODE" >/dev/null && ok "verify clean after repair" || fail "verify after repair"
-# The envelope path is phase 3: without --raw the CLI says so, cleanly.
-assert_rc 2 "non-raw put points at phase 3" -- $PVFS secure put "$SNODE" /dev/null
 $PVFS --json secure status "$SNODE" | grep -q '"size":5' && ok "ledger head tracks size" || fail "secure status"
+
+# Companion envelope (doc 12 §8.5): encrypt to the owner, decrypt via the agent.
+say "P3: secure blobs — companion envelope (doc 12 §8.5)"
+ESTORE="$DATA/secure-enc"; mkdir -p "$ESTORE"
+EVAULT="$DATA/secure.vault"; ESOCK="$DATA/secure.sock"
+EINIT="$($PVFS --json forest init --mount "$DATA/enc-forest")"
+EROOT="$(jget "$EINIT" root_node_id)"
+EMN="$(jget "$EINIT" mnemonic)"
+printf '%s' "$EMN" | PVFS_COMPANION_PASSPHRASE=encpass "$COMPANION" init --vault "$EVAULT" >/dev/null 2>&1 \
+  && ok "sealed the enc-forest owner seed" || fail "enc companion init"
+PVFS_COMPANION_PASSPHRASE=encpass "$COMPANION" serve --vault "$EVAULT" --socket "$ESOCK" --prompt deny >/dev/null 2>&1 &
+EPID=$!
+for _ in $(seq 1 50); do [ -S "$ESOCK" ] && break; sleep 0.1; done
+[ -S "$ESOCK" ] && ok "enc companion serving" || fail "enc socket missing"
+ENODE="$(jget "$($PVFS --json --data-dir "$DATA/enc-forest/.pvfs" secure create "$EROOT" note "$ESTORE/note.enc")" created)"
+# Default put encrypts via the companion; the on-disk bytes are NOT the plaintext.
+printf 'dear diary' | $PVFS --data-dir "$DATA/enc-forest/.pvfs" secure put "$ENODE" - --companion-socket "$ESOCK" >/dev/null \
+  && ok "secure put (companion-encrypted)" || fail "encrypted put"
+grep -q 'dear diary' "$ESTORE/note.enc" && fail "plaintext leaked to disk" || ok "on-disk bytes are ciphertext, not plaintext"
+# cat decrypts via the companion and returns the plaintext.
+[ "$($PVFS --data-dir "$DATA/enc-forest/.pvfs" secure cat "$ENODE" --companion-socket "$ESOCK")" = "dear diary" ] \
+  && ok "secure cat (companion-decrypted) round-trips" || fail "encrypted cat"
+# --raw shows it really is an opaque envelope, not the message.
+$PVFS --data-dir "$DATA/enc-forest/.pvfs" secure cat "$ENODE" --raw | grep -q 'dear diary' && fail "raw exposed plaintext" || ok "raw cat yields the opaque envelope"
+# Grant a second key, then that key can find its wrap (unwrap needs its own companion; here we assert the wrap lands).
+GRANTEE="$(jget "$(XDG_CONFIG_HOME="$DATA/grantee" $PVFS --json whoami)" pubkey)"
+$PVFS --data-dir "$DATA/enc-forest/.pvfs" secure grant "$ENODE" "$GRANTEE" --companion-socket "$ESOCK" >/dev/null \
+  && ok "secure grant re-wraps for a recipient" || fail "secure grant"
+$PVFS --data-dir "$DATA/enc-forest/.pvfs" secure verify "$ENODE" >/dev/null \
+  && ok "verify clean after grant (ledger advanced)" || fail "verify after grant"
+kill -TERM "$EPID" 2>/dev/null || true; wait "$EPID" 2>/dev/null || true
+EPID=""
 
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"

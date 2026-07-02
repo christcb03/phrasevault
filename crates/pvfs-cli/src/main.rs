@@ -348,21 +348,39 @@ enum SecureCmd {
         path: PathBuf,
     },
     /// Write the blob's bytes (a file, or `-` for stdin) and advance the
-    /// signed ledger. Old bytes are discarded — that's the point.
+    /// signed ledger. By default the bytes are encrypted to you via the
+    /// companion envelope; old bytes are discarded — that's the point.
     Put {
         node: String,
         input: String,
-        /// The bytes are ciphertext you encrypted yourself (doc 12 §5).
-        /// Without --raw, companion-envelope encryption applies (phase 3).
+        /// Store the bytes verbatim as app-managed ciphertext (doc 12 §5) —
+        /// no companion, no envelope.
         #[arg(long)]
         raw: bool,
+        /// Companion signer socket (default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
     },
-    /// Read the blob to stdout, verifying it against the signed ledger first
+    /// Read the blob to stdout, verifying it against the signed ledger first,
+    /// then decrypting via the companion (unless --raw)
     Cat {
         node: String,
-        /// Emit the stored ciphertext without companion decryption
+        /// Emit the stored ciphertext verbatim, no companion decryption
         #[arg(long)]
         raw: bool,
+        /// Companion signer socket (default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+    },
+    /// Share a blob with another key: add them as an envelope recipient
+    /// (re-wraps the content key; the payload is untouched)
+    Grant {
+        node: String,
+        /// The recipient's compressed secp256k1 public key (hex)
+        pubkey: String,
+        /// Companion signer socket (default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
     },
     /// Check the location bytes against the signed ledger head
     Verify { node: String },
@@ -857,6 +875,42 @@ fn companion_sign(socket: &Path, request_type: &str, digest: &[u8; 32]) -> Resul
         }
         pvfs_companion::AgentResponse::Error { code, message } => Err(PvfsError::Forbidden {
             action: "companion sign".into(),
+            reason: format!("{code}: {message}"),
+        }),
+        _ => Err(PvfsError::BadInput {
+            field: "companion".into(),
+            reason: "unexpected companion response".into(),
+        }),
+    }
+}
+
+/// Ask the companion to unwrap a secure-blob content key (doc 12 §8.5).
+fn companion_unwrap(
+    socket: &Path,
+    wrap: &pvfs_core::envelope::Wrap,
+) -> Result<[u8; 32], PvfsError> {
+    let resp = pvfs_companion::request(
+        socket,
+        &pvfs_companion::AgentRequest::SecureUnwrap {
+            ephemeral_pubkey: hex::encode(&wrap.ephemeral_pubkey),
+            nonce: hex::encode(&wrap.nonce),
+            wrapped_key: hex::encode(&wrap.wrapped_key),
+        },
+    )
+    .map_err(|e| PvfsError::BadInput {
+        field: "companion".into(),
+        reason: e.to_string(),
+    })?;
+    match resp {
+        pvfs_companion::AgentResponse::ContentKey { content_key } => hex::decode(&content_key)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .ok_or_else(|| PvfsError::BadInput {
+                field: "companion".into(),
+                reason: "companion returned a bad content key".into(),
+            }),
+        pvfs_companion::AgentResponse::Error { code, message } => Err(PvfsError::Forbidden {
+            action: "companion unwrap".into(),
             reason: format!("{code}: {message}"),
         }),
         _ => Err(PvfsError::BadInput {
@@ -1712,16 +1766,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
-                SecureCmd::Put { node, input, raw } => {
-                    if !raw {
-                        return Err(PvfsError::BadInput {
-                            field: "raw".into(),
-                            reason: "companion-envelope encryption lands in doc 12 §9 phase 3 — \
-                                     pass --raw to store ciphertext you encrypted yourself"
-                                .into(),
-                        });
-                    }
-                    let bytes = if input == "-" {
+                SecureCmd::Put {
+                    node,
+                    input,
+                    raw,
+                    companion_socket,
+                } => {
+                    let plaintext = if input == "-" {
                         use std::io::Read as _;
                         let mut b = Vec::new();
                         std::io::stdin()
@@ -1731,38 +1782,93 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         std::fs::read(&input).map_err(|e| PvfsError::io("read input", e))?
                     };
+                    // Default: encrypt to the owner's encryption key via the
+                    // companion envelope. --raw stores app-managed bytes as-is.
+                    let bytes = if raw {
+                        plaintext
+                    } else {
+                        let sock = resolve_companion_socket(companion_socket)?;
+                        let enc_pub = companion_pubkey(&sock, "encryption")?;
+                        pvfs_core::envelope::seal(&plaintext, &[enc_pub])?
+                    };
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
                     let mut engine = Engine::open(&state_dir)?;
                     let hash = engine.secure_put_local(&node_id, &bytes)?;
                     engine.close()?;
                     if json {
                         println!(
-                            "{{\"updated\":\"{node_id}\",\"content_hash\":\"{}\",\"size\":{}}}",
+                            "{{\"updated\":\"{node_id}\",\"content_hash\":\"{}\",\"size\":{},\"encrypted\":{}}}",
                             hex::encode(hash),
-                            bytes.len()
+                            bytes.len(),
+                            !raw
                         );
                     } else {
-                        println!("updated {node_id}: {} bytes, hash {}", bytes.len(), hex::encode(hash));
+                        println!(
+                            "updated {node_id}: {} bytes ({}), hash {}",
+                            bytes.len(),
+                            if raw { "raw" } else { "encrypted" },
+                            hex::encode(hash)
+                        );
                     }
                     Ok(())
                 }
-                SecureCmd::Cat { node, raw } => {
-                    if !raw {
-                        return Err(PvfsError::BadInput {
-                            field: "raw".into(),
-                            reason: "companion-envelope decryption lands in doc 12 §9 phase 3 — \
-                                     pass --raw for the stored ciphertext"
-                                .into(),
-                        });
-                    }
+                SecureCmd::Cat {
+                    node,
+                    raw,
+                    companion_socket,
+                } => {
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
                     let engine = Engine::open(&state_dir)?;
-                    let bytes = engine.secure_read(&node_id)?;
+                    let stored = engine.secure_read(&node_id)?; // verified vs the ledger
                     engine.close()?;
+                    let out = if raw {
+                        stored
+                    } else {
+                        let env = pvfs_core::envelope::parse(&stored)?;
+                        let sock = resolve_companion_socket(companion_socket)?;
+                        let enc_pub = companion_pubkey(&sock, "encryption")?;
+                        let wrap = env.wrap_for(&enc_pub).ok_or_else(|| PvfsError::Forbidden {
+                            action: "secure cat".into(),
+                            reason: "this blob is not encrypted to your key".into(),
+                        })?;
+                        let ck = companion_unwrap(&sock, wrap)?;
+                        pvfs_core::envelope::open_with_key(&env, &ck)?
+                    };
                     use std::io::Write as _;
                     std::io::stdout()
-                        .write_all(&bytes)
+                        .write_all(&out)
                         .map_err(|e| PvfsError::io("write stdout", e))?;
+                    Ok(())
+                }
+                SecureCmd::Grant {
+                    node,
+                    pubkey,
+                    companion_socket,
+                } => {
+                    let recipient = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
+                        field: "pubkey".into(),
+                        reason: "must be hex".into(),
+                    })?;
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
+                    let mut engine = Engine::open(&state_dir)?;
+                    let stored = engine.secure_read(&node_id)?;
+                    let env = pvfs_core::envelope::parse(&stored)?;
+                    let sock = resolve_companion_socket(companion_socket)?;
+                    let enc_pub = companion_pubkey(&sock, "encryption")?;
+                    let wrap = env.wrap_for(&enc_pub).ok_or_else(|| PvfsError::Forbidden {
+                        action: "secure grant".into(),
+                        reason: "you must be a recipient to grant access".into(),
+                    })?;
+                    let ck = companion_unwrap(&sock, wrap)?;
+                    let regranted =
+                        pvfs_core::envelope::add_recipient(&stored, &ck, &recipient)?;
+                    engine.secure_put_local(&node_id, &regranted)?;
+                    engine.close()?;
+                    if json {
+                        println!("{{\"granted\":\"{}\"}}", json_escape(&pubkey));
+                    } else {
+                        println!("granted {pubkey} access to {node_id}");
+                    }
                     Ok(())
                 }
                 SecureCmd::Verify { node } => {

@@ -92,6 +92,23 @@ pub fn identity_key(mnemonic: &Mnemonic, bip39_passphrase: &str, id: u64) -> Res
     )
 }
 
+/// Encryption key `id` (doc 12 §8.5) — the owner's decryption credential on the
+/// reserved `2'` branch, custodied by the companion (used for ECDH unwrapping,
+/// never for signing). `id` defaults to 0, mirroring the identity branch.
+pub fn encryption_key(mnemonic: &Mnemonic, bip39_passphrase: &str, id: u64) -> Result<SigningKey> {
+    if id >= 0x8000_0000 {
+        return Err(PvfsError::BadInput {
+            field: "encryption_id".into(),
+            reason: "must be < 2^31 (hardened BIP32 child index)".into(),
+        });
+    }
+    derive(
+        mnemonic,
+        bip39_passphrase,
+        &format!("m/{PVFS_PURPOSE}'/{PVFS_PATH_INDEX}'/2'/{id}'"),
+    )
+}
+
 /// The digest both keys sign in an identity **handoff assertion** (doc 15 §1
 /// A4): "the human behind `old_pub` is now `new_pub`". Length-prefixed fields
 /// under a domain tag, so the encoding is unambiguous.

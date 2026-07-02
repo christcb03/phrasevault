@@ -169,10 +169,18 @@ secure blobs, replica secure-erase.
    envelope default). Tests: put/read/overwrite (old bytes gone from disk), tamper → verify false
    + read Integrity, repair put, one-location rule, no-location refused. Smoke: the full
    put→cat→overwrite→tamper→repair cycle + rc contracts.
-3. ☐ **Envelope + companion** — reference envelope (wrap/unwrap, multi-recipient), `2'/0'`
-   encryption key in the companion + `secure_unwrap` request type/tier, `secure put/cat` default
-   encrypt path + `secure grant`; tests incl. companion-gated decrypt end-to-end and a
-   no-companion → ciphertext-only proof.
+3. ☑ **Envelope + companion** — `pvfs_core::envelope` (XChaCha20-Poly1305 content key; ECDH-on-
+   secp256k1 wraps with a per-wrap ephemeral key + `blake3::derive_key` KDF; PCE-serialized,
+   multi-recipient; `seal`/`parse`/`unwrap_content_key`/`open_with_key`/`add_recipient`). The
+   `2'/0'` **encryption key** joins the companion (`identity::encryption_key`, new `KeyRole::Encryption`);
+   `SecureUnwrap` request type + `AgentRequest::SecureUnwrap`/`ContentKey` reply — local,
+   auto-while-unlocked tier, the private key never leaves the agent (only the content key is
+   returned). CLI: `secure put`/`cat` now encrypt/decrypt through the companion by default (`--raw`
+   keeps the app-managed path), and `secure grant <pubkey>` re-wraps for a recipient without
+   re-encrypting. Tests: envelope unit suite (multi-recipient round-trip, stranger/tamper refused,
+   grant, raw-isn't-an-envelope); companion socket unwrap integration; smoke proves default-encrypt
+   → on-disk bytes are NOT the plaintext → companion-decrypt round-trips → `--raw` shows the opaque
+   envelope → grant + verify.
 4. ☐ **Daemon path** — secure put/cat over the socket (raw plane + signed update), multi-user
    smoke: member with `w` updates, member without is refused, anon sees nothing.
 5. ☐ **Docs + audit** — USER-MANUAL section, `pvfs audit`/`verify` coverage notes, doc 08 rows.

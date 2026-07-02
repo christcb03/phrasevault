@@ -299,6 +299,39 @@ impl Agent {
                 AgentResponse::Ok
             }
             AgentRequest::RotateIdentity => self.rotate_identity(),
+            AgentRequest::SecureUnwrap {
+                ephemeral_pubkey,
+                nonce,
+                wrapped_key,
+            } => {
+                // Local, auto-while-unlocked (doc 12 §8.5): same tier as the
+                // owner's own identity ops — no per-request prompt, and the
+                // encryption key never leaves the companion. Only the unwrapped
+                // content key is returned. Rate limit + lock still apply.
+                let (Ok(eph), Ok(non), Ok(wk)) = (
+                    hex::decode(&ephemeral_pubkey),
+                    hex::decode(&nonce),
+                    hex::decode(&wrapped_key),
+                ) else {
+                    return AgentResponse::error("bad_input", "wrap fields must be hex");
+                };
+                if self.rate_limited() {
+                    return AgentResponse::error("rate_limited", "too many requests");
+                }
+                let wrap = pvfs_core::envelope::Wrap {
+                    recipient_pubkey: Vec::new(), // not needed to unwrap
+                    ephemeral_pubkey: eph,
+                    nonce: non,
+                    wrapped_key: wk,
+                };
+                match self.with_signer(|s| s.unwrap_content_key(&wrap)) {
+                    Ok(Ok(ck)) => AgentResponse::ContentKey {
+                        content_key: hex::encode(ck),
+                    },
+                    Ok(Err(e)) => AgentResponse::error("unwrap", e.to_string()),
+                    Err(resp) => resp,
+                }
+            }
         }
     }
 

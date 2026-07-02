@@ -16,7 +16,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 blake3 = "1.5"
-k256 = "0.13"
+k256 = { version = "0.13", features = ["ecdh"] }
 bip39 = { version = "2.1", features = ["rand"] }
 bip32 = "0.5"
 rusqlite = { version = "0.31", features = ["bundled"] }

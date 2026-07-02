@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 blake3.workspace = true
 k256.workspace = true
+chacha20poly1305.workspace = true
 bip39.workspace = true
 bip32.workspace = true
 rusqlite.workspace = true
