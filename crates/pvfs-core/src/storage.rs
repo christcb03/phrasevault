@@ -72,6 +72,31 @@ pub fn path_to_uri(path: &Path) -> Result<String> {
     Ok(format!("file://{p}"))
 }
 
+/// Atomic in-place replace for a **secure blob's** location (doc 12 §8.3) — the
+/// one deliberate exception to "location bytes are never overwritten": write to
+/// a sibling temp file, fsync, rename over the target. The superseded bytes are
+/// unlinked (logical deletion; physical remanence is documented out of scope —
+/// crypto-shredding is the envelope's job).
+pub fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| bad("path", format!("no parent directory: {}", path.display())))?;
+    fs::create_dir_all(dir).map_err(|e| PvfsError::io("create blob dir", e))?;
+    let tmp = dir.join(format!(
+        ".pvfs-secure-{}-{}.tmp",
+        std::process::id(),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("blob")
+    ));
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp).map_err(|e| PvfsError::io("write blob tmp", e))?;
+        f.write_all(bytes).map_err(|e| PvfsError::io("write blob tmp", e))?;
+        f.sync_all().map_err(|e| PvfsError::io("sync blob tmp", e))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| PvfsError::io("replace blob", e))
+}
+
 fn mtime_ms(md: &fs::Metadata) -> u64 {
     md.modified()
         .ok()

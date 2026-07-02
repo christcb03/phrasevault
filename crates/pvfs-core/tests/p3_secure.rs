@@ -119,6 +119,76 @@ fn secure_updates_are_write_gated_live_and_at_commit() {
 }
 
 #[test]
+fn secure_put_read_overwrite_and_tamper() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let blob = engine.add_node(&root, secure("vault.enc")).unwrap();
+    let blob_path = store.path().join("vault.enc");
+    let uri = pvfs_core::storage::path_to_uri(&blob_path).unwrap();
+
+    // No location yet: put refuses before touching anything.
+    assert!(matches!(
+        engine.secure_put_local(&blob, b"x"),
+        Err(PvfsError::BadInput { .. })
+    ));
+    engine.add_location(&blob, &uri).unwrap();
+
+    // Put v1: bytes land, ledger head matches, read verifies.
+    let h1 = engine.secure_put_local(&blob, b"ciphertext-one").unwrap();
+    assert_eq!(engine.secure_read(&blob).unwrap(), b"ciphertext-one");
+    assert_eq!(engine.secure_current(&blob).unwrap().unwrap().0, h1.to_vec());
+
+    // Overwrite: the OLD BYTES ARE GONE from disk — the deletability contract.
+    let h2 = engine.secure_put_local(&blob, b"v2").unwrap();
+    assert_ne!(h1, h2);
+    assert_eq!(std::fs::read(&blob_path).unwrap(), b"v2");
+    assert!(engine.secure_verify(&blob).unwrap());
+
+    // Tampered location bytes: verify says no, read refuses with Integrity.
+    std::fs::write(&blob_path, b"evil bytes").unwrap();
+    assert!(!engine.secure_verify(&blob).unwrap());
+    assert!(matches!(
+        engine.secure_read(&blob),
+        Err(PvfsError::Integrity { .. })
+    ));
+
+    // A fresh put repairs the blob (new bytes, new signed head).
+    engine.secure_put_local(&blob, b"v3").unwrap();
+    assert!(engine.secure_verify(&blob).unwrap());
+    engine.close().unwrap();
+}
+
+#[test]
+fn secure_location_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let blob = engine.add_node(&root, secure("one.enc")).unwrap();
+    let uri_a = pvfs_core::storage::path_to_uri(&store.path().join("a.enc")).unwrap();
+    let uri_b = pvfs_core::storage::path_to_uri(&store.path().join("b.enc")).unwrap();
+
+    // Exactly one location (doc 12 §8.3): a second, different one is refused;
+    // re-adding the same one is the usual idempotent no-op.
+    engine.add_location(&blob, &uri_a).unwrap();
+    engine.add_location(&blob, &uri_a).unwrap();
+    assert!(matches!(
+        engine.add_location(&blob, &uri_b),
+        Err(PvfsError::BadInput { .. })
+    ));
+
+    // Folders still take no locations; file nodes are untouched by all this.
+    let folder_node = engine.add_node(&root, folder("plain")).unwrap();
+    assert!(matches!(
+        engine.add_location(&folder_node, &uri_b),
+        Err(PvfsError::BadInput { .. })
+    ));
+    engine.close().unwrap();
+}
+
+#[test]
 fn secure_prepare_rejects_wrong_targets() {
     let dir = tempfile::tempdir().unwrap();
     let (mut engine, mn) = Engine::init(dir.path()).unwrap();

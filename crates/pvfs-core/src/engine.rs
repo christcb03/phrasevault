@@ -927,8 +927,14 @@ impl Engine {
             kind: "node",
             id: file.clone(),
         })?;
-        if n.node_type != node::TYPE_FILE {
-            return Err(bad("file", "locations can only be added to file nodes"));
+        if n.node_type == node::TYPE_SECURE {
+            // doc 12 §8.3: a secure blob takes exactly ONE location (v1).
+            let existing = self.locations(file)?;
+            if !existing.is_empty() && existing.iter().any(|u| u != uri) {
+                return Err(bad("uri", "a secure node takes exactly one location (doc 12 §8.3)"));
+            }
+        } else if n.node_type != node::TYPE_FILE {
+            return Err(bad("file", "locations can only be added to file or secure nodes"));
         }
         let t = now_ms();
         if n.is_temp {
@@ -2151,6 +2157,88 @@ impl Engine {
             )
             .optional()
             .map_err(map_db("secure blob head"))
+    }
+
+    /// The secure blob's single location (doc 12 §8.3), verified to exist and
+    /// be a `secure` node. Errors if no location has been added yet.
+    fn secure_location(&self, blob_id: &NodeId) -> Result<String> {
+        let node = fetch_node(&self.conn, blob_id)?.ok_or_else(|| PvfsError::NotFound {
+            kind: "node",
+            id: blob_id.clone(),
+        })?;
+        if node.node_type != node::TYPE_SECURE {
+            return Err(PvfsError::BadInput {
+                field: "node".into(),
+                reason: format!("{blob_id} is a {} node, not secure", node.node_type),
+            });
+        }
+        self.locations(blob_id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| PvfsError::BadInput {
+                field: "location".into(),
+                reason: format!("secure node {blob_id} has no location yet — add one"),
+            })
+    }
+
+    /// Phase 2 (doc 12 §8.3): replace the blob's ciphertext **in place**
+    /// (tmp + fsync + rename; superseded bytes unlinked) and advance the signed
+    /// ledger in the same call, authored by this device. Validation happens
+    /// before any bytes move; a crash between the write and the commit is
+    /// detected by [`secure_verify`](Self::secure_verify) as a mismatch.
+    /// Returns the new ciphertext hash.
+    pub fn secure_put_local(&mut self, blob_id: &NodeId, ciphertext: &[u8]) -> Result<[u8; 32]> {
+        self.ensure_device_active()?;
+        let uri = self.secure_location(blob_id)?;
+        let path = crate::storage::uri_to_path(&uri)?;
+        let hash: [u8; 32] = blake3::hash(ciphertext).into();
+        let me = self.device.pubkey();
+        // Reuse the full prepare validation (type + author-w), then self-sign.
+        let prep = self.prepare_secure_update(&me, blob_id, &hash, ciphertext.len() as u64)?;
+        let mut events = Vec::new();
+        for pe in prep.events {
+            let mut ev = pe.event;
+            ev.set_author_sig(crypto::sign_digest(&self.device.signing_key, &pe.digest)?);
+            events.push(ev);
+        }
+        crate::storage::atomic_overwrite(&path, ciphertext)?;
+        self.commit_member_write(events)?;
+        Ok(hash)
+    }
+
+    /// Phase 2: read the blob's ciphertext, **verifying it against the signed
+    /// ledger head first** — integrity-on-read without ever needing a key.
+    pub fn secure_read(&self, blob_id: &NodeId) -> Result<Vec<u8>> {
+        let (head, _size, _t, _a) =
+            self.secure_current(blob_id)?
+                .ok_or_else(|| PvfsError::NotFound {
+                    kind: "secure blob head",
+                    id: blob_id.clone(),
+                })?;
+        let uri = self.secure_location(blob_id)?;
+        let path = crate::storage::uri_to_path(&uri)?;
+        let bytes = std::fs::read(&path).map_err(|e| PvfsError::io("read secure blob", e))?;
+        let actual: [u8; 32] = blake3::hash(&bytes).into();
+        if actual.as_slice() != head.as_slice() {
+            return Err(PvfsError::Integrity {
+                kind: "secure blob",
+                id: blob_id.clone(),
+                reason: crate::error::IntegrityReason::IdMismatch {
+                    expected: hex::encode(&head),
+                    actual: hex::encode(actual),
+                },
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Phase 2: do the location bytes match the signed ledger head?
+    pub fn secure_verify(&self, blob_id: &NodeId) -> Result<bool> {
+        match self.secure_read(blob_id) {
+            Ok(_) => Ok(true),
+            Err(PvfsError::Integrity { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Phase 1 (doc 15 §1 A2): build the atomic **identity swap** — revoke the

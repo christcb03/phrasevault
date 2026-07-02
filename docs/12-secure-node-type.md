@@ -161,9 +161,14 @@ secure blobs, replica secure-erase.
    `secure_current`. Tests: update chain + head replacement, full-rebuild parity, no-grant refused at
    prepare, TOCTOU (prepared-while-granted, committed-after-revoke) refused at commit, wrong node
    type / unknown node refused.
-2. ☐ **Mutable storage** — overwrite-permitted location semantics for secure nodes (tmp+rename),
-   `secure create/put/cat --raw` engine-direct, `verify` integration; smoke: put→cat→overwrite→cat,
-   old bytes gone, hash mismatch quarantines.
+2. ☑ **Mutable storage** — `storage::atomic_overwrite` (tmp+fsync+rename, the one sanctioned
+   overwrite); `add_location` admits secure nodes with the one-location rule; engine
+   `secure_put_local` (validate → write bytes → advance the signed ledger, device-authored),
+   `secure_read` (integrity-on-read against the head), `secure_verify`; CLI
+   `pvfs secure create/put/cat/verify/status` (`--raw` required until phase 3 supplies the
+   envelope default). Tests: put/read/overwrite (old bytes gone from disk), tamper → verify false
+   + read Integrity, repair put, one-location rule, no-location refused. Smoke: the full
+   put→cat→overwrite→tamper→repair cycle + rc contracts.
 3. ☐ **Envelope + companion** — reference envelope (wrap/unwrap, multi-recipient), `2'/0'`
    encryption key in the companion + `secure_unwrap` request type/tier, `secure put/cat` default
    encrypt path + `secure grant`; tests incl. companion-gated decrypt end-to-end and a

@@ -543,6 +543,24 @@ assert_rc 1 "tenant wrong password rejected" -- \
 kill "$TPID" 2>/dev/null || true; wait "$TPID" 2>/dev/null || true
 TPID=""
 
+say "P3: secure blobs — mutable ciphertext + signed ledger (doc 12 §8)"
+SB="$DATA/secure-store"; mkdir -p "$SB"
+SNODE="$(jget "$($PVFS --json secure create "$ROOT" secrets.db "$SB/secrets.enc")" created)"
+[ -n "$SNODE" ] && ok "secure node created with its location" || fail "secure create"
+printf 'ciphertext-v1' | $PVFS secure put "$SNODE" - --raw >/dev/null && ok "secure put v1" || fail "secure put"
+[ "$($PVFS secure cat "$SNODE" --raw)" = "ciphertext-v1" ] && ok "secure cat verifies and returns the bytes" || fail "secure cat"
+printf 'ct-v2' | $PVFS secure put "$SNODE" - --raw >/dev/null
+[ "$(cat "$SB/secrets.enc")" = "ct-v2" ] && ok "overwrite in place — old ciphertext bytes are gone" || fail "overwrite"
+$PVFS secure verify "$SNODE" >/dev/null && ok "secure verify clean" || fail "secure verify"
+printf 'tampered!' > "$SB/secrets.enc"
+assert_rc 5 "tampered ciphertext refused at cat" -- $PVFS secure cat "$SNODE" --raw
+assert_rc 5 "tampered ciphertext fails verify" -- $PVFS secure verify "$SNODE"
+printf 'ct-v3' | $PVFS secure put "$SNODE" - --raw >/dev/null && ok "a fresh put repairs the blob" || fail "repair put"
+$PVFS secure verify "$SNODE" >/dev/null && ok "verify clean after repair" || fail "verify after repair"
+# The envelope path is phase 3: without --raw the CLI says so, cleanly.
+assert_rc 2 "non-raw put points at phase 3" -- $PVFS secure put "$SNODE" /dev/null
+$PVFS --json secure status "$SNODE" | grep -q '"size":5' && ok "ledger head tracks size" || fail "secure status"
+
 say "json error shape"
 $PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
 

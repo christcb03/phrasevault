@@ -118,6 +118,10 @@ enum Cmd {
     /// dual-signed handoff
     #[command(subcommand)]
     Member(MemberCmd),
+    /// Secure blobs (doc 12): encrypted-at-rest mutable content with a
+    /// content-free signed ledger
+    #[command(subcommand)]
+    Secure(SecureCmd),
     /// Access-control list operations (doc 06 §4)
     #[command(subcommand)]
     Acl(AclCmd),
@@ -330,6 +334,40 @@ enum MemberCmd {
         /// or `-` to read it from stdin
         handoff: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SecureCmd {
+    /// Create a secure node under a parent; `path` is where its ciphertext
+    /// will live (the one place PVFS overwrites in place — doc 12 §8.3)
+    Create {
+        /// Parent node (id, pvfs:// URI, or path under a mount)
+        parent: String,
+        label: String,
+        /// Absolute path for the ciphertext bytes
+        path: PathBuf,
+    },
+    /// Write the blob's bytes (a file, or `-` for stdin) and advance the
+    /// signed ledger. Old bytes are discarded — that's the point.
+    Put {
+        node: String,
+        input: String,
+        /// The bytes are ciphertext you encrypted yourself (doc 12 §5).
+        /// Without --raw, companion-envelope encryption applies (phase 3).
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Read the blob to stdout, verifying it against the signed ledger first
+    Cat {
+        node: String,
+        /// Emit the stored ciphertext without companion decryption
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Check the location bytes against the signed ledger head
+    Verify { node: String },
+    /// Show the ledger head (hash, size, when, by whom)
+    Status { node: String },
 }
 
 #[derive(Subcommand)]
@@ -1635,6 +1673,139 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             hex::encode(&new),
                             tags.len()
                         );
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Cmd::Secure(cmd) => {
+            let state_dir = ctx?;
+            match cmd {
+                SecureCmd::Create {
+                    parent,
+                    label,
+                    path,
+                } => {
+                    let parent_id = resolve_node_id(Ok(state_dir.clone()), &parent)?;
+                    let uri = pvfs_core::storage::path_to_uri(&path)?;
+                    let mut engine = Engine::open(&state_dir)?;
+                    let id = engine.add_node(
+                        &parent_id,
+                        NodeSpec {
+                            node_type: pvfs_core::TYPE_SECURE.into(),
+                            label: label.clone(),
+                            payload: Vec::new(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?;
+                    engine.add_location(&id, &uri)?;
+                    engine.close()?;
+                    if json {
+                        println!(
+                            "{{\"created\":\"{id}\",\"label\":\"{}\",\"location\":\"{}\"}}",
+                            json_escape(&label),
+                            json_escape(&uri)
+                        );
+                    } else {
+                        println!("created secure node {id} ({label}) at {uri}");
+                    }
+                    Ok(())
+                }
+                SecureCmd::Put { node, input, raw } => {
+                    if !raw {
+                        return Err(PvfsError::BadInput {
+                            field: "raw".into(),
+                            reason: "companion-envelope encryption lands in doc 12 §9 phase 3 — \
+                                     pass --raw to store ciphertext you encrypted yourself"
+                                .into(),
+                        });
+                    }
+                    let bytes = if input == "-" {
+                        use std::io::Read as _;
+                        let mut b = Vec::new();
+                        std::io::stdin()
+                            .read_to_end(&mut b)
+                            .map_err(|e| PvfsError::io("read stdin", e))?;
+                        b
+                    } else {
+                        std::fs::read(&input).map_err(|e| PvfsError::io("read input", e))?
+                    };
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
+                    let mut engine = Engine::open(&state_dir)?;
+                    let hash = engine.secure_put_local(&node_id, &bytes)?;
+                    engine.close()?;
+                    if json {
+                        println!(
+                            "{{\"updated\":\"{node_id}\",\"content_hash\":\"{}\",\"size\":{}}}",
+                            hex::encode(hash),
+                            bytes.len()
+                        );
+                    } else {
+                        println!("updated {node_id}: {} bytes, hash {}", bytes.len(), hex::encode(hash));
+                    }
+                    Ok(())
+                }
+                SecureCmd::Cat { node, raw } => {
+                    if !raw {
+                        return Err(PvfsError::BadInput {
+                            field: "raw".into(),
+                            reason: "companion-envelope decryption lands in doc 12 §9 phase 3 — \
+                                     pass --raw for the stored ciphertext"
+                                .into(),
+                        });
+                    }
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
+                    let engine = Engine::open(&state_dir)?;
+                    let bytes = engine.secure_read(&node_id)?;
+                    engine.close()?;
+                    use std::io::Write as _;
+                    std::io::stdout()
+                        .write_all(&bytes)
+                        .map_err(|e| PvfsError::io("write stdout", e))?;
+                    Ok(())
+                }
+                SecureCmd::Verify { node } => {
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
+                    let engine = Engine::open(&state_dir)?;
+                    let res = engine.secure_read(&node_id).map(|_| ());
+                    engine.close()?;
+                    let clean = res.is_ok();
+                    if json {
+                        println!("{{\"node\":\"{node_id}\",\"clean\":{clean}}}");
+                    } else {
+                        println!("{node_id}: {}", if clean { "clean" } else { "MISMATCH" });
+                    }
+                    res // the real Integrity error (expected vs actual hash) → rc 5
+                }
+                SecureCmd::Status { node } => {
+                    let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
+                    let engine = Engine::open(&state_dir)?;
+                    let head = engine.secure_current(&node_id)?;
+                    engine.close()?;
+                    match head {
+                        Some((hash, size, at, author)) => {
+                            if json {
+                                println!(
+                                    "{{\"node\":\"{node_id}\",\"content_hash\":\"{}\",\"size\":{size},\
+                                     \"updated_at\":{at},\"author\":\"{}\"}}",
+                                    hex::encode(&hash),
+                                    hex::encode(&author)
+                                );
+                            } else {
+                                println!("hash   : {}", hex::encode(&hash));
+                                println!("size   : {size} bytes");
+                                println!("updated: {at}");
+                                println!("author : {}", hex::encode(&author));
+                            }
+                        }
+                        None => {
+                            if json {
+                                println!("{{\"node\":\"{node_id}\",\"content_hash\":null}}");
+                            } else {
+                                println!("(no updates yet)");
+                            }
+                        }
                     }
                     Ok(())
                 }
