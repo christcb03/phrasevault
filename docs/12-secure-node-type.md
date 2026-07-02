@@ -1,6 +1,6 @@
 # PVFS — Secure Node Type / Encryption-at-Rest (12)
 
-Status: **Proposed (design input)** — PVOS-driven (the Messenger app); the P3 driver.
+Status: **Buildable design** (§8–§9 added 2026-07-02; §1–§7 are the original design input) — PVOS-driven (the Messenger app); the P3 driver.
 Date: 2026-06-21
 Depends on: [01 (core engine)](01-core-engine-design.md), [02 (P0 spec)](02-p0-core-engine-spec.md), [04 (storage/FS ops)](04-p1-storage-and-fs-ops-spec.md), [11 (compaction)](11-compaction-and-verifiable-snapshots.md)
 Motivation: a **privacy-first messenger** (and any app storing data the server must not read or retain forever) needs storage that is **encrypted so the server can't read it** and **truly deletable** — which the append-only log resists. This is the same crypto core as the original PhraseVault (envelope encryption, client-side decryption, server-as-blob-store).
@@ -66,3 +66,106 @@ App-level concerns PVFS does **not** implement (the app/secure-module-above does
 4. **TEE / confidential computing** (decrypt on an untrusted host without it seeing memory) — a **later enhancement**, not P3-launch (PVOS DECISIONS D24).
 
 Full app-side architecture: PVOS `docs/examples/messenger-app.md`.
+
+---
+
+## 8. Buildable design (settles §7; decisions marked, 2026-07-02)
+
+### 8.1 The node
+
+A third node type, `TYPE_SECURE = "secure"`. `NodeCreated` is unchanged on the wire — the type
+string selects the behavior. A secure node's **identity** is its node id (stable, minted at
+creation like any node); its **content** is described only by the moving hash in the projection
+(§8.2), never by the node row. Labels stay plaintext (they're metadata the owner chose to expose;
+apps that want opaque labels use opaque strings).
+
+### 8.2 The ledger event
+
+One new event kind, member-event class:
+
+```
+SecureBlobUpdated {
+    blob_id:      NodeId,     // the secure node
+    content_hash: [u8; 32],   // hash of the NEW ciphertext bytes (§8.4)
+    size:         u64,        // ciphertext length (integrity + quota, not content)
+    updated_at:   u64,
+    author:       Vec<u8>,    // must hold WRITE (w) on the node; replay-enforced
+    sig:          Vec<u8>,
+}
+```
+
+Projection: `secure_blobs (blob_id PK, content_hash, size, updated_at, author)` — **last write
+wins**, previous rows overwritten (the whole point: the log keeps the content-free transition
+chain; the projection keeps only "current"). Replay/commit rule: author holds `w` on `blob_id`
+(same `require_right` as writes), node exists and is `secure`.
+
+### 8.3 Mutable location (§7.1 — DECIDED)
+
+A secure node takes **exactly one location** (v1), added with the existing `FileLocationAdded`.
+The storage layer treats a location on a `secure` node as **overwrite-permitted**: `secure put`
+writes the new ciphertext to a temp file in the same directory, fsyncs, and **renames over** the
+old bytes (atomic on POSIX; discarded bytes are unlinked). No overwrite of location bytes is ever
+permitted for `file` nodes — the existing quarantine-on-mismatch behavior stays their contract.
+**Secure-erase guarantee (§7.3 — DECIDED: documented limit):** PVFS guarantees *logical* deletion
+(the bytes are no longer referenced and the projection hash moves); physical remanence
+(filesystem journals, SSD wear-leveling, replicas, backups) is explicitly out of scope —
+crypto-shredding (discarding the content key) is the real erasure, and that is the app's/envelope's
+job. `verify` on a secure node = hash the location bytes against the projected hash.
+
+### 8.4 Hash domain (§7.2 — DECIDED: ciphertext hash)
+
+The log hashes **ciphertext**. It's what the daemon can verify without keys, what replicas hold,
+and what `verify` checks. Apps that need a plaintext-agreement digest put it *inside* the
+authenticated envelope.
+
+### 8.5 Envelope + companion gating (the `2'` branch)
+
+PVFS ships a **reference envelope** (one canonical format, apps may bring their own):
+
+- **Content key**: random 32 bytes; ciphertext = XChaCha20-Poly1305(content key) — same AEAD as
+  the vault, one crypto suite in the codebase.
+- **Wraps**: the content key encrypted to one or more **recipient public keys** via ECIES-style
+  ECDH on secp256k1 (ephemeral key + HKDF → AEAD) — one wrap per credential, any one unwraps
+  (§3). The envelope file/bytes: version, wraps `[{recipient_pubkey, ephemeral_pub, wrapped_key}]`,
+  nonce, ciphertext.
+- **The owner's encryption key** is `m/43'/20566'/2'/0'` — derived and custodied **only by the
+  companion**, like the identity key. New companion request type `secure_unwrap` (tier: same row
+  as identity ops — **auto while unlocked, local only**; never web, never a tenant token op).
+  The companion returns the unwrapped **content key**, not the private key. Daemon and `pvfsd`
+  never see keys or plaintext (§3): encrypt/decrypt happen in the client (CLI/app) with the
+  companion supplying the unwrap.
+
+### 8.6 Surface
+
+- **Engine**: `prepare_secure_update(author, blob_id, hash, size)`; `secure_current(blob_id)`;
+  secure nodes excluded from content dedupe/scan paths.
+- **CLI** (prompt-first): `pvfs secure create <parent> <label>`; `pvfs secure put <node> [file]`
+  (encrypts via the companion envelope by default, `--raw` for app-supplied ciphertext; writes
+  bytes, commits the ledger event — auto-routes through the daemon like other writes);
+  `pvfs secure cat <node>` (verifies hash, decrypts via companion; `--raw` for ciphertext out);
+  `pvfs secure grant <node> <pubkey>` (re-wrap the content key for a recipient — client-side,
+  since only a key-holder can).
+- **Daemon**: ciphertext up/down over the existing raw data plane + the signed update in the
+  member-write path; ACL-checked identically live and at replay.
+
+### 8.7 Non-goals (v1, unchanged from §5)
+
+Ratchets, group epochs, delivery, per-message keys, TEE (§7.4 stays post-1.0), multi-location
+secure blobs, replica secure-erase.
+
+## 9. Build plan (phased, pipeline-verifiable)
+
+1. ☐ **Kernel** — `TYPE_SECURE`, `SecureBlobUpdated` (encode/decode/digest/sig), projection table
+   + last-write-wins apply, commit/replay author-`w` rule, `prepare_secure_update` +
+   `secure_current`; unit + integration tests (update chain, non-writer refused, wrong-type refused,
+   replay parity).
+2. ☐ **Mutable storage** — overwrite-permitted location semantics for secure nodes (tmp+rename),
+   `secure create/put/cat --raw` engine-direct, `verify` integration; smoke: put→cat→overwrite→cat,
+   old bytes gone, hash mismatch quarantines.
+3. ☐ **Envelope + companion** — reference envelope (wrap/unwrap, multi-recipient), `2'/0'`
+   encryption key in the companion + `secure_unwrap` request type/tier, `secure put/cat` default
+   encrypt path + `secure grant`; tests incl. companion-gated decrypt end-to-end and a
+   no-companion → ciphertext-only proof.
+4. ☐ **Daemon path** — secure put/cat over the socket (raw plane + signed update), multi-user
+   smoke: member with `w` updates, member without is refused, anon sees nothing.
+5. ☐ **Docs + audit** — USER-MANUAL section, `pvfs audit`/`verify` coverage notes, doc 08 rows.
