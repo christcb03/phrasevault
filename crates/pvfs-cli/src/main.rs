@@ -338,14 +338,17 @@ enum MemberCmd {
 
 #[derive(Subcommand)]
 enum SecureCmd {
-    /// Create a secure node under a parent; `path` is where its ciphertext
-    /// will live (the one place PVFS overwrites in place — doc 12 §8.3)
+    /// Create a secure node under a parent. Storage is managed by default
+    /// (allocated on first write) so apps provision on the fly, even with the
+    /// daemon running; `--path` pins an explicit ciphertext location instead.
     Create {
         /// Parent node (id, pvfs:// URI, or path under a mount)
         parent: String,
         label: String,
-        /// Absolute path for the ciphertext bytes
-        path: PathBuf,
+        /// Pin the ciphertext to an explicit absolute path (local/advanced;
+        /// default is a managed location under the forest)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Write the blob's bytes (a file, or `-` for stdin) and advance the
     /// signed ledger. By default the bytes are encrypted to you via the
@@ -917,6 +920,17 @@ fn companion_unwrap(
             field: "companion".into(),
             reason: "unexpected companion response".into(),
         }),
+    }
+}
+
+/// A `NodeSpec` for a secure node (doc 12) with the given label.
+fn secure_spec(label: &str) -> NodeSpec {
+    NodeSpec {
+        node_type: pvfs_core::TYPE_SECURE.into(),
+        label: label.into(),
+        payload: Vec::new(),
+        is_temp: false,
+        creation_nonce: None,
     }
 }
 
@@ -1741,28 +1755,33 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     path,
                 } => {
                     let parent_id = resolve_node_id(Ok(state_dir.clone()), &parent)?;
-                    let uri = pvfs_core::storage::path_to_uri(&path)?;
-                    let mut engine = Engine::open(&state_dir)?;
-                    let id = engine.add_node(
-                        &parent_id,
-                        NodeSpec {
-                            node_type: pvfs_core::TYPE_SECURE.into(),
-                            label: label.clone(),
-                            payload: Vec::new(),
-                            is_temp: false,
-                            creation_nonce: None,
-                        },
-                    )?;
-                    engine.add_location(&id, &uri)?;
-                    engine.close()?;
-                    if json {
-                        println!(
-                            "{{\"created\":\"{id}\",\"label\":\"{}\",\"location\":\"{}\"}}",
-                            json_escape(&label),
-                            json_escape(&uri)
-                        );
+                    // Auto-route through the daemon if one runs, so apps create
+                    // stores on the fly without stopping the filesystem. A pinned
+                    // --path forces the direct engine path (the daemon uses managed
+                    // storage only).
+                    let id = if path.is_none() {
+                        if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                            client
+                                .secure_create(&parent_id, &label, |d| sign(d))
+                                .map_err(remote_err)?
+                        } else {
+                            let mut engine = Engine::open(&state_dir)?;
+                            let id = engine.add_node(&parent_id, secure_spec(&label))?;
+                            engine.close()?;
+                            id
+                        }
                     } else {
-                        println!("created secure node {id} ({label}) at {uri}");
+                        let uri = pvfs_core::storage::path_to_uri(path.as_ref().unwrap())?;
+                        let mut engine = Engine::open(&state_dir)?;
+                        let id = engine.add_node(&parent_id, secure_spec(&label))?;
+                        engine.add_location(&id, &uri)?;
+                        engine.close()?;
+                        id
+                    };
+                    if json {
+                        println!("{{\"created\":\"{id}\",\"label\":\"{}\"}}", json_escape(&label));
+                    } else {
+                        println!("created secure node {id} ({label})");
                     }
                     Ok(())
                 }

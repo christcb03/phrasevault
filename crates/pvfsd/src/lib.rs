@@ -370,26 +370,18 @@ fn do_secure_put(
     let id: NodeId = node.to_string();
     let hash: [u8; 32] = blake3::hash(&ciphertext).into();
 
-    // Under the lock: validate (author holds w + node is secure) and resolve
-    // the path. Prepare BEFORE any bytes move, so an unauthorized write is
-    // rejected without touching storage.
+    // Under the lock: validate (author holds w + node is secure), allocate the
+    // managed location on first write, and resolve the path. Prepare BEFORE any
+    // bytes move, so an unauthorized write is rejected without touching storage.
     let (prepared, path) = {
         let e = daemon.engine.lock().unwrap();
-        let prepared = match e.prepare_secure_update(&author, &id, &hash, ciphertext.len() as u64) {
-            Ok(p) => p,
+        match e.prepare_secure_write(&author, &id, &hash, ciphertext.len() as u64) {
+            Ok(pw) => pw,
             Err(pve) => {
                 write_msg(stream, &err_from(pve))?;
                 return Ok(());
             }
-        };
-        let path = match e.secure_location_path(&id) {
-            Ok(p) => p,
-            Err(pve) => {
-                write_msg(stream, &err_from(pve))?;
-                return Ok(());
-            }
-        };
-        (prepared, path)
+        }
     }; // lock released before the write
 
     if let Err(pve) = pvfs_core::storage::atomic_overwrite(&path, &ciphertext) {
@@ -435,6 +427,17 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
                 &parent,
                 NodeSpec {
                     node_type: TYPE_FOLDER.into(),
+                    label,
+                    payload: Vec::new(),
+                    is_temp: false,
+                    creation_nonce: None,
+                },
+            ),
+            WriteOp::SecureCreate { parent, label } => e.prepare_add_node(
+                &author,
+                &parent,
+                NodeSpec {
+                    node_type: pvfs_core::TYPE_SECURE.into(),
                     label,
                     payload: Vec::new(),
                     is_temp: false,

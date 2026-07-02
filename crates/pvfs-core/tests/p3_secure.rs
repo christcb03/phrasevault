@@ -127,12 +127,6 @@ fn secure_put_read_overwrite_and_tamper() {
     let blob = engine.add_node(&root, secure("vault.enc")).unwrap();
     let blob_path = store.path().join("vault.enc");
     let uri = pvfs_core::storage::path_to_uri(&blob_path).unwrap();
-
-    // No location yet: put refuses before touching anything.
-    assert!(matches!(
-        engine.secure_put_local(&blob, b"x"),
-        Err(PvfsError::BadInput { .. })
-    ));
     engine.add_location(&blob, &uri).unwrap();
 
     // Put v1: bytes land, ledger head matches, read verifies.
@@ -157,6 +151,30 @@ fn secure_put_read_overwrite_and_tamper() {
     // A fresh put repairs the blob (new bytes, new signed head).
     engine.secure_put_local(&blob, b"v3").unwrap();
     assert!(engine.secure_verify(&blob).unwrap());
+    engine.close().unwrap();
+}
+
+#[test]
+fn secure_put_auto_allocates_a_managed_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    // A secure node created with NO location — the app never chose a path.
+    let blob = engine.add_node(&root, secure("chat.enc")).unwrap();
+    assert!(engine.secure_current(&blob).unwrap().is_none());
+
+    // First put allocates a managed location under the forest, writes, and
+    // advances the ledger — all in one go.
+    engine.secure_put_local(&blob, b"first ciphertext").unwrap();
+    assert_eq!(engine.secure_read(&blob).unwrap(), b"first ciphertext");
+    // The managed path lives under <data_dir>/secure/<blob_id>.
+    let managed = dir.path().join("secure").join(&blob);
+    assert!(managed.exists(), "ciphertext should be at the managed path");
+
+    // A second put reuses the same location (no duplicate).
+    engine.secure_put_local(&blob, b"second").unwrap();
+    assert_eq!(engine.secure_read(&blob).unwrap(), b"second");
+    assert_eq!(engine.locations(&blob).unwrap().len(), 1);
     engine.close().unwrap();
 }
 

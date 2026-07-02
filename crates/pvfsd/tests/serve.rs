@@ -491,3 +491,46 @@ fn daemon_secure_put_and_cat_multi_user() {
         .unwrap();
     assert_eq!(r.secure_cat(&blob).unwrap(), b"v2 bytes");
 }
+
+/// Doc 12 §8.5: an app (or member) **creates** a secure store on the fly over
+/// the daemon — no path, no stopping the filesystem — then writes and reads it.
+/// This is the messenger "new chat = new encrypted store" case.
+#[test]
+fn daemon_creates_secure_store_on_the_fly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    // The owner's admin device (authorized at init) is our authenticated client.
+    let dev = identity::device_key(&owner_mn, "", 0).unwrap();
+    let dev_pub = crypto::pubkey_bytes(&dev);
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(engine));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let mut c = Client::connect_signed(&sock, &dev_pub, |d| crypto::sign_digest(&dev, d).unwrap())
+        .unwrap();
+    // Create the store — daemon stays up the whole time.
+    let blob = c
+        .secure_create(&root, "chat-42", |d| crypto::sign_digest(&dev, d).unwrap())
+        .unwrap();
+    // Write to it immediately; the managed location is allocated on this first put.
+    c.secure_put(&blob, b"first message ciphertext", |d| crypto::sign_digest(&dev, d).unwrap())
+        .unwrap();
+    assert_eq!(c.secure_cat(&blob).unwrap(), b"first message ciphertext");
+    // And a second store, still live.
+    let blob2 = c
+        .secure_create(&root, "chat-43", |d| crypto::sign_digest(&dev, d).unwrap())
+        .unwrap();
+    assert_ne!(blob, blob2);
+    c.secure_put(&blob2, b"other chat", |d| crypto::sign_digest(&dev, d).unwrap())
+        .unwrap();
+    assert_eq!(c.secure_cat(&blob2).unwrap(), b"other chat");
+}

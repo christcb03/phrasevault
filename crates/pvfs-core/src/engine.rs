@@ -2187,6 +2187,89 @@ impl Engine {
         crate::storage::uri_to_path(&self.secure_location(blob_id)?)
     }
 
+    /// The **managed** ciphertext location for a secure blob (doc 12 §8.3):
+    /// `<data_dir>/secure/<blob_id>`, allocated on the blob's first write so an
+    /// app never chooses a filesystem path (and a member can't point a location
+    /// at an arbitrary owner path). Deterministic from the node id.
+    pub fn secure_managed_uri(&self, blob_id: &NodeId) -> Result<String> {
+        let base = std::fs::canonicalize(&self.data_dir)
+            .map_err(|e| PvfsError::io("resolve data dir", e))?;
+        crate::storage::path_to_uri(&base.join("secure").join(blob_id))
+    }
+
+    /// Phase 1 (doc 12 §8.3/§8.5): prepare a secure write — the `SecureBlobUpdated`
+    /// ledger event, plus a `FileLocationAdded` for the **managed** location when
+    /// the blob has none yet (first write). So `secure create` needs only mint the
+    /// node; the location materializes here, works identically local or over the
+    /// daemon, and needs no path from the caller. Returns the prepared events and
+    /// the filesystem path the ciphertext bytes go to. Author must hold write.
+    pub fn prepare_secure_write(
+        &self,
+        author_pub: &[u8],
+        blob_id: &NodeId,
+        content_hash: &[u8; 32],
+        size: u64,
+    ) -> Result<(PreparedWrite, std::path::PathBuf)> {
+        let node = fetch_node(&self.conn, blob_id)?.ok_or_else(|| PvfsError::NotFound {
+            kind: "node",
+            id: blob_id.clone(),
+        })?;
+        if node.node_type != node::TYPE_SECURE {
+            return Err(PvfsError::BadInput {
+                field: "node".into(),
+                reason: format!("{blob_id} is a {} node, not secure", node.node_type),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, blob_id)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "write secure blob".into(),
+                reason: format!("author lacks write (w) on {blob_id}"),
+            });
+        }
+        let t = now_ms();
+        let mut events = Vec::new();
+        // Allocate the managed location on the first write.
+        let uri = match self.locations(blob_id)?.into_iter().next() {
+            Some(existing) => existing,
+            None => {
+                let uri = self.secure_managed_uri(blob_id)?;
+                let digest = event::msg_file_location_added(blob_id, &uri, t, author_pub);
+                events.push(PreparedEvent {
+                    digest,
+                    event: Event::FileLocationAdded {
+                        file_id: blob_id.clone(),
+                        uri: uri.clone(),
+                        added_at: t,
+                        author: author_pub.to_vec(),
+                        sig: Vec::new(),
+                    },
+                });
+                uri
+            }
+        };
+        let path = crate::storage::uri_to_path(&uri)?;
+        let digest = event::msg_secure_blob_updated(blob_id, content_hash, size, t, author_pub);
+        events.push(PreparedEvent {
+            digest,
+            event: Event::SecureBlobUpdated {
+                blob_id: blob_id.clone(),
+                content_hash: content_hash.to_vec(),
+                size,
+                updated_at: t,
+                author: author_pub.to_vec(),
+                sig: Vec::new(),
+            },
+        });
+        Ok((
+            PreparedWrite {
+                result_id: blob_id.clone(),
+                events,
+            },
+            path,
+        ))
+    }
+
     /// Phase 2 (doc 12 §8.3): replace the blob's ciphertext **in place**
     /// (tmp + fsync + rename; superseded bytes unlinked) and advance the signed
     /// ledger in the same call, authored by this device. Validation happens
@@ -2195,12 +2278,11 @@ impl Engine {
     /// Returns the new ciphertext hash.
     pub fn secure_put_local(&mut self, blob_id: &NodeId, ciphertext: &[u8]) -> Result<[u8; 32]> {
         self.ensure_device_active()?;
-        let uri = self.secure_location(blob_id)?;
-        let path = crate::storage::uri_to_path(&uri)?;
         let hash: [u8; 32] = blake3::hash(ciphertext).into();
         let me = self.device.pubkey();
-        // Reuse the full prepare validation (type + author-w), then self-sign.
-        let prep = self.prepare_secure_update(&me, blob_id, &hash, ciphertext.len() as u64)?;
+        // Full validation (type + author-w) and location allocation, then self-sign.
+        let (prep, path) =
+            self.prepare_secure_write(&me, blob_id, &hash, ciphertext.len() as u64)?;
         let mut events = Vec::new();
         for pe in prep.events {
             let mut ev = pe.event;

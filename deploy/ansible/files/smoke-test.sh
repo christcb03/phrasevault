@@ -302,6 +302,15 @@ $PVFS remote --socket "$SOCK" add-location "$MFILE" "file://$DMOUNT/uploaded-blo
   && ok "member added a file location"
 [ "$($PVFS remote --socket "$SOCK" cat "$MFILE")" = "member-bytes" ] \
   && ok "member reads back its own file content" || fail "member cat mismatch"
+# secure store created + written + read on the fly WHILE the daemon serves
+# (doc 12 §8.5): the messenger "new chat = new encrypted store" case. These
+# auto-route through the running daemon (managed location, no path, no restart).
+SSNODE="$(jget "$($PVFS --json --data-dir "$DMOUNT/.pvfs" secure create "$DROOT" chat-1)" created)"
+[ ${#SSNODE} -eq 64 ] && ok "secure store created over the LIVE daemon (no restart)" || fail "secure create over daemon: $SSNODE"
+printf 'msg-ciphertext' | $PVFS --data-dir "$DMOUNT/.pvfs" secure put "$SSNODE" - --raw >/dev/null \
+  && ok "secure put over the live daemon (managed location auto-allocated)" || fail "secure put over daemon"
+[ "$($PVFS --data-dir "$DMOUNT/.pvfs" secure cat "$SSNODE" --raw)" = "msg-ciphertext" ] \
+  && ok "secure cat over the live daemon round-trips" || fail "secure cat over daemon"
 # member moves the "uploaded" folder under a new "archive" folder
 DEST="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" archive)" created)"
 UPLOADED_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DROOT")" uploaded)"
@@ -547,8 +556,8 @@ TPID=""
 
 say "P3: secure blobs — mutable ciphertext + signed ledger (doc 12 §8)"
 SB="$DATA/secure-store"; mkdir -p "$SB"
-SNODE="$(jget "$($PVFS --json secure create "$ROOT" secrets.db "$SB/secrets.enc")" created)"
-[ -n "$SNODE" ] && ok "secure node created with its location" || fail "secure create"
+SNODE="$(jget "$($PVFS --json secure create "$ROOT" secrets.db --path "$SB/secrets.enc")" created)"
+[ -n "$SNODE" ] && ok "secure node created with a pinned location" || fail "secure create"
 printf 'ciphertext-v1' | $PVFS secure put "$SNODE" - --raw >/dev/null && ok "secure put v1" || fail "secure put"
 [ "$($PVFS secure cat "$SNODE" --raw)" = "ciphertext-v1" ] && ok "secure cat verifies and returns the bytes" || fail "secure cat"
 printf 'ct-v2' | $PVFS secure put "$SNODE" - --raw >/dev/null
@@ -574,7 +583,7 @@ PVFS_COMPANION_PASSPHRASE=encpass "$COMPANION" serve --vault "$EVAULT" --socket 
 EPID=$!
 for _ in $(seq 1 50); do [ -S "$ESOCK" ] && break; sleep 0.1; done
 [ -S "$ESOCK" ] && ok "enc companion serving" || fail "enc socket missing"
-ENODE="$(jget "$($PVFS --json --data-dir "$DATA/enc-forest/.pvfs" secure create "$EROOT" note "$ESTORE/note.enc")" created)"
+ENODE="$(jget "$($PVFS --json --data-dir "$DATA/enc-forest/.pvfs" secure create "$EROOT" note --path "$ESTORE/note.enc")" created)"
 # Default put encrypts via the companion; the on-disk bytes are NOT the plaintext.
 printf 'dear diary' | $PVFS --data-dir "$DATA/enc-forest/.pvfs" secure put "$ENODE" - --companion-socket "$ESOCK" >/dev/null \
   && ok "secure put (companion-encrypted)" || fail "encrypted put"

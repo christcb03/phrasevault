@@ -198,6 +198,22 @@ impl Client {
         }
     }
 
+    /// Create a secure node under `parent` (doc 12) with a managed ciphertext
+    /// location — provision storage on the fly without stopping the daemon.
+    /// Returns the new node id.
+    pub fn secure_create<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::SecureCreate {
+                parent: parent.into(),
+                label: label.into(),
+            },
+            sign,
+        )
+    }
+
     /// Download a secure blob's ciphertext (doc 12 §8) — the daemon verifies it
     /// against the signed ledger before streaming; decryption is the caller's job.
     pub fn secure_cat(&mut self, node: &str) -> Result<Vec<u8>> {

@@ -64,6 +64,10 @@ pub enum ServerMsg {
 pub enum WriteOp {
     /// Create a folder named `label` under `parent`.
     Mkdir { parent: String, label: String },
+    /// Create a **secure** node (doc 12) named `label` under `parent`. Its
+    /// ciphertext location is managed — allocated on the first `SecurePut` — so
+    /// an app provisions storage on the fly without ever choosing a path.
+    SecureCreate { parent: String, label: String },
     /// Create a file node named `label` under `parent` (metadata only; bytes are
     /// recorded separately by a location).
     AddFile {

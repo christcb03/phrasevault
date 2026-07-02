@@ -101,8 +101,12 @@ chain; the projection keeps only "current"). Replay/commit rule: author holds `w
 
 ### 8.3 Mutable location (§7.1 — DECIDED)
 
-A secure node takes **exactly one location** (v1), added with the existing `FileLocationAdded`.
-The storage layer treats a location on a `secure` node as **overwrite-permitted**: `secure put`
+A secure node takes **exactly one location** (v1). It is normally **managed** —
+`<data_dir>/secure/<node_id>`, allocated automatically on the blob's first write (§8.6), so an app
+never chooses a filesystem path and a member can't point storage at an arbitrary owner path — with
+an explicit `--path` escape hatch for local/advanced use. Either way it is added with the existing
+`FileLocationAdded`. The storage layer treats a location on a `secure` node as
+**overwrite-permitted**: `secure put`
 writes the new ciphertext to a temp file in the same directory, fsyncs, and **renames over** the
 old bytes (atomic on POSIX; discarded bytes are unlinked). No overwrite of location bytes is ever
 permitted for `file` nodes — the existing quarantine-on-mismatch behavior stays their contract.
@@ -189,6 +193,14 @@ secure blobs, replica secure-erase.
    ciphertext). Integration test (`daemon_secure_put_and_cat_multi_user`): a member with `w`
    updates over the socket, the daemon writes exactly the uploaded bytes (no decryption), a
    read-only member downloads the verified ciphertext, and a member without `w` is refused; 256 MB
-   upload cap. **Known limitation (v1):** `secure create` is owner-direct (no daemon op yet), so
-   create the node before serving; blob *updates* — the hot path — go through the daemon.
+   upload cap.
+4.5. ☑ **Create over the daemon (on the fly)** — apps provision a secure store *while the daemon
+   serves*, no restart, no path chosen: `WriteOp::SecureCreate` mints the node, and its ciphertext
+   location is a **managed** path (`<data_dir>/secure/<node_id>`) allocated on the first write by
+   `prepare_secure_write` (which emits the `FileLocationAdded` + `SecureBlobUpdated` in one
+   member-signed commit). So `secure create` needs no location, a member can't point storage at an
+   arbitrary owner path, and the messenger "new chat = new encrypted store" case just works.
+   `--path` still pins an explicit location for local/advanced use. Integration test
+   (`daemon_creates_secure_store_on_the_fly`) + engine test (managed-location auto-allocation) +
+   smoke (create→put→cat over the live daemon).
 5. ☐ **Docs + audit** — USER-MANUAL section, `pvfs audit`/`verify` coverage notes, doc 08 rows.
