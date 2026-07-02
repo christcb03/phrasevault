@@ -118,7 +118,7 @@ impl UnlockedSigner {
         Ok((next, old, new))
     }
 
-    fn key_for(&self, role: KeyRole) -> Result<k256::ecdsa::SigningKey, SignerError> {
+    fn key_for(&self, role: KeyRole) -> Result<identity::SigningKey, SignerError> {
         match role {
             KeyRole::Root => identity::root_key(&self.mnemonic, ""),
             KeyRole::Identity => identity::identity_key(&self.mnemonic, "", self.identity_id),

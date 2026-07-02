@@ -61,6 +61,7 @@ fn describe(request: RequestType, origin: Origin) -> String {
         }
         RequestType::IdentityTag => "identity signature: a tag grant or membership under your authority",
         RequestType::IdentityAssertion => "identity assertion: prove who you are (sign-in)",
+        RequestType::SecureUnwrap => "decrypt a secure blob (unwrap its content key)",
     };
     let from = match origin {
         Origin::Local => "this machine",

@@ -15,7 +15,7 @@ use std::path::Path;
 
 use bip39::Language;
 pub use bip39::Mnemonic;
-use k256::ecdsa::SigningKey;
+pub use k256::ecdsa::SigningKey;
 
 use crate::crypto;
 use crate::error::{PvfsError, Result};

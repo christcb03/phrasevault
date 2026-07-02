@@ -56,10 +56,15 @@ impl ApprovalPolicy {
             (RequestType::RootDeviceCert, _) => yes_or_prompt(self.auto_root),
             // Anything from a web origin: bind to a per-origin connect (prompt) unless auto.
             (_, Origin::Web) => yes_or_prompt(self.auto_web_origin),
-            // The human's own identity ops, initiated locally: friction-free while unlocked.
-            (RequestType::IdentityTag | RequestType::IdentityAssertion, Origin::Local) => {
-                yes_or_prompt(self.auto_identity_local)
-            }
+            // The human's own identity ops + secure-blob decryption, initiated
+            // locally: friction-free while unlocked (doc 12 §8.5). A web origin
+            // never reaches here — it hit the Origin::Web arm above.
+            (
+                RequestType::IdentityTag
+                | RequestType::IdentityAssertion
+                | RequestType::SecureUnwrap,
+                Origin::Local,
+            ) => yes_or_prompt(self.auto_identity_local),
         }
     }
 
