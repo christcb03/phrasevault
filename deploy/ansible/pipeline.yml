@@ -16,12 +16,12 @@
   vars:
     pvfs_src: /opt/pvfs/src
     pvfs_bin: /usr/local/bin/pvfs
-    pvfs_user_bin: "{{ ansible_env.HOME }}/.local/bin"
+    pvfs_user_bin: "{{ ansible_facts.env.HOME }}/.local/bin"
     # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
     daemon_forest: smoke
-    daemon_mount: "{{ ansible_env.HOME }}/pvfs-mounts/{{ daemon_forest }}"
+    daemon_mount: "{{ ansible_facts.env.HOME }}/pvfs-mounts/{{ daemon_forest }}"
     cargo_env:
-      PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+      PATH: "{{ ansible_facts.env.HOME }}/.cargo/bin:{{ ansible_facts.env.PATH }}"
       CARGO_TERM_COLOR: never
     # systemctl --user over ssh needs the user manager's runtime dir + bus.
     user_systemd_env:
@@ -42,7 +42,7 @@
 
     - name: Check for rustup
       ansible.builtin.stat:
-        path: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+        path: "{{ ansible_facts.env.HOME }}/.cargo/bin/cargo"
       register: cargo_stat
       tags: [prepare]
 
@@ -62,7 +62,7 @@
       ansible.builtin.file:
         path: "{{ pvfs_src }}"
         state: directory
-        owner: "{{ ansible_user_id }}"
+        owner: "{{ ansible_facts.user_id }}"
         mode: "0755"
       tags: [deploy]
 
@@ -151,7 +151,7 @@
         mode: "0755"
       loop:
         - "{{ pvfs_user_bin }}"
-        - "{{ ansible_env.HOME }}/.config/systemd/user"
+        - "{{ ansible_facts.env.HOME }}/.config/systemd/user"
         - "{{ daemon_mount }}"
       tags: [daemon]
 
@@ -180,15 +180,15 @@
 
     - name: Enable lingering so the user manager (and pvfsd) survives logout
       become: true
-      ansible.builtin.command: loginctl enable-linger {{ ansible_user_id }}
+      ansible.builtin.command: loginctl enable-linger {{ ansible_facts.user_id }}
       args:
-        creates: "/var/lib/systemd/linger/{{ ansible_user_id }}"
+        creates: "/var/lib/systemd/linger/{{ ansible_facts.user_id }}"
       tags: [daemon]
 
     - name: Install the pvfsd@ user unit
       ansible.builtin.copy:
         src: files/pvfsd@.service
-        dest: "{{ ansible_env.HOME }}/.config/systemd/user/pvfsd@.service"
+        dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/pvfsd@.service"
         mode: "0644"
       tags: [daemon]
 

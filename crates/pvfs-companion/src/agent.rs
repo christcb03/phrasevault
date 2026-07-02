@@ -326,7 +326,7 @@ impl Agent {
             let sig_new = next
                 .sign(RequestType::IdentityAssertion, &digest)
                 .map_err(|e| e.to_string())?;
-            Ok((next, old, new, sig_old, sig_new))
+            Ok::<_, String>((next, old, new, sig_old, sig_new))
         });
         let (next, old, new, sig_old, sig_new) = match prepared {
             Ok(Ok(v)) => v,
