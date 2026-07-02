@@ -181,6 +181,14 @@ secure blobs, replica secure-erase.
    grant, raw-isn't-an-envelope); companion socket unwrap integration; smoke proves default-encrypt
    → on-disk bytes are NOT the plaintext → companion-decrypt round-trips → `--raw` shows the opaque
    envelope → grant + verify.
-4. ☐ **Daemon path** — secure put/cat over the socket (raw plane + signed update), multi-user
-   smoke: member with `w` updates, member without is refused, anon sees nothing.
+4. ☑ **Daemon path** — `SecureCat` (server verifies vs the ledger, then streams the opaque
+   ciphertext on the existing data plane) and `SecurePut` (client uploads ciphertext frames →
+   daemon writes them in place and prepares the member-signed `SecureBlobUpdated` → client signs +
+   `Commit`s). Client `secure_cat`/`secure_put`; the CLI `secure put/cat/grant` **auto-route**
+   through a running daemon (encrypt/decrypt stay client-side — the daemon only ever handles
+   ciphertext). Integration test (`daemon_secure_put_and_cat_multi_user`): a member with `w`
+   updates over the socket, the daemon writes exactly the uploaded bytes (no decryption), a
+   read-only member downloads the verified ciphertext, and a member without `w` is refused; 256 MB
+   upload cap. **Known limitation (v1):** `secure create` is owner-direct (no daemon op yet), so
+   create the node before serving; blob *updates* — the hot path — go through the daemon.
 5. ☐ **Docs + audit** — USER-MANUAL section, `pvfs audit`/`verify` coverage notes, doc 08 rows.

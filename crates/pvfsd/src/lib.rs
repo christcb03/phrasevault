@@ -18,8 +18,8 @@ use pvfs_core::{
     crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
 };
 use pvfs_proto::{
-    auth_digest, read_msg, write_data_frame, write_msg, ChildInfo, ClientMsg, NodeInfo, ServerMsg,
-    WriteOp, DATA_CHUNK, PROTO_VERSION,
+    auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ChildInfo, ClientMsg,
+    NodeInfo, ServerMsg, WriteOp, DATA_CHUNK, PROTO_VERSION,
 };
 use rand::RngCore;
 
@@ -146,12 +146,24 @@ pub fn serve_connection(daemon: &Daemon, mut stream: UnixStream) -> io::Result<(
     while let Some(req) = read_msg::<_, ClientMsg>(&mut stream)? {
         // Cat uses the data plane: it writes multiple frames to the stream
         // directly rather than returning a single ServerMsg.
-        if let ClientMsg::Cat { node } = req {
-            do_cat(daemon, &principal, &mut stream, &node)?;
-            continue;
+        match req {
+            ClientMsg::Cat { node } => {
+                do_cat(daemon, &principal, &mut stream, &node)?;
+                continue;
+            }
+            ClientMsg::SecureCat { node } => {
+                do_secure_cat(daemon, &principal, &mut stream, &node)?;
+                continue;
+            }
+            ClientMsg::SecurePut { node } => {
+                do_secure_put(daemon, &principal, &mut stream, &node)?;
+                continue;
+            }
+            req => {
+                let resp = handle(daemon, &principal, req);
+                write_msg(&mut stream, &resp)?;
+            }
         }
-        let resp = handle(daemon, &principal, req);
-        write_msg(&mut stream, &resp)?;
     }
     Ok(())
 }
@@ -194,10 +206,12 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
         },
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
-        // Cat is handled above in serve_connection (data-plane path).
-        ClientMsg::Cat { .. } | ClientMsg::Auth { .. } | ClientMsg::Anonymous => {
-            err("bad_input", "unexpected message in request loop")
-        }
+        // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
+        ClientMsg::Cat { .. }
+        | ClientMsg::SecureCat { .. }
+        | ClientMsg::SecurePut { .. }
+        | ClientMsg::Auth { .. }
+        | ClientMsg::Anonymous => err("bad_input", "unexpected message in request loop"),
     }
 }
 
@@ -274,6 +288,136 @@ fn do_cat(daemon: &Daemon, principal: &Principal, stream: &mut UnixStream, node:
         written += got as u64;
     }
     write_msg(stream, &ServerMsg::CatDone { written })?;
+    Ok(())
+}
+
+/// The most ciphertext the daemon will accept for one secure blob (v1 cap).
+const SECURE_BLOB_CAP: usize = 256 * 1024 * 1024;
+
+/// Stream a secure blob's ciphertext (doc 12 §8), **verified against the signed
+/// ledger** before a byte leaves. Like `do_cat` but the daemon never decrypts —
+/// it serves the opaque bytes. Verify happens under the lock (`secure_read`), so
+/// a tampered or half-written blob is refused, not served.
+fn do_secure_cat(
+    daemon: &Daemon,
+    principal: &Principal,
+    stream: &mut UnixStream,
+    node: &str,
+) -> io::Result<()> {
+    let id: NodeId = node.to_string();
+    let bytes = {
+        let e = daemon.engine.lock().unwrap();
+        match e.effective_rights(principal, &id) {
+            Ok(r) if r & acl::ACL_R != 0 => {}
+            Ok(_) => {
+                write_msg(stream, &err("forbidden", "access denied"))?;
+                return Ok(());
+            }
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        }
+        match e.secure_read(&id) {
+            Ok(b) => b,
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        }
+    }; // lock released before streaming
+
+    write_msg(stream, &ServerMsg::CatStart { size: bytes.len() as u64 })?;
+    for chunk in bytes.chunks(DATA_CHUNK) {
+        write_data_frame(stream, chunk)?;
+    }
+    write_msg(stream, &ServerMsg::CatDone { written: bytes.len() as u64 })?;
+    Ok(())
+}
+
+/// Receive a secure blob's new ciphertext (data frames, zero-length terminator),
+/// write it in place, and prepare the member-signed `SecureBlobUpdated` (doc 12
+/// §8.5 daemon path). The client then `Commit`s the returned prepared write. The
+/// daemon handles only ciphertext — it has no key and never decrypts.
+fn do_secure_put(
+    daemon: &Daemon,
+    principal: &Principal,
+    stream: &mut UnixStream,
+    node: &str,
+) -> io::Result<()> {
+    let author = match principal {
+        Principal::Key(pk) => pk.clone(),
+        _ => {
+            write_msg(stream, &err("forbidden", "writes require an authenticated identity"))?;
+            return Ok(());
+        }
+    };
+    // Read the uploaded ciphertext (frames until a zero-length frame).
+    let mut ciphertext = Vec::new();
+    loop {
+        match read_data_frame(stream)? {
+            Some(chunk) if chunk.is_empty() => break,
+            Some(chunk) => {
+                if ciphertext.len() + chunk.len() > SECURE_BLOB_CAP {
+                    write_msg(stream, &err("bad_input", "secure blob exceeds the size cap"))?;
+                    return Ok(());
+                }
+                ciphertext.extend_from_slice(&chunk);
+            }
+            None => return Ok(()), // client hung up mid-upload
+        }
+    }
+    let id: NodeId = node.to_string();
+    let hash: [u8; 32] = blake3::hash(&ciphertext).into();
+
+    // Under the lock: validate (author holds w + node is secure) and resolve
+    // the path. Prepare BEFORE any bytes move, so an unauthorized write is
+    // rejected without touching storage.
+    let (prepared, path) = {
+        let e = daemon.engine.lock().unwrap();
+        let prepared = match e.prepare_secure_update(&author, &id, &hash, ciphertext.len() as u64) {
+            Ok(p) => p,
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        };
+        let path = match e.secure_location_path(&id) {
+            Ok(p) => p,
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        };
+        (prepared, path)
+    }; // lock released before the write
+
+    if let Err(pve) = pvfs_core::storage::atomic_overwrite(&path, &ciphertext) {
+        write_msg(stream, &err_from(pve))?;
+        return Ok(());
+    }
+
+    // Stash the prepared ledger event; the client signs + Commits as usual.
+    let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
+    let result_id = prepared.result_id.clone();
+    let prepared_id = random_id();
+    daemon.prepared.lock().unwrap().insert(
+        prepared_id.clone(),
+        PreparedState {
+            author_pub: author,
+            events: prepared.events,
+            result_id: result_id.clone(),
+            expiry_ms: now_ms() + PREPARE_TTL_MS,
+        },
+    );
+    write_msg(
+        stream,
+        &ServerMsg::Prepared {
+            prepared_id,
+            preimages,
+            result_id,
+        },
+    )?;
     Ok(())
 }
 

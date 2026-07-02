@@ -9,7 +9,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use pvfs_proto::{auth_digest, read_data_frame, read_msg, write_msg, ClientMsg, ServerMsg, WriteOp};
+use pvfs_proto::{
+    auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ClientMsg, ServerMsg,
+    WriteOp,
+};
 
 pub use pvfs_proto::{ChildInfo, NodeInfo};
 
@@ -192,6 +195,66 @@ impl Client {
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
             Some(other) => Err(unexpected("CatDone", &other)),
             None => Ok(written), // server closed cleanly after data
+        }
+    }
+
+    /// Download a secure blob's ciphertext (doc 12 §8) — the daemon verifies it
+    /// against the signed ledger before streaming; decryption is the caller's job.
+    pub fn secure_cat(&mut self, node: &str) -> Result<Vec<u8>> {
+        write_msg(&mut self.stream, &ClientMsg::SecureCat { node: node.into() })?;
+        let size = match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::CatStart { size }) => size,
+            Some(ServerMsg::Error { code, message }) => return Err(ClientError::Server { code, message }),
+            Some(other) => return Err(unexpected("CatStart", &other)),
+            None => return Err(ClientError::Protocol("connection closed before CatStart".into())),
+        };
+        let mut out = Vec::with_capacity(size as usize);
+        while (out.len() as u64) < size {
+            match read_data_frame(&mut self.stream)? {
+                Some(chunk) if chunk.is_empty() => break,
+                Some(chunk) => out.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::CatDone { .. }) => Ok(out),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("CatDone", &other)),
+            None => Ok(out),
+        }
+    }
+
+    /// Upload a secure blob's new ciphertext and commit its ledger advance
+    /// (doc 12 §8.5 daemon path). `sign` signs the `SecureBlobUpdated` digest
+    /// with the caller's device key. Returns the blob id.
+    pub fn secure_put<F>(&mut self, node: &str, ciphertext: &[u8], sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        write_msg(&mut self.stream, &ClientMsg::SecurePut { node: node.into() })?;
+        for chunk in ciphertext.chunks(pvfs_proto::DATA_CHUNK) {
+            write_data_frame(&mut self.stream, chunk)?;
+        }
+        write_data_frame(&mut self.stream, &[])?; // zero-length terminator
+        let (prepared_id, preimages) = match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::Prepared { prepared_id, preimages, .. }) => (prepared_id, preimages),
+            Some(ServerMsg::Error { code, message }) => return Err(ClientError::Server { code, message }),
+            Some(other) => return Err(unexpected("Prepared", &other)),
+            None => return Err(ClientError::Protocol("connection closed before Prepared".into())),
+        };
+        let mut sigs = Vec::with_capacity(preimages.len());
+        for preimage in &preimages {
+            let bytes = hex::decode(preimage)
+                .map_err(|_| ClientError::Protocol("preimage not hex".into()))?;
+            let digest: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::Protocol("preimage not 32 bytes".into()))?;
+            sigs.push(hex::encode(sign(&digest)));
+        }
+        match self.request(ClientMsg::Commit { prepared_id, sigs })? {
+            ServerMsg::Committed { id } => Ok(id),
+            other => Err(unexpected("Committed", &other)),
         }
     }
 

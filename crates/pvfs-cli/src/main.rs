@@ -1792,22 +1792,27 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         pvfs_core::envelope::seal(&plaintext, &[enc_pub])?
                     };
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
-                    let mut engine = Engine::open(&state_dir)?;
-                    let hash = engine.secure_put_local(&node_id, &bytes)?;
-                    engine.close()?;
+                    // Auto-route ciphertext + ledger through the daemon if one
+                    // runs (doc 12 §8.5 daemon path); else engine-direct. Either
+                    // way the plaintext was encrypted client-side above.
+                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                        client.secure_put(&node_id, &bytes, |d| sign(d)).map_err(remote_err)?;
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        engine.secure_put_local(&node_id, &bytes)?;
+                        engine.close()?;
+                    }
                     if json {
                         println!(
-                            "{{\"updated\":\"{node_id}\",\"content_hash\":\"{}\",\"size\":{},\"encrypted\":{}}}",
-                            hex::encode(hash),
+                            "{{\"updated\":\"{node_id}\",\"size\":{},\"encrypted\":{}}}",
                             bytes.len(),
                             !raw
                         );
                     } else {
                         println!(
-                            "updated {node_id}: {} bytes ({}), hash {}",
+                            "updated {node_id}: {} bytes ({})",
                             bytes.len(),
-                            if raw { "raw" } else { "encrypted" },
-                            hex::encode(hash)
+                            if raw { "raw" } else { "encrypted" }
                         );
                     }
                     Ok(())
@@ -1818,9 +1823,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     companion_socket,
                 } => {
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
-                    let engine = Engine::open(&state_dir)?;
-                    let stored = engine.secure_read(&node_id)?; // verified vs the ledger
-                    engine.close()?;
+                    // Verified download: the daemon (or the engine) checks the
+                    // ledger head before yielding a byte.
+                    let stored = if let Some((mut client, _sign)) = daemon_client(&state_dir)? {
+                        client.secure_cat(&node_id).map_err(remote_err)?
+                    } else {
+                        let engine = Engine::open(&state_dir)?;
+                        let b = engine.secure_read(&node_id)?;
+                        engine.close()?;
+                        b
+                    };
                     let out = if raw {
                         stored
                     } else {
@@ -1850,11 +1862,24 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         reason: "must be hex".into(),
                     })?;
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
-                    let mut engine = Engine::open(&state_dir)?;
-                    let stored = engine.secure_read(&node_id)?;
-                    let env = pvfs_core::envelope::parse(&stored)?;
+                    let daemon_up = try_daemon_socket(&state_dir).is_some();
+                    // Read current ciphertext (daemon if up, else engine).
+                    let stored = if daemon_up {
+                        daemon_client(&state_dir)?
+                            .expect("daemon up")
+                            .0
+                            .secure_cat(&node_id)
+                            .map_err(remote_err)?
+                    } else {
+                        let engine = Engine::open(&state_dir)?;
+                        let b = engine.secure_read(&node_id)?;
+                        engine.close()?;
+                        b
+                    };
+                    // Re-wrap client-side for the new recipient.
                     let sock = resolve_companion_socket(companion_socket)?;
                     let enc_pub = companion_pubkey(&sock, "encryption")?;
+                    let env = pvfs_core::envelope::parse(&stored)?;
                     let wrap = env.wrap_for(&enc_pub).ok_or_else(|| PvfsError::Forbidden {
                         action: "secure grant".into(),
                         reason: "you must be a recipient to grant access".into(),
@@ -1862,8 +1887,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let ck = companion_unwrap(&sock, wrap)?;
                     let regranted =
                         pvfs_core::envelope::add_recipient(&stored, &ck, &recipient)?;
-                    engine.secure_put_local(&node_id, &regranted)?;
-                    engine.close()?;
+                    // Write back the same way (no two-writer hazard).
+                    if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                        client.secure_put(&node_id, &regranted, |d| sign(d)).map_err(remote_err)?;
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        engine.secure_put_local(&node_id, &regranted)?;
+                        engine.close()?;
+                    }
                     if json {
                         println!("{{\"granted\":\"{}\"}}", json_escape(&pubkey));
                     } else {

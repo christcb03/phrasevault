@@ -111,6 +111,14 @@ pub enum ClientMsg {
     /// Stream a file node's bytes. Server responds: CatStart, then binary data
     /// frames (`write_data_frame`), then CatDone.
     Cat { node: String },
+    /// Stream a **secure** blob's ciphertext (doc 12 §8), verified against the
+    /// signed ledger first. Same wire shape as `Cat` (CatStart → frames → CatDone).
+    SecureCat { node: String },
+    /// Upload a secure blob's new ciphertext, then advance its ledger. The client
+    /// sends this, then binary data frames terminated by a zero-length frame; the
+    /// server writes the bytes and replies `Prepared` (the `SecureBlobUpdated`
+    /// digest to sign), after which the client `Commit`s as usual.
+    SecurePut { node: String },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },
     /// Phase 2: return one signature (hex) per preimage, in order.

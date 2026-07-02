@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use pvfs_client::{Client, ClientError};
 use pvfs_core::acl::{self, Principal};
-use pvfs_core::{crypto, identity, Engine, FilePayload, NodeSpec, TYPE_FILE, TYPE_FOLDER};
+use pvfs_core::{
+    crypto, identity, Engine, FilePayload, NodeSpec, TYPE_FILE, TYPE_FOLDER, TYPE_SECURE,
+};
 use pvfsd::{serve, Daemon};
 
 fn folder(label: &str) -> NodeSpec {
@@ -420,4 +422,72 @@ fn daemon_member_cannot_admin() {
         })),
         "a non-admin member must not authorize members over the socket"
     );
+}
+
+fn secure(label: &str) -> NodeSpec {
+    NodeSpec {
+        node_type: TYPE_SECURE.into(),
+        label: label.into(),
+        payload: Vec::new(),
+        is_temp: false,
+        creation_nonce: None,
+    }
+}
+
+/// Doc 12 §8.5 daemon path: a member with `w` updates a secure blob over the
+/// socket (ciphertext upload + member-signed ledger), reads it back verified,
+/// and a member WITHOUT write is refused. The daemon only ever sees ciphertext.
+#[test]
+fn daemon_secure_put_and_cat_multi_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let blob = engine.add_node(&root, secure("shared.enc")).unwrap();
+    let uri = pvfs_core::storage::path_to_uri(&store.path().join("shared.enc")).unwrap();
+    engine.add_location(&blob, &uri).unwrap();
+
+    // Two members: writer (w on the blob) and reader (r only).
+    let writer_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let writer = crypto::pubkey_bytes(&writer_key);
+    let reader_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let reader = crypto::pubkey_bytes(&reader_key);
+    engine.authorize_member(&owner_mn, &writer).unwrap();
+    engine.authorize_member(&owner_mn, &reader).unwrap();
+    engine.set_acl(&blob, &Principal::Key(writer.clone()), acl::ACL_R | acl::ACL_W).unwrap();
+    engine.set_acl(&blob, &Principal::Key(reader.clone()), acl::ACL_R).unwrap();
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(engine));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    // The writer uploads ciphertext and commits the ledger over the socket.
+    let ciphertext = b"opaque encrypted bytes v1";
+    let mut w = Client::connect_signed(&sock, &writer, |d| crypto::sign_digest(&writer_key, d).unwrap())
+        .unwrap();
+    w.secure_put(&blob, ciphertext, |d| crypto::sign_digest(&writer_key, d).unwrap())
+        .unwrap();
+    // The daemon wrote exactly those bytes to the location — nothing decrypted.
+    assert_eq!(std::fs::read(store.path().join("shared.enc")).unwrap(), ciphertext);
+
+    // The reader downloads the verified ciphertext.
+    let mut r = Client::connect_signed(&sock, &reader, |d| crypto::sign_digest(&reader_key, d).unwrap())
+        .unwrap();
+    assert_eq!(r.secure_cat(&blob).unwrap(), ciphertext);
+
+    // The reader (no w) cannot update the blob.
+    assert!(forbidden(
+        r.secure_put(&blob, b"forged", |d| crypto::sign_digest(&reader_key, d).unwrap())
+    ));
+    // The writer can overwrite; the reader sees the new bytes.
+    w.secure_put(&blob, b"v2 bytes", |d| crypto::sign_digest(&writer_key, d).unwrap())
+        .unwrap();
+    assert_eq!(r.secure_cat(&blob).unwrap(), b"v2 bytes");
 }

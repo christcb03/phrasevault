@@ -2181,6 +2181,12 @@ impl Engine {
             })
     }
 
+    /// The filesystem path of a secure blob's single location (doc 12 §8.3) —
+    /// for the daemon, which writes/reads ciphertext it cannot decrypt.
+    pub fn secure_location_path(&self, blob_id: &NodeId) -> Result<std::path::PathBuf> {
+        crate::storage::uri_to_path(&self.secure_location(blob_id)?)
+    }
+
     /// Phase 2 (doc 12 §8.3): replace the blob's ciphertext **in place**
     /// (tmp + fsync + rename; superseded bytes unlinked) and advance the signed
     /// ledger in the same call, authored by this device. Validation happens
