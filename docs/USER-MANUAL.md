@@ -217,7 +217,67 @@ read `-` — what's actually in effect). To sweep a whole forest for such dead g
 
 ---
 
-## 8. Recovery & devices
+## 8. Secure blobs (encrypted-at-rest storage)
+
+A **secure blob** is a node whose bytes are **encrypted so the server can never read them**, and
+which you can **truly delete** — unlike normal files, whose content is kept forever in the log. It's
+meant for private app data: a messenger's message store, secrets, anything the host must not see.
+
+Two things make it different from a normal file:
+
+- **The bytes are one opaque encrypted blob** you overwrite in place. Old versions are discarded —
+  real deletion, not soft-delete.
+- **The log records only a signed hash of the ciphertext** (never the content), so PVFS can prove
+  *that* it changed and *who* changed it, but never *what* it says.
+
+By default the bytes are encrypted with the **companion envelope**: a random key encrypts the
+content, and that key is wrapped to your **encryption key** (held by the companion, derived from
+your phrase). The daemon stores and serves only ciphertext — **without your companion attached, the
+server holds inert bytes.**
+
+```bash
+# create a secure store (storage is managed for you — no path needed).
+# Works while the daemon is running: apps make new stores on the fly.
+NODE=$(pvfs secure create <parent> my-secrets --json | sed -n 's/.*"created":"\([^"]*\)".*/\1/p')
+
+# write to it (encrypted via your companion by default); old bytes are discarded
+echo "top secret" | pvfs secure put "$NODE" -
+
+# read it back (verified against the signed ledger, then decrypted via the companion)
+pvfs secure cat "$NODE"
+
+# who it's encrypted for, when it last changed, its size
+pvfs secure status "$NODE"
+
+# check the on-disk bytes still match the signed ledger
+pvfs secure verify "$NODE"
+
+# share it with someone else's key (re-wraps the content key; no re-encryption)
+pvfs secure grant "$NODE" <their-pubkey-hex>
+```
+
+**Bringing your own encryption.** Apps that manage their own keys (the Messenger does) pass `--raw`
+to `put`/`cat` to store and retrieve bytes verbatim — PVFS then treats the blob as opaque and does
+no envelope work.
+
+**Durability & recovery — what survives, and what doesn't.** A secure blob is deliberately split:
+its *structure* is in the signed log, its *content bytes* are not.
+
+| Event | What happens |
+|-------|--------------|
+| Reboot / crash mid-write | Safe. Bytes are fsynced then atomically renamed into place; the ledger event is in the write-ahead log. The worst case — a crash between writing bytes and recording the ledger — is a **detectable** mismatch that `secure verify` flags and a fresh `put` repairs. Never silent corruption. |
+| Rebuilding the index | Full recovery. The node, its location, and every signed hash replay from the log. |
+| New machine / `pvfs recover` | Structure and your decryption key both come back (the log replays; keys re-derive from your phrase). **But the ciphertext bytes live outside the log** — if the disk holding them is gone and the blob wasn't replicated, the bytes are unrecoverable. The log will tell you exactly what was lost (which hash, what size, when) but can't resurrect it. |
+| Deleting / overwriting | The old bytes are discarded on purpose — that's the whole feature. **Crypto-shredding** (throwing away the content key) is the real erasure; physical remanence on disks, backups, or replicas is out of PVFS's hands. |
+
+So: everything *provable* about a secure blob survives anything. The one thing that can be lost is
+the encrypted content itself — which is exactly the trade a disappearing-messages store wants.
+Anything you can't afford to lose should be replicated (the daemon happily replicates ciphertext it
+can't read).
+
+---
+
+## 9. Recovery & devices
 
 - Your **recovery phrase** (shown once at `forest init`) regenerates your keys. Store it safely.
 - Move a forest to a new machine: copy the whole mount (including `.pvfs/`), then
@@ -230,7 +290,7 @@ everyday admin device, not the phrase (doc 09 §2.2).
 
 ---
 
-## 9. Command reference (summary)
+## 10. Command reference (summary)
 
 | Command | What it does |
 |---------|--------------|
@@ -246,6 +306,11 @@ everyday admin device, not the phrase (doc 09 §2.2).
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs audit` | Authorization health check: list tag grants/memberships under a revoked authority. |
+| `pvfs secure create <parent> <label> [--path P]` | Create an encrypted-at-rest blob (managed storage; `--path` pins a location). |
+| `pvfs secure put <node> <file\|-> [--raw]` | Encrypt (companion) & write the blob's bytes; `--raw` stores app ciphertext as-is. |
+| `pvfs secure cat <node> [--raw]` | Verify vs the ledger, then decrypt (companion) to stdout; `--raw` emits ciphertext. |
+| `pvfs secure grant <node> <pubkey>` | Add another key as a recipient (re-wraps the content key). |
+| `pvfs secure verify <node>` · `pvfs secure status <node>` | Check bytes vs the signed head · show the ledger head. |
 | `pvfs device authorize-member --pubkey <hex>` | Authorize a member's key (admin device; no phrase). |
 | `pvfs device authorize-member --via-companion --companion-socket <p> --pubkey <hex>` | Root-sign the admit through a running companion — no phrase typed (doc 14). |
 | `pvfs-companion init --vault <p>` · `pvfs-companion serve --vault <p> --socket <s> [--allow-root]` | Seal your seed into a vault · run the local signing agent. |
@@ -268,7 +333,7 @@ mount to set the forest context for tree commands.
 
 ---
 
-## 10. Roadmap
+## 11. Roadmap
 
 Available now: forests & import, the full ACL model **with per-key tags**, phrase-free member admin,
 and daemon sharing — members **read** (`ls`/`stat`/`cat`) and **write**
@@ -281,11 +346,15 @@ ships a `pvfsd@.service` systemd `--user` unit and shuts down cleanly on SIGTERM
 (checkpointing the WAL), and `pvfs audit` reports any tag grants/memberships left under a revoked
 authority.
 
+The **companion** (a local custodian for your keys, doc 14) is built: it seals your seed in an
+OS-keychain or passphrase vault, signs high-authority operations without you typing your phrase,
+prompts before anything consequential, keeps a signature audit log, locks on idle, and runs a
+loopback "Sign in with PVFS" agent for web apps. And **encryption at rest** (secure blobs, §8) is
+built: encrypted opaque storage with a content-free signed ledger, companion-gated decryption, and
+create/read/update over the running daemon.
+
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **A companion app** — a local custodian for your root key that also auto-logs you in to
-  PVFS-backed web apps. It reproduces your identity key from your phrase on any machine, so your
-  sharing works the same everywhere.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; trades away old history).
-- **Encryption at rest** and **federation / network sharing**.
+- **Federation / network sharing** — reach and sync forests across hosts.

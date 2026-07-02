@@ -203,4 +203,11 @@ secure blobs, replica secure-erase.
    `--path` still pins an explicit location for local/advanced use. Integration test
    (`daemon_creates_secure_store_on_the_fly`) + engine test (managed-location auto-allocation) +
    smoke (create→put→cat over the live daemon).
-5. ☐ **Docs + audit** — USER-MANUAL section, `pvfs audit`/`verify` coverage notes, doc 08 rows.
+5. ☑ **Docs + audit** — USER-MANUAL §8 (secure blobs: create/put/cat/grant/verify/status, the
+   companion-envelope default vs `--raw`, and the **durability & recovery matrix** — what survives
+   rebuild/reboot/machine-loss and what doesn't); command-reference rows; roadmap updated (companion
+   + encryption-at-rest now "built"). **Audit/verify coverage:** per-blob integrity is
+   `pvfs secure verify` (bytes vs the signed head, rc 5 on mismatch); `pvfs audit` remains the
+   *authorization* health check (inert grants) and is unaffected — a secure blob's ledger is already
+   content-free, so there's nothing authorization-inert to sweep. A forest-wide secure-integrity
+   sweep (verify every blob at once) is a natural future `pvfs verify --secure`, noted for post-1.0.

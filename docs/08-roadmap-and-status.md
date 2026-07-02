@@ -25,7 +25,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
 | **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); remaining: §7 joint PVOS API spec + Touch ID gate |
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
-| **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ◑ **in progress** (doc 12 §8–9): design settled ✅, kernel ledger ✅, mutable storage ✅, envelope + companion gating ✅ (server-alone = inert ciphertext), daemon path ✅ (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested); docs/audit pass ☐ |
+| **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
 
@@ -123,14 +123,17 @@ hardening, packaging, and two scope calls. Tracked as a checklist; details in §
 
 **Scope decisions (DECIDED 2026-06-29 — both committed to 1.0):**
 
-- **Companion app** (doc 09 §6) — **in 1.0; full scope** (signer/custodian + identity agent). Design
-  settled in **[doc 14](14-companion-app.md)**: root+identity keys in an OS-keychain/passphrase vault,
-  a Unix-socket signer with request-type-tiered approval (root events always prompt; local owner-
-  initiated tag ops auto-sign while unlocked; web origins use per-origin connect), and a loopback
-  "Sign in with PVFS" agent. Device keys stay local for everyday writes. Build plan: doc 14 §9.
-- **Encryption at rest** (P3, doc 12) — **in 1.0.** Secure node type at reserved key path
-  `m/43'/20566'/2'`: opaque mutable encrypted blob + content-free signed hash-state log +
-  companion-gated decryption. Currently unbuilt.
+- **Companion app** (doc 09 §6) — **in 1.0; full scope** (signer/custodian + identity agent).
+  **Built** (doc 14 phases 1–6): OS-keychain/passphrase vault, Unix-socket signer with request-type-
+  tiered approval (desktop/terminal prompts, rate limit, audit log, idle lock), multi-tenant custody,
+  and the loopback "Sign in with PVFS" agent. Device keys stay local for everyday writes. Remaining:
+  the §7 joint PVOS API and the optional Touch ID gate.
+- **Encryption at rest** (P3, doc 12) — **in 1.0; built** (doc 12 §8–9, phases 1–5). Secure node
+  type at the reserved `m/43'/20566'/2'` path: opaque mutable encrypted blob + content-free signed
+  hash-state log + companion-gated decryption + on-the-fly create/update over the daemon.
+- **Key replacement** (doc 15) — the committed follow-on to "one identity everywhere" (§4 item 17).
+  **Built:** identity-key replacement + re-issue and the dual-signed member handoff (cases A/B).
+  Remaining: root rotation + recovery key (case C, draft awaiting review of doc 15 §6).
 
 **Explicitly post-1.0:** federation + sub-forest replication (P4, doc 03), compaction (doc 11),
 single-use challenge nonce (only matters once the socket is network-proxied), arbitrary named groups
