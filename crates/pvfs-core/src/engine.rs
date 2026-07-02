@@ -2088,6 +2088,71 @@ impl Engine {
         })
     }
 
+    /// Phase 1 (doc 12 §8.2): build an unsigned `SecureBlobUpdated` advancing a
+    /// secure blob's content-free ledger. The node must exist and be `secure`;
+    /// the author must hold write (`w`) on it — re-checked at commit and replay.
+    pub fn prepare_secure_update(
+        &self,
+        author_pub: &[u8],
+        blob_id: &NodeId,
+        content_hash: &[u8; 32],
+        size: u64,
+    ) -> Result<PreparedWrite> {
+        let node = fetch_node(&self.conn, blob_id)?.ok_or_else(|| PvfsError::NotFound {
+            kind: "node",
+            id: blob_id.clone(),
+        })?;
+        if node.node_type != node::TYPE_SECURE {
+            return Err(PvfsError::BadInput {
+                field: "node".into(),
+                reason: format!("{blob_id} is a {} node, not secure", node.node_type),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, blob_id)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "update secure blob".into(),
+                reason: format!("author lacks write (w) on {blob_id}"),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_secure_blob_updated(blob_id, content_hash, size, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: blob_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::SecureBlobUpdated {
+                    blob_id: blob_id.clone(),
+                    content_hash: content_hash.to_vec(),
+                    size,
+                    updated_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// The current ledger head of a secure blob (doc 12 §8.2):
+    /// `(content_hash, size, updated_at, author)`; `None` before its first update.
+    pub fn secure_current(&self, blob_id: &NodeId) -> Result<Option<(Vec<u8>, u64, u64, Vec<u8>)>> {
+        self.conn
+            .query_row(
+                "SELECT content_hash, size, updated_at, author FROM secure_blobs WHERE blob_id = ?1",
+                params![blob_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_db("secure blob head"))
+    }
+
     /// Phase 1 (doc 15 §1 A2): build the atomic **identity swap** — revoke the
     /// old identity key and admit its replacement (`IDENTITY_DEVICE_INDEX`) as a
     /// single two-event commit, so the compromise window closes in one append.

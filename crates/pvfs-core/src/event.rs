@@ -24,6 +24,7 @@ pub const K_FOLDER_BOUND: &str = "FolderBound";
 pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
 pub const K_ACL_SET: &str = "AclSet";
 pub const K_MEMBER_TAGGED: &str = "MemberTagged";
+pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -132,6 +133,17 @@ pub enum Event {
         tag: String,
         granted: bool,
         set_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Advance a secure blob's content-free ledger (doc 12 §8.2): "the
+    /// ciphertext at `blob_id`'s location is now `content_hash` (`size` bytes),
+    /// changed by `author`". Never any content. Author must hold write (w).
+    SecureBlobUpdated {
+        blob_id: String,
+        content_hash: Vec<u8>, // 32 bytes — hash of the ciphertext (doc 12 §8.4)
+        size: u64,
+        updated_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -291,6 +303,22 @@ pub fn msg_member_tagged(
     crypto::domain_digest("pvfs:membertagged:v1:", &e.finish())
 }
 
+pub fn msg_secure_blob_updated(
+    blob_id: &str,
+    content_hash: &[u8],
+    size: u64,
+    updated_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(blob_id)
+        .bytes(content_hash)
+        .u64(size)
+        .u64(updated_at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:secureblob:v1:", &e.finish())
+}
+
 // ---- encode / decode --------------------------------------------------------
 
 impl Event {
@@ -313,6 +341,7 @@ impl Event {
             Event::FolderUnbound { .. } => K_FOLDER_UNBOUND,
             Event::AclSet { .. } => K_ACL_SET,
             Event::MemberTagged { .. } => K_MEMBER_TAGGED,
+            Event::SecureBlobUpdated { .. } => K_SECURE_BLOB_UPDATED,
         }
     }
 
@@ -333,7 +362,8 @@ impl Event {
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
             | Event::AclSet { author, .. }
-            | Event::MemberTagged { author, .. } => author,
+            | Event::MemberTagged { author, .. }
+            | Event::SecureBlobUpdated { author, .. } => author,
             Event::NodeCreated(n) => &n.author,
             Event::LinkCreated(l) => &l.author,
             Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
@@ -351,6 +381,7 @@ impl Event {
             Event::LinkCreated(l) => l.sig = sig,
             Event::AclSet { sig: s, .. }
             | Event::MemberTagged { sig: s, .. }
+            | Event::SecureBlobUpdated { sig: s, .. }
             | Event::DeviceAuthorized { sig: s, .. }
             | Event::DeviceRevoked { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
@@ -548,6 +579,21 @@ impl Event {
                     .bytes(author)
                     .bytes(sig);
             }
+            Event::SecureBlobUpdated {
+                blob_id,
+                content_hash,
+                size,
+                updated_at,
+                author,
+                sig,
+            } => {
+                e.string(blob_id)
+                    .bytes(content_hash)
+                    .u64(*size)
+                    .u64(*updated_at)
+                    .bytes(author)
+                    .bytes(sig);
+            }
         }
         e.finish()
     }
@@ -682,6 +728,14 @@ impl Event {
                 tag: d.string()?,
                 granted: d.boolean()?,
                 set_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_SECURE_BLOB_UPDATED => Event::SecureBlobUpdated {
+                blob_id: d.string()?,
+                content_hash: d.bytes()?,
+                size: d.u64()?,
+                updated_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -863,6 +917,18 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_member_tagged(member_pubkey, tag, *granted, *set_at, author),
+                sig,
+            ),
+            Event::SecureBlobUpdated {
+                blob_id,
+                content_hash,
+                size,
+                updated_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_secure_blob_updated(blob_id, content_hash, *size, *updated_at, author),
                 sig,
             ),
         }

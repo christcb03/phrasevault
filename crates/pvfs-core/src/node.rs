@@ -8,6 +8,9 @@ pub type NodeId = String; // 64 hex chars (BLAKE3-256)
 
 pub const TYPE_FILE: &str = "file";
 pub const TYPE_FOLDER: &str = "folder";
+/// A secure blob (doc 12): stable node identity, opaque mutable ciphertext at
+/// its location, content described only by the `secure_blobs` ledger projection.
+pub const TYPE_SECURE: &str = "secure";
 pub const VISIBILITY_PUBLIC: &str = "public";
 pub const LABEL_SOFT_CAP: usize = 4096; // spec §3
 

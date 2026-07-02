@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS member_tags (
   PRIMARY KEY (member_pubkey, tag, authority)
 );
 
+-- Secure-blob ledger heads (doc 12 §8.2): the CURRENT ciphertext hash per blob.
+-- Last write wins by design — the log keeps the content-free transition chain;
+-- the projection keeps only "now". No content, ever.
+CREATE TABLE IF NOT EXISTS secure_blobs (
+  blob_id      TEXT PRIMARY KEY,
+  content_hash BLOB    NOT NULL,     -- hash of the ciphertext bytes (doc 12 §8.4)
+  size         INTEGER NOT NULL,     -- ciphertext length
+  updated_at   INTEGER NOT NULL,
+  author       BLOB    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS temp_nodes (
   id             TEXT PRIMARY KEY,
   node_type      TEXT NOT NULL,
@@ -321,6 +332,25 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                 )
                 .map_err(&m)?;
             }
+        }
+        Event::SecureBlobUpdated {
+            blob_id,
+            content_hash,
+            size,
+            updated_at,
+            author,
+            ..
+        } => {
+            // Last write wins (doc 12 §8.2): the projection holds only "now";
+            // the transition chain lives in the log, content-free.
+            tx.execute(
+                "INSERT INTO secure_blobs (blob_id, content_hash, size, updated_at, author)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(blob_id) DO UPDATE SET content_hash = excluded.content_hash,
+                   size = excluded.size, updated_at = excluded.updated_at, author = excluded.author",
+                params![blob_id, content_hash, *size as i64, *updated_at as i64, author],
+            )
+            .map_err(&m)?;
         }
         Event::NodeCreated(n) => {
             tx.execute(
@@ -695,6 +725,11 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
             // forest root" requirement was over-broad (it existed only because tags
             // were unscoped) and is dropped. A key-scoped membership only unlocks
             // nodes whose `Tag` grant that same key authored — i.e. nodes it controls.
+        }
+        Event::SecureBlobUpdated { blob_id, .. } => {
+            // Advancing a blob's ledger is a write (doc 12 §8.2) — the same right
+            // a content change needs, enforced identically live and at replay.
+            require_right(conn, author, blob_id, acl::ACL_W, "update secure blob")?
         }
         _ => {}
     }

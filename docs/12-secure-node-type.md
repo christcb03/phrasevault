@@ -155,10 +155,12 @@ secure blobs, replica secure-erase.
 
 ## 9. Build plan (phased, pipeline-verifiable)
 
-1. ☐ **Kernel** — `TYPE_SECURE`, `SecureBlobUpdated` (encode/decode/digest/sig), projection table
-   + last-write-wins apply, commit/replay author-`w` rule, `prepare_secure_update` +
-   `secure_current`; unit + integration tests (update chain, non-writer refused, wrong-type refused,
-   replay parity).
+1. ☑ **Kernel** — `TYPE_SECURE`, `SecureBlobUpdated` (encode/decode/digest/sig, domain
+   `pvfs:secureblob:v1:`), `secure_blobs` last-write-wins projection, the author-`w` rule wired into
+   `check_member_event` (one seam = live commit AND replay), `prepare_secure_update` +
+   `secure_current`. Tests: update chain + head replacement, full-rebuild parity, no-grant refused at
+   prepare, TOCTOU (prepared-while-granted, committed-after-revoke) refused at commit, wrong node
+   type / unknown node refused.
 2. ☐ **Mutable storage** — overwrite-permitted location semantics for secure nodes (tmp+rename),
    `secure create/put/cat --raw` engine-direct, `verify` integration; smoke: put→cat→overwrite→cat,
    old bytes gone, hash mismatch quarantines.
