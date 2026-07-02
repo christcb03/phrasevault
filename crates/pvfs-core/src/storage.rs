@@ -94,7 +94,17 @@ pub fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
         f.write_all(bytes).map_err(|e| PvfsError::io("write blob tmp", e))?;
         f.sync_all().map_err(|e| PvfsError::io("sync blob tmp", e))?;
     }
-    fs::rename(&tmp, path).map_err(|e| PvfsError::io("replace blob", e))
+    fs::rename(&tmp, path).map_err(|e| PvfsError::io("replace blob", e))?;
+    // fsync the directory so the RENAME itself survives power loss — without
+    // this the file contents are durable but the swap might not be. (The
+    // failure mode would be benign — old bytes ⇒ a detectable verify mismatch —
+    // but strict durability is one syscall.)
+    #[cfg(unix)]
+    {
+        let d = fs::File::open(dir).map_err(|e| PvfsError::io("open blob dir", e))?;
+        d.sync_all().map_err(|e| PvfsError::io("sync blob dir", e))?;
+    }
+    Ok(())
 }
 
 fn mtime_ms(md: &fs::Metadata) -> u64 {
