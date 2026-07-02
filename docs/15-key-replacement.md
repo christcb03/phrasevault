@@ -1,6 +1,6 @@
 # PVFS — Key replacement & rotation (15)
 
-Status: **Draft for review**; §5 phases 1–3 (cases A + B) built 2026-07-02 — case C (root lineage) awaits review of the §6 open questions
+Status: **§6 decisions resolved 2026-07-02**; §5 phases 1–3 (cases A + B) built; case C (root lineage) building next
 Depends on: [01 (identity & derivation)](01-core-engine-design.md), [03 (federation trust)](03-federation-trust-and-uris.md), [10 (per-key tag authority)](10-per-key-tag-authority.md), [11 (compaction & snapshots)](11-compaction-and-verifiable-snapshots.md), [13 §B (multi-region logs)](13-pvos-driven-requirements.md), [14 (companion)](14-companion-app.md)
 Motivation: the companion makes a human's identity **one stable key everywhere** (doc 10 §9.1). The accepted cost is that a compromise of that key — or, worse, of the seed — cannot be contained by revoking one machine. This spec is the mitigation that makes the tradeoff acceptable: a clean, verifiable path to replace **any** key in the system, up to and including the root.
 
@@ -76,13 +76,15 @@ Valid iff `author` is the **current root of the lineage** (or the recovery key, 
 
 **C4 — the race.** The attacker holds the old root too. **First valid `RootRotated` in the canonical log wins**; a second is invalid at append and at replay (its author is no longer `root(t)`). This is honest about the residual risk: if the attacker appends first, the owner has lost the forest — which is why C5 exists and why peers alarm on lineage changes rather than silently following them.
 
-**C5 — the recovery key (decided: build it).** At `forest init` (and retrofittable any time by the current root), generate a **second, independent phrase** — the *rotation recovery phrase* — deriving a single key that is registered in the log:
+**C5 — the recovery key (decided: build it).** At `forest init`, generate a **second, independent phrase** — the *rotation recovery phrase* — deriving a single key registered in the log:
 
 ```
 RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 ```
 
-`RootRotated` may be authored by the current root **or** the registered recovery key. The recovery phrase lives on paper, is never typed into any machine except during a rotation, and is never held by the companion — so a thief of the *operating* seed cannot rotate, and the owner can rotate even after total compromise of every machine. Init prompts for it (default: yes, print and confirm); declining falls back to C4 race semantics.
+**Registration is phrase-authenticated (§6 decision 4):** the event must be signed by the root key **derived from the typed recovery-seed phrase**, never by the companion-held root. This closes the retrofit window by prevention — a compromised companion root cannot register an attacker's recovery key, and a phrase-holder has already won. So registration happens at `forest init` (the default) or via an explicit later command that types the phrase; there is no companion-signable mid-life path.
+
+`RootRotated` may be authored by the current root **or** the registered recovery key. The recovery phrase lives on paper, is never typed into any machine except at registration and rotation, and is never held by the companion — so a thief of the *operating* seed cannot rotate, and the owner can rotate even after total compromise of every machine. Init prompts for it (default: yes, print and confirm); declining falls back to C4 race semantics. **Scope (§6 decision 1):** a local companion → one recovery key per forest; a remote companion → the owner may choose per-forest or one shared recovery key per seed.
 
 **C6 — after the rotation.** The new root mass-revokes the old device and identity keys and admits their replacements (cases A and B under the new root — same ops, same re-issue). One guided command: `pvfs forest rotate-root` — interactive, states consequences, takes the old phrase *or* the recovery phrase, prints the new phrase, performs the rotation + mass re-admission + re-issue, ends with `pvfs audit`.
 
@@ -107,9 +109,30 @@ RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 4. ☐ **Root lineage** — `RootRotated` + `RecoveryKeyRegistered`, projection/replay lineage, `pvfs forest rotate-root`, init's recovery-phrase prompt; smoke: rotate, old root rejected, history still replays.
 5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03 amendment); doc 08 item 17 closed.
 
-## 6. Open questions (for review)
+## 6. Resolved decisions (2026-07-02)
 
-- **Handoff transport** — a printable/pasteable blob first (works everywhere), or also a daemon-to-daemon channel? Draft assumes blob-first.
-- **`key:` grant re-issue linkability** — re-homing `key:old → key:new` publicly links the two keys in every forest's log. That is inherent to continuity (and the handoff already asserts it); flagging it as accepted, not accidental.
-- **Recovery key ceremony** — one recovery key per forest, or one per seed (shared across the owner's forests)? Draft assumes per-forest (simplest trust story); per-seed would reduce paper.
-- **Retrofit window** — `RecoveryKeyRegistered` by the *current* root at any time means a quiet attacker could register *their* recovery key before rotating. Mitigation as specced: registration is a root-tier prompt + audit event; consider also alerting in `pvfs status`/`audit` when a recovery key changes.
+1. **Recovery-key scope — gated by companion location.** A **local** companion (on the same host as
+   the served forest) always uses **one recovery key per forest**: a compromise there could reach
+   both the operating seed and the recovery setup, so isolate the blast radius. A **remote**
+   companion (a separate device) is a stronger posture, so the owner may **choose** per-forest or
+   one shared recovery key **per seed** (across all their forests) — the convenience is earned by the
+   stronger custody. Default per-forest either way.
+2. **Handoff transport — printable blob** (works everywhere, zero infra), consistent with cases A/B.
+   A daemon-to-daemon channel is a post-1.0 convenience.
+3. **Re-issue linkability — accepted, and transient.** Re-homing `key:old → key:new` writes both keys
+   into the log, so a reader can see "X became Y" — inherent to *continuity* of access (the handoff
+   already asserts it publicly). But it is **transient**: after the swap the old key is revoked and
+   its grants are inert, so the **next compaction** (doc 11 re-genesis rebuilds from current effective
+   state) drops the old key and the linkage entirely — effectively crypto-shredding it over time.
+   *Boundary:* this applies to **grant re-homing** (cases A/B). It does **not** apply to the **root
+   lineage** (case C), which compaction must *preserve* (§C7) so device certs across rotations stay
+   verifiable. Caveat: doc 11's sealed archive of the pre-compaction log, and any replica synced
+   before compaction, still hold the linkage; the live/compacted forest is what sheds it.
+4. **Retrofit window — closed by prevention, not detection.** `RecoveryKeyRegistered` is
+   **phrase-authenticated only** — it must be signed by the root **key derived from the typed
+   recovery phrase**, never by the companion-held root. So a compromised *companion* root cannot
+   silently register an attacker's recovery key; and anyone who holds the *phrase* has already won
+   (they can rotate root directly), so allowing it there adds no new attack surface. The phrase is
+   naturally present at `forest init` (the default moment) and at `recover`; adding a recovery key to
+   an existing forest later is an explicit phrase-typed command. No mid-life companion-signable
+   registration exists, so there is no quiet-retrofit surface to alarm on.
