@@ -1,6 +1,6 @@
 # PVFS — Key replacement & rotation (15)
 
-Status: **Draft for review** (the doc 08 §4 item 17 mini-spec) — drafted 2026-07-01
+Status: **Draft for review**; §5 phases 1–3 (cases A + B) built 2026-07-02 — case C (root lineage) awaits review of the §6 open questions
 Depends on: [01 (identity & derivation)](01-core-engine-design.md), [03 (federation trust)](03-federation-trust-and-uris.md), [10 (per-key tag authority)](10-per-key-tag-authority.md), [11 (compaction & snapshots)](11-compaction-and-verifiable-snapshots.md), [13 §B (multi-region logs)](13-pvos-driven-requirements.md), [14 (companion)](14-companion-app.md)
 Motivation: the companion makes a human's identity **one stable key everywhere** (doc 10 §9.1). The accepted cost is that a compromise of that key — or, worse, of the seed — cannot be contained by revoking one machine. This spec is the mitigation that makes the tradeoff acceptable: a clean, verifiable path to replace **any** key in the system, up to and including the root.
 
@@ -101,9 +101,9 @@ RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 
 ## 5. Build plan (phased, pipeline-verifiable)
 
-1. ☐ **Re-issue core** — `reissue_authority` + `prepare_replace_identity`; unit + integration tests (grants inert after swap, identical effective rights after re-issue, audit clean).
-2. ☐ **Identity replace UX** — companion `identity_index`, `pvfs identity replace` end-to-end; smoke: replace, prove old key inert + new key authoritative, audit clean.
-3. ☐ **Member handoff** — assertion sign/verify + `pvfs member replace`; smoke across two forests.
+1. ☑ **Re-issue core** — `prepare_replace_identity` (the atomic two-event swap) + `prepare_reissue_authority` (memberships, tag grants, `key:old → key:new`); integration test: member loses access at the swap, regains it identically after re-issue, re-running the swap refused.
+2. ☑ **Identity replace UX** — companion `identity_index` in the vault envelope; `RotateIdentity` agent op (root-tier gate: `--allow-root` or the rotation prompt; persist-then-swap; dual-signs the handoff with both keys before swapping); `pvfs identity replace` does rotate → swap → re-issue → prints the handoff. Smoke: grant re-homed to the new authority end to end.
+3. ☑ **Member handoff** — `identity::handoff_digest`/`verify_handoff` (domain-tagged, dual-signature) + `pvfs member replace <file|->` (verify, revoke old, admit new, re-grant tags — composing existing device-signed ops, no new events). Smoke: replace across a second forest; tampered handoff refused (rc 5).
 4. ☐ **Root lineage** — `RootRotated` + `RecoveryKeyRegistered`, projection/replay lineage, `pvfs forest rotate-root`, init's recovery-phrase prompt; smoke: rotate, old root rejected, history still replays.
 5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03 amendment); doc 08 item 17 closed.
 

@@ -458,6 +458,35 @@ CAUDIT="$DATA/companion.audit.jsonl"
 grep -q '"decision":"approved"' "$CAUDIT" && ok "audit recorded approved signatures" || fail "audit signs"
 grep -q '"event":"lock"' "$CAUDIT" && ok "audit recorded the lock" || fail "audit lock"
 grep -q '"event":"unlock"' "$CAUDIT" && ok "audit recorded the re-unlock" || fail "audit unlock"
+# identity replacement (doc 15 §1): swap, re-home, handoff to a second forest.
+say "companion: identity replacement (doc 15)"
+M2="$(jget "$(XDG_CONFIG_HOME="$DATA/m2cfg" $PVFS --json whoami)" pubkey)"
+$PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$M2" >/dev/null \
+  && ok "admitted a member to carry a grant" || fail "admit M2"
+$PVFS --data-dir "$CMOUNT/.pvfs" tag add "$M2" crew --via-companion --companion-socket "$CSOCK" >/dev/null \
+  && ok "identity granted a tag" || fail "tag M2"
+RJSON="$($PVFS --json --data-dir "$CMOUNT/.pvfs" identity replace --yes --companion-socket "$CSOCK")"
+OLDID="$(jget "$RJSON" old)"; NEWID="$(jget "$RJSON" new)"
+[ -n "$NEWID" ] && [ "$OLDID" != "$NEWID" ] && ok "identity replaced (companion rotated + swap committed)" \
+  || fail "identity replace: $RJSON"
+printf '%s' "$RJSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["handoff"]))' > "$DATA/handoff.json"
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$M2" | grep -q "\"tag\":\"crew\",\"authority\":\"$NEWID\",\"active\":true" \
+  && ok "grant re-homed to the new identity" || fail "reissue authority"
+# A second forest where the OLD key was a member: replace from the handoff.
+F2="$DATA/handoff-forest"; mkdir -p "$F2"
+$PVFS --json forest init --mount "$F2" >/dev/null
+$PVFS --data-dir "$F2/.pvfs" device authorize-member --pubkey "$OLDID" >/dev/null 2>&1 \
+  && ok "old key was a member of the second forest" || fail "F2 admit"
+$PVFS --data-dir "$F2/.pvfs" tag add "$OLDID" vip >/dev/null 2>&1 || true
+$PVFS --data-dir "$F2/.pvfs" member replace "$DATA/handoff.json" >/dev/null \
+  && ok "member replaced from the dual-signed handoff" || fail "member replace"
+$PVFS --json --data-dir "$F2/.pvfs" tag ls "$NEWID" | grep -q '"tag":"vip"' \
+  && ok "tags re-granted to the new key" || fail "F2 regrant"
+python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); h["replaced_at_ms"]+=1; print(json.dumps(h))' \
+  "$DATA/handoff.json" > "$DATA/handoff-bad.json"
+assert_rc 5 "tampered handoff refused" -- \
+  $PVFS --data-dir "$F2/.pvfs" member replace "$DATA/handoff-bad.json"
+
 # identity agent (doc 14 §6): port file + token gate + headless connect denial.
 CPORTF="${CSOCK%.sock}.http"
 [ -f "$CPORTF" ] && ok "identity agent port file exists" || fail "port file missing"

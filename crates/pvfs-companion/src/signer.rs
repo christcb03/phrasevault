@@ -92,6 +92,24 @@ impl UnlockedSigner {
         self
     }
 
+    /// The current identity index.
+    pub fn identity_id(&self) -> u64 {
+        self.identity_id
+    }
+
+    /// Derive the **next** identity (doc 15 §1 A1): same seed, index `id+1`.
+    /// Returns `(next_signer, old_identity_pub, new_identity_pub)` — the caller
+    /// decides when to swap (after dual-signing the handoff with both).
+    pub fn rotate_identity(&self) -> Result<(UnlockedSigner, Vec<u8>, Vec<u8>), SignerError> {
+        let old = self.pubkey(KeyRole::Identity)?;
+        let next = UnlockedSigner {
+            mnemonic: self.mnemonic.clone(),
+            identity_id: self.identity_id + 1,
+        };
+        let new = next.pubkey(KeyRole::Identity)?;
+        Ok((next, old, new))
+    }
+
     /// The compressed public key for a role — what a forest authorizes / verifies.
     pub fn pubkey(&self, role: KeyRole) -> Result<Vec<u8>, SignerError> {
         let key = match role {

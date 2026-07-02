@@ -110,6 +110,14 @@ enum Cmd {
     /// Device certificate operations
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Identity-key lifecycle (doc 15): replace a compromised identity key
+    /// and re-home its authority
+    #[command(subcommand)]
+    Identity(IdentityCmd),
+    /// Member-key lifecycle (doc 15 §1 A4): swap a member's key from a
+    /// dual-signed handoff
+    #[command(subcommand)]
+    Member(MemberCmd),
     /// Access-control list operations (doc 06 §4)
     #[command(subcommand)]
     Acl(AclCmd),
@@ -284,6 +292,43 @@ enum DeviceCmd {
         /// Companion signer socket path (with --via-companion; default: auto-detect)
         #[arg(long)]
         companion_socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Replace your identity key (doc 15 §1): rotates it in the companion,
+    /// root-signs the revoke+admit swap, re-issues your grants under the new
+    /// key, and prints the handoff for forests where you are a member.
+    Replace {
+        /// Companion signer socket path (default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+        /// Skip the confirmation prompt (automation)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Re-home grants authored by a replaced key onto your current identity
+    /// key (repair — `replace` already does this in its own forest).
+    Reissue {
+        /// The replaced authority's public key (hex)
+        old: String,
+        /// Companion signer socket path (default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemberCmd {
+    /// Swap a member's key after their identity replacement (doc 15 §1 A4):
+    /// verifies the dual-signed handoff, revokes the old key, admits the new
+    /// one, and re-grants the tags the old key held. Signed by your admin
+    /// device — the handoff is evidence, your signature is the authority.
+    Replace {
+        /// Path to the handoff file (JSON printed by `pvfs identity replace`),
+        /// or `-` to read it from stdin
+        handoff: String,
     },
 }
 
@@ -1388,6 +1433,208 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{{\"revoked\":true}}");
                     } else {
                         println!("revoked {pubkey}");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Cmd::Identity(cmd) => {
+            let state_dir = ctx?;
+            match cmd {
+                IdentityCmd::Replace {
+                    companion_socket,
+                    yes,
+                } => {
+                    let sock = resolve_companion_socket(companion_socket)?;
+                    if !yes {
+                        eprintln!(
+                            "This REPLACES your identity key (doc 15): grants under the old key \
+                             go inert and are re-issued under the new one; other forests need \
+                             the printed handoff. Type yes to continue:"
+                        );
+                        let mut line = String::new();
+                        std::io::stdin()
+                            .read_line(&mut line)
+                            .map_err(|e| PvfsError::io("read confirmation", e))?;
+                        if !line.trim().eq_ignore_ascii_case("yes") {
+                            return Err(PvfsError::BadInput {
+                                field: "confirmation".into(),
+                                reason: "aborted".into(),
+                            });
+                        }
+                    }
+                    // 1. Rotate inside the companion (root-tier approval there).
+                    let resp = pvfs_companion::request(
+                        &sock,
+                        &pvfs_companion::AgentRequest::RotateIdentity,
+                    )
+                    .map_err(|e| PvfsError::BadInput {
+                        field: "companion".into(),
+                        reason: e.to_string(),
+                    })?;
+                    let (old_hex, new_hex, ts, sig_old, sig_new) = match resp {
+                        pvfs_companion::AgentResponse::IdentityRotated {
+                            old_pubkey,
+                            new_pubkey,
+                            replaced_at_ms,
+                            sig_old,
+                            sig_new,
+                        } => (old_pubkey, new_pubkey, replaced_at_ms, sig_old, sig_new),
+                        pvfs_companion::AgentResponse::Error { code, message } => {
+                            return Err(PvfsError::Forbidden {
+                                action: "rotate identity".into(),
+                                reason: format!("{code}: {message}"),
+                            })
+                        }
+                        _ => {
+                            return Err(PvfsError::BadInput {
+                                field: "companion".into(),
+                                reason: "unexpected response".into(),
+                            })
+                        }
+                    };
+                    let bad_hex = |field: &'static str| PvfsError::BadInput {
+                        field: field.into(),
+                        reason: "companion returned bad hex".into(),
+                    };
+                    let old = hex::decode(&old_hex).map_err(|_| bad_hex("old"))?;
+                    let new = hex::decode(&new_hex).map_err(|_| bad_hex("new"))?;
+                    // 2. The atomic root-signed swap in this forest.
+                    let root_pub = companion_pubkey(&sock, "root")?;
+                    let mut engine = Engine::open(&state_dir)?;
+                    let prep = engine.prepare_replace_identity(&root_pub, &old, &new)?;
+                    let mut events = Vec::new();
+                    for mut ev in prep.events {
+                        let sig = companion_sign(&sock, "root_device_cert", &ev.digest)?;
+                        ev.event.set_author_sig(sig);
+                        events.push(ev.event);
+                    }
+                    engine.commit_member_write(events)?;
+                    // 3. Re-home the old key's grants under the new identity.
+                    let prep = engine.prepare_reissue_authority(&old, &new)?;
+                    let reissued = prep.events.len();
+                    if reissued > 0 {
+                        let mut events = Vec::new();
+                        for mut ev in prep.events {
+                            let sig = companion_sign(&sock, "identity_tag", &ev.digest)?;
+                            ev.event.set_author_sig(sig);
+                            events.push(ev.event);
+                        }
+                        engine.commit_member_write(events)?;
+                    }
+                    engine.close()?;
+                    // 4. The handoff for the forests we can't reach from here.
+                    let handoff = format!(
+                        "{{\"old_pubkey\":\"{old_hex}\",\"new_pubkey\":\"{new_hex}\",\
+                         \"replaced_at_ms\":{ts},\"sig_old\":\"{sig_old}\",\"sig_new\":\"{sig_new}\"}}"
+                    );
+                    if json {
+                        println!(
+                            "{{\"replaced\":true,\"old\":\"{old_hex}\",\"new\":\"{new_hex}\",\
+                             \"reissued\":{reissued},\"handoff\":{handoff}}}"
+                        );
+                    } else {
+                        println!("identity replaced: {old_hex} -> {new_hex}");
+                        println!("re-issued {reissued} grant(s) in this forest");
+                        println!();
+                        println!("HANDOFF — save as a file and send to owners of forests where");
+                        println!("you are a member; they run: pvfs member replace <that-file>");
+                        println!();
+                        println!("{handoff}");
+                    }
+                    Ok(())
+                }
+                IdentityCmd::Reissue {
+                    old,
+                    companion_socket,
+                } => {
+                    let sock = resolve_companion_socket(companion_socket)?;
+                    let old = hex::decode(&old).map_err(|_| PvfsError::BadInput {
+                        field: "old".into(),
+                        reason: "must be hex".into(),
+                    })?;
+                    let new = companion_pubkey(&sock, "identity")?;
+                    let mut engine = Engine::open(&state_dir)?;
+                    let prep = engine.prepare_reissue_authority(&old, &new)?;
+                    let reissued = prep.events.len();
+                    if reissued > 0 {
+                        let mut events = Vec::new();
+                        for mut ev in prep.events {
+                            let sig = companion_sign(&sock, "identity_tag", &ev.digest)?;
+                            ev.event.set_author_sig(sig);
+                            events.push(ev.event);
+                        }
+                        engine.commit_member_write(events)?;
+                    }
+                    engine.close()?;
+                    if json {
+                        println!("{{\"reissued\":{reissued}}}");
+                    } else {
+                        println!("re-issued {reissued} grant(s)");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Cmd::Member(cmd) => {
+            let state_dir = ctx?;
+            match cmd {
+                MemberCmd::Replace { handoff } => {
+                    let blob = if handoff == "-" {
+                        use std::io::Read as _;
+                        let mut s = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut s)
+                            .map_err(|e| PvfsError::io("read handoff", e))?;
+                        s
+                    } else {
+                        std::fs::read_to_string(&handoff)
+                            .map_err(|e| PvfsError::io("read handoff", e))?
+                    };
+                    let bad = |reason: &str| PvfsError::BadInput {
+                        field: "handoff".into(),
+                        reason: reason.into(),
+                    };
+                    let v: serde_json::Value =
+                        serde_json::from_str(blob.trim()).map_err(|_| bad("not valid JSON"))?;
+                    let field = |k: &str| -> Result<Vec<u8>, PvfsError> {
+                        hex::decode(v[k].as_str().unwrap_or_default())
+                            .map_err(|_| bad("missing or non-hex field"))
+                    };
+                    let (old, new) = (field("old_pubkey")?, field("new_pubkey")?);
+                    let (sig_old, sig_new) = (field("sig_old")?, field("sig_new")?);
+                    let ts = v["replaced_at_ms"]
+                        .as_u64()
+                        .ok_or_else(|| bad("missing replaced_at_ms"))?;
+                    // The dual signature proves seed custody of BOTH keys.
+                    identity::verify_handoff(&old, &new, ts, &sig_old, &sig_new)?;
+
+                    let mut engine = Engine::open(&state_dir)?;
+                    // Capture the old key's tags before revoking masks them.
+                    let tags: std::collections::BTreeSet<String> = engine
+                        .member_tags(&old)?
+                        .into_iter()
+                        .map(|(_authority, tag)| tag)
+                        .collect();
+                    engine.revoke_by_device(&old)?;
+                    engine.authorize_member_by_device(&new)?;
+                    for tag in &tags {
+                        engine.set_member_tag(&new, tag, true)?;
+                    }
+                    engine.close()?;
+                    if json {
+                        println!(
+                            "{{\"replaced\":true,\"new_member\":\"{}\",\"regranted\":{}}}",
+                            hex::encode(&new),
+                            tags.len()
+                        );
+                    } else {
+                        println!(
+                            "member replaced: {} -> {} ({} tag(s) re-granted)",
+                            hex::encode(&old),
+                            hex::encode(&new),
+                            tags.len()
+                        );
                     }
                     Ok(())
                 }

@@ -24,6 +24,11 @@ use crate::signer::{KeyRole, RequestType, UnlockedSigner};
 /// Must not retain secret material of its own.
 pub type Unlocker = Box<dyn Fn() -> Result<UnlockedSigner, String> + Send + Sync>;
 
+/// Persists a new identity index after a rotation (doc 15 §1 A1) — typically
+/// `Vault::set_identity_index` on the served vault, so the bump survives
+/// restarts and the lock/re-unlock cycle.
+pub type IdentityRotator = Box<dyn Fn(u64) -> Result<(), String> + Send + Sync>;
+
 /// Default sliding-window rate limit: signatures per minute (doc 14 §4).
 const DEFAULT_RATE_PER_MIN: u32 = 60;
 
@@ -34,6 +39,7 @@ pub struct Agent {
     prompter: Box<dyn Prompter>,
     audit: Option<AuditLog>,
     unlocker: Option<Unlocker>,
+    rotator: Option<IdentityRotator>,
     idle_timeout: Option<Duration>,
     last_used: Mutex<Instant>,
     rate: Mutex<Vec<Instant>>,
@@ -50,6 +56,7 @@ impl Agent {
             prompter: Box::new(DenyPrompter),
             audit: None,
             unlocker: None,
+            rotator: None,
             idle_timeout: None,
             last_used: Mutex::new(Instant::now()),
             rate: Mutex::new(Vec::new()),
@@ -73,6 +80,12 @@ impl Agent {
     /// Allow a locked agent to re-unlock on demand.
     pub fn with_unlocker(mut self, unlocker: Unlocker) -> Agent {
         self.unlocker = Some(unlocker);
+        self
+    }
+
+    /// Persist identity-index bumps (doc 15 §1). Without one, rotation is refused.
+    pub fn with_identity_rotator(mut self, rotator: IdentityRotator) -> Agent {
+        self.rotator = Some(rotator);
         self
     }
 
@@ -285,6 +298,60 @@ impl Agent {
                 self.lock("lock");
                 AgentResponse::Ok
             }
+            AgentRequest::RotateIdentity => self.rotate_identity(),
+        }
+    }
+
+    /// Doc 15 §1: derive the next identity, dual-sign the handoff with both
+    /// keys, swap the in-memory signer, persist the index. Root-tier approval:
+    /// `auto_root` (explicit automation opt-in) or the rotation prompt.
+    fn rotate_identity(&self) -> AgentResponse {
+        if self.rotator.is_none() {
+            return AgentResponse::error(
+                "unsupported",
+                "this agent cannot persist an identity rotation (no vault hook)",
+            );
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Derive + dual-sign under the signer lock; swap only after approval.
+        let prepared = self.with_signer(|s| {
+            let (next, old, new) = s.rotate_identity().map_err(|e| e.to_string())?;
+            let digest = pvfs_core::identity::handoff_digest(&old, &new, ts);
+            let sig_old = s
+                .sign(RequestType::IdentityAssertion, &digest)
+                .map_err(|e| e.to_string())?;
+            let sig_new = next
+                .sign(RequestType::IdentityAssertion, &digest)
+                .map_err(|e| e.to_string())?;
+            Ok((next, old, new, sig_old, sig_new))
+        });
+        let (next, old, new, sig_old, sig_new) = match prepared {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return AgentResponse::error("sign", e),
+            Err(resp) => return resp,
+        };
+        let (old_hex, new_hex) = (hex::encode(&old), hex::encode(&new));
+        if !(self.policy.auto_root || self.prompter.approve_rotation(&old_hex, &new_hex)) {
+            self.audit_event("identity_rotate_denied");
+            return AgentResponse::error("denied", "approval required or denied by policy");
+        }
+        // Persist first, then swap — a failed persist must not leave a running
+        // agent on an index that a restart would silently roll back.
+        let next_id = next.identity_id();
+        if let Err(e) = (self.rotator.as_ref().expect("checked above"))(next_id) {
+            return AgentResponse::error("rotate", format!("could not persist the new index: {e}"));
+        }
+        *self.signer.lock().expect("signer poisoned") = Some(next);
+        self.audit_event("identity_rotate");
+        AgentResponse::IdentityRotated {
+            old_pubkey: old_hex,
+            new_pubkey: new_hex,
+            replaced_at_ms: ts,
+            sig_old: hex::encode(sig_old),
+            sig_new: hex::encode(sig_new),
         }
     }
 }

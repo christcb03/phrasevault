@@ -2088,6 +2088,156 @@ impl Engine {
         })
     }
 
+    /// Phase 1 (doc 15 §1 A2): build the atomic **identity swap** — revoke the
+    /// old identity key and admit its replacement (`IDENTITY_DEVICE_INDEX`) as a
+    /// single two-event commit, so the compromise window closes in one append.
+    /// The old key's grants go inert at that instant (doc 10 §9.2 masking); the
+    /// re-homing is [`prepare_reissue_authority`](Self::prepare_reissue_authority).
+    /// The author must hold admin on root (or be the root).
+    pub fn prepare_replace_identity(
+        &self,
+        author_pub: &[u8],
+        old_pub: &[u8],
+        new_pub: &[u8],
+    ) -> Result<PreparedWrite> {
+        crypto::validate_pubkey(new_pub)?;
+        self.require_admin_on_root(author_pub, "replace identity")?;
+        if !self.authority_active(old_pub)? {
+            return Err(PvfsError::BadInput {
+                field: "old identity".into(),
+                reason: "not an active key in this forest".into(),
+            });
+        }
+        if self.device_known(new_pub)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "device",
+                id: hex::encode(new_pub),
+            });
+        }
+        let t = now_ms();
+        let idx = crate::acl::IDENTITY_DEVICE_INDEX;
+        let revoke_digest = event::msg_device_revoked(old_pub, t, author_pub);
+        let admit_digest = event::msg_device_authorized(new_pub, idx, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(new_pub),
+            events: vec![
+                PreparedEvent {
+                    digest: revoke_digest,
+                    event: Event::DeviceRevoked {
+                        device_pubkey: old_pub.to_vec(),
+                        revoked_at: t,
+                        author: author_pub.to_vec(),
+                        sig: Vec::new(),
+                    },
+                },
+                PreparedEvent {
+                    digest: admit_digest,
+                    event: Event::DeviceAuthorized {
+                        device_pubkey: new_pub.to_vec(),
+                        device_index: idx,
+                        authorized_at: t,
+                        author: author_pub.to_vec(),
+                        sig: Vec::new(),
+                    },
+                },
+            ],
+        })
+    }
+
+    /// Phase 1 (doc 15 §1 A3): **re-home** the live state a replaced authority
+    /// authored. Scans the projection for `old_pub`'s footprint and prepares the
+    /// same grants re-authored under `new_pub`: tag memberships it granted, ACL
+    /// `tag:` grants it authored, and ACL grants made *to* `key:old` (re-granted
+    /// to `key:new`). Old rows are left to masking now and compaction later —
+    /// history is never rewritten. The new key must already be an active member
+    /// (run the swap first); events may be empty when there is nothing to do.
+    pub fn prepare_reissue_authority(
+        &self,
+        old_pub: &[u8],
+        new_pub: &[u8],
+    ) -> Result<PreparedWrite> {
+        self.require_active_member(new_pub, "reissue authority")?;
+        let t = now_ms();
+        let mut events = Vec::new();
+
+        // Tag memberships granted under the old authority (doc 10 §4).
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT member_pubkey, tag FROM member_tags WHERE authority = ?1
+                 ORDER BY tag, member_pubkey",
+            )
+            .map_err(map_db("prepare reissue memberships"))?;
+        let rows = stmt
+            .query_map(params![old_pub], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_db("query reissue memberships"))?;
+        for row in rows {
+            let (member, tag) = row.map_err(map_db("read reissue membership"))?;
+            if member == old_pub {
+                continue; // never re-grant the replaced key its own memberships
+            }
+            let digest = event::msg_member_tagged(&member, &tag, true, t, new_pub);
+            events.push(PreparedEvent {
+                digest,
+                event: Event::MemberTagged {
+                    member_pubkey: member,
+                    tag,
+                    granted: true,
+                    set_at: t,
+                    author: new_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            });
+        }
+
+        // ACL `tag:` grants the old key authored, and grants *to* `key:old`.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT node_id, principal_kind, principal_id, rights FROM acl
+                 WHERE (principal_kind = 3 AND authority = ?1)
+                    OR (principal_kind = 1 AND principal_id = ?1)
+                 ORDER BY node_id, principal_kind, principal_id",
+            )
+            .map_err(map_db("prepare reissue acl"))?;
+        let rows = stmt
+            .query_map(params![old_pub], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })
+            .map_err(map_db("query reissue acl"))?;
+        for row in rows {
+            let (node_id, kind, pid, rights) = row.map_err(map_db("read reissue acl"))?;
+            // A grant TO the old key becomes a grant to the new key; a tag grant
+            // keeps its name and gets the new key as its (implicit) authority.
+            let principal_id = if kind == 1 { new_pub.to_vec() } else { pid };
+            let digest = event::msg_acl_set(&node_id, kind, &principal_id, rights, t, new_pub);
+            events.push(PreparedEvent {
+                digest,
+                event: Event::AclSet {
+                    node_id,
+                    principal_kind: kind,
+                    principal_id,
+                    rights,
+                    set_at: t,
+                    author: new_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            });
+        }
+
+        Ok(PreparedWrite {
+            result_id: hex::encode(new_pub),
+            events,
+        })
+    }
+
     /// Phase 1: build an unsigned `DeviceRevoked`. The author must hold admin on root.
     pub fn prepare_revoke(
         &self,

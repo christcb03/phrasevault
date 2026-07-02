@@ -26,6 +26,10 @@ pub enum AgentRequest {
     /// Drop the seed from memory (doc 14 §4 lock). The agent keeps serving; a
     /// later request re-unlocks through the configured unlocker, or is refused.
     Lock,
+    /// Replace the identity key (doc 15 §1): derive `3'/<id+1>'`, dual-sign the
+    /// handoff assertion, swap the in-memory signer, persist the new index.
+    /// Root-tier approval (prompt, or `--allow-root` for automation).
+    RotateIdentity,
 }
 
 /// The agent's reply.
@@ -34,6 +38,15 @@ pub enum AgentRequest {
 pub enum AgentResponse {
     Pubkey { pubkey: String },
     Signature { sig: String },
+    /// The result of a [`AgentRequest::RotateIdentity`]: the swap pair plus the
+    /// dual-signed handoff assertion (doc 15 §1 A4), all hex.
+    IdentityRotated {
+        old_pubkey: String,
+        new_pubkey: String,
+        replaced_at_ms: u64,
+        sig_old: String,
+        sig_new: String,
+    },
     Ok,
     Error { code: String, message: String },
 }

@@ -322,6 +322,7 @@ pvfs-companion origins revoke <origin>     # disconnect one immediately
 | Keychain entry deleted / OS reinstalled | `status` warns the key is not retrievable | Delete the vault file, re-run `init` with your phrase. |
 | `no companion running at …` | Any `--via-companion` command | Start it: `pvfs-companion serve`. |
 | Machine died entirely | — | On the new machine: `pvfs recover --mnemonic "<phrase>"`, then `pvfs-companion init` with the same phrase. Your identity key derives identically, so memberships and tags carry over. |
+| Identity key compromised | a machine that held the unlocked companion was breached | `pvfs identity replace` — one command: new key, old grants re-issued, prints a handoff for other forests (their owners run `pvfs member replace <file>`). |
 
 ---
 

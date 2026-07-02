@@ -22,6 +22,13 @@ pub trait Prompter: Send + Sync {
     fn approve_connect(&self, _origin: &str) -> bool {
         false
     }
+
+    /// An identity **replacement** (doc 15 §1) — root-tier consequence, its own
+    /// wording. Default deny.
+    fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
+        let _ = (old_hex, new_hex);
+        false
+    }
 }
 
 /// Headless: every prompt is a denial (never approve what nobody saw).
@@ -37,6 +44,13 @@ fn describe_connect(origin: &str) -> String {
     format!(
         "pvfs-companion: allow \"{origin}\" to SIGN IN as you (identity assertions \
          only, revocable with `pvfs-companion origins revoke`)?"
+    )
+}
+
+fn describe_rotation(old_hex: &str, new_hex: &str) -> String {
+    format!(
+        "pvfs-companion: REPLACE your identity key? {old_hex} -> {new_hex}. Grants \
+         under the old key go inert until re-issued; do this only for a compromise."
     )
 }
 
@@ -108,6 +122,9 @@ impl Prompter for TerminalPrompter {
     fn approve_connect(&self, origin: &str) -> bool {
         self.ask(&describe_connect(origin))
     }
+    fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
+        self.ask(&describe_rotation(old_hex, new_hex))
+    }
 }
 
 /// Ask with a native desktop dialog: `osascript` on macOS, `zenity` on Linux.
@@ -135,6 +152,9 @@ impl Prompter for DesktopPrompter {
     }
     fn approve_connect(&self, origin: &str) -> bool {
         self.dialog(&describe_connect(origin))
+    }
+    fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
+        self.dialog(&describe_rotation(old_hex, new_hex))
     }
 }
 

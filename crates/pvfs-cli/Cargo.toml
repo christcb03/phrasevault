@@ -15,4 +15,5 @@ pvfs-client = { path = "../pvfs-client" }
 pvfs-companion = { path = "../pvfs-companion" }
 clap.workspace = true
 hex.workspace = true
+serde_json.workspace = true
 notify = "6"

@@ -92,6 +92,34 @@ pub fn identity_key(mnemonic: &Mnemonic, bip39_passphrase: &str, id: u64) -> Res
     )
 }
 
+/// The digest both keys sign in an identity **handoff assertion** (doc 15 §1
+/// A4): "the human behind `old_pub` is now `new_pub`". Length-prefixed fields
+/// under a domain tag, so the encoding is unambiguous.
+pub fn handoff_digest(old_pub: &[u8], new_pub: &[u8], replaced_at_ms: u64) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(old_pub.len() + new_pub.len() + 16);
+    buf.extend_from_slice(&(old_pub.len() as u32).to_le_bytes());
+    buf.extend_from_slice(old_pub);
+    buf.extend_from_slice(&(new_pub.len() as u32).to_le_bytes());
+    buf.extend_from_slice(new_pub);
+    buf.extend_from_slice(&replaced_at_ms.to_le_bytes());
+    crypto::domain_digest("pvfs:identity-handoff:v1:", &buf)
+}
+
+/// Verify both signatures of a handoff assertion (doc 15 §1 A4). The assertion
+/// is a *convenience, not an authority*: the receiving forest owner's own
+/// root/admin signature is what actually changes their forest.
+pub fn verify_handoff(
+    old_pub: &[u8],
+    new_pub: &[u8],
+    replaced_at_ms: u64,
+    sig_old: &[u8],
+    sig_new: &[u8],
+) -> crate::error::Result<()> {
+    let digest = handoff_digest(old_pub, new_pub, replaced_at_ms);
+    crypto::verify_digest(old_pub, &digest, sig_old)?;
+    crypto::verify_digest(new_pub, &digest, sig_new)
+}
+
 /// The on-disk device-key cache (mode 0600). Cache, not source of truth —
 /// the mnemonic regenerates it (spec §10).
 pub struct DeviceKeyCache {

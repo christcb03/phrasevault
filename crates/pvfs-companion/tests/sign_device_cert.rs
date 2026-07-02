@@ -130,3 +130,98 @@ fn companion_identity_key_tags_and_root_revokes() {
     assert!(!engine.authority_active(&member).unwrap());
     engine.close().unwrap();
 }
+
+/// Doc 15 §1: the full identity replacement — atomic swap, instant inertness,
+/// re-homing under the new key, and the dual-signed handoff.
+#[test]
+fn identity_replacement_swaps_and_reissues() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root_pub = crypto::pubkey_bytes(&identity::root_key(&owner_mn, "").unwrap());
+    let root_node = engine.identity.root_node_id.clone();
+    let signer = UnlockedSigner::from_phrase(&owner_mn.to_string()).unwrap();
+
+    let commit = |engine: &mut Engine,
+                  signer: &UnlockedSigner,
+                  rt: RequestType,
+                  prep: pvfs_core::PreparedWrite| {
+        let mut events = Vec::new();
+        for mut ev in prep.events {
+            ev.event.set_author_sig(signer.sign(rt, &ev.digest).unwrap());
+            events.push(ev.event);
+        }
+        engine.commit_member_write(events).unwrap();
+    };
+
+    // Admit identity(0) as owner + a member; the identity grants "vip" and
+    // authors a tag: ACL grant on the root; root grants key:identity a right.
+    let old_pub = signer.pubkey(KeyRole::Identity).unwrap();
+    let prep = engine.prepare_authorize_identity(&root_pub, &old_pub).unwrap();
+    commit(&mut engine, &signer, RequestType::RootDeviceCert, prep);
+    let member = crypto::pubkey_bytes(
+        &identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
+    );
+    let prep = engine.prepare_authorize_member(&root_pub, &member).unwrap();
+    commit(&mut engine, &signer, RequestType::RootDeviceCert, prep);
+    let prep = engine
+        .prepare_set_member_tag(&old_pub, &member, "vip", true)
+        .unwrap();
+    commit(&mut engine, &signer, RequestType::IdentityTag, prep);
+    let prep = engine
+        .prepare_set_acl(
+            &old_pub,
+            &root_node,
+            &pvfs_core::Principal::Tag("vip".into()),
+            pvfs_core::ACL_R,
+        )
+        .unwrap();
+    commit(&mut engine, &signer, RequestType::IdentityTag, prep);
+    let prep = engine
+        .prepare_set_acl(
+            &root_pub,
+            &root_node,
+            &pvfs_core::Principal::Key(old_pub.clone()),
+            pvfs_core::ACL_R,
+        )
+        .unwrap();
+    commit(&mut engine, &signer, RequestType::RootDeviceCert, prep);
+
+    // The member can read the root via the identity-scoped tag grant.
+    let m = pvfs_core::Principal::Key(member.clone());
+    assert!(engine.can(&m, &root_node, pvfs_core::ACL_R).unwrap());
+
+    // Rotate: derive identity(1), dual-sign the handoff, then the atomic swap.
+    let (next, old, new) = signer.rotate_identity().unwrap();
+    assert_eq!(old, old_pub);
+    let ts = 1_700_000_000_000u64;
+    let digest = identity::handoff_digest(&old, &new, ts);
+    let sig_old = signer.sign(RequestType::IdentityAssertion, &digest).unwrap();
+    let sig_new = next.sign(RequestType::IdentityAssertion, &digest).unwrap();
+    identity::verify_handoff(&old, &new, ts, &sig_old, &sig_new).unwrap();
+    // Tampering with any field breaks it.
+    assert!(identity::verify_handoff(&old, &new, ts + 1, &sig_old, &sig_new).is_err());
+    assert!(identity::verify_handoff(&new, &old, ts, &sig_old, &sig_new).is_err());
+
+    let prep = engine.prepare_replace_identity(&root_pub, &old, &new).unwrap();
+    assert_eq!(prep.events.len(), 2);
+    commit(&mut engine, &signer, RequestType::RootDeviceCert, prep);
+
+    // The swap closed the window: old inert, member's access gone.
+    assert!(!engine.authority_active(&old).unwrap());
+    assert!(engine.authority_active(&new).unwrap());
+    assert!(!engine.can(&m, &root_node, pvfs_core::ACL_R).unwrap());
+
+    // Re-issue re-homes all three rows: the membership, the tag grant, key:old.
+    let prep = engine.prepare_reissue_authority(&old, &new).unwrap();
+    assert_eq!(prep.events.len(), 3, "membership + tag grant + key grant");
+    commit(&mut engine, &next, RequestType::IdentityTag, prep);
+    assert!(engine.can(&m, &root_node, pvfs_core::ACL_R).unwrap());
+    assert!(engine
+        .member_tags(&member)
+        .unwrap()
+        .contains(&(new.clone(), "vip".to_string())));
+
+    // Re-running the swap is refused (old no longer active; new known).
+    assert!(engine.prepare_replace_identity(&root_pub, &old, &new).is_err());
+    engine.close().unwrap();
+}

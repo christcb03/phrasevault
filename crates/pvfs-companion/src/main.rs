@@ -384,6 +384,12 @@ fn run() -> Result<(), String> {
             let unlock_vault = vault.clone();
             let unlocker: pvfs_companion::Unlocker =
                 Box::new(move || unseal_signer(&unlock_vault));
+            // Identity rotation (doc 15 §1) persists its index bump to the vault
+            // envelope, so restarts and re-unlocks stay on the new identity.
+            let rotate_vault = vault.clone();
+            let rotator: pvfs_companion::IdentityRotator = Box::new(move |idx| {
+                Vault::set_identity_index(&rotate_vault, idx).map_err(|e| e.to_string())
+            });
             let idle = match idle_lock_secs {
                 0 => None,
                 n => Some(Duration::from_secs(n)),
@@ -393,6 +399,7 @@ fn run() -> Result<(), String> {
                     .with_prompter(prompter)
                     .with_audit(audit)
                     .with_unlocker(unlocker)
+                    .with_identity_rotator(rotator)
                     .with_idle_timeout(idle)
                     .with_rate_limit(rate_limit),
             );
