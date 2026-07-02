@@ -229,8 +229,12 @@ fn unseal_signer(vault: &std::path::Path) -> Result<UnlockedSigner, String> {
             v.unseal(pass.as_bytes()).map_err(|e| e.to_string())?
         }
     };
-    UnlockedSigner::from_phrase(std::str::from_utf8(&secret).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    Ok(
+        UnlockedSigner::from_phrase(std::str::from_utf8(&secret).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+            // doc 15 §1: the vault names which 3'/<id>' key is the identity.
+            .with_identity(v.identity_index()),
+    )
 }
 
 /// Seal into / unseal from the OS keychain — compiled out without `os-keychain`,

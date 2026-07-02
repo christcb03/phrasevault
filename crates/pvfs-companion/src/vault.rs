@@ -104,6 +104,11 @@ struct VaultFile {
     /// v2 only: names the data key in the OS secret store (hex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_id: Option<String>,
+    /// The current identity index (doc 15 §1 A1): `3'/<id>'`; absent ⇒ 0.
+    /// Plaintext by design — public info; tampering yields a key that matches
+    /// nothing (a visible DoS, not an escalation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_index: Option<u64>,
     cipher: String,     // "xchacha20poly1305"
     nonce: String,      // hex
     ciphertext: String, // hex (sealed secret + AEAD tag)
@@ -144,6 +149,7 @@ impl Vault {
                 p_cost: params.p_cost,
             }),
             key_id: None,
+            identity_index: None,
             cipher: "xchacha20poly1305".into(),
             nonce: hex::encode(nonce),
             ciphertext: hex::encode(&ciphertext),
@@ -177,6 +183,7 @@ impl Vault {
             sealing: Some("keychain".into()),
             kdf: None,
             key_id: Some(key_id),
+            identity_index: None,
             cipher: "xchacha20poly1305".into(),
             nonce: hex::encode(nonce),
             ciphertext: hex::encode(&ciphertext),
@@ -229,6 +236,24 @@ impl Vault {
     /// The OS-store entry name of a keychain-sealed vault's data key.
     pub fn key_id(&self) -> Option<&str> {
         self.file.key_id.as_deref()
+    }
+
+    /// The current identity index (doc 15 §1): which `3'/<id>'` key is *the*
+    /// identity. Bumped by an identity replacement; absent means 0.
+    pub fn identity_index(&self) -> u64 {
+        self.file.identity_index.unwrap_or(0)
+    }
+
+    /// Persist a new identity index (doc 15 §1 A1) — rewrites the envelope in
+    /// place, leaving the sealed secret and every other field untouched.
+    pub fn set_identity_index(path: &Path, index: u64) -> Result<(), VaultError> {
+        let bytes = std::fs::read(path).map_err(|e| VaultError::Io(e.to_string()))?;
+        let mut file: VaultFile =
+            serde_json::from_slice(&bytes).map_err(|e| VaultError::Format(e.to_string()))?;
+        file.identity_index = Some(index);
+        let json =
+            serde_json::to_vec_pretty(&file).map_err(|e| VaultError::Format(e.to_string()))?;
+        write_private(path, &json)
     }
 
     /// Unlock a **passphrase-sealed** vault: re-derive the key from `passphrase`
@@ -505,6 +530,18 @@ mod tests {
         let a = Vault::open(&p1).unwrap();
         let b = Vault::open(&p2).unwrap();
         assert_ne!(a.key_id().unwrap(), b.key_id().unwrap());
+    }
+
+    #[test]
+    fn identity_index_persists_without_touching_the_seal() {
+        let (_d, path) = vault_path();
+        Vault::create_with(&path, b"seed-secret", b"pw", fast()).unwrap();
+        assert_eq!(Vault::open(&path).unwrap().identity_index(), 0);
+        Vault::set_identity_index(&path, 3).unwrap();
+        let v = Vault::open(&path).unwrap();
+        assert_eq!(v.identity_index(), 3);
+        // The sealed secret is untouched by the envelope rewrite.
+        assert_eq!(&v.unseal(b"pw").unwrap()[..], b"seed-secret");
     }
 
     #[test]
