@@ -176,15 +176,17 @@ fn identity_replacement_swaps_and_reissues() {
         )
         .unwrap();
     commit(&mut engine, &signer, RequestType::IdentityTag, prep);
+    // Note: the ROOT key is a cert authority, not an ACL principal — it cannot
+    // author an AclSet (no device_keys row, no owner shortcut). Owner keys do.
     let prep = engine
         .prepare_set_acl(
-            &root_pub,
+            &old_pub,
             &root_node,
             &pvfs_core::Principal::Key(old_pub.clone()),
             pvfs_core::ACL_R,
         )
         .unwrap();
-    commit(&mut engine, &signer, RequestType::RootDeviceCert, prep);
+    commit(&mut engine, &signer, RequestType::IdentityTag, prep);
 
     // The member can read the root via the identity-scoped tag grant.
     let m = pvfs_core::Principal::Key(member.clone());

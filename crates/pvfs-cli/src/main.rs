@@ -1833,7 +1833,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
                 TagCmd::Ls { member } => {
                     // Read-only: open engine directly (no mutation, no race with daemon).
-                    let mut engine = Engine::open(&ctx?)?;
+                    let engine = Engine::open(&ctx?)?;
                     let tags = engine.member_tags(&decode_member(&member)?)?;
                     // A membership under a revoked authority is **inert** — masked on
                     // the read path (doc 10 §9.2). Flag it; compaction removes it.
