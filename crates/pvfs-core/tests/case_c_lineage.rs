@@ -118,7 +118,5 @@ fn a_stranger_cannot_rotate_or_register() {
     // Neither the current root nor a recovery key → both prepares refuse.
     assert!(engine.prepare_rotate_root(&stranger, &target).is_err());
     assert!(engine.prepare_register_recovery(&stranger, &target).is_err());
-    // Keep RequestType referenced (shared test import surface) without effect.
-    let _ = RequestType::RootDeviceCert;
     engine.close().unwrap();
 }
