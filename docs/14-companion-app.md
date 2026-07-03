@@ -193,7 +193,7 @@ What it needs to cover:
   ids survive) — interacts with compaction's re-genesis (doc 11) and federation trust (doc 03).
 
 Design this as its own mini-spec (a new doc) before the companion's §9 phase 7. Tracked in doc 08 §4.
-**Drafted:** [doc 15 — key replacement & rotation](15-key-replacement.md) (2026-07-01, awaiting review).
+**Built:** [doc 15 — key replacement & rotation](15-key-replacement.md) — cases A/B/C (identity replacement, member handoff, root rotation + recovery key) shipped 2026-07-02; §6 decisions resolved.
 
 ## 12. Remaining open questions
 

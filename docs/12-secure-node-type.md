@@ -152,6 +152,16 @@ PVFS ships a **reference envelope** (one canonical format, apps may bring their 
 - **Daemon**: ciphertext up/down over the existing raw data plane + the signed update in the
   member-write path; ACL-checked identically live and at replay.
 
+### 8.6a Concurrency note (single-writer-per-store)
+
+The two-phase member-signed write splits *write bytes* (data plane, off-lock) from *commit ledger*
+(control plane), so two clients writing the **same** blob concurrently can interleave such that the
+on-disk bytes are the last *writer*'s while the ledger head is the last *committer*'s — a **detectable**
+(`secure verify`) and **self-healing** (next `put` fixes it) mismatch, the same shape as the
+documented write-then-commit crash window (§8.3). This is fine under the design assumption of
+**one writer per secure store** (a messenger's store, a per-app blob). Multiple concurrent writers to
+one blob is out of scope for v1; a per-blob write lock would close it if a future app needs it.
+
 ### 8.7 Non-goals (v1, unchanged from §5)
 
 Ratchets, group epochs, delivery, per-message keys, TEE (§7.4 stays post-1.0), multi-location

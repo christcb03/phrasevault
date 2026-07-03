@@ -88,6 +88,16 @@ RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 
 **C6 — after the rotation.** The new root mass-revokes the old device and identity keys and admits their replacements (cases A and B under the new root — same ops, same re-issue). One guided command: `pvfs forest rotate-root` — interactive, states consequences, takes the old phrase *or* the recovery phrase, prints the new phrase, performs the rotation + mass re-admission + re-issue, ends with `pvfs audit`.
 
+**C6a — recovery-key lifecycle (review note, 2026-07-02).** A registered recovery key stays valid
+across rotations (a `RootRotated` updates the current root but does not clear `recovery_keys`). This
+is **consistent with the model** — a recovery key is a *root-equivalent* authority, so its compromise
+is as catastrophic as a root compromise and rotation can't out-run it (the C4 race). Two open
+follow-ons, neither a 1.0 blocker: (a) no command yet **de-registers** a stale recovery key (retire an
+old paper phrase after a non-compromise rotation); (b) whether a rotation should *reset* recovery keys
+(clean-slate under the new root, requiring re-registration) is a deliberate semantic choice — left as
+additive for now so a rotation never strands you without a recovery path. Decide before compaction
+embeds the lineage (§C7).
+
 **C7 — compaction.** A compacted snapshot's re-genesis (doc 11) must embed the **full lineage** (`RootRotated` chain, plus `RecoveryKeyRegistered`) so a verifier of the snapshot can validate device certs without the pruned history.
 
 ---
