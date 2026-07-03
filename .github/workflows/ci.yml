@@ -20,7 +20,6 @@ jobs:
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
-        continue-on-error: true
       - name: CLI smoke suite
         run: |
           cargo build --release -p pvfs-cli -p pvfsd -p pvfs-companion

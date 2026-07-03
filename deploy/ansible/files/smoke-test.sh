@@ -144,7 +144,8 @@ $PVFS info >/dev/null && ok "forest usable after recovery"
 
 say "rebuild from log (projection is disposable)"
 rm "$PVFS_DATA_DIR/index.db"
-$PVFS walk "$ROOT" | grep -q second-tree || true # walk only walks one tree
+$PVFS walk "$ROOT" >/dev/null && ok "walk triggers index rebuild" || fail "walk post-rebuild"
+$PVFS walk "$ROOT" | grep -q second-tree && fail "walk crossed into another tree" || ok "walk stays within one tree"
 $PVFS info >/dev/null && ok "index rebuilt from log"
 $PVFS ls "$TREE2" | grep -q fifth-element && ok "rebuilt projection has ref links"
 
