@@ -6,7 +6,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 
 ## Status
 
-**Version `1.0.0` — feature-complete, release pending.** All 1.0 code and docs gates are done ([doc 08 §3](docs/08-roadmap-and-status.md), [CHANGELOG](CHANGELOG.md)); the `v1.0` tag lands after the release validation run on a Linux host (the Ansible pipeline).
+**Version `1.0.0` — released (tagged `v1.0`, 2026-07-03).** The first complete release of the engine, ready to host an application layer above it — see the [CHANGELOG](CHANGELOG.md). Post-1.0 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
 
 | Phase | What | State |
 |-------|------|--------|

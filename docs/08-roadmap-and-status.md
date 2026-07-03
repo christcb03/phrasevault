@@ -93,14 +93,14 @@ tagged `1.0` is **four gates**; everything else is explicitly 1.1+.
 rotation (§9), and the companion (§11); docs 14/16 flipped to built; README status table and
 `VERSIONING.md` match reality; stale "not built" markers cleared (item 17, doc 13 Q-E3).
 
-**Gate 3 — validation: ◑ CI green; pipeline run pending.** `main` is pushed and CI (build, tests,
-clippy now *enforced*, smoke) is green at the release candidate. **Remaining:** one full Ansible
-pipeline run (build → test → smoke → daemon stage) on the Linux host at the release commit —
-deferred until ready to test the remote companion.
+**Gate 3 — validation: ✅ DONE.** CI (build, tests, clippy *enforced*, smoke) green at the release
+commit; validated on the Linux host via the Ansible pipeline.
 
-**Gate 4 — release packaging: ◑ all but the tag.** `CHANGELOG.md` written (the 0.1 → 1.0
-narrative), workspace version bumped `0.1.0 → 1.0.0`, README + `VERSIONING.md` flipped to
-release-pending. **Remaining:** tag `v1.0` once Gate 3's pipeline run passes.
+**Gate 4 — release packaging: ✅ DONE.** `CHANGELOG.md` (the 0.1 → 1.0 narrative), workspace
+version `1.0.0`, README + `VERSIONING.md` flipped, **tagged `v1.0` (2026-07-03)**.
+
+**→ 1.0 SHIPPED.** This checklist is closed; post-1.0 work continues in §4 and the P4/compaction
+tracks (docs 03, 11).
 
 **Cut to 1.1 (decided 2026-07-03):**
 
