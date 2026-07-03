@@ -89,16 +89,18 @@ tagged `1.0` is **four gates**; everything else is explicitly 1.1+.
 
 (The `pvos.sso` service itself is PVOS-repo work consuming this API — **not** a PVFS 1.0 gate.)
 
-**Gate 2 — docs current:** finish the manual sweep (§4 item 6 successor): `USER-MANUAL` and docs
-06–15 reflect case C rotation, secure blobs, and the companion as shipped; README status table
-matches reality.
+**Gate 2 — docs current: ✅ DONE (2026-07-03).** `USER-MANUAL` covers secure blobs (§8), case C
+rotation (§9), and the companion (§11); docs 14/16 flipped to built; README status table and
+`VERSIONING.md` match reality; stale "not built" markers cleared (item 17, doc 13 Q-E3).
 
-**Gate 3 — validation:** push `main` (local is ahead of origin — case C + doc 16 have not run CI),
-CI green, and one full Ansible pipeline run (build → test → smoke → daemon stage) on the Linux host
-at the release commit.
+**Gate 3 — validation: ◑ CI green; pipeline run pending.** `main` is pushed and CI (build, tests,
+clippy now *enforced*, smoke) is green at the release candidate. **Remaining:** one full Ansible
+pipeline run (build → test → smoke → daemon stage) on the Linux host at the release commit —
+deferred until ready to test the remote companion.
 
-**Gate 4 — release packaging:** write `CHANGELOG.md` (0.1 → 1.0 narrative), bump the workspace
-version `0.1.0 → 1.0.0`, flip README + `VERSIONING.md` status, tag `v1.0`.
+**Gate 4 — release packaging: ◑ all but the tag.** `CHANGELOG.md` written (the 0.1 → 1.0
+narrative), workspace version bumped `0.1.0 → 1.0.0`, README + `VERSIONING.md` flipped to
+release-pending. **Remaining:** tag `v1.0` once Gate 3's pipeline run passes.
 
 **Cut to 1.1 (decided 2026-07-03):**
 

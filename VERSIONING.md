@@ -44,6 +44,6 @@ The **rightmost** component is always the PVFS major version required. Reading r
 
 ## Current status
 
-- **PVFS: `0.1` — feature-complete for the committed `1.0` scope.** P0–P2 (core, storage, mounts, multi-user daemon), P3 encryption-at-rest, key replacement/rotation (doc 15), and the companion app through phase 6 are implemented in Rust. See [docs/INSTALL.md](docs/INSTALL.md) to build and test.
-- **`1.0`** — the first release ready to host the sync/file-server layer above PVFS. The remaining release gates (companion phase 7 code, docs sweep, validation run at the release commit, `CHANGELOG` + version bump + `v1.0` tag) are tracked in [docs/08-roadmap-and-status.md §3](docs/08-roadmap-and-status.md).
+- **PVFS: `1.0.0` — feature-complete, release pending.** P0–P2 (core, storage, mounts, multi-user daemon), P3 encryption-at-rest, key replacement/rotation (doc 15), and the companion app through phase 7 (joint agent API, doc 16) are implemented in Rust. See [docs/INSTALL.md](docs/INSTALL.md) to build and test, [CHANGELOG.md](CHANGELOG.md) for the release notes.
+- **Remaining before the `v1.0` tag:** the release validation run (full Ansible pipeline — build, test, smoke, daemon stage — on the Linux host at the release commit). Tracked in [docs/08-roadmap-and-status.md §3](docs/08-roadmap-and-status.md).
 - The previous Python + TypeScript prototype is archived under `v0.0-concept/` and tagged `v0.0-concept`.

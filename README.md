@@ -6,7 +6,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 
 ## Status
 
-**Version `0.1` — feature-complete for the committed `1.0` scope; release gates tracked in [doc 08 §3](docs/08-roadmap-and-status.md#3-road-to-10--the-release-checklist-nailed-down-2026-07-03).**
+**Version `1.0.0` — feature-complete, release pending.** All 1.0 code and docs gates are done ([doc 08 §3](docs/08-roadmap-and-status.md), [CHANGELOG](CHANGELOG.md)); the `v1.0` tag lands after the release validation run on a Linux host (the Ansible pipeline).
 
 | Phase | What | State |
 |-------|------|--------|
