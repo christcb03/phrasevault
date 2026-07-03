@@ -23,7 +23,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E (3d)** | CLI **auto-routes** plain `acl`/`tag`/`device` mutations to a running daemon (path/URI args too); direct-engine fallback | ✅ shipped (doc 09 §3d) |
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
-| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); §7 joint PVOS API **spec ✅** ([doc 16](16-joint-agent-api.md)); remaining: doc 16 phase-7 build (approval context, `pvfsd` challenge consumer, `api_version`) — Touch ID gate deferred to 1.1 |
+| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); §7 joint PVOS API ✅ **spec + PVFS build** ([doc 16](16-joint-agent-api.md) §7: approval context + `user_action`, `pvfsd` challenge consumer, `api_version`) — **✅ complete**; Touch ID gate deferred to 1.1 |
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
@@ -75,14 +75,17 @@ cases A/B/C), and the companion through phase 6 + the doc 16 API spec. Every ear
 (items 0–4 of previous drafts) is resolved — history lives in §4. What separates today from a
 tagged `1.0` is **four gates**; everything else is explicitly 1.1+.
 
-**Gate 1 — companion phase 7, PVFS side** (doc 16 §7 items 1, 2, 4 — all small):
+**Gate 1 — companion phase 7, PVFS side** (doc 16 §7 items 1, 2, 4) — ✅ **DONE (2026-07-03)**:
 
-- ☐ **`ApprovalContext` on the sign surface** — optional `context` on `AgentRequest::Sign` and the
-  tenant sign ops; the `Prompter` renders it, the audit log records it; new `user_action` request
-  type (doc 16 §2–3).
-- ☐ **`pvfsd` challenge consumer** — integration test + reference closing the "Sign in with PVFS"
-  loop end-to-end against a live daemon (doc 16 §6).
-- ☐ **`api_version` handshake** — pin an explicit version in the agent protocol (doc 16 §7 item 4).
+- ☑ **`ApprovalContext` on the sign surface** — optional `context` on `AgentRequest::Sign` and the
+  tenant sign ops; the `Prompter` renders it (`approve_with_context`), the audit log records it
+  whole; new `user_action` request type (identity key, prompt-by-default); a `digest_hex` that
+  disagrees with the digest being signed is refused before any prompt (doc 16 §2–3).
+- ☑ **`pvfsd` challenge consumer** — `pvfs-companion/tests/signin_pvfsd.rs` closes the "Sign in
+  with PVFS" loop end-to-end against a live daemon (doc 16 §6); the signing closure is the
+  app-side reference.
+- ☑ **`api_version` handshake** — `API_VERSION` (= 1) + an `api_version` op on both the local
+  agent and tenant sockets, answered even while locked (doc 16 §7 item 4).
 
 (The `pvos.sso` service itself is PVOS-repo work consuming this API — **not** a PVFS 1.0 gate.)
 
@@ -247,7 +250,7 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     `pvfsd` is up; rc 0 is decisive because the old client-identity signer (a member, not an admin)
     returned `forbidden`. This also covers the daemon-running half of Road-to-1.0 item 4.
 
-17. **Owner / identity key replacement — REQUIRED follow-on (not yet built).** The companion (doc 14)
+17. **Owner / identity key replacement — ✅ BUILT (doc 15 cases A/B/C, 2026-07-03).** The companion (doc 14)
     makes a human's identity **one stable key across devices** (doc 10 §9.1), whose accepted cost is
     that you can't revoke a single lost machine's copy of the *identity* without rotating that key. That
     is only acceptable if a clean **key-replacement** path exists. Three cases: replace a lost/compromised
@@ -259,7 +262,10 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     → **Drafted (2026-07-01):** [doc 15 — key replacement & rotation](15-key-replacement.md): identity-index
     bump + root-signed swap + `reissue_authority` re-homing (case A), revoke/re-authorize composition (case B),
     and a `RootRotated` **root lineage** with an optional offline **recovery key** so the forest survives full
-    seed compromise with `forest_id`/history intact (case C). Awaiting review; build plan in doc 15 §5.
+    seed compromise with `forest_id`/history intact (case C).
+    → **Built (2026-07-03):** all three cases shipped (`pvfs forest rotate-root` / `recovery-key` /
+    `member replace`, doc 15 §6 decisions settled); the compaction-lineage and federation-pinning
+    edges are folded into those tracks (docs 11, 03).
 
 **Resolved since earlier drafts:** `PvfsError::Forbidden` now exists; the daemon socket is
 discoverable (conventional path, P2-E §3b); admit/revoke no longer need the recovery phrase (§3a);

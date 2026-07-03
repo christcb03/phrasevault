@@ -785,9 +785,11 @@ fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
 /// We therefore prefer the forest device key whenever it is readable here (only the
 /// owner can read the `0600` `.pvfs/device.key`), and fall back to the client
 /// identity otherwise (e.g. a member auto-routing against a forest they don't own).
-fn daemon_client(
-    state_dir: &std::path::Path,
-) -> Result<Option<(Client, Box<dyn Fn(&[u8; 32]) -> Vec<u8>>)>, PvfsError> {
+/// The per-mutation signer for a connected key (what the daemon's two-phase
+/// member writes call to sign each event digest).
+type SignFn = Box<dyn Fn(&[u8; 32]) -> Vec<u8>>;
+
+fn daemon_client(state_dir: &std::path::Path) -> Result<Option<(Client, SignFn)>, PvfsError> {
     let Some(sock) = try_daemon_socket(state_dir) else {
         return Ok(None);
     };
@@ -805,8 +807,7 @@ fn daemon_client(
     })
     .map_err(remote_err)?;
     // key is free to move: the FnOnce above was consumed inside connect_signed.
-    let sign: Box<dyn Fn(&[u8; 32]) -> Vec<u8>> =
-        Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
+    let sign: SignFn = Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
     Ok(Some((client, sign)))
 }
 
@@ -1781,22 +1782,20 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     // stores on the fly without stopping the filesystem. A pinned
                     // --path forces the direct engine path (the daemon uses managed
                     // storage only).
-                    let id = if path.is_none() {
-                        if let Some((mut client, sign)) = daemon_client(&state_dir)? {
-                            client
-                                .secure_create(&parent_id, &label, |d| sign(d))
-                                .map_err(remote_err)?
-                        } else {
-                            let mut engine = Engine::open(&state_dir)?;
-                            let id = engine.add_node(&parent_id, secure_spec(&label))?;
-                            engine.close()?;
-                            id
-                        }
-                    } else {
-                        let uri = pvfs_core::storage::path_to_uri(path.as_ref().unwrap())?;
+                    let id = if let Some(p) = &path {
+                        let uri = pvfs_core::storage::path_to_uri(p)?;
                         let mut engine = Engine::open(&state_dir)?;
                         let id = engine.add_node(&parent_id, secure_spec(&label))?;
                         engine.add_location(&id, &uri)?;
+                        engine.close()?;
+                        id
+                    } else if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                        client
+                            .secure_create(&parent_id, &label, |d| sign(d))
+                            .map_err(remote_err)?
+                    } else {
+                        let mut engine = Engine::open(&state_dir)?;
+                        let id = engine.add_node(&parent_id, secure_spec(&label))?;
                         engine.close()?;
                         id
                     };
