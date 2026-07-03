@@ -115,16 +115,16 @@ A loopback HTTP endpoint lets a PVFS-backed web app authenticate the user with n
 
 ## 7. Joint PVFS + PVOS agent API (doc 13 Q-E3)
 
-PVOS wants the *same* agent. The companion exposes a **superset** API both consume, to be pinned in a short joint spec (PVFS doc 09 §6 + PVOS doc 10 §4.1):
+PVOS wants the *same* agent (one shared companion — PVOS D7 ✅). The full contract is pinned in **[doc 16 — Joint Companion Agent API](16-joint-agent-api.md)**, which resolves PVOS D7 (coordinate the API) and D19 (the SSSO approval-context protocol). Summary of the shared surface:
 
 | Method | Used by | Notes |
 |--------|---------|-------|
-| `get-identity` / `get-pubkey` | both | the connected identity's public key(s) |
-| `sign(digest, type, context)` | both | the core signer; `type` selects the §4 policy row |
-| `sign-in(challenge, origin)` | PVFS auto-login | §6 |
-| `sign-as-user(context)` | PVOS SSSO | human-signature brokering; same approval tiers |
+| `get-identity` / `get-pubkey` | both | the connected identity's public key(s) — built |
+| `sign(digest, type, context)` | both | the core signer; `type` selects the §4 policy row; `context` is the D19 `ApprovalContext` (doc 16 §3) |
+| `sign-in(challenge, origin)` | PVFS auto-login | §6; the real `pvfsd` challenge consumer is doc 16 §6 |
+| `sign-as-user(context)` | PVOS SSSO | human-signature brokering via the tenant custody core (§13) + the approval context |
 
-The PVFS build targets the PVFS subset first; the methods are named/shaped so PVOS's additions are additive.
+**The surface is ~90% built** (phases 1–6 + §13). Phase 7's PVFS work is small and named in doc 16 §7: the `ApprovalContext` field on `sign`/tenant-sign, the `pvfsd` challenge consumer, and an explicit `api_version` handshake. The `pvos.sso` service that consumes it is PVOS-side (their doc 07 §3.5).
 
 ---
 
