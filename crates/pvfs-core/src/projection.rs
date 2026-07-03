@@ -974,11 +974,17 @@ pub fn authority_active(conn: &Connection, authority: &[u8]) -> Result<bool> {
     Ok(device_status(conn, authority)?.0)
 }
 
+/// One inert tag grant found by the audit: `(node_id, tag_name, authority, rights)`.
+pub type InertTagGrant = (String, String, Vec<u8>, u8);
+
+/// One inert tag membership found by the audit: `(member_pubkey, tag, authority)`.
+pub type InertMembership = (Vec<u8>, String, Vec<u8>);
+
 /// Forest-wide authorization audit (doc 08 §4 item 14): every **tag grant** whose
 /// authority is no longer a live member — `(node_id, tag_name, authority, rights)`.
 /// These grants are inert (masked on the read path; flagged `[inert]` by `acl ls`).
 /// Read-only; ordered for stable output.
-pub fn inert_tag_grants(conn: &Connection) -> Result<Vec<(String, String, Vec<u8>, u8)>> {
+pub fn inert_tag_grants(conn: &Connection) -> Result<Vec<InertTagGrant>> {
     let mut stmt = conn
         .prepare(
             "SELECT a.node_id, a.principal_id, a.authority, a.rights FROM acl a
@@ -1008,7 +1014,7 @@ pub fn inert_tag_grants(conn: &Connection) -> Result<Vec<(String, String, Vec<u8
 /// Forest-wide authorization audit (doc 08 §4 item 14): every tag **membership**
 /// whose authority is no longer a live member — `(member_pubkey, tag, authority)`.
 /// Inert (masked), the membership counterpart of [`inert_tag_grants`]. Read-only.
-pub fn inert_memberships(conn: &Connection) -> Result<Vec<(Vec<u8>, String, Vec<u8>)>> {
+pub fn inert_memberships(conn: &Connection) -> Result<Vec<InertMembership>> {
     let mut stmt = conn
         .prepare(
             "SELECT mt.member_pubkey, mt.tag, mt.authority FROM member_tags mt

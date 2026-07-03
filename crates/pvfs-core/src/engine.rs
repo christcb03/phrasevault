@@ -32,6 +32,10 @@ pub struct NodeSpec {
     pub creation_nonce: Option<u64>,
 }
 
+/// The current ledger head of a secure blob (doc 12 §8.2):
+/// `(content_hash, size, updated_at, author)`.
+pub type SecureBlobHead = (Vec<u8>, u64, u64, Vec<u8>);
+
 /// One ordered child of a parent (merged `contains` + `ref`).
 #[derive(Debug, Clone)]
 pub struct ChildEntry {
@@ -1535,14 +1539,14 @@ impl Engine {
     /// counterpart to `pvfs verify`. Returns every **tag grant** under a revoked
     /// authority as `(node_id, tag_name, authority, rights)`. Read-only: these are
     /// inert (masked, flagged `[inert]` by `acl ls`); cleanup is compaction's job.
-    pub fn inert_tag_grants(&self) -> Result<Vec<(String, String, Vec<u8>, u8)>> {
+    pub fn inert_tag_grants(&self) -> Result<Vec<projection::InertTagGrant>> {
         projection::inert_tag_grants(&self.conn)
     }
 
     /// Forest-wide audit: every tag **membership** under a revoked authority as
     /// `(member_pubkey, tag, authority)`. The membership counterpart of
     /// [`inert_tag_grants`](Self::inert_tag_grants).
-    pub fn inert_memberships(&self) -> Result<Vec<(Vec<u8>, String, Vec<u8>)>> {
+    pub fn inert_memberships(&self) -> Result<Vec<projection::InertMembership>> {
         projection::inert_memberships(&self.conn)
     }
 
@@ -2176,7 +2180,7 @@ impl Engine {
 
     /// The current ledger head of a secure blob (doc 12 §8.2):
     /// `(content_hash, size, updated_at, author)`; `None` before its first update.
-    pub fn secure_current(&self, blob_id: &NodeId) -> Result<Option<(Vec<u8>, u64, u64, Vec<u8>)>> {
+    pub fn secure_current(&self, blob_id: &NodeId) -> Result<Option<SecureBlobHead>> {
         self.conn
             .query_row(
                 "SELECT content_hash, size, updated_at, author FROM secure_blobs WHERE blob_id = ?1",
