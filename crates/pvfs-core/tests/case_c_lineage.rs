@@ -106,6 +106,32 @@ fn recovery_key_can_rotate_after_total_seed_loss() {
 }
 
 #[test]
+fn recover_uses_the_current_root_not_genesis() {
+    // Regression (review 2026-07-02): after a rotation, `recover` must accept the
+    // NEW phrase and reject the OLD one — it previously compared against the
+    // fixed genesis root, so the correct new seed was rejected and the stale old
+    // seed passed (writing a device cert its author no longer had authority for).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, old_mn) = Engine::init(dir.path()).unwrap();
+    let old_root = crypto::pubkey_bytes(&identity::root_key(&old_mn, "").unwrap());
+    let old_root_key = identity::root_key(&old_mn, "").unwrap();
+
+    let new_mn = identity::generate_mnemonic().unwrap();
+    let new_root = crypto::pubkey_bytes(&identity::root_key(&new_mn, "").unwrap());
+    let prep = engine.prepare_rotate_root(&old_root, &new_root).unwrap();
+    commit1(&mut engine, prep, &old_root_key);
+    engine.close().unwrap();
+
+    // The OLD seed no longer recovers; the NEW seed does.
+    assert!(Engine::recover(dir.path(), &old_mn, 7).is_err());
+    let engine = Engine::recover(dir.path(), &new_mn, 7).expect("new seed recovers");
+    engine.close().unwrap();
+    // And the forest still opens cleanly (the recover-authorized device is valid
+    // at replay because its author is the current root).
+    Engine::open(dir.path()).unwrap().close().unwrap();
+}
+
+#[test]
 fn a_stranger_cannot_rotate_or_register() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _mn) = Engine::init(dir.path()).unwrap();

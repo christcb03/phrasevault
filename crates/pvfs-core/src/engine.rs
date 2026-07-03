@@ -366,9 +366,14 @@ impl Engine {
 
         let mut conn = open_connection(data_dir)?;
         let identity = projection::startup_check(&mut conn)?;
-        if identity.root_pubkey != root_pub {
+        // Compare against the CURRENT lineage root (doc 15 §C2), not the genesis
+        // root: after a root rotation only the new seed recovers, and the old
+        // (compromised) seed is rejected here rather than writing a device cert
+        // its author no longer has authority for.
+        let current_root = projection::current_root(&conn, &identity)?;
+        if current_root != root_pub {
             return Err(PvfsError::Identity {
-                detail: "mnemonic does not match this forest's identity root".into(),
+                detail: "mnemonic does not match this forest's current identity root".into(),
             });
         }
         let device = DeviceKeyCache {
