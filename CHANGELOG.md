@@ -3,7 +3,7 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
-## 1.0.0 — unreleased (tag pending the release validation run)
+## 1.0.0 — 07/03/2026
 
 The first complete release: a standalone, multi-user, signed file-system
 engine, ready to host an application layer (sync/file server) above it.
