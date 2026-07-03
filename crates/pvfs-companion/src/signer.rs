@@ -32,6 +32,10 @@ pub enum RequestType {
     /// Unwrap a secure-blob content key (doc 12 §8.5) — the **encryption** key
     /// (`2'/<id>'`) does ECDH; the content key is returned, never the private key.
     SecureUnwrap,
+    /// A human-attributed app action brokered by `pvos.sso` (doc 16 §2–3) —
+    /// signed by the **identity** key; approval is driven by the
+    /// [`ApprovalContext`](crate::proto::ApprovalContext), prompt-by-default.
+    UserAction,
 }
 
 /// Which custodied key a request resolves to.
@@ -47,7 +51,9 @@ impl RequestType {
     pub fn key_role(self) -> KeyRole {
         match self {
             RequestType::RootDeviceCert => KeyRole::Root,
-            RequestType::IdentityTag | RequestType::IdentityAssertion => KeyRole::Identity,
+            RequestType::IdentityTag
+            | RequestType::IdentityAssertion
+            | RequestType::UserAction => KeyRole::Identity,
             RequestType::SecureUnwrap => KeyRole::Encryption,
         }
     }
@@ -59,6 +65,7 @@ impl RequestType {
             "identity_tag" => Some(RequestType::IdentityTag),
             "identity_assertion" => Some(RequestType::IdentityAssertion),
             "secure_unwrap" => Some(RequestType::SecureUnwrap),
+            "user_action" => Some(RequestType::UserAction),
             _ => None,
         }
     }

@@ -85,6 +85,7 @@ fn tenant_socket_session_and_root_reauth() {
             token: token.clone(),
             request_type: "identity_tag".into(),
             digest: hex::encode(digest),
+            context: None,
         },
     ) {
         TenantResponse::Signature { sig } => {
@@ -100,6 +101,7 @@ fn tenant_socket_session_and_root_reauth() {
             token: token.clone(),
             request_type: "root_device_cert".into(),
             digest: hex::encode(digest),
+            context: None,
         },
     ) {
         TenantResponse::Error { code, .. } => assert_eq!(code, "reauth_required"),
@@ -114,6 +116,7 @@ fn tenant_socket_session_and_root_reauth() {
             passphrase: "alice-pw".into(),
             request_type: "root_device_cert".into(),
             digest: hex::encode(digest),
+            context: None,
         },
     ) {
         TenantResponse::Signature { .. } => {}
@@ -128,6 +131,7 @@ fn tenant_socket_session_and_root_reauth() {
             passphrase: "wrong".into(),
             request_type: "identity_tag".into(),
             digest: hex::encode(digest),
+            context: None,
         },
     ) {
         TenantResponse::Error { .. } => {}
@@ -142,6 +146,7 @@ fn tenant_socket_session_and_root_reauth() {
             token,
             request_type: "identity_tag".into(),
             digest: hex::encode(digest),
+            context: None,
         },
     ) {
         TenantResponse::Error { code, .. } => assert_eq!(code, "no_session"),

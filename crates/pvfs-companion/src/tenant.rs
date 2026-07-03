@@ -17,6 +17,7 @@ use std::time::Duration;
 use pvfs_proto::{read_msg, write_msg};
 use serde::{Deserialize, Serialize};
 
+use crate::proto::{ApprovalContext, API_VERSION};
 use crate::session::{SessionError, Sessions};
 use crate::signer::{KeyRole, RequestType};
 
@@ -24,6 +25,8 @@ use crate::signer::{KeyRole, RequestType};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TenantRequest {
+    /// The agent protocol version (doc 16 §7 item 4); needs no secret.
+    ApiVersion,
     /// Public key for a user's `role` (`"root"`/`"identity"`); needs the secret.
     GetPubkey {
         user_id: String,
@@ -36,18 +39,24 @@ pub enum TenantRequest {
         passphrase: String,
         ttl_secs: u64,
     },
-    /// Public-device / per-action: unlock, sign, drop.
+    /// Public-device / per-action: unlock, sign, drop. `context` is the doc 16
+    /// §3 approval context — checked against `digest` and carried so the
+    /// per-user prompt (PVOS D18) has something meaningful to render.
     SignOnce {
         user_id: String,
         passphrase: String,
         request_type: String,
         digest: String,
+        #[serde(default)]
+        context: Option<ApprovalContext>,
     },
     /// Trusted-device: sign with a cached session (never a root request type).
     SignWithSession {
         token: String,
         request_type: String,
         digest: String,
+        #[serde(default)]
+        context: Option<ApprovalContext>,
     },
     /// End a session (logout), wiping the cached key.
     CloseSession { token: String },
@@ -57,6 +66,7 @@ pub enum TenantRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TenantResponse {
+    ApiVersion { api_version: u32 },
     Session { token: String, ttl_secs: u64 },
     Signature { sig: String },
     Pubkey { pubkey: String },
@@ -98,6 +108,9 @@ impl TenantAgent {
 
     pub fn handle(&self, req: TenantRequest) -> TenantResponse {
         match req {
+            TenantRequest::ApiVersion => TenantResponse::ApiVersion {
+                api_version: API_VERSION,
+            },
             TenantRequest::GetPubkey {
                 user_id,
                 passphrase,
@@ -135,11 +148,15 @@ impl TenantAgent {
                 passphrase,
                 request_type,
                 digest,
+                context,
             } => {
                 let (Some(rt), Some(d)) = (RequestType::parse(&request_type), parse_digest(&digest))
                 else {
                     return TenantResponse::bad("unknown request_type or bad digest");
                 };
+                if context_digest_mismatch(context.as_ref(), &digest) {
+                    return TenantResponse::bad("context digest_hex does not match the digest");
+                }
                 match self
                     .sessions
                     .sign_once(&user_id, passphrase.as_bytes(), rt, &d)
@@ -154,11 +171,15 @@ impl TenantAgent {
                 token,
                 request_type,
                 digest,
+                context,
             } => {
                 let (Some(rt), Some(d)) = (RequestType::parse(&request_type), parse_digest(&digest))
                 else {
                     return TenantResponse::bad("unknown request_type or bad digest");
                 };
+                if context_digest_mismatch(context.as_ref(), &digest) {
+                    return TenantResponse::bad("context digest_hex does not match the digest");
+                }
                 match self.sessions.sign_with_session(&token, rt, &d) {
                     Ok(sig) => TenantResponse::Signature {
                         sig: hex::encode(sig),
@@ -196,6 +217,14 @@ fn serve_connection(agent: &TenantAgent, mut stream: UnixStream) -> io::Result<(
 
 fn parse_digest(hexs: &str) -> Option<[u8; 32]> {
     hex::decode(hexs).ok()?.try_into().ok()
+}
+
+/// True when a context names a digest that is NOT the one being signed —
+/// refused as `bad_input` (same rule as the local agent, doc 16 §3.1).
+fn context_digest_mismatch(context: Option<&ApprovalContext>, digest: &str) -> bool {
+    context
+        .and_then(|c| c.digest_hex.as_deref())
+        .is_some_and(|d| !d.eq_ignore_ascii_case(digest))
 }
 
 /// Client: send one request to a multi-tenant custody agent and read its reply.

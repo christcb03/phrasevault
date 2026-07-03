@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::proto::ApprovalContext;
+
 /// One audit line.
 #[derive(Serialize)]
 pub struct AuditEntry<'a> {
@@ -33,6 +35,10 @@ pub struct AuditEntry<'a> {
     /// The 32-byte digest that was (or would have been) signed, hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<&'a str>,
+    /// The broker-built approval context, when the request carried one (doc 16
+    /// §3.2: the audit records the full context — it is all public metadata).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<&'a ApprovalContext>,
 }
 
 /// An open audit log; appends are serialized and flushed per line.
@@ -84,6 +90,18 @@ impl AuditLog {
 
     /// Convenience for the common case.
     pub fn sign(&self, request_type: &str, origin: &str, decision: &str, digest: &str) {
+        self.sign_ctx(request_type, origin, decision, digest, None);
+    }
+
+    /// As [`sign`](AuditLog::sign), recording the approval context when present.
+    pub fn sign_ctx(
+        &self,
+        request_type: &str,
+        origin: &str,
+        decision: &str,
+        digest: &str,
+        context: Option<&ApprovalContext>,
+    ) {
         self.record(&AuditEntry {
             ts_ms: 0,
             event: "sign",
@@ -91,6 +109,7 @@ impl AuditLog {
             origin: Some(origin),
             decision: Some(decision),
             digest: Some(digest),
+            context,
         });
     }
 
@@ -103,6 +122,7 @@ impl AuditLog {
             origin: None,
             decision: None,
             digest: None,
+            context: None,
         });
     }
 }

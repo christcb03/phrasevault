@@ -35,7 +35,7 @@ pub use webagent::WebAgent;
 pub use keychain::{MemoryStore, SecretStore};
 pub use paths::{default_socket_path, default_vault_path};
 pub use policy::{ApprovalPolicy, Decision, Origin};
-pub use proto::{AgentRequest, AgentResponse};
+pub use proto::{AgentRequest, AgentResponse, ApprovalContext, API_VERSION};
 pub use session::{DeviceTrust, SessionError, Sessions};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
 pub use store::{StoreError, VaultStore};

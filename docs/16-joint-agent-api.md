@@ -36,9 +36,9 @@ The methods PVOS doc 10 §7 and PVFS doc 14 §7 both name, pinned to the built P
 | Canonical method | PVFS companion wire form | Key used | Built? |
 |------------------|--------------------------|----------|--------|
 | `get-identity` / `get-pubkey` | `AgentRequest::GetPubkey { role }` → `Pubkey` | root / identity / encryption | ✅ (phases 2–4) |
-| `sign(digest, type, context)` | `AgentRequest::Sign { request_type, digest, context?, origin }` → `Signature` | by request type (§4 policy tier) | ◑ **`context` is the D19 addition (§3)** |
-| `sign-in(challenge, origin)` | loopback `POST /sign-in { challenge }` → `{ sig, pubkey }` | identity | ✅ (phase 6); ☐ real `pvfsd` challenge consumer (§6) |
-| `sign-as-user(context)` | tenant `sign_once` / `sign_with_session` **+ context** (§5) | per-user identity | ◑ custody built (phase 3.5); context is the §3 addition |
+| `sign(digest, type, context)` | `AgentRequest::Sign { request_type, digest, context?, origin }` → `Signature` | by request type (§4 policy tier) | ✅ (phase 7: `ApprovalContext` rendered + audited, `user_action` type) |
+| `sign-in(challenge, origin)` | loopback `POST /sign-in { challenge }` → `{ sig, pubkey }` | identity | ✅ (phase 6); ✅ real `pvfsd` challenge consumer (§6, `tests/signin_pvfsd.rs`) |
+| `sign-as-user(context)` | tenant `sign_once` / `sign_with_session` **+ context** (§5) | per-user identity | ✅ (phase 7: context accepted + digest-checked on the tenant ops) |
 | lifecycle | `Lock`, `RotateIdentity`, `SecureUnwrap` (doc 12 §8.5) | — | ✅ |
 
 So the surface is **already ~90% built**. Phase 7 is: (a) the **approval-context** field on `Sign` and the tenant sign ops (§3), and (b) the **`pvfsd` challenge consumer** (§6). Everything else exists.
@@ -148,12 +148,12 @@ The only new code is a **consumer/example** proving steps 1→4 against a runnin
 **Already built (PVFS companion phases 1–6 + 3.5):** the vault, the tiered signer + approval prompts + audit + lock, `GetPubkey`/`Sign`, the loopback identity agent with origin connect, and the multi-tenant custody core. That is the bulk of doc 14 §7's surface.
 
 **Remaining for phase 7:**
-1. ☐ **`ApprovalContext` on the sign surface** — add the optional `context` field to `AgentRequest::Sign` and the tenant sign ops; the `Prompter` renders it; the audit log records it; new `user_action` request type (§2–3). *PVFS-side, small.*
-2. ☐ **`pvfsd` challenge consumer** — an integration test + reference proving the §6 loop end-to-end. *PVFS-side, small.*
+1. ☑ **`ApprovalContext` on the sign surface** — the optional `context` field on `AgentRequest::Sign` and the tenant sign ops; the `Prompter` renders it (`approve_with_context`, doc 16 §3.2 wording in the terminal/desktop backends); the audit log records the full context; new `user_action` request type signed by the identity key, **prompt-by-default** (§3.3's allow-list is broker-side only). A context whose `digest_hex` disagrees with the digest being signed is refused as `bad_input` before any prompt, on both the local agent and the tenant ops. *Built.*
+2. ☑ **`pvfsd` challenge consumer** — `crates/pvfs-companion/tests/signin_pvfsd.rs` proves the §6 loop 1→4 against a live `pvfsd`: challenge → loopback `POST /sign-in` → identity-key signature → daemon `Auth` verifies the member, and ACLs bind to the signed-in principal. The signing closure in that test is the app-side reference. *Built.*
 3. ☐ **`pvos.sso` service** — `whoami` / `session` / `sign_as_user`, the policy engine (§3.3), and the digest+context construction (§3.1). *PVOS-side, in `pvosd` — built in the PVOS repo, consuming this API.*
-4. ☐ **`api_version` handshake** — the companion socket already versions implicitly; pin an explicit `api_version` in the agent protocol so PVOS/apps negotiate (mirrors PVOS doc 04 §9). *PVFS-side, small.*
+4. ☑ **`api_version` handshake** — `API_VERSION` (= 1) in `pvfs_companion::proto`, answered by the new `api_version` op on **both** the local agent and the tenant socket; answered even while locked, so negotiation never requires an unlock. *Built.*
 
-So PVFS's phase-7 work is items 1, 2, 4 — all small and self-contained. Item 3 is PVOS's, and this doc is the contract it builds to.
+PVFS's phase-7 work (items 1, 2, 4) is **done**; item 3 is PVOS's, and this doc is the contract it builds to.
 
 ## 8. Open items (carried, not blocking)
 

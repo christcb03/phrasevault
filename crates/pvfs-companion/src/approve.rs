@@ -11,11 +11,26 @@ use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
 use crate::policy::Origin;
+use crate::proto::ApprovalContext;
 use crate::signer::RequestType;
 
 /// Ask the human to approve a signature the policy wouldn't auto-approve.
 pub trait Prompter: Send + Sync {
     fn approve(&self, request: RequestType, origin: Origin) -> bool;
+
+    /// As [`approve`](Prompter::approve), rendering the broker-built
+    /// [`ApprovalContext`] (doc 16 §3.2) so the human reads *"MediaForest wants
+    /// to share 3 photos"*, never an opaque hash. Default: ignore the context
+    /// and fall back to the plain prompt — backends that can show text override.
+    fn approve_with_context(
+        &self,
+        request: RequestType,
+        origin: Origin,
+        context: Option<&ApprovalContext>,
+    ) -> bool {
+        let _ = context;
+        self.approve(request, origin)
+    }
 
     /// The wallet-style connect (doc 14 §6): "allow `origin` to sign in as
     /// you?". Default deny — a backend must opt in explicitly.
@@ -62,12 +77,38 @@ fn describe(request: RequestType, origin: Origin) -> String {
         RequestType::IdentityTag => "identity signature: a tag grant or membership under your authority",
         RequestType::IdentityAssertion => "identity assertion: prove who you are (sign-in)",
         RequestType::SecureUnwrap => "decrypt a secure blob (unwrap its content key)",
+        RequestType::UserAction => "an app action signed AS YOU (brokered by pvos.sso)",
     };
     let from = match origin {
         Origin::Local => "this machine",
         Origin::Web => "a WEB ORIGIN",
     };
     format!("pvfs-companion: approve {what}, requested from {from}?")
+}
+
+/// The doc 16 §3.2 rendering: lead with the broker's human line, then the
+/// attributed app, action verb, and resource — the digest is never shown.
+fn describe_with_context(
+    request: RequestType,
+    origin: Origin,
+    context: Option<&ApprovalContext>,
+) -> String {
+    let Some(ctx) = context else {
+        return describe(request, origin);
+    };
+    let mut s = format!(
+        "pvfs-companion: \"{}\" wants to sign as you: {} (action: {}",
+        ctx.app_id, ctx.summary, ctx.action
+    );
+    if let Some(r) = &ctx.resource {
+        s.push_str(&format!(", resource: {r}"));
+    }
+    let from = match origin {
+        Origin::Local => "this machine",
+        Origin::Web => "a WEB ORIGIN",
+    };
+    s.push_str(&format!("), requested from {from}. Approve?"));
+    s
 }
 
 /// Ask on the controlling terminal (`/dev/tty`), independent of stdin/stdout —
@@ -120,6 +161,14 @@ impl Prompter for TerminalPrompter {
     fn approve(&self, request: RequestType, origin: Origin) -> bool {
         self.ask(&describe(request, origin))
     }
+    fn approve_with_context(
+        &self,
+        request: RequestType,
+        origin: Origin,
+        context: Option<&ApprovalContext>,
+    ) -> bool {
+        self.ask(&describe_with_context(request, origin, context))
+    }
     fn approve_connect(&self, origin: &str) -> bool {
         self.ask(&describe_connect(origin))
     }
@@ -150,6 +199,14 @@ impl DesktopPrompter {
 impl Prompter for DesktopPrompter {
     fn approve(&self, request: RequestType, origin: Origin) -> bool {
         self.dialog(&describe(request, origin))
+    }
+    fn approve_with_context(
+        &self,
+        request: RequestType,
+        origin: Origin,
+        context: Option<&ApprovalContext>,
+    ) -> bool {
+        self.dialog(&describe_with_context(request, origin, context))
     }
     fn approve_connect(&self, origin: &str) -> bool {
         self.dialog(&describe_connect(origin))
@@ -224,5 +281,23 @@ mod tests {
     fn descriptions_name_the_authority_and_origin() {
         let s = describe(RequestType::RootDeviceCert, Origin::Web);
         assert!(s.contains("ROOT") && s.contains("WEB ORIGIN"));
+    }
+
+    #[test]
+    fn context_rendering_leads_with_the_brokers_line() {
+        let ctx = ApprovalContext {
+            app_id: "app:mediaforest".into(),
+            action: "share".into(),
+            summary: "Share 3 photos with your Friends".into(),
+            resource: Some("pvfs://f/media/albums/trip".into()),
+            digest_hex: None,
+        };
+        let s = describe_with_context(RequestType::UserAction, Origin::Local, Some(&ctx));
+        assert!(s.contains("app:mediaforest"));
+        assert!(s.contains("Share 3 photos with your Friends"));
+        assert!(s.contains("albums/trip"));
+        // No context falls back to the generic wording.
+        let s = describe_with_context(RequestType::UserAction, Origin::Local, None);
+        assert!(s.contains("signed AS YOU"));
     }
 }

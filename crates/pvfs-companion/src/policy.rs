@@ -56,6 +56,11 @@ impl ApprovalPolicy {
             (RequestType::RootDeviceCert, _) => yes_or_prompt(self.auto_root),
             // Anything from a web origin: bind to a per-origin connect (prompt) unless auto.
             (_, Origin::Web) => yes_or_prompt(self.auto_web_origin),
+            // A brokered app action signed as the human (doc 16 §2–3): the
+            // context drives the prompt, and the companion's floor is
+            // prompt-by-default (doc 16 §8) — any auto-approve allow-list
+            // lives broker-side (`pvos.sso`), never here.
+            (RequestType::UserAction, Origin::Local) => Decision::Prompt,
             // The human's own identity ops + secure-blob decryption, initiated
             // locally: friction-free while unlocked (doc 12 §8.5). A web origin
             // never reaches here — it hit the Origin::Web arm above.
@@ -114,6 +119,16 @@ mod tests {
         // web identity assertion prompts (connect) by default
         assert_eq!(
             p.decide_headless(RequestType::IdentityAssertion, Origin::Web),
+            Decision::Deny
+        );
+        // a brokered user_action always prompts (deny headless) — the
+        // companion floor has no auto-approve for app actions (doc 16 §8)
+        assert_eq!(
+            p.decide(RequestType::UserAction, Origin::Local),
+            Decision::Prompt
+        );
+        assert_eq!(
+            p.decide_headless(RequestType::UserAction, Origin::Local),
             Decision::Deny
         );
     }

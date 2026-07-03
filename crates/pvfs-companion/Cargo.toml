@@ -42,3 +42,8 @@ keyring = { version = "3", optional = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+# The doc 16 §6 "Sign in with PVFS" loop is proven end-to-end against a real
+# daemon: pvfsd issues the challenge, this crate's loopback agent signs it,
+# pvfs-client completes the auth (tests/signin_pvfsd.rs).
+pvfsd = { path = "../pvfsd" }
+pvfs-client = { path = "../pvfs-client" }

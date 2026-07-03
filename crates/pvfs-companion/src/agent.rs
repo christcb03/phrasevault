@@ -16,7 +16,7 @@ use pvfs_proto::{read_msg, write_msg};
 use crate::approve::{DenyPrompter, Prompter};
 use crate::audit::AuditLog;
 use crate::policy::{ApprovalPolicy, Decision, Origin};
-use crate::proto::{AgentRequest, AgentResponse};
+use crate::proto::{AgentRequest, AgentResponse, ApprovalContext, API_VERSION};
 use crate::signer::{KeyRole, RequestType, UnlockedSigner};
 
 /// Re-creates an [`UnlockedSigner`] after a lock (doc 14 §5): fetch the data key
@@ -101,12 +101,21 @@ impl Agent {
         self
     }
 
-    fn audit_sign(&self, rt: &str, origin: Origin, decision: &str, digest: &str) {
+    fn audit_sign(
+        &self,
+        rt: &str,
+        origin: Origin,
+        decision: &str,
+        digest: &str,
+        context: Option<&ApprovalContext>,
+    ) {
         let o = match origin {
             Origin::Local => "local",
             Origin::Web => "web",
         };
-        self.audit_sign_str(rt, o, decision, digest);
+        if let Some(a) = &self.audit {
+            a.sign_ctx(rt, o, decision, digest, context);
+        }
     }
 
     fn audit_sign_str(&self, rt: &str, origin: &str, decision: &str, digest: &str) {
@@ -188,6 +197,7 @@ impl Agent {
                 origin: Some(origin),
                 decision: Some(if ok { "approved" } else { "denied" }),
                 digest: None,
+                context: None,
             });
         }
         ok
@@ -235,6 +245,10 @@ impl Agent {
     /// Handle one request, applying the policy, prompter, rate limit, and lock.
     pub fn handle(&self, req: AgentRequest) -> AgentResponse {
         match req {
+            // Version negotiation must work even while locked (doc 16 §7 item 4).
+            AgentRequest::ApiVersion => AgentResponse::ApiVersion {
+                api_version: API_VERSION,
+            },
             AgentRequest::GetPubkey { role } => {
                 let Some(role) = KeyRole::parse(&role) else {
                     return AgentResponse::error("bad_input", "unknown role");
@@ -251,6 +265,7 @@ impl Agent {
                 request_type,
                 digest,
                 origin,
+                context,
             } => {
                 let Some(rt) = RequestType::parse(&request_type) else {
                     return AgentResponse::error("bad_input", "unknown request_type");
@@ -264,32 +279,44 @@ impl Agent {
                     Ok(a) => a,
                     Err(_) => return AgentResponse::error("bad_input", "digest must be 32 bytes"),
                 };
+                // A context that names a digest must name THIS one — the broker
+                // built both from one operation (doc 16 §3.1), so a mismatch
+                // means a confused (or lying) caller. Refuse before any prompt.
+                if let Some(ctx_digest) = context.as_ref().and_then(|c| c.digest_hex.as_deref()) {
+                    if !ctx_digest.eq_ignore_ascii_case(&digest) {
+                        return AgentResponse::error(
+                            "bad_input",
+                            "context digest_hex does not match the digest being signed",
+                        );
+                    }
+                }
+                let ctx = context.as_ref();
                 if self.rate_limited() {
-                    self.audit_sign(&request_type, origin, "rate_limited", &digest);
+                    self.audit_sign(&request_type, origin, "rate_limited", &digest, ctx);
                     return AgentResponse::error("rate_limited", "too many signature requests");
                 }
                 let approved = match self.policy.decide(rt, origin) {
                     Decision::Approve => true,
                     Decision::Deny => false,
-                    Decision::Prompt => self.prompter.approve(rt, origin),
+                    Decision::Prompt => self.prompter.approve_with_context(rt, origin, ctx),
                 };
                 if !approved {
-                    self.audit_sign(&request_type, origin, "denied", &digest);
+                    self.audit_sign(&request_type, origin, "denied", &digest, ctx);
                     return AgentResponse::error("denied", "approval required or denied by policy");
                 }
                 match self.with_signer(|s| s.sign(rt, &arr)) {
                     Ok(Ok(sig)) => {
-                        self.audit_sign(&request_type, origin, "approved", &digest);
+                        self.audit_sign(&request_type, origin, "approved", &digest, ctx);
                         AgentResponse::Signature {
                             sig: hex::encode(sig),
                         }
                     }
                     Ok(Err(e)) => {
-                        self.audit_sign(&request_type, origin, "error", &digest);
+                        self.audit_sign(&request_type, origin, "error", &digest, ctx);
                         AgentResponse::error("sign", e.to_string())
                     }
                     Err(resp) => {
-                        self.audit_sign(&request_type, origin, "locked", &digest);
+                        self.audit_sign(&request_type, origin, "locked", &digest, ctx);
                         resp
                     }
                 }
@@ -438,6 +465,17 @@ mod tests {
             request_type: rt.into(),
             digest: "ab".repeat(32),
             origin: None,
+            context: None,
+        }
+    }
+
+    fn ctx(digest_hex: Option<&str>) -> ApprovalContext {
+        ApprovalContext {
+            app_id: "app:mediaforest".into(),
+            action: "share".into(),
+            summary: "Share 3 photos with your Friends".into(),
+            resource: None,
+            digest_hex: digest_hex.map(String::from),
         }
     }
 
@@ -456,6 +494,105 @@ mod tests {
         assert!(matches!(
             headless.handle(sign_req("root_device_cert")),
             AgentResponse::Error { code, .. } if code == "denied"
+        ));
+    }
+
+    #[test]
+    fn api_version_answers_even_locked() {
+        let (s, _) = signer();
+        let agent = Agent::new(s, ApprovalPolicy::default());
+        assert!(matches!(agent.handle(AgentRequest::Lock), AgentResponse::Ok));
+        assert!(matches!(
+            agent.handle(AgentRequest::ApiVersion),
+            AgentResponse::ApiVersion { api_version } if api_version == API_VERSION
+        ));
+    }
+
+    /// Doc 16 §2–3: a `user_action` prompts by default, the prompter sees the
+    /// broker's context, the signature is the identity key's, and the audit
+    /// line carries the full context.
+    #[test]
+    fn user_action_prompts_with_context_and_audits_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAW_CONTEXT: AtomicBool = AtomicBool::new(false);
+        struct CtxProbe;
+        impl Prompter for CtxProbe {
+            fn approve(&self, _r: RequestType, _o: Origin) -> bool {
+                true
+            }
+            fn approve_with_context(
+                &self,
+                r: RequestType,
+                _o: Origin,
+                context: Option<&ApprovalContext>,
+            ) -> bool {
+                assert_eq!(r, RequestType::UserAction);
+                let c = context.expect("the broker context reaches the prompt");
+                assert_eq!(c.summary, "Share 3 photos with your Friends");
+                SAW_CONTEXT.store(true, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(&dir.path().join("a.jsonl")).unwrap();
+        let (s, _) = signer();
+        let id_pub = s.pubkey(KeyRole::Identity).unwrap();
+        let agent = Agent::new(s, ApprovalPolicy::default())
+            .with_prompter(Box::new(CtxProbe))
+            .with_audit(audit);
+
+        let digest_hex = "ab".repeat(32);
+        let resp = agent.handle(AgentRequest::Sign {
+            request_type: "user_action".into(),
+            digest: digest_hex.clone(),
+            origin: None,
+            context: Some(ctx(Some(&digest_hex))),
+        });
+        let AgentResponse::Signature { sig } = resp else {
+            panic!("expected a signature, got {resp:?}");
+        };
+        assert!(SAW_CONTEXT.load(Ordering::SeqCst));
+
+        // Signed by the IDENTITY key (doc 16 §5), verifiable by anyone.
+        let digest: [u8; 32] = hex::decode(&digest_hex).unwrap().try_into().unwrap();
+        pvfs_core::crypto::verify_digest(&id_pub, &digest, &hex::decode(sig).unwrap()).unwrap();
+
+        // The audit line records the whole context.
+        let text = std::fs::read_to_string(dir.path().join("a.jsonl")).unwrap();
+        assert!(text.contains("\"request_type\":\"user_action\""));
+        assert!(text.contains("\"app_id\":\"app:mediaforest\""));
+        assert!(text.contains("Share 3 photos with your Friends"));
+
+        // Headless (no prompter): the same request is denied — prompt-by-default.
+        let (s2, _) = signer();
+        let headless = Agent::new(s2, ApprovalPolicy::default());
+        assert!(matches!(
+            headless.handle(AgentRequest::Sign {
+                request_type: "user_action".into(),
+                digest: digest_hex.clone(),
+                origin: None,
+                context: Some(ctx(None)),
+            }),
+            AgentResponse::Error { code, .. } if code == "denied"
+        ));
+    }
+
+    /// A context that names a different digest than the one being signed is a
+    /// lying (or confused) caller — refused before any prompt.
+    #[test]
+    fn context_digest_mismatch_is_refused() {
+        let (s, _) = signer();
+        let agent = Agent::new(s, ApprovalPolicy::default()).with_prompter(Box::new(ApproveAll));
+        let resp = agent.handle(AgentRequest::Sign {
+            request_type: "user_action".into(),
+            digest: "ab".repeat(32),
+            origin: None,
+            context: Some(ctx(Some(&"cd".repeat(32)))),
+        });
+        assert!(matches!(
+            resp,
+            AgentResponse::Error { code, message } if code == "bad_input" && message.contains("digest_hex")
         ));
     }
 

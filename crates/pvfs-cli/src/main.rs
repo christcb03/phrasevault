@@ -884,6 +884,7 @@ fn companion_sign(socket: &Path, request_type: &str, digest: &[u8; 32]) -> Resul
             request_type: request_type.into(),
             digest: hex::encode(digest),
             origin: Some("local".into()),
+            context: None,
         },
     )
     .map_err(|e| PvfsError::BadInput {

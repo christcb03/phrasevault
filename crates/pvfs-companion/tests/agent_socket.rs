@@ -71,6 +71,7 @@ fn agent_socket_pubkey_sign_and_deny() {
             request_type: "root_device_cert".into(),
             digest: hex::encode(digest),
             origin: Some("local".into()),
+            context: None,
         },
     )
     .unwrap();
@@ -88,6 +89,7 @@ fn agent_socket_pubkey_sign_and_deny() {
         request_type: "root_device_cert".into(),
         digest: hex::encode(digest),
         origin: Some("local".into()),
+        context: None,
     });
     assert!(matches!(resp, AgentResponse::Error { ref code, .. } if code == "denied"));
 }
