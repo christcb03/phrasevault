@@ -1737,12 +1737,13 @@ impl Engine {
                         });
                     }
                 }
-                // Recovery-key registration: current root only (§C5).
-                Event::RecoveryKeyRegistered { author, .. } => {
+                // Recovery-key register/revoke: current root only (§C5/§C6a).
+                Event::RecoveryKeyRegistered { author, .. }
+                | Event::RecoveryKeyRevoked { author, .. } => {
                     if author.as_slice() != root.as_slice() {
                         return Err(PvfsError::Forbidden {
-                            action: "register recovery key".into(),
-                            reason: "only the current root may register a recovery key".into(),
+                            action: "recovery key".into(),
+                            reason: "only the current root may register/revoke a recovery key".into(),
                         });
                     }
                 }
@@ -2602,6 +2603,43 @@ impl Engine {
                 event: Event::RecoveryKeyRegistered {
                     recovery_pubkey: recovery_pubkey.to_vec(),
                     registered_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase (doc 15 §C6a): build an unsigned `RecoveryKeyRevoked` retiring a
+    /// registered recovery key without rotating. `author_pub` must be the current
+    /// root (phrase-authenticated). A `RootRotated` clears them all anyway; this
+    /// is for retiring one deliberately.
+    pub fn prepare_revoke_recovery(
+        &self,
+        author_pub: &[u8],
+        recovery_pubkey: &[u8],
+    ) -> Result<PreparedWrite> {
+        if author_pub != self.current_root()?.as_slice() {
+            return Err(PvfsError::Forbidden {
+                action: "revoke recovery key".into(),
+                reason: "only the current root may revoke a recovery key".into(),
+            });
+        }
+        if !projection::is_recovery_key(&self.conn, recovery_pubkey)? {
+            return Err(PvfsError::NotFound {
+                kind: "recovery key",
+                id: hex::encode(recovery_pubkey),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_recovery_key_revoked(recovery_pubkey, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: hex::encode(recovery_pubkey),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::RecoveryKeyRevoked {
+                    recovery_pubkey: recovery_pubkey.to_vec(),
+                    revoked_at: t,
                     author: author_pub.to_vec(),
                     sig: Vec::new(),
                 },

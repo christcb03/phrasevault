@@ -132,6 +132,57 @@ fn recover_uses_the_current_root_not_genesis() {
 }
 
 #[test]
+fn rotation_resets_recovery_keys_and_deregister_works() {
+    // Doc 15 §C6a: a rotation is a clean slate — the recovery key that authored
+    // it (and any others) no longer rotate. And a recovery key can be retired
+    // deliberately without rotating.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let owner_root = crypto::pubkey_bytes(&identity::root_key(&owner_mn, "").unwrap());
+    let owner_key = identity::root_key(&owner_mn, "").unwrap();
+
+    // Register two recovery keys.
+    let rec1 = identity::root_key(&identity::generate_mnemonic().unwrap(), "").unwrap();
+    let rec1_pub = crypto::pubkey_bytes(&rec1);
+    let rec2 = identity::root_key(&identity::generate_mnemonic().unwrap(), "").unwrap();
+    let rec2_pub = crypto::pubkey_bytes(&rec2);
+    let p = engine.prepare_register_recovery(&owner_root, &rec1_pub).unwrap();
+    commit1(&mut engine, p, &owner_key);
+    let p = engine.prepare_register_recovery(&owner_root, &rec2_pub).unwrap();
+    commit1(&mut engine, p, &owner_key);
+    assert!(engine.is_recovery_key(&rec1_pub).unwrap());
+    assert!(engine.is_recovery_key(&rec2_pub).unwrap());
+
+    // Deregister rec1 (owner-signed) — rec2 remains.
+    let p = engine.prepare_revoke_recovery(&owner_root, &rec1_pub).unwrap();
+    commit1(&mut engine, p, &owner_key);
+    assert!(!engine.is_recovery_key(&rec1_pub).unwrap());
+    assert!(engine.is_recovery_key(&rec2_pub).unwrap());
+    // Deregistering an unknown key is NotFound.
+    assert!(engine.prepare_revoke_recovery(&owner_root, &rec1_pub).is_err());
+
+    // Rotate USING rec2 — the rotation clears ALL recovery keys, incl. rec2.
+    let new_mn = identity::generate_mnemonic().unwrap();
+    let new_root = crypto::pubkey_bytes(&identity::root_key(&new_mn, "").unwrap());
+    let p = engine.prepare_rotate_root(&rec2_pub, &new_root).unwrap();
+    commit1(&mut engine, p, &rec2);
+    assert_eq!(engine.current_root().unwrap(), new_root);
+    assert!(!engine.is_recovery_key(&rec2_pub).unwrap(), "rotation must reset recovery keys");
+    // rec2 can no longer rotate again (it was cleared).
+    let newer = crypto::pubkey_bytes(
+        &identity::root_key(&identity::generate_mnemonic().unwrap(), "").unwrap(),
+    );
+    assert!(engine.prepare_rotate_root(&rec2_pub, &newer).is_err());
+
+    // Reset survives a full rebuild.
+    engine.close().unwrap();
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    assert!(!engine.is_recovery_key(&rec2_pub).unwrap());
+    engine.close().unwrap();
+}
+
+#[test]
 fn a_stranger_cannot_rotate_or_register() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _mn) = Engine::init(dir.path()).unwrap();

@@ -88,15 +88,21 @@ RecoveryKeyRegistered { recovery_pubkey, registered_at, author = root, sig }
 
 **C6 — after the rotation.** The new root mass-revokes the old device and identity keys and admits their replacements (cases A and B under the new root — same ops, same re-issue). One guided command: `pvfs forest rotate-root` — interactive, states consequences, takes the old phrase *or* the recovery phrase, prints the new phrase, performs the rotation + mass re-admission + re-issue, ends with `pvfs audit`.
 
-**C6a — recovery-key lifecycle (review note, 2026-07-02).** A registered recovery key stays valid
-across rotations (a `RootRotated` updates the current root but does not clear `recovery_keys`). This
-is **consistent with the model** — a recovery key is a *root-equivalent* authority, so its compromise
-is as catastrophic as a root compromise and rotation can't out-run it (the C4 race). Two open
-follow-ons, neither a 1.0 blocker: (a) no command yet **de-registers** a stale recovery key (retire an
-old paper phrase after a non-compromise rotation); (b) whether a rotation should *reset* recovery keys
-(clean-slate under the new root, requiring re-registration) is a deliberate semantic choice — left as
-additive for now so a rotation never strands you without a recovery path. Decide before compaction
-embeds the lineage (§C7).
+**C6a — recovery-key lifecycle (DECIDED + built 2026-07-02).** A recovery key is a *root-equivalent*
+authority, so it gets a clean lifecycle:
+
+- **Reset on rotation.** A `RootRotated` **clears all** registered recovery keys (the fold does
+  `DELETE FROM recovery_keys`) — including the one that just authored the rotation. After a rotation
+  you register fresh recovery keys under the new root, so a compromised or stale recovery key never
+  survives a rotation. (The rotation's authorization check runs *before* the clear, so authoring a
+  rotation with a recovery key still works; it just retires itself in the same event.)
+- **Explicit de-registration.** `RecoveryKeyRevoked { recovery_pubkey, author, sig }` (author = current
+  root, phrase-authenticated) retires one recovery key without rotating — for shredding an old paper
+  phrase. `pvfs forest recovery-key --revoke <pubkey>`.
+
+Note the residual risk this does *not* remove: if a recovery key is compromised, the attacker can
+rotate the root themselves (they hold a root-equivalent), so reset-on-rotation is hygiene, not a cure
+for a stolen recovery phrase — the C4 first-in-log-wins race still governs a live compromise.
 
 **C7 — compaction.** A compacted snapshot's re-genesis (doc 11) must embed the **full lineage** (`RootRotated` chain, plus `RecoveryKeyRegistered`) so a verifier of the snapshot can validate device certs without the pruned history.
 
@@ -105,7 +111,7 @@ embeds the lineage (§C7).
 ## 4. Kernel impact
 
 - **No changes** to existing event encodings or ids.
-- **Two new event kinds**: `RootRotated`, `RecoveryKeyRegistered` — both follow the root-lineage validation rule; neither is writable from a member, the web path (doc 14 §4), or a sub-region log.
+- **Three new event kinds**: `RootRotated`, `RecoveryKeyRegistered`, `RecoveryKeyRevoked` — all follow the root-lineage validation rule; none is writable from a member, the web path (doc 14 §4), or a sub-region log. A `RootRotated` also clears `recovery_keys` (reset on rotation, §C6a).
 - **Projection**: a `root_lineage` table (position → root pubkey); `check_device_cert` + replay consult `root(position)` instead of the fixed genesis root.
 - **Engine ops**: `prepare_replace_identity` (the A2 pair, atomic), `reissue_authority(old, new)`, `prepare_member_replace`, `prepare_rotate_root`, `prepare_register_recovery`.
 - **Companion**: `identity_index` in the vault envelope; the handoff assertion (signed at the `identity_assertion` tier — it *is* an identity assertion); rotation always prompts (never `--allow-root`-auto) and is audited.
@@ -121,11 +127,13 @@ embeds the lineage (§C7).
    so `check_device_cert`/replay and every engine root-authority check consult `current_root()` — a
    rotated-away seed is rejected, a new root accepted, all with replay/rebuild parity. `recovery_keys`
    table; author rules (rotate = current root OR recovery key, first-valid wins; register = current
-   root only, phrase-authenticated). CLI `pvfs forest recovery-key` (register, phrase on stdin, prints
-   a paper recovery phrase) and `pvfs forest rotate-root` (rotate via current-or-recovery phrase,
-   prints the new phrase). Tests: `case_c_lineage.rs` (rotation moves authority + rebuild parity,
-   recovery-key rotation after total seed loss, stranger refused); smoke: register → rotate via
-   recovery phrase → old seed rejected, new accepted, `forest_id` survives.
+   root only, phrase-authenticated). **Reset on rotation + de-register (§C6a):** `RootRotated` clears
+   all recovery keys; `RecoveryKeyRevoked` retires one; `pvfs forest recovery-key [--revoke <pubkey>]`.
+   CLI `pvfs forest recovery-key` (register/revoke, phrase on stdin) and `pvfs forest rotate-root`.
+   Tests: `case_c_lineage.rs` (rotation moves authority + rebuild parity, recovery-key rotation after
+   total seed loss, reset-on-rotation + de-register, stranger refused); smoke: register → rotate via
+   recovery phrase → old seed rejected, new accepted, `forest_id` survives, retired key can't
+   re-rotate, explicit de-register + unknown-key NotFound.
 5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03
    amendment); optional `forest rotate-root` mass re-admission of old-seed devices; doc 08 item 17 closed.
 

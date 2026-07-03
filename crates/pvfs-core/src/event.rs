@@ -27,6 +27,7 @@ pub const K_MEMBER_TAGGED: &str = "MemberTagged";
 pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
 pub const K_ROOT_ROTATED: &str = "RootRotated";
 pub const K_RECOVERY_KEY_REGISTERED: &str = "RecoveryKeyRegistered";
+pub const K_RECOVERY_KEY_REVOKED: &str = "RecoveryKeyRevoked";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -66,6 +67,15 @@ pub enum Event {
     RecoveryKeyRegistered {
         recovery_pubkey: Vec<u8>,
         registered_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// De-register a recovery key (doc 15 §C6a). `author` must be the current
+    /// root. (A `RootRotated` also clears ALL recovery keys — this is for
+    /// retiring one without rotating.)
+    RecoveryKeyRevoked {
+        recovery_pubkey: Vec<u8>,
+        revoked_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -201,6 +211,12 @@ pub fn msg_recovery_key_registered(
     let mut e = Enc::new();
     e.bytes(recovery_pubkey).u64(registered_at).bytes(author);
     crypto::domain_digest("pvfs:recoverykey:v1:", &e.finish())
+}
+
+pub fn msg_recovery_key_revoked(recovery_pubkey: &[u8], revoked_at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.bytes(recovery_pubkey).u64(revoked_at).bytes(author);
+    crypto::domain_digest("pvfs:recoverykeyrevoked:v1:", &e.finish())
 }
 
 pub fn msg_device_authorized(
@@ -365,6 +381,7 @@ impl Event {
             Event::DeviceRevoked { .. } => K_DEVICE_REVOKED,
             Event::RootRotated { .. } => K_ROOT_ROTATED,
             Event::RecoveryKeyRegistered { .. } => K_RECOVERY_KEY_REGISTERED,
+            Event::RecoveryKeyRevoked { .. } => K_RECOVERY_KEY_REVOKED,
             Event::NodeCreated(_) => K_NODE_CREATED,
             Event::LinkCreated(_) => K_LINK_CREATED,
             Event::LinkRemoved { .. } => K_LINK_REMOVED,
@@ -393,6 +410,7 @@ impl Event {
             | Event::DeviceRevoked { author, .. }
             | Event::RootRotated { author, .. }
             | Event::RecoveryKeyRegistered { author, .. }
+            | Event::RecoveryKeyRevoked { author, .. }
             | Event::LinkReordered { author, .. }
             | Event::LinkSuperseded { author, .. }
             | Event::LinkSuspended { author, .. }
@@ -426,6 +444,7 @@ impl Event {
             | Event::DeviceRevoked { sig: s, .. }
             | Event::RootRotated { sig: s, .. }
             | Event::RecoveryKeyRegistered { sig: s, .. }
+            | Event::RecoveryKeyRevoked { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -487,6 +506,14 @@ impl Event {
                 sig,
             } => {
                 e.bytes(recovery_pubkey).u64(*registered_at).bytes(author).bytes(sig);
+            }
+            Event::RecoveryKeyRevoked {
+                recovery_pubkey,
+                revoked_at,
+                author,
+                sig,
+            } => {
+                e.bytes(recovery_pubkey).u64(*revoked_at).bytes(author).bytes(sig);
             }
             Event::NodeCreated(n) => {
                 e.string(&n.id)
@@ -692,6 +719,12 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
+            K_RECOVERY_KEY_REVOKED => Event::RecoveryKeyRevoked {
+                recovery_pubkey: d.bytes()?,
+                revoked_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
             K_NODE_CREATED => Event::NodeCreated(Node {
                 id: d.string()?,
                 node_type: d.string()?,
@@ -875,6 +908,16 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_recovery_key_registered(recovery_pubkey, *registered_at, author),
+                sig,
+            ),
+            Event::RecoveryKeyRevoked {
+                recovery_pubkey,
+                revoked_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_recovery_key_revoked(recovery_pubkey, *revoked_at, author),
                 sig,
             ),
             Event::NodeCreated(n) => n.verify(),

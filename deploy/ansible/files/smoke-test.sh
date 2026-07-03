@@ -514,11 +514,20 @@ RRJSON="$(printf '%s' "$RKPHRASE" | $PVFS --json forest rotate-root --forest "$R
 NEWMN="$(jget "$RRJSON" new_phrase)"
 NEWROOT="$(jget "$RRJSON" new_root_pubkey)"
 [ -n "$NEWMN" ] && [ -n "$NEWROOT" ] && ok "rotated the root via the recovery phrase" || fail "rotate: $RRJSON"
+# The recovery key that authored the rotation is now invalid (reset on rotation).
+RKRC=0; printf '%s' "$RKPHRASE" | $PVFS forest rotate-root --forest "$RCF" >/dev/null 2>&1 || RKRC=$?
+[ "$RKRC" -eq 5 ] && ok "recovery key retired by the rotation cannot rotate again" || fail "reset-on-rotation rc=$RKRC"
 # The OLD phrase no longer authorizes; the NEW phrase does.
 assert_rc 5 "old seed rejected after rotation" -- \
   $PVFS --data-dir "$RCF/.pvfs" device authorize --mnemonic "$RCMN" --index 5
 $PVFS --data-dir "$RCF/.pvfs" device authorize --mnemonic "$NEWMN" --index 5 >/dev/null \
   && ok "new seed authorizes after rotation" || fail "new seed authorize"
+# De-register: register a key under the new root, then retire it explicitly.
+RK2="$(jget "$(printf '%s' "$NEWMN" | $PVFS --json forest recovery-key --forest "$RCF")" recovery_pubkey)"
+printf '%s' "$NEWMN" | $PVFS forest recovery-key --forest "$RCF" --revoke "$RK2" >/dev/null \
+  && ok "recovery key de-registered explicitly" || fail "recovery-key --revoke"
+assert_rc 3 "de-registering an unknown recovery key is NotFound" -- \
+  sh -c "printf '%s' '$NEWMN' | $PVFS forest recovery-key --forest '$RCF' --revoke '$RK2'"
 # forest_id is unchanged across the rotation (identity is the log, not the key).
 RCFID="$(jget "$RCINIT" forest_id)"
 $PVFS --json --data-dir "$RCF/.pvfs" forest info | grep -q "\"forest_id\":\"$RCFID\"" \

@@ -240,9 +240,13 @@ enum ForestCmd {
     /// rotate the root even after total seed compromise. Reads your current
     /// recovery phrase from stdin to authorize; prints a NEW recovery phrase to
     /// store on paper (never typed into a machine except to rotate).
+    /// `--revoke <pubkey>` retires a registered recovery key instead.
     RecoveryKey {
         #[arg(long)]
         forest: Option<String>,
+        /// Retire this registered recovery key (hex) instead of registering one.
+        #[arg(long)]
+        revoke: Option<String>,
     },
     /// **Rotate the root key** (doc 15 §C, disaster recovery for a compromised
     /// seed). Reads the authorizing phrase from stdin — your current recovery
@@ -2784,11 +2788,28 @@ fn forest_cmd(
             }
             engine.close()
         }
-        ForestCmd::RecoveryKey { forest } => {
+        ForestCmd::RecoveryKey { forest, revoke } => {
             let state = forest_state_dir(forest, ctx)?;
             let auth_mn = read_phrase_stdin("current recovery phrase (to authorize)")?;
             let root_key = identity::root_key(&auth_mn, "")?;
             let root_pub = crypto::pubkey_bytes(&root_key);
+            // --revoke: retire a registered recovery key, don't create one.
+            if let Some(revoke_hex) = revoke {
+                let rec_pub = hex::decode(&revoke_hex).map_err(|_| PvfsError::BadInput {
+                    field: "revoke".into(),
+                    reason: "must be hex".into(),
+                })?;
+                let mut engine = Engine::open(&state)?;
+                let prep = engine.prepare_revoke_recovery(&root_pub, &rec_pub)?;
+                commit_phrase_signed(&mut engine, prep, &root_key)?;
+                engine.close()?;
+                if json {
+                    println!("{{\"revoked\":true,\"recovery_pubkey\":\"{revoke_hex}\"}}");
+                } else {
+                    println!("retired recovery key {revoke_hex}");
+                }
+                return Ok(());
+            }
             // Fresh, independent recovery phrase — its root is the recovery key.
             let rec_mn = identity::generate_mnemonic()?;
             let rec_pub = crypto::pubkey_bytes(&identity::root_key(&rec_mn, "")?);

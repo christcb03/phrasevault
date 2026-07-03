@@ -300,10 +300,15 @@ echo "<current recovery phrase>" | pvfs forest recovery-key --forest <alias|moun
 # rotate the root: authorize with your current phrase OR the recovery phrase;
 # it prints a fresh recovery phrase and re-anchors authority to a new key.
 echo "<authorizing phrase>" | pvfs forest rotate-root --forest <alias|mount>
+
+# retire an old recovery key without rotating (e.g. you shredded the paper):
+echo "<current phrase>" | pvfs forest recovery-key --forest <alias|mount> --revoke <pubkey>
 ```
 
-After a rotation the old seed can no longer authorize anything; device/identity keys derived from the
-old seed keep working until you revoke and re-admit them, so do that next in a compromise.
+A rotation **clears all recovery keys** (register fresh ones under the new root afterwards), so a
+stale or compromised recovery key never survives a rotation. After a rotation the old seed can no
+longer authorize anything; device/identity keys derived from the old seed keep working until you
+revoke and re-admit them, so do that next in a compromise.
 
 A single lost identity key (not the whole seed) is cheaper: `pvfs identity replace` swaps it and
 re-issues your grants under the new key, printing a handoff for forests where you're a member (they

@@ -297,6 +297,11 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                 params![hex::encode(new_root_pubkey)],
             )
             .map_err(&m)?;
+            // A rotation is a clean slate for recovery keys (doc 15 §C6a): the
+            // old ones — including any that authored this rotation — no longer
+            // rotate. Register fresh recovery keys under the new root afterwards.
+            tx.execute("DELETE FROM recovery_keys", [])
+                .map_err(&m)?;
         }
         Event::RecoveryKeyRegistered {
             recovery_pubkey,
@@ -306,6 +311,15 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             tx.execute(
                 "INSERT OR IGNORE INTO recovery_keys (recovery_pubkey, registered_at) VALUES (?1, ?2)",
                 params![recovery_pubkey, *registered_at as i64],
+            )
+            .map_err(&m)?;
+        }
+        Event::RecoveryKeyRevoked {
+            recovery_pubkey, ..
+        } => {
+            tx.execute(
+                "DELETE FROM recovery_keys WHERE recovery_pubkey = ?1",
+                params![recovery_pubkey],
             )
             .map_err(&m)?;
         }
@@ -691,9 +705,9 @@ fn replay_one(
                 return Err(unauthorized(row.seq, ev.kind()));
             }
         }
-        // Recovery-key registration (doc 15 §C5): author must be the current root.
-        // (Phrase-authenticated by construction — the companion never signs this.)
-        Event::RecoveryKeyRegistered { author, .. } => {
+        // Recovery-key register/revoke (doc 15 §C5/§C6a): author = current root.
+        // (Phrase-authenticated by construction — the companion never signs these.)
+        Event::RecoveryKeyRegistered { author, .. } | Event::RecoveryKeyRevoked { author, .. } => {
             let root = current_root(tx, identity)?;
             if author.as_slice() != root.as_slice() {
                 return Err(unauthorized(row.seq, ev.kind()));
