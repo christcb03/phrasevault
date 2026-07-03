@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-06-29.
+Status: **Living document** — update as phases land. Last updated 2026-07-03.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–09; this is the index + the honest "what's not done yet."
@@ -23,7 +23,7 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E (3d)** | CLI **auto-routes** plain `acl`/`tag`/`device` mutations to a running daemon (path/URI args too); direct-engine fallback | ✅ shipped (doc 09 §3d) |
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
-| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); remaining: §7 joint PVOS API spec + Touch ID gate |
+| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); §7 joint PVOS API **spec ✅** ([doc 16](16-joint-agent-api.md)); remaining: doc 16 phase-7 build (approval context, `pvfsd` challenge consumer, `api_version`) — Touch ID gate deferred to 1.1 |
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
@@ -66,80 +66,57 @@ The recovery phrase is **recovery-only**; everyday admin is signed by the owner'
 
 ---
 
-## 3. Road to 1.0
+## 3. Road to 1.0 — the release checklist (nailed down 2026-07-03)
 
-The core multi-user signed file server is **capability-complete**: signed tree + content, per-node
+The engine is **feature-complete for the committed 1.0 scope**: signed tree + content, per-node
 ACLs, per-key tags, the live daemon with seamless CLI, member-signed writes, a raw concurrent data
-plane, and replay-enforced authorization. What remains for a shippable **1.0** is completeness,
-hardening, packaging, and two scope calls. Tracked as a checklist; details in §4.
+plane, replay-enforced authorization, encryption-at-rest (P3), key replacement/rotation (doc 15
+cases A/B/C), and the companion through phase 6 + the doc 16 API spec. Every earlier must-have
+(items 0–4 of previous drafts) is resolved — history lives in §4. What separates today from a
+tagged `1.0` is **four gates**; everything else is explicitly 1.1+.
 
-**Must-have for 1.0 (committed scope):**
+**Gate 1 — companion phase 7, PVFS side** (doc 16 §7 items 1, 2, 4 — all small):
 
-0. **Auto-route admin signing identity. ✅ RESOLVED (§4 item 16).** `daemon_client()` now signs
-   auto-routed `acl`/`tag`/`device` ops with the forest's **authorized admin device key** from
-   `<mount>/.pvfs/device.key` (model (a)), falling back to the generic client identity only when that
-   key isn't readable (a non-owner auto-routing). The smoke suite now exercises auto-routed owner
-   admin **with `pvfsd` running** (new "P2-E 3d: auto-routed owner admin with the daemon RUNNING"
-   section), which is decisive: pre-fix it signed with the member-level client identity and the daemon
-   returned `forbidden`.
-1. **Orphaned-tag handling** (§4 item 13) — **decided: no signed sweep.** Masking already makes
-   revoked-authority grants/memberships inert on the read path, and the append-only log never shrinks,
-   so a signed-removal sweep buys nothing a rebuild wouldn't undo. **Done:** `acl ls` / `tag ls` now
-   flag such rows `[inert: authority revoked]` (read-only, `Engine::authority_active`). **Deferred:**
-   physical removal of the dead rows happens for free in **compaction's re-genesis** (doc 11). *Closed.*
-2. **`pvfs audit`. ✅ DONE (§4 item 14).** Read-only forest-wide scan: lists every tag grant and
-   membership under a revoked authority (inert rows), text or `--json`. The authorization counterpart
-   to `pvfs verify`. Reuses `inert_tag_grants` / `inert_memberships`; covered by
-   `audit_reports_inert_grants_and_memberships` and a smoke clean-case check.
-3. **Graceful daemon shutdown. ✅ DONE (§4 item 4).** `pvfsd` traps SIGTERM/SIGINT (a signal handler
-   sets an atomic flag), the accept loop (`serve_until`) polls it and returns, then the daemon runs
-   `Engine::shutdown_checkpoint` — `wal_checkpoint(TRUNCATE)` on the projection + attached log db plus
-   `clean_shutdown = 1` — and `SocketGuard` removes the socket. Tested by `serve_until_stops_on_shutdown_flag`
-   and a smoke check (SIGTERM → exit 0 + socket gone).
-4. **Multi-user end-to-end test. ✅ DONE (single-host).** The smoke suite now runs a **two-identity**
-   scenario: a second client identity ("Bob", separate config) is authorized and granted rw on
-   `/shared` only — over the socket Bob reads/writes `/shared` and is denied `/private` (and an anon
-   client is denied too). A `pvfsd` test (`daemon_member_cannot_admin`) proves an rw member **cannot**
-   grant ACLs or authorize members. Also fixed: `pvfs remote` now maps daemon errors to real exit codes
-   (forbidden → 5, not_found → 3), so denials are scriptable. **Note:** true *cross-OS-user* isolation
-   (the `0600` `.pvfs/` boundary) and a genuine *two-host* run still need a second account/host in the
-   inventory — the single-OS-user smoke can't exercise the file-permission boundary. Left for the
-   federation track (P4).
-5. **Release packaging** — ◑ **partly done.** Shipped: `INSTALL.md` systemd user-service section,
-   `$PVFS_SOCKET_DIR=/run/pvfs` in the unit + a `pvfs-tmpfiles.conf` (and `pvfsd` now leaves a
-   root-managed socket dir's mode alone), refreshed top-level `README` status, `LICENSE` present.
-   **Remaining:** `CHANGELOG` + a version tag — deferred until companion + encryption land so 1.0 is
-   tagged once feature-complete.
-6. **Docs/manual sweep** — bring `USER-MANUAL` and docs 06–11 fully current with 3d + P2-F + P2-G
-   (this pass started it). *Small, ongoing.*
+- ☐ **`ApprovalContext` on the sign surface** — optional `context` on `AgentRequest::Sign` and the
+  tenant sign ops; the `Prompter` renders it, the audit log records it; new `user_action` request
+  type (doc 16 §2–3).
+- ☐ **`pvfsd` challenge consumer** — integration test + reference closing the "Sign in with PVFS"
+  loop end-to-end against a live daemon (doc 16 §6).
+- ☐ **`api_version` handshake** — pin an explicit version in the agent protocol (doc 16 §7 item 4).
 
-**Nice-to-have for 1.0 (do if time; otherwise 1.1):**
+(The `pvos.sso` service itself is PVOS-repo work consuming this API — **not** a PVFS 1.0 gate.)
 
-7. **Read-pool concurrency** (§4 item 2) — the data plane is already off-lock; metadata still
-   serializes behind `Mutex<Engine>`. A WAL read-only pool removes that. Fine to defer for
-   personal/small-team scale.
-8. **Path/URI everywhere** — `remote` subcommands still take node ids (the `acl`/`tag` resolver
-   landed in 3d); extend it. *Small.*
+**Gate 2 — docs current:** finish the manual sweep (§4 item 6 successor): `USER-MANUAL` and docs
+06–15 reflect case C rotation, secure blobs, and the companion as shipped; README status table
+matches reality.
 
-**Scope decisions (DECIDED 2026-06-29 — both committed to 1.0):**
+**Gate 3 — validation:** push `main` (local is ahead of origin — case C + doc 16 have not run CI),
+CI green, and one full Ansible pipeline run (build → test → smoke → daemon stage) on the Linux host
+at the release commit.
 
-- **Companion app** (doc 09 §6) — **in 1.0; full scope** (signer/custodian + identity agent).
-  **Built** (doc 14 phases 1–6): OS-keychain/passphrase vault, Unix-socket signer with request-type-
-  tiered approval (desktop/terminal prompts, rate limit, audit log, idle lock), multi-tenant custody,
-  and the loopback "Sign in with PVFS" agent. Device keys stay local for everyday writes. Remaining:
-  the §7 joint PVOS API and the optional Touch ID gate.
-- **Encryption at rest** (P3, doc 12) — **in 1.0; built** (doc 12 §8–9, phases 1–5). Secure node
-  type at the reserved `m/43'/20566'/2'` path: opaque mutable encrypted blob + content-free signed
-  hash-state log + companion-gated decryption + on-the-fly create/update over the daemon.
-- **Key replacement** (doc 15) — the committed follow-on to "one identity everywhere" (§4 item 17).
-  **Built (cases A/B/C):** identity-key replacement + re-issue, the dual-signed member handoff, and
-  **root rotation** with an offline **recovery key** (`RootRotated`/`RecoveryKeyRegistered` lineage;
-  `pvfs forest rotate-root` / `recovery-key`). §6 decisions resolved. Remaining edge: compaction must
-  embed the lineage (doc 11) and federation must pin genesis+lineage (doc 03) — folded into those tracks.
+**Gate 4 — release packaging:** write `CHANGELOG.md` (0.1 → 1.0 narrative), bump the workspace
+version `0.1.0 → 1.0.0`, flip README + `VERSIONING.md` status, tag `v1.0`.
 
-**Explicitly post-1.0:** federation + sub-forest replication (P4, doc 03), compaction (doc 11),
-single-use challenge nonce (only matters once the socket is network-proxied), arbitrary named groups
-/ explicit deny.
+**Cut to 1.1 (decided 2026-07-03):**
+
+- **Touch ID / biometric unlock gate** (doc 14 phases 4–5 deferral) — the keychain seal already
+  covers at-rest; biometrics are UX polish.
+- **Read-pool metadata concurrency** (§4 item 2) — data plane is off-lock; fine at
+  personal/small-team scale.
+- **Path/URI resolver in `remote` subcommands** (§4 item 6 remainder) — plain commands auto-route,
+  so `remote` is already the escape hatch, not the main path.
+- **`key:`-grants-to-revoked-devices audit** (§4 item 14 follow-on).
+- **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — driven by PVOS D18 needs.
+
+**Post-1.0 (unchanged):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
+both now also carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins
+genesis + lineage) — single-use challenge nonce (matters only when the socket is network-proxied),
+arbitrary named groups / explicit deny, and the cross-OS-user / two-host end-to-end (needs a second
+account/host in the inventory; federation track).
+
+**Scope decisions (DECIDED 2026-06-29, delivered):** companion app (doc 14 phases 1–6 + 3.5 built),
+encryption-at-rest (P3, doc 12 phases 1–5 built), and key replacement (doc 15 cases A/B/C built)
+are all **in 1.0** and all landed; only Gate 1 above remains as code.
 
 ---
 
