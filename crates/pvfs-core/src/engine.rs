@@ -53,6 +53,11 @@ pub struct PreparedEvent {
     pub digest: [u8; 32],
 }
 
+/// One direct grant listed by `acl ls`: `(principal, authority, rights,
+/// expires_at)` — `authority` is the granting key for `tag:` grants (doc 10,
+/// empty otherwise); `expires_at` is ms epoch, 0 = never (doc 13 Q-E1).
+pub type AclEntry = (crate::acl::Principal, Vec<u8>, u8, u64);
+
 /// A two-phase member write prepared by the daemon for the member to sign.
 #[derive(Debug, Clone)]
 pub struct PreparedWrite {
@@ -1511,10 +1516,7 @@ impl Engine {
     /// `(principal, authority, rights, expires_at)`; `authority` is the granting
     /// key for `tag:` grants (doc 10) and empty for `public`/`any`/`key` grants;
     /// `expires_at` is ms epoch, 0 = never (doc 13 Q-E1).
-    pub fn acl_entries(
-        &self,
-        node_id: &NodeId,
-    ) -> Result<Vec<(crate::acl::Principal, Vec<u8>, u8, u64)>> {
+    pub fn acl_entries(&self, node_id: &NodeId) -> Result<Vec<AclEntry>> {
         let mut stmt = self
             .conn
             .prepare(
