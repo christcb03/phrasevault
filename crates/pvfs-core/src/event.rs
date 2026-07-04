@@ -148,12 +148,17 @@ pub enum Event {
         sig: Vec<u8>,
     },
     /// Set (or, with rights 0, clear) one principal's rights on a node (doc 06 §4).
+    /// `expires_at` (doc 13 Q-E1, 1.1): ms epoch after which the grant is inert;
+    /// 0 = never. On the wire it is a trailing field written only when nonzero,
+    /// so pre-1.1 events decode unchanged and a no-expiry event is byte-identical
+    /// to its 1.0 form.
     AclSet {
         node_id: String,
         principal_kind: u64,
         principal_id: Vec<u8>,
         rights: u64,
         set_at: u64,
+        expires_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -321,12 +326,16 @@ pub fn msg_folder_unbound(folder_id: &str, unbound_at: u64, author: &[u8]) -> [u
     crypto::domain_digest("pvfs:folderunbound:v1:", &e.finish())
 }
 
+/// `expires_at == 0` (no expiry) keeps the v1 domain and message bytes, so every
+/// pre-1.1 signature still verifies; an expiring grant signs under a fresh v2
+/// domain that covers the expiry, so the two can never be confused.
 pub fn msg_acl_set(
     node_id: &str,
     principal_kind: u64,
     principal_id: &[u8],
     rights: u64,
     set_at: u64,
+    expires_at: u64,
     author: &[u8],
 ) -> [u8; 32] {
     let mut e = Enc::new();
@@ -334,9 +343,14 @@ pub fn msg_acl_set(
         .u64(principal_kind)
         .bytes(principal_id)
         .u64(rights)
-        .u64(set_at)
-        .bytes(author);
-    crypto::domain_digest("pvfs:aclset:v1:", &e.finish())
+        .u64(set_at);
+    if expires_at == 0 {
+        e.bytes(author);
+        crypto::domain_digest("pvfs:aclset:v1:", &e.finish())
+    } else {
+        e.u64(expires_at).bytes(author);
+        crypto::domain_digest("pvfs:aclset:v2:", &e.finish())
+    }
 }
 
 pub fn msg_member_tagged(
@@ -638,6 +652,7 @@ impl Event {
                 principal_id,
                 rights,
                 set_at,
+                expires_at,
                 author,
                 sig,
             } => {
@@ -648,6 +663,11 @@ impl Event {
                     .u64(*set_at)
                     .bytes(author)
                     .bytes(sig);
+                // Trailing, only when set: the canonical no-expiry body stays
+                // byte-identical to 1.0 and old bodies decode unchanged.
+                if *expires_at != 0 {
+                    e.u64(*expires_at);
+                }
             }
             Event::MemberTagged {
                 member_pubkey,
@@ -817,15 +837,41 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
-            K_ACL_SET => Event::AclSet {
-                node_id: d.string()?,
-                principal_kind: d.u64()?,
-                principal_id: d.bytes()?,
-                rights: d.u64()?,
-                set_at: d.u64()?,
-                author: d.bytes()?,
-                sig: d.bytes()?,
-            },
+            K_ACL_SET => {
+                let node_id = d.string()?;
+                let principal_kind = d.u64()?;
+                let principal_id = d.bytes()?;
+                let rights = d.u64()?;
+                let set_at = d.u64()?;
+                let author = d.bytes()?;
+                let sig = d.bytes()?;
+                // Optional trailing expiry (1.1): absent on pre-1.1 bodies. The
+                // canonical encoding omits a zero, so a present 0 is malformed.
+                let expires_at = if d.remaining() > 0 {
+                    match d.u64()? {
+                        0 => {
+                            return Err(PvfsError::Encoding {
+                                what: "event body".into(),
+                                offset: body.len() - 8,
+                                detail: "non-canonical AclSet: expires_at 0 must be omitted".into(),
+                            })
+                        }
+                        t => t,
+                    }
+                } else {
+                    0
+                };
+                Event::AclSet {
+                    node_id,
+                    principal_kind,
+                    principal_id,
+                    rights,
+                    set_at,
+                    expires_at,
+                    author,
+                    sig,
+                }
+            }
             K_MEMBER_TAGGED => Event::MemberTagged {
                 member_pubkey: d.bytes()?,
                 tag: d.string()?,
@@ -1033,11 +1079,20 @@ impl Event {
                 principal_id,
                 rights,
                 set_at,
+                expires_at,
                 author,
                 sig,
             } => crypto::verify_digest(
                 author,
-                &msg_acl_set(node_id, *principal_kind, principal_id, *rights, *set_at, author),
+                &msg_acl_set(
+                    node_id,
+                    *principal_kind,
+                    principal_id,
+                    *rights,
+                    *set_at,
+                    *expires_at,
+                    author,
+                ),
                 sig,
             ),
             Event::MemberTagged {
@@ -1065,5 +1120,107 @@ impl Event {
                 sig,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity;
+
+    fn signer() -> (identity::SigningKey, Vec<u8>) {
+        let k = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+        let pk = crypto::pubkey_bytes(&k);
+        (k, pk)
+    }
+
+    fn acl_set(expires_at: u64) -> Event {
+        let (key, author) = signer();
+        let (node, kind, id, rights, t) = ("n".repeat(64), 1u64, author.clone(), 3u64, 1_000u64);
+        let sig = crypto::sign_digest(
+            &key,
+            &msg_acl_set(&node, kind, &id, rights, t, expires_at, &author),
+        )
+        .unwrap();
+        Event::AclSet {
+            node_id: node,
+            principal_kind: kind,
+            principal_id: id,
+            rights,
+            set_at: t,
+            expires_at,
+            author,
+            sig,
+        }
+    }
+
+    // doc 13 Q-E1 wire compat: a no-expiry AclSet is byte-identical to its 1.0
+    // encoding (expiry omitted), so pre-1.1 bodies decode and old sigs verify.
+    #[test]
+    fn aclset_without_expiry_matches_v1_bytes_and_verifies() {
+        let ev = acl_set(0);
+        let body = ev.encode_body();
+        let Event::AclSet {
+            node_id,
+            principal_kind,
+            principal_id,
+            rights,
+            set_at,
+            author,
+            sig,
+            ..
+        } = &ev
+        else {
+            unreachable!()
+        };
+        // the exact 1.0 field sequence — no trailing expiry
+        let mut v1 = Enc::new();
+        v1.string(node_id)
+            .u64(*principal_kind)
+            .bytes(principal_id)
+            .u64(*rights)
+            .u64(*set_at)
+            .bytes(author)
+            .bytes(sig);
+        assert_eq!(body, v1.finish(), "no-expiry AclSet must stay 1.0-identical");
+
+        let back = Event::decode(K_ACL_SET, &body).unwrap();
+        assert_eq!(back, ev);
+        back.verify_sig().unwrap();
+    }
+
+    #[test]
+    fn aclset_with_expiry_roundtrips_and_verifies() {
+        let ev = acl_set(2_000);
+        let body = ev.encode_body();
+        let back = Event::decode(K_ACL_SET, &body).unwrap();
+        assert_eq!(back, ev);
+        back.verify_sig().unwrap();
+        assert!(matches!(back, Event::AclSet { expires_at: 2_000, .. }));
+    }
+
+    // The v2 digest domain covers the expiry: same fields, different expiry (or
+    // none) can never share a signature.
+    #[test]
+    fn aclset_expiry_changes_the_signed_digest() {
+        let a = msg_acl_set("n", 1, b"p", 3, 1_000, 0, b"a");
+        let b = msg_acl_set("n", 1, b"p", 3, 1_000, 2_000, b"a");
+        let c = msg_acl_set("n", 1, b"p", 3, 1_000, 3_000, b"a");
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+    }
+
+    // Canonical form omits a zero expiry — a present 0 must be rejected, so one
+    // logical event keeps exactly one valid byte sequence (spec §3).
+    #[test]
+    fn aclset_trailing_zero_expiry_is_non_canonical() {
+        let ev = acl_set(0);
+        let mut body = ev.encode_body();
+        body.extend_from_slice(&0u64.to_le_bytes());
+        let err = Event::decode(K_ACL_SET, &body);
+        assert!(
+            matches!(err, Err(PvfsError::Encoding { .. })),
+            "expected Encoding error, got {err:?}"
+        );
     }
 }

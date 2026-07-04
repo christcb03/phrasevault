@@ -11,7 +11,9 @@ use crate::log_store;
 // v2 (doc 10): per-key tag authority — `acl`/`member_tags` carry an `authority`
 // column and tag matching is scoped to `(authority, name)`. Non-additive, so the
 // projection (a pure cache of the log) is dropped and replayed on upgrade.
-pub const SCHEMA_VERSION: u32 = 2;
+// v3 (doc 13 Q-E1, 1.1): `acl` carries `expires_at` (0 = never); an expired grant
+// is masked on the read path. Same drop-and-replay upgrade.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS acl (
   authority      BLOB    NOT NULL,   -- (doc 10) tag grants: the AclSet author; empty for non-tag
   rights         INTEGER NOT NULL,   -- bitmask r=1 w=2 a=4; row absent => none
   set_at         INTEGER NOT NULL,
+  expires_at     INTEGER NOT NULL DEFAULT 0, -- (doc 13 Q-E1) ms epoch; 0 = never
   PRIMARY KEY (node_id, principal_kind, principal_id, authority)
 );
 
@@ -329,6 +332,7 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             principal_id,
             rights,
             set_at,
+            expires_at,
             author,
             ..
         } => {
@@ -344,11 +348,12 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                 .map_err(&m)?;
             } else {
                 tx.execute(
-                    "INSERT INTO acl (node_id, principal_kind, principal_id, authority, rights, set_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "INSERT INTO acl (node_id, principal_kind, principal_id, authority, rights, set_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(node_id, principal_kind, principal_id, authority)
-                     DO UPDATE SET rights = excluded.rights, set_at = excluded.set_at",
-                    params![node_id, *principal_kind as i64, principal_id, authority, *rights as i64, *set_at as i64],
+                     DO UPDATE SET rights = excluded.rights, set_at = excluded.set_at,
+                       expires_at = excluded.expires_at",
+                    params![node_id, *principal_kind as i64, principal_id, authority, *rights as i64, *set_at as i64, *expires_at as i64],
                 )
                 .map_err(&m)?;
             }
@@ -693,7 +698,7 @@ fn replay_one(
         // certs signed by a post-rotation root validate on replay.
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
             let root = current_root(tx, identity)?;
-            check_device_cert(tx, &root, &identity.root_node_id, author)
+            check_device_cert(tx, &root, &identity.root_node_id, author, row.written_at)
                 .map_err(|_| unauthorized(row.seq, ev.kind()))?;
         }
         // Root rotation (doc 15 §C2): author is the current root OR a registered
@@ -717,7 +722,10 @@ fn replay_one(
         // Every other event is device-authored: enforce the same author + ACL
         // rules used by live member writes, so a tampered or synced log can't
         // carry an event its author had no right to (doc 06 §4.3, doc 07 §5).
-        _ => check_member_event(tx, &ev).map_err(|_| unauthorized(row.seq, ev.kind()))?,
+        // Expiry is judged as of the row's chain-protected `written_at`, so a
+        // write that was in-rights when appended replays identically forever.
+        _ => check_member_event(tx, &ev, row.written_at)
+            .map_err(|_| unauthorized(row.seq, ev.kind()))?,
     }
     fold(tx, &ev)?;
     Ok(expect)
@@ -737,7 +745,11 @@ fn unauthorized(seq: u64, kind: &str) -> PvfsError {
 /// placing `LinkCreated`. Shared by replay (rebuild/sync) and the live member-write
 /// commit, so the replicated and live rules can never drift. Owner devices have
 /// implicit full rights (via `effective_rights`), so existing forests are unaffected.
-pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
+/// `as_of_ms` is the instant ACL expiry (doc 13 Q-E1) is judged at: the wall
+/// clock for a live commit, the event row's chain-protected `written_at` on
+/// replay — so a write authorized by a then-valid expiring grant still replays
+/// after the grant lapses, and a rebuild is deterministic.
+pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Result<()> {
     let author = ev.author();
     let active: i64 = conn
         .query_row(
@@ -754,10 +766,12 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         });
     }
     match ev {
-        Event::AclSet { node_id, .. } => require_right(conn, author, node_id, acl::ACL_A, "set acl")?,
+        Event::AclSet { node_id, .. } => {
+            require_right(conn, author, node_id, acl::ACL_A, "set acl", as_of_ms)?
+        }
         Event::LinkCreated(l) => {
             if let Some(parent) = &l.parent_id {
-                require_right(conn, author, parent, acl::ACL_W, "create link")?;
+                require_right(conn, author, parent, acl::ACL_W, "create link", as_of_ms)?;
             }
         }
         Event::LinkRemoved { link_id, .. } => {
@@ -776,11 +790,11 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
                     Some(p) => (p, acl::ACL_W),
                     None => (child, acl::ACL_A),
                 };
-                require_right(conn, author, &target, needed, "remove link")?;
+                require_right(conn, author, &target, needed, "remove link", as_of_ms)?;
             }
         }
         Event::FileLocationAdded { file_id, .. } => {
-            require_right(conn, author, file_id, acl::ACL_W, "add location")?
+            require_right(conn, author, file_id, acl::ACL_W, "add location", as_of_ms)?
         }
         Event::MemberTagged { .. } => {
             // Per-key tags (doc 10 §4): any authorized member may assign a tag under
@@ -794,7 +808,7 @@ pub fn check_member_event(conn: &Connection, ev: &Event) -> Result<()> {
         Event::SecureBlobUpdated { blob_id, .. } => {
             // Advancing a blob's ledger is a write (doc 12 §8.2) — the same right
             // a content change needs, enforced identically live and at replay.
-            require_right(conn, author, blob_id, acl::ACL_W, "update secure blob")?
+            require_right(conn, author, blob_id, acl::ACL_W, "update secure blob", as_of_ms)?
         }
         _ => {}
     }
@@ -840,10 +854,13 @@ pub fn check_device_cert(
     root_pubkey: &[u8],
     root_node_id: &str,
     author: &[u8],
+    as_of_ms: u64,
 ) -> Result<()> {
     let by_root = author == root_pubkey;
     let by_admin = !by_root
-        && effective_rights(conn, &Principal::Key(author.to_vec()), root_node_id)? & acl::ACL_A != 0;
+        && effective_rights_at(conn, &Principal::Key(author.to_vec()), root_node_id, as_of_ms)?
+            & acl::ACL_A
+            != 0;
     if by_root || by_admin {
         Ok(())
     } else {
@@ -856,8 +873,16 @@ pub fn check_device_cert(
 }
 
 /// Require that `author` holds every bit in `right` on `node`, else `Forbidden`.
-fn require_right(conn: &Connection, author: &[u8], node: &str, right: u8, action: &str) -> Result<()> {
-    if effective_rights(conn, &Principal::Key(author.to_vec()), node)? & right != right {
+fn require_right(
+    conn: &Connection,
+    author: &[u8],
+    node: &str,
+    right: u8,
+    action: &str,
+    as_of_ms: u64,
+) -> Result<()> {
+    if effective_rights_at(conn, &Principal::Key(author.to_vec()), node, as_of_ms)? & right != right
+    {
         return Err(PvfsError::Forbidden {
             action: action.into(),
             reason: format!("author lacks the required right on {node}"),
@@ -875,7 +900,23 @@ fn require_right(conn: &Connection, author: &[u8], node: &str, right: u8, action
 /// member**; and **`Key(pk)` grants for the caller's own key**. Grant-only — grants
 /// flow down the tree. Accepts `&Connection`; a `&Transaction` derefs to it, so
 /// replay can call it too.
+///
+/// Evaluates expiry (doc 13 Q-E1) at the wall clock — the live-path entry point.
+/// Replay and other as-of consumers call [`effective_rights_at`] directly.
 pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str) -> Result<u8> {
+    effective_rights_at(conn, principal, node_id, crate::engine::now_ms())
+}
+
+/// [`effective_rights`] evaluated as of `as_of_ms`: a grant with a nonzero
+/// `expires_at <= as_of_ms` is **inert** — masked exactly like a tag grant under
+/// a revoked authority (doc 10 §9.2). The row stays for inspection (`acl ls`
+/// flags it); compaction removes it (doc 11).
+pub fn effective_rights_at(
+    conn: &Connection,
+    principal: &Principal,
+    node_id: &str,
+    as_of_ms: u64,
+) -> Result<u8> {
     // An owner device short-circuits to full rights. Otherwise determine whether
     // the caller is an authorized member (so `Any` grants apply) and, for a member
     // key, which tags they hold (so the node's `tag:` grants apply).
@@ -901,24 +942,24 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
     let mut guard = 0u32;
     while let Some(n) = cur {
         if include_public {
-            rights |= grant_for(conn, &n, 2, &[], &[])?; // Public — applies to everyone
+            rights |= grant_for(conn, &n, 2, &[], &[], as_of_ms)?; // Public — applies to everyone
         }
         if is_member {
-            rights |= grant_for(conn, &n, 0, &[], &[])?; // Any — authorized members
+            rights |= grant_for(conn, &n, 0, &[], &[], as_of_ms)?; // Any — authorized members
         }
         match principal {
             Principal::Key(pk) => {
-                rights |= grant_for(conn, &n, 1, pk, &[])?; // this specific key
+                rights |= grant_for(conn, &n, 1, pk, &[], as_of_ms)?; // this specific key
                 // A tag the member holds unlocks only the node's `Tag` grants
                 // authored by the *same* authority (doc 10 §3).
                 for (authority, t) in &member_tags {
-                    rights |= grant_for(conn, &n, 3, t.as_bytes(), authority)?;
+                    rights |= grant_for(conn, &n, 3, t.as_bytes(), authority, as_of_ms)?;
                 }
             }
             Principal::Tag(t) => {
                 // Inspection (`acl check tag:<name>`): report this name's grants
                 // across every authority that set one.
-                rights |= grant_for_tag_any_authority(conn, &n, t.as_bytes())?;
+                rights |= grant_for_tag_any_authority(conn, &n, t.as_bytes(), as_of_ms)?;
             }
             _ => {}
         }
@@ -1055,11 +1096,21 @@ fn device_status(conn: &Connection, pubkey: &[u8]) -> Result<(bool, bool)> {
     }
 }
 
-fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8], authority: &[u8]) -> Result<u8> {
+/// An expired grant (nonzero `expires_at <= as_of_ms`, doc 13 Q-E1) is masked
+/// here — the read-path counterpart of the revoked-authority mask above.
+fn grant_for(
+    conn: &Connection,
+    node_id: &str,
+    kind: u64,
+    id: &[u8],
+    authority: &[u8],
+    as_of_ms: u64,
+) -> Result<u8> {
     let r: Option<i64> = conn
         .query_row(
-            "SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3 AND authority = ?4",
-            params![node_id, kind as i64, id, authority],
+            "SELECT rights FROM acl WHERE node_id = ?1 AND principal_kind = ?2 AND principal_id = ?3 AND authority = ?4
+               AND (expires_at = 0 OR expires_at > ?5)",
+            params![node_id, kind as i64, id, authority, as_of_ms as i64],
             |r| r.get(0),
         )
         .optional()
@@ -1076,16 +1127,22 @@ fn grant_for(conn: &Connection, node_id: &str, kind: u64, id: &[u8], authority: 
 /// met by a membership under the *same* authority, which is itself masked — so it can
 /// never confer access. Excluding it keeps `acl check tag:` honest (effective, like
 /// `acl check key:`), while `acl ls` still lists the row and flags it `[inert]`.
-fn grant_for_tag_any_authority(conn: &Connection, node_id: &str, name: &[u8]) -> Result<u8> {
+fn grant_for_tag_any_authority(
+    conn: &Connection,
+    node_id: &str,
+    name: &[u8],
+    as_of_ms: u64,
+) -> Result<u8> {
     let mut stmt = conn
         .prepare(
             "SELECT a.rights FROM acl a WHERE a.node_id = ?1 AND a.principal_kind = 3 AND a.principal_id = ?2
+               AND (a.expires_at = 0 OR a.expires_at > ?3)
                AND EXISTS (SELECT 1 FROM device_keys dk
                            WHERE dk.device_pubkey = a.authority AND dk.revoked_at IS NULL)",
         )
         .map_err(map_db("prepare tag grants"))?;
     let rows = stmt
-        .query_map(params![node_id, name], |r| r.get::<_, i64>(0))
+        .query_map(params![node_id, name, as_of_ms as i64], |r| r.get::<_, i64>(0))
         .map_err(map_db("query tag grants"))?;
     let mut rights = 0u8;
     for r in rows {
@@ -1391,7 +1448,7 @@ mod enforcement_tests {
         let (kind, id, rights) = (0u64, Vec::<u8>::new(), acl::ACL_R as u64); // grant `any` read
         let sig = crypto::sign_digest(
             &member,
-            &crate::event::msg_acl_set(&root, kind, &id, rights, t, &member_pub),
+            &crate::event::msg_acl_set(&root, kind, &id, rights, t, 0, &member_pub),
         )
         .unwrap();
         append_to_log(
@@ -1402,6 +1459,7 @@ mod enforcement_tests {
                 principal_id: id,
                 rights,
                 set_at: t,
+                expires_at: 0,
                 author: member_pub,
                 sig,
             },

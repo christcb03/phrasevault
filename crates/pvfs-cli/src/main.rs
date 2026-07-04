@@ -422,6 +422,10 @@ enum AclCmd {
         principal: String,
         /// Rights: letters from r,w,a (e.g. `rw`), or `-`/`none` to clear
         rights: String,
+        /// Expire the grant after a duration (`45s`, `30m`, `12h`, `7d`, `2w`)
+        /// or at an absolute instant (`@<unix-ms>`). Omit for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// List the direct ACL grants on a node
     Ls {
@@ -598,6 +602,71 @@ fn print_created(id: &str, json: bool) {
     } else {
         println!("created {id}");
     }
+}
+
+/// Parse `--expires` (doc 13 Q-E1) into a ms-epoch instant: a duration from now
+/// (`45s`, `30m`, `12h`, `7d`, `2w`) or an absolute `@<unix-ms>`.
+fn parse_expires(s: &str) -> Result<u64, PvfsError> {
+    let bad = |reason: String| PvfsError::BadInput {
+        field: "expires".into(),
+        reason,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Some(ms) = s.strip_prefix('@') {
+        let t: u64 = ms
+            .parse()
+            .map_err(|_| bad(format!("{s:?} — @<unix-ms> must be an integer")))?;
+        if t == 0 {
+            return Err(bad("@0 — zero means \"never\"; omit --expires instead".into()));
+        }
+        return Ok(t);
+    }
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: u64 = num
+        .parse()
+        .map_err(|_| bad(format!("{s:?} — use <N>(s|m|h|d|w) or @<unix-ms>")))?;
+    let ms_per = match unit {
+        "s" => 1_000u64,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 7 * 86_400_000,
+        _ => return Err(bad(format!("{s:?} — use <N>(s|m|h|d|w) or @<unix-ms>"))),
+    };
+    n.checked_mul(ms_per)
+        .and_then(|d| now.checked_add(d))
+        .ok_or_else(|| bad(format!("{s:?} — duration overflows")))
+}
+
+/// Human note for a grant expiry: `""` for never, ` [expired]` once past, else
+/// ` (expires in ~<coarse duration>)`.
+fn expiry_suffix(expires_at: u64) -> String {
+    if expires_at == 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if expires_at <= now {
+        return " [expired]".into();
+    }
+    let left = expires_at - now;
+    let (val, unit) = if left >= 7 * 86_400_000 {
+        (left / (7 * 86_400_000), "w")
+    } else if left >= 86_400_000 {
+        (left / 86_400_000, "d")
+    } else if left >= 3_600_000 {
+        (left / 3_600_000, "h")
+    } else if left >= 60_000 {
+        (left / 60_000, "m")
+    } else {
+        (left.div_ceil(1_000), "s")
+    };
+    format!(" (expires in ~{val}{unit})")
 }
 
 /// ` (by <short-hex>)` for a non-empty tag authority (doc 10), else empty. Lets
@@ -1994,32 +2063,56 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     node,
                     principal,
                     rights,
+                    expires,
                 } => {
                     // Resolve path/URI → node id (fix: was node-id only before).
                     let state_dir = ctx?;
                     let node_id = resolve_node_id(Ok(state_dir.clone()), &node)?;
                     let p = acl::Principal::parse(&principal)?;
                     let r = acl::parse_rights(&rights)?;
+                    let expires_at = match &expires {
+                        Some(s) => parse_expires(s)?,
+                        None => 0,
+                    };
+                    if expires_at != 0 && r == 0 {
+                        return Err(PvfsError::BadInput {
+                            field: "expires".into(),
+                            reason: "clearing a grant takes no expiry".into(),
+                        });
+                    }
 
                     // Auto-route through daemon when one is running (doc 09 §3d).
                     if let Some((mut client, sign)) = daemon_client(&state_dir)? {
                         client
-                            .set_acl(&node_id, &p.display(), &acl::rights_to_str(r), |d| sign(d))
+                            .set_acl_expiring(
+                                &node_id,
+                                &p.display(),
+                                &acl::rights_to_str(r),
+                                expires_at,
+                                |d| sign(d),
+                            )
                             .map_err(remote_err)?;
                     } else {
                         let mut engine = Engine::open(&state_dir)?;
-                        engine.set_acl(&node_id, &p, r)?;
+                        engine.set_acl_expiring(&node_id, &p, r, expires_at)?;
                         engine.close()?;
                     }
                     if json {
                         println!(
-                            "{{\"node\":\"{}\",\"principal\":\"{}\",\"rights\":\"{}\"}}",
+                            "{{\"node\":\"{}\",\"principal\":\"{}\",\"rights\":\"{}\",\"expires_at\":{}}}",
                             json_escape(&node_id),
                             json_escape(&p.display()),
-                            acl::rights_to_str(r)
+                            acl::rights_to_str(r),
+                            expires_at
                         );
                     } else {
-                        println!("set {} on {} = {}", p.display(), node_id, acl::rights_to_str(r));
+                        println!(
+                            "set {} on {} = {}{}",
+                            p.display(),
+                            node_id,
+                            acl::rights_to_str(r),
+                            expiry_suffix(expires_at)
+                        );
                     }
                     Ok(())
                 }
@@ -2029,28 +2122,35 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let entries = engine.acl_entries(&node_id)?;
                     // Report **effective** rights, never the stored value of a grant
                     // that isn't in force: a tag grant under a revoked authority is
-                    // inert (masked on the read path, doc 10 §9.2), so its effective
-                    // rights are none (`-`). We surface the *granted* value only in the
-                    // inert annotation, so a troubleshooter reading the rights column
+                    // inert (masked on the read path, doc 10 §9.2), and so is an
+                    // **expired** grant (doc 13 Q-E1) — so their effective rights are
+                    // none (`-`). We surface the *granted* value only in the inert/
+                    // expired annotation, so a troubleshooter reading the rights column
                     // never mistakes a dead grant for live access. Physical removal of
                     // the row is left to compaction (doc 11).
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                     let mut rows = Vec::with_capacity(entries.len());
-                    for (p, authority, granted) in entries {
+                    for (p, authority, granted, expires_at) in entries {
                         let inert = !engine.authority_active(&authority)?;
-                        let effective = if inert { 0 } else { granted };
-                        rows.push((p, authority, granted, effective, inert));
+                        let expired = expires_at != 0 && expires_at <= now;
+                        let effective = if inert || expired { 0 } else { granted };
+                        rows.push((p, authority, granted, expires_at, effective, inert, expired));
                     }
                     if json {
                         let items: Vec<String> = rows
                             .iter()
-                            .map(|(p, authority, granted, effective, inert)| {
+                            .map(|(p, authority, granted, expires_at, effective, inert, expired)| {
                                 format!(
-                                    "{{\"principal\":\"{}\",\"authority\":\"{}\",\"rights\":\"{}\",\"granted\":\"{}\",\"active\":{}}}",
+                                    "{{\"principal\":\"{}\",\"authority\":\"{}\",\"rights\":\"{}\",\"granted\":\"{}\",\"expires_at\":{},\"active\":{}}}",
                                     json_escape(&p.display()),
                                     hex::encode(authority),
                                     acl::rights_to_str(*effective),
                                     acl::rights_to_str(*granted),
-                                    !*inert
+                                    expires_at,
+                                    !*inert && !*expired
                                 )
                             })
                             .collect();
@@ -2058,14 +2158,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else if rows.is_empty() {
                         println!("(no direct grants on {node_id})");
                     } else {
-                        for (p, authority, granted, effective, inert) in rows {
+                        for (p, authority, granted, expires_at, effective, inert, expired) in rows {
                             let note = if inert {
                                 format!(
                                     "  [inert: authority revoked; granted {}]",
                                     acl::rights_to_str(granted)
                                 )
+                            } else if expired {
+                                format!("  [expired; granted {}]", acl::rights_to_str(granted))
                             } else {
-                                String::new()
+                                expiry_suffix(expires_at)
                             };
                             println!(
                                 "{:>3}  {}{}{}",

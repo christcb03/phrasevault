@@ -103,12 +103,13 @@ The **owner** (identity root, and devices it marks admin) always has full rights
 A new event kind **`AclSet`** (and its inverse, expressed as an `AclSet` to empty) records grants in the log, so access policy is **versioned, attributed, replayable, and replicated** like all other state — never a side file.
 
 ```
-AclSet { node_id, principal, rights, set_at, author, sig }
+AclSet { node_id, principal, rights, set_at, expires_at?, author, sig }
 ```
 
 - `author` must hold `a` (admin) on `node_id` (the owner's root always qualifies). Enforced both by the daemon (at request time) and by the projection (at apply time), using the same authorization spine as §3.3.
-- Projected into an `acl(node_id, principal, rights, set_at)` table for O(1) lookups during traversal.
+- Projected into an `acl(node_id, principal, rights, set_at, expires_at)` table for O(1) lookups during traversal.
 - Exact PCE field encoding and digest domain string (`pvfs:aclset:v1:`) are specified alongside implementation in [02] when Phase B lands.
+- **Expiry (1.1, doc 13 Q-E1):** `expires_at` (ms epoch, `0`/absent = never) makes a grant **time-limited**: once past, it is *inert* — masked by `effective_rights` exactly like a tag grant under a revoked authority (doc 10 §9.2). The row stays for inspection (`acl ls` flags `[expired]`; CLI: `pvfs acl set <node> <principal> <rights> --expires 7d`); compaction removes it (doc 11). On the wire the field is trailing and written only when nonzero, so pre-1.1 events decode unchanged, a no-expiry event stays byte-identical to its 1.0 form (digest domain `pvfs:aclset:v1:`), and an expiring grant signs under `pvfs:aclset:v2:`. Live checks judge expiry at the wall clock; replay judges it at the log row's chain-protected `written_at`, so a write authorized by a then-valid grant replays deterministically forever.
 
 ### 4.4 Why not POSIX bits on nodes
 

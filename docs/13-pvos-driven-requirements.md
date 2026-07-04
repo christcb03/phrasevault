@@ -89,7 +89,7 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 - **Q-E3:** **Shared companion API (PVOS D7)** — the companion is partly a PVFS component (doc 09 §6). One agent must serve **PVFS root-signing + PVOS owner-signing + PVOS SSSO** (identity assertion + human-signature brokering). Agree the agent's API surface across both projects.
 
 ### E — Resolved (2026-06-21)
-- **Q-E1:** **Add optional `expiry` to ACL grants** (`AclSet` gains an optional expiry; `effective_rights` treats an expired grant as inert). Small additive change; mirrors PVOS's capability TTL and powers public-links. *(Preferred over PVOS revoking on a timer.)*
+- **Q-E1:** **Add optional `expiry` to ACL grants** (`AclSet` gains an optional expiry; `effective_rights` treats an expired grant as inert). Small additive change; mirrors PVOS's capability TTL and powers public-links. *(Preferred over PVOS revoking on a timer.)* **Shipped in 1.1** — `AclSet.expires_at` (trailing wire field, 0 = never; digest domain `pvfs:aclset:v2:` when set), masked on the read path like doc 10 §9.2's revoked-authority grants, `--expires` on `pvfs acl set`, `expires_at` on the daemon's `SetAcl` op. See doc 06 §4.3.
 - **Q-E2:** **No new identity primitive.** A "guest" / public link = an **expiring `public`/`key` grant** (E1) + a shareable token; the recipient holds an ephemeral key. Covers non-PVOS sharing without a guest-identity type.
 - **Q-E3:** **One companion agent**, a superset API both consume: `get-identity/pubkey`, `sign(digest)` (with approval), plus PVOS's `sign-in challenge` and `sign-as-user(context)`. A small joint spec to write when the companion is built (PVFS doc 09 §6 + PVOS doc 10 §4.1).
 

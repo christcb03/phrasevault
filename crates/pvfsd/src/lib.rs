@@ -476,8 +476,9 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
                 node,
                 principal,
                 rights,
+                expires_at,
             } => match (Principal::parse(&principal), acl::parse_rights(&rights)) {
-                (Ok(p), Ok(r)) => e.prepare_set_acl(&author, &node, &p, r),
+                (Ok(p), Ok(r)) => e.prepare_set_acl_expiring(&author, &node, &p, r, expires_at),
                 (Err(err), _) | (_, Err(err)) => Err(err),
             },
             WriteOp::TagMember {

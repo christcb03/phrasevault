@@ -460,7 +460,7 @@ fn revoking_tag_authority_denies_access() {
         .acl_entries(&node)
         .unwrap()
         .into_iter()
-        .any(|(pr, authority, _)| {
+        .any(|(pr, authority, _, _)| {
             matches!(pr, acl::Principal::Tag(ref t) if t.as_str() == "crew")
                 && authority == app_pub
                 && !engine.authority_active(&authority).unwrap()
@@ -557,5 +557,85 @@ fn root_may_prepare_device_cert() {
         engine.prepare_authorize_member(&stranger, &member),
         Err(PvfsError::Forbidden { .. })
     ));
+    engine.close().unwrap();
+}
+
+// doc 13 Q-E1 (1.1) — expiring ACL grants. A grant past its `expires_at` is
+// inert on the read path — live and across a full rebuild — exactly like a tag
+// grant under a revoked authority. A member write authorized while the grant
+// was valid must still replay after it lapses (expiry is judged as of the log
+// row's `written_at`, not the rebuild's wall clock).
+#[test]
+fn expiring_grants_deny_after_expiry_live_and_rebuilt() {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let shared = engine.add_node(&root, folder("shared")).unwrap();
+    let vault = engine.add_node(&root, folder("vault")).unwrap();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&m, &member_pub).unwrap();
+    let p = acl::Principal::Key(member_pub.clone());
+
+    // a grant born expired is inert immediately — nothing ever flows from it
+    engine
+        .set_acl_expiring(&vault, &p, acl::ACL_R, now() - 1)
+        .unwrap();
+    assert_eq!(engine.effective_rights(&p, &vault).unwrap(), 0);
+
+    // a short-lived rw grant admits a member write while valid…
+    let expiry = now() + 800;
+    engine
+        .set_acl_expiring(&shared, &p, acl::ACL_R | acl::ACL_W, expiry)
+        .unwrap();
+    assert_eq!(
+        engine.effective_rights(&p, &shared).unwrap(),
+        acl::ACL_R | acl::ACL_W
+    );
+    // …and `acl_entries` reports the expiry for inspection
+    let entries = engine.acl_entries(&shared).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].3, expiry);
+
+    let prep = engine.prepare_add_node(&member_pub, &shared, folder("drop")).unwrap();
+    let dropped = prep.result_id.clone();
+    commit_with(&mut engine, prep, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    });
+
+    // wait out the expiry: the grant goes inert with no further log events
+    while now() <= expiry {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        engine.effective_rights(&p, &shared).unwrap(),
+        0,
+        "an expired grant must not confer rights"
+    );
+    // …and no new write can be prepared under it
+    assert!(matches!(
+        engine.prepare_add_node(&member_pub, &shared, folder("late")),
+        Err(PvfsError::Forbidden { .. })
+    ));
+    engine.close().unwrap();
+
+    // Full rebuild: the member's write was in-rights when appended, so replay
+    // must accept it (as-of `written_at`), while the expired grant stays inert.
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).expect("in-window member write must replay after expiry");
+    assert!(engine.node(&dropped).unwrap().is_some(), "replayed write present");
+    assert_eq!(engine.effective_rights(&p, &shared).unwrap(), 0);
+    assert_eq!(engine.effective_rights(&p, &vault).unwrap(), 0);
+    // the expired row is still listed for audit, expiry intact
+    let entries = engine.acl_entries(&shared).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].3, expiry);
     engine.close().unwrap();
 }

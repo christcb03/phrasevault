@@ -3,6 +3,21 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
+## Unreleased (1.1)
+
+- **Expiring ACL grants** (doc 13 Q-E1): `AclSet` gains an optional
+  `expires_at` (ms epoch, 0 = never). An expired grant is inert on the read
+  path — masked by `effective_rights` like a revoked-authority tag grant —
+  while the row stays listed (`acl ls` flags `[expired]`) until compaction.
+  Backward compatible: the expiry is a trailing wire field written only when
+  set, so 1.0 events decode unchanged and no-expiry events stay byte-identical
+  (expiring grants sign under a new `pvfs:aclset:v2:` digest domain). Replay
+  judges expiry at the row's chain-protected `written_at`, so writes
+  authorized by a then-valid grant rebuild deterministically. Surfaces:
+  `pvfs acl set … --expires <45s|30m|12h|7d|2w|@unix-ms>`, engine/client
+  `set_acl_expiring`, daemon `SetAcl.expires_at` (serde-defaulted; old
+  clients unaffected). Projection schema v3 (self-heals by rebuild).
+
 ## 1.0.0 — 07/03/2026
 
 The first complete release: a standalone, multi-user, signed file-system

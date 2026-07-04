@@ -1450,6 +1450,19 @@ impl Engine {
         principal: &crate::acl::Principal,
         rights: u8,
     ) -> Result<()> {
+        self.set_acl_expiring(node_id, principal, rights, 0)
+    }
+
+    /// [`set_acl`](Self::set_acl) with an expiry (doc 13 Q-E1): the grant goes
+    /// inert once `expires_at` (ms epoch) passes; `0` = never. A past instant is
+    /// accepted — the grant is simply born inert (useful for tests and imports).
+    pub fn set_acl_expiring(
+        &mut self,
+        node_id: &NodeId,
+        principal: &crate::acl::Principal,
+        rights: u8,
+        expires_at: u64,
+    ) -> Result<()> {
         self.ensure_device_active()?;
         if fetch_node(&self.conn, node_id)?.is_none() {
             return Err(PvfsError::NotFound {
@@ -1470,7 +1483,7 @@ impl Engine {
         let author = self.device_pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_acl_set(node_id, kind, &id, rights as u64, t, &author),
+            &event::msg_acl_set(node_id, kind, &id, rights as u64, t, expires_at, &author),
         )?;
         self.append_durable(vec![Event::AclSet {
             node_id: node_id.clone(),
@@ -1478,6 +1491,7 @@ impl Engine {
             principal_id: id,
             rights: rights as u64,
             set_at: t,
+            expires_at,
             author,
             sig,
         }])
@@ -1494,16 +1508,18 @@ impl Engine {
     }
 
     /// Direct ACL grants on `node_id` (not inherited), for `acl ls`. Each entry is
-    /// `(principal, authority, rights)`; `authority` is the granting key for `tag:`
-    /// grants (doc 10) and empty for `public`/`any`/`key` grants.
+    /// `(principal, authority, rights, expires_at)`; `authority` is the granting
+    /// key for `tag:` grants (doc 10) and empty for `public`/`any`/`key` grants;
+    /// `expires_at` is ms epoch, 0 = never (doc 13 Q-E1).
     pub fn acl_entries(
         &self,
         node_id: &NodeId,
-    ) -> Result<Vec<(crate::acl::Principal, Vec<u8>, u8)>> {
+    ) -> Result<Vec<(crate::acl::Principal, Vec<u8>, u8, u64)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT principal_kind, principal_id, authority, rights FROM acl WHERE node_id = ?1
+                "SELECT principal_kind, principal_id, authority, rights, expires_at
+                 FROM acl WHERE node_id = ?1
                  ORDER BY principal_kind, principal_id, authority",
             )
             .map_err(map_db("prepare acl list"))?;
@@ -1514,13 +1530,19 @@ impl Engine {
                     r.get::<_, Vec<u8>>(1)?,
                     r.get::<_, Vec<u8>>(2)?,
                     r.get::<_, i64>(3)? as u8,
+                    r.get::<_, i64>(4)? as u64,
                 ))
             })
             .map_err(map_db("query acl list"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, id, authority, rights) = row.map_err(map_db("read acl row"))?;
-            out.push((crate::acl::Principal::from_wire(kind, id)?, authority, rights));
+            let (kind, id, authority, rights, expires_at) = row.map_err(map_db("read acl row"))?;
+            out.push((
+                crate::acl::Principal::from_wire(kind, id)?,
+                authority,
+                rights,
+                expires_at,
+            ));
         }
         Ok(out)
     }
@@ -1728,6 +1750,7 @@ impl Engine {
                         &root,
                         &self.identity.root_node_id,
                         ev.author(),
+                        now_ms(),
                     )?;
                 }
                 // Root rotation: current root or a registered recovery key (§C2).
@@ -1751,7 +1774,10 @@ impl Engine {
                         });
                     }
                 }
-                _ => projection::check_member_event(&self.conn, ev)?,
+                // Live commit judges ACL expiry at the wall clock (an expired
+                // grant must not admit new writes); replay re-judges at the
+                // row's `written_at`, which is at/after this instant.
+                _ => projection::check_member_event(&self.conn, ev, now_ms())?,
             }
         }
         // Idempotent double-commit of the same prepared node ⇒ success, no re-append.
@@ -2000,6 +2026,19 @@ impl Engine {
         principal: &crate::acl::Principal,
         rights: u8,
     ) -> Result<PreparedWrite> {
+        self.prepare_set_acl_expiring(author_pub, node_id, principal, rights, 0)
+    }
+
+    /// [`prepare_set_acl`](Self::prepare_set_acl) with an expiry (doc 13 Q-E1):
+    /// ms epoch after which the grant is inert; `0` = never.
+    pub fn prepare_set_acl_expiring(
+        &self,
+        author_pub: &[u8],
+        node_id: &NodeId,
+        principal: &crate::acl::Principal,
+        rights: u8,
+        expires_at: u64,
+    ) -> Result<PreparedWrite> {
         if fetch_node(&self.conn, node_id)?.is_none() {
             return Err(PvfsError::NotFound {
                 kind: "node",
@@ -2015,7 +2054,7 @@ impl Engine {
         }
         let t = now_ms();
         let (kind, id) = (principal.kind(), principal.id().to_vec());
-        let digest = event::msg_acl_set(node_id, kind, &id, rights as u64, t, author_pub);
+        let digest = event::msg_acl_set(node_id, kind, &id, rights as u64, t, expires_at, author_pub);
         Ok(PreparedWrite {
             result_id: node_id.clone(),
             events: vec![PreparedEvent {
@@ -2026,6 +2065,7 @@ impl Engine {
                     principal_id: id,
                     rights: rights as u64,
                     set_at: t,
+                    expires_at,
                     author: author_pub.to_vec(),
                     sig: Vec::new(),
                 },
@@ -2476,7 +2516,7 @@ impl Engine {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT node_id, principal_kind, principal_id, rights FROM acl
+                "SELECT node_id, principal_kind, principal_id, rights, expires_at FROM acl
                  WHERE (principal_kind = 3 AND authority = ?1)
                     OR (principal_kind = 1 AND principal_id = ?1)
                  ORDER BY node_id, principal_kind, principal_id",
@@ -2489,15 +2529,18 @@ impl Engine {
                     r.get::<_, i64>(1)? as u64,
                     r.get::<_, Vec<u8>>(2)?,
                     r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
                 ))
             })
             .map_err(map_db("query reissue acl"))?;
         for row in rows {
-            let (node_id, kind, pid, rights) = row.map_err(map_db("read reissue acl"))?;
+            let (node_id, kind, pid, rights, expires_at) = row.map_err(map_db("read reissue acl"))?;
             // A grant TO the old key becomes a grant to the new key; a tag grant
             // keeps its name and gets the new key as its (implicit) authority.
+            // An expiry rides along unchanged — reissue never extends a grant.
             let principal_id = if kind == 1 { new_pub.to_vec() } else { pid };
-            let digest = event::msg_acl_set(&node_id, kind, &principal_id, rights, t, new_pub);
+            let digest =
+                event::msg_acl_set(&node_id, kind, &principal_id, rights, t, expires_at, new_pub);
             events.push(PreparedEvent {
                 digest,
                 event: Event::AclSet {
@@ -2506,6 +2549,7 @@ impl Engine {
                     principal_id,
                     rights,
                     set_at: t,
+                    expires_at,
                     author: new_pub.to_vec(),
                     sig: Vec::new(),
                 },

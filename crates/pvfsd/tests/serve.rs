@@ -534,3 +534,66 @@ fn daemon_creates_secure_store_on_the_fly() {
         .unwrap();
     assert_eq!(c.secure_cat(&blob2).unwrap(), b"other chat");
 }
+
+// doc 13 Q-E1 (1.1) — the expiry rides the wire: `SetAcl.expires_at` flows
+// client → daemon → engine. A far-future grant admits the member; a grant set
+// already-expired confers nothing, and the public tier behaves the same.
+#[test]
+fn daemon_set_acl_carries_expiry() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let shared = engine.add_node(&root, folder("shared")).unwrap();
+    let owner_key = identity::device_key(&owner_mn, "", 0).unwrap();
+    let owner_pub = crypto::pubkey_bytes(&owner_key);
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    let member_hex = hex::encode(&member_pub);
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let mut owner = Client::connect_signed(&sock, &owner_pub, |d| {
+        crypto::sign_digest(&owner_key, d).unwrap()
+    })
+    .unwrap();
+    // a member grant valid for an hour, and a public grant that is already dead
+    owner
+        .set_acl_expiring(&shared, &format!("key:{member_hex}"), "rw", now + 3_600_000, |d| {
+            crypto::sign_digest(&owner_key, d).unwrap()
+        })
+        .unwrap();
+    owner
+        .set_acl_expiring(&root, "public", "r", now - 1, |d| {
+            crypto::sign_digest(&owner_key, d).unwrap()
+        })
+        .unwrap();
+
+    // the live member grant works end to end
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+    member
+        .mkdir(&shared, "in-window", |d| crypto::sign_digest(&member_key, d).unwrap())
+        .unwrap();
+    assert!(labels(&member.ls(&shared).unwrap()).contains(&"in-window".to_string()));
+
+    // the born-expired public grant confers nothing
+    let mut anon = Client::connect_public(&sock).unwrap();
+    assert!(forbidden(anon.ls(&root)));
+}

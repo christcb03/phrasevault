@@ -353,11 +353,30 @@ impl Client {
     where
         F: Fn(&[u8; 32]) -> Vec<u8>,
     {
+        self.set_acl_expiring(node, principal, rights, 0, sign)
+    }
+
+    /// [`set_acl`](Self::set_acl) with an expiry (doc 13 Q-E1): ms epoch after
+    /// which the grant is inert; `0` = never. A pre-1.1 daemon ignores the field
+    /// (JSON, unknown-field tolerant) and records a permanent grant — pair a 1.1
+    /// client with a 1.1 daemon when expiry matters.
+    pub fn set_acl_expiring<F>(
+        &mut self,
+        node: &str,
+        principal: &str,
+        rights: &str,
+        expires_at: u64,
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
         self.write_op(
             WriteOp::SetAcl {
                 node: node.into(),
                 principal: principal.into(),
                 rights: rights.into(),
+                expires_at,
             },
             sign,
         )

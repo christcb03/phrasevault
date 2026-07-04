@@ -83,11 +83,15 @@ pub enum WriteOp {
     /// Re-home `node` under `new_parent`.
     Mv { node: String, new_parent: String },
     /// Set a principal's rights on a node. `principal` = `public`|`any`|`tag:<name>`|
-    /// `key:<hex>`; `rights` = `rwa` letters or `-` to clear.
+    /// `key:<hex>`; `rights` = `rwa` letters or `-` to clear. `expires_at` (doc 13
+    /// Q-E1, 1.1): ms epoch after which the grant is inert; 0 = never. Defaulted
+    /// so a pre-1.1 client's frame still parses (additive wire change).
     SetAcl {
         node: String,
         principal: String,
         rights: String,
+        #[serde(default)]
+        expires_at: u64,
     },
     /// Grant (`granted`) or remove a membership tag from a member key (hex).
     TagMember {
