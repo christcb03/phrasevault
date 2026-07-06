@@ -555,6 +555,12 @@ fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
                     id: message.clone(),
                 }
             }
+            "already_exists" => {
+                return PvfsError::AlreadyExists {
+                    kind: "remote",
+                    id: message.clone(),
+                }
+            }
             _ => {}
         }
     }

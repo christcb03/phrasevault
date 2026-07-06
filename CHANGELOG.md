@@ -5,6 +5,13 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+### Fixed
+
+- **Daemon error fidelity:** `pvfsd` now sends `already_exists` as a typed
+  error code instead of the `internal` catch-all, and `pvfs remote …` maps it
+  back to `AlreadyExists` (exit 4), matching the local-path semantics scripts
+  already rely on. (Surfaced by PVOS's idempotent hand-install path.)
+
 ### Security
 
 - **Revoked keys are contained on the read path** (doc 06 §5, doc 06 §9 rule

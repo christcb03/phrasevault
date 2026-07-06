@@ -623,6 +623,7 @@ fn err_from(e: PvfsError) -> ServerMsg {
         PvfsError::BadInput { .. } => "bad_input",
         PvfsError::Forbidden { .. } => "forbidden",
         PvfsError::Integrity { .. } => "integrity",
+        PvfsError::AlreadyExists { .. } => "already_exists",
         _ => "internal",
     };
     err(code, &e.to_string())
