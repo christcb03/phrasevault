@@ -3,6 +3,19 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
+## Unreleased
+
+### Security
+
+- **Revoked keys are contained on the read path** (doc 06 §5, doc 06 §9 rule
+  table). `effective_rights` now distinguishes a key's standing: *revoked* keys
+  have their direct `key:` ACL grants masked at access time (previously only
+  `any`/tag grants and authorship died with `DeviceRevoked`; a lingering `key:`
+  row still granted reads). *Never-authorized* guest keys are unchanged —
+  their `key:` grants apply without membership (the doc 13 §E public-link
+  path). Found by the PVOS M1 §0 default-deny smoke gate; regression test in
+  `p2_access.rs` (`revoked_key_acl_grants_are_masked_but_guest_keys_keep_theirs`).
+
 ## 1.0.0 — 07/03/2026
 
 The first complete release: a standalone, multi-user, signed file-system

@@ -193,7 +193,7 @@ enabled = true
 ## 9. Security model
 
 - **Private by default.** No ACL grant ⇒ no access. `.pvfs/` `0700` enforces this even if the daemon is down.
-- **No key sharing.** Each writer signs with their own authorized key; revocation is root-signed and kernel-enforced (§3.3). A stolen member key is contained by `DeviceRevoked`.
+- **No key sharing.** Each writer signs with their own authorized key; revocation is root-signed and kernel-enforced (§3.3). A stolen member key is contained by `DeviceRevoked` **on both paths**: authorship dies at the kernel (§3.3), and the key's direct `key:` ACL grants are **masked at access time** — a revoked key reads nothing, even where its ACL rows linger (they go inert, like a dead tag authority, doc 10 §9.2; compaction reclaims them, doc 11). *Never-authorized* keys are different: their `key:` grants apply without membership — that is the ephemeral guest-key / public-link path (doc 13 §E). So the access rule is: owner ⇒ full; active member ⇒ `key:` + `tag:` + `any` + `public`; never-authorized ⇒ `key:` + `public`; revoked ⇒ `public` only.
 - **Faithful authorship.** Every event names and is signed by its real author; the owner's daemon cannot silently forge another member's writes (it doesn't hold their key), and a replica re-verifies independently.
 - **Daemon compromise.** A compromised owner daemon can mis-serve *that owner's* forest (it holds the owner key) but cannot author as other members, and cannot touch other owners' forests (separate uids, `0700`).
 - **Peer-cred trust.** uid→principal rests on kernel-supplied peer credentials; acceptable under trust assumption (8). Optional connect-time key challenge removes even that assumption later.

@@ -559,3 +559,51 @@ fn root_may_prepare_device_cert() {
     ));
     engine.close().unwrap();
 }
+
+// doc 06 §5 containment — a REVOKED key's direct `key:` grants are masked on the
+// read path (like a dead tag authority, doc 10 §9.2); a NEVER-authorized key's
+// `key:` grants still apply (the ephemeral guest-key path, doc 13 §E).
+#[test]
+fn revoked_key_acl_grants_are_masked_but_guest_keys_keep_theirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, m) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let region = engine.add_node(&root, folder("region")).unwrap();
+    let inner = engine.add_node(&region, folder("inner")).unwrap();
+
+    // A guest key: never authorized, direct grant → rights apply (public-link path).
+    let guest = foreign_pubkey();
+    let gp = acl::Principal::Key(guest.clone());
+    engine.set_acl(&region, &gp, acl::ACL_R).unwrap();
+    assert_eq!(engine.effective_rights(&gp, &region).unwrap(), acl::ACL_R);
+    assert_eq!(engine.effective_rights(&gp, &inner).unwrap(), acl::ACL_R);
+
+    // A member key with rw on the region.
+    let member = foreign_pubkey();
+    engine.authorize_member(&m, &member).unwrap();
+    let p = acl::Principal::Key(member.clone());
+    engine
+        .set_acl(&region, &p, acl::ACL_R | acl::ACL_W)
+        .unwrap();
+    assert_eq!(
+        engine.effective_rights(&p, &region).unwrap(),
+        acl::ACL_R | acl::ACL_W
+    );
+
+    // Revoke the member: its lingering key: grant goes inert — reads included —
+    // even though the ACL row still exists. Inherited nodes too.
+    engine.revoke_device(&m, &member).unwrap();
+    assert_eq!(engine.effective_rights(&p, &region).unwrap(), 0);
+    assert_eq!(engine.effective_rights(&p, &inner).unwrap(), 0);
+
+    // The guest key is untouched by someone else's revocation.
+    assert_eq!(engine.effective_rights(&gp, &region).unwrap(), acl::ACL_R);
+
+    // Containment survives a full projection rebuild (it's all log-derived).
+    engine.close().unwrap();
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = Engine::open(dir.path()).unwrap();
+    assert_eq!(engine.effective_rights(&p, &region).unwrap(), 0);
+    assert_eq!(engine.effective_rights(&gp, &region).unwrap(), acl::ACL_R);
+    engine.close().unwrap();
+}

@@ -877,23 +877,24 @@ fn require_right(conn: &Connection, author: &[u8], node: &str, right: u8, action
 /// replay can call it too.
 pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str) -> Result<u8> {
     // An owner device short-circuits to full rights. Otherwise determine whether
-    // the caller is an authorized member (so `Any` grants apply) and, for a member
-    // key, which tags they hold (so the node's `tag:` grants apply).
-    let (is_member, member_tags): (bool, Vec<(Vec<u8>, String)>) = match principal {
-        Principal::Public | Principal::Tag(_) => (false, Vec::new()),
-        Principal::Any => (true, Vec::new()),
-        Principal::Key(pk) => {
-            let (authorized, is_owner) = device_status(conn, pk)?;
-            if is_owner {
-                return Ok(acl::ACL_RWA);
-            }
-            if authorized {
-                (true, member_tags_of(conn, pk)?)
-            } else {
-                (false, Vec::new())
-            }
-        }
-    };
+    // the caller is an authorized member (so `Any` grants apply), which tags a
+    // member key holds (so the node's `tag:` grants apply), and whether the key's
+    // direct `key:` grants are live: a NEVER-authorized key keeps them (the
+    // ephemeral guest-key path, doc 13 §E), but a REVOKED key is masked —
+    // `DeviceRevoked` must contain a stolen member key on the read path too
+    // (doc 06 §5), exactly like a dead tag authority (doc 10 §9.2). The lingering
+    // ACL rows go inert, not removed (compaction reclaims them, doc 11).
+    let (is_member, member_tags, key_grants_live): (bool, Vec<(Vec<u8>, String)>, bool) =
+        match principal {
+            Principal::Public | Principal::Tag(_) => (false, Vec::new(), true),
+            Principal::Any => (true, Vec::new(), true),
+            Principal::Key(pk) => match key_standing(conn, pk)? {
+                KeyStanding::Active { owner: true } => return Ok(acl::ACL_RWA),
+                KeyStanding::Active { owner: false } => (true, member_tags_of(conn, pk)?, true),
+                KeyStanding::Never => (false, Vec::new(), true),
+                KeyStanding::Revoked => (false, Vec::new(), false),
+            },
+        };
     // A `Tag` query reports only that tag's grants (no `public` floor).
     let include_public = !matches!(principal, Principal::Tag(_));
     let mut rights = 0u8;
@@ -908,7 +909,9 @@ pub fn effective_rights(conn: &Connection, principal: &Principal, node_id: &str)
         }
         match principal {
             Principal::Key(pk) => {
-                rights |= grant_for(conn, &n, 1, pk, &[])?; // this specific key
+                if key_grants_live {
+                    rights |= grant_for(conn, &n, 1, pk, &[])?; // this specific key
+                }
                 // A tag the member holds unlocks only the node's `Tag` grants
                 // authored by the *same* authority (doc 10 §3).
                 for (authority, t) in &member_tags {
@@ -1040,6 +1043,46 @@ pub fn inert_memberships(conn: &Connection) -> Result<Vec<InertMembership>> {
 }
 
 /// `(authorized_and_unrevoked, is_owner_device)` for a key in `device_keys`.
+/// A key's standing in the device-cert projection: never seen, currently
+/// authorized (owner device or member), or revoked. Distinct from
+/// `device_status` because the access path must tell "never authorized"
+/// (guest key — direct `key:` grants apply, doc 13 §E) apart from "revoked"
+/// (contained — all personal grants masked, doc 06 §5).
+enum KeyStanding {
+    Never,
+    Active { owner: bool },
+    Revoked,
+}
+
+fn key_standing(conn: &Connection, pubkey: &[u8]) -> Result<KeyStanding> {
+    let idx: Option<i64> = conn
+        .query_row(
+            "SELECT device_index FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL",
+            params![pubkey],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("acl key standing"))?;
+    if let Some(i) = idx {
+        return Ok(KeyStanding::Active {
+            owner: (i as u64) != acl::MEMBER_DEVICE_INDEX,
+        });
+    }
+    let seen: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM device_keys WHERE device_pubkey = ?1 LIMIT 1",
+            params![pubkey],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("acl key standing"))?;
+    Ok(if seen.is_some() {
+        KeyStanding::Revoked
+    } else {
+        KeyStanding::Never
+    })
+}
+
 fn device_status(conn: &Connection, pubkey: &[u8]) -> Result<(bool, bool)> {
     let idx: Option<i64> = conn
         .query_row(
