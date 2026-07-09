@@ -6,7 +6,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 
 ## Status
 
-**Version `1.0.0` — released (tagged `v1.0`, 2026-07-03).** The first complete release of the engine, ready to host an application layer above it — see the [CHANGELOG](CHANGELOG.md). Post-1.0 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
+**Version `1.1.0` — packaged, tag pending validation** (run the full pipeline; tag `v1.1` on green). `1.0.0` was tagged `v1.0` 2026-07-03; 1.1 adds the PVOS-driven daemon ops (`AddNode`/`Payload`, `stat` parent) and two fixes surfaced by PVOS M1 (revoked-key read containment, typed `already_exists`) — see the [CHANGELOG](CHANGELOG.md). Post-1.0 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
 
 | Phase | What | State |
 |-------|------|--------|

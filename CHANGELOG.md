@@ -3,7 +3,10 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
-## Unreleased
+## 1.1.0 — 07/09/2026
+
+Backward-compatible additions + fixes surfaced by the first PVOS milestone
+(the M1 walking skeleton builds and tests against this engine).
 
 ### Added
 
