@@ -42,6 +42,8 @@ pub enum ServerMsg {
     },
     Ls { children: Vec<ChildInfo> },
     Stat { node: NodeInfo },
+    /// A node's inline payload (hex; response to `ClientMsg::Payload`).
+    Payload { payload: String },
     /// Phase 1 of a write: the digests to sign (hex), plus the id the write yields.
     Prepared {
         prepared_id: String,
@@ -75,6 +77,16 @@ pub enum WriteOp {
         label: String,
         size: u64,
         mime: String,
+    },
+    /// Create a typed node with an inline **payload** (hex; capped small). The
+    /// payload lives in the signed event log itself — for small, auditable,
+    /// replayable records (e.g. PVOS grant events, doc 13). Not for file bytes
+    /// (`AddFile` + locations) or large/private blobs (`SecureCreate`/`SecurePut`).
+    AddNode {
+        parent: String,
+        label: String,
+        node_type: String,
+        payload: String, // hex
     },
     /// Unlink `node` from its home parent (soft remove).
     Rm { node: String },
@@ -112,6 +124,8 @@ pub enum ClientMsg {
     Info,
     Ls { node: String },
     Stat { node: String },
+    /// Read a node's inline payload (read-ACL-gated; hex on the wire).
+    Payload { node: String },
     /// Stream a file node's bytes. Server responds: CatStart, then binary data
     /// frames (`write_data_frame`), then CatDone.
     Cat { node: String },

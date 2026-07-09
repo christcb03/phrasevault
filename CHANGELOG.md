@@ -5,6 +5,14 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+### Added
+
+- **`AddNode` / `Payload` daemon ops** (doc 13, PVOS-driven): create a
+  custom-typed node with a small inline payload (≤64 KiB, lives in the signed
+  event log — auditable + replayable) and read it back, both ACL-gated.
+  Reserved types (`file`/`folder`/`secure`) keep their dedicated ops. Client:
+  `add_node()` / `payload()`. Carries PVOS grant records (`/grants`).
+
 ### Fixed
 
 - **Daemon error fidelity:** `pvfsd` now sends `already_exists` as a typed

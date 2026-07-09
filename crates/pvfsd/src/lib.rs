@@ -27,6 +27,9 @@ use rand::RngCore;
 const CHALLENGE_TTL_MS: u64 = 30_000;
 /// How long a prepared (phase-1) write awaits its signatures.
 const PREPARE_TTL_MS: u64 = 30_000;
+/// Max decoded size of an `AddNode` inline payload — these live in the event
+/// log, so they must stay small (records, not files).
+const PAYLOAD_CAP: usize = 64 * 1024;
 
 /// A phase-1 write held server-side until the member sends signatures.
 struct PreparedState {
@@ -204,6 +207,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Ok(node) => ServerMsg::Stat { node },
             Err(msg) => msg,
         },
+        ClientMsg::Payload { node } => do_payload(daemon, principal, &node),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
@@ -212,6 +216,23 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
         | ClientMsg::SecurePut { .. }
         | ClientMsg::Auth { .. }
         | ClientMsg::Anonymous => err("bad_input", "unexpected message in request loop"),
+    }
+}
+
+/// A node's inline payload (control plane; read-ACL-gated like `stat`).
+fn do_payload(daemon: &Daemon, principal: &Principal, node: &str) -> ServerMsg {
+    let e = daemon.engine.lock().unwrap();
+    match e.effective_rights(principal, &node.to_string()) {
+        Ok(r) if r & acl::ACL_R != 0 => {}
+        Ok(_) => return forbidden(),
+        Err(pve) => return err_from(pve),
+    }
+    match e.node(&node.to_string()) {
+        Ok(Some(n)) => ServerMsg::Payload {
+            payload: hex::encode(n.payload),
+        },
+        Ok(None) => err("not_found", "no such node"),
+        Err(pve) => err_from(pve),
     }
 }
 
@@ -468,6 +489,43 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
                         creation_nonce: None,
                     },
                 )
+            }
+            WriteOp::AddNode {
+                parent,
+                label,
+                node_type,
+                payload,
+            } => {
+                if node_type.is_empty()
+                    || node_type == pvfs_core::TYPE_SECURE
+                    || node_type == TYPE_FILE
+                    || node_type == TYPE_FOLDER
+                {
+                    Err(PvfsError::BadInput {
+                        field: "node_type".into(),
+                        reason: "must be a custom type (file/folder/secure have their own ops)"
+                            .into(),
+                    })
+                } else {
+                    match hex::decode(&payload) {
+                        Ok(p) if p.len() <= PAYLOAD_CAP => e.prepare_add_node(
+                            &author,
+                            &parent,
+                            NodeSpec {
+                                node_type,
+                                label,
+                                payload: p,
+                                is_temp: false,
+                                creation_nonce: None,
+                            },
+                        ),
+                        Ok(_) => Err(PvfsError::BadInput {
+                            field: "payload".into(),
+                            reason: format!("exceeds {PAYLOAD_CAP} bytes (use AddFile/Secure)"),
+                        }),
+                        Err(_) => Err(bad_hex("payload")),
+                    }
+                }
             }
             WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
             WriteOp::AddLocation { file, uri } => e.prepare_add_location(&author, &file, &uri),

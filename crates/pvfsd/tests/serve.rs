@@ -534,3 +534,75 @@ fn daemon_creates_secure_store_on_the_fly() {
         .unwrap();
     assert_eq!(c.secure_cat(&blob2).unwrap(), b"other chat");
 }
+
+// AddNode/Payload (doc 13: log-resident records, e.g. PVOS grant events):
+// member-signed typed node with inline payload, read back ACL-gated.
+#[test]
+fn daemon_add_node_payload_roundtrip_and_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let region = engine.add_node(&root, folder("region")).unwrap();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(
+            &region,
+            &Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&member_key, d).unwrap();
+    let mut member = Client::connect_signed(&sock, &member_pub, sign).unwrap();
+
+    // round-trip: typed node, payload back intact, visible in ls with its type
+    let rec = br#"{"type":"grant","id":"g-1"}"#;
+    let id = member
+        .add_node(&region, "g-1", "pvos.grant", rec, sign)
+        .unwrap();
+    assert_eq!(member.payload(&id).unwrap(), rec.to_vec());
+    let kid = member
+        .ls(&region)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("new node listed");
+    assert_eq!(kid.node_type, "pvos.grant");
+
+    // guards: reserved types refused; oversize payload refused; no write ACL → forbidden
+    assert!(member
+        .add_node(&region, "x", TYPE_FOLDER, b"", sign)
+        .is_err());
+    assert!(member
+        .add_node(&region, "x", TYPE_SECURE, b"", sign)
+        .is_err());
+    let big = vec![0u8; 64 * 1024 + 1];
+    assert!(member
+        .add_node(&region, "big", "pvos.grant", &big, sign)
+        .is_err());
+    assert!(forbidden(member.add_node(
+        &root,
+        "sneaky",
+        "pvos.grant",
+        rec,
+        sign
+    )));
+
+    // payload read is ACL-gated: an anonymous client can't read it
+    let mut anon = Client::connect_public(&sock).unwrap();
+    assert!(forbidden(anon.payload(&id)));
+}

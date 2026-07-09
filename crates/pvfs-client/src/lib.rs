@@ -311,6 +311,39 @@ impl Client {
         )
     }
 
+    /// Create a typed node with an inline payload (small, log-resident record —
+    /// e.g. a PVOS grant event). Returns the new node id.
+    pub fn add_node<F>(
+        &mut self,
+        parent: &str,
+        label: &str,
+        node_type: &str,
+        payload: &[u8],
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::AddNode {
+                parent: parent.into(),
+                label: label.into(),
+                node_type: node_type.into(),
+                payload: hex::encode(payload),
+            },
+            sign,
+        )
+    }
+
+    /// Read a node's inline payload (read-ACL-gated).
+    pub fn payload(&mut self, node: &str) -> Result<Vec<u8>> {
+        match self.request(ClientMsg::Payload { node: node.into() })? {
+            ServerMsg::Payload { payload } => hex::decode(&payload)
+                .map_err(|_| ClientError::Protocol("payload not hex".into())),
+            other => Err(unexpected("Payload", &other)),
+        }
+    }
+
     /// Unlink `node` from its home parent. Returns the removed link id.
     pub fn rm<F>(&mut self, node: &str, sign: F) -> Result<String>
     where
