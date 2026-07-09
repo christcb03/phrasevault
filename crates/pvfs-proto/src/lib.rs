@@ -160,6 +160,10 @@ pub struct NodeInfo {
     pub node_type: String,
     /// The caller's effective rights on the node, e.g. `"r"` / `"rwa"` / `"-"`.
     pub rights: String,
+    /// The node's home (`contains`) parent; `None` for a tree root.
+    /// (Additive since 1.0 — defaults for older peers.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// The 32-byte digest a client signs to prove key possession (doc 07 §2). Binds

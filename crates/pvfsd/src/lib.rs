@@ -649,11 +649,13 @@ fn do_stat(daemon: &Daemon, principal: &Principal, node: &str) -> Result<NodeInf
         .node(&id)
         .map_err(err_from)?
         .ok_or_else(|| err("not_found", "no such node"))?;
+    let parent = e.parent_of(&id).map_err(err_from)?;
     Ok(NodeInfo {
         id: n.id,
         label: n.label,
         node_type: n.node_type,
         rights: acl::rights_to_str(rights),
+        parent,
     })
 }
 

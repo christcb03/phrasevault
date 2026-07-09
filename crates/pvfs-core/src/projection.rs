@@ -1138,7 +1138,7 @@ fn grant_for_tag_any_authority(conn: &Connection, node_id: &str, name: &[u8]) ->
 }
 
 /// The node's `contains` (home) parent, or `None` at the root / for an orphan.
-fn contains_parent(conn: &Connection, node_id: &str) -> Result<Option<String>> {
+pub fn contains_parent(conn: &Connection, node_id: &str) -> Result<Option<String>> {
     let p: Option<Option<String>> = conn
         .query_row(
             "SELECT parent_id FROM links WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",

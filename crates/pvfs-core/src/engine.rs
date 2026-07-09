@@ -448,6 +448,11 @@ impl Engine {
         fetch_node(&self.conn, id)
     }
 
+    /// The node's home (`contains`) parent, `None` for a tree root.
+    pub fn parent_of(&self, id: &NodeId) -> Result<Option<String>> {
+        crate::projection::contains_parent(&self.conn, id)
+    }
+
     // ---- internal helpers ------------------------------------------------------
 
     fn device_known(&self, pubkey: &[u8]) -> Result<bool> {
