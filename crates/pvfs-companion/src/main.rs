@@ -624,7 +624,7 @@ fn run() -> Result<(), String> {
         }
         Cmd::PhraseNew => {
             let mn = pvfs_core::identity::generate_mnemonic().map_err(|e| e.to_string())?;
-            println!("{}", mn.to_string());
+            println!("{mn}");
             Ok(())
         }
     }
