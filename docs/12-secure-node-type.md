@@ -1,6 +1,6 @@
 # PVFS — Secure Node Type / Encryption-at-Rest (12)
 
-Status: **Buildable design** (§8–§9 added 2026-07-02; §1–§7 are the original design input) — PVOS-driven (the Messenger app); the P3 driver.
+Status: **Implemented** (P3 shipped in 1.0; tests in `p3_secure.rs` + daemon secure path) — design + build notes; §1–§7 original design input, §8–§9 added 2026-07-02. PVOS-driven (Messenger app).
 Date: 2026-06-21
 Depends on: [01 (core engine)](01-core-engine-design.md), [02 (P0 spec)](02-p0-core-engine-spec.md), [04 (storage/FS ops)](04-p1-storage-and-fs-ops-spec.md), [11 (compaction)](11-compaction-and-verifiable-snapshots.md)
 Motivation: a **privacy-first messenger** (and any app storing data the server must not read or retain forever) needs storage that is **encrypted so the server can't read it** and **truly deletable** — which the append-only log resists. This is the same crypto core as the original PhraseVault (envelope encryption, client-side decryption, server-as-blob-store).

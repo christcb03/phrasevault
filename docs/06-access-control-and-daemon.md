@@ -1,6 +1,6 @@
 # PVFS — Access control, per-writer identity, and the mediating daemon (06)
 
-Status: **Decided (model)** — implementation phased (A/B/C below); kernel additions noted
+Status: **Implemented** (P2 A–G; model doc — phases A/B/C below are historical build order; live status in [doc 08](08-roadmap-and-status.md))
 Date: 2026-06-15
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md), [05-instance-registry-and-mounts.md](05-instance-registry-and-mounts.md)
 

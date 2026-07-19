@@ -1,6 +1,6 @@
 # PVFS — tags, and the daemon as the single live instance (09)
 
-Status: **Decided (model)** — implementation phased (§5)
+Status: **Implemented** (P2-D/E tags + live daemon; model doc — §5 is historical build order; live status in [doc 08](08-roadmap-and-status.md))
 Date: 2026-06-18
 Depends on: [06-access-control-and-daemon.md](06-access-control-and-daemon.md), [07-daemon-protocol.md](07-daemon-protocol.md)
 

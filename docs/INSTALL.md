@@ -2,7 +2,13 @@
 
 This guide is for someone comfortable with a terminal, SSH, and copying commands — you do not need to be a Rust developer.
 
-**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`) and a data directory (SQLite log + index). Version **0.1** today includes the **P0 core engine** (forest, signed nodes/links, event log), **P1 storage ops** (bind real folders, scan, read files with hash verification, background watcher), **mounts & a host registry** (P1.5), and the **multi-user access layer** (P2): per-node ACLs, per-key tags, member-signed writes and live admin over the `pvfsd` daemon, a concurrent raw-bytes `cat`, an authorization audit (`pvfs audit`), and graceful daemon shutdown.
+**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). Version **`1.1.0`** (tagged `v1.1`) is the current release. It includes:
+
+- **P0–P1.5** — core engine (forest, signed nodes/links, event log), storage ops (bind/scan/verified reads/watcher), mounts & host registry
+- **P2** — multi-user access: per-node ACLs, per-key tags, member-signed writes and live admin over `pvfsd`, concurrent raw-bytes `cat`, `pvfs audit`, graceful daemon shutdown
+- **P3** — secure (encrypted-at-rest) nodes with companion-gated decryption
+- **Companion** — local key vault + signer + “Sign in with PVFS” agent (doc 14 / 16)
+- **1.1** — PVOS-facing daemon ops (`AddNode` / `Payload` via `pvfs-client`, `stat` parent) and security/error-code fixes (see [CHANGELOG.md](../CHANGELOG.md))
 
 Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
 
@@ -42,7 +48,13 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-The `pvfs` binary is at `target/release/pvfs`.
+Binaries land under `target/release/`:
+
+| Binary | Role |
+|--------|------|
+| `pvfs` | CLI |
+| `pvfsd` | Per-forest daemon |
+| `pvfs-companion` | Local key vault / signing agent |
 
 ### 4. Create a forest and try a few commands
 
@@ -236,7 +248,20 @@ signs high-authority operations for you — admitting or revoking devices and
 members, and your cross-machine identity (doc 14). Set it up once; no flags
 needed for normal use.
 
-### 1. Seal your phrase (one time)
+### macOS menu-bar app (optional)
+
+On a Mac you can use a native menu-bar app instead of the CLI:
+
+```bash
+./apps/macos-companion/build.sh
+open "dist/PVFS Companion.app"
+# optional installer image:
+./apps/macos-companion/package-dmg.sh   # → dist/PVFS-Companion-1.1.0.dmg
+```
+
+Setup (create/import recovery phrase), Keychain sealing, menu-bar agent, console (origins/audit), open-at-login. See [apps/macos-companion/README.md](../apps/macos-companion/README.md).
+
+### 1. Seal your phrase (one time, CLI)
 
 ```bash
 pvfs-companion init
@@ -267,6 +292,12 @@ same way as `pvfsd@` — see Option C).
 ### 3. Use it (no phrase, no flags)
 
 ```bash
+# New forest on this machine: if companion is running, confirm to reuse its
+# seed (no new phrase). Or force either path:
+#   pvfs forest init --via-companion
+#   pvfs forest init --new-phrase
+pvfs forest init --mount ~/media
+
 pvfs device authorize-identity      # your one identity across machines
 pvfs device authorize-member --via-companion --pubkey <hex>
 pvfs device revoke --via-companion --pubkey <hex>
@@ -274,6 +305,24 @@ pvfs tag add <member> <tag> --via-companion
 ```
 
 The `pvfs` CLI finds the running companion automatically.
+
+### 3b. Desktop companion as SSO for remote hosts
+
+The companion only listens on a **local** Unix socket. To use **this machine’s**
+companion when operating on a server (e.g. presubuntu), reverse-forward the
+socket over SSH from the desktop:
+
+```bash
+# companion running on the desktop, then:
+pvfs ssh chris@presubuntu
+# → remote shell with PVFS_COMPANION_SOCKET pointed at your desktop agent
+
+pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion
+# → forest on the server, root-signed by the desktop companion (approve on desktop)
+```
+
+Plain `ssh` into the server without this forward still only sees a companion
+**on the server**, not your desktop.
 
 ### 4. Check on it
 
@@ -354,6 +403,9 @@ pvfs-companion origins revoke <origin>     # disconnect one immediately
 
 ## Further reading
 
+- **Status & roadmap:** [08-roadmap-and-status.md](08-roadmap-and-status.md)
+- **User manual:** [USER-MANUAL.md](USER-MANUAL.md)
+- **Changelog / versions:** [CHANGELOG.md](../CHANGELOG.md) · [VERSIONING.md](../VERSIONING.md)
 - Design specs: [00](00-architecture-decisions.md) · [01](01-core-engine-design.md) · [02](02-p0-core-engine-spec.md) · [03](03-federation-trust-and-uris.md) · [04](04-p1-storage-and-fs-ops-spec.md)
 - Version scheme: [VERSIONING.md](../VERSIONING.md)
 - Ansible pipeline: [deploy/ansible/README.md](../deploy/ansible/README.md)

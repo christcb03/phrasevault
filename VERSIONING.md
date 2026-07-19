@@ -38,12 +38,12 @@ The **rightmost** component is always the PVFS major version required. Reading r
 
 | Layer | Format | Example |
 |---|---|---|
-| PVFS | `MAJOR.MINOR` | `0.1`, `1.0` |
+| PVFS | `MAJOR.MINOR` | `0.1`, `1.0`, `1.1` |
 | Sync / sharing server | `MAJOR.MINOR.<pvfs>` | `1.0.1` |
 | Media server app | `MAJOR.MINOR.<sync>.<pvfs>` | `1.0.1.1` |
 
 ## Current status
 
-- **PVFS: `1.0.0` — released (tagged `v1.0`, 2026-07-03).** P0–P2 (core, storage, mounts, multi-user daemon), P3 encryption-at-rest, key replacement/rotation (doc 15), and the companion app through phase 7 (joint agent API, doc 16). See [docs/INSTALL.md](docs/INSTALL.md) to build, [CHANGELOG.md](CHANGELOG.md) for the release notes.
-- **Next:** the sync/file-server layer (Layer 1) can now target PVFS major `1`; engine-side post-1.0 work (federation, compaction) is tracked in [docs/08-roadmap-and-status.md](docs/08-roadmap-and-status.md).
+- **PVFS: `1.1.0` — released (tagged `v1.1`, 2026-07-09).** Builds on `1.0.0` (tagged `v1.0`, 2026-07-03): P0–P2 (core, storage, mounts, multi-user daemon), P3 encryption-at-rest, key replacement/rotation (doc 15), and the companion through phase 7 (joint agent API, doc 16). **1.1** adds PVOS-driven daemon ops (`AddNode`/`Payload`, `stat` parent) plus revoked-key `key:` grant masking and typed `already_exists` — see [CHANGELOG.md](CHANGELOG.md). Build: [docs/INSTALL.md](docs/INSTALL.md).
+- **Next:** apps (notably PVOS) target PVFS major `1`; engine-side post-1.1 work (federation, compaction, polish) is tracked in [docs/08-roadmap-and-status.md](docs/08-roadmap-and-status.md). The sync/file-server layer (Layer 1) remains the next product layer above the engine.
 - The previous Python + TypeScript prototype is archived under `v0.0-concept/` and tagged `v0.0-concept`.

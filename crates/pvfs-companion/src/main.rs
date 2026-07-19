@@ -122,6 +122,10 @@ enum Cmd {
         #[arg(long, default_value = "identity")]
         role: String,
     },
+    /// Print a fresh 24-word recovery phrase (for GUI setup: create-new flow).
+    /// The phrase is not stored; the caller must seal it with `init` or show it
+    /// once for the user to write down.
+    PhraseNew,
 }
 
 #[derive(Subcommand)]
@@ -617,6 +621,11 @@ fn run() -> Result<(), String> {
                 TenantResponse::Error { code, message } => Err(format!("{code}: {message}")),
                 _ => Err("unexpected response".into()),
             }
+        }
+        Cmd::PhraseNew => {
+            let mn = pvfs_core::identity::generate_mnemonic().map_err(|e| e.to_string())?;
+            println!("{}", mn.to_string());
+            Ok(())
         }
     }
 }

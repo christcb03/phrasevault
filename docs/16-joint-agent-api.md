@@ -1,6 +1,6 @@
 # PVFS ⇄ PVOS — Joint Companion Agent API (16)
 
-Status: **Buildable spec** — the coordination doc for PVFS companion §7 (doc 14) and PVOS D7/D19 (PVOS docs 10 §5, 07 §3.5). Drafted 2026-07-02.
+Status: **PVFS side implemented** (phase 7 items 1, 2, 4 done in 1.0); **`pvos.sso` remains PVOS-repo work**. Coordination doc for PVFS companion §7 (doc 14) and PVOS D7/D19. Drafted 2026-07-02.
 Depends on: [14 (companion)](14-companion-app.md), [12 (secure blobs)](12-secure-node-type.md); PVOS [10 (companion requirements)](../../PVOS/docs/10-companion-requirements.md), [02 (delegation)](../../PVOS/docs/02-delegation-and-revocation.md), [04 (control socket)](../../PVOS/docs/04-control-socket-protocol.md), [07 §3.5 (`pvos.sso`)](../../PVOS/docs/07-built-in-services.md).
 Resolves: PVOS **D7** (one shared companion — coordinate the API) and **D19** (the SSSO context protocol).
 

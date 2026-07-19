@@ -1,6 +1,6 @@
 # PVFS — Core Engine (Kernel) Design (01)
 
-Status: **Draft for review — design only, no implementation yet**
+Status: **Implemented** (design reference; normative buildable spec is [doc 02](02-p0-core-engine-spec.md))
 Date: 2026-06-07
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md)
 Scope: Phase **P0**, the first thing we build — the core engine that everything else plugs into.

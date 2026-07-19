@@ -1,6 +1,6 @@
 # PVFS — the per-user daemon & client protocol (07)
 
-Status: **Decided** — implementation pending (`pvfsd` + `pvfs-client`); design locked 2026-06-16
+Status: **Implemented** (`pvfsd` + `pvfs-proto` + `pvfs-client`; PROTO_VERSION 2) — design locked 2026-06-16; live status in [doc 08](08-roadmap-and-status.md)
 Depends on: [06-access-control-and-daemon.md](06-access-control-and-daemon.md)
 
 Phase C of doc 06: how another user's process talks to a forest it doesn't own. All six open

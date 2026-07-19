@@ -1,8 +1,8 @@
 # PVFS — Architecture Decision Record (00)
 
-Status: **Draft for review**
+Status: **Accepted** (foundational ADR; engine 1.x implements the core direction — see [doc 08](08-roadmap-and-status.md))
 Date: 2026-06-06
-Scope: Foundational decisions and module boundaries for a from-scratch PVFS. This is intentionally lean — it locks direction before detailed per-module engineering specs are written. No implementation in this round.
+Scope: Foundational decisions and module boundaries for a from-scratch PVFS. Intentionally lean — locks direction. WASM modules, FUSE mounts, and federation wire protocols remain future work as noted in the body.
 
 ---
 

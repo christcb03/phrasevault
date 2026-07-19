@@ -7,4 +7,4 @@ This directory points at tooling for provisioning a **remote Linux test host**. 
 
 ## Legacy stack
 
-The v0.0 Docker prototype is under `v0.0-concept/`. It is archived and not part of the 0.1 Rust implementation.
+The v0.0 Docker prototype is under `v0.0-concept/`. It is archived and not part of the 1.x Rust implementation.

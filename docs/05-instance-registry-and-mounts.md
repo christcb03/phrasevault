@@ -1,6 +1,6 @@
 # PVFS — Instance registry, mounts, and operator URIs (05)
 
-Status: **Decided (operator UX)** — implementation follows P0 kernel; replaces `PVFS_DATA_DIR` as the primary CLI model
+Status: **Implemented** (P1.5; tests in `p15_mounts.rs`) — primary CLI model; `PVFS_DATA_DIR` remains a supported override
 Date: 2026-06-11
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 

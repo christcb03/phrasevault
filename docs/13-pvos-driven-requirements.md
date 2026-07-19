@@ -1,8 +1,8 @@
 # PVFS — Requirements Driven by PVOS (13)
 
-Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consolidated set of things PVFS must do for PVOS, now with a chosen direction for each. §G/P3 is tracked in doc 12; deferred *implementation* details are noted inline. Written from the PVOS side so the PVFS work has one clear target. Goal: **finish the PVFS layer before PVOS goes deeper.**
-Date: 2026-06-21
-Related: doc 03 (federation), doc 10 (per-key tags — done, P2-G), doc 11 (compaction), doc 12 (secure node — P3 proposal).
+Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consolidated set of things PVFS must do for PVOS. **P3 secure node shipped (1.0, doc 12)**; **1.1** delivered `AddNode`/`Payload` + revoked-key containment for PVOS M1. Remaining heavy lift is **P4 federation** (doc 03) and compaction (doc 11). Written from the PVOS side so the PVFS work has one clear target.
+Date: 2026-06-21 (status refreshed 2026-07-11)
+Related: doc 03 (federation — future), doc 10 (per-key tags — done, P2-G), doc 11 (compaction — future), doc 12 (secure node — shipped), doc 16 (joint agent API — PVFS side done).
 
 Most of what PVOS needs already exists (P0–P2-G). The PVFS-impacting work concentrates in **two big workstreams (P3 secure node, P4 federation)** plus **three smaller additions**. This doc enumerates every open question; §A is flagged as the **most impactful** (settle it first).
 

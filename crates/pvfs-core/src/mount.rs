@@ -112,25 +112,51 @@ pub fn init_forest(
     std::fs::create_dir_all(mount).map_err(|e| PvfsError::io("create mount", e))?;
     let mount = std::fs::canonicalize(mount).map_err(|e| PvfsError::io("canonicalize mount", e))?;
     let (mut engine, mnemonic) = Engine::init(&state_dir(&mount))?;
-    let report = if import {
-        let root = engine.identity.root_node_id.clone();
-        engine.bind_folder(
-            &root,
-            BindSpec {
-                source_uri: path_to_uri(&mount)?,
-                recursive: true,
-                auto_index: true,
-                extensions: String::new(),
-                hash_policy,
-            },
-        )?;
-        let mut reports = engine.scan(Some(&root))?;
-        reports.pop()
-    } else {
-        None
-    };
+    let report = finish_init_import(&mut engine, &mount, import, hash_policy)?;
     ensure_mount_owned_by_operator(&mount)?;
     Ok((engine, mnemonic, report))
+}
+
+/// Like [`init_forest`], but root-signs genesis with an external signer (e.g.
+/// a running companion that already holds the recovery seed). No new mnemonic.
+pub fn init_forest_with_root_signer(
+    mount: &Path,
+    import: bool,
+    hash_policy: HashPolicy,
+    root_pub: &[u8],
+    sign_root: impl FnMut(&[u8; 32]) -> Result<Vec<u8>>,
+) -> Result<(Engine, Option<ScanReport>)> {
+    mount_owner_credentials()?;
+    std::fs::create_dir_all(mount).map_err(|e| PvfsError::io("create mount", e))?;
+    let mount = std::fs::canonicalize(mount).map_err(|e| PvfsError::io("canonicalize mount", e))?;
+    let mut engine = Engine::init_with_root_signer(&state_dir(&mount), root_pub, sign_root)?;
+    let report = finish_init_import(&mut engine, &mount, import, hash_policy)?;
+    ensure_mount_owned_by_operator(&mount)?;
+    Ok((engine, report))
+}
+
+fn finish_init_import(
+    engine: &mut Engine,
+    mount: &Path,
+    import: bool,
+    hash_policy: HashPolicy,
+) -> Result<Option<ScanReport>> {
+    if !import {
+        return Ok(None);
+    }
+    let root = engine.identity.root_node_id.clone();
+    engine.bind_folder(
+        &root,
+        BindSpec {
+            source_uri: path_to_uri(mount)?,
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy,
+        },
+    )?;
+    let mut reports = engine.scan(Some(&root))?;
+    Ok(reports.pop())
 }
 
 /// UID/GID that should own a mount's `.pvfs/` tree: real user when invoked via

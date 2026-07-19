@@ -1,6 +1,6 @@
 # PVFS — Key replacement & rotation (15)
 
-Status: **§6 decisions resolved 2026-07-02**; §5 phases 1–3 (cases A + B) built; case C (root lineage) building next
+Status: **Implemented** (cases A/B/C shipped in 1.0; §6 decisions resolved 2026-07-02) — tests include `case_c_lineage.rs`
 Depends on: [01 (identity & derivation)](01-core-engine-design.md), [03 (federation trust)](03-federation-trust-and-uris.md), [10 (per-key tag authority)](10-per-key-tag-authority.md), [11 (compaction & snapshots)](11-compaction-and-verifiable-snapshots.md), [13 §B (multi-region logs)](13-pvos-driven-requirements.md), [14 (companion)](14-companion-app.md)
 Motivation: the companion makes a human's identity **one stable key everywhere** (doc 10 §9.1). The accepted cost is that a compromise of that key — or, worse, of the seed — cannot be contained by revoking one machine. This spec is the mitigation that makes the tradeoff acceptable: a clean, verifiable path to replace **any** key in the system, up to and including the root.
 

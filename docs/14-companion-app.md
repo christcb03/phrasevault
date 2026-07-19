@@ -1,6 +1,6 @@
 # PVFS — Companion app: key custodian & identity agent (14)
 
-Status: **Design** (committed to 1.0 scope, doc 08 §3) — drafted 2026-06-29
+Status: **Implemented** (phases 1–7 shipped in 1.0; joint API in doc 16) — design + build notes; drafted 2026-06-29. Touch ID unlock remains deferred polish.
 Depends on: [01 (identity)](01-core-engine-design.md), [06 (ACLs & daemon)](06-access-control-and-daemon.md), [07 (daemon protocol)](07-daemon-protocol.md), [09 §6 (the companion sketch)](09-tags-and-the-live-daemon.md), [10 §9.1 (identity = tag authority)](10-per-key-tag-authority.md), [12 (encryption at rest)](12-secure-node-type.md), [13 (PVOS superset API)](13-pvos-driven-requirements.md)
 Motivation: give the **root/identity key** a strong home (a hardware-wallet / `ssh-agent` posture) so root-strength authorization needs no typed phrase, a human's tag authority is stable across machines, and PVFS-backed apps can "Sign in with PVFS." Decisions in §0 are settled; the rest is the buildable design.
 

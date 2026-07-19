@@ -192,6 +192,40 @@ impl Engine {
     /// First-time setup (spec §6 init flow): generate mnemonic + keys, write
     /// the genesis events. Returns the mnemonic for ONE-TIME display.
     pub fn init(data_dir: &Path) -> Result<(Engine, Mnemonic)> {
+        let mnemonic = identity::generate_mnemonic()?;
+        let root_key = identity::root_key(&mnemonic, "")?;
+        let root_pub = crypto::pubkey_bytes(&root_key);
+        let device_key = identity::device_key(&mnemonic, "", 0)?;
+        let engine = Self::init_with_keys(data_dir, &root_pub, device_key, 0, |digest| {
+            crypto::sign_digest(&root_key, digest)
+        })?;
+        Ok((engine, mnemonic))
+    }
+
+    /// Create a forest whose **root key** is supplied externally (doc 14 genesis
+    /// via companion): `sign_root` produces root signatures for `ForestCreated`
+    /// and this machine's `DeviceAuthorized`. A fresh local **device key** is
+    /// generated (not the seed) and cached under `.pvfs/device.key`.
+    ///
+    /// Used when a running companion already holds the human's seed — no new
+    /// recovery phrase is created.
+    pub fn init_with_root_signer(
+        data_dir: &Path,
+        root_pub: &[u8],
+        mut sign_root: impl FnMut(&[u8; 32]) -> Result<Vec<u8>>,
+    ) -> Result<Engine> {
+        crypto::validate_pubkey(root_pub)?;
+        let device_key = identity::generate_device_key();
+        Self::init_with_keys(data_dir, root_pub, device_key, 0, |d| sign_root(d))
+    }
+
+    fn init_with_keys(
+        data_dir: &Path,
+        root_pub: &[u8],
+        device_key: identity::SigningKey,
+        device_index: u64,
+        mut sign_root: impl FnMut(&[u8; 32]) -> Result<Vec<u8>>,
+    ) -> Result<Engine> {
         std::fs::create_dir_all(data_dir).map_err(|e| PvfsError::io("create data dir", e))?;
         // Engine state is private to its creator: an unshared forest is reachable
         // only through the owner's own daemon (doc 06 §2). Cross-user sharing is
@@ -208,10 +242,7 @@ impl Engine {
                 id: data_dir.to_string_lossy().into_owned(),
             });
         }
-        let mnemonic = identity::generate_mnemonic()?;
-        let root_key = identity::root_key(&mnemonic, "")?;
-        let root_pub = crypto::pubkey_bytes(&root_key);
-        let device_key = identity::device_key(&mnemonic, "", 0)?;
+        let root_pub = root_pub.to_vec();
         let device_pub = crypto::pubkey_bytes(&device_key);
 
         let instance_id = std::env::var("PVFS_INSTANCE_ID").unwrap_or_else(|_| {
@@ -250,14 +281,19 @@ impl Engine {
             sig: crypto::sign_digest(&device_key, &root_digest)?,
         };
 
-        let fc_sig = crypto::sign_digest(
-            &root_key,
-            &event::msg_forest_created(&instance_id, &forest_id, &root_node.id, t, &root_pub),
-        )?;
-        let da_sig = crypto::sign_digest(
-            &root_key,
-            &event::msg_device_authorized(&device_pub, 0, t, &root_pub),
-        )?;
+        let fc_sig = sign_root(&event::msg_forest_created(
+            &instance_id,
+            &forest_id,
+            &root_node.id,
+            t,
+            &root_pub,
+        ))?;
+        let da_sig = sign_root(&event::msg_device_authorized(
+            &device_pub,
+            device_index,
+            t,
+            &root_pub,
+        ))?;
 
         let link_digest = link::compute_id_digest(None, &root_node.id, LINK_CONTAINS, 0);
         let root_link = Link {
@@ -286,7 +322,7 @@ impl Engine {
             },
             Event::DeviceAuthorized {
                 device_pubkey: device_pub.clone(),
-                device_index: 0,
+                device_index,
                 authorized_at: t,
                 author: root_pub.clone(),
                 sig: da_sig,
@@ -322,11 +358,11 @@ impl Engine {
 
         let device = DeviceKeyCache {
             signing_key: device_key,
-            device_index: 0,
+            device_index,
         };
         device.save(data_dir)?;
 
-        let engine = Engine {
+        Ok(Engine {
             conn,
             data_dir: data_dir.to_path_buf(),
             device,
@@ -337,8 +373,7 @@ impl Engine {
                 root_pubkey: root_pub,
             },
             closed: false,
-        };
-        Ok((engine, mnemonic))
+        })
     }
 
     /// Open an existing data dir using the cached device key (spec §9.3 runs

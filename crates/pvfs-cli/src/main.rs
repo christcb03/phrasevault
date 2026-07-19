@@ -195,6 +195,30 @@ enum Cmd {
         #[arg(long, default_value_t = 2000)]
         debounce_ms: u64,
     },
+    /// SSH to a host with this machine's companion socket reverse-forwarded
+    /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
+    /// actually your desktop agent — approvals appear on this machine.
+    ///
+    /// Examples:
+    ///   pvfs ssh chris@presubuntu
+    ///   pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion
+    Ssh {
+        /// SSH destination (`user@host` or an ssh config Host)
+        target: String,
+        /// Local companion socket (default: auto-detect running agent)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+        /// Path of the forwarded socket on the remote host (default: unique under /tmp)
+        #[arg(long)]
+        remote_socket: Option<PathBuf>,
+        /// Extra args passed to `ssh` before the destination (repeatable)
+        #[arg(long = "ssh-option", short = 'o')]
+        ssh_option: Vec<String>,
+        /// Remote command + args. If empty, opens an interactive login shell
+        /// with `PVFS_COMPANION_SOCKET` set. Use `--` before a remote `pvfs …`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        remote_cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,7 +230,11 @@ enum TreeCmd {
 #[derive(Subcommand)]
 enum ForestCmd {
     /// Create a forest at a mount directory (state in <mount>/.pvfs/);
-    /// imports the directory's existing tree unless --no-import
+    /// imports the directory's existing tree unless --no-import.
+    ///
+    /// If a local companion is running, you are asked whether to use its existing
+    /// root key (no new recovery phrase). Pass `--via-companion` to require that
+    /// path, or `--new-phrase` to always mint a fresh phrase.
     Init {
         /// Mount directory (default: current directory)
         #[arg(long)]
@@ -219,6 +247,15 @@ enum ForestCmd {
         alias: Option<String>,
         #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
         hash_policy: String,
+        /// Root-sign genesis with a running companion (existing seed; no new phrase)
+        #[arg(long)]
+        via_companion: bool,
+        /// Companion signer socket (with --via-companion; default: auto-detect)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+        /// Always create a new recovery phrase (ignore a running companion)
+        #[arg(long)]
+        new_phrase: bool,
     },
     /// Add an existing mount to this host's registry
     Register {
@@ -838,6 +875,69 @@ fn resolve_companion_socket(explicit: Option<PathBuf>) -> Result<PathBuf, PvfsEr
             p.display()
         ),
     })
+}
+
+/// Best-effort companion detection (socket present + answers `get_pubkey root`).
+///
+/// If `$PVFS_COMPANION_SOCKET` is set (desktop SSO / explicit env) but the agent
+/// is unreachable, returns `Err` so we never silently mint a new phrase.
+fn probe_companion(explicit: Option<PathBuf>) -> Result<Option<(PathBuf, Vec<u8>)>, PvfsError> {
+    let env_set = std::env::var_os("PVFS_COMPANION_SOCKET")
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let required = env_set || explicit.is_some();
+    let sock = if let Some(p) = explicit {
+        p
+    } else {
+        let p = pvfs_companion::default_socket_path();
+        if !p.exists() {
+            if env_set {
+                return Err(PvfsError::BadInput {
+                    field: "companion-socket".into(),
+                    reason: format!(
+                        "PVFS_COMPANION_SOCKET is set but {} does not exist — \
+                         is the desktop SSO SSH forward still up?",
+                        p.display()
+                    ),
+                });
+            }
+            return Ok(None);
+        }
+        p
+    };
+    match companion_pubkey(&sock, "root") {
+        Ok(pk) => Ok(Some((sock, pk))),
+        Err(e) => {
+            if required {
+                Err(PvfsError::BadInput {
+                    field: "companion".into(),
+                    reason: format!(
+                        "companion at {} did not answer ({e}) — start the desktop agent \
+                         and keep the SSO SSH session open",
+                        sock.display()
+                    ),
+                })
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Interactive: use companion identity for this forest? Default yes.
+fn confirm_use_companion(root_pub_hex: &str) -> Result<bool, PvfsError> {
+    use std::io::{self, Write};
+    eprint!(
+        "Local companion is running (root key {root_pub_hex}…).\n\
+         Use that identity for this forest (no new recovery phrase)? [Y/n] "
+    );
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| PvfsError::io("read confirm", e))?;
+    let t = line.trim().to_ascii_lowercase();
+    Ok(t.is_empty() || t == "y" || t == "yes")
 }
 
 /// The shared shape of a companion-signed admin op (doc 14 §3): open the engine,
@@ -2631,7 +2731,181 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             debounce_ms,
         } => serve(&ctx?, json, reconcile_secs, debounce_ms),
         Cmd::Forest(cmd) => forest_cmd(cmd, ctx, json),
+        Cmd::Ssh {
+            target,
+            companion_socket,
+            remote_socket,
+            ssh_option,
+            remote_cmd,
+        } => ssh_with_companion(target, companion_socket, remote_socket, ssh_option, remote_cmd),
     }
+}
+
+/// Desktop SSO: reverse-forward the local companion Unix socket over SSH so a
+/// remote `pvfs` uses this machine's agent for root/identity signing.
+fn ssh_with_companion(
+    target: String,
+    companion_socket: Option<PathBuf>,
+    remote_socket: Option<PathBuf>,
+    ssh_options: Vec<String>,
+    remote_cmd: Vec<String>,
+) -> Result<(), PvfsError> {
+    let local = resolve_companion_socket(companion_socket)?;
+    // Prove the agent answers before opening SSH.
+    let root = companion_pubkey(&local, "root")?;
+    let preview = hex::encode(&root[..root.len().min(8)]);
+
+    // Unique path by default so a second session (or a stale socket) does not
+    // hit "remote port forwarding failed for listen path …".
+    let remote_sock = match remote_socket {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => {
+            let mut b = [0u8; 4];
+            // cheap unique suffix without extra deps
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let n = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            b.copy_from_slice(&(n as u32).to_le_bytes());
+            format!("/tmp/pvfs-companion-fwd-{:02x}{:02x}{:02x}{:02x}.sock", b[0], b[1], b[2], b[3])
+        }
+    };
+    let forward = format!("{remote_sock}:{}", local.display());
+
+    let mut cmd = std::process::Command::new("ssh");
+    // Allocate a TTY for interactive shells so the remote prompt appears.
+    if remote_cmd.is_empty() {
+        cmd.arg("-t");
+    }
+    cmd.arg("-o").arg("ExitOnForwardFailure=yes");
+    cmd.arg("-o").arg("StreamLocalBindUnlink=yes");
+    for opt in &ssh_options {
+        cmd.arg("-o").arg(opt);
+    }
+    cmd.arg("-R").arg(&forward);
+    cmd.arg(&target);
+
+    if remote_cmd.is_empty() {
+        // Interactive shell with companion socket in the environment.
+        let shell = format!(
+            "export PVFS_COMPANION_SOCKET={sock}; \
+             trap 'rm -f -- \"$PVFS_COMPANION_SOCKET\" 2>/dev/null' EXIT; \
+             echo \"pvfs: companion SSO active (desktop root {preview}…) → $PVFS_COMPANION_SOCKET\"; \
+             exec \"${{SHELL:-/bin/bash}}\" -il",
+            sock = shell_single_quote(&remote_sock),
+            preview = preview,
+        );
+        cmd.arg(shell);
+    } else {
+        let mut parts = Vec::with_capacity(remote_cmd.len());
+        for a in &remote_cmd {
+            parts.push(shell_single_quote(a));
+        }
+        let remote = format!(
+            "export PVFS_COMPANION_SOCKET={sock}; exec {cmd}",
+            sock = shell_single_quote(&remote_sock),
+            cmd = parts.join(" "),
+        );
+        cmd.arg(remote);
+    }
+
+    let status = cmd.status().map_err(|e| PvfsError::io("ssh", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PvfsError::BadInput {
+            field: "ssh".into(),
+            reason: format!(
+                "ssh exited with status {} (companion was local {}; remote {})",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                local.display(),
+                remote_sock
+            ),
+        })
+    }
+}
+
+/// Single-quote a string for safe embedding in a remote shell command.
+fn shell_single_quote(s: &str) -> String {
+    // 'foo'bar' → 'foo'"'"'bar'
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn print_forest_created(
+    engine: &Engine,
+    mount: &std::path::Path,
+    alias: Option<&str>,
+    report: Option<&pvfs_core::ScanReport>,
+    mnemonic: Option<String>,
+    json: bool,
+) -> Result<(), PvfsError> {
+    if json {
+        let mnemonic_json = match &mnemonic {
+            Some(m) => format!("\"{}\"", json_escape(m)),
+            None => "null".into(),
+        };
+        println!(
+            "{{\"mount\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"root_pubkey\":\"{}\",\"imported\":{},\"registered\":false,\"suggested_alias\":{},\"mnemonic\":{},\"via_companion\":{}}}",
+            json_escape(&mount.to_string_lossy()),
+            json_escape(&engine.identity.instance_id),
+            json_escape(&engine.identity.forest_id),
+            json_escape(&engine.identity.root_node_id),
+            hex::encode(&engine.identity.root_pubkey),
+            report.is_some(),
+            alias
+                .map(|a| format!("\"{}\"", json_escape(a)))
+                .unwrap_or_else(|| "null".into()),
+            mnemonic_json,
+            mnemonic.is_none(),
+        );
+    } else {
+        println!("Forest created at {}", mount.display());
+        println!("  instance_id : {}", engine.identity.instance_id);
+        println!("  forest_id   : {}", engine.identity.forest_id);
+        println!("  root node   : {}", engine.identity.root_node_id);
+        println!(
+            "  root key    : {}",
+            hex::encode(&engine.identity.root_pubkey)
+        );
+        if let Some(r) = report {
+            println!(
+                "  imported    : {} file(s) from the mount tree",
+                r.stats.added
+            );
+            if r.stats.unreadable > 0 {
+                println!(
+                    "  skipped     : {} path(s) you cannot read (not imported)",
+                    r.stats.unreadable
+                );
+            }
+        }
+        println!("  portable    : register for system-wide listing:");
+        if let Some(a) = alias {
+            println!(
+                "    sudo pvfs forest register {} --alias {}",
+                mount.display(),
+                a
+            );
+        } else {
+            println!("    sudo pvfs forest register {}", mount.display());
+        }
+        println!();
+        if let Some(mnemonic) = mnemonic {
+            println!("RECOVERY PHRASE — write this down now; it is shown ONCE and never stored:");
+            println!();
+            println!("  {mnemonic}");
+            println!();
+        } else {
+            println!("Root identity: companion (existing seed; no new recovery phrase).");
+            println!("This machine's device key is stored under .pvfs/device.key.");
+            println!();
+        }
+    }
+    Ok(())
 }
 
 fn forest_cmd(
@@ -2645,7 +2919,16 @@ fn forest_cmd(
             no_import,
             alias,
             hash_policy,
+            via_companion,
+            companion_socket,
+            new_phrase,
         } => {
+            if via_companion && new_phrase {
+                return Err(PvfsError::BadInput {
+                    field: "forest init".into(),
+                    reason: "pass only one of --via-companion or --new-phrase".into(),
+                });
+            }
             mount::mount_owner_credentials()?; // fail before creating state as raw root
             let target = match mount_arg {
                 Some(m) => m,
@@ -2654,58 +2937,93 @@ fn forest_cmd(
             if let Some(a) = &alias {
                 Registry::validate_alias(a)?;
             }
-            let (engine, mnemonic, report) =
-                mount::init_forest(&target, !no_import, HashPolicy::parse(&hash_policy)?)?;
-            let mount = std::fs::canonicalize(&target)
-                .map_err(|e| PvfsError::io("canonicalize mount", e))?;
-            if json {
-                println!(
-                    "{{\"mount\":\"{}\",\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"imported\":{},\"registered\":false,\"suggested_alias\":{},\"mnemonic\":\"{}\"}}",
-                    json_escape(&mount.to_string_lossy()),
-                    json_escape(&engine.identity.instance_id),
-                    json_escape(&engine.identity.forest_id),
-                    json_escape(&engine.identity.root_node_id),
-                    report.is_some(),
-                    alias
-                        .as_ref()
-                        .map(|a| format!("\"{}\"", json_escape(a)))
-                        .unwrap_or_else(|| "null".into()),
-                    json_escape(&mnemonic.to_string()),
-                );
-            } else {
-                println!("Forest created at {}", mount.display());
-                println!("  instance_id : {}", engine.identity.instance_id);
-                println!("  forest_id   : {}", engine.identity.forest_id);
-                println!("  root node   : {}", engine.identity.root_node_id);
-                if let Some(r) = &report {
-                    println!(
-                        "  imported    : {} file(s) from the mount tree",
-                        r.stats.added
-                    );
-                    if r.stats.unreadable > 0 {
-                        println!(
-                            "  skipped     : {} path(s) you cannot read (not imported)",
-                            r.stats.unreadable
-                        );
+            let policy = HashPolicy::parse(&hash_policy)?;
+            let import = !no_import;
+
+            // Prefer an existing companion identity when available (doc 14 genesis).
+            // Desktop SSO exports PVFS_COMPANION_SOCKET — never ignore it silently.
+            let env_sso = std::env::var_os("PVFS_COMPANION_SOCKET")
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let probed = probe_companion(companion_socket.clone())?;
+            let use_companion = if new_phrase {
+                false
+            } else if via_companion {
+                if probed.is_none() {
+                    return Err(PvfsError::BadInput {
+                        field: "companion".into(),
+                        reason: "no companion running — start the agent (desktop SSO: keep \
+                                 the SSH forward session open)"
+                            .into(),
+                    });
+                }
+                true
+            } else if let Some((ref sock, ref root_pub)) = probed {
+                let preview = hex::encode(&root_pub[..root_pub.len().min(8)]);
+                if json {
+                    return Err(PvfsError::BadInput {
+                        field: "forest init".into(),
+                        reason: format!(
+                            "companion is running at {} (root {preview}…) — pass \
+                             --via-companion to use it, or --new-phrase for a fresh seed \
+                             (required with --json)",
+                            sock.display()
+                        ),
+                    });
+                }
+                // Confirm for both local agent and desktop-SSO forwarded socket.
+                if !confirm_use_companion(&preview)? {
+                    if env_sso {
+                        return Err(PvfsError::BadInput {
+                            field: "forest init".into(),
+                            reason: "declined companion identity — pass --new-phrase for a \
+                                     separate seed, or re-run and accept"
+                                .into(),
+                        });
                     }
-                }
-                println!("  portable    : register for system-wide listing:");
-                if let Some(a) = &alias {
-                    println!(
-                        "    sudo pvfs forest register {} --alias {}",
-                        mount.display(),
-                        a
-                    );
+                    false
                 } else {
-                    println!("    sudo pvfs forest register {}", mount.display());
+                    true
                 }
-                println!();
-                println!("RECOVERY PHRASE — write this down now; it is shown ONCE and never stored:");
-                println!();
-                println!("  {mnemonic}");
-                println!();
+            } else {
+                false
+            };
+
+            if use_companion {
+                let sock = resolve_companion_socket(companion_socket)?;
+                let root_pub = companion_pubkey(&sock, "root")?;
+                let (engine, report) = mount::init_forest_with_root_signer(
+                    &target,
+                    import,
+                    policy,
+                    &root_pub,
+                    |digest| companion_sign(&sock, "root_device_cert", digest),
+                )?;
+                let mount = std::fs::canonicalize(&target)
+                    .map_err(|e| PvfsError::io("canonicalize mount", e))?;
+                print_forest_created(
+                    &engine,
+                    &mount,
+                    alias.as_deref(),
+                    report.as_ref(),
+                    None,
+                    json,
+                )?;
+                engine.close()
+            } else {
+                let (engine, mnemonic, report) = mount::init_forest(&target, import, policy)?;
+                let mount = std::fs::canonicalize(&target)
+                    .map_err(|e| PvfsError::io("canonicalize mount", e))?;
+                print_forest_created(
+                    &engine,
+                    &mount,
+                    alias.as_deref(),
+                    report.as_ref(),
+                    Some(mnemonic.to_string()),
+                    json,
+                )?;
+                engine.close()
             }
-            engine.close()
         }
         ForestCmd::Register { mount: m, alias } => {
             if let Some(a) = &alias {

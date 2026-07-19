@@ -58,6 +58,14 @@ pub fn root_key(mnemonic: &Mnemonic, bip39_passphrase: &str) -> Result<SigningKe
     )
 }
 
+/// Fresh random device signing key (not seed-derived). Used when genesis is
+/// root-signed by an external companion: the machine gets its own key and a
+/// root-signed `DeviceAuthorized` cert, without exposing the recovery phrase.
+pub fn generate_device_key() -> SigningKey {
+    use rand::rngs::OsRng;
+    SigningKey::random(&mut OsRng)
+}
+
 /// Device signing key `n` — the everyday author on one machine.
 pub fn device_key(mnemonic: &Mnemonic, bip39_passphrase: &str, index: u64) -> Result<SigningKey> {
     if index >= 0x8000_0000 {

@@ -1,9 +1,9 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-07-03.
+Status: **Living document** — update as phases land. Last updated 2026-07-11.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
-docs 02–09; this is the index + the honest "what's not done yet."
+docs 02–16; this is the index + the honest "what's not done yet."
 
 ---
 
@@ -23,15 +23,17 @@ docs 02–09; this is the index + the honest "what's not done yet."
 | **P2-E (3d)** | CLI **auto-routes** plain `acl`/`tag`/`device` mutations to a running daemon (path/URI args too); direct-engine fallback | ✅ shipped (doc 09 §3d) |
 | **P2-F data plane** | **Raw binary byte stream** for `cat` (PROTO_VERSION 2), lock released before I/O → concurrent transfers; daemon lifecycle (SocketGuard + `pvfsd@.service`) | ✅ shipped (doc 07 §6) |
 | **P2-G per-key tags** | Multi-tenant tags: tag identity = `(authority, name)`, relaxed `MemberTagged` auth, scoped matching, authority-liveness masking — lets one forest host many apps' tag namespaces | ✅ shipped (doc 10) |
-| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ◑ **nearly done** ([doc 14](14-companion-app.md)): vault ✅, signer + policy ✅, Unix-socket agent ✅, CLI wiring ✅, multi-tenant custody ✅ (§13), OS keychain sealing ✅, approval UI + controls ✅ (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent ✅ (per-launch token, origin connect/revoke, sign-in); §7 joint PVOS API ✅ **spec + PVFS build** ([doc 16](16-joint-agent-api.md) §7: approval context + `user_action`, `pvfsd` challenge consumer, `api_version`) — **✅ complete**; Touch ID gate deferred to 1.1 |
-| **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`, read-only report) ☐. No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ◑ partial (doc 08 §4 items 13–14) |
+| **Companion** | Root/identity key vault + local signer + localhost identity agent ("Sign in with PVFS") | ✅ **shipped** ([doc 14](14-companion-app.md) phases 1–7 + [doc 16](16-joint-agent-api.md)): vault, signer + policy, Unix-socket agent, CLI wiring, multi-tenant custody, OS keychain sealing, approval UI (prompts, rate limit, audit, lock/idle re-unlock), loopback identity agent, joint API (`ApprovalContext`, `user_action`, `api_version`, live `pvfsd` sign-in test). Touch ID / biometric unlock remains deferred (polish) |
+| **Key replacement** | Identity swap, member handoff, root rotation + offline recovery key | ✅ **shipped** (doc 15 cases A/B/C) |
+| **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`) ✅; revoked-device direct `key:` grants masked at access time ✅ (1.1). No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ✅ shipped (follow-on: audit also flagging `key:`→revoked devices) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
+| **1.1 (PVOS M1)** | Daemon `AddNode`/`Payload` (log-resident typed records), `stat` exposes home `parent`, typed `already_exists`, revoked-key `key:` ACL masking | ✅ **shipped** (tagged `v1.1`, 2026-07-09) — see [CHANGELOG](../CHANGELOG.md) |
 | **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
 
 ---
 
-## 2. What works end-to-end today (76 Rust tests + smoke suite, clippy-clean, CI-green on `main`)
+## 2. What works end-to-end today (~151 Rust tests + smoke suite, clippy-clean, CI-green on `main`)
 
 - **Forests & ownership:** `forest init` (owner-owned `.pvfs/` at `0700`, raw-root refused), import a
   tree (skipping unreadable files), `sudo forest register` for host-wide listing, ownership repair.
@@ -61,6 +63,12 @@ docs 02–09; this is the index + the honest "what's not done yet."
   at next bind; `pvfsd@.service` is a systemd `--user` unit template for per-forest installs.
 - **Replay hardening:** the one-active-`contains`-home-per-node invariant is now enforced at replay
   (not just the live API), so a crafted/corrupt log can't give a node two homes.
+- **Secure blobs (P3):** create/put/cat encrypted stores over the CLI and daemon; companion-gated
+  unwrap — server alone holds inert ciphertext.
+- **Companion:** local vault + signer + "Sign in with PVFS" loopback agent; end-to-end against live
+  `pvfsd` (doc 16).
+- **1.1 PVOS surface:** `AddNode`/`Payload` (log-resident typed records via `pvfs-client`), `stat`
+  home parent, typed `already_exists`, revoked-key `key:` grant masking.
 
 The recovery phrase is **recovery-only**; everyday admin is signed by the owner's device.
 
@@ -99,29 +107,32 @@ commit; validated on the Linux host via the Ansible pipeline.
 **Gate 4 — release packaging: ✅ DONE.** `CHANGELOG.md` (the 0.1 → 1.0 narrative), workspace
 version `1.0.0`, README + `VERSIONING.md` flipped, **tagged `v1.0` (2026-07-03)**.
 
-**→ 1.0 SHIPPED.** This checklist is closed; post-1.0 work continues in §4 and the P4/compaction
-tracks (docs 03, 11).
+**→ 1.0 SHIPPED.** This checklist is closed.
 
-**Cut to 1.1 (decided 2026-07-03):**
+### 3.1 — 1.1 SHIPPED (2026-07-09)
 
-- **Touch ID / biometric unlock gate** (doc 14 phases 4–5 deferral) — the keychain seal already
-  covers at-rest; biometrics are UX polish.
-- **Read-pool metadata concurrency** (§4 item 2) — data plane is off-lock; fine at
-  personal/small-team scale.
-- **Path/URI resolver in `remote` subcommands** (§4 item 6 remainder) — plain commands auto-route,
-  so `remote` is already the escape hatch, not the main path.
-- **`key:`-grants-to-revoked-devices audit** (§4 item 14 follow-on).
-- **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — driven by PVOS D18 needs.
+Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fixes:
 
-**Post-1.0 (unchanged):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
-both now also carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins
-genesis + lineage) — single-use challenge nonce (matters only when the socket is network-proxied),
-arbitrary named groups / explicit deny, and the cross-OS-user / two-host end-to-end (needs a second
-account/host in the inventory; federation track).
+| Item | State |
+|------|--------|
+| **`AddNode` / `Payload` daemon ops** (doc 13 grants / log-resident typed records) | ✅ `pvfs-proto` + `pvfsd` + `pvfs-client` (`add_node` / `payload`); reserved types keep dedicated ops |
+| **`stat` exposes home `parent`** (additive `NodeInfo.parent`) | ✅ |
+| **Typed `already_exists`** (not `internal`) | ✅ daemon + `pvfs remote` exit mapping |
+| **Revoked keys: mask direct `key:` ACL grants** on the read path | ✅ regression in `p2_access.rs` |
 
-**Scope decisions (DECIDED 2026-06-29, delivered):** companion app (doc 14 phases 1–6 + 3.5 built),
-encryption-at-rest (P3, doc 12 phases 1–5 built), and key replacement (doc 15 cases A/B/C built)
-are all **in 1.0** and all landed; only Gate 1 above remains as code.
+**Still polish / post-1.1 (not in the 1.1 tag):**
+
+- **Touch ID / biometric unlock gate** (doc 14) — keychain seal covers at-rest; biometrics are UX.
+- **Read-pool metadata concurrency** (§4 item 2) — data plane is off-lock; fine at personal/small-team scale.
+- **Path/URI resolver in `remote` subcommands** (§4 item 6 remainder).
+- **CLI `remote add-node` / `payload` wrappers** — library API exists; thin CLI surface optional for operators.
+- **`key:`-grants-to-revoked-devices in `pvfs audit`** (§4 item 14 follow-on; masking already correct).
+- **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — driven by PVOS D18.
+
+**Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
+both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
+lineage) — single-use challenge nonce (when the socket is network-proxied), arbitrary named groups /
+explicit deny, and cross-OS-user / two-host end-to-end (needs a second account/host; federation track).
 
 ---
 
@@ -287,7 +298,8 @@ and encryption-at-rest (P3) are both committed to 1.0.
 | `pvfs-proto` | daemon/client wire protocol (JSON frames, challenge digest, message types) | pvfs-core |
 | `pvfsd` | per-user daemon — socket, challenge-response auth, ACL-enforced read/write/admin serving | pvfs-core, pvfs-proto |
 | `pvfs-client` | client library — connect, handshake, read/write/admin requests | pvfs-core, pvfs-proto |
-| `pvfs-cli` | the `pvfs` CLI (forest/tree/acl/tag/device admin + `whoami`/`remote`) | pvfs-core, pvfs-client |
+| `pvfs-cli` | the `pvfs` CLI (forest/tree/acl/tag/device admin + `whoami`/`remote`) | pvfs-core, pvfs-client, pvfs-companion |
+| `pvfs-companion` | key vault + tiered signer + loopback identity agent (`pvfs-companion` binary) | pvfs-core |
 
 Build/test via the Ansible pipeline to a Linux host (`deploy/ansible/`); CI mirrors it on GitHub.
-See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); design: docs 06, 07, 09.
+See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); status: this doc; design: docs 02–16.

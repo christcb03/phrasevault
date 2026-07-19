@@ -52,8 +52,8 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [06–10](docs/06-access-control-and-daemon.md) | Access control & daemon, daemon protocol, tags & live daemon, per-key tag authority (P2, implemented) |
 | [**08-roadmap-and-status.md**](docs/08-roadmap-and-status.md) | **What's built, what's next, open concerns** — the honest status index |
 | [**USER-MANUAL.md**](docs/USER-MANUAL.md) | End-user guide: sharing, ACLs, tags, recovery, command reference |
-| [11–13](docs/11-compaction-and-verifiable-snapshots.md) | Compaction, secure (encrypted) node type, PVOS-driven requirements (specified) |
-| [14-companion-app.md](docs/14-companion-app.md) | Companion app — key vault, local signer, "Sign in with PVFS" (design, 1.0) |
+| [11–13](docs/11-compaction-and-verifiable-snapshots.md) | Compaction (future), secure node type (shipped), PVOS-driven requirements |
+| [14-companion-app.md](docs/14-companion-app.md) | Companion app — key vault, local signer, "Sign in with PVFS" (implemented, phases 1–7) |
 
 ## Core ideas
 

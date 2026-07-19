@@ -10,10 +10,12 @@ DATA="$(mktemp -d /tmp/pvfs-smoke.XXXXXX)"
 export PVFS_DATA_DIR="$DATA/forest"
 export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
 export XDG_CONFIG_HOME="$DATA/config"       # keep the client identity out of $HOME
+export XDG_RUNTIME_DIR="$DATA/runtime"      # isolate companion auto-detect from a host agent
+unset PVFS_COMPANION_SOCKET                 # never inherit a desktop-SSO forward
 export PVFS_SOCKET_DIR="$DATA/sockets"      # per-forest daemon sockets (doc 09 §3b)
 # Pre-create the socket dir so pvfsd exercises its "dir already exists → don't
 # chmod" path (the /run/pvfs systemd/tmpfiles case), not just first-use creation.
-mkdir -p "$PVFS_SOCKET_DIR"
+mkdir -p "$PVFS_SOCKET_DIR" "$XDG_RUNTIME_DIR"
 PASS=0
 FAIL=0
 DPID=""
@@ -427,6 +429,46 @@ PVFS_COMPANION_PASSPHRASE=testpass "$COMPANION" serve --vault "$CVAULT" --socket
 CPID=$!
 for _ in $(seq 1 50); do [ -S "$CSOCK" ] && break; sleep 0.1; done
 [ -S "$CSOCK" ] && ok "companion serving" || fail "companion socket missing"
+
+# --- forest genesis via companion (desktop-SSO shape: env socket, no new phrase) ---
+say "companion: forest init reuses companion root (no new phrase)"
+G2="$DATA/genesis-via-companion"; mkdir -p "$G2"
+# --json never auto-picks the companion (must be explicit).
+assert_rc 2 "forest init --json + companion env requires --via-companion or --new-phrase" -- \
+  env PVFS_COMPANION_SOCKET="$CSOCK" $PVFS --json forest init --mount "$G2" --no-import
+# Dead env must not silently mint a phrase.
+assert_rc 2 "forest init errors when PVFS_COMPANION_SOCKET points at nothing" -- \
+  env PVFS_COMPANION_SOCKET="$DATA/missing-companion.sock" \
+  $PVFS --json forest init --mount "$DATA/dead-env-mount" --no-import --via-companion
+G2JSON="$(env PVFS_COMPANION_SOCKET="$CSOCK" $PVFS --json forest init \
+  --mount "$G2" --no-import --via-companion)"
+[ "$(jget "$G2JSON" via_companion)" = "True" ] || [ "$(jget "$G2JSON" via_companion)" = "true" ] \
+  && ok "forest init --via-companion sets via_companion" || fail "via_companion: $G2JSON"
+# Python json true → jget may print True depending on extractor — handle both.
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("mnemonic") is None; assert d.get("via_companion") is True' "$G2JSON" \
+  && ok "forest init via companion mints no mnemonic" || fail "mnemonic leaked: $G2JSON"
+G2ROOT="$(jget "$G2JSON" root_pubkey)"
+[ ${#G2ROOT} -eq 66 ] && ok "companion-rooted forest has root pubkey" || fail "root_pubkey: $G2ROOT"
+# A second forest through the same companion shares the root identity.
+G3="$DATA/genesis-via-companion-2"; mkdir -p "$G3"
+G3JSON="$($PVFS --json forest init --mount "$G3" --no-import --via-companion --companion-socket "$CSOCK")"
+python3 -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); assert a["root_pubkey"]==b["root_pubkey"]; assert a["forest_id"]!=b["forest_id"]' \
+  "$G2JSON" "$G3JSON" \
+  && ok "two companion forests share root, distinct forest_id" || fail "shared root: $G2JSON / $G3JSON"
+# --new-phrase ignores the running companion and mints a separate seed.
+G4="$DATA/genesis-new-phrase"; mkdir -p "$G4"
+G4JSON="$(env PVFS_COMPANION_SOCKET="$CSOCK" $PVFS --json forest init \
+  --mount "$G4" --no-import --new-phrase)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("via_companion") is False; assert d.get("mnemonic") and len(d["mnemonic"].split())==24' "$G4JSON" \
+  && ok "forest init --new-phrase ignores companion" || fail "new-phrase: $G4JSON"
+python3 -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); assert a["root_pubkey"]!=b["root_pubkey"]' \
+  "$G2JSON" "$G4JSON" \
+  && ok "--new-phrase forest has a different root" || fail "new-phrase root collision"
+# Forest is usable after companion genesis (device key cached under .pvfs/).
+$PVFS --data-dir "$G2/.pvfs" info >/dev/null && ok "companion-rooted forest reopens" || fail "reopen G2"
+G2FOLDER="$($PVFS --data-dir "$G2/.pvfs" add "$(jget "$G2JSON" root_node_id)" --kind folder --label docs)"
+[ ${#G2FOLDER} -eq 64 ] && ok "write works on companion-rooted forest" || fail "add on G2: $G2FOLDER"
+
 # Admit a member with NO phrase typed — the companion root-signs the DeviceAuthorized.
 CMEMBER="$(jget "$($PVFS --json whoami)" pubkey)"
 $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$CMEMBER" >/dev/null \

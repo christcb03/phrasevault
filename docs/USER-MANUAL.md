@@ -3,8 +3,8 @@
 PhraseVault File System — a content-addressed, cryptographically-signed file system you own.
 This manual covers everyday use of the `pvfs` command-line tool and sharing forests between users.
 
-> Status: covers the features available today (forest management, import, access control, and
-> read-only daemon sharing). Features still in progress are listed under [Roadmap](#10-roadmap).
+> Status: covers features available in **PVFS 1.1** (forests, ACLs/tags, full daemon read/write/admin,
+> secure blobs, companion, key replacement). Post-1.1 work is under [Roadmap](#11-roadmap).
 
 ---
 
@@ -17,7 +17,7 @@ append-only, signed event log. Unlike a normal directory:
 - Files are **content-addressed** (identified by a BLAKE3 hash), so identical content is recognized
   anywhere.
 - A forest can be **registered** on a host so apps and other users can find it, **shared** with
-  fine-grained per-folder permissions, and (soon) accessed over a network.
+  fine-grained per-folder permissions, and (later) accessed over a network via federation.
 
 Your real files stay where they are on disk; PVFS *indexes and binds* them into the forest.
 
@@ -356,6 +356,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --socket <path> add-location <file> <uri>` | Record where a file's bytes live. |
 | `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
+| *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
 mount to set the forest context for tree commands.
@@ -382,8 +383,15 @@ loopback "Sign in with PVFS" agent for web apps. And **encryption at rest** (sec
 built: encrypted opaque storage with a content-free signed ledger, companion-gated decryption, and
 create/read/update over the running daemon.
 
+**1.1 (library / daemon):** apps can create small log-resident typed nodes via `AddNode` and read
+them with `Payload` over `pvfs-client` (used by PVOS for grant records); `stat` reports a node's home
+parent. Operator CLI wrappers for those ops are optional polish — the smoke/integration tests and
+client library cover the wire path.
+
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
+- **Polish** — Touch ID unlock, metadata read concurrency, richer `remote` path resolvers / CLI
+  surfaces for `AddNode`.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
-  and speed up rebuilds (signed by you; trades away old history).
+  and speed up rebuilds (signed by you; old history sealed for audit).
 - **Federation / network sharing** — reach and sync forests across hosts.
