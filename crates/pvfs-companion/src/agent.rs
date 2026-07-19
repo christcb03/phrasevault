@@ -44,6 +44,8 @@ pub struct Agent {
     last_used: Mutex<Instant>,
     rate: Mutex<Vec<Instant>>,
     rate_per_min: u32,
+    /// Paired servers (PVOS M3.1). `None` = pairing ops refused.
+    pairings: Option<crate::pairings::PairingRegistry>,
 }
 
 impl Agent {
@@ -61,7 +63,14 @@ impl Agent {
             last_used: Mutex::new(Instant::now()),
             rate: Mutex::new(Vec::new()),
             rate_per_min: DEFAULT_RATE_PER_MIN,
+            pairings: None,
         }
+    }
+
+    /// Enable server pairing (PVOS M3.1): where enrolled pairings persist.
+    pub fn with_pairings(mut self, registry: crate::pairings::PairingRegistry) -> Agent {
+        self.pairings = Some(registry);
+        self
     }
 
     /// How a [`Decision::Prompt`] reaches a human (doc 14 §9 phase 5).
@@ -232,6 +241,148 @@ impl Agent {
     }
 
     /// The identity public key (for a connected origin's `/identity`).
+    /// Enroll a paired server (PVOS M3.1). Socket-only (0600-trusted caller);
+    /// human-prompted with name + key + origins; answers with the identity
+    /// pubkey the server stores for verifying relayed answers.
+    fn pair(&self, name: &str, server_pubkey: &str, origins: Vec<String>) -> AgentResponse {
+        let Some(reg) = &self.pairings else {
+            return AgentResponse::error("unsupported", "pairing not enabled");
+        };
+        if name.is_empty() || origins.is_empty() {
+            return AgentResponse::error("bad_input", "pairing needs a name and origins");
+        }
+        let Ok(pk) = hex::decode(server_pubkey) else {
+            return AgentResponse::error("bad_input", "server_pubkey not hex");
+        };
+        if pvfs_core::crypto::validate_pubkey(&pk).is_err() {
+            return AgentResponse::error("bad_input", "server_pubkey invalid");
+        }
+        if !self.prompter.approve_pair(name, server_pubkey, &origins) {
+            if let Some(a) = &self.audit {
+                a.event("pair_denied");
+            }
+            return AgentResponse::error("denied", "pairing not approved");
+        }
+        if let Err(e) = reg.add(name, server_pubkey, origins) {
+            return AgentResponse::error("io", e.to_string());
+        }
+        if let Some(a) = &self.audit {
+            a.event("paired");
+        }
+        match self.identity_pubkey() {
+            AgentResponse::Pubkey { pubkey } => AgentResponse::Paired {
+                identity_pubkey: pubkey,
+            },
+            other => other,
+        }
+    }
+
+    /// A browser-relayed signing request from a paired server (M3.1 §3.2/3.3).
+    /// `request_origin` is the relaying page's browser-enforced Origin header.
+    /// Verification order: pairing exists (by claimed key) → Origin bound to
+    /// that pairing → envelope signature over `domain_digest(RELAY_DOMAIN,
+    /// payload_json)` → inner digest/context agreement → rate limit → prompt
+    /// (server name + origin + 6-digit code + context) → sign.
+    pub fn relay(
+        &self,
+        request_origin: &str,
+        payload_json: &str,
+        server_sig_hex: &str,
+    ) -> AgentResponse {
+        use crate::proto::{verify_code, RelayPayload, RELAY_DOMAIN};
+
+        let Some(reg) = &self.pairings else {
+            return AgentResponse::error("unsupported", "pairing not enabled");
+        };
+        let Ok(payload) = serde_json::from_str::<RelayPayload>(payload_json) else {
+            return AgentResponse::error("bad_input", "malformed relay payload");
+        };
+        let Some(pairing) = reg.find_by_pubkey(&payload.server_pubkey) else {
+            return AgentResponse::error("unpaired", "no pairing for that server key");
+        };
+        if !pairing.origins.iter().any(|o| o == request_origin) {
+            return AgentResponse::error("bad_origin", "origin not bound to this pairing");
+        }
+        let (Ok(pk), Ok(sig)) = (hex::decode(&payload.server_pubkey), hex::decode(server_sig_hex))
+        else {
+            return AgentResponse::error("bad_input", "sig not hex");
+        };
+        let relay_digest = pvfs_core::crypto::domain_digest(RELAY_DOMAIN, payload_json.as_bytes());
+        if pvfs_core::crypto::verify_digest(&pk, &relay_digest, &sig).is_err() {
+            return AgentResponse::error("bad_sig", "envelope signature does not verify");
+        }
+        let Ok(bytes) = hex::decode(&payload.digest) else {
+            return AgentResponse::error("bad_input", "digest not hex");
+        };
+        let Ok(digest32) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+            return AgentResponse::error("bad_input", "digest must be 32 bytes");
+        };
+        let code = verify_code(&digest32);
+
+        let (rt, rt_name, context) = match payload.kind.as_str() {
+            "sign_in" => {
+                let ctx = crate::proto::ApprovalContext {
+                    app_id: pairing.name.clone(),
+                    action: "sign_in".into(),
+                    summary: format!(
+                        "Sign in to \"{}\" from {request_origin} — code {code}",
+                        pairing.name
+                    ),
+                    resource: None,
+                    digest_hex: Some(payload.digest.clone()),
+                };
+                (RequestType::IdentityAssertion, "identity_assertion", ctx)
+            }
+            "user_action" => {
+                let Some(mut ctx) = payload.context.clone() else {
+                    return AgentResponse::error("bad_input", "user_action needs a context");
+                };
+                // doc 16 §3.2 unchanged: context digest must equal the digest.
+                if ctx.digest_hex.as_deref() != Some(payload.digest.as_str()) {
+                    return AgentResponse::error(
+                        "bad_input",
+                        "context digest_hex does not match the digest being signed",
+                    );
+                }
+                ctx.summary = format!(
+                    "{} — via \"{}\" from {request_origin}, code {code}",
+                    ctx.summary, pairing.name
+                );
+                (RequestType::UserAction, "user_action", ctx)
+            }
+            _ => return AgentResponse::error("bad_input", "unknown relay kind"),
+        };
+
+        if self.rate_limited() {
+            self.audit_sign(rt_name, Origin::Web, "rate_limited", &payload.digest, Some(&context));
+            return AgentResponse::error("rate_limited", "too many signature requests");
+        }
+        let approved = match self.policy.decide(rt, Origin::Web) {
+            Decision::Approve => true,
+            Decision::Deny => false,
+            Decision::Prompt => self
+                .prompter
+                .approve_with_context(rt, Origin::Web, Some(&context)),
+        };
+        if !approved {
+            self.audit_sign(rt_name, Origin::Web, "denied", &payload.digest, Some(&context));
+            return AgentResponse::error("denied", "approval required or denied");
+        }
+        match self.with_signer(|s| s.sign(rt, &digest32)) {
+            Ok(Ok(sig)) => {
+                self.audit_sign(rt_name, Origin::Web, "approved", &payload.digest, Some(&context));
+                AgentResponse::Signature {
+                    sig: hex::encode(sig),
+                }
+            }
+            Ok(Err(e)) => AgentResponse::error("sign", e.to_string()),
+            Err(resp) => {
+                self.audit_sign(rt_name, Origin::Web, "locked", &payload.digest, Some(&context));
+                resp
+            }
+        }
+    }
+
     pub fn identity_pubkey(&self) -> AgentResponse {
         match self.with_signer(|s| s.pubkey(KeyRole::Identity)) {
             Ok(Ok(pk)) => AgentResponse::Pubkey {
@@ -325,6 +476,40 @@ impl Agent {
                 self.lock("lock");
                 AgentResponse::Ok
             }
+            // ── pairing (PVOS M3.1; socket-only ops, 0600-trusted caller) ──
+            AgentRequest::Pair {
+                name,
+                server_pubkey,
+                origins,
+            } => self.pair(&name, &server_pubkey, origins),
+            AgentRequest::ListPairings => match &self.pairings {
+                None => AgentResponse::error("unsupported", "pairing not enabled"),
+                Some(reg) => AgentResponse::Pairings {
+                    pairings: reg
+                        .list()
+                        .into_iter()
+                        .map(|p| crate::proto::PairingInfo {
+                            name: p.name,
+                            server_pubkey_hex: p.server_pubkey_hex,
+                            origins: p.origins,
+                            created_ms: p.created_ms,
+                        })
+                        .collect(),
+                },
+            },
+            AgentRequest::RevokePairing { name } => match &self.pairings {
+                None => AgentResponse::error("unsupported", "pairing not enabled"),
+                Some(reg) => match reg.revoke(&name) {
+                    Ok(true) => {
+                        if let Some(a) = &self.audit {
+                            a.event("pairing_revoked");
+                        }
+                        AgentResponse::Ok
+                    }
+                    Ok(false) => AgentResponse::error("not_found", "no pairing by that name"),
+                    Err(e) => AgentResponse::error("io", e.to_string()),
+                },
+            },
             AgentRequest::RotateIdentity => self.rotate_identity(),
             AgentRequest::SecureUnwrap {
                 ephemeral_pubkey,

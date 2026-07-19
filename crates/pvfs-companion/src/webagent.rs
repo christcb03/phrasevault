@@ -110,7 +110,10 @@ impl WebAgent {
         if method == "OPTIONS" {
             return respond(&mut stream, 204, "No Content", origin.as_deref(), "");
         }
-        if token.as_deref() != Some(self.token.as_str()) {
+        // `/relay` is deliberately token-exempt (M3.1): its authentication is
+        // the paired-server signature + the Origin↔pairing binding, so a page
+        // needs no port-file secret — which is the whole point of pairing.
+        if path != "/relay" && token.as_deref() != Some(self.token.as_str()) {
             return respond_json(
                 &mut stream,
                 401,
@@ -190,6 +193,26 @@ impl WebAgent {
                         "OK",
                         format!("{{\"sig\":\"{sig}\",\"pubkey\":\"{pubkey}\"}}"),
                     ),
+                    other => error_response(other),
+                }
+            }
+            ("POST", "/relay") => {
+                // A paired-server envelope (M3.1): {payload: "<json>", server_sig}.
+                let (Some(payload), Some(sig)) = (
+                    json_str_field(body, "payload"),
+                    json_str_field(body, "server_sig"),
+                ) else {
+                    return (400, "Bad Request", "{\"error\":\"missing_envelope\"}".into());
+                };
+                match self.agent.relay(origin, &payload, &sig) {
+                    AgentResponse::Signature { sig } => match self.agent.identity_pubkey() {
+                        AgentResponse::Pubkey { pubkey } => (
+                            200,
+                            "OK",
+                            format!("{{\"sig\":\"{sig}\",\"pubkey\":\"{pubkey}\"}}"),
+                        ),
+                        other => error_response(other),
+                    },
                     other => error_response(other),
                 }
             }

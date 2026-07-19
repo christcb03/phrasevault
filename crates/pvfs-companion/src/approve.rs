@@ -44,6 +44,14 @@ pub trait Prompter: Send + Sync {
         let _ = (old_hex, new_hex);
         false
     }
+
+    /// Enroll a paired server (PVOS M3.1): the server named here will be able
+    /// to submit relayed signing requests (each still individually prompted).
+    /// Default deny.
+    fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
+        let _ = (name, server_pubkey_hex, origins);
+        false
+    }
 }
 
 /// Headless: every prompt is a denial (never approve what nobody saw).
@@ -66,6 +74,17 @@ fn describe_rotation(old_hex: &str, new_hex: &str) -> String {
     format!(
         "pvfs-companion: REPLACE your identity key? {old_hex} -> {new_hex}. Grants \
          under the old key go inert until re-issued; do this only for a compromise."
+    )
+}
+
+fn describe_pair(name: &str, server_pubkey_hex: &str, origins: &[String]) -> String {
+    let key_short = &server_pubkey_hex[..server_pubkey_hex.len().min(12)];
+    format!(
+        "pvfs-companion: PAIR server \"{name}\" (key {key_short}…) for origins \
+         [{}]? It may then request sign-ins and approvals through your browser \
+         — each still asks you individually (revoke with `pvfs-companion \
+         pairings revoke`).",
+        origins.join(", ")
     )
 }
 
@@ -175,6 +194,9 @@ impl Prompter for TerminalPrompter {
     fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
         self.ask(&describe_rotation(old_hex, new_hex))
     }
+    fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
+        self.ask(&describe_pair(name, server_pubkey_hex, origins))
+    }
 }
 
 /// Ask with a native desktop dialog: `osascript` on macOS, `zenity` on Linux.
@@ -213,6 +235,9 @@ impl Prompter for DesktopPrompter {
     }
     fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
         self.dialog(&describe_rotation(old_hex, new_hex))
+    }
+    fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
+        self.dialog(&describe_pair(name, server_pubkey_hex, origins))
     }
 }
 

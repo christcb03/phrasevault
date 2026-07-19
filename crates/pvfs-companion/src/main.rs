@@ -67,6 +67,10 @@ enum Cmd {
         /// and services should pass `deny` so a prompt can never block them.
         #[arg(long, default_value = "auto", value_parser = ["auto", "deny", "terminal", "desktop"])]
         prompt: String,
+        /// Loopback web-agent port (M3.1: stable so pages need no lookup;
+        /// 0 = ephemeral, previous behavior).
+        #[arg(long, default_value_t = 7421)]
+        web_port: u16,
     },
     /// Lock a running agent now: the seed is dropped from memory. The next
     /// request re-unlocks it (keychain/env/prompt) — or is refused if it can't.
@@ -126,12 +130,26 @@ enum Cmd {
     /// The phrase is not stored; the caller must seal it with `init` or show it
     /// once for the user to write down.
     PhraseNew,
+    /// List paired servers (PVOS M3.1) — or revoke one.
+    Pairings {
+        #[command(subcommand)]
+        cmd: Option<PairingsCmd>,
+        /// Vault file (pairings live next to it; default: the usual vault path)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 enum OriginsCmd {
     /// Disconnect an origin — takes effect immediately, even while serving.
     Revoke { origin: String },
+}
+
+#[derive(Subcommand)]
+enum PairingsCmd {
+    /// Remove a pairing by name — takes effect immediately, even while serving.
+    Revoke { name: String },
 }
 
 fn main() -> std::process::ExitCode {
@@ -365,6 +383,7 @@ fn run() -> Result<(), String> {
             idle_lock_secs,
             rate_limit,
             prompt,
+            web_port,
         } => {
             let vault = match vault {
                 Some(p) => p,
@@ -424,7 +443,10 @@ fn run() -> Result<(), String> {
                     .with_unlocker(unlocker)
                     .with_identity_rotator(rotator)
                     .with_idle_timeout(idle)
-                    .with_rate_limit(rate_limit),
+                    .with_rate_limit(rate_limit)
+                    .with_pairings(pvfs_companion::PairingRegistry::at(
+                        &vault.with_extension("pairings.json"),
+                    )),
             );
 
             let _ = std::fs::remove_file(&socket); // clear a stale socket
@@ -433,12 +455,15 @@ fn run() -> Result<(), String> {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
 
-            // The loopback identity agent (doc 14 §6): ephemeral 127.0.0.1 port,
+            // The loopback identity agent (doc 14 §6): a STABLE 127.0.0.1 port
+            // (M3.1 — pages find it with no port-file lookup; 0 = ephemeral),
             // per-launch token in a 0600 port file next to the socket.
             let origins =
                 pvfs_companion::OriginRegistry::at(&vault.with_extension("origins.json"));
             let web = Arc::new(pvfs_companion::WebAgent::new(Arc::clone(&agent), origins));
-            let http = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+            let http = std::net::TcpListener::bind(("127.0.0.1", web_port)).map_err(|e| {
+                format!("web agent port {web_port} unavailable ({e}) — pass --web-port")
+            })?;
             let addr = http.local_addr().map_err(|e| e.to_string())?.to_string();
             let port_file = socket.with_extension("http");
             web.write_port_file(&port_file, &addr)
@@ -566,6 +591,40 @@ fn run() -> Result<(), String> {
                         Ok(())
                     } else {
                         Err(format!("{origin} was not connected"))
+                    }
+                }
+            }
+        }
+        Cmd::Pairings { cmd, vault } => {
+            let vault_path = match vault {
+                Some(p) => p,
+                None => default_vault()?,
+            };
+            let reg =
+                pvfs_companion::PairingRegistry::at(&vault_path.with_extension("pairings.json"));
+            match cmd {
+                None => {
+                    let list = reg.list();
+                    if list.is_empty() {
+                        println!("(no paired servers)");
+                    } else {
+                        for p in list {
+                            println!(
+                                "{}  key {}…  origins [{}]",
+                                p.name,
+                                &p.server_pubkey_hex[..p.server_pubkey_hex.len().min(12)],
+                                p.origins.join(", ")
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Some(PairingsCmd::Revoke { name }) => {
+                    if reg.revoke(&name).map_err(|e| e.to_string())? {
+                        eprintln!("pvfs-companion: revoked pairing {name}");
+                        Ok(())
+                    } else {
+                        Err(format!("no pairing named {name}"))
                     }
                 }
             }

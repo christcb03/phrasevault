@@ -11,7 +11,46 @@ use serde::{Deserialize, Serialize};
 /// The agent protocol version (doc 16 §7 item 4). Bump on any breaking change
 /// to the request/response surface; clients negotiate via
 /// [`AgentRequest::ApiVersion`] before relying on newer ops.
-pub const API_VERSION: u32 = 1;
+///
+/// v2: pairing (`Pair`/`ListPairings`/`RevokePairing`) + the browser-relay
+/// envelope (PVOS M3.1).
+pub const API_VERSION: u32 = 2;
+
+/// Domain prefix for the relay envelope signature: the paired server signs
+/// `domain_digest(RELAY_DOMAIN, payload_json_bytes)`.
+pub const RELAY_DOMAIN: &str = "pvfs:relay:v1:";
+
+/// The 6-digit verification code both screens display (M3.1 §4.3): derived
+/// from the operation digest so the approving human can match the prompt to
+/// the page that caused it.
+pub fn verify_code(digest: &[u8; 32]) -> String {
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{n:06}")
+}
+
+/// The relayed request a paired server signs (transmitted as the exact JSON
+/// string the signature covers — no canonicalization games).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayPayload {
+    /// `"sign_in"` or `"user_action"`.
+    pub kind: String,
+    /// The paired server's pubkey (hex) — selects the pairing to verify with.
+    pub server_pubkey: String,
+    /// The 32-byte digest (hex) to sign.
+    pub digest: String,
+    /// Required for `user_action` (doc 16 §3); optional context for sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ApprovalContext>,
+}
+
+/// A pairing as reported over the socket (no secrets — it's all public data).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairingInfo {
+    pub name: String,
+    pub server_pubkey_hex: String,
+    pub origins: Vec<String>,
+    pub created_ms: u64,
+}
 
 /// The human-approval context a trusted broker binds to a digest (doc 16 §3.1).
 /// `pvosd` composes it from the *same operation* it computed the digest from, so
@@ -71,6 +110,17 @@ pub enum AgentRequest {
         nonce: String,
         wrapped_key: String,
     },
+    /// Enroll a paired server (PVOS M3.1): human-prompted (name + key +
+    /// origins rendered); replaces an existing pairing of the same name.
+    /// Answers `Paired{identity_pubkey}` so the server can store the identity
+    /// it will verify relayed answers against.
+    Pair {
+        name: String,
+        server_pubkey: String,
+        origins: Vec<String>,
+    },
+    ListPairings,
+    RevokePairing { name: String },
 }
 
 /// The agent's reply.
@@ -92,6 +142,10 @@ pub enum AgentResponse {
     },
     /// A recovered secure-blob content key (hex), from `SecureUnwrap`.
     ContentKey { content_key: String },
+    /// Pairing accepted: the identity pubkey (hex) the server stores and will
+    /// verify relayed answers against.
+    Paired { identity_pubkey: String },
+    Pairings { pairings: Vec<PairingInfo> },
     Ok,
     Error { code: String, message: String },
 }

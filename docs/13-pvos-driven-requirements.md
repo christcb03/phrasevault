@@ -123,3 +123,38 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 4. **§C, §D, §E, §F** — the smaller additions, mostly downstream of §A/§B.
 
 **Net:** the secure node (P3) can be built fairly independently; the federation cluster (§A–§D, §F) all hinges on **§A**. Decide §A and the rest of the foundation falls into a clear order.
+
+---
+
+## H. Companion pairing & browser relay (PVOS M3.1) — SHIPPED companion-side
+
+PVOS's web desktop runs on a server (e.g. presubuntu) while the owner's
+companion is a menu-bar app on their Mac. Rather than keep an SSH forward
+alive forever, a server **pairs** with a companion once (over the trusted
+0600 socket, human-approved) and thereafter reaches it by **relaying**
+signing requests through the browser page — which is already on the same
+machine as the companion. Implemented in `pvfs-companion`:
+
+- **Stable web-agent port** (`serve --web-port`, default **7421**): pages
+  find the loopback agent with no port-file lookup. Port file still written
+  (informational).
+- **Pairing registry** (`pairings.rs`, `<vault>.pairings.json`): a pairing =
+  `{name, server_pubkey, origins[]}`. Socket ops `Pair`/`ListPairings`/
+  `RevokePairing`; CLI `pvfs-companion pairings [revoke <name>]`. `Pair` is
+  human-prompted (name + key + origins rendered) and returns the identity
+  pubkey the server stores.
+- **Relay endpoint** `POST /relay` (token-exempt by design): body
+  `{payload, server_sig}` where `payload` is the exact signed JSON
+  (`{kind, server_pubkey, digest, context?}`). Verification order: pairing
+  by key → **Origin ∈ pairing.origins** (browser-enforced header) → envelope
+  sig over `domain_digest("pvfs:relay:v1:", payload)` → inner digest/context
+  agreement (doc 16 §3.2 unchanged) → rate limit → prompt (renders server
+  name, origin, **6-digit `verify_code`**, and the full context for
+  `user_action`) → sign. Every relay is individually prompted and audited.
+- Agent proto → **API_VERSION 2**.
+
+Security posture (multiuser target): both directions are signed; origin
+binding is mechanical (no human judgment for drive-by pages); the code on
+both screens closes prompt-confusion; each member pairs their own companion
+(the pairing table is the member/role registry for PVOS sign-in). **TLS is a
+pre-1.0 requirement** for shared deployment — cleartext ws is dev-LAN only.
