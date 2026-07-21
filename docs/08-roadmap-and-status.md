@@ -288,6 +288,15 @@ now **decided** and **shipped** (items 11–12, doc 10 §9); CLI auto-routing (3
 is fixed and tested with a daemon running (item 16). **Scope decided (2026-06-29):** companion app
 and encryption-at-rest (P3) are both committed to 1.0.
 
+**Requested (2026-07-21, from PVOS M3.5 live testing):** the companion must be a **singleton per
+user** — on launch, detect an existing instance (live socket at the conventional path / pidfile)
+and **take over: kill the stale copy, rebind the socket, keep serving the web relay port**.
+Observed failure: a menu-bar `PVFS Companion.app` and a CLI `pvfs-companion serve` ran side by
+side, both holding FDs on `/tmp/pvfs-companion-<user>.sock` (the later bind orphaned the first),
+the menu-bar icon disappeared, and which copy answered was luck. Also wanted: an explicit
+**restart** affordance (menu-bar item and/or `pvfs-companion restart`). Companion work tracks
+doc 14.
+
 ---
 
 ## 5. Crate map
