@@ -3486,3 +3486,44 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    // doc 13 Q-E1: `--expires` accepts a duration (relative to now) or an
+    // absolute `@<unix-ms>`; zero and garbage are refused with `bad_input`.
+    #[test]
+    fn parse_expires_durations_and_absolute() {
+        let before = now_ms();
+        let t = parse_expires("45s").unwrap();
+        assert!(t >= before + 45_000 && t <= now_ms() + 45_000);
+        let t = parse_expires("2w").unwrap();
+        assert!(t >= before + 14 * 86_400_000);
+        assert_eq!(parse_expires("@1753000000000").unwrap(), 1_753_000_000_000);
+
+        for bad in ["@0", "@x", "5", "5y", "", "s", "99999999999999999999w"] {
+            assert!(
+                matches!(parse_expires(bad), Err(PvfsError::BadInput { .. })),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_suffix_marks_never_expired_and_coarse_remaining() {
+        assert_eq!(expiry_suffix(0), "");
+        assert_eq!(expiry_suffix(1), " [expired]");
+        let s = expiry_suffix(now_ms() + 2 * 86_400_000 + 60_000);
+        assert!(s.contains("expires in ~2d"), "{s}");
+        let s = expiry_suffix(now_ms() + 30 * 60_000 + 1_000);
+        assert!(s.contains("expires in ~30m"), "{s}");
+    }
+}
