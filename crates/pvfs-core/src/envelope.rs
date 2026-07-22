@@ -237,7 +237,7 @@ mod tests {
     fn strangers_and_tampering_fail() {
         let (_alice, alice_pub) = keypair();
         let (mallory, mallory_pub) = keypair();
-        let sealed = seal(b"secret", &[alice_pub.clone()]).unwrap();
+        let sealed = seal(b"secret", std::slice::from_ref(&alice_pub)).unwrap();
         let env = parse(&sealed).unwrap();
 
         // No wrap for a stranger; using Alice's wrap with the wrong key fails.
@@ -247,7 +247,7 @@ mod tests {
 
         // A flipped payload byte fails the AEAD even with the right key.
         let (alice, alice_pub) = keypair();
-        let sealed = seal(b"secret", &[alice_pub.clone()]).unwrap();
+        let sealed = seal(b"secret", std::slice::from_ref(&alice_pub)).unwrap();
         let mut env = parse(&sealed).unwrap();
         let ck = unwrap_content_key(env.wrap_for(&alice_pub).unwrap(), &alice).unwrap();
         env.payload[0] ^= 1;
@@ -258,7 +258,7 @@ mod tests {
     fn grant_adds_a_recipient_without_reencrypting() {
         let (alice, alice_pub) = keypair();
         let (bob, bob_pub) = keypair();
-        let sealed = seal(b"shared later", &[alice_pub.clone()]).unwrap();
+        let sealed = seal(b"shared later", std::slice::from_ref(&alice_pub)).unwrap();
 
         let env = parse(&sealed).unwrap();
         let ck = unwrap_content_key(env.wrap_for(&alice_pub).unwrap(), &alice).unwrap();

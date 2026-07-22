@@ -27,7 +27,7 @@ fn companion_unwraps_a_secure_blob_key_over_the_socket() {
     }
 
     // Seal a plaintext to the owner, parse, and unwrap via the socket.
-    let sealed = envelope::seal(b"top secret", &[enc_pub.clone()]).unwrap();
+    let sealed = envelope::seal(b"top secret", std::slice::from_ref(&enc_pub)).unwrap();
     let env = envelope::parse(&sealed).unwrap();
     let wrap = env.wrap_for(&enc_pub).unwrap();
 
