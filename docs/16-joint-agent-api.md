@@ -53,11 +53,17 @@ Every signature carries a `request_type` selecting the approval tier. The existi
 |----------------|-------------------|----------|
 | `root_device_cert` | always prompt | owner admin (PVFS root) |
 | `identity_tag` | auto while unlocked, local | the human's own tag grants / delegations they initiate |
-| `identity_assertion` | per-origin connect (web) | "Sign in with PVFS"; SSSO identity assertion |
+| `identity_assertion` | per-origin connect (web); **auto over a trusted paired `(key, url)`** (PVOS D29) | "Sign in with PVFS"; SSSO identity assertion |
 | `secure_unwrap` | auto while unlocked, local | companion-gated decryption (doc 12) |
 | **`user_action`** (new) | **context-driven (§3)** | **`sign_as_user` — the D19 path** |
 
 `user_action` is the one addition: a human-attributed app action whose approval decision is driven by the **context**, not a fixed tier — auto-approved when it matches a policy allow-list, prompted otherwise (§3.3).
+
+Per PVOS D27/D29 (2026-07-22), the paired-relay path (doc 14 §6.1) moves
+`sign_in` to the auto tier once the requesting url is trusted for the paired
+server key: prompts remain only for first contact from a new url (the one-time
+"trust this new address?" prompt) and for admin/sensitive types — exactly the
+tiering this table models.
 
 ---
 

@@ -52,6 +52,15 @@ pub trait Prompter: Send + Sync {
         let _ = (name, server_pubkey_hex, origins);
         false
     }
+
+    /// First contact from a new url for a **known** server key (PVOS D27): the
+    /// relay envelope already verified against the pairing, only the address is
+    /// new. Approving records a per-`(key, url)` trust grant — future sign-ins
+    /// from it are automatic (D29). Default deny.
+    fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
+        let _ = (name, server_pubkey_hex, origin);
+        false
+    }
 }
 
 /// Headless: every prompt is a denial (never approve what nobody saw).
@@ -79,12 +88,28 @@ fn describe_rotation(old_hex: &str, new_hex: &str) -> String {
 
 fn describe_pair(name: &str, server_pubkey_hex: &str, origins: &[String]) -> String {
     let key_short = &server_pubkey_hex[..server_pubkey_hex.len().min(12)];
+    // D27: the key is the identity; urls are trust-on-first-contact grants, so
+    // pairing may carry none (any it does carry are pre-trusted).
+    let urls = if origins.is_empty() {
+        "its addresses are approved on first contact".to_string()
+    } else {
+        format!("pre-trusted addresses [{}]", origins.join(", "))
+    };
     format!(
-        "pvfs-companion: PAIR server \"{name}\" (key {key_short}…) for origins \
-         [{}]? It may then request sign-ins and approvals through your browser \
-         — each still asks you individually (revoke with `pvfs-companion \
-         pairings revoke`).",
-        origins.join(", ")
+        "pvfs-companion: PAIR server \"{name}\" (key {key_short}…)? {urls}. It \
+         may then request sign-ins and approvals through your browser — \
+         trusted-address sign-ins are automatic, everything else still asks you \
+         (revoke with `pvfs-companion pairings revoke`)."
+    )
+}
+
+fn describe_trust_url(name: &str, server_pubkey_hex: &str, origin: &str) -> String {
+    let key_short = &server_pubkey_hex[..server_pubkey_hex.len().min(12)];
+    format!(
+        "pvfs-companion: trust NEW ADDRESS \"{origin}\" for paired server \
+         \"{name}\" (key {key_short}…)? The request verified against its key — \
+         only the address is new. Approving remembers it and future sign-ins \
+         from it are automatic (revoke with `pvfs-companion pairings revoke`)."
     )
 }
 
@@ -197,6 +222,9 @@ impl Prompter for TerminalPrompter {
     fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
         self.ask(&describe_pair(name, server_pubkey_hex, origins))
     }
+    fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
+        self.ask(&describe_trust_url(name, server_pubkey_hex, origin))
+    }
 }
 
 /// Ask with a native desktop dialog: `osascript` on macOS, `zenity` on Linux.
@@ -238,6 +266,9 @@ impl Prompter for DesktopPrompter {
     }
     fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
         self.dialog(&describe_pair(name, server_pubkey_hex, origins))
+    }
+    fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
+        self.dialog(&describe_trust_url(name, server_pubkey_hex, origin))
     }
 }
 

@@ -47,31 +47,12 @@ enum Cmd {
     /// vaults unlock silently; passphrase vaults prompt (or use
     /// $PVFS_COMPANION_PASSPHRASE when scripted). `--allow-root` opts a
     /// headless agent into signing root device certs without a prompt.
-    Serve {
-        /// Vault file (default: ~/.config/pvfs/companion.vault, or $PVFS_COMPANION_VAULT)
-        #[arg(long)]
-        vault: Option<PathBuf>,
-        /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        #[arg(long)]
-        allow_root: bool,
-        /// Drop the seed after this many idle seconds; it re-unlocks on demand
-        /// (keychain/env silently, terminal by prompt). 0 disables.
-        #[arg(long, default_value_t = 900)]
-        idle_lock_secs: u64,
-        /// Max signatures per minute (doc 14 §4 rate limit). 0 disables.
-        #[arg(long, default_value_t = 60)]
-        rate_limit: u32,
-        /// Approval prompt backend. `auto` picks desktop/terminal/deny; scripts
-        /// and services should pass `deny` so a prompt can never block them.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "deny", "terminal", "desktop"])]
-        prompt: String,
-        /// Loopback web-agent port (M3.1: stable so pages need no lookup;
-        /// 0 = ephemeral, previous behavior).
-        #[arg(long, default_value_t = 7421)]
-        web_port: u16,
-    },
+    /// Singleton per user: an existing instance on the socket is taken over
+    /// (killed via its pidfile) before this one binds.
+    Serve(ServeArgs),
+    /// Take over from any running companion and serve fresh — the explicit
+    /// restart affordance (same flags as `serve`, which also takes over).
+    Restart(ServeArgs),
     /// Lock a running agent now: the seed is dropped from memory. The next
     /// request re-unlocks it (keychain/env/prompt) — or is refused if it can't.
     Lock {
@@ -140,6 +121,33 @@ enum Cmd {
     },
 }
 
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Vault file (default: ~/.config/pvfs/companion.vault, or $PVFS_COMPANION_VAULT)
+    #[arg(long)]
+    vault: Option<PathBuf>,
+    /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    #[arg(long)]
+    allow_root: bool,
+    /// Drop the seed after this many idle seconds; it re-unlocks on demand
+    /// (keychain/env silently, terminal by prompt). 0 disables.
+    #[arg(long, default_value_t = 900)]
+    idle_lock_secs: u64,
+    /// Max signatures per minute (doc 14 §4 rate limit). 0 disables.
+    #[arg(long, default_value_t = 60)]
+    rate_limit: u32,
+    /// Approval prompt backend. `auto` picks desktop/terminal/deny; scripts
+    /// and services should pass `deny` so a prompt can never block them.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "deny", "terminal", "desktop"])]
+    prompt: String,
+    /// Loopback web-agent port (M3.1: stable so pages need no lookup;
+    /// 0 = ephemeral, previous behavior).
+    #[arg(long, default_value_t = 7421)]
+    web_port: u16,
+}
+
 #[derive(Subcommand)]
 enum OriginsCmd {
     /// Disconnect an origin — takes effect immediately, even while serving.
@@ -150,6 +158,10 @@ enum OriginsCmd {
 enum PairingsCmd {
     /// Remove a pairing by name — takes effect immediately, even while serving.
     Revoke { name: String },
+    /// Pre-trust a url for a paired server (D27) — as if approved at first contact.
+    Trust { name: String, url: String },
+    /// Forget a trusted url (the next relay from it prompts again).
+    Untrust { name: String, url: String },
 }
 
 fn main() -> std::process::ExitCode {
@@ -376,119 +388,9 @@ fn run() -> Result<(), String> {
             eprintln!("pvfs-companion: sealed vault at {}", vault.display());
             Ok(())
         }
-        Cmd::Serve {
-            vault,
-            socket,
-            allow_root,
-            idle_lock_secs,
-            rate_limit,
-            prompt,
-            web_port,
-        } => {
-            let vault = match vault {
-                Some(p) => p,
-                None => default_vault()?,
-            };
-            if !vault.exists() {
-                return Err(format!(
-                    "no vault at {} — run `pvfs-companion init` first",
-                    vault.display()
-                ));
-            }
-            let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
-            let signer = unseal_signer(&vault)?;
-            let policy = ApprovalPolicy {
-                auto_root: allow_root,
-                ..Default::default()
-            };
-
-            // Phase 5 controls (doc 14 §4, §9): prompts, audit, rate limit, and
-            // lock with on-demand re-unlock (the unlocker retains no secrets —
-            // it re-opens the vault and unseals the same way serve just did).
-            // `--prompt deny` makes a scripted agent deterministic: a prompt can
-            // never block it (it denies instead), no matter what tty it holds.
-            let (prompter, prompt_label): (Box<dyn pvfs_companion::Prompter>, &str) =
-                match prompt.as_str() {
-                    "deny" => (Box::new(pvfs_companion::DenyPrompter), "deny (forced)"),
-                    "terminal" => match pvfs_companion::approve::TerminalPrompter::open() {
-                        Some(p) => (Box::new(p), "terminal (forced)"),
-                        None => return Err("--prompt terminal: no controlling terminal".into()),
-                    },
-                    "desktop" => match pvfs_companion::approve::DesktopPrompter::detect() {
-                        Some(p) => (Box::new(p), "desktop dialog (forced)"),
-                        None => return Err("--prompt desktop: no GUI session detected".into()),
-                    },
-                    _ => pvfs_companion::auto_prompter_labeled(),
-                };
-            let audit_path = vault.with_extension("audit.jsonl");
-            let audit =
-                pvfs_companion::AuditLog::open(&audit_path).map_err(|e| e.to_string())?;
-            let unlock_vault = vault.clone();
-            let unlocker: pvfs_companion::Unlocker =
-                Box::new(move || unseal_signer(&unlock_vault));
-            // Identity rotation (doc 15 §1) persists its index bump to the vault
-            // envelope, so restarts and re-unlocks stay on the new identity.
-            let rotate_vault = vault.clone();
-            let rotator: pvfs_companion::IdentityRotator = Box::new(move |idx| {
-                Vault::set_identity_index(&rotate_vault, idx).map_err(|e| e.to_string())
-            });
-            let idle = match idle_lock_secs {
-                0 => None,
-                n => Some(Duration::from_secs(n)),
-            };
-            let agent = Arc::new(
-                Agent::new(signer, policy)
-                    .with_prompter(prompter)
-                    .with_audit(audit)
-                    .with_unlocker(unlocker)
-                    .with_identity_rotator(rotator)
-                    .with_idle_timeout(idle)
-                    .with_rate_limit(rate_limit)
-                    .with_pairings(pvfs_companion::PairingRegistry::at(
-                        &vault.with_extension("pairings.json"),
-                    )),
-            );
-
-            let _ = std::fs::remove_file(&socket); // clear a stale socket
-            let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
-            // Owner-only: the socket mode is the authentication (doc 14 §3).
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-
-            // The loopback identity agent (doc 14 §6): a STABLE 127.0.0.1 port
-            // (M3.1 — pages find it with no port-file lookup; 0 = ephemeral),
-            // per-launch token in a 0600 port file next to the socket.
-            let origins =
-                pvfs_companion::OriginRegistry::at(&vault.with_extension("origins.json"));
-            let web = Arc::new(pvfs_companion::WebAgent::new(Arc::clone(&agent), origins));
-            let http = std::net::TcpListener::bind(("127.0.0.1", web_port)).map_err(|e| {
-                format!("web agent port {web_port} unavailable ({e}) — pass --web-port")
-            })?;
-            let addr = http.local_addr().map_err(|e| e.to_string())?.to_string();
-            let port_file = socket.with_extension("http");
-            web.write_port_file(&port_file, &addr)
-                .map_err(|e| e.to_string())?;
-            {
-                let w = Arc::clone(&web);
-                std::thread::spawn(move || w.serve(http));
-            }
-
-            eprintln!("pvfs-companion: serving on {}", socket.display());
-            eprintln!(
-                "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
-                match idle_lock_secs {
-                    0 => "off".to_string(),
-                    n => format!("{n}s"),
-                },
-                audit_path.display()
-            );
-            eprintln!(
-                "pvfs-companion: identity agent on http://{addr} (port file {})",
-                port_file.display()
-            );
-            serve(listener, agent).map_err(|e| e.to_string())?;
-            Ok(())
-        }
+        // `restart` is `serve` made explicit: serve already takes over any
+        // running instance (the singleton posture), so both run the same code.
+        Cmd::Serve(args) | Cmd::Restart(args) => run_serve(args),
         Cmd::Lock { socket } => {
             let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
             let resp = pvfs_companion::request(&socket, &pvfs_companion::AgentRequest::Lock)
@@ -504,131 +406,9 @@ fn run() -> Result<(), String> {
                 _ => Err("unexpected response".into()),
             }
         }
-        Cmd::Status { vault, socket } => {
-            let vault_path = match vault {
-                Some(p) => p,
-                None => default_vault()?,
-            };
-            let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
-            if !vault_path.exists() {
-                println!(
-                    "vault : none at {} — run `pvfs-companion init`",
-                    vault_path.display()
-                );
-            } else {
-                match Vault::open(&vault_path) {
-                    Ok(v) => match v.sealing() {
-                        pvfs_companion::Sealing::Passphrase => {
-                            println!("vault : {} (passphrase-sealed)", vault_path.display());
-                        }
-                        pvfs_companion::Sealing::Keychain => {
-                            println!("vault : {} (keychain-sealed)", vault_path.display());
-                            match keychain_probe(&v) {
-                                Ok(()) => println!("key   : present in the OS keychain"),
-                                Err(e) => println!(
-                                    "key   : not retrievable ({e}) — if it was deleted, remove \
-                                     the vault and re-run `pvfs-companion init` with your phrase"
-                                ),
-                            }
-                        }
-                    },
-                    Err(e) => println!("vault : {} (unreadable: {e})", vault_path.display()),
-                }
-            }
-            match pvfs_companion::request(
-                &socket,
-                &pvfs_companion::AgentRequest::GetPubkey {
-                    role: "identity".into(),
-                },
-            ) {
-                Ok(pvfs_companion::AgentResponse::Pubkey { pubkey }) => {
-                    println!("agent : running on {} (identity {pubkey})", socket.display());
-                    let port_file = socket.with_extension("http");
-                    if let Ok(s) = std::fs::read_to_string(&port_file) {
-                        let addr = s
-                            .split("\"addr\":\"")
-                            .nth(1)
-                            .and_then(|r| r.split('"').next())
-                            .unwrap_or("?");
-                        println!("web   : identity agent on http://{addr}");
-                    }
-                }
-                Ok(_) => println!(
-                    "agent : running on {} (unexpected reply)",
-                    socket.display()
-                ),
-                Err(_) => println!(
-                    "agent : not running (would serve on {})",
-                    socket.display()
-                ),
-            }
-            let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
-            let n = reg.list().len();
-            println!("origins: {n} connected for sign-in");
-            Ok(())
-        }
-        Cmd::Origins { cmd, vault } => {
-            let vault_path = match vault {
-                Some(p) => p,
-                None => default_vault()?,
-            };
-            let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
-            match cmd {
-                None => {
-                    let grants = reg.list();
-                    if grants.is_empty() {
-                        println!("(no connected origins)");
-                    } else {
-                        for g in grants {
-                            println!("{}  expires {}", g.origin, fmt_expiry(g.expires_at_ms()));
-                        }
-                    }
-                    Ok(())
-                }
-                Some(OriginsCmd::Revoke { origin }) => {
-                    if reg.revoke(&origin)? {
-                        eprintln!("pvfs-companion: revoked {origin}");
-                        Ok(())
-                    } else {
-                        Err(format!("{origin} was not connected"))
-                    }
-                }
-            }
-        }
-        Cmd::Pairings { cmd, vault } => {
-            let vault_path = match vault {
-                Some(p) => p,
-                None => default_vault()?,
-            };
-            let reg =
-                pvfs_companion::PairingRegistry::at(&vault_path.with_extension("pairings.json"));
-            match cmd {
-                None => {
-                    let list = reg.list();
-                    if list.is_empty() {
-                        println!("(no paired servers)");
-                    } else {
-                        for p in list {
-                            println!(
-                                "{}  key {}…  origins [{}]",
-                                p.name,
-                                &p.server_pubkey_hex[..p.server_pubkey_hex.len().min(12)],
-                                p.origins.join(", ")
-                            );
-                        }
-                    }
-                    Ok(())
-                }
-                Some(PairingsCmd::Revoke { name }) => {
-                    if reg.revoke(&name).map_err(|e| e.to_string())? {
-                        eprintln!("pvfs-companion: revoked pairing {name}");
-                        Ok(())
-                    } else {
-                        Err(format!("no pairing named {name}"))
-                    }
-                }
-            }
-        }
+        Cmd::Status { vault, socket } => run_status(vault, socket),
+        Cmd::Origins { cmd, vault } => run_origins(cmd, vault),
+        Cmd::Pairings { cmd, vault } => run_pairings(cmd, vault),
         Cmd::TenantInit { store, user } => {
             let pass = passphrase()?;
             let phrase = read_phrase()?;
@@ -685,6 +465,297 @@ fn run() -> Result<(), String> {
             let mn = pvfs_core::identity::generate_mnemonic().map_err(|e| e.to_string())?;
             println!("{mn}");
             Ok(())
+        }
+    }
+}
+
+fn run_serve(args: ServeArgs) -> Result<(), String> {
+    let ServeArgs {
+        vault,
+        socket,
+        allow_root,
+        idle_lock_secs,
+        rate_limit,
+        prompt,
+        web_port,
+    } = args;
+    let vault = match vault {
+        Some(p) => p,
+        None => default_vault()?,
+    };
+    if !vault.exists() {
+        return Err(format!(
+            "no vault at {} — run `pvfs-companion init` first",
+            vault.display()
+        ));
+    }
+    let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
+    let signer = unseal_signer(&vault)?;
+    let policy = ApprovalPolicy {
+        auto_root: allow_root,
+        ..Default::default()
+    };
+
+    // Phase 5 controls (doc 14 §4, §9): prompts, audit, rate limit, and
+    // lock with on-demand re-unlock (the unlocker retains no secrets —
+    // it re-opens the vault and unseals the same way serve just did).
+    // `--prompt deny` makes a scripted agent deterministic: a prompt can
+    // never block it (it denies instead), no matter what tty it holds.
+    let (prompter, prompt_label): (Box<dyn pvfs_companion::Prompter>, &str) =
+        match prompt.as_str() {
+            "deny" => (Box::new(pvfs_companion::DenyPrompter), "deny (forced)"),
+            "terminal" => match pvfs_companion::approve::TerminalPrompter::open() {
+                Some(p) => (Box::new(p), "terminal (forced)"),
+                None => return Err("--prompt terminal: no controlling terminal".into()),
+            },
+            "desktop" => match pvfs_companion::approve::DesktopPrompter::detect() {
+                Some(p) => (Box::new(p), "desktop dialog (forced)"),
+                None => return Err("--prompt desktop: no GUI session detected".into()),
+            },
+            _ => pvfs_companion::auto_prompter_labeled(),
+        };
+    let audit_path = vault.with_extension("audit.jsonl");
+    let audit =
+        pvfs_companion::AuditLog::open(&audit_path).map_err(|e| e.to_string())?;
+    let unlock_vault = vault.clone();
+    let unlocker: pvfs_companion::Unlocker =
+        Box::new(move || unseal_signer(&unlock_vault));
+    // Identity rotation (doc 15 §1) persists its index bump to the vault
+    // envelope, so restarts and re-unlocks stay on the new identity.
+    let rotate_vault = vault.clone();
+    let rotator: pvfs_companion::IdentityRotator = Box::new(move |idx| {
+        Vault::set_identity_index(&rotate_vault, idx).map_err(|e| e.to_string())
+    });
+    let idle = match idle_lock_secs {
+        0 => None,
+        n => Some(Duration::from_secs(n)),
+    };
+    let agent = Arc::new(
+        Agent::new(signer, policy)
+            .with_prompter(prompter)
+            .with_audit(audit)
+            .with_unlocker(unlocker)
+            .with_identity_rotator(rotator)
+            .with_idle_timeout(idle)
+            .with_rate_limit(rate_limit)
+            .with_pairings(pvfs_companion::PairingRegistry::at(
+                &vault.with_extension("pairings.json"),
+            )),
+    );
+
+    // Singleton per user (2026-07-21 request): take over from any existing
+    // instance — kill it via its pidfile, clear the stale socket — then bind
+    // and record ourselves as the one companion.
+    let takeover = pvfs_companion::take_over(&socket);
+    if let Some(pid) = takeover.killed {
+        eprintln!("pvfs-companion: took over from a running instance (pid {pid})");
+    }
+    if takeover.orphaned {
+        eprintln!(
+            "pvfs-companion: WARNING: an older companion answers on {} but left no \
+             pidfile — it cannot be killed and is now orphaned (quit it manually)",
+            socket.display()
+        );
+    }
+    let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
+    // Owner-only: the socket mode is the authentication (doc 14 §3).
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
+    pvfs_companion::write_pidfile(&socket).map_err(|e| e.to_string())?;
+
+    // The loopback identity agent (doc 14 §6): a STABLE 127.0.0.1 port
+    // (M3.1 — pages find it with no port-file lookup; 0 = ephemeral),
+    // per-launch token in a 0600 port file next to the socket. A just-killed
+    // predecessor releases the port asynchronously, so retry briefly before
+    // giving up — "keep serving the web relay port" is the whole point.
+    let origins =
+        pvfs_companion::OriginRegistry::at(&vault.with_extension("origins.json"));
+    let web = Arc::new(pvfs_companion::WebAgent::new(Arc::clone(&agent), origins));
+    let http = {
+        let mut bound = None;
+        for _ in 0..20 {
+            match std::net::TcpListener::bind(("127.0.0.1", web_port)) {
+                Ok(l) => {
+                    bound = Some(l);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+        match bound {
+            Some(l) => l,
+            None => std::net::TcpListener::bind(("127.0.0.1", web_port)).map_err(|e| {
+                format!("web agent port {web_port} unavailable ({e}) — pass --web-port")
+            })?,
+        }
+    };
+    let addr = http.local_addr().map_err(|e| e.to_string())?.to_string();
+    let port_file = socket.with_extension("http");
+    web.write_port_file(&port_file, &addr)
+        .map_err(|e| e.to_string())?;
+    {
+        let w = Arc::clone(&web);
+        std::thread::spawn(move || w.serve(http));
+    }
+
+    eprintln!("pvfs-companion: serving on {}", socket.display());
+    eprintln!(
+        "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
+        match idle_lock_secs {
+            0 => "off".to_string(),
+            n => format!("{n}s"),
+        },
+        audit_path.display()
+    );
+    eprintln!(
+        "pvfs-companion: identity agent on http://{addr} (port file {})",
+        port_file.display()
+    );
+    serve(listener, agent).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn run_status(vault: Option<PathBuf>, socket: Option<PathBuf>) -> Result<(), String> {
+    let vault_path = match vault {
+        Some(p) => p,
+        None => default_vault()?,
+    };
+    let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
+    if !vault_path.exists() {
+        println!(
+            "vault : none at {} — run `pvfs-companion init`",
+            vault_path.display()
+        );
+    } else {
+        match Vault::open(&vault_path) {
+            Ok(v) => match v.sealing() {
+                pvfs_companion::Sealing::Passphrase => {
+                    println!("vault : {} (passphrase-sealed)", vault_path.display());
+                }
+                pvfs_companion::Sealing::Keychain => {
+                    println!("vault : {} (keychain-sealed)", vault_path.display());
+                    match keychain_probe(&v) {
+                        Ok(()) => println!("key   : present in the OS keychain"),
+                        Err(e) => println!(
+                            "key   : not retrievable ({e}) — if it was deleted, remove \
+                             the vault and re-run `pvfs-companion init` with your phrase"
+                        ),
+                    }
+                }
+            },
+            Err(e) => println!("vault : {} (unreadable: {e})", vault_path.display()),
+        }
+    }
+    match pvfs_companion::request(
+        &socket,
+        &pvfs_companion::AgentRequest::GetPubkey {
+            role: "identity".into(),
+        },
+    ) {
+        Ok(pvfs_companion::AgentResponse::Pubkey { pubkey }) => {
+            println!("agent : running on {} (identity {pubkey})", socket.display());
+            let port_file = socket.with_extension("http");
+            if let Ok(s) = std::fs::read_to_string(&port_file) {
+                let addr = s
+                    .split("\"addr\":\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or("?");
+                println!("web   : identity agent on http://{addr}");
+            }
+        }
+        Ok(_) => println!(
+            "agent : running on {} (unexpected reply)",
+            socket.display()
+        ),
+        Err(_) => println!(
+            "agent : not running (would serve on {})",
+            socket.display()
+        ),
+    }
+    let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
+    let n = reg.list().len();
+    println!("origins: {n} connected for sign-in");
+    Ok(())
+}
+
+fn run_origins(cmd: Option<OriginsCmd>, vault: Option<PathBuf>) -> Result<(), String> {
+    let vault_path = match vault {
+        Some(p) => p,
+        None => default_vault()?,
+    };
+    let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
+    match cmd {
+        None => {
+            let grants = reg.list();
+            if grants.is_empty() {
+                println!("(no connected origins)");
+            } else {
+                for g in grants {
+                    println!("{}  expires {}", g.origin, fmt_expiry(g.expires_at_ms()));
+                }
+            }
+            Ok(())
+        }
+        Some(OriginsCmd::Revoke { origin }) => {
+            if reg.revoke(&origin)? {
+                eprintln!("pvfs-companion: revoked {origin}");
+                Ok(())
+            } else {
+                Err(format!("{origin} was not connected"))
+            }
+        }
+    }
+}
+
+fn run_pairings(cmd: Option<PairingsCmd>, vault: Option<PathBuf>) -> Result<(), String> {
+    let vault_path = match vault {
+        Some(p) => p,
+        None => default_vault()?,
+    };
+    let reg =
+        pvfs_companion::PairingRegistry::at(&vault_path.with_extension("pairings.json"));
+    match cmd {
+        None => {
+            let list = reg.list();
+            if list.is_empty() {
+                println!("(no paired servers)");
+            } else {
+                for p in list {
+                    println!(
+                        "{}  key {}…  trusted urls [{}]",
+                        p.name,
+                        &p.server_pubkey_hex[..p.server_pubkey_hex.len().min(12)],
+                        p.origins.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(PairingsCmd::Revoke { name }) => {
+            if reg.revoke(&name).map_err(|e| e.to_string())? {
+                eprintln!("pvfs-companion: revoked pairing {name}");
+                Ok(())
+            } else {
+                Err(format!("no pairing named {name}"))
+            }
+        }
+        Some(PairingsCmd::Trust { name, url }) => {
+            let Some(p) = reg.list().into_iter().find(|p| p.name == name) else {
+                return Err(format!("no pairing named {name}"));
+            };
+            reg.trust_origin(&p.server_pubkey_hex, &url)
+                .map_err(|e| e.to_string())?;
+            eprintln!("pvfs-companion: trusting {url} for {name}");
+            Ok(())
+        }
+        Some(PairingsCmd::Untrust { name, url }) => {
+            if reg.untrust_origin(&name, &url).map_err(|e| e.to_string())? {
+                eprintln!("pvfs-companion: forgot {url} for {name}");
+                Ok(())
+            } else {
+                Err(format!("{url} was not trusted for {name}"))
+            }
         }
     }
 }

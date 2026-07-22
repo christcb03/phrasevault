@@ -217,6 +217,16 @@ final class AgentController: ObservableObject {
         statusLine = "Stopped"
     }
 
+    /// Restart affordance (roadmap 2026-07-21): spawn a fresh `serve`. The
+    /// binary's singleton takeover kills whichever instance holds the socket —
+    /// including one this app didn't start (a stray CLI `serve`).
+    func restartAgent() throws {
+        agentProcess?.terminate()
+        agentProcess = nil
+        agentRunning = false
+        try startAgent()
+    }
+
     func lockAgent() {
         _ = runCompanion(args: ["lock"], env: [:])
         refresh()

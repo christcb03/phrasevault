@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased (1.2)
 
+- **Companion: pairing trust binds to the server key, not pinned urls**
+  (PVOS D27, doc 14 §6.1): the relay envelope verifies against the paired key
+  first; a relay from a new url for a known key gets a one-time "trust this
+  new address?" prompt, remembered as a per-`(key, url)` trust grant
+  (`pvfs-companion pairings trust|untrust`). Pairing no longer requires
+  origins (`Pair.origins` optional; `API_VERSION` 3, additive) — no re-pair
+  when a server moves or adds an https origin.
+- **Companion: auto sign-in over trusted pairs** (PVOS D29, doc 16 §2):
+  `sign_in` relayed over a trusted `(key, url)` auto-approves — no tap per
+  login; prompts remain for first contact and admin/sensitive request types
+  (`user_action` unchanged). Rate limit, lock, and audit unchanged.
+- **Companion: singleton per user + restart** (2026-07-21 request, PVOS M3.5):
+  `serve` takes over an existing instance on launch — kill via `<socket>.pid`
+  (SIGTERM → SIGKILL), rebind the socket, re-acquire the stable web port —
+  and `pvfs-companion restart` / the menu-bar "Restart agent" item make it
+  explicit. The dual-instance socket-orphaning failure can no longer happen.
 - **Expiring ACL grants** (doc 13 Q-E1): `AclSet` gains an optional
   `expires_at` (ms epoch, 0 = never). An expired grant is inert on the read
   path — masked by `effective_rights` like a revoked-authority tag grant —

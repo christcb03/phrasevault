@@ -1,10 +1,12 @@
 //! M3.1 pairing + browser relay, end to end against a real WebAgent HTTP
 //! listener: pair a server (prompted), then relayed sign_in/user_action with
-//! the full verification order — pairing key, Origin↔pairing binding,
-//! envelope signature, context/digest agreement, prompt (code rendered),
-//! sign. Probes: unpaired key, wrong origin, forged envelope, context
-//! mismatch. The /relay route is token-exempt by design (the pairing
-//! signature + origin binding are its authentication).
+//! the full verification order — pairing key, envelope signature, url trust
+//! (D27: per-`(key, url)` grants, prompted on first contact), context/digest
+//! agreement, approval (D29: sign_in from a trusted url is automatic;
+//! user_action prompts with the code rendered), sign. Probes: unpaired key,
+//! untrusted url with a denying prompter, forged envelope, context mismatch.
+//! The /relay route is token-exempt by design (the pairing signature + url
+//! trust are its authentication).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -141,12 +143,14 @@ fn pairing_and_relay_end_to_end() {
     assert_eq!(v["pubkey"], identity_pubkey);
     let sig = hex::decode(v["sig"].as_str().unwrap()).unwrap();
     crypto::verify_digest(&identity_bytes, &digest, &sig).expect("relayed sig verifies");
-    // The prompt rendered the code and the requesting origin.
+    // D29: sign-in over the trusted (key, url) is AUTOMATIC — no prompt ran.
     let seen = summaries.lock().unwrap().clone();
-    assert!(seen.contains(&verify_code(&digest)), "code in prompt: {seen}");
-    assert!(seen.contains(origin_ok), "origin in prompt: {seen}");
+    assert!(seen.is_empty(), "sign_in must not prompt on a trusted url: {seen}");
 
-    // Wrong origin → bad_origin, before any prompt.
+    // Untrusted url + a prompter that doesn't grant trust (the Recorder keeps
+    // the default-deny `approve_trust_url`) → bad_origin. The envelope was
+    // still required to verify FIRST — an unsigned request can't reach the
+    // trust prompt at all.
     let resp = http_post(&addr, "/relay", Some("http://evil.example"), &envelope(&server_sign, &payload));
     assert!(resp.contains("bad_origin"), "{resp}");
 
@@ -203,4 +207,86 @@ fn pairing_and_relay_end_to_end() {
     ));
     let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &payload));
     assert!(resp.contains("unpaired"), "revoked: {resp}");
+}
+
+/// PVOS D27/D29: a relay from a NEW url for a known (verified) key triggers a
+/// one-time "trust this new address?" prompt; approval records the per-`(key,
+/// url)` grant, the sign-in proceeds, and the next sign-in from that url is
+/// automatic — no prompt at all. Pairing itself needs no origins.
+#[test]
+fn new_url_for_known_key_prompts_once_then_signs_in_automatically() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TrustOnce {
+        asked: Arc<AtomicU32>,
+    }
+    impl Prompter for TrustOnce {
+        fn approve(&self, _r: pvfs_companion::RequestType, _o: pvfs_companion::Origin) -> bool {
+            panic!("sign_in must never reach the plain approve prompt");
+        }
+        fn approve_with_context(
+            &self,
+            _r: pvfs_companion::RequestType,
+            _o: pvfs_companion::Origin,
+            _c: Option<&ApprovalContext>,
+        ) -> bool {
+            panic!("sign_in must never reach the context prompt");
+        }
+        fn approve_pair(&self, _n: &str, _k: &str, _o: &[String]) -> bool {
+            true
+        }
+        fn approve_trust_url(&self, name: &str, _k: &str, origin: &str) -> bool {
+            assert_eq!(name, "pvos");
+            assert_eq!(origin, "https://pvos.example");
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    let mn = identity::generate_mnemonic().unwrap();
+    let signer = pvfs_companion::UnlockedSigner::from_phrase(&mn.to_string()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let agent = pvfs_companion::Agent::new(signer, ApprovalPolicy::default())
+        .with_prompter(Box::new(TrustOnce { asked: asked.clone() }))
+        .with_pairings(PairingRegistry::at(&dir.path().join("pairings.json")));
+
+    let server_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let server_pub = hex::encode(crypto::pubkey_bytes(&server_key));
+    let server_sign = |d: &[u8; 32]| crypto::sign_digest(&server_key, d).unwrap();
+
+    // Pair with NO origins — the key alone is the identity (D27).
+    let resp = agent.handle(AgentRequest::Pair {
+        name: "pvos".into(),
+        server_pubkey: server_pub.clone(),
+        origins: vec![],
+    });
+    assert!(matches!(resp, AgentResponse::Paired { .. }), "{resp:?}");
+
+    let payload = RelayPayload {
+        kind: "sign_in".into(),
+        server_pubkey: server_pub.clone(),
+        digest: hex::encode([7u8; 32]),
+        context: None,
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap();
+    let d = crypto::domain_digest(RELAY_DOMAIN, payload_json.as_bytes());
+    let sig_hex = hex::encode(server_sign(&d));
+
+    // First contact from the url: the trust prompt runs once, then it signs.
+    let resp = agent.relay("https://pvos.example", &payload_json, &sig_hex);
+    assert!(matches!(resp, AgentResponse::Signature { .. }), "{resp:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    // The grant was persisted on the pairing…
+    let reg = PairingRegistry::at(&dir.path().join("pairings.json"));
+    assert_eq!(
+        reg.find_by_pubkey(&server_pub).unwrap().origins,
+        vec!["https://pvos.example"]
+    );
+
+    // …so the second sign-in from the same url is fully automatic (D29).
+    let resp = agent.relay("https://pvos.example", &payload_json, &sig_hex);
+    assert!(matches!(resp, AgentResponse::Signature { .. }), "{resp:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "no second trust prompt");
 }

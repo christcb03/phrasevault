@@ -54,8 +54,9 @@ The seed never leaves the vault: not over the socket, not to disk in the clear, 
 
 - **`crates/pvfs-companion`** — new crate; depends on `pvfs-core` (identity/crypto) and `pvfs-proto` (digests, message shapes). Reuses BIP39/BIP32 derivation and `crypto::sign_digest`; adds the vault, the two listeners, and the approval UI.
 - **Local signer socket** (`AF_UNIX`, `0600`, in `$XDG_RUNTIME_DIR/pvfs-companion.sock`): owner-only. The CLI/daemon dial it to request a signature.
-- **Loopback HTTP** (`127.0.0.1`, ephemeral port published to a well-known file): the "Sign in with PVFS" surface for browsers/apps. Never bound to a non-loopback address.
+- **Loopback HTTP** (`127.0.0.1`, stable port 7421 by default, per-launch token in a well-known `0600` file): the "Sign in with PVFS" surface for browsers/apps. Never bound to a non-loopback address.
 - **Approval UI**: a desktop prompt (native dialog where available; a terminal prompt for headless/CLI-only). The agent is usable headless with a pre-approved policy for automation (§4).
+- **Singleton per user** (2026-07-21, from PVOS M3.5 live testing): `serve` **takes over** on launch — an instance already answering on the conventional socket is killed via its pidfile (`<socket>.pid`, SIGTERM → SIGKILL after 5 s), the socket is rebound, and the stable web relay port is re-acquired (with a short retry while the predecessor releases it). A pre-pidfile instance that can't be located is orphaned with a loud warning. `pvfs-companion restart` is the explicit affordance (same flags as `serve`), and the macOS menu-bar app has a matching **Restart agent** item.
 
 ---
 
@@ -110,6 +111,29 @@ A loopback HTTP endpoint lets a PVFS-backed web app authenticate the user with n
 - **Flow.** App ↔ its PVFS daemon does the doc 07 §2 challenge; the app hands the challenge to the companion's loopback endpoint; the companion signs it with the **identity key** and returns the signature; the app proves the identity to the daemon. While the companion runs and the origin is connected, this is automatic.
 - **Origin gating (the security boundary).** Every request carries its web **origin**. First contact from an origin requires an explicit **connect** approval (wallet-style: "Allow `app.example` to sign in as you?"). Connected origins are stored with a scope + TTL and are individually **revocable** in the UI. The connect grant authorizes **identity assertions only** — never root events (§4).
 - **No ambient authority.** Loopback only; a per-launch token in the well-known port file so only local processes that can read the user's runtime dir can talk to it; CORS/Origin checks; no wildcard origins.
+
+### 6.1 Server pairing & browser relay (PVOS M3.1; trust model per PVOS D27/D29)
+
+A *pairing* enrolls a known server (e.g. `pvosd`) once — over the `0600` agent
+socket, human-approved — so its pages can submit **relayed** signing requests
+through the browser (`POST /relay`, deliberately token-exempt: the pairing is
+its authentication).
+
+- **The key is the identity (D27).** A relay payload must verify against the
+  paired server key (`pvfs:relay:v1:` domain digest) — that check runs before
+  anything else. URLs are **not** pinned at pair time: each `(server key, url)`
+  is a trust grant learned on first contact — a relay from a new url for a
+  known key gets a one-time "trust this new address for *server*?" prompt and
+  is remembered on approval (`pairings.json`, next to the vault; manage with
+  `pvfs-companion pairings trust|untrust|revoke`). No re-pair when a server
+  moves or gains an https origin.
+- **Auto sign-in (D29).** `sign_in` relayed over a trusted `(key, url)` is the
+  **auto tier** — no approval tap per login; the pairing approval plus the url
+  trust grant are the standing consent (on first contact, the trust prompt
+  covers that login too). `user_action` and everything admin/sensitive keeps
+  its per-request context prompt (doc 16 §3), with the 6-digit verify code.
+- **Rate limit, lock, and audit apply unchanged**; the audit log records
+  `url_trusted` / `url_trust_denied` events and every relay decision.
 
 ---
 

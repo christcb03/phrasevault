@@ -57,6 +57,11 @@ Without those env vars you still get a local DMG (ad-hoc / unsigned) for your ow
 
 If “nothing happens,” check the menu bar (and quit any duplicate `PVFS Companion` process in Activity Monitor).
 
+The embedded agent is a **singleton per user**: starting it (menu-bar **Start
+agent**, **Restart agent**, or a CLI `pvfs-companion serve`/`restart`) takes
+over from whichever instance currently holds the socket — no more two copies
+fighting over `/tmp/pvfs-companion-<user>.sock`.
+
 ## Layout
 
 ```

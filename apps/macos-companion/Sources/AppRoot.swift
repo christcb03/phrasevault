@@ -136,6 +136,7 @@ struct MenuBarRoot: View {
                 }
             } else if agent.agentRunning {
                 Button("Lock keys") { agent.lockAgent() }
+                Button("Restart agent") { restartAgent() }
                 Button("Stop agent") { agent.stopAgent() }
             } else {
                 Button("Start agent") { startAgent() }
@@ -218,6 +219,20 @@ struct MenuBarRoot: View {
     private func startAgent() {
         do {
             try agent.startAgent()
+        } catch AgentError.needsPassword {
+            showPasswordSheet = true
+        } catch {
+            if agent.sealing == .passphrase {
+                showPasswordSheet = true
+            } else {
+                agent.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func restartAgent() {
+        do {
+            try agent.restartAgent()
         } catch AgentError.needsPassword {
             showPasswordSheet = true
         } catch {

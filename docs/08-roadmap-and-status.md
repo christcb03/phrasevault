@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-07-11.
+Status: **Living document** — update as phases land. Last updated 2026-07-22.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–16; this is the index + the honest "what's not done yet."
@@ -128,6 +128,16 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 - **CLI `remote add-node` / `payload` wrappers** — library API exists; thin CLI surface optional for operators.
 - **`key:`-grants-to-revoked-devices in `pvfs audit`** (§4 item 14 follow-on; masking already correct).
 - **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — driven by PVOS D18.
+
+### 3.2 — Unreleased (the 1.2 line, as of 2026-07-22)
+
+| Item | State |
+|------|--------|
+| **Expiring ACL grants** (doc 13 Q-E1): `AclSet.expires_at`, read-path masking, `--expires`, daemon `SetAcl.expires_at`, projection schema v3 | ✅ built — *recovered from a stranded worktree*: authored post-1.0 but never merged, so the `v1.1` tag shipped without it; now rebased onto the 1.1 line (expiry masking composes with revoked-key `key:` masking) |
+| **Companion: key-based pairing trust + auto sign-in** (PVOS D27/D29) | ✅ built (doc 14 §6.1, doc 16 §2) |
+| **Companion: singleton per user + restart affordance** | ✅ built (doc 14 §2) |
+
+All three await pipeline validation on the Linux host before a `v1.2` tag.
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
@@ -288,22 +298,23 @@ now **decided** and **shipped** (items 11–12, doc 10 §9); CLI auto-routing (3
 is fixed and tested with a daemon running (item 16). **Scope decided (2026-06-29):** companion app
 and encryption-at-rest (P3) are both committed to 1.0.
 
-**Requested (2026-07-22, Chris — companion trust + session UX, PVOS D27/D29):** (a) pairing should
-bind to the server's **key**, not a pinned origin list: a relay from a new url for a known key
-prompts once ("trust this new address for <server>?") and is remembered — the current
-origins-at-pair-time model forced a re-pair just to add an https origin; (b) **auto sign-in** for
-trusted (key, url) pairs — no approval tap per login; prompts only for first contact and
-admin/sensitive request types (the doc 16 §3 policy tiers already model this — move `sign_in` to
-the auto tier for trusted origins). Details in PVOS `docs/DECISIONS.md` D27/D29.
+**Built (2026-07-22, unreleased — companion trust + session UX, PVOS D27/D29):** (a) pairing now
+binds to the server's **key**, not a pinned origin list: the relay envelope verifies against the
+paired key first, and a relay from a new url for a known key prompts once ("trust this new address
+for <server>?") and is remembered as a per-`(key, url)` trust grant (`pairings trust/untrust`
+manage them; pairing itself needs no origins, `API_VERSION` 3 additive); (b) **auto sign-in** for
+trusted (key, url) pairs — `sign_in` joined the auto tier (doc 16 §2), no approval tap per login;
+prompts remain for first contact and admin/sensitive request types. Doc 14 §6.1. Details in PVOS
+`docs/DECISIONS.md` D27/D29.
 
-**Requested (2026-07-21, from PVOS M3.5 live testing):** the companion must be a **singleton per
-user** — on launch, detect an existing instance (live socket at the conventional path / pidfile)
-and **take over: kill the stale copy, rebind the socket, keep serving the web relay port**.
-Observed failure: a menu-bar `PVFS Companion.app` and a CLI `pvfs-companion serve` ran side by
-side, both holding FDs on `/tmp/pvfs-companion-<user>.sock` (the later bind orphaned the first),
-the menu-bar icon disappeared, and which copy answered was luck. Also wanted: an explicit
-**restart** affordance (menu-bar item and/or `pvfs-companion restart`). Companion work tracks
-doc 14.
+**Built (2026-07-22, unreleased — requested 2026-07-21 from PVOS M3.5 live testing):** the
+companion is now a **singleton per user** — on launch `serve` detects an existing instance
+(conventional socket + `<socket>.pid` pidfile) and **takes over: kills the stale copy (SIGTERM →
+SIGKILL), rebinds the socket, re-acquires the stable web relay port** (retry while the predecessor
+releases it). The observed dual-instance failure (menu-bar app + CLI `serve` both holding FDs on
+the socket, later bind orphaning the first) can no longer happen; a pre-pidfile instance is
+orphaned with a loud warning. Explicit **restart** affordances: `pvfs-companion restart` and a
+menu-bar "Restart agent" item. Doc 14 §2.
 
 ---
 

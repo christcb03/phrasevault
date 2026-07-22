@@ -14,7 +14,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// v2: pairing (`Pair`/`ListPairings`/`RevokePairing`) + the browser-relay
 /// envelope (PVOS M3.1).
-pub const API_VERSION: u32 = 2;
+///
+/// v3 (additive; PVOS D27/D29): pairing binds to the server **key**, not a
+/// pinned origin list — `Pair.origins` is optional (any given are pre-trusted
+/// urls), a relay from a new url for a known key gets a one-time "trust this
+/// new address?" prompt (remembered as a per-`(key, url)` grant), and
+/// `sign_in` from a trusted url auto-approves. v2 clients work unchanged.
+pub const API_VERSION: u32 = 3;
 
 /// Domain prefix for the relay envelope signature: the paired server signs
 /// `domain_digest(RELAY_DOMAIN, payload_json_bytes)`.
@@ -44,10 +50,12 @@ pub struct RelayPayload {
 }
 
 /// A pairing as reported over the socket (no secrets — it's all public data).
+/// `origins` are the urls trusted for this server key so far (D27).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairingInfo {
     pub name: String,
     pub server_pubkey_hex: String,
+    #[serde(default)]
     pub origins: Vec<String>,
     pub created_ms: u64,
 }
@@ -110,13 +118,16 @@ pub enum AgentRequest {
         nonce: String,
         wrapped_key: String,
     },
-    /// Enroll a paired server (PVOS M3.1): human-prompted (name + key +
-    /// origins rendered); replaces an existing pairing of the same name.
-    /// Answers `Paired{identity_pubkey}` so the server can store the identity
-    /// it will verify relayed answers against.
+    /// Enroll a paired server (PVOS M3.1; D27 trust model): human-prompted
+    /// (name + key rendered); replaces an existing pairing of the same name.
+    /// `origins` is optional — the key is the identity; urls are trusted on
+    /// first contact (any listed here are pre-trusted). Answers
+    /// `Paired{identity_pubkey}` so the server can store the identity it will
+    /// verify relayed answers against.
     Pair {
         name: String,
         server_pubkey: String,
+        #[serde(default)]
         origins: Vec<String>,
     },
     ListPairings,

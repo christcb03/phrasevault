@@ -240,16 +240,17 @@ impl Agent {
         }
     }
 
-    /// The identity public key (for a connected origin's `/identity`).
-    /// Enroll a paired server (PVOS M3.1). Socket-only (0600-trusted caller);
-    /// human-prompted with name + key + origins; answers with the identity
-    /// pubkey the server stores for verifying relayed answers.
+    /// Enroll a paired server (PVOS M3.1; trust model per PVOS D27). Socket-only
+    /// (0600-trusted caller); human-prompted with name + key; answers with the
+    /// identity pubkey the server stores for verifying relayed answers. Origins
+    /// are optional — the key is the identity, and urls become per-`(key, url)`
+    /// trust grants approved on first contact (any passed here are pre-trusted).
     fn pair(&self, name: &str, server_pubkey: &str, origins: Vec<String>) -> AgentResponse {
         let Some(reg) = &self.pairings else {
             return AgentResponse::error("unsupported", "pairing not enabled");
         };
-        if name.is_empty() || origins.is_empty() {
-            return AgentResponse::error("bad_input", "pairing needs a name and origins");
+        if name.is_empty() {
+            return AgentResponse::error("bad_input", "pairing needs a name");
         }
         let Ok(pk) = hex::decode(server_pubkey) else {
             return AgentResponse::error("bad_input", "server_pubkey not hex");
@@ -277,12 +278,18 @@ impl Agent {
         }
     }
 
-    /// A browser-relayed signing request from a paired server (M3.1 §3.2/3.3).
-    /// `request_origin` is the relaying page's browser-enforced Origin header.
-    /// Verification order: pairing exists (by claimed key) → Origin bound to
-    /// that pairing → envelope signature over `domain_digest(RELAY_DOMAIN,
-    /// payload_json)` → inner digest/context agreement → rate limit → prompt
-    /// (server name + origin + 6-digit code + context) → sign.
+    /// A browser-relayed signing request from a paired server (M3.1 §3.2/3.3;
+    /// trust model per PVOS D27/D29). `request_origin` is the relaying page's
+    /// browser-enforced Origin header. Verification order: pairing exists (by
+    /// claimed key) → envelope signature over `domain_digest(RELAY_DOMAIN,
+    /// payload_json)` → url trusted for that key (else the one-time "trust
+    /// this new address?" prompt — remembered on approval) → inner
+    /// digest/context agreement → rate limit → approval: `sign_in` from a
+    /// trusted url is **automatic** (D29); `user_action` still prompts with
+    /// its context (server name + origin + 6-digit code) → sign.
+    ///
+    /// Note the order: the signature check comes FIRST — a "trust this
+    /// address?" prompt must never be triggerable by an unsigned request.
     pub fn relay(
         &self,
         request_origin: &str,
@@ -300,9 +307,6 @@ impl Agent {
         let Some(pairing) = reg.find_by_pubkey(&payload.server_pubkey) else {
             return AgentResponse::error("unpaired", "no pairing for that server key");
         };
-        if !pairing.origins.iter().any(|o| o == request_origin) {
-            return AgentResponse::error("bad_origin", "origin not bound to this pairing");
-        }
         let (Ok(pk), Ok(sig)) = (hex::decode(&payload.server_pubkey), hex::decode(server_sig_hex))
         else {
             return AgentResponse::error("bad_input", "sig not hex");
@@ -310,6 +314,23 @@ impl Agent {
         let relay_digest = pvfs_core::crypto::domain_digest(RELAY_DOMAIN, payload_json.as_bytes());
         if pvfs_core::crypto::verify_digest(&pk, &relay_digest, &sig).is_err() {
             return AgentResponse::error("bad_sig", "envelope signature does not verify");
+        }
+        // D27: the key is the identity; the url is a trust grant. First contact
+        // from a new url for this (verified) key prompts once and is remembered.
+        let url_trusted = pairing.origins.iter().any(|o| o == request_origin);
+        if !url_trusted {
+            if !self.prompter.approve_trust_url(
+                &pairing.name,
+                &pairing.server_pubkey_hex,
+                request_origin,
+            ) {
+                self.audit_event("url_trust_denied");
+                return AgentResponse::error("bad_origin", "address not trusted for this pairing");
+            }
+            if let Err(e) = reg.trust_origin(&pairing.server_pubkey_hex, request_origin) {
+                return AgentResponse::error("io", e.to_string());
+            }
+            self.audit_event("url_trusted");
         }
         let Ok(bytes) = hex::decode(&payload.digest) else {
             return AgentResponse::error("bad_input", "digest not hex");
@@ -357,12 +378,20 @@ impl Agent {
             self.audit_sign(rt_name, Origin::Web, "rate_limited", &payload.digest, Some(&context));
             return AgentResponse::error("rate_limited", "too many signature requests");
         }
-        let approved = match self.policy.decide(rt, Origin::Web) {
-            Decision::Approve => true,
-            Decision::Deny => false,
-            Decision::Prompt => self
-                .prompter
-                .approve_with_context(rt, Origin::Web, Some(&context)),
+        // D29: sign-in over a trusted (key, url) is the auto tier — the pairing
+        // approval + the url trust grant ARE the standing consent, so no tap per
+        // login (on first contact, the trust prompt above just covered it).
+        // Admin/sensitive kinds (`user_action`) keep their per-request prompt.
+        let approved = if rt == RequestType::IdentityAssertion {
+            true
+        } else {
+            match self.policy.decide(rt, Origin::Web) {
+                Decision::Approve => true,
+                Decision::Deny => false,
+                Decision::Prompt => self
+                    .prompter
+                    .approve_with_context(rt, Origin::Web, Some(&context)),
+            }
         };
         if !approved {
             self.audit_sign(rt_name, Origin::Web, "denied", &payload.digest, Some(&context));

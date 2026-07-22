@@ -24,6 +24,7 @@ os-keychain = ["dep:keyring"]
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+nix = { workspace = true, features = ["signal"] }
 clap.workspace = true
 thiserror.workspace = true
 hex.workspace = true

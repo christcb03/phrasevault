@@ -21,6 +21,7 @@ mod webagent;
 mod proto;
 mod session;
 mod signer;
+mod singleton;
 mod store;
 mod tenant;
 mod vault;
@@ -42,6 +43,7 @@ pub use proto::{
     API_VERSION, RELAY_DOMAIN,
 };
 pub use session::{DeviceTrust, SessionError, Sessions};
+pub use singleton::{pidfile_path, take_over, write_pidfile, TakeoverReport};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
 pub use store::{StoreError, VaultStore};
 pub use tenant::{serve_tenant, tenant_request, TenantAgent, TenantRequest, TenantResponse};
