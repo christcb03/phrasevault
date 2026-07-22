@@ -137,7 +137,11 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 | **Companion: key-based pairing trust + auto sign-in** (PVOS D27/D29) | ✅ built (doc 14 §6.1, doc 16 §2) |
 | **Companion: singleton per user + restart affordance** | ✅ built (doc 14 §2) |
 
-All three await pipeline validation on the Linux host before a `v1.2` tag.
+All three **validated on presubuntu** (2026-07-22): pipeline `deploy → build →
+test → smoke` green — 169 unit/integration tests + 188 smoke checks, 0 failures
+(includes the new expiring-grant engine/wire/CLI tests, the D27 trust-on-first-
+contact test, the D29 no-prompt sign-in assertions, and a real-process
+takeover/restart e2e). `v1.2` tag pending (Chris tags manually).
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
