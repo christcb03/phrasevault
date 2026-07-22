@@ -288,6 +288,14 @@ now **decided** and **shipped** (items 11–12, doc 10 §9); CLI auto-routing (3
 is fixed and tested with a daemon running (item 16). **Scope decided (2026-06-29):** companion app
 and encryption-at-rest (P3) are both committed to 1.0.
 
+**Requested (2026-07-22, Chris — companion trust + session UX, PVOS D27/D29):** (a) pairing should
+bind to the server's **key**, not a pinned origin list: a relay from a new url for a known key
+prompts once ("trust this new address for <server>?") and is remembered — the current
+origins-at-pair-time model forced a re-pair just to add an https origin; (b) **auto sign-in** for
+trusted (key, url) pairs — no approval tap per login; prompts only for first contact and
+admin/sensitive request types (the doc 16 §3 policy tiers already model this — move `sign_in` to
+the auto tier for trusted origins). Details in PVOS `docs/DECISIONS.md` D27/D29.
+
 **Requested (2026-07-21, from PVOS M3.5 live testing):** the companion must be a **singleton per
 user** — on launch, detect an existing instance (live socket at the conventional path / pidfile)
 and **take over: kill the stale copy, rebind the socket, keep serving the web relay port**.
