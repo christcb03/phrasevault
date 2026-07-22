@@ -362,6 +362,21 @@ pvfs-companion origins                     # who's connected, and until when
 pvfs-companion origins revoke <origin>     # disconnect one immediately
 ```
 
+Paired servers (e.g. a PVOS install) relay sign-ins through your browser. A
+pairing is identified by the server's **key**; the first request from a new
+address asks once ("trust this new address?") and is then automatic:
+
+```bash
+pvfs-companion pairings                    # paired servers + their trusted urls
+pvfs-companion pairings trust <name> <url>   # pre-trust an address
+pvfs-companion pairings untrust <name> <url> # forget one (it will ask again)
+pvfs-companion pairings revoke <name>      # unpair the server entirely
+```
+
+Only one companion runs per user: starting a new `serve` (or
+`pvfs-companion restart`, or the menu-bar app's Restart agent) takes over
+from the instance currently holding the socket.
+
 ### If something goes wrong
 
 | Problem | What it looks like | Recovery |
