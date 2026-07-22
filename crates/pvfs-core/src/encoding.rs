@@ -138,6 +138,12 @@ impl<'a> Dec<'a> {
         }
     }
 
+    /// Bytes not yet consumed — lets a decoder accept an optional trailing
+    /// field added by a later version (e.g. `AclSet.expires_at`, doc 13 Q-E1).
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
     /// Assert the input is fully consumed (canonical: no trailing bytes).
     pub fn finish(self) -> Result<()> {
         if self.pos != self.data.len() {

@@ -344,7 +344,7 @@ run `pvfs member replace <file>`).
 | `pvfs forest recovery-key [--forest F]` | Register an offline rotation recovery key (phrase on stdin; prints a paper phrase). |
 | `pvfs forest rotate-root [--forest F]` | Rotate the root after seed compromise (phrase on stdin; prints a new phrase). |
 | `pvfs identity replace` · `pvfs member replace <file>` | Replace a compromised identity key · adopt a member's replacement from a handoff. |
-| `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights>` | Grant/clear rights (`-` clears). |
+| `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights> [--expires 7d\|@ms]` | Grant/clear rights (`-` clears); `--expires` makes the grant lapse after a duration (`45s`/`30m`/`12h`/`7d`/`2w`) or at `@<unix-ms>`. |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
 | `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |
 | `pvfs whoami` | Print this machine's client identity pubkey. |
