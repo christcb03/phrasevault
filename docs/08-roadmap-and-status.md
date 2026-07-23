@@ -303,6 +303,13 @@ now **decided** and **shipped** (items 11–12, doc 10 §9); CLI auto-routing (3
 is fixed and tested with a daemon running (item 16). **Scope decided (2026-06-29):** companion app
 and encryption-at-rest (P3) are both committed to 1.0.
 
+**Shipped (2026-07-22): web-agent HTTPS (PVOS M3.6 §4a).** The loopback agent serves 7421
+dual-mode (TLS-or-plain via first-byte peek) with a generated localhost cert offered to the login
+keychain — the https desktop no longer relies on the browser loopback mixed-content exemption.
+Operational lesson: replacing a binary inside the .app breaks the ad-hoc bundle seal, and keychain
+approvals stop sticking (prompt storms) — re-sign after any swap (`codesign --force --deep -s -`);
+a STABLE signing identity for the .app would make approvals survive rebuilds (wanted, small).
+
 **Built (2026-07-22, unreleased — companion trust + session UX, PVOS D27/D29):** (a) pairing now
 binds to the server's **key**, not a pinned origin list: the relay envelope verifies against the
 paired key first, and a relay from a new url for a known key prompts once ("trust this new address
