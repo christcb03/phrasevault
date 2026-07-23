@@ -15,7 +15,7 @@
 //! - `POST /sign-in`  — `{challenge: <64-hex>}` → `{sig, pubkey}`, connected only.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -62,19 +62,37 @@ impl WebAgent {
         f.write_all(json.as_bytes())
     }
 
-    /// Serve until the listener closes — one thread per connection.
-    pub fn serve(self: Arc<Self>, listener: TcpListener) {
+    /// Serve until the listener closes — one thread per connection. With TLS
+    /// material (PVOS M3.6 §4a) the port is DUAL-MODE: a one-byte peek tells
+    /// a TLS ClientHello (0x16) from plain HTTP, so an https desktop page
+    /// and an older http caller share the same 7421 through the transition.
+    pub fn serve(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let me = Arc::clone(&self);
+            let tls = tls.clone();
             std::thread::spawn(move || {
-                let _ = me.handle_conn(stream);
+                let mut first = [0u8; 1];
+                let is_tls = matches!(stream.peek(&mut first), Ok(1) if first[0] == 0x16);
+                match (is_tls, tls) {
+                    (true, Some(cfg)) => {
+                        let Ok(conn) = rustls::ServerConnection::new(cfg) else { return };
+                        let _ = me.handle_conn(rustls::StreamOwned::new(conn, stream));
+                    }
+                    _ => {
+                        let _ = me.handle_conn(stream);
+                    }
+                }
             });
         }
     }
 
-    fn handle_conn(&self, mut stream: TcpStream) -> std::io::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
+    fn handle_conn<S: Read + Write>(&self, stream: S) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream);
 
         // Request line.
         let mut line = String::new();
@@ -108,14 +126,14 @@ impl WebAgent {
 
         // CORS preflight needs no token (the browser sends it without headers).
         if method == "OPTIONS" {
-            return respond(&mut stream, 204, "No Content", origin.as_deref(), "");
+            return respond(reader.get_mut(), 204, "No Content", origin.as_deref(), "");
         }
         // `/relay` is deliberately token-exempt (M3.1): its authentication is
         // the paired-server signature + the Origin↔pairing binding, so a page
         // needs no port-file secret — which is the whole point of pairing.
         if path != "/relay" && token.as_deref() != Some(self.token.as_str()) {
             return respond_json(
-                &mut stream,
+                reader.get_mut(),
                 401,
                 "Unauthorized",
                 origin.as_deref(),
@@ -124,7 +142,7 @@ impl WebAgent {
         }
         let Some(origin) = origin else {
             return respond_json(
-                &mut stream,
+                reader.get_mut(),
                 400,
                 "Bad Request",
                 None,
@@ -135,7 +153,7 @@ impl WebAgent {
         // Body.
         if content_length > MAX_BODY {
             return respond_json(
-                &mut stream,
+                reader.get_mut(),
                 413,
                 "Payload Too Large",
                 Some(&origin),
@@ -147,7 +165,7 @@ impl WebAgent {
         let body = String::from_utf8_lossy(&body);
 
         let (status, reason, out) = self.route(&method, &path, &origin, &body);
-        respond_json(&mut stream, status, reason, Some(&origin), &out)
+        respond_json(reader.get_mut(), status, reason, Some(&origin), &out)
     }
 
     fn route(&self, method: &str, path: &str, origin: &str, body: &str) -> (u16, &'static str, String) {
@@ -256,8 +274,8 @@ fn json_str_field(body: &str, field: &str) -> Option<String> {
     v.get(field)?.as_str().map(|s| s.to_string())
 }
 
-fn respond_json(
-    stream: &mut TcpStream,
+fn respond_json<W: Write>(
+    stream: &mut W,
     status: u16,
     reason: &str,
     origin: Option<&str>,
@@ -266,8 +284,8 @@ fn respond_json(
     respond(stream, status, reason, origin, body)
 }
 
-fn respond(
-    stream: &mut TcpStream,
+fn respond<W: Write>(
+    stream: &mut W,
     status: u16,
     reason: &str,
     origin: Option<&str>,

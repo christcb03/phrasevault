@@ -117,7 +117,7 @@ fn sign_in_with_pvfs_against_a_live_daemon() {
     let addr = http_listener.local_addr().unwrap().to_string();
     {
         let w = Arc::clone(&web);
-        std::thread::spawn(move || w.serve(http_listener));
+        std::thread::spawn(move || w.serve(http_listener, None));
     }
 
     // The app's origin connects once (the human approves — wallet-style).

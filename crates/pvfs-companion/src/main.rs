@@ -594,8 +594,24 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     web.write_port_file(&port_file, &addr)
         .map_err(|e| e.to_string())?;
     {
+        // Web-agent TLS (PVOS M3.6 §4a): serve https on the same port
+        // (dual-mode peek keeps plain-http callers working). Best-effort —
+        // a failure here keeps the agent up in http-only mode.
+        let tls = match pvfs_companion::webtls::load_or_generate(&vault) {
+            Ok(t) => {
+                if t.fresh {
+                    pvfs_companion::webtls::install_trust(&t.cert_path);
+                }
+                eprintln!("companion: web agent serves https (dual-mode) on port {web_port}");
+                Some(t.config)
+            }
+            Err(e) => {
+                eprintln!("companion: web-agent TLS unavailable ({e}) — serving plain http");
+                None
+            }
+        };
         let w = Arc::clone(&web);
-        std::thread::spawn(move || w.serve(http));
+        std::thread::spawn(move || w.serve(http, tls));
     }
 
     eprintln!("pvfs-companion: serving on {}", socket.display());
@@ -608,7 +624,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         audit_path.display()
     );
     eprintln!(
-        "pvfs-companion: identity agent on http://{addr} (port file {})",
+        "pvfs-companion: identity agent on http(s)://{addr} (dual-mode; port file {})",
         port_file.display()
     );
     serve(listener, agent).map_err(|e| e.to_string())?;

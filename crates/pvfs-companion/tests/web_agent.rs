@@ -73,11 +73,78 @@ fn start(prompter: Box<dyn Prompter>) -> (String, String, Vec<u8>, tempfile::Tem
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    // Dual-mode (M3.6 §4a): every test serves WITH TLS material, so the
+    // plain-http requests below double as the peek-fallback coverage.
+    let tls = pvfs_companion::webtls::load_or_generate(&dir.path().join("companion.vault"))
+        .unwrap();
     {
         let w = Arc::clone(&web);
-        std::thread::spawn(move || w.serve(listener));
+        let cfg = tls.config.clone();
+        std::thread::spawn(move || w.serve(listener, Some(cfg)));
     }
     (addr, token, id_pub, dir)
+}
+
+/// The same raw request, but through a rustls client that trusts the
+/// generated web-agent cert — the https side of the dual-mode port.
+fn https_get_identity(addr: &str, dir: &tempfile::TempDir, token: &str, origin: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(
+            pvfs_companion::webtls::webtls_dir(&dir.path().join("companion.vault"))
+                .join("cert.pem"),
+        )
+        .unwrap(),
+    )) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let conn = rustls::ClientConnection::new(cfg, name).unwrap();
+    let mut s = rustls::StreamOwned::new(conn, tcp);
+    write!(
+        s,
+        "GET /identity HTTP/1.1
+Host: x
+Origin: {origin}
+X-Pvfs-Token: {token}
+         Content-Length: 0
+Connection: close
+
+"
+    )
+    .unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+#[test]
+fn dual_mode_serves_https_and_http_on_one_port() {
+    // M3.6 §4a: the same port answers a rustls client (an https desktop
+    // page, no loopback-exception reliance) AND a plain-http caller (older
+    // pages) — the one-byte peek routes each correctly.
+    let (addr, token, id_pub, dir) = start(Box::new(ApproveAll));
+    let app = "https://app.example";
+    let (code, _) = http(&addr, "POST", "/connect", app, &token, "");
+    assert_eq!(code, 200);
+
+    // Plain http still works (this is also every other test's transport).
+    let (code, body) = http(&addr, "GET", "/identity", app, &token, "");
+    assert_eq!(code, 200);
+    assert_eq!(jfield(&body, "pubkey"), hex::encode(&id_pub));
+
+    // https on the SAME port, trusting the generated cert.
+    let out = https_get_identity(&addr, &dir, &token, app);
+    assert!(out.contains("200 OK"), "https identity over dual-mode port: {out}");
+    assert!(out.contains(&hex::encode(&id_pub)), "same identity over TLS: {out}");
 }
 
 #[test]

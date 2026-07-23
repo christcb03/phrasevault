@@ -125,7 +125,7 @@ fn pairing_and_relay_end_to_end() {
     let addr = format!("127.0.0.1:{}", http.local_addr().unwrap().port());
     {
         let w = Arc::clone(&web);
-        std::thread::spawn(move || w.serve(http));
+        std::thread::spawn(move || w.serve(http, None));
     }
 
     // sign_in happy path (note: NO x-pvfs-token header anywhere).

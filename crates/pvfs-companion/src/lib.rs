@@ -18,6 +18,7 @@ mod pairings;
 mod paths;
 mod policy;
 mod webagent;
+pub mod webtls;
 mod proto;
 mod session;
 mod signer;
