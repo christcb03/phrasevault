@@ -143,11 +143,13 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 | **`pvfs remote add-node` / `payload`** — the CLI face of the 1.1 daemon ops | ✅ built (2026-07-22) |
 | **`pvfs audit` completeness**: revoked-key direct `key:` grants + expired grants reported (guest keys stay unreported — their grants are live) | ✅ built (2026-07-22) |
 
-All three **validated on presubuntu** (2026-07-22): pipeline `deploy → build →
-test → smoke` green — 169 unit/integration tests + 188 smoke checks, 0 failures
-(includes the new expiring-grant engine/wire/CLI tests, the D27 trust-on-first-
-contact test, the D29 no-prompt sign-in assertions, and a real-process
-takeover/restart e2e). `v1.2` tag pending (Chris tags manually).
+The whole 1.2 line **validated on presubuntu** (2026-07-22): pipeline `deploy →
+build → test → smoke` green — **172 unit/integration tests + 193 smoke checks,
+0 failures**, clippy `-D warnings` clean (includes the expiring-grant
+engine/wire/CLI tests, the D27/D29 trust + auto sign-in tests, the real-process
+takeover/restart e2e, the read-pool cross-connection visibility test, and the
+new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
+`v1.2` tag pending (Chris tags manually).
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
