@@ -256,7 +256,7 @@ On a Mac you can use a native menu-bar app instead of the CLI:
 ./apps/macos-companion/build.sh
 open "dist/PVFS Companion.app"
 # optional installer image:
-./apps/macos-companion/package-dmg.sh   # → dist/PVFS-Companion-1.1.0.dmg
+./apps/macos-companion/package-dmg.sh   # → dist/PVFS-Companion-<version>.dmg
 ```
 
 Setup (create/import recovery phrase), Keychain sealing, menu-bar agent, console (origins/audit), open-at-login. See [apps/macos-companion/README.md](../apps/macos-companion/README.md).

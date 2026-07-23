@@ -7,7 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="${1:-$ROOT/dist/PVFS Companion.app}"
 STAGE="$ROOT/dist/dmg-stage"
-DMG="$ROOT/dist/PVFS-Companion-1.1.0.dmg"
+# Version from the workspace manifest, so the DMG always names the release it
+# was built from (no hardcoded bump to forget).
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+DMG="$ROOT/dist/PVFS-Companion-${VERSION:?could not read version from Cargo.toml}.dmg"
 VOL="PVFS Companion"
 
 if [[ ! -d "$APP" ]]; then

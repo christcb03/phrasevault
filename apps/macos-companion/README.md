@@ -29,7 +29,7 @@ Optional: copy to `/Applications` (recommended for login items).
 ```bash
 ./apps/macos-companion/build.sh
 ./apps/macos-companion/package-dmg.sh
-# → dist/PVFS-Companion-1.1.0.dmg
+# → dist/PVFS-Companion-<version>.dmg
 ```
 
 ### Sign & notarize (needs Apple Developer account)
