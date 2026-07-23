@@ -136,6 +136,7 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 | **Expiring ACL grants** (doc 13 Q-E1): `AclSet.expires_at`, read-path masking, `--expires`, daemon `SetAcl.expires_at`, projection schema v3 | ✅ built — *recovered from a stranded worktree*: authored post-1.0 but never merged, so the `v1.1` tag shipped without it; now rebased onto the 1.1 line (expiry masking composes with revoked-key `key:` masking) |
 | **Companion: key-based pairing trust + auto sign-in** (PVOS D27/D29) | ✅ built (doc 14 §6.1, doc 16 §2) |
 | **Companion: singleton per user + restart affordance** | ✅ built (doc 14 §2) |
+| **Companion: web agent serves https** (PVOS M3.6 §4a) — localhost cert next to the vault, dual-mode port 7421 (TLS + plain http through the transition) | ✅ built (2026-07-22, after the validation run below; covered by the dual-mode e2e test) |
 
 All three **validated on presubuntu** (2026-07-22): pipeline `deploy → build →
 test → smoke` green — 169 unit/integration tests + 188 smoke checks, 0 failures

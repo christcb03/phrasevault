@@ -16,6 +16,13 @@ file tracks Layer 0, the file-system engine.
   `sign_in` relayed over a trusted `(key, url)` auto-approves — no tap per
   login; prompts remain for first contact and admin/sensitive request types
   (`user_action` unchanged). Rate limit, lock, and audit unchanged.
+- **Companion: web agent serves https** (PVOS M3.6 §4a): the loopback agent
+  generates a `localhost`/`127.0.0.1` cert next to the vault (key `0600`),
+  offers it to the macOS login keychain once, and serves port 7421
+  **dual-mode** — a one-byte peek distinguishes a TLS ClientHello from plain
+  HTTP, so https pages and older http callers share the port through the
+  transition. Closes the reliance on Chromium's loopback mixed-content
+  exemption.
 - **Companion: singleton per user + restart** (2026-07-21 request, PVOS M3.5):
   `serve` takes over an existing instance on launch — kill via `<socket>.pid`
   (SIGTERM → SIGKILL), rebind the socket, re-acquire the stable web port —
