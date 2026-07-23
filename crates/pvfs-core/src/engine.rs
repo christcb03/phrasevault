@@ -89,6 +89,26 @@ pub(crate) fn bad(field: &str, reason: &str) -> PvfsError {
     }
 }
 
+/// Open the same databases **read-only** for a metadata read view (doc 07 §6).
+/// WAL lets these run concurrently with the single writer connection; the -shm
+/// coordination file already exists because the writer is open (same process).
+fn open_connection_read_only(data_dir: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        data_dir.join(INDEX_FILE),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(map_db("open index.db read-only"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(map_db("busy timeout"))?;
+    let log_path = data_dir.join(LOG_FILE).to_string_lossy().into_owned();
+    // The attached db inherits the connection's read-only mode; no schema
+    // creation and no journal-mode pragma — the writer configured WAL already.
+    conn.execute("ATTACH DATABASE ?1 AS log", params![log_path])
+        .map_err(map_db("attach log.db read-only"))?;
+    Ok(conn)
+}
+
 fn open_connection(data_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(data_dir.join(INDEX_FILE)).map_err(map_db("open index.db"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -398,6 +418,29 @@ impl Engine {
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
         Ok(engine)
+    }
+
+    /// An additional **read-only view** of an already-open forest, for the
+    /// daemon's concurrent metadata reads (doc 07 §6): the same databases on a
+    /// `SQLITE_OPEN_READ_ONLY` connection, with none of `open`'s startup writes
+    /// (no clean-shutdown flip, no self-heal, no spool sweep — the primary
+    /// writer engine did those; a view that finds a schema it doesn't speak
+    /// errors instead of rebuilding). Read methods behave identically; any
+    /// mutating call fails at the SQLite layer, so misuse cannot corrupt.
+    /// Open views only while a writer `Engine` has the forest open.
+    pub fn open_read_view(data_dir: &Path) -> Result<Engine> {
+        let device = DeviceKeyCache::load(data_dir)?;
+        let conn = open_connection_read_only(data_dir)?;
+        let identity = projection::read_view_check(&conn)?;
+        Ok(Engine {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            device,
+            identity,
+            // `closed: true` keeps Drop from touching the clean-shutdown flag —
+            // shutdown bookkeeping belongs to the writer engine alone.
+            closed: true,
+        })
     }
 
     /// Recover onto a machine from the mnemonic: re-derive the device key and

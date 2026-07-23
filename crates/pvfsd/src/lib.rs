@@ -1,16 +1,17 @@
 //! PVFS per-user daemon (doc 07): serves one forest over a Unix socket with
 //! challenge-response auth (§2) and per-node ACL enforcement (§4).
 //!
-//! Control plane (metadata): serialized writer behind a Mutex; reads serialize
-//! for now (WAL read-pool is a later optimization).
+//! Control plane (metadata), split per doc 07 §6: mutations serialize behind
+//! the single writer Mutex; **reads run concurrently** over a pool of
+//! read-only WAL views (`Engine::open_read_view`), checked out round-robin.
 //! Data plane (bytes): engine lock released before streaming raw bytes so
-//! concurrent cat transfers don't block each other (doc 07 §6).
+//! concurrent cat transfers don't block each other.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pvfs_core::acl::{self, Principal};
@@ -39,10 +40,19 @@ struct PreparedState {
     expiry_ms: u64,
 }
 
-/// One forest served by the daemon: the engine, its forest id (challenge
-/// binding), and in-flight prepared writes.
+/// How many read-only views back the metadata read pool (doc 07 §6). Small on
+/// purpose — personal/small-team scale; each view is one SQLite connection.
+const READ_POOL: usize = 4;
+
+/// One forest served by the daemon: the writer engine, a pool of read-only
+/// views, its forest id (challenge binding), and in-flight prepared writes.
 pub struct Daemon {
     engine: Mutex<Engine>,
+    /// Read-only WAL views for concurrent metadata reads. May be empty (view
+    /// open failed) — then reads fall back to the writer lock, the pre-pool
+    /// behavior.
+    readers: Vec<Mutex<Engine>>,
+    next_reader: AtomicUsize,
     forest_id: String,
     prepared: Mutex<HashMap<String, PreparedState>>,
 }
@@ -50,11 +60,30 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(engine: Engine) -> Daemon {
         let forest_id = engine.identity.forest_id.clone();
+        // Best-effort pool: stop at the first view that fails to open rather
+        // than failing the daemon — correctness never depends on the pool.
+        let readers: Vec<Mutex<Engine>> = (0..READ_POOL)
+            .map_while(|_| Engine::open_read_view(engine.data_dir()).ok())
+            .map(Mutex::new)
+            .collect();
         Daemon {
             engine: Mutex::new(engine),
+            readers,
+            next_reader: AtomicUsize::new(0),
             forest_id,
             prepared: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Check out an engine for a **read**: round-robin over the read pool, so
+    /// up to `READ_POOL` metadata reads run concurrently (plus writes on the
+    /// writer). Falls back to the writer lock when the pool is empty.
+    fn reader(&self) -> MutexGuard<'_, Engine> {
+        if self.readers.is_empty() {
+            return self.engine.lock().unwrap();
+        }
+        let i = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[i].lock().unwrap()
     }
 
     /// Flush the WAL and record a clean shutdown (doc 08 §4 item 4). Called by the
@@ -192,7 +221,7 @@ fn resolve_auth(
 fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
     match req {
         ClientMsg::Info => {
-            let e = daemon.engine.lock().unwrap();
+            let e = daemon.reader();
             ServerMsg::Info {
                 instance_id: e.identity.instance_id.clone(),
                 forest_id: e.identity.forest_id.clone(),
@@ -221,7 +250,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
 
 /// A node's inline payload (control plane; read-ACL-gated like `stat`).
 fn do_payload(daemon: &Daemon, principal: &Principal, node: &str) -> ServerMsg {
-    let e = daemon.engine.lock().unwrap();
+    let e = daemon.reader();
     match e.effective_rights(principal, &node.to_string()) {
         Ok(r) if r & acl::ACL_R != 0 => {}
         Ok(_) => return forbidden(),
@@ -247,9 +276,9 @@ fn do_payload(daemon: &Daemon, principal: &Principal, node: &str) -> ServerMsg {
 fn do_cat(daemon: &Daemon, principal: &Principal, stream: &mut UnixStream, node: &str) -> io::Result<()> {
     let id: NodeId = node.to_string();
 
-    // --- control plane: ACL check + path resolution (lock held briefly) ---
+    // --- control plane: ACL check + path resolution (read view, doc 07 §6) ---
     let path = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.reader();
         // ACL: caller needs read access.
         match e.effective_rights(principal, &id) {
             Ok(r) if r & acl::ACL_R != 0 => {}
@@ -327,7 +356,7 @@ fn do_secure_cat(
 ) -> io::Result<()> {
     let id: NodeId = node.to_string();
     let bytes = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.reader();
         match e.effective_rights(principal, &id) {
             Ok(r) if r & acl::ACL_R != 0 => {}
             Ok(_) => {
@@ -623,7 +652,7 @@ fn random_id() -> String {
 }
 
 fn do_ls(daemon: &Daemon, principal: &Principal, node: &str) -> Result<Vec<ChildInfo>, ServerMsg> {
-    let e = daemon.engine.lock().unwrap();
+    let e = daemon.reader();
     let id: NodeId = node.to_string();
     if !e.can(principal, &id, acl::ACL_R).map_err(err_from)? {
         return Err(forbidden());
@@ -640,7 +669,7 @@ fn do_ls(daemon: &Daemon, principal: &Principal, node: &str) -> Result<Vec<Child
 }
 
 fn do_stat(daemon: &Daemon, principal: &Principal, node: &str) -> Result<NodeInfo, ServerMsg> {
-    let e = daemon.engine.lock().unwrap();
+    let e = daemon.reader();
     let id: NodeId = node.to_string();
     let rights = e.effective_rights(principal, &id).map_err(err_from)?;
     if rights & acl::ACL_R == 0 {

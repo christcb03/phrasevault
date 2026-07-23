@@ -123,11 +123,12 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 **Still polish / post-1.1 (not in the 1.1 tag):**
 
 - **Touch ID / biometric unlock gate** (doc 14) — keychain seal covers at-rest; biometrics are UX.
-- **Read-pool metadata concurrency** (§4 item 2) — data plane is off-lock; fine at personal/small-team scale.
-- **Path/URI resolver in `remote` subcommands** (§4 item 6 remainder).
-- **CLI `remote add-node` / `payload` wrappers** — library API exists; thin CLI surface optional for operators.
-- **`key:`-grants-to-revoked-devices in `pvfs audit`** (§4 item 14 follow-on; masking already correct).
-- **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — driven by PVOS D18.
+  *Deferred by Chris (2026-07-22) — later.*
+- ~~Read-pool metadata concurrency~~ ✅ **built for 1.2** (§3.2).
+- ~~Path/URI resolver in `remote` subcommands~~ ✅ **built for 1.2** (§3.2).
+- ~~CLI `remote add-node` / `payload` wrappers~~ ✅ **built for 1.2** (§3.2).
+- ~~`key:`-grants-to-revoked-devices in `pvfs audit`~~ ✅ **built for 1.2** (§3.2, with expired-grant reporting).
+- **Richer tenant provisioning/rotation UX** (doc 14 §13 remainder) — blocked on PVOS D18 (non-owner users).
 
 ### 3.2 — Unreleased (the 1.2 line, as of 2026-07-22)
 
@@ -137,6 +138,10 @@ Tagged `v1.1` after PVOS M1 feedback. Backward-compatible engine additions + fix
 | **Companion: key-based pairing trust + auto sign-in** (PVOS D27/D29) | ✅ built (doc 14 §6.1, doc 16 §2) |
 | **Companion: singleton per user + restart affordance** | ✅ built (doc 14 §2) |
 | **Companion: web agent serves https** (PVOS M3.6 §4a) — localhost cert next to the vault, dual-mode port 7421 (TLS + plain http through the transition) | ✅ built (2026-07-22, after the validation run below; covered by the dual-mode e2e test) |
+| **Metadata read pool** (doc 07 §6 split, §4 item 2): `pvfsd` reads (`ls`/`stat`/`payload`/`info` + `cat`/secure-cat control phase) run concurrently over read-only WAL views (`Engine::open_read_view`); only mutations serialize behind the writer | ✅ built (2026-07-22) |
+| **`remote` takes paths/URIs** (§4 item 6 remainder): resolved over the daemon by ACL-filtered `ls`, never the owner's engine | ✅ built (2026-07-22) |
+| **`pvfs remote add-node` / `payload`** — the CLI face of the 1.1 daemon ops | ✅ built (2026-07-22) |
+| **`pvfs audit` completeness**: revoked-key direct `key:` grants + expired grants reported (guest keys stay unreported — their grants are live) | ✅ built (2026-07-22) |
 
 All three **validated on presubuntu** (2026-07-22): pipeline `deploy → build →
 test → smoke` green — 169 unit/integration tests + 188 smoke checks, 0 failures
@@ -160,12 +165,12 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
    device key via the `daemon_client()` helper), falling back to the direct engine when none runs or
    a recovery phrase is given (root-signed, can't proxy). The two-writer hazard is gone.
 
-2. **Control-plane concurrency is still one `Mutex<Engine>` (data plane is now off-lock).** P2-F moved
-   byte transfers off the lock (concurrent `cat`), but metadata ops (`ls`/`stat`/mutations) still
-   serialize behind the mutex.
-   → **Fix (1.0 nice-to-have / 1.1):** the doc 07 §6 split — a WAL read-only connection pool for
-   metadata so reads run concurrently; only mutations serialize. No async runtime. Fine to defer at
-   personal/small-team scale.
+2. **Control-plane concurrency. ✅ RESOLVED (1.2).** The doc 07 §6 split landed: `pvfsd` keeps one
+   serialized writer `Mutex<Engine>` for mutations, and metadata reads run concurrently over a pool
+   of **read-only WAL views** (`Engine::open_read_view` — same databases, `SQLITE_OPEN_READ_ONLY`,
+   none of `open`'s startup writes), checked out round-robin. No async runtime. Best-effort: if a
+   view can't open, reads fall back to the writer lock (the pre-pool behavior). Covered by
+   `read_pool_sees_committed_writes_immediately` (cross-connection read-your-writes).
 
 3. **`cat` raw data plane. ✅ RESOLVED (P2-F).** Raw binary frames (no hex/JSON), PROTO_VERSION 2; the
    daemon resolves the path under the lock then streams from the filesystem lock-free, so transfers

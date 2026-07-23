@@ -5,6 +5,20 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased (1.2)
 
+- **Daemon: concurrent metadata reads** (doc 07 §6 split): `ls`/`stat`/
+  `payload`/`info` and the `cat`/secure-cat control phase now run over a pool
+  of read-only WAL views (`Engine::open_read_view`); only mutations serialize
+  behind the writer. No async runtime; if a view can't open, reads fall back
+  to the writer lock.
+- **CLI: `pvfs remote` takes paths and `pvfs://` URIs** everywhere a node id
+  was required — resolved over the daemon by ACL-filtered `ls` (the owner's
+  engine is never opened), so callers can only resolve what they could list.
+- **CLI: `pvfs remote add-node` / `payload`** — operator surface for the 1.1
+  log-resident typed records (payload from a literal, `@<file>`, or `@-`).
+- **CLI: `pvfs audit` completeness**: now also reports direct `key:` grants
+  to revoked device keys (never-authorized guest keys stay unreported — their
+  grants are live by design) and grants past their `expires_at`, as two new
+  appended sections (JSON keys `inert_key_grants`, `expired_grants`).
 - **Companion: pairing trust binds to the server key, not pinned urls**
   (PVOS D27, doc 14 §6.1): the relay envelope verifies against the paired key
   first; a relay from a new url for a known key gets a one-time "trust this

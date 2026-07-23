@@ -163,6 +163,7 @@ pvfsd --mount ~/media          # (--socket <path> to override)
 Point at the forest with `--forest` (an alias or mount path) — no socket path needed:
 ```bash
 # authenticated as their identity (signs a challenge):
+# node args everywhere accept ids, pvfs:// URIs, and absolute paths
 pvfs remote --forest media ls   <photos-node-id>
 pvfs remote --forest media stat <node-id>
 pvfs remote --forest media info
@@ -331,7 +332,7 @@ run `pvfs member replace <file>`).
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
-| `pvfs audit` | Authorization health check: list tag grants/memberships under a revoked authority. |
+| `pvfs audit` | Authorization health check: tag grants/memberships under a revoked authority, `key:` grants to revoked devices, and expired grants. |
 | `pvfs secure create <parent> <label> [--path P]` | Create an encrypted-at-rest blob (managed storage; `--path` pins a location). |
 | `pvfs secure put <node> <file\|-> [--raw]` | Encrypt (companion) & write the blob's bytes; `--raw` stores app ciphertext as-is. |
 | `pvfs secure cat <node> [--raw]` | Verify vs the ledger, then decrypt (companion) to stdout; `--raw` emits ciphertext. |
@@ -349,6 +350,7 @@ run `pvfs member replace <file>`).
 | `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |
 | `pvfs whoami` | Print this machine's client identity pubkey. |
 | `pvfs remote --socket <path> [--anon] info\|ls\|stat …` | Read a forest via its daemon. |
+| `pvfs remote … add-node <parent> <label> <type> [--payload <text\|@file\|@->]` · `payload <node>` | Create / read a small typed record via the daemon (doc 13). |
 | `pvfs remote --socket <path> mkdir <parent> <label>` | Create a folder via the daemon (member-signed). |
 | `pvfs remote --socket <path> add-file <parent> <label> [--size N --mime M]` | Create a file node via the daemon. |
 | `pvfs remote --socket <path> rm <node>` | Unlink a node from its home via the daemon. |

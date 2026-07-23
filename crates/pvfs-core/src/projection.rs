@@ -1337,6 +1337,25 @@ pub fn full_rebuild(conn: &mut Connection) -> Result<ForestIdentity> {
 
 /// The §9.3 startup check. Runs on every open, after both files are attached.
 /// Returns the forest identity on success.
+/// Identity + schema gate for a **read-only view** (doc 07 §6). The primary
+/// writer engine already ran [`startup_check`] — verification, self-heal,
+/// replay — so a reader only confirms it speaks the current schema and decodes
+/// the genesis identity. Any mismatch is a hard error: a read view cannot (and
+/// must not) rebuild.
+pub fn read_view_check(conn: &Connection) -> Result<ForestIdentity> {
+    let version: u32 = meta_get(conn, "schema_version")?
+        .unwrap_or_else(|| SCHEMA_VERSION.to_string())
+        .parse()
+        .unwrap_or(SCHEMA_VERSION);
+    if version != SCHEMA_VERSION {
+        return Err(PvfsError::SchemaVersion {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    decode_genesis(conn)
+}
+
 pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
     // Step 1 — structural check.
     if !quick_check(conn, "log")? {

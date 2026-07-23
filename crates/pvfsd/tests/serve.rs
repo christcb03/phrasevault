@@ -669,3 +669,55 @@ fn daemon_set_acl_carries_expiry() {
     let mut anon = Client::connect_public(&sock).unwrap();
     assert!(forbidden(anon.ls(&root)));
 }
+
+// doc 07 §6 read pool: metadata reads ride read-only WAL views, so a write
+// committed through the writer engine must be visible to the very next read on
+// a DIFFERENT connection (each query takes a fresh WAL snapshot). Loops a few
+// rounds so every pooled view (round-robin) proves it sees the newest commit.
+#[test]
+fn read_pool_sees_committed_writes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    engine
+        .set_acl(&root, &Principal::Public, acl::ACL_R)
+        .unwrap();
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    engine
+        .set_acl(
+            &root,
+            &Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("d.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    let mut member = Client::connect_signed(&sock, &member_pub, |d| {
+        crypto::sign_digest(&member_key, d).unwrap()
+    })
+    .unwrap();
+    // More rounds than the pool has views: every reader must see fresh state.
+    for i in 0..8 {
+        let label = format!("round-{i}");
+        member
+            .mkdir(&root, &label, |d| crypto::sign_digest(&member_key, d).unwrap())
+            .unwrap();
+        let mut probe = Client::connect_public(&sock).unwrap();
+        assert!(
+            labels(&probe.ls(&root).unwrap()).contains(&label),
+            "write {label} must be visible to a fresh read connection"
+        );
+    }
+}
