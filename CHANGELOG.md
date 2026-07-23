@@ -3,7 +3,7 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
-## Unreleased (1.2)
+## 1.2.0 — 07/22/2026
 
 - **Daemon: concurrent metadata reads** (doc 07 §6 split): `ls`/`stat`/
   `payload`/`info` and the `cat`/secure-cat control phase now run over a pool

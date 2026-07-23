@@ -6,7 +6,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 
 ## Status
 
-**Version `1.1.0` — released (tagged `v1.1`, 2026-07-09).** Adds the PVOS-driven daemon ops (`AddNode`/`Payload`, `stat` parent) and two fixes surfaced by PVOS M1 (revoked-key read containment, typed `already_exists`) — see the [CHANGELOG](CHANGELOG.md). Post-1.0 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
+**Version `1.2.0` — release candidate (tag `v1.2` pending).** Adds expiring ACL grants, key-identity companion pairing with auto sign-in (PVOS D27/D29), the singleton companion + restart, the https web agent, concurrent daemon metadata reads, `remote` paths/URIs + `add-node`/`payload`, and a completeness pass on `pvfs audit` — see the [CHANGELOG](CHANGELOG.md). Post-1.1 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
 
 | Phase | What | State |
 |-------|------|--------|

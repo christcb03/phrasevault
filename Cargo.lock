@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "pvfs-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "hex",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "pvfs-client"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "pvfs-core",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "pvfs-companion"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "pvfs-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bip32",
  "bip39",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "pvfs-proto"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "pvfs-core",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "pvfsd"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "clap",

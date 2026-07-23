@@ -2,13 +2,14 @@
 
 This guide is for someone comfortable with a terminal, SSH, and copying commands — you do not need to be a Rust developer.
 
-**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). Version **`1.1.0`** (tagged `v1.1`) is the current release. It includes:
+**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). Version **`1.2.0`** is current (tag `v1.2` pending; `v1.1` was tagged 2026-07-09). It includes:
 
 - **P0–P1.5** — core engine (forest, signed nodes/links, event log), storage ops (bind/scan/verified reads/watcher), mounts & host registry
 - **P2** — multi-user access: per-node ACLs, per-key tags, member-signed writes and live admin over `pvfsd`, concurrent raw-bytes `cat`, `pvfs audit`, graceful daemon shutdown
 - **P3** — secure (encrypted-at-rest) nodes with companion-gated decryption
 - **Companion** — local key vault + signer + “Sign in with PVFS” agent (doc 14 / 16)
 - **1.1** — PVOS-facing daemon ops (`AddNode` / `Payload` via `pvfs-client`, `stat` parent) and security/error-code fixes (see [CHANGELOG.md](../CHANGELOG.md))
+- **1.2** — expiring ACL grants, companion trust/singleton/https upgrades, concurrent daemon reads, `remote` paths + typed records, fuller `pvfs audit` (see [CHANGELOG.md](../CHANGELOG.md))
 
 Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
 
