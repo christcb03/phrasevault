@@ -557,6 +557,7 @@ fn remote_payload_bytes(arg: &str) -> Result<Vec<u8>, PvfsError> {
     match arg.strip_prefix('@') {
         None => Ok(arg.as_bytes().to_vec()),
         Some("-") => {
+            use std::io::Read as _;
             let mut buf = Vec::new();
             std::io::stdin()
                 .read_to_end(&mut buf)
