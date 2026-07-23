@@ -1083,6 +1083,85 @@ pub fn inert_memberships(conn: &Connection) -> Result<Vec<InertMembership>> {
     Ok(out)
 }
 
+/// One inert direct `key:` grant found by the audit: `(node_id, key, rights)`.
+pub type InertKeyGrant = (String, Vec<u8>, u8);
+
+/// Forest-wide audit (doc 08 §3.1 follow-on to item 14): every direct `key:`
+/// grant whose key **was** a device/member and is now revoked. Such grants are
+/// inert — masked at access time (doc 06 §5) — but the rows linger until
+/// compaction. A **never-authorized** guest key is NOT reported: its `key:`
+/// grants still apply (the ephemeral guest/public-link path, doc 13 §E), so
+/// only keys with certs that are all revoked qualify. Read-only.
+pub fn inert_key_grants(conn: &Connection) -> Result<Vec<InertKeyGrant>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.node_id, a.principal_id, a.rights FROM acl a
+             WHERE a.principal_kind = 1
+               AND EXISTS (SELECT 1 FROM device_keys dk
+                           WHERE dk.device_pubkey = a.principal_id)
+               AND NOT EXISTS (SELECT 1 FROM device_keys dk
+                               WHERE dk.device_pubkey = a.principal_id AND dk.revoked_at IS NULL)
+             ORDER BY a.node_id, a.principal_id",
+        )
+        .map_err(map_db("prepare audit key grants"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)? as u8,
+            ))
+        })
+        .map_err(map_db("query audit key grants"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(map_db("read audit key grant"))?);
+    }
+    Ok(out)
+}
+
+/// One expired grant found by the audit:
+/// `(node_id, principal, authority, rights, expires_at)`.
+pub type ExpiredGrant = (String, crate::acl::Principal, Vec<u8>, u8, u64);
+
+/// Forest-wide audit: every grant whose `expires_at` has passed (doc 13 Q-E1).
+/// Expired grants are inert — masked by `effective_rights` — but the rows stay
+/// listed until compaction; this surfaces them all in one place. Read-only.
+pub fn expired_grants(conn: &Connection, as_of_ms: u64) -> Result<Vec<ExpiredGrant>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT node_id, principal_kind, principal_id, authority, rights, expires_at
+             FROM acl WHERE expires_at != 0 AND expires_at <= ?1
+             ORDER BY node_id, principal_kind, principal_id",
+        )
+        .map_err(map_db("prepare audit expired"))?;
+    let rows = stmt
+        .query_map(params![as_of_ms as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, i64>(4)? as u8,
+                r.get::<_, i64>(5)? as u64,
+            ))
+        })
+        .map_err(map_db("query audit expired"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (node, kind, id, authority, rights, expires_at) =
+            r.map_err(map_db("read audit expired"))?;
+        out.push((
+            node,
+            crate::acl::Principal::from_wire(kind, id)?,
+            authority,
+            rights,
+            expires_at,
+        ));
+    }
+    Ok(out)
+}
+
 /// `(authorized_and_unrevoked, is_owner_device)` for a key in `device_keys`.
 /// A key's standing in the device-cert projection: never seen, currently
 /// authorized (owner device or member), or revoked. Distinct from

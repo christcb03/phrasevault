@@ -305,6 +305,22 @@ $PVFS remote --socket "$SOCK" add-location "$MFILE" "file://$DMOUNT/uploaded-blo
   && ok "member added a file location"
 [ "$($PVFS remote --socket "$SOCK" cat "$MFILE")" = "member-bytes" ] \
   && ok "member reads back its own file content" || fail "member cat mismatch"
+# remote takes paths/URIs too (doc 08 §4 item 6 remainder): resolved by
+# ACL-filtered ls over the daemon, never by opening the owner's engine
+[ "$($PVFS remote --socket "$SOCK" cat "$DMOUNT/albums/a.txt")" = "hi" ] \
+  && ok "remote cat resolves an absolute path" || fail "remote path cat"
+$PVFS remote --socket "$SOCK" --anon ls "$DMOUNT/albums" | grep -q a.txt \
+  && ok "remote ls resolves a path (anon)" || fail "remote path ls"
+# remote add-node/payload (doc 13 log-resident records via the CLI)
+RECID="$(jget "$($PVFS --json remote --socket "$SOCK" add-node "$DROOT" g-1 pvos.grant --payload '{"grant":1}')" created)"
+[ ${#RECID} -eq 64 ] && ok "remote add-node created a typed record" || fail "remote add-node: $RECID"
+[ "$($PVFS remote --socket "$SOCK" payload "$RECID")" = '{"grant":1}' ] \
+  && ok "remote payload reads the record back" || fail "remote payload mismatch"
+if $PVFS remote --socket "$SOCK" add-node "$DROOT" bad folder --payload x >/dev/null 2>&1; then
+  fail "remote add-node accepted a reserved type"
+else
+  ok "remote add-node refuses reserved types"
+fi
 # secure store created + written + read on the fly WHILE the daemon serves
 # (doc 12 §8.5): the messenger "new chat = new encrypted store" case. These
 # auto-route through the running daemon (managed location, no path, no restart).

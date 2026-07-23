@@ -536,6 +536,35 @@ enum RemoteCmd {
     AddLocation { file: String, uri: String },
     /// Move a node under a new parent (requires your client identity)
     Mv { node: String, new_parent: String },
+    /// Create a custom-typed node with a small inline payload (doc 13 —
+    /// log-resident records; reserved types file/folder/secure are refused;
+    /// requires your client identity)
+    AddNode {
+        parent: String,
+        label: String,
+        /// The custom node type, e.g. `pvos.grant`
+        node_type: String,
+        /// Payload: a literal string, `@<file>` to read a file, `@-` for stdin
+        #[arg(long, default_value = "")]
+        payload: String,
+    },
+    /// Print a typed node's inline payload to stdout
+    Payload { node: String },
+}
+
+/// A `remote` payload argument: literal text, `@<file>`, or `@-` (stdin).
+fn remote_payload_bytes(arg: &str) -> Result<Vec<u8>, PvfsError> {
+    match arg.strip_prefix('@') {
+        None => Ok(arg.as_bytes().to_vec()),
+        Some("-") => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| PvfsError::io("read payload from stdin", e))?;
+            Ok(buf)
+        }
+        Some(path) => std::fs::read(path).map_err(|e| PvfsError::io("read payload file", e)),
+    }
 }
 
 /// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
@@ -863,6 +892,32 @@ fn resolve_node_id(ctx: Result<PathBuf, PvfsError>, target: &str) -> Result<Stri
     let (engine, id) = engine_and_node(ctx, target)?;
     engine.close()?;
     Ok(id)
+}
+
+/// Resolve a `remote` target (doc 08 §4 item 6 remainder): a bare node id
+/// passes through; a `pvfs://` URI or absolute path parses its tree segments
+/// locally (registry / mount-prefix only — the owner's engine is never opened)
+/// and walks them **over the daemon** with ACL-filtered `ls`, so a caller can
+/// only resolve what they could already list. An empty tail is the root.
+fn remote_node(client: &mut Client, target: &str) -> Result<String, PvfsError> {
+    if is_node_id(target) {
+        return Ok(target.to_string());
+    }
+    let segments = mount::resolve_target(&Registry::system(), target)?.segments;
+    let mut cur = client.info().map_err(remote_err)?.root;
+    for seg in &segments {
+        cur = client
+            .ls(&cur)
+            .map_err(remote_err)?
+            .into_iter()
+            .find(|c| c.label == *seg)
+            .ok_or_else(|| PvfsError::NotFound {
+                kind: "path segment",
+                id: seg.clone(),
+            })?
+            .id;
+    }
+    Ok(cur)
 }
 
 /// Find the daemon socket for the current forest context, if a daemon is
@@ -1493,14 +1548,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Audit => {
-            // Read-only authorization health check (doc 08 §4 item 14): tag grants
-            // and memberships whose authority is a revoked member. They're inert
-            // (masked live), so this never changes access — it surfaces dead grants
-            // a troubleshooter would otherwise have to hunt for. Compaction removes
-            // the rows; this only reports them.
+            // Read-only authorization health check (doc 08 §4 item 14 + follow-ons):
+            // tag grants/memberships under a revoked authority, direct `key:` grants
+            // to revoked device keys (doc 06 §5), and expired grants (doc 13 Q-E1).
+            // All are inert (masked live), so this never changes access — it surfaces
+            // dead rows a troubleshooter would otherwise have to hunt for. Compaction
+            // removes them; this only reports them.
             let engine = Engine::open(&ctx?)?;
             let grants = engine.inert_tag_grants()?;
             let memberships = engine.inert_memberships()?;
+            let key_grants = engine.inert_key_grants()?;
+            let expired = engine.expired_grants()?;
             if json {
                 let g: Vec<String> = grants
                     .iter()
@@ -1525,13 +1583,45 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         )
                     })
                     .collect();
+                let k: Vec<String> = key_grants
+                    .iter()
+                    .map(|(node, key, rights)| {
+                        format!(
+                            "{{\"node\":\"{}\",\"key\":\"{}\",\"granted\":\"{}\"}}",
+                            json_escape(node),
+                            hex::encode(key),
+                            acl::rights_to_str(*rights)
+                        )
+                    })
+                    .collect();
+                let e: Vec<String> = expired
+                    .iter()
+                    .map(|(node, principal, authority, rights, expires_at)| {
+                        format!(
+                            "{{\"node\":\"{}\",\"principal\":\"{}\",\"authority\":\"{}\",\"granted\":\"{}\",\"expired_at\":{}}}",
+                            json_escape(node),
+                            json_escape(&principal.display()),
+                            hex::encode(authority),
+                            acl::rights_to_str(*rights),
+                            expires_at
+                        )
+                    })
+                    .collect();
+                // Key order matters: scripts (and the smoke suite) match on the
+                // first two arrays as a prefix; new sections are appended only.
                 println!(
-                    "{{\"inert_grants\":[{}],\"inert_memberships\":[{}]}}",
+                    "{{\"inert_grants\":[{}],\"inert_memberships\":[{}],\"inert_key_grants\":[{}],\"expired_grants\":[{}]}}",
                     g.join(","),
-                    m.join(",")
+                    m.join(","),
+                    k.join(","),
+                    e.join(",")
                 );
-            } else if grants.is_empty() && memberships.is_empty() {
-                println!("no stale authorizations: all tag grants and memberships have live authorities");
+            } else if grants.is_empty()
+                && memberships.is_empty()
+                && key_grants.is_empty()
+                && expired.is_empty()
+            {
+                println!("no stale authorizations: every grant and membership has a live authority, a live key, and no lapsed expiry");
             } else {
                 if !grants.is_empty() {
                     println!("inert tag grants (authority revoked) — {}:", grants.len());
@@ -1553,6 +1643,29 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             hex::encode(member),
                             tag,
                             authority_suffix(authority)
+                        );
+                    }
+                }
+                if !key_grants.is_empty() {
+                    println!("inert key grants (device revoked) — {}:", key_grants.len());
+                    for (node, key, rights) in &key_grants {
+                        println!(
+                            "  {}  key:{}  (granted {})",
+                            node,
+                            hex::encode(key),
+                            acl::rights_to_str(*rights)
+                        );
+                    }
+                }
+                if !expired.is_empty() {
+                    println!("expired grants — {}:", expired.len());
+                    for (node, principal, authority, rights, _expires_at) in &expired {
+                        println!(
+                            "  {}  {}{}  (granted {}) [expired]",
+                            node,
+                            principal.display(),
+                            authority_suffix(authority),
+                            acl::rights_to_str(*rights)
                         );
                     }
                 }
@@ -2481,6 +2594,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Ls { node } => {
+                    let node = remote_node(&mut client, &node)?;
                     let kids = client.ls(&node).map_err(remote_err)?;
                     if json {
                         let items: Vec<String> = kids
@@ -2502,6 +2616,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Stat { node } => {
+                    let node = remote_node(&mut client, &node)?;
                     let n = client.stat(&node).map_err(remote_err)?;
                     if json {
                         println!(
@@ -2516,10 +2631,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Cat { node } => {
+                    let node = remote_node(&mut client, &node)?;
                     let mut stdout = std::io::stdout().lock();
                     client.cat(&node, &mut stdout).map_err(remote_err)?;
                 }
                 RemoteCmd::Mkdir { parent, label } => {
+                    let parent = remote_node(&mut client, &parent)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
                         .mkdir(&parent, &label, |d| {
@@ -2534,6 +2651,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     size,
                     mime,
                 } => {
+                    let parent = remote_node(&mut client, &parent)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
                         .add_file(&parent, &label, size, &mime, |d| {
@@ -2543,6 +2661,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     print_created(&id, json);
                 }
                 RemoteCmd::AddLocation { file, uri } => {
+                    let file = remote_node(&mut client, &file)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
                         .add_location(&file, &uri, |d| {
@@ -2556,6 +2675,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Mv { node, new_parent } => {
+                    let node = remote_node(&mut client, &node)?;
+                    let new_parent = remote_node(&mut client, &new_parent)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
                         .mv(&node, &new_parent, |d| {
@@ -2569,6 +2690,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 RemoteCmd::Rm { node } => {
+                    let node = remote_node(&mut client, &node)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let removed = client
                         .rm(&node, |d| crypto::sign_digest(key, d).unwrap_or_default())
@@ -2578,6 +2700,31 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         println!("removed (link {removed})");
                     }
+                }
+                RemoteCmd::AddNode {
+                    parent,
+                    label,
+                    node_type,
+                    payload,
+                } => {
+                    let parent = remote_node(&mut client, &parent)?;
+                    let bytes = remote_payload_bytes(&payload)?;
+                    let key = identity_key.as_ref().ok_or_else(needs_identity)?;
+                    let id = client
+                        .add_node(&parent, &label, &node_type, &bytes, |d| {
+                            crypto::sign_digest(key, d).unwrap_or_default()
+                        })
+                        .map_err(remote_err)?;
+                    print_created(&id, json);
+                }
+                RemoteCmd::Payload { node } => {
+                    let node = remote_node(&mut client, &node)?;
+                    let bytes = client.payload(&node).map_err(remote_err)?;
+                    use std::io::Write as _;
+                    std::io::stdout()
+                        .lock()
+                        .write_all(&bytes)
+                        .map_err(|e| PvfsError::io("write payload", e))?;
                 }
             }
             Ok(())

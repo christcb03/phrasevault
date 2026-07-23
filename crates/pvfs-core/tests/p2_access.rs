@@ -514,9 +514,27 @@ fn audit_reports_inert_grants_and_memberships() {
         .unwrap();
     commit_with(&mut engine, prep, |d| crypto::sign_digest(&app, d).unwrap());
 
+    // A guest key (never authorized) with a direct grant, and an expired grant
+    // on the member: neither must the clean-case flag (guest grants are LIVE,
+    // doc 13 §E; the member grant hasn't lapsed yet).
+    let guest = foreign_pubkey();
+    engine
+        .set_acl(&node, &acl::Principal::Key(guest.clone()), acl::ACL_R)
+        .unwrap();
+    let far_future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    engine
+        .set_acl_expiring(&node, &acl::Principal::Key(member.clone()), acl::ACL_R, far_future)
+        .unwrap();
+
     // live authority → audit is clean
     assert!(engine.inert_tag_grants().unwrap().is_empty());
     assert!(engine.inert_memberships().unwrap().is_empty());
+    assert!(engine.inert_key_grants().unwrap().is_empty());
+    assert!(engine.expired_grants().unwrap().is_empty());
 
     // revoke the app authority → both grant and membership become inert findings
     engine.revoke_by_device(&app_pub).unwrap();
@@ -526,6 +544,21 @@ fn audit_reports_inert_grants_and_memberships() {
     let memberships = engine.inert_memberships().unwrap();
     assert_eq!(memberships.len(), 1);
     assert_eq!(memberships[0], (member.clone(), "crew".to_string(), app_pub.clone()));
+    // …and the app's own direct key: grant (ACL_A above) is now a revoked-key
+    // finding, while the guest key's grant stays unreported.
+    let key_grants = engine.inert_key_grants().unwrap();
+    assert_eq!(key_grants.len(), 1);
+    assert_eq!(key_grants[0], (node.clone(), app_pub.clone(), acl::ACL_A));
+
+    // an already-lapsed grant surfaces in the expired section
+    engine
+        .set_acl_expiring(&node, &acl::Principal::Public, acl::ACL_R, 1)
+        .unwrap();
+    let expired = engine.expired_grants().unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0, node);
+    assert!(matches!(expired[0].1, acl::Principal::Public));
+    assert_eq!(expired[0].4, 1);
 
     // findings survive a rebuild from the log
     engine.close().unwrap();
@@ -533,6 +566,8 @@ fn audit_reports_inert_grants_and_memberships() {
     let engine = Engine::open(dir.path()).unwrap();
     assert_eq!(engine.inert_tag_grants().unwrap().len(), 1);
     assert_eq!(engine.inert_memberships().unwrap().len(), 1);
+    assert_eq!(engine.inert_key_grants().unwrap().len(), 1);
+    assert_eq!(engine.expired_grants().unwrap().len(), 1);
     engine.close().unwrap();
 }
 

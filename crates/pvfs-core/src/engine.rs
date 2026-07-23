@@ -1614,6 +1614,19 @@ impl Engine {
         projection::inert_memberships(&self.conn)
     }
 
+    /// Forest-wide audit: every direct `key:` grant to a **revoked** device key
+    /// as `(node_id, key, rights)` — inert on the read path (doc 06 §5); a
+    /// never-authorized guest key's grants are live and not reported (doc 13 §E).
+    pub fn inert_key_grants(&self) -> Result<Vec<projection::InertKeyGrant>> {
+        projection::inert_key_grants(&self.conn)
+    }
+
+    /// Forest-wide audit: every grant past its `expires_at` (doc 13 Q-E1), as
+    /// `(node_id, principal, authority, rights, expires_at)` — inert, judged now.
+    pub fn expired_grants(&self) -> Result<Vec<projection::ExpiredGrant>> {
+        projection::expired_grants(&self.conn, now_ms())
+    }
+
     /// Assign (`granted = true`) or remove a membership tag from a member key
     /// (doc 09 §1). Authored by the local device, which must hold admin (`a`) on
     /// the forest root (owner devices always do).
