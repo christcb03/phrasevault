@@ -19,6 +19,48 @@ use crate::policy::{ApprovalPolicy, Decision, Origin};
 use crate::proto::{AgentRequest, AgentResponse, ApprovalContext, API_VERSION};
 use crate::signer::{KeyRole, RequestType, UnlockedSigner};
 
+/// A PVOS invite as presented for redemption (D18 §2.7) — the fields the
+/// server's `RedeemChallenge` handed the page, plus the bearer code the
+/// human typed. The prompt renders these; the acceptance digest is computed
+/// from them companion-side.
+pub struct InviteRedemption {
+    pub invite_id: String,
+    pub member: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+    pub server_pubkey_hex: String,
+    pub origins: Vec<String>,
+    pub code: String,
+}
+
+/// The PVOS acceptance digest (must byte-match `pvos-core::invites::
+/// acceptance_digest` — a shared fixture is pinned in both repos' tests):
+/// SHA-256 over the domain tag and u64-LE length-prefixed fields.
+pub fn invite_acceptance_digest(
+    invite_id: &str,
+    identity_pubkey_hex_lower: &str,
+    normalized_code: &str,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pvos:invite-acceptance:v1:");
+    for field in [invite_id, identity_pubkey_hex_lower, normalized_code] {
+        h.update((field.len() as u64).to_le_bytes());
+        h.update(field.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// PVOS invite codes are compared normalized: uppercase alphanumerics only
+/// (dashes and whitespace are presentation).
+pub fn normalize_invite_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
 /// Re-creates an [`UnlockedSigner`] after a lock (doc 14 §5): fetch the data key
 /// from the OS keychain, re-read the env passphrase, or prompt on the terminal.
 /// Must not retain secret material of its own.
@@ -275,6 +317,94 @@ impl Agent {
                 identity_pubkey: pubkey,
             },
             other => other,
+        }
+    }
+
+    /// Accept a PVOS member invite (PVOS D18 §2.7): the pairing BOOTSTRAP.
+    /// One human approval covers both halves — enrolling `server_pubkey` as
+    /// a paired server bound to `origins`, and signing the acceptance digest
+    /// (`{invite_id, own identity pubkey, code}`) with the identity key. The
+    /// digest is computed HERE from the semantic fields, never accepted
+    /// pre-hashed from the page; the prompt shows exactly what is accepted.
+    pub fn redeem_invite(&self, request_origin: &str, r: &InviteRedemption) -> AgentResponse {
+        let Some(reg) = &self.pairings else {
+            return AgentResponse::error("unsupported", "pairing not enabled");
+        };
+        let Ok(pk) = hex::decode(&r.server_pubkey_hex) else {
+            return AgentResponse::error("bad_input", "server_pubkey not hex");
+        };
+        if pvfs_core::crypto::validate_pubkey(&pk).is_err() {
+            return AgentResponse::error("bad_input", "server_pubkey invalid");
+        }
+        if r.invite_id.is_empty() || r.member.is_empty() || r.code.is_empty() {
+            return AgentResponse::error("bad_input", "invite_id, member and code are required");
+        }
+        if self.rate_limited() {
+            self.audit_sign_str("invite_accept", request_origin, "rate_limited", "");
+            return AgentResponse::error("rate_limited", "too many requests");
+        }
+        let own_pubkey = match self.identity_pubkey() {
+            AgentResponse::Pubkey { pubkey } => pubkey.to_ascii_lowercase(),
+            other => return other,
+        };
+        let digest = invite_acceptance_digest(&r.invite_id, &own_pubkey, &normalize_invite_code(&r.code));
+        let hexd = hex::encode(digest);
+
+        if !self.prompter.approve_redeem_invite(
+            &r.member,
+            &r.role,
+            &r.capabilities,
+            &r.server_pubkey_hex,
+            &r.origins,
+        ) {
+            self.audit_sign_str("invite_accept", request_origin, "denied", &hexd);
+            return AgentResponse::error("denied", "invite not accepted");
+        }
+
+        // Half 1: the server becomes a paired server bound to its origins —
+        // sign-ins there ride the normal relay path from now on. A key that
+        // is already paired just gains any new origins.
+        if let Some(existing) = reg.find_by_pubkey(&r.server_pubkey_hex) {
+            for o in &r.origins {
+                if !existing.origins.iter().any(|e| e == o) {
+                    if let Err(e) = reg.trust_origin(&r.server_pubkey_hex, o) {
+                        return AgentResponse::error("io", e.to_string());
+                    }
+                }
+            }
+        } else {
+            let mut name = r
+                .origins
+                .first()
+                .map(|o| {
+                    format!("pvos {}", o.trim_start_matches("https://").trim_start_matches("http://"))
+                })
+                .unwrap_or_else(|| "pvos".to_string());
+            // `add` replaces by name (re-pair semantics) — a derived name must
+            // never clobber an EXISTING pairing under a different key.
+            if reg.list().iter().any(|p| p.name == name) {
+                let tail = &r.server_pubkey_hex[..r.server_pubkey_hex.len().min(8)];
+                name = format!("{name} ({tail})");
+            }
+            if let Err(e) = reg.add(&name, &r.server_pubkey_hex, r.origins.clone()) {
+                return AgentResponse::error("io", e.to_string());
+            }
+        }
+
+        // Half 2: the signed acceptance — identity-key, audited distinctly.
+        match self.with_signer(|s| s.sign(RequestType::IdentityAssertion, &digest)) {
+            Ok(Ok(sig)) => {
+                self.audit_sign_str("invite_accept", request_origin, "approved", &hexd);
+                AgentResponse::Signature { sig: hex::encode(sig) }
+            }
+            Ok(Err(e)) => {
+                self.audit_sign_str("invite_accept", request_origin, "error", &hexd);
+                AgentResponse::error("sign", e.to_string())
+            }
+            Err(resp) => {
+                self.audit_sign_str("invite_accept", request_origin, "locked", &hexd);
+                resp
+            }
         }
     }
 

@@ -158,3 +158,34 @@ binding is mechanical (no human judgment for drive-by pages); the code on
 both screens closes prompt-confusion; each member pairs their own companion
 (the pairing table is the member/role registry for PVOS sign-in). **TLS is a
 pre-1.0 requirement** for shared deployment — cleartext ws is dev-LAN only.
+
+
+## Invite redemption (PVOS D18 §2.7)
+
+PVOS members join by **invite**: the owner's companion signs a delegation
+("whoever proves knowledge of this code joins as X"), and the invitee's
+companion signs an **acceptance** — `{invite_id, identity_pubkey, code}` —
+completing a chain PVOS verifies with no online inviter. The invitee has no
+SSH to the server and no prior pairing, so their half must work entirely
+from the browser page. Implemented in `pvfs-companion`:
+
+- **`POST /redeem-invite`** on the web agent (token-exempt like `/relay` —
+  this is the pairing BOOTSTRAP; the gates are loopback binding, the
+  browser-enforced Origin, one explicit human prompt, and the bearer code
+  itself, which only an invited human holds). Body:
+  `{invite_id, member, role, capabilities[], server_pubkey, origins[], code}`
+  — exactly what the PVOS `RedeemChallenge` handed the page, so the human
+  is shown precisely what they are accepting.
+- **One prompt does both halves**: on approval the companion (1) enrolls
+  the server as a **paired server** bound to the offered origins (or, if
+  the key is already paired, trusts the new origins for it), and (2) signs
+  the acceptance digest with the **identity** key. Sign-ins to that server
+  then ride the normal relay path with no further setup.
+- **The acceptance digest is computed COMPANION-SIDE** from the semantic
+  fields — never accepted pre-hashed from the page:
+  `SHA-256("pvos:invite-acceptance:v1:" || lp(invite_id) || lp(own identity
+  pubkey hex, lowercase) || lp(code, normalized uppercase-alphanumeric))`
+  with `lp` = u64-LE length prefix. A fixture digest is pinned in BOTH
+  repos' tests so drift breaks loudly on either side.
+- Audited as `invite_accept`; rate-limited like every signing path;
+  default-deny in the `Prompter` (backends opt in explicitly).

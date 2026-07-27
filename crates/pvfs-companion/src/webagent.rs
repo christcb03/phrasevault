@@ -131,7 +131,10 @@ impl WebAgent {
         // `/relay` is deliberately token-exempt (M3.1): its authentication is
         // the paired-server signature + the Origin↔pairing binding, so a page
         // needs no port-file secret — which is the whole point of pairing.
-        if path != "/relay" && token.as_deref() != Some(self.token.as_str()) {
+        // `/redeem-invite` (PVOS D18) is exempt too: it IS the pairing
+        // bootstrap — its gates are loopback binding, the browser-enforced
+        // Origin, one explicit human prompt, and the bearer code itself.
+        if path != "/relay" && path != "/redeem-invite" && token.as_deref() != Some(self.token.as_str()) {
             return respond_json(
                 reader.get_mut(),
                 401,
@@ -223,6 +226,48 @@ impl WebAgent {
                     return (400, "Bad Request", "{\"error\":\"missing_envelope\"}".into());
                 };
                 match self.agent.relay(origin, &payload, &sig) {
+                    AgentResponse::Signature { sig } => match self.agent.identity_pubkey() {
+                        AgentResponse::Pubkey { pubkey } => (
+                            200,
+                            "OK",
+                            format!("{{\"sig\":\"{sig}\",\"pubkey\":\"{pubkey}\"}}"),
+                        ),
+                        other => error_response(other),
+                    },
+                    other => error_response(other),
+                }
+            }
+            ("POST", "/redeem-invite") => {
+                // PVOS D18 §2.7: accept a member invite — enroll the server
+                // as paired AND sign the acceptance, behind one prompt.
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+                    return (400, "Bad Request", "{\"error\":\"malformed_body\"}".into());
+                };
+                let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let list = |k: &str| -> Vec<String> {
+                    v.get(k)
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default()
+                };
+                let (Some(invite_id), Some(member), Some(server_pubkey_hex), Some(code)) = (
+                    field("invite_id"),
+                    field("member"),
+                    field("server_pubkey"),
+                    field("code"),
+                ) else {
+                    return (400, "Bad Request", "{\"error\":\"missing_fields\"}".into());
+                };
+                let redemption = crate::agent::InviteRedemption {
+                    invite_id,
+                    member,
+                    role: field("role").unwrap_or_else(|| "member".into()),
+                    capabilities: list("capabilities"),
+                    server_pubkey_hex,
+                    origins: list("origins"),
+                    code,
+                };
+                match self.agent.redeem_invite(origin, &redemption) {
                     AgentResponse::Signature { sig } => match self.agent.identity_pubkey() {
                         AgentResponse::Pubkey { pubkey } => (
                             200,

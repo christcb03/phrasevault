@@ -214,3 +214,131 @@ fn headless_connect_is_denied_and_revocation_bites() {
     let (code, _) = http(&addr, "GET", "/identity", app, &token, "");
     assert_eq!(code, 403);
 }
+
+// ── PVOS D18 §2.7: invite redemption — the pairing bootstrap ────────────────
+
+/// The acceptance digest must byte-match `pvos-core::invites::
+/// acceptance_digest`. This fixture is pinned in BOTH repos, so drift on
+/// either side breaks a test loudly instead of breaking members silently.
+#[test]
+fn invite_acceptance_digest_matches_the_pvos_fixture() {
+    let d = pvfs_companion::invite_acceptance_digest("inv-fixture", "02aabbcc", "ABCD1234");
+    assert_eq!(
+        hex::encode(d),
+        "6bc05eba4a9b80bb35a723b60c663d06f00d46da05a6f18faa3e8128b0775344"
+    );
+    assert_eq!(pvfs_companion::normalize_invite_code(" abcd-12 34 "), "ABCD1234");
+}
+
+#[test]
+fn redeem_invite_pairs_the_server_and_signs_the_acceptance() {
+    struct ApproveInvites;
+    impl Prompter for ApproveInvites {
+        fn approve(&self, _r: RequestType, _o: Origin) -> bool {
+            true
+        }
+        fn approve_redeem_invite(
+            &self,
+            member: &str,
+            role: &str,
+            capabilities: &[String],
+            _server_pubkey_hex: &str,
+            origins: &[String],
+        ) -> bool {
+            // The prompt sees exactly what the human would.
+            member == "kim"
+                && role == "member"
+                && capabilities.iter().any(|c| c == "use_shared_apps")
+                && origins.iter().any(|o| o == "https://pvos.example:7420")
+        }
+    }
+
+    let mn = identity::generate_mnemonic().unwrap();
+    let id_pub = crypto::pubkey_bytes(&identity::identity_key(&mn, "", 0).unwrap());
+    let signer = UnlockedSigner::from_phrase(&mn.to_string()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pairings = pvfs_companion::PairingRegistry::at(&dir.path().join("pairings.json"));
+    let agent = Arc::new(
+        Agent::new(signer, ApprovalPolicy::default())
+            .with_prompter(Box::new(ApproveInvites))
+            .with_pairings(pairings),
+    );
+    let reg = OriginRegistry::at(&dir.path().join("origins.json"));
+    let web = Arc::new(WebAgent::new(agent, reg));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    {
+        let w = Arc::clone(&web);
+        std::thread::spawn(move || w.serve(listener, None));
+    }
+
+    // A plausible PVOS server key (any valid secp256k1 point).
+    let server_pub = hex::encode(crypto::pubkey_bytes(
+        &identity::identity_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
+    ));
+    let body = format!(
+        "{{\"invite_id\":\"inv-1\",\"member\":\"kim\",\"role\":\"member\",\
+         \"capabilities\":[\"use_shared_apps\"],\"server_pubkey\":\"{server_pub}\",\
+         \"origins\":[\"https://pvos.example:7420\"],\"code\":\"abcd-efgh-ijkl\"}}"
+    );
+    // Token-exempt: a BOGUS token must not matter — this is the bootstrap,
+    // and the invitee's page has no port file.
+    let (code, resp) = http(&addr, "POST", "/redeem-invite", "https://pvos.example:7420", "bogus", &body);
+    assert_eq!(code, 200, "{resp}");
+
+    // The signature verifies against the identity key over the digest the
+    // companion computed itself (normalized code, lowercase pubkey).
+    assert_eq!(jfield(&resp, "pubkey"), hex::encode(&id_pub));
+    let sig = hex::decode(jfield(&resp, "sig")).unwrap();
+    let digest = pvfs_companion::invite_acceptance_digest(
+        "inv-1",
+        &hex::encode(&id_pub),
+        "ABCDEFGHIJKL",
+    );
+    crypto::verify_digest(&id_pub, &digest, &sig).unwrap();
+
+    // Half 1 really happened: the server is a paired server bound to its
+    // origins, so sign-ins now ride the normal relay path.
+    let reg2 = pvfs_companion::PairingRegistry::at(&dir.path().join("pairings.json"));
+    let pairing = reg2.find_by_pubkey(&server_pub).expect("server enrolled");
+    assert!(pairing.origins.iter().any(|o| o == "https://pvos.example:7420"));
+
+    // Malformed bodies refuse.
+    let (code, _) = http(&addr, "POST", "/redeem-invite", "https://pvos.example:7420", "", "{}");
+    assert_eq!(code, 400);
+}
+
+#[test]
+fn redeem_invite_default_deny_and_no_prompter_refuse() {
+    // A prompter that has not opted in (DenyPrompter) refuses the invite —
+    // and refuses BEFORE any pairing is written.
+    let mn = identity::generate_mnemonic().unwrap();
+    let signer = UnlockedSigner::from_phrase(&mn.to_string()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pairings = pvfs_companion::PairingRegistry::at(&dir.path().join("pairings.json"));
+    let agent = Arc::new(
+        Agent::new(signer, ApprovalPolicy::default())
+            .with_prompter(Box::new(pvfs_companion::DenyPrompter))
+            .with_pairings(pairings),
+    );
+    let reg = OriginRegistry::at(&dir.path().join("origins.json"));
+    let web = Arc::new(WebAgent::new(agent, reg));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    {
+        let w = Arc::clone(&web);
+        std::thread::spawn(move || w.serve(listener, None));
+    }
+    let server_pub = hex::encode(crypto::pubkey_bytes(
+        &identity::identity_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
+    ));
+    let body = format!(
+        "{{\"invite_id\":\"inv-1\",\"member\":\"kim\",\"role\":\"member\",\
+         \"capabilities\":[\"use_shared_apps\"],\"server_pubkey\":\"{server_pub}\",\
+         \"origins\":[\"https://pvos.example:7420\"],\"code\":\"abcd\"}}"
+    );
+    let (code, resp) = http(&addr, "POST", "/redeem-invite", "https://pvos.example:7420", "", &body);
+    assert_eq!(code, 403, "{resp}");
+    let reg2 = pvfs_companion::PairingRegistry::at(&dir.path().join("pairings.json"));
+    assert!(reg2.find_by_pubkey(&server_pub).is_none(), "denial writes NOTHING");
+}

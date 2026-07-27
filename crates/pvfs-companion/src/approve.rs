@@ -61,6 +61,21 @@ pub trait Prompter: Send + Sync {
         let _ = (name, server_pubkey_hex, origin);
         false
     }
+
+    /// Accept a PVOS member invite (D18): ONE approval covers both halves —
+    /// enrolling the inviting server as paired, and signing the acceptance
+    /// that makes this identity a member there. Default deny.
+    fn approve_redeem_invite(
+        &self,
+        member: &str,
+        role: &str,
+        capabilities: &[String],
+        server_pubkey_hex: &str,
+        origins: &[String],
+    ) -> bool {
+        let _ = (member, role, capabilities, server_pubkey_hex, origins);
+        false
+    }
 }
 
 /// Headless: every prompt is a denial (never approve what nobody saw).
@@ -100,6 +115,25 @@ fn describe_pair(name: &str, server_pubkey_hex: &str, origins: &[String]) -> Str
          may then request sign-ins and approvals through your browser — \
          trusted-address sign-ins are automatic, everything else still asks you \
          (revoke with `pvfs-companion pairings revoke`)."
+    )
+}
+
+fn describe_redeem_invite(
+    member: &str,
+    role: &str,
+    capabilities: &[String],
+    server_pubkey_hex: &str,
+    origins: &[String],
+) -> String {
+    let key_short = &server_pubkey_hex[..server_pubkey_hex.len().min(12)];
+    format!(
+        "pvfs-companion: JOIN the PVOS server at [{}] (key {key_short}…) as \
+         member \"{member}\" ({role})? You would be able to: {}. Approving \
+         pairs the server AND signs your acceptance — you become a member \
+         there (leave by asking its admin; unpair with `pvfs-companion \
+         pairings revoke`).",
+        origins.join(", "),
+        capabilities.join(", ")
     )
 }
 
@@ -225,6 +259,16 @@ impl Prompter for TerminalPrompter {
     fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
         self.ask(&describe_trust_url(name, server_pubkey_hex, origin))
     }
+    fn approve_redeem_invite(
+        &self,
+        member: &str,
+        role: &str,
+        capabilities: &[String],
+        server_pubkey_hex: &str,
+        origins: &[String],
+    ) -> bool {
+        self.ask(&describe_redeem_invite(member, role, capabilities, server_pubkey_hex, origins))
+    }
 }
 
 /// Ask with a native desktop dialog: `osascript` on macOS, `zenity` on Linux.
@@ -269,6 +313,16 @@ impl Prompter for DesktopPrompter {
     }
     fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
         self.dialog(&describe_trust_url(name, server_pubkey_hex, origin))
+    }
+    fn approve_redeem_invite(
+        &self,
+        member: &str,
+        role: &str,
+        capabilities: &[String],
+        server_pubkey_hex: &str,
+        origins: &[String],
+    ) -> bool {
+        self.dialog(&describe_redeem_invite(member, role, capabilities, server_pubkey_hex, origins))
     }
 }
 

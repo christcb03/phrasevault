@@ -27,7 +27,7 @@ mod store;
 mod tenant;
 mod vault;
 
-pub use agent::{serve, Agent, IdentityRotator, Unlocker};
+pub use agent::{invite_acceptance_digest, normalize_invite_code, serve, Agent, IdentityRotator, InviteRedemption, Unlocker};
 pub use approve::{auto_prompter, auto_prompter_labeled, DenyPrompter, Prompter};
 pub use audit::{AuditEntry, AuditLog};
 pub use client::request;
