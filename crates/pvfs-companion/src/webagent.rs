@@ -261,6 +261,7 @@ impl WebAgent {
                 let redemption = crate::agent::InviteRedemption {
                     invite_id,
                     member,
+                    email: field("email").unwrap_or_default(),
                     role: field("role").unwrap_or_else(|| "member".into()),
                     capabilities: list("capabilities"),
                     server_pubkey_hex,

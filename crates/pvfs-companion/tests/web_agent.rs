@@ -240,13 +240,15 @@ fn redeem_invite_pairs_the_server_and_signs_the_acceptance() {
         fn approve_redeem_invite(
             &self,
             member: &str,
+            email: &str,
             role: &str,
             capabilities: &[String],
             _server_pubkey_hex: &str,
             origins: &[String],
         ) -> bool {
-            // The prompt sees exactly what the human would.
+            // The prompt sees exactly what the human would — email included.
             member == "kim"
+                && email == "kim@example.com"
                 && role == "member"
                 && capabilities.iter().any(|c| c == "use_shared_apps")
                 && origins.iter().any(|o| o == "https://pvos.example:7420")
@@ -277,7 +279,8 @@ fn redeem_invite_pairs_the_server_and_signs_the_acceptance() {
         &identity::identity_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap(),
     ));
     let body = format!(
-        "{{\"invite_id\":\"inv-1\",\"member\":\"kim\",\"role\":\"member\",\
+        "{{\"invite_id\":\"inv-1\",\"member\":\"kim\",\"email\":\"kim@example.com\",\
+         \"role\":\"member\",\
          \"capabilities\":[\"use_shared_apps\"],\"server_pubkey\":\"{server_pub}\",\
          \"origins\":[\"https://pvos.example:7420\"],\"code\":\"abcd-efgh-ijkl\"}}"
     );
@@ -302,6 +305,13 @@ fn redeem_invite_pairs_the_server_and_signs_the_acceptance() {
     let reg2 = pvfs_companion::PairingRegistry::at(&dir.path().join("pairings.json"));
     let pairing = reg2.find_by_pubkey(&server_pub).expect("server enrolled");
     assert!(pairing.origins.iter().any(|o| o == "https://pvos.example:7420"));
+    // The derived name pins THIS INSTALL: host + key fingerprint, always
+    // (several PVOS instances can share one host).
+    assert!(
+        pairing.name.starts_with("pvos pvos.example:7420 (") && pairing.name.ends_with(")"),
+        "install-pinned name, got {:?}",
+        pairing.name
+    );
 
     // Malformed bodies refuse.
     let (code, _) = http(&addr, "POST", "/redeem-invite", "https://pvos.example:7420", "", "{}");

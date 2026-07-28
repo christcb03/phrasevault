@@ -65,15 +65,17 @@ pub trait Prompter: Send + Sync {
     /// Accept a PVOS member invite (D18): ONE approval covers both halves —
     /// enrolling the inviting server as paired, and signing the acceptance
     /// that makes this identity a member there. Default deny.
+    #[allow(clippy::too_many_arguments)]
     fn approve_redeem_invite(
         &self,
         member: &str,
+        email: &str,
         role: &str,
         capabilities: &[String],
         server_pubkey_hex: &str,
         origins: &[String],
     ) -> bool {
-        let _ = (member, role, capabilities, server_pubkey_hex, origins);
+        let _ = (member, email, role, capabilities, server_pubkey_hex, origins);
         false
     }
 }
@@ -120,6 +122,7 @@ fn describe_pair(name: &str, server_pubkey_hex: &str, origins: &[String]) -> Str
 
 fn describe_redeem_invite(
     member: &str,
+    email: &str,
     role: &str,
     capabilities: &[String],
     server_pubkey_hex: &str,
@@ -128,9 +131,9 @@ fn describe_redeem_invite(
     let key_short = &server_pubkey_hex[..server_pubkey_hex.len().min(12)];
     format!(
         "pvfs-companion: JOIN the PVOS server at [{}] (key {key_short}…) as \
-         member \"{member}\" ({role})? You would be able to: {}. Approving \
-         pairs the server AND signs your acceptance — you become a member \
-         there (leave by asking its admin; unpair with `pvfs-companion \
+         member \"{member}\" <{email}> ({role})? You would be able to: {}. \
+         Approving pairs the server AND signs your acceptance — you become a \
+         member there (leave by asking its admin; unpair with `pvfs-companion \
          pairings revoke`).",
         origins.join(", "),
         capabilities.join(", ")
@@ -262,12 +265,13 @@ impl Prompter for TerminalPrompter {
     fn approve_redeem_invite(
         &self,
         member: &str,
+        email: &str,
         role: &str,
         capabilities: &[String],
         server_pubkey_hex: &str,
         origins: &[String],
     ) -> bool {
-        self.ask(&describe_redeem_invite(member, role, capabilities, server_pubkey_hex, origins))
+        self.ask(&describe_redeem_invite(member, email, role, capabilities, server_pubkey_hex, origins))
     }
 }
 
@@ -317,12 +321,13 @@ impl Prompter for DesktopPrompter {
     fn approve_redeem_invite(
         &self,
         member: &str,
+        email: &str,
         role: &str,
         capabilities: &[String],
         server_pubkey_hex: &str,
         origins: &[String],
     ) -> bool {
-        self.dialog(&describe_redeem_invite(member, role, capabilities, server_pubkey_hex, origins))
+        self.dialog(&describe_redeem_invite(member, email, role, capabilities, server_pubkey_hex, origins))
     }
 }
 

@@ -26,6 +26,9 @@ use crate::signer::{KeyRole, RequestType, UnlockedSigner};
 pub struct InviteRedemption {
     pub invite_id: String,
     pub member: String,
+    /// The invitee's email as the inviter signed it (PVOS §3'''') — shown on
+    /// the prompt so the human can spot a mismatch before signing.
+    pub email: String,
     pub role: String,
     pub capabilities: Vec<String>,
     pub server_pubkey_hex: String,
@@ -352,6 +355,7 @@ impl Agent {
 
         if !self.prompter.approve_redeem_invite(
             &r.member,
+            &r.email,
             &r.role,
             &r.capabilities,
             &r.server_pubkey_hex,
@@ -373,19 +377,17 @@ impl Agent {
                 }
             }
         } else {
-            let mut name = r
+            // The derived name ALWAYS carries the install's key fingerprint
+            // (Chris, 2026-07-27): several PVOS instances can share one host,
+            // and `add` replaces by name — an address alone must never be a
+            // pairing's identity, or name a different install's pairing.
+            let host = r
                 .origins
                 .first()
-                .map(|o| {
-                    format!("pvos {}", o.trim_start_matches("https://").trim_start_matches("http://"))
-                })
-                .unwrap_or_else(|| "pvos".to_string());
-            // `add` replaces by name (re-pair semantics) — a derived name must
-            // never clobber an EXISTING pairing under a different key.
-            if reg.list().iter().any(|p| p.name == name) {
-                let tail = &r.server_pubkey_hex[..r.server_pubkey_hex.len().min(8)];
-                name = format!("{name} ({tail})");
-            }
+                .map(|o| o.trim_start_matches("https://").trim_start_matches("http://").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let tail = &r.server_pubkey_hex[..r.server_pubkey_hex.len().min(8)];
+            let name = format!("pvos {host} ({tail})");
             if let Err(e) = reg.add(&name, &r.server_pubkey_hex, r.origins.clone()) {
                 return AgentResponse::error("io", e.to_string());
             }
