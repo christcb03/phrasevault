@@ -153,3 +153,116 @@ fn tenant_socket_session_and_root_reauth() {
         other => panic!("expected no_session, got {other:?}"),
     }
 }
+
+/// D32 hosted enrollment over the socket: provision a brand-new user, prove
+/// the sealed seed signs (against the returned pubkey — including the PVOS
+/// acceptance-digest fixture), and delete them cleanly.
+#[test]
+fn tenant_socket_provisioning_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = VaultStore::open(dir.path()).unwrap();
+    let agent = Arc::new(TenantAgent::new(
+        pvfs_companion::Sessions::new(store).with_kdf(fast()),
+        Duration::from_secs(3600),
+    ));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("tenant.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let a = Arc::clone(&agent);
+        std::thread::spawn(move || {
+            let _ = serve_tenant(listener, a);
+        });
+    }
+
+    // A weak passphrase never mints a vault.
+    match roundtrip(
+        &sock,
+        &TenantRequest::CreateUser {
+            user_id: "kim".into(),
+            passphrase: "short".into(),
+        },
+    ) {
+        TenantResponse::Error { code, .. } => assert_eq!(code, "bad_input"),
+        other => panic!("expected bad_input, got {other:?}"),
+    }
+
+    // Provision kim; the reply carries her identity pubkey.
+    let id_pub = match roundtrip(
+        &sock,
+        &TenantRequest::CreateUser {
+            user_id: "kim".into(),
+            passphrase: "kim-pw-longer".into(),
+        },
+    ) {
+        TenantResponse::Pubkey { pubkey } => hex::decode(pubkey).unwrap(),
+        other => panic!("expected pubkey, got {other:?}"),
+    };
+
+    // Re-provisioning is refused — never a silent re-seal.
+    match roundtrip(
+        &sock,
+        &TenantRequest::CreateUser {
+            user_id: "kim".into(),
+            passphrase: "another-pw".into(),
+        },
+    ) {
+        TenantResponse::Error { code, .. } => assert_eq!(code, "user_exists"),
+        other => panic!("expected user_exists, got {other:?}"),
+    }
+
+    // Enrollment signing: the PVOS invite-acceptance fixture digest, signed
+    // per-action with the fresh secret (a root-style action by design).
+    let acceptance =
+        hex::decode("6bc05eba4a9b80bb35a723b60c663d06f00d46da05a6f18faa3e8128b0775344").unwrap();
+    match roundtrip(
+        &sock,
+        &TenantRequest::SignOnce {
+            user_id: "kim".into(),
+            passphrase: "kim-pw-longer".into(),
+            request_type: "user_action".into(),
+            digest: hex::encode(&acceptance),
+            context: None,
+        },
+    ) {
+        TenantResponse::Signature { sig } => {
+            let d: [u8; 32] = acceptance.clone().try_into().unwrap();
+            crypto::verify_digest(&id_pub, &d, &hex::decode(sig).unwrap()).unwrap();
+        }
+        other => panic!("expected signature, got {other:?}"),
+    }
+
+    // A live session dies with the user.
+    let token = match roundtrip(
+        &sock,
+        &TenantRequest::OpenSession {
+            user_id: "kim".into(),
+            passphrase: "kim-pw-longer".into(),
+            ttl_secs: 600,
+        },
+    ) {
+        TenantResponse::Session { token, .. } => token,
+        other => panic!("expected session, got {other:?}"),
+    };
+    match roundtrip(&sock, &TenantRequest::DeleteUser { user_id: "kim".into() }) {
+        TenantResponse::Ok => {}
+        other => panic!("expected ok, got {other:?}"),
+    }
+    match roundtrip(
+        &sock,
+        &TenantRequest::SignWithSession {
+            token,
+            request_type: "identity_tag".into(),
+            digest: hex::encode([1u8; 32]),
+            context: None,
+        },
+    ) {
+        TenantResponse::Error { code, .. } => assert_eq!(code, "no_session"),
+        other => panic!("expected no_session, got {other:?}"),
+    }
+    // …and so does the vault.
+    match roundtrip(&sock, &TenantRequest::DeleteUser { user_id: "kim".into() }) {
+        TenantResponse::Error { code, .. } => assert_eq!(code, "no_such_user"),
+        other => panic!("expected no_such_user, got {other:?}"),
+    }
+}

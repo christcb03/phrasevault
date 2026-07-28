@@ -45,6 +45,7 @@ pub enum SessionError {
 }
 
 struct Live {
+    user_id: String,
     signer: UnlockedSigner,
     expires_at: Instant,
 }
@@ -52,6 +53,7 @@ struct Live {
 /// Server-side custody: per-user vaults plus cached unlocked sessions.
 pub struct Sessions {
     store: VaultStore,
+    kdf: crate::vault::KdfParams,
     live: Mutex<HashMap<String, Live>>,
 }
 
@@ -59,8 +61,37 @@ impl Sessions {
     pub fn new(store: VaultStore) -> Sessions {
         Sessions {
             store,
+            kdf: crate::vault::KdfParams::default(),
             live: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Override the KDF cost used by [`create_user`](Sessions::create_user)
+    /// (tests and constrained hosts; the default is desktop-interactive).
+    pub fn with_kdf(mut self, kdf: crate::vault::KdfParams) -> Sessions {
+        self.kdf = kdf;
+        self
+    }
+
+    /// Provision a brand-new user (D32 hosted enrollment): generate a fresh
+    /// 24-word seed, seal it under `passphrase`, and return the identity
+    /// pubkey. Refuses an existing user — never a silent re-seal.
+    pub fn create_user(&self, user_id: &str, passphrase: &[u8]) -> Result<Vec<u8>, SessionError> {
+        let mnemonic = pvfs_core::identity::generate_mnemonic()
+            .map_err(|e| SignerError::Identity(e.to_string()))?;
+        let phrase = zeroize::Zeroizing::new(mnemonic.to_string());
+        self.store
+            .create_with(user_id, phrase.as_bytes(), passphrase, self.kdf)?;
+        let signer = UnlockedSigner::from_phrase(&phrase)?;
+        Ok(signer.pubkey(KeyRole::Identity)?)
+    }
+
+    /// Remove a user: delete the sealed vault and wipe any live sessions
+    /// holding their unlocked key. Unknown users error.
+    pub fn delete_user(&self, user_id: &str) -> Result<(), SessionError> {
+        self.store.delete(user_id)?;
+        self.live.lock().unwrap().retain(|_, s| s.user_id != user_id);
+        Ok(())
     }
 
     pub fn store(&self) -> &VaultStore {
@@ -102,6 +133,7 @@ impl Sessions {
         self.live.lock().unwrap().insert(
             token.clone(),
             Live {
+                user_id: user_id.to_string(),
                 signer,
                 expires_at: Instant::now() + ttl,
             },
@@ -218,6 +250,53 @@ mod tests {
             s.sign_with_session(&token, RequestType::IdentityTag, &digest),
             Err(SessionError::NoSession)
         ));
+    }
+
+    #[test]
+    fn create_user_provisions_and_refuses_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VaultStore::open(dir.path()).unwrap();
+        let s = Sessions::new(store).with_kdf(fast());
+
+        let id_pub = s.create_user("kim", b"kim-pw-longer").unwrap();
+        // The returned pubkey is the one the sealed seed signs with.
+        let digest = [7u8; 32];
+        let sig = s
+            .sign_once("kim", b"kim-pw-longer", RequestType::UserAction, &digest)
+            .unwrap();
+        crypto::verify_digest(&id_pub, &digest, &sig).unwrap();
+
+        // Never a silent re-seal.
+        assert!(matches!(
+            s.create_user("kim", b"other-pw"),
+            Err(SessionError::Store(crate::store::StoreError::Exists(_)))
+        ));
+    }
+
+    #[test]
+    fn delete_user_wipes_vault_and_live_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VaultStore::open(dir.path()).unwrap();
+        let s = Sessions::new(store).with_kdf(fast());
+        s.create_user("kim", b"kim-pw-longer").unwrap();
+
+        let token = s
+            .open_session("kim", b"kim-pw-longer", Duration::from_secs(60))
+            .unwrap();
+        s.delete_user("kim").unwrap();
+
+        // The cached unlocked key died with the vault…
+        assert!(matches!(
+            s.sign_with_session(&token, RequestType::IdentityTag, &[8u8; 32]),
+            Err(SessionError::NoSession)
+        ));
+        // …the vault is gone…
+        assert!(matches!(
+            s.open_session("kim", b"kim-pw-longer", Duration::from_secs(60)),
+            Err(SessionError::Store(crate::store::StoreError::NotFound(_)))
+        ));
+        // …and a double delete is an error, not a shrug.
+        assert!(s.delete_user("kim").is_err());
     }
 
     #[test]

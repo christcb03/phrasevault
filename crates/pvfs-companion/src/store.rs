@@ -71,6 +71,17 @@ impl VaultStore {
         Ok(())
     }
 
+    /// Delete `user_id`'s vault (D32 hosted-member removal: the identity key is
+    /// revoked forest-side, so keeping dead sealed material is a liability, not
+    /// a courtesy). Unknown users error — the caller should know what it holds.
+    pub fn delete(&self, user_id: &str) -> Result<(), StoreError> {
+        let path = self.path(user_id)?;
+        if !path.exists() {
+            return Err(StoreError::NotFound(user_id.to_string()));
+        }
+        std::fs::remove_file(&path).map_err(|e| StoreError::Io(e.to_string()))
+    }
+
     /// Unseal `user_id`'s vault with `passphrase`, returning the zeroizing secret.
     pub fn unseal(&self, user_id: &str, passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         let path = self.path(user_id)?;

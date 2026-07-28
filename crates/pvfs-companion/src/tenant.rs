@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 use crate::proto::{ApprovalContext, API_VERSION};
 use crate::session::{SessionError, Sessions};
 use crate::signer::{KeyRole, RequestType};
+use crate::store::StoreError;
+
+/// Floor for a hosted user's unlock passphrase (D32 §3.2). The vault layer
+/// itself imposes no minimum (a local companion's phrase is the owner's own
+/// business); server-hosted custody is where a weak secret hurts, so the
+/// floor lives here.
+const MIN_PASSPHRASE_CHARS: usize = 8;
 
 /// A request to the multi-tenant custody agent.
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +34,13 @@ use crate::signer::{KeyRole, RequestType};
 pub enum TenantRequest {
     /// The agent protocol version (doc 16 §7 item 4); needs no secret.
     ApiVersion,
+    /// Provision a brand-new user (PVOS D32 hosted enrollment): a fresh seed is
+    /// generated server-side, sealed under `passphrase`, and the identity
+    /// pubkey returned. Refuses an existing user_id — never a silent re-seal.
+    CreateUser { user_id: String, passphrase: String },
+    /// Remove a user: wipe their live sessions and delete the sealed vault
+    /// (D32 member removal — the identity key is revoked forest-side first).
+    DeleteUser { user_id: String },
     /// Public key for a user's `role` (`"root"`/`"identity"`); needs the secret.
     GetPubkey {
         user_id: String,
@@ -85,6 +99,8 @@ impl TenantResponse {
         let code = match &e {
             SessionError::NeedsReauth => "reauth_required",
             SessionError::NoSession => "no_session",
+            SessionError::Store(StoreError::Exists(_)) => "user_exists",
+            SessionError::Store(StoreError::NotFound(_)) => "no_such_user",
             _ => "error",
         };
         TenantResponse::Error {
@@ -111,6 +127,23 @@ impl TenantAgent {
             TenantRequest::ApiVersion => TenantResponse::ApiVersion {
                 api_version: API_VERSION,
             },
+            TenantRequest::CreateUser { user_id, passphrase } => {
+                if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+                    return TenantResponse::bad("passphrase too short (minimum 8 characters)");
+                }
+                match self.sessions.create_user(&user_id, passphrase.as_bytes()) {
+                    Ok(pk) => TenantResponse::Pubkey {
+                        pubkey: hex::encode(pk),
+                    },
+                    Err(e) => TenantResponse::from_err(e),
+                }
+            }
+            TenantRequest::DeleteUser { user_id } => {
+                match self.sessions.delete_user(&user_id) {
+                    Ok(()) => TenantResponse::Ok,
+                    Err(e) => TenantResponse::from_err(e),
+                }
+            }
             TenantRequest::GetPubkey {
                 user_id,
                 passphrase,
