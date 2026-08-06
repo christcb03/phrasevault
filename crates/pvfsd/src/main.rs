@@ -54,6 +54,21 @@ fn install_signal_handlers() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Best-effort sd_notify READY=1 (std-only, no libsystemd): a no-op when
+/// NOTIFY_SOCKET is absent (plain runs, tests, Type=simple units).
+/// Abstract-namespace notify sockets (a leading '@', rare outside
+/// containers) are skipped — Rust paths cannot carry the NUL those need,
+/// and best-effort means exactly that.
+fn notify_systemd_ready() {
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else { return };
+    if path.starts_with('@') {
+        return;
+    }
+    if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+        let _ = sock.send_to(b"READY=1", &path);
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
@@ -102,6 +117,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.mount.display(),
         socket.display()
     );
+    // Tell systemd we are SERVING — a Type=notify unit holds dependents
+    // (pvosd's After=pvfsd) until this moment, not "process exists". The
+    // forest replay above can run minutes on a grown library; "started
+    // but not yet serving" is exactly the window that crash-looped pvosd
+    // three times (PVOS D49/D55/M4b close-outs).
+    notify_systemd_ready();
     serve_until(listener, Arc::clone(&daemon), &SHUTDOWN)?;
 
     // Graceful stop: flush the WAL and record a clean shutdown so the next start is
