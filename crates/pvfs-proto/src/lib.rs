@@ -56,8 +56,28 @@ pub enum ServerMsg {
     CatStart { size: u64 },
     /// Data-plane cat: all bytes sent; total written byte count.
     CatDone { written: u64 },
+    /// The log's chain tip position (response to `ClientMsg::LogInfo`; F2).
+    LogInfo { tip_seq: u64 },
+    /// A batch of raw signed log rows (response to `ClientMsg::LogRead`; F2).
+    /// `tip_seq` is the tip at read time so the client knows when it's caught up.
+    LogEvents {
+        tip_seq: u64,
+        events: Vec<LogEventWire>,
+    },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
+}
+
+/// One shipped log row, verbatim (F2 log shipping, doc 17 §5): the replica
+/// re-verifies the chain linkage on ingest and the full log (signatures +
+/// replay authorization) on open, so these carry no authority of their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEventWire {
+    pub seq: u64,
+    pub kind: String,
+    pub body: String,       // hex
+    pub chain_hash: String, // hex
+    pub written_at: u64,
 }
 
 /// A high-level write intent the daemon turns into signable events (doc 07 §5).
@@ -141,6 +161,13 @@ pub enum ClientMsg {
     /// server writes the bytes and replies `Prepared` (the `SecureBlobUpdated`
     /// digest to sign), after which the client `Commit`s as usual.
     SecurePut { node: String },
+    /// The log's chain tip (F2). Gated like `LogRead`.
+    LogInfo,
+    /// Ship raw log rows `[from_seq ..]`, at most `max` per batch (F2).
+    /// Gated: the caller needs **admin rights on the forest root** — a full
+    /// log reveals the whole forest's history, so replication is an
+    /// owner/admin capability (doc 17 §5), not a member read.
+    LogRead { from_seq: u64, max: u32 },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },
     /// Phase 2: return one signature (hex) per preimage, in order.

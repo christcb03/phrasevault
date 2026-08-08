@@ -73,6 +73,9 @@ pub struct Engine {
     pub(crate) device: DeviceKeyCache,
     pub identity: ForestIdentity,
     pub(crate) closed: bool,
+    /// A replica forest (doc 03 §1.1): full verified copy, local writes
+    /// refused — the owner instance is the forest's only writer.
+    pub(crate) replica: bool,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -109,7 +112,7 @@ fn open_connection_read_only(data_dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn open_connection(data_dir: &Path) -> Result<Connection> {
+pub(crate) fn open_connection(data_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(data_dir.join(INDEX_FILE)).map_err(map_db("open index.db"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(map_db("busy timeout"))?;
@@ -398,12 +401,18 @@ impl Engine {
                 root_pubkey: root_pub,
             },
             closed: false,
+            replica: false,
         })
     }
 
     /// Open an existing data dir using the cached device key (spec §9.3 runs
     /// on every open).
     pub fn open(data_dir: &Path) -> Result<Engine> {
+        // A marked replica dir routes to the read-only open (F2, doc 17 §5) —
+        // callers need not know which kind of forest a data dir holds.
+        if crate::replica::marker_path(data_dir).exists() {
+            return Self::open_replica(data_dir);
+        }
         let device = DeviceKeyCache::load(data_dir)?;
         let mut conn = open_connection(data_dir)?;
         let identity = projection::startup_check(&mut conn)?;
@@ -414,6 +423,7 @@ impl Engine {
             device,
             identity,
             closed: false,
+            replica: false,
         };
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
@@ -440,7 +450,45 @@ impl Engine {
             // `closed: true` keeps Drop from touching the clean-shutdown flag —
             // shutdown bookkeeping belongs to the writer engine alone.
             closed: true,
+            replica: false,
         })
+    }
+
+    /// Open a **replica** forest read-only (F2, doc 17 §5): the standard
+    /// startup check replays and verifies the shipped log (chain, signatures,
+    /// replay authorization), so a replica that opens is a *proven* copy.
+    /// There is no device key — the local machine is not a member of the
+    /// replicated forest by construction — so an ephemeral key satisfies the
+    /// engine plumbing and every log write is refused.
+    pub fn open_replica(data_dir: &Path) -> Result<Engine> {
+        let device = DeviceKeyCache::ephemeral()?;
+        let mut conn = open_connection(data_dir)?;
+        let identity = projection::startup_check(&mut conn)?;
+        projection::meta_set(&conn, "clean_shutdown", "0")?;
+        Ok(Engine {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            device,
+            identity,
+            closed: false,
+            replica: true,
+        })
+    }
+
+    /// True for a replica forest (local writes refused).
+    pub fn is_replica(&self) -> bool {
+        self.replica
+    }
+
+    /// Highest seq in the log (the chain tip position).
+    pub fn log_tip(&self) -> Result<u64> {
+        log_store::max_seq(&self.conn)
+    }
+
+    /// Raw log rows `[from_seq ..]`, at most `max` (log shipping, F2). The
+    /// caller gates access — a full log reveals the whole forest's history.
+    pub fn log_events(&self, from_seq: u64, max: usize) -> Result<Vec<log_store::EventRow>> {
+        log_store::read_range(&self.conn, from_seq, max)
     }
 
     /// Recover onto a machine from the mnemonic: re-derive the device key and
@@ -473,6 +521,7 @@ impl Engine {
             device,
             identity,
             closed: false,
+            replica: false,
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();
@@ -552,8 +601,16 @@ impl Engine {
     }
 
     /// Local API events must be authored by an authorized, unrevoked device
-    /// key (spec §6 device-key acceptance rule).
+    /// key (spec §6 device-key acceptance rule). A replica short-circuits to
+    /// the read-only refusal — its ephemeral key is deliberately no one.
     pub(crate) fn ensure_device_active(&self) -> Result<()> {
+        if self.replica {
+            return Err(PvfsError::Forbidden {
+                action: "write".into(),
+                reason: "replica forest is read-only — its owner instance is the only writer"
+                    .into(),
+            });
+        }
         let pk = self.device.pubkey();
         let active: Option<i64> = self
             .conn
@@ -581,6 +638,13 @@ impl Engine {
         events: Vec<Event>,
         temp_ops: impl FnOnce(&Transaction<'_>) -> Result<()>,
     ) -> Result<()> {
+        if self.replica {
+            return Err(PvfsError::Forbidden {
+                action: "write".into(),
+                reason: "replica forest is read-only — its owner instance is the only writer"
+                    .into(),
+            });
+        }
         let genesis = log_store::genesis_seed(&self.identity.instance_id, &self.identity.forest_id);
         let tx = self.conn.transaction().map_err(map_db("begin write"))?;
         let mut seq = log_store::max_seq(&tx)?;

@@ -57,7 +57,7 @@ so region granularity isn't on this scenario's critical path.
 | **F0** | `pvfs export` — materialize a tree as a native directory (symlink / hardlink / verified copy), manifest-tracked idempotent re-runs, prune | ✅ built (§3) |
 | **F0.1** | `pvfs serve` keeps exports fresh (re-export on change), `export --fetch` once F3 lands | ☐ small follow-on |
 | **F1** | Network transport: `pvfsd --listen` over TCP+TLS with a pinned transport cert, single-use challenge nonces (doc 08 §4 item 7), `pvfs instance` registry + `remote --connect/--instance` | ✅ built (§4) |
-| **F2** | Forest replica — doc 03 Mode A: full-log fetch + tail follow, chain/signature verification on ingest, replica projection served read-only by `pvfsd`; multi-forest data dir (doc 03 §1.1) | ☐ |
+| **F2** | Forest replica — doc 03 Mode A: admin-gated log shipping (`LogInfo`/`LogRead`), `pvfs replica add/sync`, chain-verified ingest + fully verified replay at open, read-only replica forests served by `pvfsd` | ✅ built (§5) |
 | **F3** | Content plane: per-subtree **placement policy** (`pointer` \| `sync`), the sync engine (fetch-by-hash, verify, record), replica-local cache locations | ☐ |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later |
 
@@ -149,19 +149,34 @@ The smallest network layer that makes doc 03's model real. As built:
 - **Remote append stays closed** in F1 — reads and member-signed writes ride the existing daemon
   ops; replication protocols come with F2, the crosslink grant (doc 03 §6 Q4) with F3.
 
-## 5. F2 — forest replica (doc 03 Mode A)
+## 5. F2 — forest replica (doc 03 Mode A) ✅ BUILT (2026-08-08)
 
-- `pvfs replica add pvfs:<instance_id>/<forest_id>` — fetch the full log from the owner, verifying
-  chain hashes + event signatures **during ingest** (the doc 03 §3 trust fixes are already in every
-  event); then `replica sync` / a `serve`-integrated tail follow.
-- A replica is a **second forest in the data dir** — this is where doc 03 §1.1's multi-forest host
-  lands. The projection rebuilds locally; `pvfsd` serves it **read-only**, ACL-filtered as usual
-  (the log carries every grant, so a replica enforces exactly what the owner would).
-- **Lineage edges honored:** a `RootRotated` chain (doc 15 case C) verifies across the swap; a
-  compacted forest replicates from its checkpoint with the sealed archive as the deep-verification
-  path (doc 11, doc 03 §6 Q8).
-- `pvfs export` from a replica = the cross-host media library, pointer-mode (metadata local, bytes
-  still remote until F3).
+As built:
+
+- **Log shipping is a gated daemon read.** New wire ops `LogInfo` / `LogRead` ship raw signed log
+  rows in batches (row + byte capped). The gate: **admin rights (`a`) on the forest root** — true
+  for the owner's devices automatically (rights short-circuit) and for anyone the owner grants `a`
+  at the root. A full log reveals the whole forest's history, so replication is an owner/admin
+  capability, not a member read (consistent with doc 13 §D3's "a host can read what it hosts").
+- **`pvfs replica add <mount> --instance <name> | --connect+--pin | --socket <path>`** pulls the
+  full log into a fresh forest dir. Ingest verifies **chain linkage row-by-row** (fail fast on a
+  tampered tail); then the open runs the standard startup replay, which verifies **everything** —
+  chain from the genesis seed, every event signature, and replay-time authorization (doc 03 §3's
+  trust fixes were built for exactly this). *A replica that opens is a proven copy*, not a trusted
+  download. A `replica` marker records the source; `pvfs replica sync` re-dials it, ships the
+  tail, and re-verifies.
+- **A replica is an ordinary forest dir, read-only.** Not a second forest *inside* a data dir —
+  each forest (owned or replica) keeps its own `.pvfs/`, which the mount/registry model already
+  handles; doc 03 §1.1's multi-forest host is satisfied at the host level, no kernel restructure.
+  `Engine::open` routes marked dirs to a replica open that refuses every log write (the owner
+  instance stays the forest's only writer) — so `pvfsd` serves a replica read-only with **identical
+  ACL answers** (the grants are in the shipped log), and `pvfs export` works on it unchanged.
+- **F0 + F2 compose today:** export from a replica = the cross-host media library. Bytes resolve
+  where the owner's `file://` locations happen to exist locally; elsewhere they're the exported
+  view's reported skips until F3 syncs them.
+- **Lineage edges honored by construction:** replay already validates `RootRotated` chains (doc 15
+  case C), so a rotated forest replicates correctly; the compaction-checkpoint cut remains with
+  doc 11 (doc 03 §6 Q8).
 
 ## 6. F3 — placement policy & the sync engine
 

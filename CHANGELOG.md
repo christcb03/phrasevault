@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Forest replicas (P4 F2, doc 17 §5 — doc 03 Mode A):** `pvfs replica add
+  <mount> --instance <name> | --connect <addr> --pin <hex> | --socket <path>`
+  pulls a served forest's **full signed log** and builds a local, read-only
+  replica; `pvfs replica sync` ships the tail from the recorded source. Log
+  shipping (`LogInfo`/`LogRead`) is gated on **admin rights on the forest
+  root** — replication is an owner/admin capability, not a member read.
+  Ingest verifies chain linkage row-by-row (fail fast on a tampered tail);
+  the open then runs the standard startup replay, verifying the entire log —
+  chain from genesis, every event signature, replay-time authorization — so
+  *a replica that opens is a proven copy*. Replicas are ordinary forest dirs
+  with a `replica` marker: `Engine::open` routes them to a read-only open
+  (every local write refused; the owner instance stays the only writer),
+  `pvfsd` serves them with identical ACL answers (the grants are in the
+  shipped log), and `pvfs export` materializes them like any forest — the
+  cross-host media library composes today from F0 + F2.
 - **Network transport (P4 F1, doc 17 §4):** `pvfsd --listen <addr>` serves the
   full daemon protocol (reads, member-signed writes, the raw data plane) over
   **TCP+TLS** alongside the Unix socket — same `serve_connection`, one generic

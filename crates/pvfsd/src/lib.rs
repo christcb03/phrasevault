@@ -316,6 +316,17 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Err(msg) => msg,
         },
         ClientMsg::Payload { node } => do_payload(daemon, principal, &node),
+        ClientMsg::LogInfo => match check_replication_gate(daemon, principal) {
+            Ok(()) => {
+                let e = daemon.reader();
+                match e.log_tip() {
+                    Ok(tip_seq) => ServerMsg::LogInfo { tip_seq },
+                    Err(pve) => err_from(pve),
+                }
+            }
+            Err(msg) => msg,
+        },
+        ClientMsg::LogRead { from_seq, max } => do_log_read(daemon, principal, from_seq, max),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
@@ -325,6 +336,62 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
         | ClientMsg::Auth { .. }
         | ClientMsg::Anonymous => err("bad_input", "unexpected message in request loop"),
     }
+}
+
+/// Most rows one `LogRead` batch returns; the server also stops a batch when
+/// the accumulated bodies pass ~4 MiB, so a frame never nears `MAX_FRAME`.
+const LOG_BATCH_ROWS: usize = 512;
+const LOG_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Log shipping is an owner/admin capability (doc 17 §5): the full log holds
+/// the whole forest's history, so the caller must hold **admin rights on the
+/// forest root** — true for the owner's devices (rights short-circuit) and
+/// for anyone the owner granted `a` at the root.
+fn check_replication_gate(daemon: &Daemon, principal: &Principal) -> Result<(), ServerMsg> {
+    let e = daemon.reader();
+    let root = e.identity.root_node_id.clone();
+    match e.effective_rights(principal, &root) {
+        Ok(r) if r & acl::ACL_A != 0 => Ok(()),
+        Ok(_) => Err(err(
+            "forbidden",
+            "log replication requires admin rights on the forest root",
+        )),
+        Err(pve) => Err(err_from(pve)),
+    }
+}
+
+/// Ship raw log rows (F2). The replica re-verifies everything, so this is a
+/// plain gated read of the events table.
+fn do_log_read(daemon: &Daemon, principal: &Principal, from_seq: u64, max: u32) -> ServerMsg {
+    if let Err(msg) = check_replication_gate(daemon, principal) {
+        return msg;
+    }
+    let e = daemon.reader();
+    let cap = (max as usize).clamp(1, LOG_BATCH_ROWS);
+    let rows = match e.log_events(from_seq, cap) {
+        Ok(r) => r,
+        Err(pve) => return err_from(pve),
+    };
+    let tip_seq = match e.log_tip() {
+        Ok(t) => t,
+        Err(pve) => return err_from(pve),
+    };
+    let mut events = Vec::with_capacity(rows.len());
+    let mut bytes = 0usize;
+    for row in rows {
+        bytes += row.body.len();
+        events.push(pvfs_proto::LogEventWire {
+            seq: row.seq,
+            kind: row.kind,
+            body: hex::encode(row.body),
+            chain_hash: hex::encode(row.chain_hash),
+            written_at: row.written_at,
+        });
+        if bytes > LOG_BATCH_BYTES {
+            break; // client continues from the next seq
+        }
+    }
+    ServerMsg::LogEvents { tip_seq, events }
 }
 
 /// A node's inline payload (control plane; read-ACL-gated like `stat`).

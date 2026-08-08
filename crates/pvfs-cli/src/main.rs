@@ -157,6 +157,9 @@ enum Cmd {
     /// Manage named network instances: address + transport pin (F1)
     #[command(subcommand)]
     Instance(InstanceCmd),
+    /// Replicate a served forest locally — verified log shipping (P4 F2, doc 17 §5)
+    #[command(subcommand)]
+    Replica(ReplicaCmd),
     /// Bind a folder node to a real directory (P1)
     Bind {
         folder: String,
@@ -535,6 +538,30 @@ enum TagCmd {
 }
 
 #[derive(Subcommand)]
+enum ReplicaCmd {
+    /// Fetch a forest's full signed log and build a read-only replica at a
+    /// new mount dir. Requires admin rights on the source forest's root.
+    Add {
+        /// Destination mount directory (its .pvfs/ must not exist yet)
+        dest: PathBuf,
+        /// A named instance from `pvfs instance add`
+        #[arg(long)]
+        instance: Option<String>,
+        /// Network address of a `pvfsd --listen` daemon (host:port); needs --pin
+        #[arg(long, conflicts_with = "instance")]
+        connect: Option<String>,
+        /// The server's transport pin (with --connect)
+        #[arg(long, requires = "connect")]
+        pin: Option<String>,
+        /// A local daemon socket (same-host replication)
+        #[arg(long, conflicts_with_all = ["instance", "connect", "pin"])]
+        socket: Option<PathBuf>,
+    },
+    /// Pull new events from the replica's recorded source and re-verify
+    Sync { mount: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum InstanceCmd {
     /// Remember a network instance: `pvfs remote --instance <name>` then dials it
     Add {
@@ -678,6 +705,99 @@ fn lookup_instance(name: &str) -> Result<(String, String), PvfsError> {
             kind: "instance",
             id: name.into(),
         })
+}
+
+/// Resolve where a replica fetches from (`--instance` / `--connect --pin` /
+/// `--socket`) into the source record the replica marker stores.
+fn resolve_replica_dial(
+    instance: Option<String>,
+    connect: Option<String>,
+    pin: Option<String>,
+    socket: Option<PathBuf>,
+) -> Result<pvfs_core::ReplicaSource, PvfsError> {
+    if let Some(s) = socket {
+        return Ok(pvfs_core::ReplicaSource {
+            transport: "socket".into(),
+            target: s.to_string_lossy().into_owned(),
+            pin: String::new(),
+        });
+    }
+    if let Some(addr) = connect {
+        let pin = pin.ok_or_else(|| PvfsError::BadInput {
+            field: "replica".into(),
+            reason: "pass --pin <hex> with --connect (printed by pvfsd --listen)".into(),
+        })?;
+        return Ok(pvfs_core::ReplicaSource {
+            transport: "tcp".into(),
+            target: addr,
+            pin,
+        });
+    }
+    if let Some(name) = instance {
+        let (addr, pin) = lookup_instance(&name)?;
+        return Ok(pvfs_core::ReplicaSource {
+            transport: "tcp".into(),
+            target: addr,
+            pin,
+        });
+    }
+    Err(PvfsError::BadInput {
+        field: "replica".into(),
+        reason: "pass --instance <name>, --connect <host:port> --pin <hex>, or --socket <path>"
+            .into(),
+    })
+}
+
+/// Dial a replica source as the client identity (log shipping is gated on
+/// root-admin rights, so the connection must be signed).
+fn replica_client(src: &pvfs_core::ReplicaSource) -> Result<Client, PvfsError> {
+    let mn = client_identity_mnemonic()?;
+    let key = identity::device_key(&mn, "", 0)?;
+    let pubkey = crypto::pubkey_bytes(&key);
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&key, d).unwrap_or_default();
+    match src.transport.as_str() {
+        "tcp" => Client::connect_tcp_signed(&src.target, &src.pin, &pubkey, sign)
+            .map_err(remote_err),
+        _ => Client::connect_signed(std::path::Path::new(&src.target), &pubkey, sign)
+            .map_err(remote_err),
+    }
+}
+
+/// Pull the source log from `from` until caught up, ingesting verbatim rows
+/// (chain-verified per batch). Returns the number of events ingested.
+fn replica_pull(
+    client: &mut Client,
+    store: &mut pvfs_core::ReplicaStore,
+    mut from: u64,
+) -> Result<u64, PvfsError> {
+    let mut total = 0u64;
+    loop {
+        let (_tip, events) = client.log_read(from, 512).map_err(remote_err)?;
+        if events.is_empty() {
+            return Ok(total);
+        }
+        let rows: Result<Vec<pvfs_core::log_store::EventRow>, PvfsError> = events
+            .iter()
+            .map(|w| {
+                Ok(pvfs_core::log_store::EventRow {
+                    seq: w.seq,
+                    kind: w.kind.clone(),
+                    body: hex::decode(&w.body).map_err(|_| PvfsError::BadInput {
+                        field: "replica".into(),
+                        reason: "shipped event body not hex".into(),
+                    })?,
+                    chain_hash: hex::decode(&w.chain_hash).map_err(|_| PvfsError::BadInput {
+                        field: "replica".into(),
+                        reason: "shipped chain hash not hex".into(),
+                    })?,
+                    written_at: w.written_at,
+                })
+            })
+            .collect();
+        let rows = rows?;
+        total += rows.len() as u64;
+        from = store.append(&rows)? + 1;
+    }
 }
 
 fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
@@ -2649,6 +2769,79 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Replica(cmd) => match cmd {
+            ReplicaCmd::Add {
+                dest,
+                instance,
+                connect,
+                pin,
+                socket,
+            } => {
+                let data_dir = dest.join(".pvfs");
+                if data_dir.exists() {
+                    return Err(PvfsError::AlreadyExists {
+                        kind: "forest",
+                        id: data_dir.to_string_lossy().into_owned(),
+                    });
+                }
+                let dial = resolve_replica_dial(instance, connect, pin, socket)?;
+                let mut client = replica_client(&dial)?;
+                let info = client.info().map_err(remote_err)?;
+                let mut store = pvfs_core::ReplicaStore::open(&data_dir)?;
+                let shipped = match replica_pull(&mut client, &mut store, 1) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&data_dir);
+                        return Err(e);
+                    }
+                };
+                drop(store);
+                dial.save(&data_dir)?;
+                // The open replays the whole shipped log — chain, signatures,
+                // replay authorization. A replica that opens is proven.
+                let engine = match Engine::open(&data_dir) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&data_dir);
+                        return Err(e);
+                    }
+                };
+                let root = engine.identity.root_node_id.clone();
+                engine.close()?;
+                if json {
+                    println!(
+                        "{{\"forest_id\":\"{}\",\"instance_id\":\"{}\",\"root\":\"{}\",\"events\":{}}}",
+                        json_escape(&info.forest_id),
+                        json_escape(&info.instance_id),
+                        root,
+                        shipped
+                    );
+                } else {
+                    println!("replica of {} ({} events, verified)", info.forest_id, shipped);
+                    println!("mount: {} (read-only; sync with `pvfs replica sync`)", dest.display());
+                }
+                Ok(())
+            }
+            ReplicaCmd::Sync { mount } => {
+                let data_dir = mount.join(".pvfs");
+                let dial = pvfs_core::ReplicaSource::load(&data_dir)?;
+                let mut client = replica_client(&dial)?;
+                let mut store = pvfs_core::ReplicaStore::open(&data_dir)?;
+                let from = store.tip()? + 1;
+                let shipped = replica_pull(&mut client, &mut store, from)?;
+                drop(store);
+                // Re-open: the startup check verifies + folds the new tail.
+                let engine = Engine::open(&data_dir)?;
+                let tip = engine.log_tip()?;
+                engine.close()?;
+                if json {
+                    println!("{{\"synced\":{shipped},\"tip\":{tip}}}");
+                } else {
+                    println!("synced {shipped} events (tip {tip})");
+                }
+                Ok(())
+            }
+        },
         Cmd::Instance(cmd) => {
             match cmd {
                 InstanceCmd::Add { name, addr, pin } => {

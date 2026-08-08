@@ -75,6 +75,29 @@ pub struct EventRow {
     pub written_at: u64,
 }
 
+/// Rows `[from_seq ..]` in seq order, at most `max` (log shipping, F2).
+pub fn read_range(conn: &Connection, from_seq: u64, max: usize) -> Result<Vec<EventRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, kind, body, chain_hash, written_at FROM log.events
+             WHERE seq >= ?1 ORDER BY seq LIMIT ?2",
+        )
+        .map_err(map_db("read range"))?;
+    let rows = stmt
+        .query_map(params![from_seq as i64, max as i64], |r| {
+            Ok(EventRow {
+                seq: r.get::<_, i64>(0)? as u64,
+                kind: r.get(1)?,
+                body: r.get(2)?,
+                chain_hash: r.get(3)?,
+                written_at: r.get::<_, i64>(4)? as u64,
+            })
+        })
+        .map_err(map_db("read range"))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_db("read range"))
+}
+
 pub fn read_event(conn: &Connection, seq: u64) -> Result<Option<EventRow>> {
     conn.query_row(
         "SELECT seq, kind, body, chain_hash, written_at FROM log.events WHERE seq = ?1",

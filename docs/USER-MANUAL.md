@@ -256,6 +256,38 @@ see which key a tag belongs to, and mark a now-dead grant `[inert: authority rev
 read `-` — what's actually in effect). To sweep a whole forest for such dead grants, run
 `pvfs audit`.
 
+### 7.7 Replicating a forest to another machine
+
+A **replica** is a full, verified, read-only copy of a forest — its signed log shipped and
+re-verified locally, its catalog rebuilt from it. Use it to carry your library to a second machine
+(the media-server case), or to hold a proven backup of the metadata:
+
+```bash
+# on the source machine — serve with a network listener (§7.4)
+pvfsd --mount ~/media --listen 0.0.0.0:7420      # prints the transport pin
+
+# on the replica machine — pin the server, then replicate
+pvfs instance add homeserver 192.168.1.10:7420 <pin>
+pvfs replica add ~/media-replica --instance homeserver
+#   replica of <forest-id> (214 events, verified)
+
+pvfs replica sync ~/media-replica                # pull what's new, any time
+pvfs export <node> /srv/plex-library --mode symlink   # replicas export like any forest
+```
+
+Three things to know:
+
+- **Replication is an owner/admin capability.** The connection's identity needs **admin (`a`)
+  rights on the forest root** — your own devices qualify automatically; grant `a` at the root to
+  delegate it. A full log holds the whole forest's history, so it is deliberately not a member read.
+- **A replica is proven, not trusted.** Ingest checks the hash chain row by row, and opening the
+  replica replays the entire log through the same verification the owner's engine uses — chain,
+  every signature, every authorization. A tampered ship fails loudly, at the exact event.
+- **Replicas are read-only.** The owner's instance stays the forest's only writer; local writes and
+  writes via a replica's daemon are refused. ACLs answer identically on a replica (the grants are
+  in the log), and file bytes read through wherever the recorded locations resolve — pulling bytes
+  local per subtree is the next phase (placement policy, doc 17 §6).
+
 ---
 
 ## 8. Secure blobs (encrypted-at-rest storage)
@@ -400,6 +432,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
+| `pvfs replica add <mount> --instance <name>` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest (§7.7). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
@@ -439,7 +472,8 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 - **Polish** — Touch ID unlock.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; old history sealed for audit).
-- **Federation / network sharing** — reach and sync forests across hosts. The track has started
-  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1) and the
-  network transport (`pvfsd --listen` + pinned TLS, §7.4) are built; replicas and pointer-vs-sync
-  placement policy follow.
+- **Federation / network sharing** — reach and sync forests across hosts. The track is underway
+  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the network
+  transport (`pvfsd --listen` + pinned TLS, §7.4), and verified read-only replicas
+  (`pvfs replica`, §7.7) are built; pointer-vs-sync placement policy (pulling chosen subtrees'
+  bytes local) is next.

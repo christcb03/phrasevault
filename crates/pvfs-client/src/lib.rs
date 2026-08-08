@@ -20,7 +20,7 @@ use pvfs_proto::{
     WriteOp,
 };
 
-pub use pvfs_proto::{ChildInfo, NodeInfo};
+pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo};
 
 /// The client's transport: both arms speak identical frames.
 enum Stream {
@@ -234,6 +234,25 @@ impl Client {
         match self.request(ClientMsg::Stat { node: node.into() })? {
             ServerMsg::Stat { node } => Ok(node),
             other => Err(unexpected("Stat", &other)),
+        }
+    }
+
+    /// The served log's chain tip (F2 log shipping). Requires admin rights on
+    /// the forest root.
+    pub fn log_info(&mut self) -> Result<u64> {
+        match self.request(ClientMsg::LogInfo)? {
+            ServerMsg::LogInfo { tip_seq } => Ok(tip_seq),
+            other => Err(unexpected("LogInfo", &other)),
+        }
+    }
+
+    /// One batch of raw signed log rows from `from_seq` (F2). Returns
+    /// `(tip_seq, events)`; keep calling from `last.seq + 1` until caught up.
+    /// Requires admin rights on the forest root.
+    pub fn log_read(&mut self, from_seq: u64, max: u32) -> Result<(u64, Vec<LogEventWire>)> {
+        match self.request(ClientMsg::LogRead { from_seq, max })? {
+            ServerMsg::LogEvents { tip_seq, events } => Ok((tip_seq, events)),
+            other => Err(unexpected("LogEvents", &other)),
         }
     }
 

@@ -27,6 +27,7 @@ pub mod mount;
 pub mod node;
 pub mod orderkey;
 pub mod projection;
+pub mod replica;
 pub mod storage;
 pub mod walk;
 
@@ -41,6 +42,7 @@ pub use fs::{
 pub use identity::Mnemonic;
 pub use link::{Link, LinkId, LINK_CONTAINS, LINK_REF};
 pub use mount::{RegisteredForest, Registry, ResolvedTarget};
+pub use replica::{ReplicaSource, ReplicaStore};
 pub use node::{FilePayload, Node, NodeId, TYPE_FILE, TYPE_FOLDER, TYPE_SECURE};
 pub use orderkey::OrderKey;
 pub use storage::ByteRange;

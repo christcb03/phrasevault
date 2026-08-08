@@ -23,6 +23,7 @@ U2PID=""
 CPID=""
 TPID=""
 EPID=""
+RPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
@@ -30,6 +31,7 @@ cleanup() {
   [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
   [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
   [ -n "$EPID" ] && kill "$EPID" 2>/dev/null
+  [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -405,6 +407,43 @@ assert_rc 0 "auto-routed acl set tag principal accepted" -- \
 # daemon is still serving the same live forest after the auto-routed admin ops
 $PVFS --json remote --socket "$SOCK" info | grep -q "\"forest_id\":\"$DFID\"" \
   && ok "daemon still serving after auto-routed admin"
+
+say "F2: replica — verified log shipping (doc 17 §5)"
+REPMOUNT="$DATA/replica"
+# the gate: log shipping needs admin on the forest root (client has only rw)
+assert_rc 5 "replica add without root admin → 5" -- \
+  $PVFS replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NETPIN"
+$PVFS --forest "$DMOUNT" acl set "$DROOT" "key:$CLIENTKEY" rwa >/dev/null \
+  && ok "owner granted the client root admin (the replication capability)"
+REP_JSON="$($PVFS --json replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NETPIN")"
+[ "$(jget "$REP_JSON" forest_id)" = "$DFID" ] \
+  && ok "replica add ships + verifies the full log (over TLS)" || fail "replica add: $REP_JSON"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q albums && ok "replica lists the tree"
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$ATXT_ID")" = "hi" ] \
+  && ok "replica cat reads through (same-host locations)" || fail "replica cat"
+assert_rc 5 "replica refuses local writes → 5" -- \
+  $PVFS --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label nope
+# F0 + F2: a replica exports like any forest — the cross-host media view
+$PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
+[ "$(cat "$DATA/replica-view/albums/a.txt")" = "hi" ] \
+  && ok "export from the replica reads through" || fail "replica export"
+# pvfsd serves a replica read-only, ACLs replayed from the shipped log
+REPSOCK="$DATA/replica.sock"
+"$PVFSD" --mount "$REPMOUNT" --socket "$REPSOCK" >/dev/null 2>&1 &
+RPID=$!
+for _ in $(seq 1 50); do [ -S "$REPSOCK" ] && break; sleep 0.1; done
+$PVFS remote --socket "$REPSOCK" --anon ls "$DROOT" | grep -q albums \
+  && ok "pvfsd serves the replica (anon via replayed public grant)" || fail "replica daemon ls"
+assert_rc 5 "write via the replica daemon refused → 5" -- \
+  $PVFS remote --socket "$REPSOCK" mkdir "$DROOT" sneaky
+kill -TERM "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null || true
+RPID=""
+# sync: new content on the owner appears after `replica sync`
+$PVFS remote --socket "$SOCK" mkdir "$DROOT" fresh-content >/dev/null
+SYNC_JSON="$($PVFS --json replica sync "$REPMOUNT")"
+[ "$(jget "$SYNC_JSON" synced)" -ge 1 ] && ok "replica sync shipped the tail" || fail "sync: $SYNC_JSON"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q fresh-content \
+  && ok "synced content visible on the replica" || fail "synced content missing"
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

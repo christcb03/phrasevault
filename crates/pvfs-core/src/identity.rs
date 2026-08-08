@@ -157,6 +157,16 @@ impl DeviceKeyCache {
         crypto::pubkey_bytes(&self.signing_key)
     }
 
+    /// A throwaway key for engines that never author events — a replica has
+    /// no device identity in the forest it mirrors (F2). Never saved.
+    pub fn ephemeral() -> Result<DeviceKeyCache> {
+        let mn = generate_mnemonic()?;
+        Ok(DeviceKeyCache {
+            signing_key: device_key(&mn, "", 0)?,
+            device_index: 0,
+        })
+    }
+
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         let path = data_dir.join(DEVICE_KEY_FILE);
         let body = format!(
