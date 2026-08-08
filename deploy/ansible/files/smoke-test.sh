@@ -421,8 +421,10 @@ REP_JSON="$($PVFS --json replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NE
 $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q albums && ok "replica lists the tree"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$ATXT_ID")" = "hi" ] \
   && ok "replica cat reads through (same-host locations)" || fail "replica cat"
-assert_rc 5 "replica refuses local writes → 5" -- \
-  $PVFS --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label nope
+# the replica's own engine never writes its log — asserted via an op with no
+# write-through route (F5.0 routes add/loc/admin to the source instead)
+assert_rc 5 "replica engine refuses local log writes → 5" -- \
+  $PVFS --data-dir "$REPMOUNT/.pvfs" link "$DROOT" "$ATXT_ID" --type ref
 # F0 + F2: a replica exports like any forest — the cross-host media view
 $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
 [ "$(cat "$DATA/replica-view/albums/a.txt")" = "hi" ] \
@@ -473,6 +475,25 @@ $PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | grep -q "pvfs-sync" \
 $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
 [ "$(cat "$DATA/replica-view/movie.mkv")" = "far-away-bytes" ] \
   && ok "re-export serves the synced file to non-PVFS apps" || fail "export after sync"
+
+say "F5.0: write-through — the replica accepts writes via its source (doc 17 §7)"
+WTID="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind file --label ingest.mkv --size 11 --mime video/x-matroska)" node_id)"
+[ ${#WTID} -eq 64 ] && ok "pvfs add on the replica wrote through" || fail "write-through add: $WTID"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q ingest.mkv \
+  && ok "read-your-writes: visible on the replica at once"
+$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | grep -q ingest.mkv \
+  && ok "…and recorded in the owner's log"
+printf 'ingested-it' > "$DATA/ingest-src.bin"
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$WTID" "file://$DATA/ingest-src.bin" >/dev/null \
+  && ok "loc add wrote through"
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$WTID")" = "ingested-it" ] \
+  && ok "replica serves the newly ingested file" || fail "write-through cat"
+$PVFS --forest "$REPMOUNT" tag add "$CLIENTKEY" via-replica >/dev/null \
+  && ok "admin op auto-routes through the source"
+$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q via-replica \
+  && ok "tag landed in the owner's log"
+assert_rc 2 "temp node on a replica refused → 2" -- \
+  $PVFS --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label scratch --temp
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

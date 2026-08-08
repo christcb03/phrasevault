@@ -322,6 +322,23 @@ pvfs export <library-node> /srv/plex-library
 pvfs replica sync ~/media && pvfs sync && pvfs export <library-node> /srv/plex-library --prune
 ```
 
+### 7.9 Writing from a replica (write-through)
+
+A replica isn't a dead end for changes — it just isn't the writer. `pvfs add`, `pvfs loc add`, and
+the admin commands (`acl`/`tag`/`device`, secure ops) on a replica mount **write through to the
+source**: the operation travels member-signed to the owner's daemon (exactly like `pvfs remote`),
+lands in the owner's log, and is pulled straight back so your own `pvfs ls` sees it immediately.
+Your client identity needs the relevant rights on the owner's forest (`w` to create, admin for
+grants), and the source must be reachable — there is no offline write queue, by design: the owner
+stays the forest's only writer, so there is never anything to merge.
+
+This is what makes an **ingest box** work: a machine that downloads new media can hold a replica,
+catalog each finished file into the owner's forest the moment it lands (`pvfs add` +
+`pvfs loc add`), and every other replica picks it up on its next sync. The rest of that story —
+locations that name *which machine* holds the bytes, read-through fetching, and automatic
+migration to the central store with space reclaimed on the ingest box — is specced as the next
+phases in [doc 17 §7](17-federation-and-sync.md).
+
 ---
 
 ## 8. Secure blobs (encrypted-at-rest storage)
@@ -511,5 +528,7 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
   **built** ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the
   network transport (`pvfsd --listen` + pinned TLS, §7.4), verified read-only replicas
   (`pvfs replica`, §7.7), and pointer-vs-sync placement (`pvfs place` / `pvfs sync`, §7.8) — the
-  cross-host media library works end to end. Still ahead: region-granular replication, a FUSE
-  mount for streaming un-synced files, swarm transfer, and failover.
+  cross-host media library works end to end, and replicas accept writes by **write-through** to
+  their source (§7.9). Still ahead: instance-qualified locations, read-through fetching, and the
+  tiered-storage mover ([doc 17 §7](17-federation-and-sync.md)); then region-granular replication,
+  a FUSE mount for streaming un-synced files, swarm transfer, and failover.

@@ -59,7 +59,12 @@ so region granularity isn't on this scenario's critical path.
 | **F1** | Network transport: `pvfsd --listen` over TCP+TLS with a pinned transport cert, single-use challenge nonces (doc 08 §4 item 7), `pvfs instance` registry + `remote --connect/--instance` | ✅ built (§4) |
 | **F2** | Forest replica — doc 03 Mode A: admin-gated log shipping (`LogInfo`/`LogRead`), `pvfs replica add/sync`, chain-verified ingest + fully verified replay at open, read-only replica forests served by `pvfsd` | ✅ built (§5) |
 | **F3** | Content plane: per-subtree **placement policy** (`pvfs place` — `pointer` \| `sync`), the sync engine (`pvfs sync`, `export --fetch` — hash-verified streaming into the managed store, synthesized `pvfs-sync://` locations) | ✅ built (§6) |
-| **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later |
+| **F5.0** | **Write-through replicas**: mutations on a replica route to its source, member-signed; read-your-writes tail pull | ✅ built (§7.1) |
+| **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth | ☐ next (§7.2) |
+| **F5.2** | **Remote read-through**: fetch-on-demand from the instance a location names, into the F3 store | ☐ (§7.3) |
+| **F5.3** | **The mover**: `place <subtree> central` + owner-side migration + edge eviction — the tiering flow | ☐ (§7.4) |
+| **F5.4** | **Tail-subscribe**: long-poll log shipping for seconds-fresh replicas | ☐ (§7.5) |
+| **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later (§8) |
 
 ---
 
@@ -209,7 +214,106 @@ The pointer-vs-sync knob, per subtree. As built:
   already ship ciphertext-only through F2's log shipping (their bytes live in the mutable store,
   doc 12; region-scoped replication of those is F4).
 
-## 7. F4 — later, in this order when needed
+## 7. F5 — write-through & tiered storage (the download-box arc)
+
+**Driving scenario (recorded 2026-08-08).** Radarr/Sonarr run on a download server with ~3 TB free;
+the canonical store is a NAS; Plex and a new media app consume the library from other machines. New
+downloads must enter the catalog **immediately** and be visible everywhere, while a background
+process migrates the bytes to the NAS and frees the download server — with zero interruption to
+consumers.
+
+**The key architectural call:** this needs **no multi-master**. Doc 13 §A's resolved write model
+already contains the answer — *reads anywhere, writes to one*. A "writable" replica is a replica
+that **forwards writes to the owner** over the F1 transport (member-signed, the same two-phase
+protocol every daemon write uses) and sees them return through log sync. The owner's single linear
+signed chain remains the only log; every integrity property survives untouched. True active-active
+stays the deferred doc 13 §A HA mode — nothing in this arc moves toward it.
+
+Deployment shape: **the NAS owns the media forest** (`pvfsd --listen`); the download server and
+every consumer box hold replicas.
+
+### 7.1 F5.0 — write-through replicas ✅ BUILT (2026-08-08)
+
+Mutations on a replica mount now **route to the recorded source** instead of being refused,
+signed by the **client identity** (a replica has no forest device key — and the member model is
+exactly what remote writes are):
+
+- `pvfs add` (folder/file) and `pvfs loc add` route explicitly; every op that already auto-routes
+  through `daemon_client` — `acl`/`tag`/`device`, secure create/put/cat — routes too, because a
+  replica mount's "daemon" **is its source** now.
+- **Read-your-writes:** after a write-through the CLI best-effort pulls the source's log tail into
+  the replica, so `pvfs ls` shows the change immediately. Log shipping needs replication rights on
+  the connection; without them the pull is silently skipped and visibility arrives with the next
+  `replica sync`.
+- **Deliberately not routed** (the engine still refuses locally): temp nodes (forest-local by
+  definition), `link`/`unlink`/`reorder` (no wire ops yet — add them when a consumer needs them),
+  and `loc rm` (location lifecycle belongs to F5.3's mover). **No offline queue**: a write-through
+  needs the source reachable; offline divergence stays app-level (doc 13 §A), by design.
+
+With F5.0, the download server can already catalog new files into the NAS's forest:
+`pvfs add … --kind file` + `pvfs loc add <id> file:///downloads/...` — but that location is only
+meaningful on the download server itself, which is exactly what F5.1 fixes.
+
+### 7.2 F5.1 — instance-qualified locations (next)
+
+A `file://` location is host-implicit — it resolves wherever the path happens to exist, which is
+wrong the moment locations cross machines. Fill doc 03 §2.1's reserved "future schemes" row:
+
+- **`pvfs-host://<transport-pin>/<abs-path>`** — bytes live at `<path>` **on the instance whose
+  transport pin this is** (the F1 pin is already the stable, verifiable instance identity).
+- Resolution: local when the pin matches one of *this* host's identities (its own listener pin, if
+  serving) — else a **remote candidate** for F5.2. `pvfs loc add` keeps accepting `file://` (a
+  same-host claim) and gains the qualified form; the download server's agent records
+  `pvfs-host://<its-pin>/downloads/…`, making "these bytes are on the download box" catalog truth
+  every replica understands.
+
+### 7.3 F5.2 — remote read-through (sync-on-demand)
+
+Doc 03 §2.3's resolution order, step 3, implemented: when no location resolves locally and a
+`pvfs-host://` location names a reachable instance (known pin → address via the instance registry
+or the replica marker), **fetch on demand** — stream through that instance's daemon into the F3
+sync store (verified, promoted to a local location by existence), then serve. v1 blocks the read
+while fetching; true open-and-stream is F4's FUSE mount. With F5.2, "immediately available
+everywhere" holds even before anyone has synced: the catalog entry is enough to reach the bytes.
+
+### 7.4 F5.3 — the mover (tiering policy)
+
+Placement (doc 17 §6) grows a **canonical** dimension, owner-side:
+
+- `pvfs place <subtree> central --to <bound-folder>` (on the owner): every file under the subtree
+  must hold a verified copy in that owner-bound storage.
+- **The mover** (a `serve` job + `pvfs tier` one-shot): for each file whose only live locations are
+  edge instances, fetch the bytes (F5.2 machinery, verified), land them in the bound folder,
+  append `FileLocationAdded` (owner log — catalog-visible redundancy, doc 03 Mode B's crosslink
+  without needing remote append: the owner appends to its own log), then **retire the edge
+  location** (`FileLocationRemoved`).
+- **Eviction:** the edge host's agent (its `serve` loop) watches its own `pvfs-host://` locations;
+  when one is removed from the catalog, it deletes the local bytes — space freed, and never before
+  the canonical copy is live. Consumers never notice: resolution finds the NAS copy (or their own
+  synced copy) throughout.
+
+### 7.5 F5.4 — tail-subscribe
+
+A long-poll variant of `LogRead` so replicas learn of new events in seconds instead of on a sync
+schedule — the difference between "available on the next cron tick" and "available now" for the
+whole fleet. (Resume tokens are just `(seq, chain_hash)`; doc 17 §9's open question 2 decides the
+frame shape.)
+
+### 7.6 The end state for the media fleet
+
+```text
+download box:  replica + Radarr agent → pvfs add / loc add (pvfs-host://download-pin/…)
+NAS (owner):   pvfsd --listen · place <library> central --to /volume1/media · the mover
+plex box(es):  replica + place <library> sync · pvfs sync loop (or F5.2 read-through) · export
+```
+
+New episode lands → cataloged in seconds (F5.0) → visible fleet-wide (F5.4, or next sync) →
+readable everywhere immediately (F5.2) → migrated to the NAS in the background (F5.3) → edge bytes
+evicted, 3 TB stays free — Plex streaming the whole time.
+
+---
+
+## 8. F4 — later, in this order when needed
 
 1. **Region logs** (doc 13 §B — already the decided architecture): per-region logs + parent
    head-commitments; unlocks per-app replication, per-region compaction, and region-scoped
@@ -221,7 +325,7 @@ The pointer-vs-sync knob, per subtree. As built:
 
 ---
 
-## 8. Open questions (new ones only — doc 03 §6 still governs the old ones)
+## 9. Open questions (new ones only — doc 03 §6 still governs the old ones)
 
 1. **TLS details (F1):** self-signed cert pinned by instance key vs. raw-key TLS (RFC 7250-style);
    how the companion's localhost-cert experience (doc 14) informs the trust prompt when adding an

@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Write-through replicas (P4 F5.0, doc 17 §7):** mutations on a replica
+  mount now **route to its recorded source** instead of being refused —
+  `pvfs add` and `pvfs loc add` explicitly, and every op that auto-routes
+  through the daemon-client path (`acl`/`tag`/`device`, secure ops), because
+  a replica's "daemon" is its source now. Writes are member-signed with the
+  client identity over the same two-phase protocol as `pvfs remote`; after a
+  write-through the CLI best-effort pulls the source's log tail so the
+  change is locally visible at once (read-your-writes; silently skipped
+  without replication rights). Temp nodes, `link`/`unlink`/`reorder`, and
+  `loc rm` stay unrouted (the engine still refuses locally); writes need
+  the source reachable — no offline queue, offline divergence stays
+  app-level (doc 13 §A). The write model is unchanged: single writer per
+  forest — a "writable replica" forwards, never merges. Doc 17 §7 specs the
+  rest of the arc (instance-qualified `pvfs-host://` locations, remote
+  read-through, the tiering mover with edge eviction, tail-subscribe) —
+  the download-box → NAS media pipeline.
 - **Placement & sync (P4 F3, doc 17 §6) — the pointer-vs-sync knob:**
   `pvfs place <target> sync` marks a subtree "keep its bytes local" (a plain
   per-instance deployment file — never log events; different replicas

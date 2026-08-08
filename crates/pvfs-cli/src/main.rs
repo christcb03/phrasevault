@@ -1221,7 +1221,47 @@ fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
 /// member writes call to sign each event digest).
 type SignFn = Box<dyn Fn(&[u8; 32]) -> Vec<u8>>;
 
+/// Write-through connection for a replica mount (F5.0, doc 17 §7): dial the
+/// recorded source, signing as the **client identity** — a replica has no
+/// forest device key, and the member model is exactly what remote writes use.
+fn replica_write_client(data_dir: &std::path::Path) -> Result<(Client, SignFn), PvfsError> {
+    let src = pvfs_core::ReplicaSource::load(data_dir)?;
+    let mn = client_identity_mnemonic()?;
+    let key = identity::device_key(&mn, "", 0)?;
+    let pubkey = crypto::pubkey_bytes(&key);
+    let client = match src.transport.as_str() {
+        "tcp" => Client::connect_tcp_signed(&src.target, &src.pin, &pubkey, |d| {
+            crypto::sign_digest(&key, d).unwrap_or_default()
+        }),
+        _ => Client::connect_signed(std::path::Path::new(&src.target), &pubkey, |d| {
+            crypto::sign_digest(&key, d).unwrap_or_default()
+        }),
+    }
+    .map_err(remote_err)?;
+    let sign: SignFn = Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
+    Ok((client, sign))
+}
+
+/// Read-your-writes, best-effort (F5.0): after a write-through, pull the
+/// source's log tail so the change is visible locally right now. Log
+/// shipping needs replication rights on this connection — when the identity
+/// lacks them the pull is quietly skipped (the write landed; visibility
+/// arrives with the next `replica sync`).
+fn replica_catch_up(data_dir: &std::path::Path, client: &mut Client) {
+    let _ = (|| -> Result<(), PvfsError> {
+        let mut store = pvfs_core::ReplicaStore::open(data_dir)?;
+        let from = store.tip()? + 1;
+        replica_pull(client, &mut store, from)?;
+        Ok(())
+    })();
+}
+
 fn daemon_client(state_dir: &std::path::Path) -> Result<Option<(Client, SignFn)>, PvfsError> {
+    // A replica mount's "daemon" is its recorded source (F5.0, doc 17 §7):
+    // every auto-routed op writes through, member-signed, to the owner.
+    if pvfs_core::replica::marker_path(state_dir).exists() {
+        return replica_write_client(state_dir).map(Some);
+    }
     let Some(sock) = try_daemon_socket(state_dir) else {
         return Ok(None);
     };
@@ -1536,6 +1576,37 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             content_hash,
         } => {
             let mut engine = Engine::open(&ctx?)?;
+            // F5.0 (doc 17 §7): on a replica mount, create through the
+            // recorded source — member-signed, then caught up locally.
+            if engine.is_replica() {
+                if temp {
+                    return Err(PvfsError::BadInput {
+                        field: "temp".into(),
+                        reason: "temp nodes are forest-local — a replica has no local writer"
+                            .into(),
+                    });
+                }
+                if !content_hash.is_empty() || nonce.is_some() {
+                    return Err(PvfsError::BadInput {
+                        field: "add".into(),
+                        reason: "--content-hash/--nonce aren't carried by write-through — \
+                                 add the node, then record bytes with `pvfs loc add`"
+                            .into(),
+                    });
+                }
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                let id = if kind == "file" {
+                    client.add_file(&parent, &label, size, &mime, |d| sign(d))
+                } else {
+                    client.mkdir(&parent, &label, |d| sign(d))
+                }
+                .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+                emit_id(json, "node_id", &id);
+                return Ok(());
+            }
             let (node_type, payload) = if kind == "file" {
                 (
                     TYPE_FILE.to_string(),
@@ -1736,6 +1807,33 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
         Cmd::Loc(loc) => {
             let mut engine = Engine::open(&ctx?)?;
+            // F5.0 (doc 17 §7): location mutations on a replica write through.
+            if engine.is_replica() {
+                match &loc {
+                    LocCmd::Add { file, uri } => {
+                        let data_dir = engine.data_dir().to_path_buf();
+                        engine.close()?;
+                        let (mut client, sign) = replica_write_client(&data_dir)?;
+                        client.add_location(file, uri, |d| sign(d)).map_err(remote_err)?;
+                        replica_catch_up(&data_dir, &mut client);
+                        if json {
+                            println!("{{\"added\":true}}");
+                        } else {
+                            println!("added");
+                        }
+                        return Ok(());
+                    }
+                    LocCmd::Rm { .. } => {
+                        return Err(PvfsError::BadInput {
+                            field: "loc".into(),
+                            reason: "location removal has no write-through op yet — \
+                                     run it against the owner (doc 17 §7, F5.3)"
+                                .into(),
+                        });
+                    }
+                    _ => {} // reads run locally
+                }
+            }
             match loc {
                 LocCmd::Add { file, uri } => {
                     engine.add_location(&file, &uri)?;
