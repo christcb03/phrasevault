@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Instance-qualified locations (P4 F5.1, doc 17 §7.2):**
+  `pvfs-host://<transport-pin>/<abs-path>` records **which instance** holds
+  a file's bytes — the pin is the host's F1 transport pin, so the claim is
+  verifiable and survives address changes. Resolution is local exactly when
+  the pin is the data dir's own; a foreign pin degrades cleanly (`stat`
+  unavailable, `cat` skips, `missing_bytes` counts it) and `pvfs sync`
+  already fetches such files through the replica's source, which resolves
+  its own pin. New `pvfs loc add <file> --here <path>` records a path on
+  this instance under its pin (requires having served with `pvfsd --listen`
+  once); composes with write-through, so an ingest box records its own pin
+  into the owner's log.
 - **Write-through replicas (P4 F5.0, doc 17 §7):** mutations on a replica
   mount now **route to its recorded source** instead of being refused —
   `pvfs add` and `pvfs loc add` explicitly, and every op that auto-routes

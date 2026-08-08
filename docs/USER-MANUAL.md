@@ -334,10 +334,13 @@ stays the forest's only writer, so there is never anything to merge.
 
 This is what makes an **ingest box** work: a machine that downloads new media can hold a replica,
 catalog each finished file into the owner's forest the moment it lands (`pvfs add` +
-`pvfs loc add`), and every other replica picks it up on its next sync. The rest of that story —
-locations that name *which machine* holds the bytes, read-through fetching, and automatic
-migration to the central store with space reclaimed on the ingest box — is specced as the next
-phases in [doc 17 §7](17-federation-and-sync.md).
+`pvfs loc add --here <path>`), and every other replica picks it up on its next sync. `--here`
+records an **instance-qualified location** — `pvfs-host://<the-box's-pin>/<path>` — so the catalog
+knows *which machine* holds the bytes (the box needs a transport pin: run `pvfsd --listen` once).
+Other machines see such a location as unavailable-locally, and `pvfs sync` fetches the bytes
+through the replica's source. The rest of the story — direct read-through from any pinned
+instance, and automatic migration to the central store with space reclaimed on the ingest box —
+is specced as F5.2/F5.3 in [doc 17 §7](17-federation-and-sync.md).
 
 ---
 

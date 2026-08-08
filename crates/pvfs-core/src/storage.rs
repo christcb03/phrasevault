@@ -72,6 +72,57 @@ pub fn path_to_uri(path: &Path) -> Result<String> {
     Ok(format!("file://{p}"))
 }
 
+// ---- instance-qualified locations (F5.1, doc 17 §7.2) -----------------------
+//
+// A `file://` location is host-implicit — it resolves wherever the path
+// happens to exist, which is wrong the moment locations cross machines.
+// `pvfs-host://<transport-pin>/<abs-path>` says WHICH instance holds the
+// bytes: the pin is the instance's F1 transport pin (BLAKE3 hex of its
+// listener cert — stable, verifiable, already what clients pin to connect).
+// Resolution is local only when the pin is this data dir's own; a foreign
+// pin is a remote candidate (fetched by sync / read-through, doc 17 §7.3).
+
+/// Scheme of an instance-qualified location.
+pub const HOST_URI_PREFIX: &str = "pvfs-host://";
+/// Where the F1 listener material records this instance's pin.
+const NETTLS_PIN_FILE: &str = "nettls/pin";
+
+/// Build `pvfs-host://<pin>/<abs-path>`.
+pub fn host_uri(pin: &str, path: &Path) -> Result<String> {
+    let p = path
+        .to_str()
+        .ok_or_else(|| bad("path", format!("non-UTF-8 path: {}", path.display())))?;
+    if !p.starts_with('/') {
+        return Err(bad("path", format!("path must be absolute: {p}")));
+    }
+    if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(bad("pin", "expected the 64-hex transport pin".into()));
+    }
+    Ok(format!("{HOST_URI_PREFIX}{}{p}", pin.to_lowercase()))
+}
+
+/// Parse `pvfs-host://<pin>/<abs-path>` → `(pin, abs_path)`.
+pub fn parse_host_uri(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix(HOST_URI_PREFIX)?;
+    let (pin, path) = rest.split_at(rest.find('/')?);
+    if pin.len() == 64 && pin.chars().all(|c| c.is_ascii_hexdigit()) && path.starts_with('/') {
+        Some((pin, path))
+    } else {
+        None
+    }
+}
+
+/// This data dir's own transport pin, if it has ever served a network
+/// listener (`pvfsd --listen` mints it). `None` until then — a host nobody
+/// can dial has no meaningful location to offer.
+pub fn host_pin(data_dir: &Path) -> Option<String> {
+    let pin = std::fs::read_to_string(data_dir.join(NETTLS_PIN_FILE))
+        .ok()?
+        .trim()
+        .to_string();
+    (pin.len() == 64).then_some(pin)
+}
+
 /// Atomic in-place replace for a **secure blob's** location (doc 12 §8.3) — the
 /// one deliberate exception to "location bytes are never overwritten": write to
 /// a sibling temp file, fsync, rename over the target. The superseded bytes are

@@ -149,3 +149,49 @@ fn folder(label: &str) -> NodeSpec {
         creation_nonce: None,
     }
 }
+
+// F5.1 (doc 17 §7.2): pvfs-host:// resolves only under the owning pin
+#[test]
+fn host_qualified_locations_resolve_by_pin() {
+    use pvfs_core::storage::{host_pin, host_uri, parse_host_uri};
+
+    let (dir, mut engine) = new_forest();
+    let root = engine.identity.root_node_id.clone();
+
+    // this instance's pin (normally minted by `pvfsd --listen`)
+    let pin = "ab".repeat(32);
+    std::fs::create_dir_all(dir.path().join("nettls")).unwrap();
+    std::fs::write(dir.path().join("nettls/pin"), format!("{pin}\n")).unwrap();
+    assert_eq!(host_pin(dir.path()).as_deref(), Some(pin.as_str()));
+
+    // real bytes + a host-qualified location naming OUR pin
+    let bytes_dir = tempfile::tempdir().unwrap();
+    let path = bytes_dir.path().join("clip.bin");
+    std::fs::write(&path, b"clip-bytes").unwrap();
+    let uri = host_uri(&pin, &std::fs::canonicalize(&path).unwrap()).unwrap();
+    let (p, pth) = parse_host_uri(&uri).unwrap();
+    assert_eq!(p, pin);
+    assert!(pth.ends_with("clip.bin"));
+
+    let file = engine
+        .add_node(&root, file_spec("clip.bin", b"clip-bytes", true))
+        .unwrap();
+    engine.add_location(&file, &uri).unwrap();
+    let mut out = Vec::new();
+    engine.cat(&file, None, &mut out).unwrap();
+    assert_eq!(out, b"clip-bytes", "own pin resolves locally");
+
+    // a FOREIGN pin never resolves here — the file counts as missing
+    let foreign = engine
+        .add_node(&root, file_spec("faraway.bin", b"remote!", true))
+        .unwrap();
+    let foreign_uri = host_uri(&"cd".repeat(32), &std::fs::canonicalize(&path).unwrap()).unwrap();
+    engine.add_location(&foreign, &foreign_uri).unwrap();
+    assert!(engine.readable_path(&foreign).unwrap().is_none());
+    let missing = engine.missing_bytes(&root).unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].1, "faraway.bin");
+    // stat degrades to unavailable, never errors
+    let st = engine.stat_node(&foreign).unwrap();
+    assert!(st.locations.iter().all(|l| !l.exists));
+}

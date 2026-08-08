@@ -964,6 +964,17 @@ impl Engine {
         if let Some(id) = crate::sync::parse_sync_uri(uri) {
             return path_to_uri(&crate::sync::sync_store_path(&self.data_dir, id));
         }
+        // Instance-qualified (F5.1): local only when the pin is our own;
+        // a foreign pin is a remote candidate (fetch via sync, doc 17 §7.3).
+        if let Some((pin, path)) = crate::storage::parse_host_uri(uri) {
+            return match crate::storage::host_pin(&self.data_dir) {
+                Some(own) if own == pin => Ok(format!("file://{path}")),
+                _ => Err(bad(
+                    "uri",
+                    &format!("location is on another instance (pin {}…)", &pin[..8]),
+                )),
+            };
+        }
         if uri.starts_with("file://") {
             return Ok(uri.to_string());
         }

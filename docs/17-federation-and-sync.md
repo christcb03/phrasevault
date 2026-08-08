@@ -60,7 +60,7 @@ so region granularity isn't on this scenario's critical path.
 | **F2** | Forest replica — doc 03 Mode A: admin-gated log shipping (`LogInfo`/`LogRead`), `pvfs replica add/sync`, chain-verified ingest + fully verified replay at open, read-only replica forests served by `pvfsd` | ✅ built (§5) |
 | **F3** | Content plane: per-subtree **placement policy** (`pvfs place` — `pointer` \| `sync`), the sync engine (`pvfs sync`, `export --fetch` — hash-verified streaming into the managed store, synthesized `pvfs-sync://` locations) | ✅ built (§6) |
 | **F5.0** | **Write-through replicas**: mutations on a replica route to its source, member-signed; read-your-writes tail pull | ✅ built (§7.1) |
-| **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth | ☐ next (§7.2) |
+| **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth, `loc add --here` | ✅ built (§7.2) |
 | **F5.2** | **Remote read-through**: fetch-on-demand from the instance a location names, into the F3 store | ☐ (§7.3) |
 | **F5.3** | **The mover**: `place <subtree> central` + owner-side migration + edge eviction — the tiering flow | ☐ (§7.4) |
 | **F5.4** | **Tail-subscribe**: long-poll log shipping for seconds-fresh replicas | ☐ (§7.5) |
@@ -254,18 +254,24 @@ With F5.0, the download server can already catalog new files into the NAS's fore
 `pvfs add … --kind file` + `pvfs loc add <id> file:///downloads/...` — but that location is only
 meaningful on the download server itself, which is exactly what F5.1 fixes.
 
-### 7.2 F5.1 — instance-qualified locations (next)
+### 7.2 F5.1 — instance-qualified locations ✅ BUILT (2026-08-08)
 
 A `file://` location is host-implicit — it resolves wherever the path happens to exist, which is
-wrong the moment locations cross machines. Fill doc 03 §2.1's reserved "future schemes" row:
+wrong the moment locations cross machines. Doc 03 §2.1's reserved "future schemes" row fills in:
 
 - **`pvfs-host://<transport-pin>/<abs-path>`** — bytes live at `<path>` **on the instance whose
-  transport pin this is** (the F1 pin is already the stable, verifiable instance identity).
-- Resolution: local when the pin matches one of *this* host's identities (its own listener pin, if
-  serving) — else a **remote candidate** for F5.2. `pvfs loc add` keeps accepting `file://` (a
-  same-host claim) and gains the qualified form; the download server's agent records
-  `pvfs-host://<its-pin>/downloads/…`, making "these bytes are on the download box" catalog truth
-  every replica understands.
+  transport pin this is** (the F1 pin is already the stable, verifiable instance identity; a host
+  that has never run `pvfsd --listen` has no pin — and correctly, no location to offer, since
+  nobody could dial it).
+- **Resolution:** local exactly when the pin is this data dir's own (`nettls/pin`); a foreign pin
+  is unresolvable-here — `stat` shows the location unavailable, `cat` skips it, `missing_bytes`
+  counts the file, and **`pvfs sync` already closes the loop**: the source *can* resolve its own
+  pin, so a replica fetches host-qualified bytes through it today (full read-through from
+  arbitrary instances is F5.2).
+- **Surface:** `pvfs loc add <file> --here <path>` canonicalizes the path and records it under
+  this instance's pin (write-through composes — an ingest box records its own pin *into the
+  owner's log*). Explicit URIs still pass through, `file://` included (a same-host claim, still
+  right for bound folders).
 
 ### 7.3 F5.2 — remote read-through (sync-on-demand)
 

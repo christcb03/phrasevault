@@ -495,6 +495,23 @@ $PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q via-replica \
 assert_rc 2 "temp node on a replica refused → 2" -- \
   $PVFS --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label scratch --temp
 
+say "F5.1: instance-qualified locations (pvfs-host://, doc 17 §7.2)"
+printf 'host-qualified' > "$DATA/hostloc.bin"
+HQ="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" hostloc.bin --size 14)" created)"
+$PVFS --data-dir "$DMOUNT/.pvfs" loc add "$HQ" --here "$DATA/hostloc.bin" >/dev/null \
+  && ok "loc add --here records this instance's pin"
+$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$HQ" | grep -q "pvfs-host://$NETPIN" \
+  && ok "location carries the owner's transport pin" || fail "host uri missing"
+[ "$($PVFS --data-dir "$DMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
+  && ok "own pin resolves locally" || fail "owner host-loc cat"
+$PVFS --json replica sync "$REPMOUNT" >/dev/null
+assert_rc 3 "foreign pin unreadable on the replica → 3" -- \
+  $PVFS --data-dir "$REPMOUNT/.pvfs" cat "$HQ"
+$PVFS --json --data-dir "$REPMOUNT/.pvfs" sync >/dev/null \
+  && ok "sync fetches the host-qualified file from the source"
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
+  && ok "replica serves it from the sync store" || fail "host-loc after sync"
+
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to
 # show per-identity ACL enforcement over the socket — not just the owner's own

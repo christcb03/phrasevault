@@ -338,7 +338,16 @@ enum ForestCmd {
 
 #[derive(Subcommand)]
 enum LocCmd {
-    Add { file: String, uri: String },
+    /// Record where a file's bytes live: a URI, or --here <path> for an
+    /// instance-qualified location on THIS host (pvfs-host://<pin>/<path>)
+    Add {
+        file: String,
+        uri: Option<String>,
+        /// record an absolute path on this instance (requires a transport
+        /// pin — serve with `pvfsd --listen` once to mint it)
+        #[arg(long, conflicts_with = "uri")]
+        here: Option<PathBuf>,
+    },
     Rm { file: String, uri: String },
     Ls { file: String },
     /// Re-hash locations; lift quarantine where bytes match again
@@ -1242,6 +1251,35 @@ fn replica_write_client(data_dir: &std::path::Path) -> Result<(Client, SignFn), 
     Ok((client, sign))
 }
 
+/// Materialize a `loc add` target: an explicit URI, or `--here <path>` as an
+/// instance-qualified location bearing this data dir's transport pin (F5.1,
+/// doc 17 §7.2).
+fn loc_add_uri(
+    data_dir: &std::path::Path,
+    uri: Option<String>,
+    here: Option<PathBuf>,
+) -> Result<String, PvfsError> {
+    match (uri, here) {
+        (Some(u), None) => Ok(u),
+        (None, Some(p)) => {
+            let abs =
+                std::fs::canonicalize(&p).map_err(|e| PvfsError::io("resolve --here path", e))?;
+            let pin =
+                pvfs_core::storage::host_pin(data_dir).ok_or_else(|| PvfsError::BadInput {
+                    field: "here".into(),
+                    reason: "this forest has no transport pin yet — run `pvfsd --listen <addr>` \
+                             once so other instances can dial these bytes (doc 17 §7.2)"
+                        .into(),
+                })?;
+            pvfs_core::storage::host_uri(&pin, &abs)
+        }
+        _ => Err(PvfsError::BadInput {
+            field: "loc".into(),
+            reason: "pass a URI or --here <path>".into(),
+        }),
+    }
+}
+
 /// Read-your-writes, best-effort (F5.0): after a write-through, pull the
 /// source's log tail so the change is visible locally right now. Log
 /// shipping needs replication rights on this connection — when the identity
@@ -1810,11 +1848,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // F5.0 (doc 17 §7): location mutations on a replica write through.
             if engine.is_replica() {
                 match &loc {
-                    LocCmd::Add { file, uri } => {
+                    LocCmd::Add { file, uri, here } => {
                         let data_dir = engine.data_dir().to_path_buf();
                         engine.close()?;
+                        let target = loc_add_uri(&data_dir, uri.clone(), here.clone())?;
                         let (mut client, sign) = replica_write_client(&data_dir)?;
-                        client.add_location(file, uri, |d| sign(d)).map_err(remote_err)?;
+                        client
+                            .add_location(file, &target, |d| sign(d))
+                            .map_err(remote_err)?;
                         replica_catch_up(&data_dir, &mut client);
                         if json {
                             println!("{{\"added\":true}}");
@@ -1835,8 +1876,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
             match loc {
-                LocCmd::Add { file, uri } => {
-                    engine.add_location(&file, &uri)?;
+                LocCmd::Add { file, uri, here } => {
+                    let target = loc_add_uri(engine.data_dir(), uri, here)?;
+                    engine.add_location(&file, &target)?;
                     if json {
                         println!("{{\"added\":true}}");
                     } else {
