@@ -279,8 +279,9 @@ $PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q testers && ok "ta
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" tag:testers r >/dev/null && ok "acl set tag principal"
 
 # pvfsd binds its conventional per-forest socket ($PVFS_SOCKET_DIR/<forest_id>.sock)
+# and (F1) a TLS network listener on an ephemeral port, logged for the F1 section.
 SOCK="$PVFS_SOCKET_DIR/$DFID.sock"
-"$PVFSD" --mount "$DMOUNT" >/dev/null 2>&1 &
+"$PVFSD" --mount "$DMOUNT" --listen 127.0.0.1:0 >/dev/null 2>"$DATA/pvfsd.log" &
 DPID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] && ok "pvfsd binds its conventional socket" || fail "pvfsd socket missing"
@@ -355,6 +356,34 @@ $PVFS remote --socket "$SOCK" mv "$UPLOADED_ID" "$DEST" >/dev/null && ok "member
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
 assert_rc 2 "anon write refused (needs identity)" -- \
   $PVFS remote --socket "$SOCK" --anon mkdir "$DROOT" sneaky
+
+say "F1: network transport — TLS listener + pinned client (doc 17 §4)"
+NETLINE="$(grep -m1 'listening on' "$DATA/pvfsd.log" || true)"
+NETADDR="$(printf '%s' "$NETLINE" | sed -E 's/.*listening on ([^ ]+).*/\1/')"
+NETPIN="$(printf '%s' "$NETLINE" | sed -E 's/.*transport pin ([0-9a-f]+).*/\1/')"
+if [ -n "$NETADDR" ] && [ ${#NETPIN} -eq 64 ]; then
+  ok "pvfsd prints its listen address + transport pin"
+else
+  fail "pvfsd --listen line missing (got: $NETLINE)"
+fi
+[ "$(cat "$DMOUNT/.pvfs/nettls/pin")" = "$NETPIN" ] \
+  && ok "pin file matches the printed pin" || fail "nettls/pin mismatch"
+$PVFS --json remote --connect "$NETADDR" --pin "$NETPIN" --anon info \
+  | grep -q "\"forest_id\":\"$DFID\"" && ok "remote --connect info over TLS (anon)"
+$PVFS remote --connect "$NETADDR" --pin "$NETPIN" --anon ls "$DROOT" | grep -q albums \
+  && ok "remote ls over TLS"
+[ "$($PVFS remote --connect "$NETADDR" --pin "$NETPIN" cat "$ATXT_ID")" = "hi" ] \
+  && ok "remote cat streams bytes over TLS (signed identity)" || fail "TLS cat mismatch"
+BADPIN="$(printf '0%.0s' $(seq 1 64))"
+assert_rc 2 "wrong pin refused at the TLS handshake → 2" -- \
+  $PVFS remote --connect "$NETADDR" --pin "$BADPIN" --anon info
+$PVFS instance add smokehost "$NETADDR" "$NETPIN" >/dev/null && ok "instance add pins the server"
+$PVFS instance ls | grep -q "smokehost  $NETADDR" && ok "instance ls lists it"
+$PVFS --json remote --instance smokehost --anon info | grep -q "\"forest_id\":\"$DFID\"" \
+  && ok "remote --instance dials by name"
+$PVFS instance rm smokehost >/dev/null && ok "instance rm forgets it"
+assert_rc 3 "removed instance no longer resolves → 3" -- \
+  $PVFS remote --instance smokehost --anon info
 
 say "P2-E 3d: auto-routed owner admin with the daemon RUNNING (doc 08 item 16)"
 # Regression guard. Plain `acl set` / `tag add` — no --data-dir, no `remote` —

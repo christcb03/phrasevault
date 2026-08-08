@@ -1,13 +1,19 @@
 //! PVFS daemon client (doc 07): connect to a forest's `pvfsd`, perform the
 //! challenge-response handshake, and issue read requests.
 //!
+//! Two transports, one protocol (F1, doc 17 §4): the local Unix socket, and
+//! TCP+TLS to a `pvfsd --listen` address — verified by **pinning** the
+//! server's transport pin (BLAKE3 hex of its certificate DER), no CA.
+//!
 //! Signing is injected as a closure so this crate needs no key library — the
 //! caller (CLI/app) holds the identity key and provides how to sign the 32-byte
 //! challenge digest.
 
 use std::io;
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 
 use pvfs_proto::{
     auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ClientMsg, ServerMsg,
@@ -15,6 +21,36 @@ use pvfs_proto::{
 };
 
 pub use pvfs_proto::{ChildInfo, NodeInfo};
+
+/// The client's transport: both arms speak identical frames.
+enum Stream {
+    Unix(UnixStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl io::Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Unix(s) => s.read(buf),
+            Stream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl io::Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Unix(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Unix(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
 
 /// Identity + root of the forest behind the socket.
 #[derive(Debug, Clone)]
@@ -62,7 +98,7 @@ struct Challenge {
 
 /// A connected, authenticated session with a forest's daemon.
 pub struct Client {
-    stream: UnixStream,
+    stream: Stream,
     /// The principal the daemon resolved us to ("public" or "key:<hex>").
     pub principal: String,
 }
@@ -81,7 +117,32 @@ impl Client {
     where
         F: FnOnce(&[u8; 32]) -> Vec<u8>,
     {
-        let (mut stream, ch) = Self::open(path)?;
+        let (stream, ch) = Self::open(path)?;
+        Self::auth(stream, ch, pubkey, sign)
+    }
+
+    /// Connect to a `pvfsd --listen` address over TLS, verified against `pin`
+    /// (the server's transport pin), and authenticate as `public` (F1).
+    pub fn connect_tcp_public(addr: &str, pin: &str) -> Result<Client> {
+        let (mut stream, _challenge) = Self::open_tcp(addr, pin)?;
+        write_msg(&mut stream, &ClientMsg::Anonymous)?;
+        Self::finish(stream)
+    }
+
+    /// [`connect_signed`](Self::connect_signed) over pinned TLS (F1).
+    pub fn connect_tcp_signed<F>(addr: &str, pin: &str, pubkey: &[u8], sign: F) -> Result<Client>
+    where
+        F: FnOnce(&[u8; 32]) -> Vec<u8>,
+    {
+        let (stream, ch) = Self::open_tcp(addr, pin)?;
+        Self::auth(stream, ch, pubkey, sign)
+    }
+
+    /// Sign the challenge and complete the handshake.
+    fn auth<F>(mut stream: Stream, ch: Challenge, pubkey: &[u8], sign: F) -> Result<Client>
+    where
+        F: FnOnce(&[u8; 32]) -> Vec<u8>,
+    {
         let digest = auth_digest(&ch.nonce, &ch.forest_id, ch.expiry_ms);
         write_msg(
             &mut stream,
@@ -93,10 +154,22 @@ impl Client {
         Self::finish(stream)
     }
 
-    /// Connect and read the server's challenge.
-    fn open(path: &Path) -> Result<(UnixStream, Challenge)> {
-        let mut stream = UnixStream::connect(path)?;
-        match read_msg::<_, ServerMsg>(&mut stream)? {
+    /// Connect the Unix socket and read the server's challenge.
+    fn open(path: &Path) -> Result<(Stream, Challenge)> {
+        let mut stream = Stream::Unix(UnixStream::connect(path)?);
+        let ch = Self::read_challenge(&mut stream)?;
+        Ok((stream, ch))
+    }
+
+    /// Dial TCP, wrap in pinned TLS, and read the server's challenge (F1).
+    fn open_tcp(addr: &str, pin: &str) -> Result<(Stream, Challenge)> {
+        let mut stream = Stream::Tls(Box::new(tls_connect(addr, pin)?));
+        let ch = Self::read_challenge(&mut stream)?;
+        Ok((stream, ch))
+    }
+
+    fn read_challenge(stream: &mut Stream) -> Result<Challenge> {
+        match read_msg::<_, ServerMsg>(stream)? {
             Some(ServerMsg::Challenge {
                 nonce,
                 forest_id,
@@ -105,14 +178,11 @@ impl Client {
             }) => {
                 let nonce = hex::decode(&nonce)
                     .map_err(|_| ClientError::Protocol("challenge nonce not hex".into()))?;
-                Ok((
-                    stream,
-                    Challenge {
-                        nonce,
-                        forest_id,
-                        expiry_ms,
-                    },
-                ))
+                Ok(Challenge {
+                    nonce,
+                    forest_id,
+                    expiry_ms,
+                })
             }
             Some(other) => Err(unexpected("Challenge", &other)),
             None => Err(ClientError::Protocol("closed before challenge".into())),
@@ -120,7 +190,7 @@ impl Client {
     }
 
     /// Read the `Ready` (or error) that completes the handshake.
-    fn finish(mut stream: UnixStream) -> Result<Client> {
+    fn finish(mut stream: Stream) -> Result<Client> {
         match read_msg::<_, ServerMsg>(&mut stream)? {
             Some(ServerMsg::Ready { principal }) => Ok(Client { stream, principal }),
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
@@ -479,4 +549,100 @@ impl Client {
 
 fn unexpected(want: &str, got: &ServerMsg) -> ClientError {
     ClientError::Protocol(format!("expected {want}, got {got:?}"))
+}
+
+// ---- pinned TLS (F1, doc 17 §4) ---------------------------------------------
+//
+// No CA, no roots: the operator copies the server's transport pin (BLAKE3 hex
+// of its certificate DER, printed by `pvfsd --listen`) and the client accepts
+// exactly that certificate. Server *identity* is the pin; user identity is
+// still the challenge-response handshake on top.
+
+/// Verifier that accepts exactly one certificate: the pinned one.
+#[derive(Debug)]
+struct PinnedCert {
+    pin: [u8; 32],
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if blake3::hash(end_entity.as_ref()).as_bytes() == &self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate does not match the pinned transport pin".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Dial `addr` and wrap it in TLS verified only by the transport pin.
+fn tls_connect(
+    addr: &str,
+    pin_hex: &str,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    let pin_bytes = hex::decode(pin_hex)
+        .map_err(|_| ClientError::Protocol("transport pin must be hex".into()))?;
+    let pin: [u8; 32] = pin_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ClientError::Protocol("transport pin must be 32 bytes of hex".into()))?;
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCert { pin }))
+        .with_no_client_auth();
+
+    // SNI name is irrelevant under pinning; still give rustls the host part.
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+        .unwrap_or(addr);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| ClientError::Protocol(format!("bad server name in address {addr:?}")))?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| ClientError::Protocol(format!("tls: {e}")))?;
+    let tcp = TcpStream::connect(addr)?;
+    Ok(rustls::StreamOwned::new(conn, tcp))
 }

@@ -56,7 +56,7 @@ so region granularity isn't on this scenario's critical path.
 |-------|-------|-------|
 | **F0** | `pvfs export` — materialize a tree as a native directory (symlink / hardlink / verified copy), manifest-tracked idempotent re-runs, prune | ✅ built (§3) |
 | **F0.1** | `pvfs serve` keeps exports fresh (re-export on change), `export --fetch` once F3 lands | ☐ small follow-on |
-| **F1** | Instance identity + network transport: `instance_id` keypair, `pvfsd` over TCP+TLS, single-use challenge nonces (doc 08 §4 item 7), instance→address registry | ☐ next |
+| **F1** | Network transport: `pvfsd --listen` over TCP+TLS with a pinned transport cert, single-use challenge nonces (doc 08 §4 item 7), `pvfs instance` registry + `remote --connect/--instance` | ✅ built (§4) |
 | **F2** | Forest replica — doc 03 Mode A: full-log fetch + tail follow, chain/signature verification on ingest, replica projection served read-only by `pvfsd`; multi-forest data dir (doc 03 §1.1) | ☐ |
 | **F3** | Content plane: per-subtree **placement policy** (`pointer` \| `sync`), the sync engine (fetch-by-hash, verify, record), replica-local cache locations | ☐ |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later |
@@ -122,20 +122,32 @@ Files on other hosts join the same tree when F2/F3 land — same export, more en
 
 ---
 
-## 4. F1 — instance identity & transport
+## 4. F1 — instance identity & transport ✅ BUILT (2026-08-08)
 
-The smallest network layer that makes doc 03's model real:
+The smallest network layer that makes doc 03's model real. As built:
 
-- **Instance identity:** a keypair per instance; `instance_id` = its public key (doc 03 §6 Q1's
-  "how is it chosen" resolves to "it's a key" — stable across DNS/IP, verifiable in handshakes).
-- **Transport:** the existing `pvfs-proto` framing over **TCP + TLS** (server cert pinned to the
-  instance key), listening alongside the Unix socket. The protocol already carries
-  challenge-response member auth; networking it activates the deferred hardening — **single-use
-  server-side nonces** (doc 08 §4 item 7).
-- **Reachability registry:** `instance_id → address` mapping in config (doc 03 §2.2 keeps
-  reachability out of URIs by design). Manual entries first; discovery is not v1.
-- **Remote append stays closed** in F1 — reads/replication only (doc 03 §6 Q4's grant mechanism
-  comes with F3's crosslink need).
+- **Transport identity = the pin, not the genesis id.** `instance_id` is bound into every existing
+  forest's `ForestCreated` genesis (doc 03 §1.2), so it cannot retroactively become a key. Instead
+  each serving instance gets a **transport pin**: `pvfsd --listen` generates a self-signed TLS cert
+  on first use (`<data_dir>/nettls/`, key `0600`) and the pin is the **BLAKE3 hex of the
+  certificate DER** — printed at startup and written to `nettls/pin`. Clients verify **only** the
+  pin (no CA, no roots, no names): a MITM needs the private key. Rotating the material mints a new
+  pin; peers re-pin explicitly, like re-pairing (doc 14's lesson). The registry binds
+  `instance_id`-bearing forests to `(address, pin)` — which is exactly doc 03 §2.2's "reachability
+  is resolved via config, not URIs".
+- **Transport:** the existing `pvfs-proto` framing over **TCP + TLS** (rustls, blocking
+  `StreamOwned`, no async runtime — doc 07 §8's decision carries over), listening alongside the
+  Unix socket; `serve_connection` is one generic body for both. TLS is transport privacy + server
+  identity; **principals still authenticate per connection** with the same challenge-response, so
+  ACL enforcement is identical on both transports.
+- **Single-use nonces (doc 08 §4 item 7): done.** Challenge nonces are registered at issue and
+  consumed on first use, on every transport — a captured auth signature can never be replayed.
+- **Reachability registry:** `pvfs instance add <name> <host:port> <pin>` (stored in
+  `<config>/instances`), `instance ls|rm`; `pvfs remote --instance <name>` dials it, or
+  `--connect <host:port> --pin <hex>` directly. Manual, explicit trust — adding the entry **is**
+  the pinning step. Discovery is not v1.
+- **Remote append stays closed** in F1 — reads and member-signed writes ride the existing daemon
+  ops; replication protocols come with F2, the crosslink grant (doc 03 §6 Q4) with F3.
 
 ## 5. F2 — forest replica (doc 03 Mode A)
 

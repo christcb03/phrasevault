@@ -5,6 +5,20 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Network transport (P4 F1, doc 17 §4):** `pvfsd --listen <addr>` serves the
+  full daemon protocol (reads, member-signed writes, the raw data plane) over
+  **TCP+TLS** alongside the Unix socket — same `serve_connection`, one generic
+  body. No CA: the daemon generates a self-signed cert on first use
+  (`<data-dir>/nettls/`, key 0600) and clients verify only its **transport
+  pin** (BLAKE3 hex of the cert DER, printed at startup and written to
+  `nettls/pin`). New `pvfs instance add|ls|rm` remembers `(address, pin)`
+  pairs — adding the entry is the pinning step — and `pvfs remote` gains
+  `--connect <host:port> --pin <hex>` / `--instance <name>`. Challenge
+  **nonces are now single-use** (registered at issue, consumed on first
+  auth; doc 08 §4 item 7 closed): a captured signature can never be
+  replayed, on either transport. Principals still authenticate per
+  connection by challenge-response — TLS is transport privacy + server
+  identity, never authorization.
 - **`pvfs export` — the native tree view (P4 F0, doc 17):** materialize any
   tree as a plain directory that non-PVFS apps (media servers, backup tools)
   read natively — files from every bound location appear as one hierarchy.

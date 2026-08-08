@@ -22,6 +22,11 @@ struct Cli {
     /// (`$PVFS_SOCKET_DIR/<forest_id>.sock`) so clients can find it (doc 09 §3b).
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Also serve TCP+TLS on this address (e.g. `0.0.0.0:7420`) for network
+    /// clients (F1, doc 17 §4). Prints the transport pin clients must pass to
+    /// `pvfs instance add` / `pvfs remote --pin`.
+    #[arg(long)]
+    listen: Option<String>,
 }
 
 /// RAII guard: removes the socket file on any clean exit (normal return or unwind).
@@ -82,6 +87,7 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
+    let data_dir = engine.data_dir().to_path_buf();
 
     let socket = match &cli.socket {
         Some(s) => s.clone(),
@@ -112,6 +118,24 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // SIGTERM/SIGINT → stop accepting, checkpoint, exit cleanly (doc 08 §4 item 4).
     install_signal_handlers()?;
 
+    // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,
+    // sharing the daemon and the shutdown flag.
+    let mut tls_thread = None;
+    if let Some(addr) = &cli.listen {
+        let tls = pvfsd::nettls::load_or_generate(&data_dir)?;
+        let tcp = std::net::TcpListener::bind(addr)?;
+        eprintln!(
+            "pvfsd: listening on {} (transport pin {})",
+            tcp.local_addr()?,
+            tls.pin
+        );
+        let d = Arc::clone(&daemon);
+        let cfg = Arc::clone(&tls.config);
+        tls_thread = Some(std::thread::spawn(move || {
+            let _ = pvfsd::serve_tls_until(tcp, cfg, d, &SHUTDOWN);
+        }));
+    }
+
     eprintln!(
         "pvfsd: serving {} on {}",
         cli.mount.display(),
@@ -127,7 +151,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful stop: flush the WAL and record a clean shutdown so the next start is
     // fast. In-flight connection threads are best-effort; the socket is removed by
-    // `_guard` on return.
+    // `_guard` on return. The TLS accept loop polls the same flag — join it so its
+    // listener closes before the checkpoint.
+    if let Some(t) = tls_thread {
+        let _ = t.join();
+    }
     eprintln!("pvfsd: shutting down (checkpointing)");
     daemon.shutdown_checkpoint()?;
     Ok(())

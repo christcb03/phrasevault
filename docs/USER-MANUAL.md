@@ -194,6 +194,27 @@ pvfs remote --forest media --anon ls <node-id>
 
 The daemon checks the caller's rights on every request and returns only what they may read.
 
+**Across the network** (another machine): start the daemon with a listen address and it serves the
+same protocol over TLS — no CA, no certificates to buy. The daemon prints a **transport pin** (also
+in `<mount>/.pvfs/nettls/pin`); a client that pins it gets a private, verified channel, and still
+authenticates as itself per connection:
+
+```bash
+# server
+pvfsd --mount ~/media --listen 0.0.0.0:7420
+#   pvfsd: listening on 0.0.0.0:7420 (transport pin 4f2a…)
+
+# client — remember the server once (the pin IS the trust decision)…
+pvfs instance add homeserver 192.168.1.10:7420 4f2a…
+# …then use it like any forest
+pvfs remote --instance homeserver ls <node-id>
+pvfs remote --instance homeserver cat <file-id> > local-copy
+# (or one-off: pvfs remote --connect 192.168.1.10:7420 --pin 4f2a… info)
+```
+
+A wrong or changed pin fails the connection before a byte of protocol is spoken. Rotating the
+server's TLS material (delete `nettls/`) mints a new pin — clients re-pin explicitly.
+
 ### 7.5 Members writing (creating folders)
 
 A member granted **`w`** on a subtree can create folders there over the daemon. Each change is
@@ -377,7 +398,10 @@ run `pvfs member replace <file>`).
 | `pvfs remote --socket <path> mv <node> <new-parent>` | Re-home a node under a new parent. |
 | `pvfs remote --socket <path> add-location <file> <uri>` | Record where a file's bytes live. |
 | `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
+| `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
+| `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
+| `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
@@ -416,5 +440,6 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; old history sealed for audit).
 - **Federation / network sharing** — reach and sync forests across hosts. The track has started
-  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1) is built;
-  network transport, replicas, and pointer-vs-sync placement policy follow.
+  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1) and the
+  network transport (`pvfsd --listen` + pinned TLS, §7.4) are built; replicas and pointer-vs-sync
+  placement policy follow.

@@ -28,7 +28,7 @@ docs 02–16; this is the index + the honest "what's not done yet."
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`) ✅; revoked-device direct `key:` grants masked at access time ✅ (1.1). No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ✅ shipped (follow-on: audit also flagging `key:`→revoked devices) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **1.1 (PVOS M1)** | Daemon `AddNode`/`Payload` (log-resident typed records), `stat` exposes home `parent`, typed `already_exists`, revoked-key `key:` ACL masking | ✅ **shipped** (tagged `v1.1`, 2026-07-09) — see [CHANGELOG](../CHANGELOG.md) |
-| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ◑ **in progress** — phased in [doc 17](17-federation-and-sync.md); **F0 `pvfs export` built** (native tree view for non-PVFS apps); F1 transport next |
+| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ◑ **in progress** — phased in [doc 17](17-federation-and-sync.md); **F0 `pvfs export`** (native tree view) + **F1 network transport** (`pvfsd --listen`, pinned TLS, single-use nonces) built; F2 replica next |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
 
 ---
@@ -162,6 +162,7 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | **Tenant custody: provision and remove hosted users over the socket** (PVOS D32) | ✅ built (2026-07-28) |
 | **`pvfsd`: sd_notify READY when serving** (PVOS D57) — `Type=notify` units gate dependents on the socket actually accepting | ✅ built (2026-08-05) |
 | **P4 F0: `pvfs export`** — the native tree view ([doc 17](17-federation-and-sync.md) §3): symlink/hardlink/verified-copy materialization, `.pvfs-export` manifest, idempotent re-runs + `--prune`, per-entry skips | ✅ built (2026-08-08) |
+| **P4 F1: network transport** ([doc 17](17-federation-and-sync.md) §4) — `pvfsd --listen` serves the same protocol over TCP+TLS (pinned self-signed cert, **transport pin** = BLAKE3 of the cert DER, printed + `nettls/pin`); `pvfs instance add/ls/rm` + `remote --connect/--pin/--instance`; **single-use challenge nonces** (item 7 below — done ahead of the proxied-socket trigger) | ✅ built (2026-08-08) |
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03 — **now phased and started**, [doc 17](17-federation-and-sync.md)), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
@@ -207,10 +208,11 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
    → **Remaining (small):** extend the same resolver to the `remote` subcommands, which still take
    node ids.
 
-7. **Challenge replay window.** Auth binds `(nonce, forest_id, expiry)`; nonce is per-connection and
-   random, expiry short — fine for local sockets.
-   → **Fix (P4, before the handshake is proxied/networked):** make the nonce single-use server-side
-   (a short-lived seen-nonce set) when federation exposes auth over a network.
+7. **Challenge replay window. ✅ RESOLVED (F1, 2026-08-08).** Auth binds `(nonce, forest_id,
+   expiry)`; with the network listener (doc 17 §4) the deferred hardening landed: nonces are
+   **registered at issue and consumed on first use** (server-side seen-set with expiry purge), on
+   both transports — a captured auth signature can never be replayed. Covered by
+   `nonce_is_single_use` and the TLS e2e test.
 
 8. **Arbitrary named groups & explicit deny are deferred.** v1 has `tag` groups, grant-only (grants
    inherit *down*, can't be carved out).

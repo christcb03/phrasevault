@@ -7,9 +7,12 @@
 //! Data plane (bytes): engine lock released before streaming raw bytes so
 //! concurrent cat transfers don't block each other.
 
+pub mod nettls;
+
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +58,10 @@ pub struct Daemon {
     next_reader: AtomicUsize,
     forest_id: String,
     prepared: Mutex<HashMap<String, PreparedState>>,
+    /// Outstanding challenge nonces (hex → expiry). A nonce is issued once per
+    /// connection and **consumed on first use** (doc 08 §4 item 7): a captured
+    /// auth signature can never be replayed, even against a network listener.
+    nonces: Mutex<HashMap<String, u64>>,
 }
 
 impl Daemon {
@@ -72,6 +79,30 @@ impl Daemon {
             next_reader: AtomicUsize::new(0),
             forest_id,
             prepared: Mutex::new(HashMap::new()),
+            nonces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Issue a fresh challenge nonce, registered for single use.
+    fn issue_nonce(&self) -> ([u8; 16], u64) {
+        let mut nonce = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let expiry_ms = now_ms() + CHALLENGE_TTL_MS;
+        let mut map = self.nonces.lock().unwrap();
+        // Opportunistic purge so abandoned handshakes don't accumulate.
+        if map.len() >= 64 {
+            let now = now_ms();
+            map.retain(|_, exp| *exp > now);
+        }
+        map.insert(hex::encode(nonce), expiry_ms);
+        (nonce, expiry_ms)
+    }
+
+    /// Consume a nonce: true exactly once per issued, unexpired nonce.
+    fn consume_nonce(&self, nonce: &[u8]) -> bool {
+        match self.nonces.lock().unwrap().remove(&hex::encode(nonce)) {
+            Some(expiry_ms) => now_ms() <= expiry_ms,
+            None => false,
         }
     }
 
@@ -133,12 +164,49 @@ pub fn serve_until(
     Ok(())
 }
 
-/// Handshake then request loop for one connection.
-pub fn serve_connection(daemon: &Daemon, mut stream: UnixStream) -> io::Result<()> {
-    // 1. challenge
-    let mut nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let expiry_ms = now_ms() + CHALLENGE_TTL_MS;
+/// F1 (doc 17 §4): accept TCP connections and serve the same protocol over
+/// TLS until `shutdown` flips. Same poll loop as [`serve_until`]; each
+/// connection handshakes lazily inside its own thread (`StreamOwned` drives
+/// TLS on first read/write), so a stalled handshake never blocks the accept
+/// loop. Clients verify the cert by pin ([`nettls`]); the daemon still
+/// authenticates *principals* per connection with the challenge-response —
+/// TLS is transport privacy + server identity, never authorization.
+pub fn serve_tls_until(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    daemon: Arc<Daemon>,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                stream.set_nonblocking(false)?;
+                let d = Arc::clone(&daemon);
+                let cfg = Arc::clone(&tls);
+                std::thread::spawn(move || {
+                    let conn = match rustls::ServerConnection::new(cfg) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let tls_stream = rustls::StreamOwned::new(conn, stream);
+                    let _ = serve_connection(&d, tls_stream);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Handshake then request loop for one connection. Generic over the stream —
+/// a Unix socket and a TLS-wrapped TCP stream serve identically (F1).
+pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, mut stream: S) -> io::Result<()> {
+    // 1. challenge (nonce registered single-use, doc 08 §4 item 7)
+    let (nonce, expiry_ms) = daemon.issue_nonce();
     write_msg(
         &mut stream,
         &ServerMsg::Challenge {
@@ -151,9 +219,19 @@ pub fn serve_connection(daemon: &Daemon, mut stream: UnixStream) -> io::Result<(
 
     // 2. resolve the principal from the client's response
     let principal = match read_msg::<_, ClientMsg>(&mut stream)? {
-        None => return Ok(()), // client hung up
-        Some(ClientMsg::Anonymous) => Principal::Public,
+        None => {
+            daemon.consume_nonce(&nonce); // client hung up — retire the nonce
+            return Ok(());
+        }
+        Some(ClientMsg::Anonymous) => {
+            daemon.consume_nonce(&nonce);
+            Principal::Public
+        }
         Some(ClientMsg::Auth { pubkey, sig }) => {
+            if !daemon.consume_nonce(&nonce) {
+                write_msg(&mut stream, &err("forbidden", "challenge already used or expired"))?;
+                return Ok(());
+            }
             match resolve_auth(&nonce, &daemon.forest_id, expiry_ms, &pubkey, &sig) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -163,6 +241,7 @@ pub fn serve_connection(daemon: &Daemon, mut stream: UnixStream) -> io::Result<(
             }
         }
         Some(_) => {
+            daemon.consume_nonce(&nonce);
             write_msg(&mut stream, &err("bad_input", "expected auth or anonymous"))?;
             return Ok(());
         }
@@ -273,7 +352,12 @@ fn do_payload(daemon: &Daemon, principal: &Principal, node: &str) -> ServerMsg {
 ///
 /// Concurrent cat transfers on separate connections therefore run truly in parallel
 /// (each on its own thread, engine lock free for the whole streaming phase).
-fn do_cat(daemon: &Daemon, principal: &Principal, stream: &mut UnixStream, node: &str) -> io::Result<()> {
+fn do_cat<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    principal: &Principal,
+    stream: &mut S,
+    node: &str,
+) -> io::Result<()> {
     let id: NodeId = node.to_string();
 
     // --- control plane: ACL check + path resolution (read view, doc 07 §6) ---
@@ -348,10 +432,10 @@ const SECURE_BLOB_CAP: usize = 256 * 1024 * 1024;
 /// ledger** before a byte leaves. Like `do_cat` but the daemon never decrypts —
 /// it serves the opaque bytes. Verify happens under the lock (`secure_read`), so
 /// a tampered or half-written blob is refused, not served.
-fn do_secure_cat(
+fn do_secure_cat<S: io::Read + io::Write>(
     daemon: &Daemon,
     principal: &Principal,
-    stream: &mut UnixStream,
+    stream: &mut S,
     node: &str,
 ) -> io::Result<()> {
     let id: NodeId = node.to_string();
@@ -389,10 +473,10 @@ fn do_secure_cat(
 /// write it in place, and prepare the member-signed `SecureBlobUpdated` (doc 12
 /// §8.5 daemon path). The client then `Commit`s the returned prepared write. The
 /// daemon handles only ciphertext — it has no key and never decrypts.
-fn do_secure_put(
+fn do_secure_put<S: io::Read + io::Write>(
     daemon: &Daemon,
     principal: &Principal,
-    stream: &mut UnixStream,
+    stream: &mut S,
     node: &str,
 ) -> io::Result<()> {
     let author = match principal {
@@ -724,4 +808,21 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // doc 08 §4 item 7 — a challenge nonce authorizes exactly one auth attempt
+    #[test]
+    fn nonce_is_single_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _mn) = Engine::init(dir.path()).unwrap();
+        let daemon = Daemon::new(engine);
+        let (nonce, _expiry) = daemon.issue_nonce();
+        assert!(daemon.consume_nonce(&nonce), "first use passes");
+        assert!(!daemon.consume_nonce(&nonce), "replay is refused");
+        assert!(!daemon.consume_nonce(&[0u8; 16]), "unissued nonce is refused");
+    }
 }

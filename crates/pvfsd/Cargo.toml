@@ -23,6 +23,11 @@ clap.workspace = true
 # `signal` for graceful SIGTERM/SIGINT shutdown (doc 08 §4 item 4); feature
 # unification adds it on top of the workspace's user/fs features.
 nix = { workspace = true, features = ["signal"] }
+# F1 network transport (doc 17 §4): TLS listener with a generated instance
+# cert; clients pin the cert hash, no CA involved.
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 pvfs-client = { path = "../pvfs-client" }

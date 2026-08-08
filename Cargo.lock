@@ -1007,9 +1007,11 @@ dependencies = [
 name = "pvfs-client"
 version = "1.2.0"
 dependencies = [
+ "blake3",
  "hex",
  "pvfs-core",
  "pvfs-proto",
+ "rustls",
 ]
 
 [[package]]
@@ -1079,6 +1081,9 @@ dependencies = [
  "pvfs-core",
  "pvfs-proto",
  "rand",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "tempfile",
 ]
 

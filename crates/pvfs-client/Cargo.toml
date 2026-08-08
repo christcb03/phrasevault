@@ -8,4 +8,8 @@ rust-version.workspace = true
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+blake3.workspace = true
 hex.workspace = true
+# F1 network transport (doc 17 §4): TLS connect pinned to the instance's
+# certificate hash — no CA, no roots.
+rustls.workspace = true

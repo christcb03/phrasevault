@@ -130,7 +130,8 @@ enum Cmd {
     Tag(TagCmd),
     /// Print this machine's PVFS client identity pubkey (doc 07 §2)
     Whoami,
-    /// Talk to a forest's daemon over its Unix socket (doc 07)
+    /// Talk to a forest's daemon — Unix socket, or TCP+TLS to a `pvfsd
+    /// --listen` address (F1, doc 17 §4)
     Remote {
         /// Explicit socket path (otherwise resolved from --forest)
         #[arg(long)]
@@ -138,12 +139,24 @@ enum Cmd {
         /// Forest (alias or mount path) — finds the daemon's conventional socket
         #[arg(long)]
         forest: Option<String>,
+        /// Network address of a `pvfsd --listen` daemon (host:port); needs --pin
+        #[arg(long, conflicts_with_all = ["socket", "forest"])]
+        connect: Option<String>,
+        /// The server's transport pin (printed by `pvfsd --listen`)
+        #[arg(long, requires = "connect")]
+        pin: Option<String>,
+        /// A named instance from `pvfs instance add` (address + pin)
+        #[arg(long, conflicts_with_all = ["socket", "forest", "connect", "pin"])]
+        instance: Option<String>,
         /// Connect as `public` instead of proving the client identity
         #[arg(long)]
         anon: bool,
         #[command(subcommand)]
         cmd: RemoteCmd,
     },
+    /// Manage named network instances: address + transport pin (F1)
+    #[command(subcommand)]
+    Instance(InstanceCmd),
     /// Bind a folder node to a real directory (P1)
     Bind {
         folder: String,
@@ -522,6 +535,24 @@ enum TagCmd {
 }
 
 #[derive(Subcommand)]
+enum InstanceCmd {
+    /// Remember a network instance: `pvfs remote --instance <name>` then dials it
+    Add {
+        /// Local nickname for the instance
+        name: String,
+        /// The `pvfsd --listen` address (host:port)
+        addr: String,
+        /// The server's transport pin (printed by `pvfsd --listen`; also in
+        /// `<data-dir>/nettls/pin` on the server)
+        pin: String,
+    },
+    /// List remembered instances
+    Ls,
+    /// Forget a remembered instance
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum RemoteCmd {
     /// Forest identity behind the socket
     Info,
@@ -596,6 +627,59 @@ fn pvfs_config_dir() -> Result<PathBuf, PvfsError> {
 /// Load (or create on first use) this machine's client identity (doc 07 §2),
 /// stored as a recovery phrase at `<config>/identity.phrase` (mode 0600). The
 /// signing key is `device_key(0)` of that phrase.
+/// The instance registry (F1, doc 17 §4): named `(address, transport pin)`
+/// pairs in `<config>/instances`, one `name addr pin` line each. Manual,
+/// explicit trust — adding an entry IS the pinning step.
+fn instances_path() -> Result<PathBuf, PvfsError> {
+    Ok(pvfs_config_dir()?.join("instances"))
+}
+
+fn load_instances() -> Result<Vec<(String, String, String)>, PvfsError> {
+    let path = instances_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(PvfsError::io("read instances", e)),
+    };
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(n), Some(a), Some(p)) => out.push((n.into(), a.into(), p.into())),
+            _ => {
+                return Err(PvfsError::BadInput {
+                    field: "instances".into(),
+                    reason: format!("corrupt registry line: {line:?}"),
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn save_instances(list: &[(String, String, String)]) -> Result<(), PvfsError> {
+    let path = instances_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
+    }
+    let mut text = String::new();
+    for (n, a, p) in list {
+        text.push_str(&format!("{n} {a} {p}\n"));
+    }
+    std::fs::write(&path, text).map_err(|e| PvfsError::io("write instances", e))
+}
+
+fn lookup_instance(name: &str) -> Result<(String, String), PvfsError> {
+    load_instances()?
+        .into_iter()
+        .find(|(n, _, _)| n == name)
+        .map(|(_, addr, pin)| (addr, pin))
+        .ok_or_else(|| PvfsError::NotFound {
+            kind: "instance",
+            id: name.into(),
+        })
+}
+
 fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
     let path = pvfs_config_dir()?.join("identity.phrase");
     if path.exists() {
@@ -2565,27 +2649,129 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Instance(cmd) => {
+            match cmd {
+                InstanceCmd::Add { name, addr, pin } => {
+                    if name.contains(char::is_whitespace) {
+                        return Err(PvfsError::BadInput {
+                            field: "name".into(),
+                            reason: "must not contain whitespace".into(),
+                        });
+                    }
+                    if !addr.contains(':') {
+                        return Err(PvfsError::BadInput {
+                            field: "addr".into(),
+                            reason: "expected host:port".into(),
+                        });
+                    }
+                    if pin.len() != 64 || hex::decode(&pin).is_err() {
+                        return Err(PvfsError::BadInput {
+                            field: "pin".into(),
+                            reason: "expected the 64-hex transport pin printed by pvfsd --listen"
+                                .into(),
+                        });
+                    }
+                    let mut list = load_instances()?;
+                    list.retain(|(n, _, _)| n != &name);
+                    list.push((name.clone(), addr, pin));
+                    save_instances(&list)?;
+                    if !json {
+                        println!("instance {name} pinned");
+                    }
+                    Ok(())
+                }
+                InstanceCmd::Ls => {
+                    let list = load_instances()?;
+                    if json {
+                        let items: Vec<String> = list
+                            .iter()
+                            .map(|(n, a, p)| {
+                                format!(
+                                    "{{\"name\":\"{}\",\"addr\":\"{}\",\"pin\":\"{}\"}}",
+                                    json_escape(n),
+                                    json_escape(a),
+                                    p
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", items.join(","));
+                    } else {
+                        for (n, a, p) in &list {
+                            println!("{n}  {a}  {p}");
+                        }
+                    }
+                    Ok(())
+                }
+                InstanceCmd::Rm { name } => {
+                    let mut list = load_instances()?;
+                    let before = list.len();
+                    list.retain(|(n, _, _)| n != &name);
+                    if list.len() == before {
+                        return Err(PvfsError::NotFound {
+                            kind: "instance",
+                            id: name,
+                        });
+                    }
+                    save_instances(&list)?;
+                    if !json {
+                        println!("instance {name} forgotten");
+                    }
+                    Ok(())
+                }
+            }
+        }
         Cmd::Remote {
             socket,
             forest,
+            connect,
+            pin,
+            instance,
             anon,
             cmd,
         } => {
-            let socket = resolve_remote_socket(socket, forest)?;
+            // Where to dial: a network target (--connect/--instance, F1) or
+            // the local Unix socket (--socket/--forest, as before).
+            let net = match (connect, instance) {
+                (Some(addr), _) => {
+                    let pin = pin.ok_or_else(|| PvfsError::BadInput {
+                        field: "remote".into(),
+                        reason: "pass --pin <hex> with --connect (printed by pvfsd --listen)"
+                            .into(),
+                    })?;
+                    Some((addr, pin))
+                }
+                (None, Some(name)) => Some(lookup_instance(&name)?),
+                (None, None) => None,
+            };
             let identity_key = if anon {
                 None
             } else {
                 let mn = client_identity_mnemonic()?;
                 Some(identity::device_key(&mn, "", 0)?)
             };
-            let mut client = match &identity_key {
-                None => Client::connect_public(&socket).map_err(remote_err)?,
-                Some(key) => {
+            let mut client = match (&net, &identity_key) {
+                (Some((addr, pin)), None) => {
+                    Client::connect_tcp_public(addr, pin).map_err(remote_err)?
+                }
+                (Some((addr, pin)), Some(key)) => {
                     let pubkey = crypto::pubkey_bytes(key);
-                    Client::connect_signed(&socket, &pubkey, |d| {
+                    Client::connect_tcp_signed(addr, pin, &pubkey, |d| {
                         crypto::sign_digest(key, d).unwrap_or_default()
                     })
                     .map_err(remote_err)?
+                }
+                (None, key) => {
+                    let socket = resolve_remote_socket(socket, forest)?;
+                    match key {
+                        None => Client::connect_public(&socket).map_err(remote_err)?,
+                        Some(key) => {
+                            let pubkey = crypto::pubkey_bytes(key);
+                            Client::connect_signed(&socket, &pubkey, |d| {
+                                crypto::sign_digest(key, d).unwrap_or_default()
+                            })
+                            .map_err(remote_err)?
+                        }
+                    }
                 }
             };
             match cmd {
