@@ -3,6 +3,28 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
+## Unreleased
+
+- **`pvfs export` — the native tree view (P4 F0, doc 17):** materialize any
+  tree as a plain directory that non-PVFS apps (media servers, backup tools)
+  read natively — files from every bound location appear as one hierarchy.
+  Symlinks by default; `--mode hardlink` for apps that refuse symlinks;
+  `--mode copy` streams through the verified read path (a corrupted location
+  quarantines instead of landing bytes). A `.pvfs-export` manifest marks the
+  directory export-owned (never adopts a foreign directory) and makes re-runs
+  idempotent: unchanged entries counted, departed entries pruned (`--prune`)
+  or reported stale. Files without local bytes, secure blobs, and folder refs
+  are skipped with per-entry reasons. First slice of the federation & sync
+  track (doc 17 phases F0–F4).
+- **Companion: `POST /redeem-invite`** — join a PVOS server from the browser
+  (PVOS D18 §2.7): one human prompt pairs the server and signs the invite
+  acceptance with the identity key; redeem prompts show the signed email, and
+  pairing names pin the install.
+- **Tenant custody: provision and remove hosted users over the socket**
+  (PVOS D32).
+- **`pvfsd`: sd_notify READY when serving** (PVOS D57) — `Type=notify`
+  systemd units gate dependents on the socket actually accepting.
+
 ## 1.2.0 — 07/22/2026
 
 - **Daemon: concurrent metadata reads** (doc 07 §6 split): `ls`/`stat`/

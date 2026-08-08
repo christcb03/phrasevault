@@ -106,6 +106,25 @@ pvfs verify <node-id>                                  # recompute id + check si
 
 Most commands take a **node id** (64-hex), a `pvfs://` URI, or an absolute path under a mount.
 
+### 6.1 Present a tree to non-PVFS apps (`pvfs export`)
+
+Any app that reads ordinary directories (a media server, a backup tool, `rsync`) can consume a
+PVFS tree via a **materialized export** — files from every bound location appear as one hierarchy:
+
+```bash
+pvfs export ~/media/library /srv/plex-library          # symlinks (default)
+pvfs export ~/media/library /srv/copyset --mode copy   # hash-verified real copies
+pvfs export ~/media/library /srv/plex-library --prune  # drop entries that left the tree
+```
+
+Point Plex (or anything else) at the export directory. Re-running refreshes it in place: unchanged
+entries are left alone, removed nodes are pruned (`--prune`) or reported as stale. The export
+directory is marked with a `.pvfs-export` manifest and is owned by the export — `pvfs` refuses to
+export into a non-empty directory it didn't create. Files with no local bytes yet, secure blobs,
+and folder refs are skipped with a per-entry reason. `--mode hardlink` serves apps that refuse
+symlinks (same filesystem only); `--mode copy` streams through the verified read path, so a
+corrupted location can never land bytes in the export (it gets quarantined instead, like any read).
+
 ---
 
 ## 7. Sharing a forest with other users
@@ -331,6 +350,7 @@ run `pvfs member replace <file>`).
 | `pvfs add <parent> --kind … --label …` | Add a node. |
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
+| `pvfs export <target> <dir> [--mode symlink\|hardlink\|copy] [--prune]` | Materialize a tree as a native directory for non-PVFS apps (§6.1). |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs audit` | Authorization health check: tag grants/memberships under a revoked authority, `key:` grants to revoked devices, and expired grants. |
 | `pvfs secure create <parent> <label> [--path P]` | Create an encrypted-at-rest blob (managed storage; `--path` pins a location). |
@@ -392,8 +412,9 @@ client library cover the wire path.
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
-- **Polish** — Touch ID unlock, metadata read concurrency, richer `remote` path resolvers / CLI
-  surfaces for `AddNode`.
+- **Polish** — Touch ID unlock.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; old history sealed for audit).
-- **Federation / network sharing** — reach and sync forests across hosts.
+- **Federation / network sharing** — reach and sync forests across hosts. The track has started
+  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1) is built;
+  network transport, replicas, and pointer-vs-sync placement policy follow.

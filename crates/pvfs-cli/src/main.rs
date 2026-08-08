@@ -173,6 +173,18 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Materialize a tree as a native directory any app can read (doc 17 §3)
+    Export {
+        /// tree root: node id, mount-relative path, or pvfs:// URI
+        target: String,
+        /// destination directory (created; re-runs refresh it)
+        dest: PathBuf,
+        #[arg(long, default_value = "symlink", value_parser = ["symlink", "hardlink", "copy"])]
+        mode: String,
+        /// remove entries that have left the tree since the last export
+        #[arg(long)]
+        prune: bool,
+    },
     /// Fill a lazy content hash (creates a successor node — prints new id)
     Hash { target: String },
     /// List nodes flagged invalid: changed-on-disk
@@ -2894,6 +2906,59 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             };
             if json {
                 eprintln!("{{\"bytes\":{written}}}");
+            }
+            engine.close()
+        }
+        Cmd::Export {
+            target,
+            dest,
+            mode,
+            prune,
+        } => {
+            let (mut engine, id) = engine_and_node(ctx, &target)?;
+            let spec = pvfs_core::ExportSpec {
+                mode: pvfs_core::ExportMode::parse(&mode)?,
+                prune,
+            };
+            let report = engine.export_tree(&id, &dest, &spec)?;
+            if json {
+                let skipped: Vec<String> = report
+                    .skipped
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{{\"path\":\"{}\",\"node\":\"{}\",\"reason\":\"{}\"}}",
+                            json_escape(&s.path),
+                            s.node,
+                            json_escape(&s.reason)
+                        )
+                    })
+                    .collect();
+                let stale: Vec<String> = report
+                    .stale
+                    .iter()
+                    .map(|p| format!("\"{}\"", json_escape(p)))
+                    .collect();
+                println!(
+                    "{{\"dirs_created\":{},\"exported\":{},\"unchanged\":{},\"pruned\":{},\"stale\":[{}],\"skipped\":[{}]}}",
+                    report.dirs_created,
+                    report.exported,
+                    report.unchanged,
+                    report.pruned,
+                    stale.join(","),
+                    skipped.join(",")
+                );
+            } else {
+                println!(
+                    "exported {} ({} unchanged, {} dirs created, {} pruned)",
+                    report.exported, report.unchanged, report.dirs_created, report.pruned
+                );
+                for p in &report.stale {
+                    eprintln!("stale: {p} (re-run with --prune to remove)");
+                }
+                for s in &report.skipped {
+                    eprintln!("skipped: {} — {}", s.path, s.reason);
+                }
             }
             engine.close()
         }

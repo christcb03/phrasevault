@@ -18,6 +18,7 @@ pub mod engine;
 pub mod envelope;
 pub mod error;
 pub mod event;
+pub mod export;
 pub mod fs;
 pub mod identity;
 pub mod link;
@@ -32,6 +33,7 @@ pub mod walk;
 pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
 pub use engine::{ChildEntry, Engine, NodeSpec, PreparedEvent, PreparedWrite};
 pub use error::{IntegrityReason, PvfsError, Result};
+pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
     BindSpec, Binding, HashPolicy, NodeStat, PendingChange, ResolveAction, ScanReport, ScanStats,
     VerifyOutcome,

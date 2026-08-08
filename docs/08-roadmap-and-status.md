@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-07-22.
+Status: **Living document** — update as phases land. Last updated 2026-08-08.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–16; this is the index + the honest "what's not done yet."
@@ -28,7 +28,7 @@ docs 02–16; this is the index + the honest "what's not done yet."
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`) ✅; revoked-device direct `key:` grants masked at access time ✅ (1.1). No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ✅ shipped (follow-on: audit also flagging `key:`→revoked devices) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **1.1 (PVOS M1)** | Daemon `AddNode`/`Payload` (log-resident typed records), `stat` exposes home `parent`, typed `already_exists`, revoked-key `key:` ACL masking | ✅ **shipped** (tagged `v1.1`, 2026-07-09) — see [CHANGELOG](../CHANGELOG.md) |
-| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ☐ future (doc 03) |
+| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ◑ **in progress** — phased in [doc 17](17-federation-and-sync.md); **F0 `pvfs export` built** (native tree view for non-PVFS apps); F1 transport next |
 | **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
 
 ---
@@ -69,6 +69,9 @@ docs 02–16; this is the index + the honest "what's not done yet."
   `pvfsd` (doc 16).
 - **1.1 PVOS surface:** `AddNode`/`Payload` (log-resident typed records via `pvfs-client`), `stat`
   home parent, typed `already_exists`, revoked-key `key:` grant masking.
+- **Native view (P4 F0):** `pvfs export` materializes any tree as a plain directory
+  (symlink / hardlink / hash-verified copy) for non-PVFS apps — a media server points its library
+  at the export; idempotent re-runs, `--prune`, per-entry skip reporting (doc 17 §3).
 
 The recovery phrase is **recovery-only**; everyday admin is signed by the owner's device.
 
@@ -151,7 +154,16 @@ takeover/restart e2e, the read-pool cross-connection visibility test, and the
 new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 `v1.2` tag pending (Chris tags manually).
 
-**Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03), compaction (doc 11) —
+### 3.3 — Unreleased (the post-1.2 line, as of 2026-08-08)
+
+| Item | State |
+|------|--------|
+| **Companion: browser invite redemption** (PVOS D18 §2.7) — `POST /redeem-invite` on the web agent: one prompt pairs the server *and* signs the acceptance; redeem prompts show the signed email; pairing names pin the install | ✅ built (2026-07-27) |
+| **Tenant custody: provision and remove hosted users over the socket** (PVOS D32) | ✅ built (2026-07-28) |
+| **`pvfsd`: sd_notify READY when serving** (PVOS D57) — `Type=notify` units gate dependents on the socket actually accepting | ✅ built (2026-08-05) |
+| **P4 F0: `pvfs export`** — the native tree view ([doc 17](17-federation-and-sync.md) §3): symlink/hardlink/verified-copy materialization, `.pvfs-export` manifest, idempotent re-runs + `--prune`, per-entry skips | ✅ built (2026-08-08) |
+
+**Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03 — **now phased and started**, [doc 17](17-federation-and-sync.md)), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
 lineage) — single-use challenge nonce (when the socket is network-proxied), arbitrary named groups /
 explicit deny, and cross-OS-user / two-host end-to-end (needs a second account/host; federation track).

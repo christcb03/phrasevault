@@ -201,6 +201,22 @@ HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
 [ ${#HASHED} -eq 64 ] && [ "$HASHED" != "$LAZY" ] && ok "hash created successor node"
 [ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified"
 
+say "P4 F0: export (native tree view, doc 17)"
+EXPORT_DIR="$DATA/exportview"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"exported":2' && ok "export materialized 2 files"
+[ -L "$EXPORT_DIR/movies/alpha.mkv" ] && ok "export entry is a symlink"
+[ "$(cat "$EXPORT_DIR/movies/alpha.mkv")" = "alpha-bytes-changed-longer" ] && ok "export reads through"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"unchanged":2' && ok "re-export idempotent"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"path":"notes.txt"' && ok "unavailable file reported skipped"
+COPY_DIR="$DATA/exportcopy"
+$PVFS export "$LFOLDER" "$COPY_DIR" --mode copy >/dev/null
+[ ! -L "$COPY_DIR/movies/lazy.bin" ] && [ "$(cat "$COPY_DIR/movies/lazy.bin")" = "lazy-content" ] \
+  && ok "copy export lands real verified bytes"
+OCCUPIED="$DATA/occupied"
+mkdir -p "$OCCUPIED"; printf 'x' > "$OCCUPIED/keep.txt"
+assert_rc 2 "export refuses foreign non-empty dir → 2" -- $PVFS export "$LFOLDER" "$OCCUPIED"
+[ -f "$OCCUPIED/keep.txt" ] && ok "foreign dir untouched"
+
 say "P1: serve daemon (watcher)"
 $PVFS serve --debounce-ms 300 >/dev/null 2>&1 &
 SERVE_PID=$!
