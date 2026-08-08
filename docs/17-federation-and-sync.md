@@ -61,7 +61,7 @@ so region granularity isn't on this scenario's critical path.
 | **F3** | Content plane: per-subtree **placement policy** (`pvfs place` — `pointer` \| `sync`), the sync engine (`pvfs sync`, `export --fetch` — hash-verified streaming into the managed store, synthesized `pvfs-sync://` locations) | ✅ built (§6) |
 | **F5.0** | **Write-through replicas**: mutations on a replica route to its source, member-signed; read-your-writes tail pull | ✅ built (§7.1) |
 | **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth, `loc add --here` | ✅ built (§7.2) |
-| **F5.2** | **Remote read-through**: fetch-on-demand from the instance a location names, into the F3 store | ☐ (§7.3) |
+| **F5.2** | **Remote read-through**: per-file candidate fetch (registry-pinned holders, then the source), self-healing `cat`, owner-side pulls | ✅ built (§7.3) |
 | **F5.3** | **The mover**: `place <subtree> central` + owner-side migration + edge eviction — the tiering flow | ☐ (§7.4) |
 | **F5.4** | **Tail-subscribe**: long-poll log shipping for seconds-fresh replicas | ☐ (§7.5) |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later (§8) |
@@ -273,14 +273,27 @@ wrong the moment locations cross machines. Doc 03 §2.1's reserved "future schem
   owner's log*). Explicit URIs still pass through, `file://` included (a same-host claim, still
   right for bound folders).
 
-### 7.3 F5.2 — remote read-through (sync-on-demand)
+### 7.3 F5.2 — remote read-through (sync-on-demand) ✅ BUILT (2026-08-08)
 
-Doc 03 §2.3's resolution order, step 3, implemented: when no location resolves locally and a
-`pvfs-host://` location names a reachable instance (known pin → address via the instance registry
-or the replica marker), **fetch on demand** — stream through that instance's daemon into the F3
-sync store (verified, promoted to a local location by existence), then serve. v1 blocks the read
-while fetching; true open-and-stream is F4's FUSE mount. With F5.2, "immediately available
-everywhere" holds even before anyone has synced: the catalog entry is enough to reach the bytes.
+Doc 03 §2.3's resolution order, step 3, implemented. As built:
+
+- **Per-file candidate resolution.** A fetch pass resolves each missing file to candidates, best
+  first: every `pvfs-host://` location whose **pin the instance registry knows** (that host
+  *definitely* holds the bytes), then the replica's recorded source (which resolves its own
+  locations). Connections pool per target; dead targets aren't re-dialed. `pvfs sync` and
+  `export --fetch` use this — so a sync now succeeds even when the bytes live on a *third*
+  instance the source can't read.
+- **`pvfs cat` self-heals.** A read of a file with no local bytes fetches on demand (blocking,
+  verified, into the F3 store) and then serves — the catalog entry alone is enough to reach the
+  bytes, before anyone has run a sync pass. Wrong bytes never land; on total failure the original
+  not-found surfaces. True open-and-stream (no full prefetch) remains F4's FUSE mount.
+- **Owned forests fetch too**: `pvfs sync` on the *owner* pulls edge bytes home through the
+  registry — the mover's core primitive, ready for F5.3 to build the policy around.
+- **Freshness note:** write-through's read-your-writes now folds the pulled tail into the
+  projection immediately, so a daemon serving the same replica picks the change up live (its
+  readers see committed projection rows). Between write-throughs, a serving replica still learns
+  of *other* writers' changes only at `replica sync` — the standing gap F5.4's tail-subscribe
+  closes.
 
 ### 7.4 F5.3 — the mover (tiering policy)
 

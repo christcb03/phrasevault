@@ -461,8 +461,11 @@ $PVFS remote --socket "$SOCK" add-location "$MOVIE" "file://$DATA/far-store/movi
 $PVFS --json replica sync "$REPMOUNT" >/dev/null
 mv "$DATA/far-store" "$DATA/far-store2"
 $PVFS remote --socket "$SOCK" add-location "$MOVIE" "file://$DATA/far-store2/movie.mkv" >/dev/null
-assert_rc 3 "replica cat before sync → 3 (no readable location)" -- \
-  $PVFS --data-dir "$REPMOUNT/.pvfs" cat "$MOVIE"
+# stat (which never fetches) shows the file unavailable locally — cat would
+# already self-heal via F5.2 read-through, so the sync pass below proves the
+# batch path instead
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | grep -q UNAVAILABLE \
+  && ok "replica sees the file unavailable locally before sync"
 $PVFS --data-dir "$REPMOUNT/.pvfs" place "$DROOT" sync >/dev/null \
   && ok "placed the root subtree sync"
 SYNCJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" sync)"
@@ -505,12 +508,45 @@ $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$HQ" | grep -q "pvfs-host://$NETPIN" \
 [ "$($PVFS --data-dir "$DMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
   && ok "own pin resolves locally" || fail "owner host-loc cat"
 $PVFS --json replica sync "$REPMOUNT" >/dev/null
-assert_rc 3 "foreign pin unreadable on the replica → 3" -- \
-  $PVFS --data-dir "$REPMOUNT/.pvfs" cat "$HQ"
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$HQ" | grep -q UNAVAILABLE \
+  && ok "foreign pin is unavailable locally (stat never fetches)"
 $PVFS --json --data-dir "$REPMOUNT/.pvfs" sync >/dev/null \
   && ok "sync fetches the host-qualified file from the source"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
   && ok "replica serves it from the sync store" || fail "host-loc after sync"
+
+say "F5.2: remote read-through — fetch from any pinned instance (doc 17 §7.3)"
+# the edge box (the first replica) now serves a TLS listener of its own
+"$PVFSD" --mount "$REPMOUNT" --socket "$REPSOCK" --listen 127.0.0.1:0 >/dev/null 2>"$DATA/repd.log" &
+RPID=$!
+for _ in $(seq 1 50); do [ -S "$REPSOCK" ] && break; sleep 0.1; done
+REPLINE="$(grep -m1 'listening on' "$DATA/repd.log" || true)"
+REPADDR="$(printf '%s' "$REPLINE" | sed -E 's/.*listening on ([^ ]+).*/\1/')"
+REPPIN="$(printf '%s' "$REPLINE" | sed -E 's/.*transport pin ([0-9a-f]+).*/\1/')"
+[ ${#REPPIN} -eq 64 ] && ok "edge box minted its own transport pin" || fail "edge pin: $REPLINE"
+# bytes that exist ONLY on the edge box, cataloged via write-through + --here
+printf 'edge-bytes' > "$DATA/edge.bin"
+EDGE="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind file --label edge.bin --size 10)" node_id)"
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$EDGE" --here "$DATA/edge.bin" >/dev/null \
+  && ok "edge box recorded its pin into the owner's log"
+# a second consumer replica: the file is cataloged but its holder unknown…
+$PVFS --json replica add "$DATA/rep2" --connect "$NETADDR" --pin "$NETPIN" >/dev/null
+assert_rc 3 "consumer cat before the holder is registered → 3" -- \
+  $PVFS --data-dir "$DATA/rep2/.pvfs" cat "$EDGE"
+# …until the holder's pin is registered — then cat fetches on demand
+$PVFS instance add edgebox "$REPADDR" "$REPPIN" >/dev/null
+[ "$($PVFS --data-dir "$DATA/rep2/.pvfs" cat "$EDGE" 2>/dev/null)" = "edge-bytes" ] \
+  && ok "consumer cat read-through fetched from the edge box" || fail "read-through cat"
+$PVFS --data-dir "$DATA/rep2/.pvfs" stat "$EDGE" | grep -q "pvfs-sync" \
+  && ok "fetched bytes promoted into the consumer's sync store"
+# the owner pulls edge bytes home too — the mover's core primitive (F5.3)
+SYNCJ2="$($PVFS --json --data-dir "$DMOUNT/.pvfs" sync "$DROOT")"
+[ "$(jget "$SYNCJ2" fetched)" -ge 1 ] && ok "owner pulled the edge bytes home" || fail "owner sync: $SYNCJ2"
+[ "$($PVFS --data-dir "$DMOUNT/.pvfs" cat "$EDGE")" = "edge-bytes" ] \
+  && ok "owner serves the file from its own store" || fail "owner cat edge"
+$PVFS instance rm edgebox >/dev/null
+kill -TERM "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null || true
+RPID=""
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

@@ -784,40 +784,117 @@ fn replica_client(src: &pvfs_core::ReplicaSource) -> Result<Client, PvfsError> {
     }
 }
 
-/// Fetch missing bytes for `roots` from the source `client`, streaming each
-/// file into the managed sync store (hash-verified on commit). Returns
-/// `(fetched, failures)` — per-file failures never abort the pass.
+/// Fetches missing bytes from wherever they can be reached (F5.2, doc 17
+/// §7.3). Per file, candidates are tried in order: every `pvfs-host://`
+/// location whose pin the instance registry knows (that host *definitely*
+/// holds the bytes), then the replica's recorded source (which resolves its
+/// own locations). Connections are pooled per target; dead targets are
+/// remembered and not re-dialed.
+struct Fetcher {
+    pool: std::collections::HashMap<String, Client>,
+    dead: std::collections::HashSet<String>,
+    instances: Vec<(String, String, String)>,
+    source: Option<pvfs_core::ReplicaSource>,
+}
+
+impl Fetcher {
+    fn new(data_dir: &std::path::Path) -> Fetcher {
+        Fetcher {
+            pool: std::collections::HashMap::new(),
+            dead: std::collections::HashSet::new(),
+            instances: load_instances().unwrap_or_default(),
+            source: pvfs_core::ReplicaSource::load(data_dir).ok(),
+        }
+    }
+
+    /// Where `id`'s bytes might be fetched from, best candidate first.
+    fn candidates(&self, engine: &Engine, id: &str) -> Vec<pvfs_core::ReplicaSource> {
+        let mut out: Vec<pvfs_core::ReplicaSource> = Vec::new();
+        for loc in engine.locations(&id.to_string()).unwrap_or_default() {
+            if let Some((pin, _path)) = pvfs_core::storage::parse_host_uri(&loc) {
+                if let Some((_, addr, _)) = self.instances.iter().find(|(_, _, p)| p == pin) {
+                    out.push(pvfs_core::ReplicaSource {
+                        transport: "tcp".into(),
+                        target: addr.clone(),
+                        pin: pin.to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(src) = &self.source {
+            out.push(src.clone());
+        }
+        out.dedup_by(|a, b| a.transport == b.transport && a.target == b.target);
+        out
+    }
+
+    /// Fetch one file into the sync store, verified. `Err` is the last
+    /// candidate's failure (or why there were none).
+    fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), String> {
+        let candidates = self.candidates(engine, id);
+        if candidates.is_empty() {
+            return Err("no reachable source holds this file (register the holding \
+                        instance with `pvfs instance add`)"
+                .into());
+        }
+        let mut last_err = String::new();
+        for cand in candidates {
+            let key = format!("{}:{}", cand.transport, cand.target);
+            if self.dead.contains(&key) {
+                continue;
+            }
+            if !self.pool.contains_key(&key) {
+                match replica_client(&cand) {
+                    Ok(c) => {
+                        self.pool.insert(key.clone(), c);
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        self.dead.insert(key);
+                        continue;
+                    }
+                }
+            }
+            let client = self.pool.get_mut(&key).expect("inserted above");
+            let mut sink = match engine.sync_begin(&id.to_string()) {
+                Ok(s) => s,
+                Err(e) => return Err(e.to_string()),
+            };
+            match client.cat(id, &mut sink) {
+                Ok(_) => match engine.sync_commit(sink) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_err = e.to_string(),
+                },
+                Err(e) => {
+                    // a failed stream may leave the connection out of step
+                    last_err = e.to_string();
+                    self.pool.remove(&key);
+                }
+            }
+        }
+        Err(last_err)
+    }
+}
+
+/// Fetch missing bytes under `roots`, streaming each file into the managed
+/// sync store (hash-verified on commit). Returns `(fetched, failures)` —
+/// per-file failures never abort the pass.
 fn sync_pull(
     engine: &mut Engine,
-    client: &mut Client,
+    fetcher: &mut Fetcher,
     roots: &[String],
 ) -> Result<(u64, Vec<(String, String)>), PvfsError> {
     let mut fetched = 0u64;
     let mut failed = Vec::new();
     for root in roots {
         for (id, label) in engine.missing_bytes(root)? {
-            let mut sink = engine.sync_begin(&id)?;
-            match client.cat(&id, &mut sink) {
-                Ok(_) => match engine.sync_commit(sink) {
-                    Ok(_) => fetched += 1,
-                    Err(e) => failed.push((label, e.to_string())),
-                },
-                Err(e) => failed.push((label, e.to_string())),
+            match fetcher.fetch(engine, &id) {
+                Ok(()) => fetched += 1,
+                Err(e) => failed.push((label, e)),
             }
         }
     }
     Ok((fetched, failed))
-}
-
-/// The replica source a sync pass fetches from, with the F3 explanation when
-/// the forest isn't a replica.
-fn sync_source(data_dir: &std::path::Path) -> Result<pvfs_core::ReplicaSource, PvfsError> {
-    pvfs_core::ReplicaSource::load(data_dir).map_err(|_| PvfsError::BadInput {
-        field: "sync".into(),
-        reason: "sync fetches from a replica's recorded source — this forest has none \
-                 (an owned forest already holds its bytes)"
-            .into(),
-    })
 }
 
 /// Pull the source log from `from` until caught up, ingesting verbatim rows
@@ -1290,6 +1367,11 @@ fn replica_catch_up(data_dir: &std::path::Path, client: &mut Client) {
         let mut store = pvfs_core::ReplicaStore::open(data_dir)?;
         let from = store.tip()? + 1;
         replica_pull(client, &mut store, from)?;
+        drop(store);
+        // Fold the tail into the projection NOW — so this process's next
+        // read and any daemon currently serving this replica (its readers
+        // see committed projection rows) pick the change up immediately.
+        Engine::open(data_dir)?.close()?;
         Ok(())
     })();
 }
@@ -2991,9 +3073,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             };
             let data_dir = engine.data_dir().to_path_buf();
-            let src = sync_source(&data_dir)?;
-            let mut client = replica_client(&src)?;
-            let (fetched, failed) = sync_pull(&mut engine, &mut client, &roots)?;
+            let mut fetcher = Fetcher::new(&data_dir);
+            if fetcher.source.is_none() && fetcher.instances.is_empty() {
+                return Err(PvfsError::BadInput {
+                    field: "sync".into(),
+                    reason: "nothing to fetch from — this forest has no replica source and \
+                             no instances are registered (`pvfs instance add`)"
+                        .into(),
+                });
+            }
+            let (fetched, failed) = sync_pull(&mut engine, &mut fetcher, &roots)?;
             engine.close()?;
             if json {
                 let fails: Vec<String> = failed
@@ -3531,6 +3620,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 None => None,
                 Some(r) => Some(parse_range(&r)?),
             };
+            // Read-through (F5.2, doc 17 §7.3): no local bytes → fetch them
+            // from a reachable holder into the sync store, then serve. The
+            // read blocks while the verified fetch streams; nothing lands on
+            // failure and the original error surfaces.
+            if engine.readable_path(&id)?.is_none()
+                && engine.node(&id)?.map(|n| n.node_type) == Some(pvfs_core::TYPE_FILE.into())
+            {
+                let data_dir = engine.data_dir().to_path_buf();
+                let mut fetcher = Fetcher::new(&data_dir);
+                if let Err(e) = fetcher.fetch(&mut engine, &id) {
+                    if !e.is_empty() {
+                        eprintln!("read-through: {e}");
+                    }
+                }
+            }
             let written = match output {
                 Some(path) => {
                     let mut f = std::fs::File::create(&path)
@@ -3558,10 +3662,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let (mut engine, id) = engine_and_node(ctx, &target)?;
             if fetch {
                 let data_dir = engine.data_dir().to_path_buf();
-                let src = sync_source(&data_dir)?;
-                let mut client = replica_client(&src)?;
+                let mut fetcher = Fetcher::new(&data_dir);
                 let (fetched, failed) =
-                    sync_pull(&mut engine, &mut client, std::slice::from_ref(&id))?;
+                    sync_pull(&mut engine, &mut fetcher, std::slice::from_ref(&id))?;
                 for (label, e) in &failed {
                     eprintln!("fetch failed: {label} — {e}");
                 }

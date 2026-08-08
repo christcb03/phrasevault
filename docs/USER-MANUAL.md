@@ -300,14 +300,16 @@ pvfs sync <node>                      # …or one subtree right now, policy or n
 pvfs export <library-node> /srv/plex-library --fetch   # fetch + materialize in one go
 ```
 
-`pvfs sync` finds every file under the placed subtrees with no readable local bytes and streams it
-from the replica's source, **hashing while it arrives** — a corrupted or truncated transfer is
-discarded and reported per file; wrong bytes never land. Fetched files live in a managed store
-inside the forest's `.pvfs/` (put the replica's mount on the disk you want filled), show up in
-`stat` as a `pvfs-sync://` location, and serve through `cat`, the daemon, and `pvfs export` like
-any other bytes. Placement is per-machine deployment state — two replicas of the same forest can
-pin different subtrees. Re-run `pvfs sync` any time (idempotent); `pvfs place <node> pointer`
-returns a subtree to catalog-only.
+`pvfs sync` finds every file under the placed subtrees with no readable local bytes and fetches
+it, **hashing while it arrives** — a corrupted or truncated transfer is discarded and reported per
+file; wrong bytes never land. Each file is fetched from the best reachable holder: an instance the
+registry knows to hold it (a `pvfs-host://` location, §7.9), else the replica's source. Fetched
+files live in a managed store inside the forest's `.pvfs/` (put the replica's mount on the disk
+you want filled), show up in `stat` as a `pvfs-sync://` location, and serve through `cat`, the
+daemon, and `pvfs export` like any other bytes. **`pvfs cat` self-heals too**: reading a file with
+no local bytes fetches it on demand and then serves it — a catalog entry is enough. Placement is
+per-machine deployment state — two replicas of the same forest can pin different subtrees. Re-run
+`pvfs sync` any time (idempotent); `pvfs place <node> pointer` returns a subtree to catalog-only.
 
 The full media flow, end to end:
 

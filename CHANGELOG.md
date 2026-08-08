@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Remote read-through (P4 F5.2, doc 17 §7.3):** fetching now resolves
+  **per file**: candidates are every `pvfs-host://` location whose pin the
+  instance registry knows (the holder), then the replica's recorded source
+  — pooled connections, dead targets skipped. `pvfs sync` / `export
+  --fetch` therefore work when bytes live on a third instance the source
+  can't read, and **`pvfs cat` self-heals**: a read with no local bytes
+  fetches on demand (blocking, hash-verified, into the sync store) and
+  serves — a catalog entry alone is enough to reach the bytes. Owned
+  forests fetch too: `pvfs sync` on the owner pulls edge bytes home (the
+  F5.3 mover's core primitive). Write-through's read-your-writes now folds
+  the pulled tail into the projection immediately, so a daemon serving the
+  same replica sees the change live.
 - **Instance-qualified locations (P4 F5.1, doc 17 §7.2):**
   `pvfs-host://<transport-pin>/<abs-path>` records **which instance** holds
   a file's bytes — the pin is the host's F1 transport pin, so the claim is
