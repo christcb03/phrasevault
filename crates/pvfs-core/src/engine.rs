@@ -1194,7 +1194,10 @@ impl Engine {
         }])
     }
 
-    /// Active URIs for a file node.
+    /// Active URIs for a file node. The managed sync store (F3) is included
+    /// by **existence, not record**: `pvfs-sync:///<id>` appears whenever the
+    /// store holds the file, so synced bytes survive projection rebuilds with
+    /// no table to keep consistent.
     pub fn locations(&self, file: &NodeId) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1208,8 +1211,13 @@ impl Engine {
         let rows = stmt
             .query_map(params![file], |r| r.get::<_, String>(0))
             .map_err(map_db("locations"))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_db("locations"))
+        let mut out: Vec<String> = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("locations"))?;
+        if crate::sync::sync_store_path(&self.data_dir, file).is_file() {
+            out.push(crate::sync::sync_uri(file));
+        }
+        Ok(out)
     }
 
     // ---- reads -------------------------------------------------------------------

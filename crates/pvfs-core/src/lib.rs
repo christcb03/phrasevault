@@ -29,6 +29,7 @@ pub mod orderkey;
 pub mod projection;
 pub mod replica;
 pub mod storage;
+pub mod sync;
 pub mod walk;
 
 pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
@@ -46,4 +47,5 @@ pub use replica::{ReplicaSource, ReplicaStore};
 pub use node::{FilePayload, Node, NodeId, TYPE_FILE, TYPE_FOLDER, TYPE_SECURE};
 pub use orderkey::OrderKey;
 pub use storage::ByteRange;
+pub use sync::SyncSink;
 pub use walk::{TreeWalk, WalkEntry};

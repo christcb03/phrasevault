@@ -58,7 +58,7 @@ so region granularity isn't on this scenario's critical path.
 | **F0.1** | `pvfs serve` keeps exports fresh (re-export on change), `export --fetch` once F3 lands | ☐ small follow-on |
 | **F1** | Network transport: `pvfsd --listen` over TCP+TLS with a pinned transport cert, single-use challenge nonces (doc 08 §4 item 7), `pvfs instance` registry + `remote --connect/--instance` | ✅ built (§4) |
 | **F2** | Forest replica — doc 03 Mode A: admin-gated log shipping (`LogInfo`/`LogRead`), `pvfs replica add/sync`, chain-verified ingest + fully verified replay at open, read-only replica forests served by `pvfsd` | ✅ built (§5) |
-| **F3** | Content plane: per-subtree **placement policy** (`pointer` \| `sync`), the sync engine (fetch-by-hash, verify, record), replica-local cache locations | ☐ |
+| **F3** | Content plane: per-subtree **placement policy** (`pvfs place` — `pointer` \| `sync`), the sync engine (`pvfs sync`, `export --fetch` — hash-verified streaming into the managed store, synthesized `pvfs-sync://` locations) | ✅ built (§6) |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later |
 
 ---
@@ -178,29 +178,36 @@ As built:
   case C), so a rotated forest replicates correctly; the compaction-checkpoint cut remains with
   doc 11 (doc 03 §6 Q8).
 
-## 6. F3 — placement policy & the sync engine
+## 6. F3 — placement policy & the sync engine ✅ BUILT (2026-08-08)
 
-The pointer-vs-sync knob, per subtree:
+The pointer-vs-sync knob, per subtree. As built:
 
-- **Placement policy is deployment state, not catalog truth** — stored per-instance (projection /
-  config, like bindings), **never** log events: two replicas legitimately pin different subtrees,
-  and policy must not need the owner's signature. Precedent: temp data and bindings already live
-  outside the log (doc 01, doc 04).
-  - `pvfs place <target> pointer` (default — today's behavior)
-  - `pvfs place <target> sync [--to <bound-folder>]` — "keep this subtree's bytes local, here."
-- **The sync engine** (a `serve` job + `pvfs sync` one-shot): walk `sync`-placed subtrees; for each
-  file node with no local bytes, fetch from a remote location by **content hash** over the F1 data
-  plane (the raw `cat` plane already streams; P2-F was built as "the torrent seam"), verify against
-  the node's hash while writing, then record the new copy.
-- **Where the new copy is recorded:** a replica cannot append to the owner's log, so locally
-  fetched bytes are recorded as **replica-local locations** (projection-only, like
-  `temp_file_locations`) — instantly readable, never claiming to be owner-catalog truth. The
-  optional doc 03 **Mode B crosslink** (owner appends `FileLocationAdded` naming the replica's
-  copy, via an authenticated remote-append grant) upgrades a copy to catalog-visible redundancy —
-  that's where doc 03 §6 Q4's grant mechanism lands.
-- **`local_only` honored:** a `local_only` region (doc 13 §C) never syncs out, ever. Secure regions
-  sync as **ciphertext + hash-ledger only** (doc 13 Q-C2).
-- `pvfs export` gains `--fetch`: materialize missing bytes through the sync engine during export.
+- **Placement policy is deployment state, not catalog truth** — a plain per-instance file
+  (`<data_dir>/placement`, like the replica marker and bindings), **never** log events: two
+  replicas legitimately pin different subtrees, and policy must not need the owner's signature.
+  - `pvfs place <target> pointer` (default — pointer entries are simply absent)
+  - `pvfs place <target> sync` — "keep this subtree's bytes local."
+- **The sync engine:** `pvfs sync` (one target, or every `sync`-placed subtree) walks the
+  contains-closure, finds file nodes with **no readable local location**, and streams each from the
+  replica's recorded source over the existing raw data plane (P2-F, "the torrent seam"), **hashing
+  while the bytes arrive**: a hashed node must match its content hash exactly; a lazy node is
+  checked against its recorded size. Wrong bytes never land — the tmp file is discarded and the
+  failure reported per file, at the exact node. `pvfs export --fetch` runs the same pass before
+  materializing.
+- **Where the copy is recorded: nowhere — deliberately.** Fetched bytes land in a **managed,
+  node-id-addressed store** (`<data_dir>/synced/<id[..2]>/<id>`), and the read path synthesizes a
+  `pvfs-sync:///<id>` location **from the store's existence**. No projection table means nothing to
+  keep consistent: synced bytes survive projection rebuilds by construction, and the whole
+  mechanism works on read-only replicas (which is where it matters — an owned forest already holds
+  its bytes). Verify-on-read still applies; a corrupted store copy quarantines like any location,
+  and a fresh verified sync lifts the quarantine. The optional doc 03 **Mode B crosslink** (owner
+  appends `FileLocationAdded` naming the replica's copy, via a remote-append grant — doc 03 §6 Q4)
+  remains future work: it upgrades a local copy to catalog-visible redundancy.
+- **Deferred from this slice:** `--to <dir>` custom destinations (put the replica's mount on the
+  big disk instead), the `serve`-integrated background sync job (F3.1 with F0.1's export
+  freshness), and `local_only` regions (doc 13 §C — arrives with region marks, F4). Secure blobs
+  already ship ciphertext-only through F2's log shipping (their bytes live in the mutable store,
+  doc 12; region-scoped replication of those is F4).
 
 ## 7. F4 — later, in this order when needed
 

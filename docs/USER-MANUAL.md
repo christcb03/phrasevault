@@ -285,8 +285,42 @@ Three things to know:
   every signature, every authorization. A tampered ship fails loudly, at the exact event.
 - **Replicas are read-only.** The owner's instance stays the forest's only writer; local writes and
   writes via a replica's daemon are refused. ACLs answer identically on a replica (the grants are
-  in the log), and file bytes read through wherever the recorded locations resolve — pulling bytes
-  local per subtree is the next phase (placement policy, doc 17 §6).
+  in the log), and file bytes read through wherever the recorded locations resolve.
+
+### 7.8 Pointer or sync — pulling bytes local
+
+By default a replica holds the **catalog**; file bytes stay wherever their recorded locations
+point (a *pointer*). For content you actually stream — a media library — tell the replica to keep
+its own verified copies:
+
+```bash
+pvfs place <library-node> sync        # policy: keep this subtree's bytes local
+pvfs sync                             # fetch everything missing, verified
+pvfs sync <node>                      # …or one subtree right now, policy or not
+pvfs export <library-node> /srv/plex-library --fetch   # fetch + materialize in one go
+```
+
+`pvfs sync` finds every file under the placed subtrees with no readable local bytes and streams it
+from the replica's source, **hashing while it arrives** — a corrupted or truncated transfer is
+discarded and reported per file; wrong bytes never land. Fetched files live in a managed store
+inside the forest's `.pvfs/` (put the replica's mount on the disk you want filled), show up in
+`stat` as a `pvfs-sync://` location, and serve through `cat`, the daemon, and `pvfs export` like
+any other bytes. Placement is per-machine deployment state — two replicas of the same forest can
+pin different subtrees. Re-run `pvfs sync` any time (idempotent); `pvfs place <node> pointer`
+returns a subtree to catalog-only.
+
+The full media flow, end to end:
+
+```bash
+# media box:
+pvfs instance add homeserver <addr> <pin>
+pvfs replica add ~/media --instance homeserver
+pvfs place <library-node> sync
+pvfs sync
+pvfs export <library-node> /srv/plex-library
+# cron / after new episodes land on the server:
+pvfs replica sync ~/media && pvfs sync && pvfs export <library-node> /srv/plex-library --prune
+```
 
 ---
 
@@ -433,6 +467,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
 | `pvfs replica add <mount> --instance <name>` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest (§7.7). |
+| `pvfs place <target> sync\|pointer` · `pvfs sync [target]` | Mark a subtree "keep bytes local" · fetch its missing bytes, verified (§7.8). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
@@ -472,8 +507,9 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 - **Polish** — Touch ID unlock.
 - **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
   and speed up rebuilds (signed by you; old history sealed for audit).
-- **Federation / network sharing** — reach and sync forests across hosts. The track is underway
-  ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the network
-  transport (`pvfsd --listen` + pinned TLS, §7.4), and verified read-only replicas
-  (`pvfs replica`, §7.7) are built; pointer-vs-sync placement policy (pulling chosen subtrees'
-  bytes local) is next.
+- **Federation / network sharing** — reach and sync forests across hosts. The first arc is
+  **built** ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the
+  network transport (`pvfsd --listen` + pinned TLS, §7.4), verified read-only replicas
+  (`pvfs replica`, §7.7), and pointer-vs-sync placement (`pvfs place` / `pvfs sync`, §7.8) — the
+  cross-host media library works end to end. Still ahead: region-granular replication, a FUSE
+  mount for streaming un-synced files, swarm transfer, and failover.

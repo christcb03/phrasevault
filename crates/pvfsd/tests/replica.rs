@@ -228,6 +228,114 @@ fn replica_end_to_end() {
     replica.close().unwrap();
 }
 
+// F3 (doc 17 §6): a replica whose recorded location doesn't resolve locally
+// — the cross-host case — pulls the bytes from its source, verified, into
+// the managed sync store, and serves them from there.
+#[test]
+fn replica_sync_fetches_missing_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let bytes_dir = tempfile::tempdir().unwrap();
+    let path_a = bytes_dir.path().join("a").join("far.mkv");
+    std::fs::create_dir_all(path_a.parent().unwrap()).unwrap();
+    std::fs::File::create(&path_a)
+        .unwrap()
+        .write_all(b"far-bytes")
+        .unwrap();
+    let far = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FILE.into(),
+                label: "far.mkv".into(),
+                payload: FilePayload {
+                    content_hash: blake3::hash(b"far-bytes").to_hex().to_string(),
+                    size_bytes: 9,
+                    mime_type: "video/x-matroska".into(),
+                    original_name: "far.mkv".into(),
+                }
+                .encode(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    engine
+        .add_location(
+            &far,
+            &pvfs_core::storage::path_to_uri(&std::fs::canonicalize(&path_a).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+    let rep_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let rep_pub = crypto::pubkey_bytes(&rep_key);
+    engine.authorize_member(&owner_mn, &rep_pub).unwrap();
+    engine
+        .set_acl(&root, &Principal::Key(rep_pub.clone()), acl::ACL_RWA)
+        .unwrap();
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(engine));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&rep_key, d).unwrap();
+    let mut rep = Client::connect_signed(&sock, &rep_pub, sign).unwrap();
+
+    // replicate, then MOVE the bytes: the owner learns location B over the
+    // daemon, but the replica's shipped log still names only the dead A —
+    // exactly what a replica on another host sees.
+    let replica_mount = tempfile::tempdir().unwrap();
+    let data_dir = replica_mount.path().join(".pvfs");
+    pull_all(&mut rep, &data_dir, 1);
+    ReplicaSource {
+        transport: "socket".into(),
+        target: sock.to_string_lossy().into_owned(),
+        pin: String::new(),
+    }
+    .save(&data_dir)
+    .unwrap();
+
+    let path_b = bytes_dir.path().join("b").join("far.mkv");
+    std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+    std::fs::rename(&path_a, &path_b).unwrap();
+    rep.add_location(
+        &far,
+        &pvfs_core::storage::path_to_uri(&std::fs::canonicalize(&path_b).unwrap()).unwrap(),
+        sign,
+    )
+    .unwrap();
+
+    let mut replica = Engine::open(&data_dir).unwrap();
+    let missing = replica.missing_bytes(&root).unwrap();
+    assert_eq!(missing.len(), 1, "far.mkv has no readable location locally");
+    assert_eq!(missing[0].1, "far.mkv");
+
+    // fetch through the source daemon into the sync store, hash-verified
+    let mut fetcher = Client::connect_signed(&sock, &rep_pub, sign).unwrap();
+    let mut sink = replica.sync_begin(&far).unwrap();
+    fetcher.cat(&far, &mut sink).unwrap();
+    replica.sync_commit(sink).unwrap();
+
+    assert!(replica.missing_bytes(&root).unwrap().is_empty());
+    let mut out = Vec::new();
+    replica.cat(&far, None, &mut out).unwrap();
+    assert_eq!(out, b"far-bytes");
+    assert!(replica
+        .locations(&far)
+        .unwrap()
+        .iter()
+        .any(|u| u.starts_with("pvfs-sync:///")));
+    replica.close().unwrap();
+}
+
 // a tampered shipped row fails ingest at the exact seq
 #[test]
 fn tampered_ship_is_refused() {

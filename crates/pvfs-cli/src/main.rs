@@ -200,7 +200,19 @@ enum Cmd {
         /// remove entries that have left the tree since the last export
         #[arg(long)]
         prune: bool,
+        /// first fetch missing bytes from the replica's source (F3, doc 17 §6)
+        #[arg(long)]
+        fetch: bool,
     },
+    /// Set a subtree's placement: `sync` keeps its bytes local (doc 17 §6)
+    Place {
+        target: String,
+        #[arg(value_parser = ["pointer", "sync"])]
+        mode: String,
+    },
+    /// Fetch missing bytes from the replica's source — for one subtree, or
+    /// every subtree placed `sync`
+    Sync { target: Option<String> },
     /// Fill a lazy content hash (creates a successor node — prints new id)
     Hash { target: String },
     /// List nodes flagged invalid: changed-on-disk
@@ -761,6 +773,42 @@ fn replica_client(src: &pvfs_core::ReplicaSource) -> Result<Client, PvfsError> {
         _ => Client::connect_signed(std::path::Path::new(&src.target), &pubkey, sign)
             .map_err(remote_err),
     }
+}
+
+/// Fetch missing bytes for `roots` from the source `client`, streaming each
+/// file into the managed sync store (hash-verified on commit). Returns
+/// `(fetched, failures)` — per-file failures never abort the pass.
+fn sync_pull(
+    engine: &mut Engine,
+    client: &mut Client,
+    roots: &[String],
+) -> Result<(u64, Vec<(String, String)>), PvfsError> {
+    let mut fetched = 0u64;
+    let mut failed = Vec::new();
+    for root in roots {
+        for (id, label) in engine.missing_bytes(root)? {
+            let mut sink = engine.sync_begin(&id)?;
+            match client.cat(&id, &mut sink) {
+                Ok(_) => match engine.sync_commit(sink) {
+                    Ok(_) => fetched += 1,
+                    Err(e) => failed.push((label, e.to_string())),
+                },
+                Err(e) => failed.push((label, e.to_string())),
+            }
+        }
+    }
+    Ok((fetched, failed))
+}
+
+/// The replica source a sync pass fetches from, with the F3 explanation when
+/// the forest isn't a replica.
+fn sync_source(data_dir: &std::path::Path) -> Result<pvfs_core::ReplicaSource, PvfsError> {
+    pvfs_core::ReplicaSource::load(data_dir).map_err(|_| PvfsError::BadInput {
+        field: "sync".into(),
+        reason: "sync fetches from a replica's recorded source — this forest has none \
+                 (an owned forest already holds its bytes)"
+            .into(),
+    })
 }
 
 /// Pull the source log from `from` until caught up, ingesting verbatim rows
@@ -2769,6 +2817,78 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Place { target, mode } => {
+            let (engine, id) = engine_and_node(ctx, &target)?;
+            let data_dir = engine.data_dir().to_path_buf();
+            engine.close()?;
+            pvfs_core::sync::set_placement(&data_dir, &id, mode == "sync")?;
+            if json {
+                println!("{{\"node\":\"{id}\",\"mode\":\"{mode}\"}}");
+            } else {
+                println!("{id} placed {mode}");
+            }
+            Ok(())
+        }
+        Cmd::Sync { target } => {
+            let (mut engine, roots) = match target {
+                Some(t) => {
+                    let (e, id) = engine_and_node(ctx, &t)?;
+                    (e, vec![id])
+                }
+                None => {
+                    let dir = ctx?;
+                    let e = Engine::open(&dir)?;
+                    let roots = pvfs_core::sync::load_placement(e.data_dir())?;
+                    if roots.is_empty() {
+                        return Err(PvfsError::BadInput {
+                            field: "sync".into(),
+                            reason: "nothing placed `sync` — run `pvfs place <target> sync` \
+                                     or pass a target"
+                                .into(),
+                        });
+                    }
+                    (e, roots)
+                }
+            };
+            let data_dir = engine.data_dir().to_path_buf();
+            let src = sync_source(&data_dir)?;
+            let mut client = replica_client(&src)?;
+            let (fetched, failed) = sync_pull(&mut engine, &mut client, &roots)?;
+            engine.close()?;
+            if json {
+                let fails: Vec<String> = failed
+                    .iter()
+                    .map(|(l, e)| {
+                        format!(
+                            "{{\"label\":\"{}\",\"error\":\"{}\"}}",
+                            json_escape(l),
+                            json_escape(e)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"fetched\":{fetched},\"failed\":[{}]}}",
+                    fails.join(",")
+                );
+            } else {
+                println!("fetched {fetched} files into the sync store");
+                for (label, e) in &failed {
+                    eprintln!("failed: {label} — {e}");
+                }
+            }
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(PvfsError::BadInput {
+                    field: "sync".into(),
+                    reason: format!(
+                        "{} of {} files failed to fetch (see above)",
+                        failed.len(),
+                        fetched + failed.len() as u64
+                    ),
+                })
+            }
+        }
         Cmd::Replica(cmd) => match cmd {
             ReplicaCmd::Add {
                 dest,
@@ -3293,8 +3413,22 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             dest,
             mode,
             prune,
+            fetch,
         } => {
             let (mut engine, id) = engine_and_node(ctx, &target)?;
+            if fetch {
+                let data_dir = engine.data_dir().to_path_buf();
+                let src = sync_source(&data_dir)?;
+                let mut client = replica_client(&src)?;
+                let (fetched, failed) =
+                    sync_pull(&mut engine, &mut client, std::slice::from_ref(&id))?;
+                for (label, e) in &failed {
+                    eprintln!("fetch failed: {label} — {e}");
+                }
+                if !json && fetched > 0 {
+                    eprintln!("fetched {fetched} files into the sync store");
+                }
+            }
             let spec = pvfs_core::ExportSpec {
                 mode: pvfs_core::ExportMode::parse(&mode)?,
                 prune,

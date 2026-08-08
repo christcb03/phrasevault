@@ -445,6 +445,35 @@ SYNC_JSON="$($PVFS --json replica sync "$REPMOUNT")"
 $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q fresh-content \
   && ok "synced content visible on the replica" || fail "synced content missing"
 
+say "F3: placement & sync — bytes pulled local (doc 17 §6)"
+# an owned forest has no source to sync from
+assert_rc 2 "sync on an owned forest → 2 (no source)" -- \
+  $PVFS --data-dir "$DMOUNT/.pvfs" sync "$DROOT"
+# a file whose bytes "live elsewhere": catalog it, ship it to the replica,
+# then move the bytes and tell only the OWNER — the replica's recorded
+# location now dangles, exactly like a location on another host.
+mkdir -p "$DATA/far-store"
+printf 'far-away-bytes' > "$DATA/far-store/movie.mkv"
+MOVIE="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" movie.mkv --size 14)" created)"
+$PVFS remote --socket "$SOCK" add-location "$MOVIE" "file://$DATA/far-store/movie.mkv" >/dev/null
+$PVFS --json replica sync "$REPMOUNT" >/dev/null
+mv "$DATA/far-store" "$DATA/far-store2"
+$PVFS remote --socket "$SOCK" add-location "$MOVIE" "file://$DATA/far-store2/movie.mkv" >/dev/null
+assert_rc 3 "replica cat before sync → 3 (no readable location)" -- \
+  $PVFS --data-dir "$REPMOUNT/.pvfs" cat "$MOVIE"
+$PVFS --data-dir "$REPMOUNT/.pvfs" place "$DROOT" sync >/dev/null \
+  && ok "placed the root subtree sync"
+SYNCJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" sync)"
+[ "$(jget "$SYNCJ" fetched)" -ge 1 ] && ok "pvfs sync fetched the missing bytes" || fail "sync: $SYNCJ"
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$MOVIE")" = "far-away-bytes" ] \
+  && ok "replica serves the synced bytes (verified)" || fail "synced cat mismatch"
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | grep -q "pvfs-sync" \
+  && ok "stat shows the managed sync-store location"
+# F0 + F3: re-export picks the synced file up like any other
+$PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
+[ "$(cat "$DATA/replica-view/movie.mkv")" = "far-away-bytes" ] \
+  && ok "re-export serves the synced file to non-PVFS apps" || fail "export after sync"
+
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to
 # show per-identity ACL enforcement over the socket — not just the owner's own

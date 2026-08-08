@@ -5,6 +5,23 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Placement & sync (P4 F3, doc 17 §6) — the pointer-vs-sync knob:**
+  `pvfs place <target> sync` marks a subtree "keep its bytes local" (a plain
+  per-instance deployment file — never log events; different replicas
+  legitimately pin different subtrees). `pvfs sync` (and `pvfs export
+  --fetch`) then streams every file that has **no readable local location**
+  from the replica's recorded source over the raw data plane, hashing while
+  the bytes arrive: a hashed node must match its content hash exactly, a
+  lazy node its recorded size — wrong bytes never land, failures report per
+  file. Fetched bytes live in a managed node-id-addressed store
+  (`<data-dir>/synced/…`) and the read path synthesizes a
+  `pvfs-sync:///<id>` location **from the store's existence** — no new
+  projection state, so synced bytes survive rebuilds by construction and
+  the whole mechanism works on read-only replicas. Verify-on-read and
+  quarantine apply to the store like any location; a fresh verified sync
+  lifts a stale quarantine. With F0–F2 this completes the cross-host media
+  scenario: replicate the catalog, place the library `sync`, export, point
+  the media server at it.
 - **Forest replicas (P4 F2, doc 17 §5 — doc 03 Mode A):** `pvfs replica add
   <mount> --instance <name> | --connect <addr> --pin <hex> | --socket <path>`
   pulls a served forest's **full signed log** and builds a local, read-only

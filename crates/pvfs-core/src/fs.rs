@@ -952,13 +952,17 @@ impl Engine {
         Ok(None)
     }
 
-    /// Map pvfs-tmp:///<id> into the spool dir; pass file:// through.
+    /// Map pvfs-tmp:///<id> into the spool dir and pvfs-sync:///<id> into the
+    /// managed sync store (F3); pass file:// through.
     fn resolve_uri(&self, uri: &str) -> Result<String> {
         if let Some(name) = uri.strip_prefix(TMP_URI_PREFIX) {
             if name.contains('/') || name.contains("..") {
                 return Err(bad("uri", "invalid pvfs-tmp URI"));
             }
             return path_to_uri(&self.data_dir.join(SPOOL_DIR).join(name));
+        }
+        if let Some(id) = crate::sync::parse_sync_uri(uri) {
+            return path_to_uri(&crate::sync::sync_store_path(&self.data_dir, id));
         }
         if uri.starts_with("file://") {
             return Ok(uri.to_string());
