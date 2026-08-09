@@ -272,6 +272,7 @@ pvfs replica add ~/media-replica --instance homeserver
 #   replica of <forest-id> (214 events, verified)
 
 pvfs replica sync ~/media-replica                # pull what's new, any time
+pvfs replica follow ~/media-replica              # …or follow live: new events in seconds
 pvfs export <node> /srv/plex-library --mode symlink   # replicas export like any forest
 ```
 
@@ -519,6 +520,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
 | `pvfs replica add <mount> --instance <name>` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest (§7.7). |
+| `pvfs replica follow <mount>` | Follow the source live (long-poll): new events land within seconds; run as a service. |
 | `pvfs place <target> sync\|pointer\|central --to <dir>` · `pvfs sync [target]` | Placement policy · fetch missing bytes, verified (§7.8, §7.10). |
 | `pvfs tier` · `pvfs evict` | Owner: migrate to the central store + retire edge locations · edge: reclaim space safely (§7.10). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
@@ -564,9 +566,9 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
   **built** ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the
   network transport (`pvfsd --listen` + pinned TLS, §7.4), verified read-only replicas
   (`pvfs replica`, §7.7), and pointer-vs-sync placement (`pvfs place` / `pvfs sync`, §7.8) — the
-  cross-host media library works end to end; replicas accept writes by **write-through** (§7.9);
-  locations name their holding instance, reads **fetch on demand** from any pinned holder, and
-  the **tiered-storage mover** migrates bytes to a central store with safe edge eviction (§7.10) —
-  the full ingest-box → NAS pipeline. Still ahead ([doc 17](17-federation-and-sync.md)):
-  tail-subscribe freshness, then region-granular replication, a FUSE mount, swarm transfer, and
-  failover.
+  cross-host media library works end to end; replicas accept writes by **write-through** (§7.9)
+  and **follow their source live** (`pvfs replica follow` — new events in seconds); locations name
+  their holding instance, reads **fetch on demand** from any pinned holder, and the
+  **tiered-storage mover** migrates bytes to a central store with safe edge eviction (§7.10) — the
+  full ingest-box → NAS pipeline. Still ahead ([doc 17](17-federation-and-sync.md) §8):
+  region-granular replication, a FUSE mount, swarm transfer, and failover.

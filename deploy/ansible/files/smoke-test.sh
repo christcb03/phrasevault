@@ -24,6 +24,7 @@ CPID=""
 TPID=""
 EPID=""
 RPID=""
+FPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
@@ -32,6 +33,7 @@ cleanup() {
   [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
   [ -n "$EPID" ] && kill "$EPID" 2>/dev/null
   [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+  [ -n "$FPID" ] && kill "$FPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -573,6 +575,32 @@ EVICTJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" evict)"
 # and the file never stopped being available fleet-wide
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$EDGE" 2>/dev/null)" = "edge-bytes" ] \
   && ok "file still streams after migration + eviction" || fail "post-eviction cat"
+
+say "F5.4: tail-subscribe — the replica follows the source live (doc 17 §7.5)"
+$PVFS replica follow "$REPMOUNT" >/dev/null 2>"$DATA/follow.log" &
+FPID=$!
+sleep 1
+$PVFS remote --socket "$SOCK" mkdir "$DROOT" hot-news >/dev/null
+FOUND=""
+for _ in $(seq 1 80); do
+  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | grep -q hot-news; then
+    FOUND=1; break
+  fi
+  sleep 0.25
+done
+[ -n "$FOUND" ] && ok "follower picked up a new event within seconds" || fail "follow: $(tail -3 "$DATA/follow.log")"
+# a second event proves the loop keeps polling, not a one-shot
+$PVFS remote --socket "$SOCK" mkdir "$DROOT" hot-news-2 >/dev/null
+FOUND2=""
+for _ in $(seq 1 80); do
+  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | grep -q hot-news-2; then
+    FOUND2=1; break
+  fi
+  sleep 0.25
+done
+[ -n "$FOUND2" ] && ok "follower keeps following (second event landed)" || fail "follow second event"
+kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null || true
+FPID=""
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

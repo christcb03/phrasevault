@@ -63,7 +63,7 @@ so region granularity isn't on this scenario's critical path.
 | **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth, `loc add --here` | ✅ built (§7.2) |
 | **F5.2** | **Remote read-through**: per-file candidate fetch (registry-pinned holders, then the source), self-healing `cat`, owner-side pulls | ✅ built (§7.3) |
 | **F5.3** | **The mover**: `place <subtree> central --to <dir>`, `pvfs tier` (verified migrate + retire), `pvfs evict` (safe edge reclaim) | ✅ built (§7.4) |
-| **F5.4** | **Tail-subscribe**: long-poll log shipping for seconds-fresh replicas | ☐ (§7.5) |
+| **F5.4** | **Tail-subscribe**: `LogWait` long-poll + `pvfs replica follow` — seconds-fresh replicas | ✅ built (§7.5) |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later (§8) |
 
 ---
@@ -322,24 +322,33 @@ Placement (doc 17 §6) grows a **central** dimension, owner-side. As built:
   file, consumer read-throughs it, owner migrates + retires, edge evicts, and the file still
   streams from every machine afterwards.
 
-### 7.5 F5.4 — tail-subscribe
+### 7.5 F5.4 — tail-subscribe ✅ BUILT (2026-08-08)
 
-A long-poll variant of `LogRead` so replicas learn of new events in seconds instead of on a sync
-schedule — the difference between "available on the next cron tick" and "available now" for the
-whole fleet. (Resume tokens are just `(seq, chain_hash)`; doc 17 §9's open question 2 decides the
-frame shape.)
+As built (settling §9's open question 2 in favor of **long-poll over the existing framing** — no
+subscribe frame, no server push state):
 
-### 7.6 The end state for the media fleet
+- **`LogWait { from_seq, max, timeout_ms }`**: like `LogRead`, but the daemon holds the request —
+  on the connection's own thread, engine locks taken only for instantaneous tip checks — until the
+  log reaches `from_seq` or the (server-capped, 60 s) timeout lapses; an empty reply means "poll
+  again". Same admin gate; resume position is just the replica's own tip + 1.
+- **`pvfs replica follow <mount>`**: the follower loop — long-poll, chain-verified ingest, fold —
+  with reconnect-on-failure backoff and tolerance for transient lock contention from concurrent
+  local commands. Events authored on the owner appear on a following replica (and through any
+  daemon serving it) **within seconds**, proven live in the smoke suite with two consecutive
+  events. Run it as a service on each consumer box; `replica sync` remains the one-shot.
+
+### 7.6 The end state for the media fleet — ✅ the whole arc is BUILT
 
 ```text
-download box:  replica + Radarr agent → pvfs add / loc add (pvfs-host://download-pin/…)
-NAS (owner):   pvfsd --listen · place <library> central --to /volume1/media · the mover
-plex box(es):  replica + place <library> sync · pvfs sync loop (or F5.2 read-through) · export
+download box:  replica + Radarr agent → pvfs add / loc add --here · pvfs evict on a schedule
+NAS (owner):   pvfsd --listen · place <library> central --to /volume1/media · pvfs tier
+plex box(es):  replica + pvfs replica follow · place <library> sync + pvfs sync · export --prune
 ```
 
-New episode lands → cataloged in seconds (F5.0) → visible fleet-wide (F5.4, or next sync) →
+New episode lands → cataloged in seconds (F5.0/F5.1) → visible fleet-wide in seconds (F5.4) →
 readable everywhere immediately (F5.2) → migrated to the NAS in the background (F5.3) → edge bytes
-evicted, 3 TB stays free — Plex streaming the whole time.
+evicted, 3 TB stays free — Plex streaming the whole time. Every step is covered end-to-end by the
+smoke suite.
 
 ---
 

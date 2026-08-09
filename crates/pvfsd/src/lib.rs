@@ -327,6 +327,11 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Err(msg) => msg,
         },
         ClientMsg::LogRead { from_seq, max } => do_log_read(daemon, principal, from_seq, max),
+        ClientMsg::LogWait {
+            from_seq,
+            max,
+            timeout_ms,
+        } => do_log_wait(daemon, principal, from_seq, max, timeout_ms),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
@@ -366,6 +371,55 @@ fn do_log_read(daemon: &Daemon, principal: &Principal, from_seq: u64, max: u32) 
     if let Err(msg) = check_replication_gate(daemon, principal) {
         return msg;
     }
+    log_rows_msg(daemon, from_seq, max)
+}
+
+/// The longest a `LogWait` may block (the client re-polls after an empty
+/// reply, so a short cap costs nothing but a round trip).
+const LOG_WAIT_CAP_MS: u64 = 60_000;
+/// How often a blocked `LogWait` re-checks the tip. Never holds an engine
+/// lock while sleeping.
+const LOG_WAIT_POLL: Duration = Duration::from_millis(200);
+
+/// Long-poll log shipping (F5.4, doc 17 §7.5): block — on this connection's
+/// own thread, engine locks taken only for the instantaneous tip check —
+/// until the log reaches `from_seq` or the timeout lapses, then answer like
+/// `LogRead` (empty events = nothing yet, poll again).
+fn do_log_wait(
+    daemon: &Daemon,
+    principal: &Principal,
+    from_seq: u64,
+    max: u32,
+    timeout_ms: u64,
+) -> ServerMsg {
+    if let Err(msg) = check_replication_gate(daemon, principal) {
+        return msg;
+    }
+    let deadline = now_ms() + timeout_ms.min(LOG_WAIT_CAP_MS);
+    loop {
+        let tip = {
+            let e = daemon.reader();
+            match e.log_tip() {
+                Ok(t) => t,
+                Err(pve) => return err_from(pve),
+            }
+        }; // lock released before any sleep
+        if tip >= from_seq {
+            return log_rows_msg(daemon, from_seq, max);
+        }
+        if now_ms() >= deadline {
+            return ServerMsg::LogEvents {
+                tip_seq: tip,
+                events: Vec::new(),
+            };
+        }
+        std::thread::sleep(LOG_WAIT_POLL);
+    }
+}
+
+/// Read + convert one batch of rows (shared by `LogRead` / `LogWait`; the
+/// caller has already passed the replication gate).
+fn log_rows_msg(daemon: &Daemon, from_seq: u64, max: u32) -> ServerMsg {
     let e = daemon.reader();
     let cap = (max as usize).clamp(1, LOG_BATCH_ROWS);
     let rows = match e.log_events(from_seq, cap) {

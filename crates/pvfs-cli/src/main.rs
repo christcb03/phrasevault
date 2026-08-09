@@ -592,6 +592,9 @@ enum ReplicaCmd {
     },
     /// Pull new events from the replica's recorded source and re-verify
     Sync { mount: PathBuf },
+    /// Follow the source live (F5.4): long-poll for new events, ingest and
+    /// fold them within seconds, reconnect on failure. Runs until killed.
+    Follow { mount: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -3392,6 +3395,85 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     println!("synced {shipped} events (tip {tip})");
                 }
                 Ok(())
+            }
+            ReplicaCmd::Follow { mount } => {
+                let data_dir = mount.join(".pvfs");
+                let dial = pvfs_core::ReplicaSource::load(&data_dir)?;
+                eprintln!(
+                    "following {} from {} (long-poll; ctrl-c to stop)",
+                    mount.display(),
+                    dial.target
+                );
+                loop {
+                    // (re)connect with backoff; each session long-polls
+                    let mut client = match replica_client(&dial) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("follow: reconnecting ({e})");
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            continue;
+                        }
+                    };
+                    loop {
+                        // transient lock contention (a local command folding
+                        // concurrently) must not kill the follower
+                        let from = match pvfs_core::ReplicaStore::open(&data_dir)
+                            .and_then(|s| s.tip())
+                        {
+                            Ok(t) => t + 1,
+                            Err(e) => {
+                                eprintln!("follow: store busy ({e})");
+                                break; // back off + retry
+                            }
+                        };
+                        let (_tip, events) = match client.log_wait(from, 512, 25_000) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("follow: connection lost ({e})");
+                                break; // reconnect
+                            }
+                        };
+                        if events.is_empty() {
+                            continue; // timeout tick — poll again
+                        }
+                        let rows: Result<Vec<pvfs_core::log_store::EventRow>, PvfsError> = events
+                            .iter()
+                            .map(|w| {
+                                Ok(pvfs_core::log_store::EventRow {
+                                    seq: w.seq,
+                                    kind: w.kind.clone(),
+                                    body: hex::decode(&w.body).map_err(|_| {
+                                        PvfsError::BadInput {
+                                            field: "replica".into(),
+                                            reason: "shipped event body not hex".into(),
+                                        }
+                                    })?,
+                                    chain_hash: hex::decode(&w.chain_hash).map_err(|_| {
+                                        PvfsError::BadInput {
+                                            field: "replica".into(),
+                                            reason: "shipped chain hash not hex".into(),
+                                        }
+                                    })?,
+                                    written_at: w.written_at,
+                                })
+                            })
+                            .collect();
+                        let tip = match pvfs_core::ReplicaStore::open(&data_dir)
+                            .and_then(|mut s| s.append(&rows?))
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("follow: ingest failed ({e})");
+                                break; // back off; the next pass re-fetches from the real tip
+                            }
+                        };
+                        // fold now (best-effort), so local reads and any
+                        // serving daemon see it; the next open folds anyway
+                        let _ = Engine::open(&data_dir).and_then(|e| e.close());
+                        eprintln!("follow: caught up to seq {tip}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
             }
         },
         Cmd::Instance(cmd) => {

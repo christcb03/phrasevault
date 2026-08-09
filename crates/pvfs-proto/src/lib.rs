@@ -168,6 +168,15 @@ pub enum ClientMsg {
     /// log reveals the whole forest's history, so replication is an
     /// owner/admin capability (doc 17 §5), not a member read.
     LogRead { from_seq: u64, max: u32 },
+    /// Long-poll `LogRead` (F5.4, doc 17 §7.5): reply immediately when the
+    /// tip has reached `from_seq`, else block up to `timeout_ms` (server-
+    /// capped) waiting for new events; an empty `LogEvents` means "still
+    /// nothing — poll again". Same gate as `LogRead`.
+    LogWait {
+        from_seq: u64,
+        max: u32,
+        timeout_ms: u64,
+    },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },
     /// Phase 2: return one signature (hex) per preimage, in order.

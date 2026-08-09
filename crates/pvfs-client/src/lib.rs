@@ -256,6 +256,25 @@ impl Client {
         }
     }
 
+    /// [`log_read`](Self::log_read) that long-polls (F5.4): the server holds
+    /// the request up to `timeout_ms` (server-capped) waiting for the log to
+    /// reach `from_seq`; empty events = nothing yet, call again.
+    pub fn log_wait(
+        &mut self,
+        from_seq: u64,
+        max: u32,
+        timeout_ms: u64,
+    ) -> Result<(u64, Vec<LogEventWire>)> {
+        match self.request(ClientMsg::LogWait {
+            from_seq,
+            max,
+            timeout_ms,
+        })? {
+            ServerMsg::LogEvents { tip_seq, events } => Ok((tip_seq, events)),
+            other => Err(unexpected("LogEvents", &other)),
+        }
+    }
+
     /// Stream a file node's bytes to `out` using the raw binary data plane
     /// (doc 07 §6, PROTO_VERSION 2). Returns the total number of bytes written.
     pub fn cat(&mut self, node: &str, out: &mut dyn std::io::Write) -> Result<u64> {

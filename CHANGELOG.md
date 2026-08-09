@@ -5,6 +5,14 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Tail-subscribe (P4 F5.4, doc 17 §7.5):** the `LogWait` long-poll — the
+  daemon holds a gated log read (up to a server-capped 60 s) until new
+  events arrive — and **`pvfs replica follow <mount>`**, the follower loop
+  that long-polls, chain-verifies, ingests, and folds, with reconnect
+  backoff and tolerance for concurrent local commands. Events authored on
+  the owner appear on following replicas (and through daemons serving
+  them) within seconds. This completes the doc 17 §7 arc: the ingest-box →
+  central-store pipeline is built end to end.
 - **The mover — tiered storage (P4 F5.3, doc 17 §7.4):** `pvfs place
   <subtree> central --to <dir>` (owner-side) declares "every file here must
   hold a verified copy in this store"; **`pvfs tier`** enforces it — bytes
