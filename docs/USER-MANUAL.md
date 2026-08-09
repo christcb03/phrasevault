@@ -339,10 +339,40 @@ catalog each finished file into the owner's forest the moment it lands (`pvfs ad
 `pvfs loc add --here <path>`), and every other replica picks it up on its next sync. `--here`
 records an **instance-qualified location** — `pvfs-host://<the-box's-pin>/<path>` — so the catalog
 knows *which machine* holds the bytes (the box needs a transport pin: run `pvfsd --listen` once).
-Other machines see such a location as unavailable-locally, and `pvfs sync` fetches the bytes
-through the replica's source. The rest of the story — direct read-through from any pinned
-instance, and automatic migration to the central store with space reclaimed on the ingest box —
-is specced as F5.2/F5.3 in [doc 17 §7](17-federation-and-sync.md).
+Any machine that registered the box (`pvfs instance add`) fetches from it on demand.
+
+### 7.10 Tiered storage: migrate to a central store, reclaim the edge
+
+The ingest box shouldn't hold the bytes forever. On the **owner**, declare the central store and
+run the mover; on the **edge**, reclaim space once the catalog says it's safe:
+
+```bash
+# owner (e.g. the NAS):
+pvfs place <library-node> central --to /volume1/media-store
+pvfs tier          # migrate: verified copies land in the store, get logged,
+                   # and only then are the edge's locations retired
+
+# ingest box:
+pvfs replica sync ~/media    # learn the retirements
+pvfs evict                   # delete local bytes — only ever when the catalog
+                             # records another live location; reports bytes freed
+```
+
+`pvfs tier` treats files already on the owner's own disks as satisfied in place; everything else
+is fetched (locally or by read-through), streamed through the verified read path into a
+node-id-addressed store, and recorded in the log as a real location. Retirement strictly follows a
+live central copy — a failed migration never retires anything — so consumers keep streaming
+throughout: before migration they read through to the ingest box, after it to the central copy.
+The store is mover-managed (don't bind or scan it); browse the library through `pvfs export`.
+
+The complete media pipeline, all four machines:
+
+```text
+ingest box:  radarr/sonarr → pvfs add + loc add --here   (cataloged in seconds)
+everyone:    replica sync / read-through                  (available immediately)
+owner NAS:   pvfs tier                                    (bytes migrate home)
+ingest box:  pvfs replica sync && pvfs evict              (3 TB stays free)
+```
 
 ---
 
@@ -489,7 +519,8 @@ run `pvfs member replace <file>`).
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
 | `pvfs replica add <mount> --instance <name>` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest (§7.7). |
-| `pvfs place <target> sync\|pointer` · `pvfs sync [target]` | Mark a subtree "keep bytes local" · fetch its missing bytes, verified (§7.8). |
+| `pvfs place <target> sync\|pointer\|central --to <dir>` · `pvfs sync [target]` | Placement policy · fetch missing bytes, verified (§7.8, §7.10). |
+| `pvfs tier` · `pvfs evict` | Owner: migrate to the central store + retire edge locations · edge: reclaim space safely (§7.10). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
@@ -533,7 +564,9 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
   **built** ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the
   network transport (`pvfsd --listen` + pinned TLS, §7.4), verified read-only replicas
   (`pvfs replica`, §7.7), and pointer-vs-sync placement (`pvfs place` / `pvfs sync`, §7.8) — the
-  cross-host media library works end to end, and replicas accept writes by **write-through** to
-  their source (§7.9). Still ahead: instance-qualified locations, read-through fetching, and the
-  tiered-storage mover ([doc 17 §7](17-federation-and-sync.md)); then region-granular replication,
-  a FUSE mount for streaming un-synced files, swarm transfer, and failover.
+  cross-host media library works end to end; replicas accept writes by **write-through** (§7.9);
+  locations name their holding instance, reads **fetch on demand** from any pinned holder, and
+  the **tiered-storage mover** migrates bytes to a central store with safe edge eviction (§7.10) —
+  the full ingest-box → NAS pipeline. Still ahead ([doc 17](17-federation-and-sync.md)):
+  tail-subscribe freshness, then region-granular replication, a FUSE mount, swarm transfer, and
+  failover.

@@ -62,7 +62,7 @@ so region granularity isn't on this scenario's critical path.
 | **F5.0** | **Write-through replicas**: mutations on a replica route to its source, member-signed; read-your-writes tail pull | ✅ built (§7.1) |
 | **F5.1** | **Instance-qualified locations**: `pvfs-host://<pin>/<path>` — cross-host location truth, `loc add --here` | ✅ built (§7.2) |
 | **F5.2** | **Remote read-through**: per-file candidate fetch (registry-pinned holders, then the source), self-healing `cat`, owner-side pulls | ✅ built (§7.3) |
-| **F5.3** | **The mover**: `place <subtree> central` + owner-side migration + edge eviction — the tiering flow | ☐ (§7.4) |
+| **F5.3** | **The mover**: `place <subtree> central --to <dir>`, `pvfs tier` (verified migrate + retire), `pvfs evict` (safe edge reclaim) | ✅ built (§7.4) |
 | **F5.4** | **Tail-subscribe**: long-poll log shipping for seconds-fresh replicas | ☐ (§7.5) |
 | **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later (§8) |
 
@@ -295,21 +295,32 @@ Doc 03 §2.3's resolution order, step 3, implemented. As built:
   of *other* writers' changes only at `replica sync` — the standing gap F5.4's tail-subscribe
   closes.
 
-### 7.4 F5.3 — the mover (tiering policy)
+### 7.4 F5.3 — the mover (tiering policy) ✅ BUILT (2026-08-08)
 
-Placement (doc 17 §6) grows a **canonical** dimension, owner-side:
+Placement (doc 17 §6) grows a **central** dimension, owner-side. As built:
 
-- `pvfs place <subtree> central --to <bound-folder>` (on the owner): every file under the subtree
-  must hold a verified copy in that owner-bound storage.
-- **The mover** (a `serve` job + `pvfs tier` one-shot): for each file whose only live locations are
-  edge instances, fetch the bytes (F5.2 machinery, verified), land them in the bound folder,
-  append `FileLocationAdded` (owner log — catalog-visible redundancy, doc 03 Mode B's crosslink
-  without needing remote append: the owner appends to its own log), then **retire the edge
-  location** (`FileLocationRemoved`).
-- **Eviction:** the edge host's agent (its `serve` loop) watches its own `pvfs-host://` locations;
-  when one is removed from the catalog, it deletes the local bytes — space freed, and never before
-  the canonical copy is live. Consumers never notice: resolution finds the NAS copy (or their own
-  synced copy) throughout.
+- **`pvfs place <subtree> central --to <dir>`** (owner): every file under the subtree must hold a
+  verified copy in that directory. One mode per subtree; `pointer` clears it. The store is
+  **mover-managed, node-id-addressed** (`<dir>/<id[..2]>/<id>`) — deliberately *not* a scan-bound
+  folder (a scan would re-index the copies as new nodes); humans browse via `pvfs export`, which
+  gives the tree its names.
+- **`pvfs tier`** (owner one-shot; `serve` integration later): per file, a subtree is
+  central-satisfied by any **logged** location that resolves locally (a live `file://` path — bytes
+  already on the owner's disks never move — or an own-pin `pvfs-host://`; synthesized sync-store
+  entries never count, they aren't catalog truth). Otherwise the mover reaches the bytes (locally
+  or by F5.2 read-through), lands a **verified copy** (streamed through `cat`, hash-checked,
+  tmp+rename) in the store, and appends `FileLocationAdded` — doc 03 Mode B's catalog-visible
+  redundancy without remote append, since the owner appends to its own log. Only **after** a
+  central copy is live does it retire foreign-pin locations (`FileLocationRemoved`); a failed
+  migration never retires anything.
+- **`pvfs evict`** (edge one-shot): acts on the catalog's *retired* rows bearing this instance's
+  own pin (`Engine::retired_own_host_locations` — removed, not re-added). Belt-and-braces: a file
+  is deleted only when the catalog still records **another live location**, the path is a regular
+  file, and the retirement has actually been synced (a stale replica evicts less, never wrongly —
+  the log's ordering guarantees the central add folded before the removal). Reports bytes freed.
+- **Consumers never notice:** the smoke suite proves the invariant end-to-end — edge catalogs a
+  file, consumer read-throughs it, owner migrates + retires, edge evicts, and the file still
+  streams from every machine afterwards.
 
 ### 7.5 F5.4 — tail-subscribe
 

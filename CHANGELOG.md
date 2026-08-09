@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The mover — tiered storage (P4 F5.3, doc 17 §7.4):** `pvfs place
+  <subtree> central --to <dir>` (owner-side) declares "every file here must
+  hold a verified copy in this store"; **`pvfs tier`** enforces it — bytes
+  already on the owner's disks satisfy it in place, everything else is
+  reached (locally or by read-through), streamed through the verified read
+  path into a node-id-addressed store, and logged as a new location; only
+  THEN are foreign-instance locations retired. **`pvfs evict`** on the edge
+  acts on the catalog's retired rows for its own pin and deletes local
+  bytes only when another live location is recorded — a stale replica
+  evicts less, never wrongly. End-to-end: an ingest box catalogs a file,
+  consumers stream it, the owner migrates it home, the edge reclaims its
+  space, and the file never stops being available.
 - **Remote read-through (P4 F5.2, doc 17 §7.3):** fetching now resolves
   **per file**: candidates are every `pvfs-host://` location whose pin the
   instance registry knows (the holder), then the replica's recorded source

@@ -1220,6 +1220,41 @@ impl Engine {
         Ok(out)
     }
 
+    /// Catalog locations bearing THIS instance's pin that have been retired
+    /// (`FileLocationRemoved`) and not re-added — the mover's eviction signal
+    /// (F5.3, doc 17 §7.4): `(file_id, uri, local_path)` rows whose bytes
+    /// this host may now delete, once it confirms another live location.
+    /// Empty when this instance has no transport pin.
+    pub fn retired_own_host_locations(&self) -> Result<Vec<(NodeId, String, PathBuf)>> {
+        let Some(pin) = crate::storage::host_pin(&self.data_dir) else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("{}{pin}/", crate::storage::HOST_URI_PREFIX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT file_id, uri FROM file_locations l1
+                 WHERE uri LIKE ?1 || '%' AND removed_at IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM file_locations l2
+                                   WHERE l2.file_id = l1.file_id AND l2.uri = l1.uri
+                                     AND l2.removed_at IS NULL)",
+            )
+            .map_err(map_db("retired locations"))?;
+        let rows = stmt
+            .query_map(params![prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_db("retired locations"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (file_id, uri) = row.map_err(map_db("retired locations"))?;
+            if let Some((_, path)) = crate::storage::parse_host_uri(&uri) {
+                out.push((file_id, uri.clone(), PathBuf::from(path)));
+            }
+        }
+        Ok(out)
+    }
+
     // ---- reads -------------------------------------------------------------------
 
     pub fn get_node(&self, id: &NodeId) -> Result<Option<Node>> {

@@ -204,15 +204,27 @@ enum Cmd {
         #[arg(long)]
         fetch: bool,
     },
-    /// Set a subtree's placement: `sync` keeps its bytes local (doc 17 §6)
+    /// Set a subtree's placement: `sync` keeps bytes local (doc 17 §6);
+    /// `central --to <dir>` makes the mover keep verified copies there
+    /// (owner-side, doc 17 §7.4)
     Place {
         target: String,
-        #[arg(value_parser = ["pointer", "sync"])]
+        #[arg(value_parser = ["pointer", "sync", "central"])]
         mode: String,
+        /// central-store directory (with `central`)
+        #[arg(long, required_if_eq("mode", "central"))]
+        to: Option<PathBuf>,
     },
-    /// Fetch missing bytes from the replica's source — for one subtree, or
-    /// every subtree placed `sync`
+    /// Fetch missing bytes from wherever they're reachable — for one
+    /// subtree, or every subtree placed `sync`
     Sync { target: Option<String> },
+    /// Owner-side mover (doc 17 §7.4): ensure central copies for
+    /// `central`-placed subtrees, then retire edge locations
+    Tier,
+    /// Edge-side space reclaim (doc 17 §7.4): delete local bytes whose
+    /// catalog location was retired by the mover — only ever with another
+    /// live location recorded
+    Evict,
     /// Fill a lazy content hash (creates a successor node — prints new id)
     Hash { target: String },
     /// List nodes flagged invalid: changed-on-disk
@@ -874,6 +886,20 @@ impl Fetcher {
         }
         Err(last_err)
     }
+}
+
+/// A logged location that resolves on THIS host (central-satisfying, F5.3):
+/// a `file://` path that exists, or a `pvfs-host://` under our own pin whose
+/// path exists. Synthesized sync-store entries never count — they aren't
+/// catalog truth.
+fn logged_local_location(uri: &str, own_pin: &Option<String>) -> bool {
+    if let Ok(p) = pvfs_core::storage::uri_to_path(uri) {
+        return p.is_file();
+    }
+    if let Some((pin, path)) = pvfs_core::storage::parse_host_uri(uri) {
+        return own_pin.as_deref() == Some(pin) && std::path::Path::new(path).is_file();
+    }
+    false
 }
 
 /// Fetch missing bytes under `roots`, streaming each file into the managed
@@ -3039,15 +3065,192 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Place { target, mode } => {
+        Cmd::Place { target, mode, to } => {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
-            pvfs_core::sync::set_placement(&data_dir, &id, mode == "sync")?;
+            if mode == "central" {
+                let dest = to.expect("clap required_if_eq");
+                std::fs::create_dir_all(&dest)
+                    .map_err(|e| PvfsError::io("create central store", e))?;
+                let dest = std::fs::canonicalize(&dest)
+                    .map_err(|e| PvfsError::io("resolve central store", e))?;
+                pvfs_core::sync::set_central(&data_dir, &id, &dest)?;
+            } else {
+                pvfs_core::sync::set_placement(&data_dir, &id, mode == "sync")?;
+            }
             if json {
                 println!("{{\"node\":\"{id}\",\"mode\":\"{mode}\"}}");
             } else {
                 println!("{id} placed {mode}");
+            }
+            Ok(())
+        }
+        Cmd::Tier => {
+            let mut engine = Engine::open(&ctx?)?;
+            if engine.is_replica() {
+                return Err(PvfsError::BadInput {
+                    field: "tier".into(),
+                    reason: "the mover runs on the owner — edges reclaim space with `pvfs evict`"
+                        .into(),
+                });
+            }
+            let data_dir = engine.data_dir().to_path_buf();
+            let central = pvfs_core::sync::load_central(&data_dir)?;
+            if central.is_empty() {
+                return Err(PvfsError::BadInput {
+                    field: "tier".into(),
+                    reason: "nothing placed central — run `pvfs place <target> central --to <dir>`"
+                        .into(),
+                });
+            }
+            let own_pin = pvfs_core::storage::host_pin(&data_dir);
+            let mut fetcher = Fetcher::new(&data_dir);
+            let (mut migrated, mut satisfied, mut retired) = (0u64, 0u64, 0u64);
+            let mut failed: Vec<(String, String)> = Vec::new();
+            for (root, dest) in central {
+                for entry in engine.walk(&root)?.entries {
+                    if entry.node.node_type != pvfs_core::TYPE_FILE {
+                        continue;
+                    }
+                    let id = entry.node.id;
+                    let label = entry.node.label;
+                    let has_central = engine
+                        .locations(&id)?
+                        .iter()
+                        .any(|u| logged_local_location(u, &own_pin));
+                    if has_central {
+                        satisfied += 1;
+                    } else {
+                        // reach the bytes (locally or via read-through)…
+                        if engine.readable_path(&id)?.is_none() {
+                            if let Err(e) = fetcher.fetch(&mut engine, &id) {
+                                failed.push((label, e));
+                                continue; // never retire without a central copy
+                            }
+                        }
+                        // …then land a verified copy in the central store
+                        let cpath = dest.join(&id[..2]).join(&id);
+                        if let Err(e) = (|| -> Result<(), PvfsError> {
+                            if let Some(dir) = cpath.parent() {
+                                std::fs::create_dir_all(dir)
+                                    .map_err(|e| PvfsError::io("create central dir", e))?;
+                            }
+                            let tmp = cpath.with_file_name(format!(".{id}.tmp"));
+                            let mut f = std::fs::File::create(&tmp)
+                                .map_err(|e| PvfsError::io("create central copy", e))?;
+                            if let Err(e) = engine.cat(&id, None, &mut f) {
+                                let _ = std::fs::remove_file(&tmp);
+                                return Err(e);
+                            }
+                            std::fs::rename(&tmp, &cpath)
+                                .map_err(|e| PvfsError::io("place central copy", e))?;
+                            engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)
+                        })() {
+                            failed.push((label, e.to_string()));
+                            continue;
+                        }
+                        migrated += 1;
+                    }
+                    // central copy live → retire foreign-instance locations
+                    for u in engine.locations(&id)? {
+                        if let Some((pin, _)) = pvfs_core::storage::parse_host_uri(&u) {
+                            if own_pin.as_deref() != Some(pin) {
+                                match engine.remove_location(&id, &u) {
+                                    Ok(()) => retired += 1,
+                                    Err(e) => failed.push((id.clone(), e.to_string())),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            engine.close()?;
+            if json {
+                let fails: Vec<String> = failed
+                    .iter()
+                    .map(|(l, e)| {
+                        format!(
+                            "{{\"label\":\"{}\",\"error\":\"{}\"}}",
+                            json_escape(l),
+                            json_escape(e)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"migrated\":{migrated},\"satisfied\":{satisfied},\"retired\":{retired},\"failed\":[{}]}}",
+                    fails.join(",")
+                );
+            } else {
+                println!(
+                    "migrated {migrated} into the central store ({satisfied} already central, {retired} edge locations retired)"
+                );
+                for (label, e) in &failed {
+                    eprintln!("failed: {label} — {e}");
+                }
+            }
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                Err(PvfsError::BadInput {
+                    field: "tier".into(),
+                    reason: format!("{} files failed to migrate (see above)", failed.len()),
+                })
+            }
+        }
+        Cmd::Evict => {
+            let engine = Engine::open(&ctx?)?;
+            let rows = engine.retired_own_host_locations()?;
+            let (mut evicted, mut freed) = (0u64, 0u64);
+            let mut skipped: Vec<(String, String)> = Vec::new();
+            for (id, uri, path) in rows {
+                // belt-and-braces: never delete unless the catalog records
+                // another LIVE location (synthesized sync-store entries don't
+                // count — they aren't catalog truth)
+                let live_elsewhere = engine
+                    .locations(&id)?
+                    .iter()
+                    .any(|u| !u.starts_with(pvfs_core::sync::SYNC_URI_PREFIX));
+                if !live_elsewhere {
+                    skipped.push((uri, "no other live location recorded".into()));
+                    continue;
+                }
+                match std::fs::symlink_metadata(&path) {
+                    Ok(md) if md.file_type().is_file() => {
+                        let size = md.len();
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {
+                                evicted += 1;
+                                freed += size;
+                            }
+                            Err(e) => skipped.push((uri, e.to_string())),
+                        }
+                    }
+                    Ok(_) => skipped.push((uri, "not a regular file".into())),
+                    Err(_) => {} // already gone — nothing to reclaim
+                }
+            }
+            engine.close()?;
+            if json {
+                let skips: Vec<String> = skipped
+                    .iter()
+                    .map(|(u, e)| {
+                        format!(
+                            "{{\"uri\":\"{}\",\"reason\":\"{}\"}}",
+                            json_escape(u),
+                            json_escape(e)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"evicted\":{evicted},\"freed_bytes\":{freed},\"skipped\":[{}]}}",
+                    skips.join(",")
+                );
+            } else {
+                println!("evicted {evicted} files ({freed} bytes reclaimed)");
+                for (u, e) in &skipped {
+                    eprintln!("skipped: {u} — {e}");
+                }
             }
             Ok(())
         }

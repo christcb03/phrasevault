@@ -548,6 +548,32 @@ $PVFS instance rm edgebox >/dev/null
 kill -TERM "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null || true
 RPID=""
 
+say "F5.3: the mover — central migration + edge eviction (doc 17 §7.4)"
+$PVFS --data-dir "$DMOUNT/.pvfs" place "$DROOT" central --to "$DATA/central-store" >/dev/null \
+  && ok "owner placed the library central"
+TIERJ="$($PVFS --json --data-dir "$DMOUNT/.pvfs" tier)"
+[ "$(jget "$TIERJ" migrated)" -ge 1 ] && ok "mover migrated the edge file" || fail "tier: $TIERJ"
+[ "$(jget "$TIERJ" retired)" -ge 1 ] && ok "mover retired the edge location" || fail "tier retired: $TIERJ"
+EDGE2="$(printf '%s' "$EDGE" | cut -c1-2)"
+[ "$(cat "$DATA/central-store/$EDGE2/$EDGE")" = "edge-bytes" ] \
+  && ok "verified copy sits in the central store" || fail "central copy missing"
+$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | grep -q "file://$DATA/central-store" \
+  && ok "central location recorded in the log"
+if $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | grep -q "pvfs-host://$REPPIN"; then
+  fail "edge location still live in the catalog"
+else
+  ok "edge location gone from the live catalog"
+fi
+# the edge box syncs the tail, then reclaims its space — never before the
+# catalog shows another live location
+$PVFS --json replica sync "$REPMOUNT" >/dev/null
+EVICTJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" evict)"
+[ "$(jget "$EVICTJ" evicted)" -ge 1 ] && ok "edge box evicted the migrated bytes" || fail "evict: $EVICTJ"
+[ ! -f "$DATA/edge.bin" ] && ok "edge bytes deleted — space reclaimed" || fail "edge bytes remain"
+# and the file never stopped being available fleet-wide
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$EDGE" 2>/dev/null)" = "edge-bytes" ] \
+  && ok "file still streams after migration + eviction" || fail "post-eviction cat"
+
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to
 # show per-identity ACL enforcement over the socket — not just the owner's own

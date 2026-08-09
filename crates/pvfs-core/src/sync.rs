@@ -51,41 +51,83 @@ pub fn placement_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PLACEMENT_FILE)
 }
 
-/// Node ids of subtrees placed `sync` (order preserved, no duplicates).
-pub fn load_placement(data_dir: &Path) -> Result<Vec<NodeId>> {
+/// Per-instance placement state: `sync` subtrees keep their bytes local;
+/// `central` subtrees (owner-side, F5.3) must hold a verified copy in the
+/// named directory — the mover enforces it. A subtree has one mode; pointer
+/// entries are simply absent.
+#[derive(Debug, Default)]
+pub struct Placement {
+    pub sync: Vec<NodeId>,
+    pub central: Vec<(NodeId, PathBuf)>,
+}
+
+pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
     let text = match std::fs::read_to_string(placement_path(data_dir)) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Placement::default()),
         Err(e) => return Err(PvfsError::io("read placement", e)),
     };
     let mut lines = text.lines();
     if lines.next() != Some(PLACEMENT_HEADER) {
         return Err(bad("placement", "unrecognized placement file"));
     }
-    let mut out = Vec::new();
+    let mut out = Placement::default();
     for line in lines.filter(|l| !l.trim().is_empty()) {
-        match line.strip_prefix("sync ") {
-            Some(id) => out.push(id.to_string()),
-            None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+        if let Some(id) = line.strip_prefix("sync ") {
+            out.sync.push(id.to_string());
+        } else if let Some(rest) = line.strip_prefix("central ") {
+            match rest.split_once(' ') {
+                Some((id, dir)) => out.central.push((id.to_string(), PathBuf::from(dir))),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
+        } else {
+            return Err(bad("placement", &format!("corrupt placement line: {line:?}")));
         }
     }
     Ok(out)
 }
 
-/// Place `id` as `sync` (true) or back to `pointer` (false; the default —
-/// pointer entries are simply absent).
-pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
-    let mut roots = load_placement(data_dir)?;
-    roots.retain(|r| r != id);
-    if sync {
-        roots.push(id.clone());
-    }
+/// Node ids of subtrees placed `sync` (order preserved, no duplicates).
+pub fn load_placement(data_dir: &Path) -> Result<Vec<NodeId>> {
+    Ok(load_placement_full(data_dir)?.sync)
+}
+
+/// Subtrees placed `central` with their store directories (owner-side).
+pub fn load_central(data_dir: &Path) -> Result<Vec<(NodeId, PathBuf)>> {
+    Ok(load_placement_full(data_dir)?.central)
+}
+
+fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     let mut text = String::from(PLACEMENT_HEADER);
     text.push('\n');
-    for r in &roots {
+    for r in &p.sync {
         text.push_str(&format!("sync {r}\n"));
     }
+    for (r, d) in &p.central {
+        text.push_str(&format!("central {r} {}\n", d.display()));
+    }
     crate::storage::atomic_overwrite(&placement_path(data_dir), text.as_bytes())
+}
+
+/// Place `id` as `sync` (true) or back to `pointer` (false). Either way any
+/// `central` entry for the subtree is cleared — one mode per subtree.
+pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.sync.retain(|r| r != id);
+    p.central.retain(|(r, _)| r != id);
+    if sync {
+        p.sync.push(id.clone());
+    }
+    save_placement(data_dir, &p)
+}
+
+/// Place `id` as `central` with its store directory (owner-side, F5.3).
+pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.sync.retain(|r| r != id);
+    p.central.retain(|(r, _)| r != id);
+    p.central.push((id.clone(), dest.to_path_buf()));
+    save_placement(data_dir, &p)
 }
 
 // ---- the sync sink ----------------------------------------------------------
