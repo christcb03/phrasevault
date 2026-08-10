@@ -37,25 +37,30 @@ owner's single signed chain is still the only log (doc 13 §A).
   three-instance choreography of the entire pipeline (ingest → read-through → tier → evict →
   still-streams), all over real sockets and real TLS on one machine
 
-**NOT yet done — the local checklist:**
-1. **The real Ansible pipeline** (release build, release-binary smoke, install, and the **systemd
-   daemon stage** — the container had no systemd):
-   ```sh
-   git fetch origin claude/phrasevault-continuation-fjdohv
-   git checkout claude/phrasevault-continuation-fjdohv
-   cd deploy/ansible && ansible-playbook -i inventory.ini pipeline.yml
-   # artifacts land in deploy/ansible/artifacts/<host>/
-   ```
-2. **A genuine two-machine test.** Everything above simulated the fleet on one host (all
-   `file://` paths incidentally resolve everywhere there). USER-MANUAL §7.7–§7.10 top to bottom
-   across two real machines is the honest test — especially: `replica add --instance` over the
-   LAN, `loc add --here` on a box that is *not* the owner, read-through across machines, and
-   `tier`/`evict` actually freeing space on the edge.
-3. **Scale spot-check.** Sync/tier/cat stream in 1 MiB chunks and were tested on toy files; run
-   one real multi-GB media file through sync → tier → evict → stream.
-4. **Container-only test caveat** (expected, not a bug): `p15_mounts` and `init_via_companion`
-   fail *when run as root* (the raw-root init refusal working as designed); both verified passing
-   as a normal user. Presubuntu runs as a user — unaffected.
+**Done locally (2026-08-10) — the checklist completed:**
+1. **The real Ansible pipeline**, on presubuntu *and* a fresh second host (pvos-test,
+   192.168.0.138): release build, 194 cargo tests, smoke **268 passed / 0 failed** (after the
+   silent-miss repair, `1536edc`), install + the full systemd daemon stage green on both,
+   `clippy -D warnings` clean. Artifacts in `deploy/ansible/artifacts/<host>/`.
+2. **The genuine two-machine test** — `deploy/fleet-test.sh` (presubuntu owner/NAS,
+   pvos-test edge/ingest): **40/40**. Replicate over the LAN, the honest cross-machine
+   UNAVAILABLE stat, read-through in both directions, write-through ingest with
+   `loc add --here`, tier to central, evict reclaiming the edge, still-streams throughout.
+3. **Scale spot-check**: one 3 GiB file — cataloged in 10 s, `tier` pulled it over the LAN in
+   83 s (~37 MB/s, verified), `evict` freed all 3 GiB, streamed back bit-perfect at ~38 MB/s.
+
+**Findings from the two-machine run (for docs / the next arc):**
+- Write-through authorship needs `device authorize-member` on the owner — an ACL grant alone
+  is refused at ingest (`UnknownAuthor`; default-deny working as designed). USER-MANUAL §7.9
+  should say so explicitly.
+- **Outbound fetches authenticate as the box's client identity, never the forest device
+  key** — including the owner's own mover: on a private forest (no `public r`), `pvfs tier`
+  cannot pull from an edge box until the owner's *client* identity is authorized + granted
+  read. Single-host smoke never sees this (it grants `public r` early). Decide: document the
+  grants as the model, or teach owner engines to dial with the device key.
+- Operational: pvosd holds port 7420 on presubuntu; the fleet test uses 7430/7431.
+- Container-only caveat (expected, not a bug): `p15_mounts` and `init_via_companion` fail
+  *as root* (raw-root init refusal working as designed); both pass as a normal user.
 
 ## 3. Release housekeeping (after validation)
 
