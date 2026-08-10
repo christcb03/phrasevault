@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-08-08.
+Status: **Living document** — update as phases land. Last updated 2026-08-10.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–16; this is the index + the honest "what's not done yet."
@@ -154,7 +154,11 @@ takeover/restart e2e, the read-pool cross-connection visibility test, and the
 new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 `v1.2` tag pending (Chris tags manually).
 
-### 3.3 — Unreleased (the post-1.2 line, as of 2026-08-08)
+### 3.3 — Unreleased (the post-1.2 line, as of 2026-08-10)
+
+> **Validation state:** the whole P4 arc below is container-validated (262-check smoke, full test
+> suite, clippy) but **awaits the real Ansible pipeline run + a two-machine fleet test** — see
+> [HANDOFF.md](HANDOFF.md) for the exact checklist, release-packaging decisions, and next work.
 
 | Item | State |
 |------|--------|
