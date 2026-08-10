@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use nix::sys::signal::{signal, SigHandler, Signal};
 use pvfs_client::fetch::{sync_pull, Fetcher};
 use pvfs_client::Client;
 use pvfs_core::{
@@ -3764,6 +3765,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     reconcile_secs,
                     debounce_ms,
                 } => {
+                    // Long-running from here on: re-ignore SIGPIPE (main gave
+                    // it the default disposition for the one-shot filter
+                    // commands) so a vanished peer surfaces as an EPIPE
+                    // io::Error, not process death. Safety: SigIgn installs
+                    // no handler code.
+                    unsafe {
+                        let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
+                    }
                     let never = std::sync::atomic::AtomicBool::new(false);
                     pvfs_client::watch::run(
                         &data_dir,
@@ -4067,6 +4076,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 dir.display(),
                 dir.display()
             );
+            // Long-running: re-ignore SIGPIPE for the mount's lifetime
+            // (same contract as `serve watch` — see main()).
+            unsafe {
+                let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
+            }
             pvfs_fuse::mount(&data_dir, &id, &dir)?;
             Ok(())
         }
@@ -5819,6 +5833,17 @@ fn emit_id(json: bool, key: &str, id: &str) {
 }
 
 fn main() -> ExitCode {
+    // Unix filter contract: when the pipe reader exits early (`pvfs ls | head`,
+    // `pvfs stat X | grep -q Y`), die quietly from SIGPIPE (shell rc 141)
+    // instead of panicking println! with "failed printing to stdout: Broken
+    // pipe". Rust ignores SIGPIPE at startup; restore the default before
+    // anything — even `--help` — writes. The long-running arms (`serve watch`,
+    // `mount`) re-ignore it: there a vanished peer must be an EPIPE
+    // io::Error, not process death.
+    // Safety: SigDfl installs no handler code.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
     let cli = Cli::parse();
     let json = cli.json;
     match run(cli) {

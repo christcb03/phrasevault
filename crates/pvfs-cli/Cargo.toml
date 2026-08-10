@@ -13,6 +13,10 @@ path = "src/main.rs"
 pvfs-core = { path = "../pvfs-core" }
 pvfs-client = { path = "../pvfs-client" }
 pvfs-companion = { path = "../pvfs-companion", default-features = false }
+# `signal` to give SIGPIPE its default disposition in main — a pipeline filter
+# dies quietly when its reader exits (`pvfs ls | head`); feature unification
+# adds it on top of the workspace's user/fs features.
+nix = { workspace = true, features = ["signal"] }
 clap.workspace = true
 hex.workspace = true
 serde_json.workspace = true

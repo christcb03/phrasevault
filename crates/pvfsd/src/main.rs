@@ -85,6 +85,11 @@ fn notify_systemd_ready() {
 }
 
 fn main() -> std::process::ExitCode {
+    // SIGPIPE stays ignored (Rust's startup default) on purpose: pvfsd writes
+    // only to client sockets and stderr, and a client vanishing mid-write must
+    // surface as EPIPE on that one connection, not kill the daemon. The
+    // pipeline-filter binaries make the opposite call — see pvfs-cli's and
+    // pvfs-companion's main().
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,

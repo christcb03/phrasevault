@@ -52,10 +52,11 @@ fail() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$*"; }
 
 # qgrep: `grep -q` semantics, but consumes ALL input before exiting. grep -q
 # quits at the first match, which closes the pipe while the writer may still
-# be printing; the Rust CLI then panics on EPIPE and pipefail turns that
-# race into a spurious pipeline failure (seen 2026-08-10: the F3 replica
-# stat UNAVAILABLE check). Reading to EOF keeps the writer's stdout open
-# for its whole lifetime.
+# be printing; the writer then dies by SIGPIPE (141) — correct Unix behavior
+# since the CLI reset SIGPIPE to default, but pipefail would still turn that
+# race into a spurious pipeline failure (first seen 2026-08-10 as an EPIPE
+# panic: the F3 replica stat UNAVAILABLE check). Reading to EOF keeps the
+# writer's stdout open for its whole lifetime.
 qgrep() { grep "$@" >/dev/null; }
 
 # assert_rc <expected_rc> <description> -- cmd args...
@@ -110,6 +111,18 @@ $PVFS link "$TREE2" "$F" --type ref --nonce 1 >/dev/null && ok "parallel ref wit
 say "ls / walk / node / verify"
 $PVFS ls "$ROOT" | qgrep movies && ok "ls shows folder" || fail "ls shows folder"
 $PVFS walk "$ROOT" | qgrep fifth-element && ok "walk reaches file" || fail "walk reaches file"
+
+# SIGPIPE filter contract: an early-exiting pipe reader must end the CLI by
+# SIGPIPE (141) or clean exit — never the EPIPE panic (rc 101, "Broken pipe"
+# on stderr) that hit the 2026-08-10 run. `:` closes the read end at birth,
+# so pvfs's writes land on a closed pipe.
+rc=0
+$PVFS walk "$ROOT" 2>"$DATA/sigpipe-err" | : || rc=${PIPESTATUS[0]}
+if [ "$rc" -ne 101 ] && ! grep -q panicked "$DATA/sigpipe-err"; then
+  ok "early pipe-reader exit dies quietly (rc=$rc)"
+else
+  fail "early pipe-reader exit panicked (rc=$rc: $(cat "$DATA/sigpipe-err"))"
+fi
 $PVFS node "$F" >/dev/null && ok "node show" || fail "node show"
 $PVFS verify "$F" >/dev/null && ok "verify valid node" || fail "verify valid node"
 assert_rc 3 "verify missing node → 3" -- $PVFS verify deadbeef

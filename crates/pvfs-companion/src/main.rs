@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use nix::sys::signal::{signal, SigHandler, Signal};
 use pvfs_companion::{
     serve, serve_tenant, tenant_request, Agent, ApprovalPolicy, Sessions, TenantAgent,
     TenantRequest, TenantResponse, UnlockedSigner, Vault, VaultStore,
@@ -165,6 +166,16 @@ enum PairingsCmd {
 }
 
 fn main() -> std::process::ExitCode {
+    // Unix filter contract for the query commands (`status | grep -q`,
+    // `origins | head`): give SIGPIPE its default disposition so an
+    // early-exiting pipe reader ends us quietly (shell rc 141) instead of
+    // panicking println! on EPIPE. The serving paths re-ignore it — see
+    // run_serve() and the ServeTenant arm — because there a vanished client
+    // must be an io::Error on one connection, not process death.
+    // Safety: SigDfl installs no handler code.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -424,6 +435,12 @@ fn run() -> Result<(), String> {
             socket,
             max_ttl_secs,
         } => {
+            // Same posture as run_serve(): a disconnecting client is an EPIPE
+            // io::Error, not process death.
+            // Safety: SigIgn installs no handler code.
+            unsafe {
+                let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
+            }
             let store = VaultStore::open(&store).map_err(|e| e.to_string())?;
             let agent = Arc::new(TenantAgent::new(
                 Sessions::new(store),
@@ -470,6 +487,13 @@ fn run() -> Result<(), String> {
 }
 
 fn run_serve(args: ServeArgs) -> Result<(), String> {
+    // Serving now: re-ignore SIGPIPE (main gave it the default disposition for
+    // the filter commands). A browser or CLI client that disconnects mid-write
+    // must surface as EPIPE on that connection, not kill the signing agent.
+    // Safety: SigIgn installs no handler code.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
+    }
     let ServeArgs {
         vault,
         socket,
