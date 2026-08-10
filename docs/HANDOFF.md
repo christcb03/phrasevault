@@ -64,11 +64,11 @@ owner's single signed chain is still the only log (doc 13 §A).
 
 ## 3. Release housekeeping (after validation)
 
-- Workspace is still `1.2.0` and `v1.2` is still untagged (pre-session state). The CHANGELOG's
-  Unreleased section now holds this arc **plus** the earlier D18/D32/D57 companion/tenant/pvfsd
-  work. Suggest: tag `v1.2` where it was validated, then package this arc as `1.3.0` (bump
-  workspace version, date the CHANGELOG, flip `INSTALL.md`'s version string, update doc 08 §3.3
-  header) — or fold everything into one release; Chris's call.
+- **Decided (2026-08-10): the two-release shape.** Packaged as `1.3.0` — workspace bumped,
+  CHANGELOG dated, `INSTALL.md` and doc 08 §3.3 updated. Pending (Chris, manual): tag `v1.2`
+  at `49b0e0d` (where the 1.2 line was validated) and `v1.3` at the packaging commit, then
+  push. The outbound-fetch identity finding is parked as doc 17 §9 Q5 (deferred, Chris's
+  call in a future arc). After the tags land, this file can be deleted.
 - `pvfsd@.service` stays `Type=simple` (sd_notify is a no-op there); PVOS's `Type=notify` units
   are the D57 consumers.
 

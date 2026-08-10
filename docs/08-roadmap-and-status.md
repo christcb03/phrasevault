@@ -154,11 +154,14 @@ takeover/restart e2e, the read-pool cross-connection visibility test, and the
 new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 `v1.2` tag pending (Chris tags manually).
 
-### 3.3 — Unreleased (the post-1.2 line, as of 2026-08-10)
+### 3.3 — the 1.3.0 line (released 2026-08-10)
 
-> **Validation state:** the whole P4 arc below is container-validated (262-check smoke, full test
-> suite, clippy) but **awaits the real Ansible pipeline run + a two-machine fleet test** — see
-> [HANDOFF.md](HANDOFF.md) for the exact checklist, release-packaging decisions, and next work.
+> **Validation state: complete.** The real Ansible pipeline ran green on two hosts (presubuntu
+> + pvos-test): release build, 194 tests, 268 smoke checks, systemd daemon stage, clippy clean.
+> The **two-machine fleet test** (`deploy/fleet-test.sh`) passed **40/40** — USER-MANUAL
+> §7.7–§7.10 across real machines, plus a 3 GiB ingest → tier → evict → stream cycle at
+> ~37 MB/s over the LAN. Findings and packaging notes: [HANDOFF.md](HANDOFF.md) §2–§3.
+> Workspace at `1.3.0`; `v1.2` (pre-arc) and `v1.3` tags pending (Chris tags manually).
 
 | Item | State |
 |------|--------|

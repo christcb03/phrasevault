@@ -3,7 +3,12 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
-## Unreleased
+## 1.3.0 — 2026-08-10
+
+Validated end to end: the Ansible pipeline on two hosts (194 tests + 268
+smoke checks, clippy clean) and the two-machine fleet test
+(`deploy/fleet-test.sh`, 40/40, including a 3 GiB tier/evict/stream cycle
+over the LAN) — see [HANDOFF.md](docs/HANDOFF.md) §2.
 
 - **Tail-subscribe (P4 F5.4, doc 17 §7.5):** the `LogWait` long-poll — the
   daemon holds a gated log read (up to a server-capped 60 s) until new
