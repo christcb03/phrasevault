@@ -42,6 +42,14 @@ say()  { printf '%s\n' "== $*"; }
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$*"; }
 fail() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$*"; }
 
+# qgrep: `grep -q` semantics, but consumes ALL input before exiting. grep -q
+# quits at the first match, which closes the pipe while the writer may still
+# be printing; the Rust CLI then panics on EPIPE and pipefail turns that
+# race into a spurious pipeline failure (seen 2026-08-10: the F3 replica
+# stat UNAVAILABLE check). Reading to EOF keeps the writer's stdout open
+# for its whole lifetime.
+qgrep() { grep "$@" >/dev/null; }
+
 # assert_rc <expected_rc> <description> -- cmd args...
 assert_rc() {
   local want="$1" desc="$2"; shift 2; shift # consume --
@@ -58,7 +66,7 @@ say "init"
 INIT_JSON="$($PVFS --json init)"
 MNEMONIC="$(jget "$INIT_JSON" mnemonic)"
 ROOT="$(jget "$INIT_JSON" root_node_id)"
-[ -n "$MNEMONIC" ] && ok "init returns mnemonic"
+[ -n "$MNEMONIC" ] && ok "init returns mnemonic" || fail "init returns mnemonic"
 [ ${#ROOT} -eq 64 ] && ok "init returns 64-hex root id" || fail "bad root id: $ROOT"
 assert_rc 4 "double init refuses (exists)" -- $PVFS init
 
@@ -86,16 +94,16 @@ $PVFS loc rm "$F" "https://host/fifth-element.mkv" >/dev/null
 assert_rc 3 "removing absent location → 3" -- $PVFS loc rm "$F" "https://nope"
 
 say "links: ref ok, second home refused, cycle refused"
-$PVFS link "$TREE2" "$F" --type ref >/dev/null && ok "ref link into second tree"
+$PVFS link "$TREE2" "$F" --type ref >/dev/null && ok "ref link into second tree" || fail "ref link into second tree"
 assert_rc 4 "second contains (one-home) → 4" -- $PVFS link "$TREE2" "$F" --type contains
 assert_rc 4 "duplicate ref same nonce → 4" -- $PVFS link "$TREE2" "$F" --type ref
-$PVFS link "$TREE2" "$F" --type ref --nonce 1 >/dev/null && ok "parallel ref with nonce 1"
+$PVFS link "$TREE2" "$F" --type ref --nonce 1 >/dev/null && ok "parallel ref with nonce 1" || fail "parallel ref with nonce 1"
 
 say "ls / walk / node / verify"
-$PVFS ls "$ROOT" | grep -q movies && ok "ls shows folder"
-$PVFS walk "$ROOT" | grep -q fifth-element && ok "walk reaches file"
-$PVFS node "$F" >/dev/null && ok "node show"
-$PVFS verify "$F" >/dev/null && ok "verify valid node"
+$PVFS ls "$ROOT" | qgrep movies && ok "ls shows folder" || fail "ls shows folder"
+$PVFS walk "$ROOT" | qgrep fifth-element && ok "walk reaches file" || fail "walk reaches file"
+$PVFS node "$F" >/dev/null && ok "node show" || fail "node show"
+$PVFS verify "$F" >/dev/null && ok "verify valid node" || fail "verify valid node"
 assert_rc 3 "verify missing node → 3" -- $PVFS verify deadbeef
 
 say "reorder"
@@ -128,10 +136,10 @@ for e in json.load(sys.stdin):
     if e["label"] == "movies": print(e["link_id"])')"
 assert_rc 4 "purge non-orphan → 4" -- $PVFS purge "$A"
 $PVFS unlink "$A_LINK" >/dev/null
-$PVFS orphans | grep -q "$A" && ok "orphan listed"
-$PVFS purge "$A" >/dev/null && ok "purge orphan"
-$PVFS orphans | grep -q "$G" && ok "ref-less child became orphan after purge"
-if $PVFS orphans | grep -q "$F"; then
+$PVFS orphans | qgrep "$A" && ok "orphan listed" || fail "orphan listed"
+$PVFS purge "$A" >/dev/null && ok "purge orphan" || fail "purge orphan"
+$PVFS orphans | qgrep "$G" && ok "ref-less child became orphan after purge" || fail "ref-less child became orphan after purge"
+if $PVFS orphans | qgrep "$F"; then
   fail "file with active refs wrongly listed as orphan"
 else
   ok "file with active refs is not an orphan"
@@ -141,19 +149,19 @@ say "device certificates"
 DEV1_JSON="$($PVFS --json device authorize --mnemonic "$MNEMONIC" --index 1)"
 DEV1="$(jget "$DEV1_JSON" device_pubkey)"
 ok "device 1 authorized"
-$PVFS device revoke --mnemonic "$MNEMONIC" --pubkey "$DEV1" >/dev/null && ok "device 1 revoked"
+$PVFS device revoke --mnemonic "$MNEMONIC" --pubkey "$DEV1" >/dev/null && ok "device 1 revoked" || fail "device 1 revoked"
 
 say "recovery from mnemonic"
 rm "$PVFS_DATA_DIR/device.key"
-$PVFS recover --mnemonic "$MNEMONIC" --device-index 0 >/dev/null && ok "recover re-derives device key"
-$PVFS info >/dev/null && ok "forest usable after recovery"
+$PVFS recover --mnemonic "$MNEMONIC" --device-index 0 >/dev/null && ok "recover re-derives device key" || fail "recover re-derives device key"
+$PVFS info >/dev/null && ok "forest usable after recovery" || fail "forest usable after recovery"
 
 say "rebuild from log (projection is disposable)"
 rm "$PVFS_DATA_DIR/index.db"
 $PVFS walk "$ROOT" >/dev/null && ok "walk triggers index rebuild" || fail "walk post-rebuild"
-$PVFS walk "$ROOT" | grep -q second-tree && fail "walk crossed into another tree" || ok "walk stays within one tree"
-$PVFS info >/dev/null && ok "index rebuilt from log"
-$PVFS ls "$TREE2" | grep -q fifth-element && ok "rebuilt projection has ref links"
+$PVFS walk "$ROOT" | qgrep second-tree && fail "walk crossed into another tree" || ok "walk stays within one tree"
+$PVFS info >/dev/null && ok "index rebuilt from log" || fail "index rebuilt from log"
+$PVFS ls "$TREE2" | qgrep fifth-element && ok "rebuilt projection has ref links" || fail "rebuilt projection has ref links"
 
 say "P1: bind / scan / stat / cat"
 LIB="$DATA/library"
@@ -161,9 +169,9 @@ mkdir -p "$LIB/movies"
 printf 'alpha-bytes' > "$LIB/movies/alpha.mkv"
 printf 'hello notes' > "$LIB/notes.txt"
 LFOLDER="$($PVFS add "$ROOT" --kind folder --label library)"
-$PVFS bind "$LFOLDER" "$LIB" --hash-policy on_add >/dev/null && ok "bind"
-$PVFS --json scan "$LFOLDER" | grep -q '"added":2' && ok "scan indexed 2 files"
-$PVFS --json scan "$LFOLDER" | grep -q '"unchanged":2' && ok "rescan no-op"
+$PVFS bind "$LFOLDER" "$LIB" --hash-policy on_add >/dev/null && ok "bind" || fail "bind"
+$PVFS --json scan "$LFOLDER" | qgrep '"added":2' && ok "scan indexed 2 files" || fail "scan indexed 2 files"
+$PVFS --json scan "$LFOLDER" | qgrep '"unchanged":2' && ok "rescan no-op" || fail "rescan no-op"
 MOVIES="$($PVFS --json ls "$LFOLDER" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
@@ -172,29 +180,31 @@ ALPHA="$($PVFS --json ls "$MOVIES" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "alpha.mkv": print(e["id"])')"
-[ "$($PVFS cat "$ALPHA")" = "alpha-bytes" ] && ok "cat verified read"
-$PVFS stat "$ALPHA" | grep -q "file://" && ok "stat shows location"
+[ "$($PVFS cat "$ALPHA")" = "alpha-bytes" ] && ok "cat verified read" || fail "cat verified read"
+$PVFS stat "$ALPHA" | qgrep "file://" && ok "stat shows location" || fail "stat shows location"
 
 say "P1: changed file -> flag -> resolve"
 printf 'alpha-bytes-changed-longer' > "$LIB/movies/alpha.mkv"
-$PVFS --json scan "$LFOLDER" | grep -q '"changed":1' && ok "change flagged"
-$PVFS changes | grep -q "$ALPHA" && ok "changes lists flagged node"
+$PVFS --json scan "$LFOLDER" | qgrep '"changed":1' && ok "change flagged" || fail "change flagged"
+$PVFS changes | qgrep "$ALPHA" && ok "changes lists flagged node" || fail "changes lists flagged node"
 assert_rc 3 "flagged location not served → 3" -- $PVFS cat "$ALPHA"
 NEW_ALPHA="$($PVFS resolve "$ALPHA" --replace)"
-[ ${#NEW_ALPHA} -eq 64 ] && ok "resolve --replace returns successor"
-[ "$($PVFS cat "$NEW_ALPHA")" = "alpha-bytes-changed-longer" ] && ok "successor serves new bytes"
-$PVFS orphans | grep -q "$ALPHA" && ok "old node kept as orphan"
+[ ${#NEW_ALPHA} -eq 64 ] && ok "resolve --replace returns successor" || fail "resolve --replace returns successor"
+[ "$($PVFS cat "$NEW_ALPHA")" = "alpha-bytes-changed-longer" ] && ok "successor serves new bytes" || fail "successor serves new bytes"
+$PVFS orphans | qgrep "$ALPHA" && ok "old node kept as orphan" || fail "old node kept as orphan"
 
 say "P1: disk deletion is soft"
 rm "$LIB/notes.txt"
-$PVFS --json scan "$LFOLDER" | grep -q '"removed":1' && ok "deletion soft-removed location"
+$PVFS --json scan "$LFOLDER" | qgrep '"removed":1' && ok "deletion soft-removed location" || fail "deletion soft-removed location"
 NOTES="$($PVFS --json ls "$LFOLDER" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "notes.txt": print(e["id"])')"
-$PVFS stat "$NOTES" | grep -q UNAVAILABLE && ok "node kept, marked unavailable"
+$PVFS stat "$NOTES" | qgrep UNAVAILABLE && ok "node kept, marked unavailable" || fail "node kept, marked unavailable"
 
-say "P1: lazy hash fill"
+say "P1: hash fill"
+# Under --hash-policy on_add the scan already content-addresses the file, so
+# `pvfs hash` is an idempotent no-op that returns the SAME id (no successor).
 printf 'lazy-content' > "$LIB/movies/lazy.bin"
 $PVFS scan "$LFOLDER" >/dev/null
 LAZY="$($PVFS --json ls "$MOVIES" | python3 -c '
@@ -202,24 +212,41 @@ import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "lazy.bin": print(e["id"])')"
 HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
-[ ${#HASHED} -eq 64 ] && [ "$HASHED" != "$LAZY" ] && ok "hash created successor node"
-[ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified"
+[ "$HASHED" = "$LAZY" ] && ok "hash on an on_add node is an idempotent no-op" \
+  || fail "hash on on_add node re-identified: $LAZY -> $HASHED"
+[ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified" || fail "hashed cat"
+# A genuinely lazy binding: scan skips hashing, so the fill happens at `pvfs
+# hash` time — the hash lives in the immutable payload, hence a successor node.
+LAZYLIB="$DATA/lazylib"
+mkdir -p "$LAZYLIB"
+printf 'truly-lazy' > "$LAZYLIB/slow.bin"
+ZFOLDER="$($PVFS add "$ROOT" --kind folder --label lazylib)"
+$PVFS bind "$ZFOLDER" "$LAZYLIB" --hash-policy lazy >/dev/null && ok "bind (lazy policy)" || fail "lazy bind"
+$PVFS scan "$ZFOLDER" >/dev/null
+SLOW="$($PVFS --json ls "$ZFOLDER" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "slow.bin": print(e["id"])')"
+FILLED="$($PVFS hash "$SLOW" 2>/dev/null)"
+[ ${#FILLED} -eq 64 ] && [ "$FILLED" != "$SLOW" ] && ok "hash created successor node (lazy policy)" \
+  || fail "lazy hash fill: $SLOW -> $FILLED"
+[ "$($PVFS cat "$FILLED")" = "truly-lazy" ] && ok "successor serves verified bytes" || fail "successor cat"
 
 say "P4 F0: export (native tree view, doc 17)"
 EXPORT_DIR="$DATA/exportview"
-$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"exported":2' && ok "export materialized 2 files"
-[ -L "$EXPORT_DIR/movies/alpha.mkv" ] && ok "export entry is a symlink"
-[ "$(cat "$EXPORT_DIR/movies/alpha.mkv")" = "alpha-bytes-changed-longer" ] && ok "export reads through"
-$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"unchanged":2' && ok "re-export idempotent"
-$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | grep -q '"path":"notes.txt"' && ok "unavailable file reported skipped"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"exported":2' && ok "export materialized 2 files" || fail "export materialized 2 files"
+[ -L "$EXPORT_DIR/movies/alpha.mkv" ] && ok "export entry is a symlink" || fail "export entry is a symlink"
+[ "$(cat "$EXPORT_DIR/movies/alpha.mkv")" = "alpha-bytes-changed-longer" ] && ok "export reads through" || fail "export reads through"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"unchanged":2' && ok "re-export idempotent" || fail "re-export idempotent"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"path":"notes.txt"' && ok "unavailable file reported skipped" || fail "unavailable file reported skipped"
 COPY_DIR="$DATA/exportcopy"
 $PVFS export "$LFOLDER" "$COPY_DIR" --mode copy >/dev/null
 [ ! -L "$COPY_DIR/movies/lazy.bin" ] && [ "$(cat "$COPY_DIR/movies/lazy.bin")" = "lazy-content" ] \
-  && ok "copy export lands real verified bytes"
+  && ok "copy export lands real verified bytes" || fail "copy export lands real verified bytes"
 OCCUPIED="$DATA/occupied"
 mkdir -p "$OCCUPIED"; printf 'x' > "$OCCUPIED/keep.txt"
 assert_rc 2 "export refuses foreign non-empty dir → 2" -- $PVFS export "$LFOLDER" "$OCCUPIED"
-[ -f "$OCCUPIED/keep.txt" ] && ok "foreign dir untouched"
+[ -f "$OCCUPIED/keep.txt" ] && ok "foreign dir untouched" || fail "foreign dir untouched"
 
 say "P1: serve daemon (watcher)"
 $PVFS serve --debounce-ms 300 >/dev/null 2>&1 &
@@ -229,22 +256,22 @@ printf 'watched-file' > "$LIB/movies/watched.mkv"
 sleep 3
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
-$PVFS ls "$MOVIES" | grep -q watched.mkv && ok "watcher ingested new file"
+$PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"
 
 say "P1.5: forest init / registry / mount URIs"
 MOUNT="$DATA/workspace"
 mkdir -p "$MOUNT/docs"
 printf 'mount notes' > "$MOUNT/docs/readme.txt"
 FINIT="$($PVFS --json forest init --mount "$MOUNT")"
-echo "$FINIT" | grep -q '"imported":true' && ok "forest init imported mount tree"
-[ -f "$MOUNT/.pvfs/log.db" ] && ok "state lives under .pvfs/"
-$PVFS forest register "$MOUNT" --alias smokehome >/dev/null && ok "forest register"
-$PVFS ls | grep -q smokehome && ok "pvfs ls lists registered forest"
-$PVFS ls "pvfs://smokehome@local/docs" | grep -q readme.txt && ok "ls by alias URI"
-$PVFS ls "$MOUNT/docs" | grep -q readme.txt && ok "ls by absolute path shorthand"
-$PVFS cat "pvfs://smokehome/docs/readme.txt" | grep -q "mount notes" && ok "cat by tree path"
-$PVFS forest info "pvfs://smokehome@local/" | grep -q instance_id && ok "forest info by URI"
-if $PVFS ls "$MOUNT" | grep -q "\.pvfs"; then
+echo "$FINIT" | qgrep '"imported":true' && ok "forest init imported mount tree" || fail "forest init imported mount tree"
+[ -f "$MOUNT/.pvfs/log.db" ] && ok "state lives under .pvfs/" || fail "state lives under .pvfs/"
+$PVFS forest register "$MOUNT" --alias smokehome >/dev/null && ok "forest register" || fail "forest register"
+$PVFS ls | qgrep smokehome && ok "pvfs ls lists registered forest" || fail "pvfs ls lists registered forest"
+$PVFS ls "pvfs://smokehome@local/docs" | qgrep readme.txt && ok "ls by alias URI" || fail "ls by alias URI"
+$PVFS ls "$MOUNT/docs" | qgrep readme.txt && ok "ls by absolute path shorthand" || fail "ls by absolute path shorthand"
+$PVFS cat "pvfs://smokehome/docs/readme.txt" | qgrep "mount notes" && ok "cat by tree path" || fail "cat by tree path"
+$PVFS forest info "pvfs://smokehome@local/" | qgrep instance_id && ok "forest info by URI" || fail "forest info by URI"
+if $PVFS ls "$MOUNT" | qgrep "\.pvfs"; then
   fail ".pvfs leaked into the indexed tree"
 else
   ok ".pvfs not indexed into the tree"
@@ -253,11 +280,11 @@ fi
 say "P1.5: portable forest (no registry)"
 PORT="$DATA/usb-project"
 cp -r "$MOUNT" "$PORT"
-$PVFS ls "$PORT/docs" | grep -q readme.txt && ok "portable mount opens by path"
-$PVFS forest unregister smokehome >/dev/null && ok "unregister"
-[ -f "$MOUNT/.pvfs/log.db" ] && ok "unregister keeps .pvfs/"
+$PVFS ls "$PORT/docs" | qgrep readme.txt && ok "portable mount opens by path" || fail "portable mount opens by path"
+$PVFS forest unregister smokehome >/dev/null && ok "unregister" || fail "unregister"
+[ -f "$MOUNT/.pvfs/log.db" ] && ok "unregister keeps .pvfs/" || fail "unregister keeps .pvfs/"
 assert_rc 3 "unknown alias → 3" -- $PVFS ls "pvfs://smokehome/docs"
-$PVFS ls "$MOUNT/docs" | grep -q readme.txt && ok "unregistered mount still opens by path"
+$PVFS ls "$MOUNT/docs" | qgrep readme.txt && ok "unregistered mount still opens by path" || fail "unregistered mount still opens by path"
 
 say "P2: daemon + remote client (doc 07)"
 DMOUNT="$DATA/served"
@@ -268,19 +295,19 @@ DROOT="$(jget "$DINIT" root_node_id)"
 DFID="$(jget "$DINIT" forest_id)"
 DMN="$(jget "$DINIT" mnemonic)"
 CLIENTKEY="$(jget "$($PVFS --json whoami)" pubkey)"
-[ -n "$CLIENTKEY" ] && ok "whoami prints client identity"
+[ -n "$CLIENTKEY" ] && ok "whoami prints client identity" || fail "whoami prints client identity"
 
 # Owner setup happens BEFORE serving (the daemon opens a snapshot of the log).
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" public r >/dev/null \
-  && ok "acl set public r on root"
+  && ok "acl set public r on root" || fail "acl set public r on root"
 $PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --pubkey "$CLIENTKEY" \
-  >/dev/null && ok "authorize member (admin device, no recovery phrase)"
+  >/dev/null && ok "authorize member (admin device, no recovery phrase)" || fail "authorize member (admin device, no recovery phrase)"
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" "key:$CLIENTKEY" rw >/dev/null \
-  && ok "grant member rw on root"
+  && ok "grant member rw on root" || fail "grant member rw on root"
 # tags (doc 09): CLI wiring — tag a member, list it, share a node to a tag
-$PVFS --data-dir "$DMOUNT/.pvfs" tag add "$CLIENTKEY" testers >/dev/null && ok "tag add"
-$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q testers && ok "tag ls"
-$PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" tag:testers r >/dev/null && ok "acl set tag principal"
+$PVFS --data-dir "$DMOUNT/.pvfs" tag add "$CLIENTKEY" testers >/dev/null && ok "tag add" || fail "tag add"
+$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | qgrep testers && ok "tag ls" || fail "tag ls"
+$PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" tag:testers r >/dev/null && ok "acl set tag principal" || fail "acl set tag principal"
 
 # pvfsd binds its conventional per-forest socket ($PVFS_SOCKET_DIR/<forest_id>.sock)
 # and (F1) a TLS network listener on an ephemeral port, logged for the F1 section.
@@ -290,25 +317,25 @@ DPID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] && ok "pvfsd binds its conventional socket" || fail "pvfsd socket missing"
 # the client finds the socket by forest (mount path) without --socket
-$PVFS --json remote --forest "$DMOUNT" --anon info | grep -q "\"forest_id\":\"$DFID\"" \
-  && ok "remote --forest resolves the daemon socket"
+$PVFS --json remote --forest "$DMOUNT" --anon info | qgrep "\"forest_id\":\"$DFID\"" \
+  && ok "remote --forest resolves the daemon socket" || fail "remote --forest resolves the daemon socket"
 
-$PVFS --json remote --socket "$SOCK" --anon info | grep -q "\"forest_id\":\"$DFID\"" \
-  && ok "remote info (anonymous)"
-$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | grep -q albums \
-  && ok "remote ls root (anon via public grant)"
-$PVFS --json remote --socket "$SOCK" info | grep -q '"principal":"key:' \
-  && ok "remote info (signed client identity)"
+$PVFS --json remote --socket "$SOCK" --anon info | qgrep "\"forest_id\":\"$DFID\"" \
+  && ok "remote info (anonymous)" || fail "remote info (anonymous)"
+$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | qgrep albums \
+  && ok "remote ls root (anon via public grant)" || fail "remote ls root (anon via public grant)"
+$PVFS --json remote --socket "$SOCK" info | qgrep '"principal":"key:' \
+  && ok "remote info (signed client identity)" || fail "remote info (signed client identity)"
 
 # member write: create a folder through the daemon, signed by the client identity
 NEWID="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" uploaded)" created)"
 [ ${#NEWID} -eq 64 ] && ok "member created a folder via the daemon" || fail "member mkdir: $NEWID"
-$PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q uploaded && ok "member's folder is visible"
+$PVFS remote --socket "$SOCK" ls "$DROOT" | qgrep uploaded && ok "member's folder is visible" || fail "member's folder is visible"
 # member adds a file then removes it via the daemon
 FILEID="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" clip.mkv --size 99 --mime video/x-matroska)" created)"
 [ ${#FILEID} -eq 64 ] && ok "member added a file via the daemon" || fail "add-file: $FILEID"
-$PVFS remote --socket "$SOCK" rm "$FILEID" >/dev/null && ok "member removed a node via the daemon"
-if $PVFS remote --socket "$SOCK" ls "$DROOT" | grep -q clip.mkv; then
+$PVFS remote --socket "$SOCK" rm "$FILEID" >/dev/null && ok "member removed a node via the daemon" || fail "member removed a node via the daemon"
+if $PVFS remote --socket "$SOCK" ls "$DROOT" | qgrep clip.mkv; then
   fail "removed file still listed"
 else
   ok "removed file is gone"
@@ -323,14 +350,14 @@ ATXT_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$ALBUMS_ID")" a.t
 printf 'member-bytes' > "$DMOUNT/uploaded-blob"
 MFILE="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" blob.bin --size 12)" created)"
 $PVFS remote --socket "$SOCK" add-location "$MFILE" "file://$DMOUNT/uploaded-blob" >/dev/null \
-  && ok "member added a file location"
+  && ok "member added a file location" || fail "member added a file location"
 [ "$($PVFS remote --socket "$SOCK" cat "$MFILE")" = "member-bytes" ] \
   && ok "member reads back its own file content" || fail "member cat mismatch"
 # remote takes paths/URIs too (doc 08 §4 item 6 remainder): resolved by
 # ACL-filtered ls over the daemon, never by opening the owner's engine
 [ "$($PVFS remote --socket "$SOCK" cat "$DMOUNT/albums/a.txt")" = "hi" ] \
   && ok "remote cat resolves an absolute path" || fail "remote path cat"
-$PVFS remote --socket "$SOCK" --anon ls "$DMOUNT/albums" | grep -q a.txt \
+$PVFS remote --socket "$SOCK" --anon ls "$DMOUNT/albums" | qgrep a.txt \
   && ok "remote ls resolves a path (anon)" || fail "remote path ls"
 # remote add-node/payload (doc 13 log-resident records via the CLI)
 RECID="$(jget "$($PVFS --json remote --socket "$SOCK" add-node "$DROOT" g-1 pvos.grant --payload '{"grant":1}')" created)"
@@ -354,7 +381,7 @@ printf 'msg-ciphertext' | $PVFS --data-dir "$DMOUNT/.pvfs" secure put "$SSNODE" 
 # member moves the "uploaded" folder under a new "archive" folder
 DEST="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" archive)" created)"
 UPLOADED_ID="$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DROOT")" uploaded)"
-$PVFS remote --socket "$SOCK" mv "$UPLOADED_ID" "$DEST" >/dev/null && ok "member moved a node"
+$PVFS remote --socket "$SOCK" mv "$UPLOADED_ID" "$DEST" >/dev/null && ok "member moved a node" || fail "member moved a node"
 [ -n "$(pick_id "$($PVFS --json remote --socket "$SOCK" ls "$DEST")" uploaded)" ] \
   && ok "moved node is under its new parent" || fail "mv target missing"
 # an anonymous client cannot write (no identity to sign with) → bad input (2)
@@ -373,19 +400,19 @@ fi
 [ "$(cat "$DMOUNT/.pvfs/nettls/pin")" = "$NETPIN" ] \
   && ok "pin file matches the printed pin" || fail "nettls/pin mismatch"
 $PVFS --json remote --connect "$NETADDR" --pin "$NETPIN" --anon info \
-  | grep -q "\"forest_id\":\"$DFID\"" && ok "remote --connect info over TLS (anon)"
-$PVFS remote --connect "$NETADDR" --pin "$NETPIN" --anon ls "$DROOT" | grep -q albums \
-  && ok "remote ls over TLS"
+  | qgrep "\"forest_id\":\"$DFID\"" && ok "remote --connect info over TLS (anon)" || fail "remote --connect info over TLS (anon)"
+$PVFS remote --connect "$NETADDR" --pin "$NETPIN" --anon ls "$DROOT" | qgrep albums \
+  && ok "remote ls over TLS" || fail "remote ls over TLS"
 [ "$($PVFS remote --connect "$NETADDR" --pin "$NETPIN" cat "$ATXT_ID")" = "hi" ] \
   && ok "remote cat streams bytes over TLS (signed identity)" || fail "TLS cat mismatch"
 BADPIN="$(printf '0%.0s' $(seq 1 64))"
 assert_rc 2 "wrong pin refused at the TLS handshake → 2" -- \
   $PVFS remote --connect "$NETADDR" --pin "$BADPIN" --anon info
-$PVFS instance add smokehost "$NETADDR" "$NETPIN" >/dev/null && ok "instance add pins the server"
-$PVFS instance ls | grep -q "smokehost  $NETADDR" && ok "instance ls lists it"
-$PVFS --json remote --instance smokehost --anon info | grep -q "\"forest_id\":\"$DFID\"" \
-  && ok "remote --instance dials by name"
-$PVFS instance rm smokehost >/dev/null && ok "instance rm forgets it"
+$PVFS instance add smokehost "$NETADDR" "$NETPIN" >/dev/null && ok "instance add pins the server" || fail "instance add pins the server"
+$PVFS instance ls | qgrep "smokehost  $NETADDR" && ok "instance ls lists it" || fail "instance ls lists it"
+$PVFS --json remote --instance smokehost --anon info | qgrep "\"forest_id\":\"$DFID\"" \
+  && ok "remote --instance dials by name" || fail "remote --instance dials by name"
+$PVFS instance rm smokehost >/dev/null && ok "instance rm forgets it" || fail "instance rm forgets it"
 assert_rc 3 "removed instance no longer resolves → 3" -- \
   $PVFS remote --instance smokehost --anon info
 
@@ -407,8 +434,8 @@ assert_rc 0 "auto-routed tag add accepted (owner admin via running daemon)" -- \
 assert_rc 0 "auto-routed acl set tag principal accepted" -- \
   $PVFS --forest "$DMOUNT" acl set "$DROOT" tag:liveadmin r
 # daemon is still serving the same live forest after the auto-routed admin ops
-$PVFS --json remote --socket "$SOCK" info | grep -q "\"forest_id\":\"$DFID\"" \
-  && ok "daemon still serving after auto-routed admin"
+$PVFS --json remote --socket "$SOCK" info | qgrep "\"forest_id\":\"$DFID\"" \
+  && ok "daemon still serving after auto-routed admin" || fail "daemon still serving after auto-routed admin"
 
 say "F2: replica — verified log shipping (doc 17 §5)"
 REPMOUNT="$DATA/replica"
@@ -416,11 +443,11 @@ REPMOUNT="$DATA/replica"
 assert_rc 5 "replica add without root admin → 5" -- \
   $PVFS replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NETPIN"
 $PVFS --forest "$DMOUNT" acl set "$DROOT" "key:$CLIENTKEY" rwa >/dev/null \
-  && ok "owner granted the client root admin (the replication capability)"
+  && ok "owner granted the client root admin (the replication capability)" || fail "owner granted the client root admin (the replication capability)"
 REP_JSON="$($PVFS --json replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NETPIN")"
 [ "$(jget "$REP_JSON" forest_id)" = "$DFID" ] \
   && ok "replica add ships + verifies the full log (over TLS)" || fail "replica add: $REP_JSON"
-$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q albums && ok "replica lists the tree"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | qgrep albums && ok "replica lists the tree" || fail "replica lists the tree"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$ATXT_ID")" = "hi" ] \
   && ok "replica cat reads through (same-host locations)" || fail "replica cat"
 # the replica's own engine never writes its log — asserted via an op with no
@@ -436,7 +463,7 @@ REPSOCK="$DATA/replica.sock"
 "$PVFSD" --mount "$REPMOUNT" --socket "$REPSOCK" >/dev/null 2>&1 &
 RPID=$!
 for _ in $(seq 1 50); do [ -S "$REPSOCK" ] && break; sleep 0.1; done
-$PVFS remote --socket "$REPSOCK" --anon ls "$DROOT" | grep -q albums \
+$PVFS remote --socket "$REPSOCK" --anon ls "$DROOT" | qgrep albums \
   && ok "pvfsd serves the replica (anon via replayed public grant)" || fail "replica daemon ls"
 assert_rc 5 "write via the replica daemon refused → 5" -- \
   $PVFS remote --socket "$REPSOCK" mkdir "$DROOT" sneaky
@@ -446,7 +473,7 @@ RPID=""
 $PVFS remote --socket "$SOCK" mkdir "$DROOT" fresh-content >/dev/null
 SYNC_JSON="$($PVFS --json replica sync "$REPMOUNT")"
 [ "$(jget "$SYNC_JSON" synced)" -ge 1 ] && ok "replica sync shipped the tail" || fail "sync: $SYNC_JSON"
-$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q fresh-content \
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | qgrep fresh-content \
   && ok "synced content visible on the replica" || fail "synced content missing"
 
 say "F3: placement & sync — bytes pulled local (doc 17 §6)"
@@ -466,16 +493,16 @@ $PVFS remote --socket "$SOCK" add-location "$MOVIE" "file://$DATA/far-store2/mov
 # stat (which never fetches) shows the file unavailable locally — cat would
 # already self-heal via F5.2 read-through, so the sync pass below proves the
 # batch path instead
-$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | grep -q UNAVAILABLE \
-  && ok "replica sees the file unavailable locally before sync"
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | qgrep UNAVAILABLE \
+  && ok "replica sees the file unavailable locally before sync" || fail "replica sees the file unavailable locally before sync"
 $PVFS --data-dir "$REPMOUNT/.pvfs" place "$DROOT" sync >/dev/null \
-  && ok "placed the root subtree sync"
+  && ok "placed the root subtree sync" || fail "placed the root subtree sync"
 SYNCJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" sync)"
 [ "$(jget "$SYNCJ" fetched)" -ge 1 ] && ok "pvfs sync fetched the missing bytes" || fail "sync: $SYNCJ"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$MOVIE")" = "far-away-bytes" ] \
   && ok "replica serves the synced bytes (verified)" || fail "synced cat mismatch"
-$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | grep -q "pvfs-sync" \
-  && ok "stat shows the managed sync-store location"
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | qgrep "pvfs-sync" \
+  && ok "stat shows the managed sync-store location" || fail "stat shows the managed sync-store location"
 # F0 + F3: re-export picks the synced file up like any other
 $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
 [ "$(cat "$DATA/replica-view/movie.mkv")" = "far-away-bytes" ] \
@@ -484,19 +511,19 @@ $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/nu
 say "F5.0: write-through — the replica accepts writes via its source (doc 17 §7)"
 WTID="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind file --label ingest.mkv --size 11 --mime video/x-matroska)" node_id)"
 [ ${#WTID} -eq 64 ] && ok "pvfs add on the replica wrote through" || fail "write-through add: $WTID"
-$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | grep -q ingest.mkv \
-  && ok "read-your-writes: visible on the replica at once"
-$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | grep -q ingest.mkv \
-  && ok "…and recorded in the owner's log"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | qgrep ingest.mkv \
+  && ok "read-your-writes: visible on the replica at once" || fail "read-your-writes: visible on the replica at once"
+$PVFS remote --socket "$SOCK" --anon ls "$DROOT" | qgrep ingest.mkv \
+  && ok "…and recorded in the owner's log" || fail "…and recorded in the owner's log"
 printf 'ingested-it' > "$DATA/ingest-src.bin"
 $PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$WTID" "file://$DATA/ingest-src.bin" >/dev/null \
-  && ok "loc add wrote through"
+  && ok "loc add wrote through" || fail "loc add wrote through"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$WTID")" = "ingested-it" ] \
   && ok "replica serves the newly ingested file" || fail "write-through cat"
 $PVFS --forest "$REPMOUNT" tag add "$CLIENTKEY" via-replica >/dev/null \
-  && ok "admin op auto-routes through the source"
-$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | grep -q via-replica \
-  && ok "tag landed in the owner's log"
+  && ok "admin op auto-routes through the source" || fail "admin op auto-routes through the source"
+$PVFS --data-dir "$DMOUNT/.pvfs" tag ls "$CLIENTKEY" | qgrep via-replica \
+  && ok "tag landed in the owner's log" || fail "tag landed in the owner's log"
 assert_rc 2 "temp node on a replica refused → 2" -- \
   $PVFS --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label scratch --temp
 
@@ -504,16 +531,16 @@ say "F5.1: instance-qualified locations (pvfs-host://, doc 17 §7.2)"
 printf 'host-qualified' > "$DATA/hostloc.bin"
 HQ="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" hostloc.bin --size 14)" created)"
 $PVFS --data-dir "$DMOUNT/.pvfs" loc add "$HQ" --here "$DATA/hostloc.bin" >/dev/null \
-  && ok "loc add --here records this instance's pin"
-$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$HQ" | grep -q "pvfs-host://$NETPIN" \
+  && ok "loc add --here records this instance's pin" || fail "loc add --here records this instance's pin"
+$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$HQ" | qgrep "pvfs-host://$NETPIN" \
   && ok "location carries the owner's transport pin" || fail "host uri missing"
 [ "$($PVFS --data-dir "$DMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
   && ok "own pin resolves locally" || fail "owner host-loc cat"
 $PVFS --json replica sync "$REPMOUNT" >/dev/null
-$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$HQ" | grep -q UNAVAILABLE \
-  && ok "foreign pin is unavailable locally (stat never fetches)"
+$PVFS --data-dir "$REPMOUNT/.pvfs" stat "$HQ" | qgrep UNAVAILABLE \
+  && ok "foreign pin is unavailable locally (stat never fetches)" || fail "foreign pin is unavailable locally (stat never fetches)"
 $PVFS --json --data-dir "$REPMOUNT/.pvfs" sync >/dev/null \
-  && ok "sync fetches the host-qualified file from the source"
+  && ok "sync fetches the host-qualified file from the source" || fail "sync fetches the host-qualified file from the source"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$HQ")" = "host-qualified" ] \
   && ok "replica serves it from the sync store" || fail "host-loc after sync"
 
@@ -530,7 +557,7 @@ REPPIN="$(printf '%s' "$REPLINE" | sed -E 's/.*transport pin ([0-9a-f]+).*/\1/')
 printf 'edge-bytes' > "$DATA/edge.bin"
 EDGE="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind file --label edge.bin --size 10)" node_id)"
 $PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$EDGE" --here "$DATA/edge.bin" >/dev/null \
-  && ok "edge box recorded its pin into the owner's log"
+  && ok "edge box recorded its pin into the owner's log" || fail "edge box recorded its pin into the owner's log"
 # a second consumer replica: the file is cataloged but its holder unknown…
 $PVFS --json replica add "$DATA/rep2" --connect "$NETADDR" --pin "$NETPIN" >/dev/null
 assert_rc 3 "consumer cat before the holder is registered → 3" -- \
@@ -539,8 +566,8 @@ assert_rc 3 "consumer cat before the holder is registered → 3" -- \
 $PVFS instance add edgebox "$REPADDR" "$REPPIN" >/dev/null
 [ "$($PVFS --data-dir "$DATA/rep2/.pvfs" cat "$EDGE" 2>/dev/null)" = "edge-bytes" ] \
   && ok "consumer cat read-through fetched from the edge box" || fail "read-through cat"
-$PVFS --data-dir "$DATA/rep2/.pvfs" stat "$EDGE" | grep -q "pvfs-sync" \
-  && ok "fetched bytes promoted into the consumer's sync store"
+$PVFS --data-dir "$DATA/rep2/.pvfs" stat "$EDGE" | qgrep "pvfs-sync" \
+  && ok "fetched bytes promoted into the consumer's sync store" || fail "fetched bytes promoted into the consumer's sync store"
 # the owner pulls edge bytes home too — the mover's core primitive (F5.3)
 SYNCJ2="$($PVFS --json --data-dir "$DMOUNT/.pvfs" sync "$DROOT")"
 [ "$(jget "$SYNCJ2" fetched)" -ge 1 ] && ok "owner pulled the edge bytes home" || fail "owner sync: $SYNCJ2"
@@ -552,16 +579,16 @@ RPID=""
 
 say "F5.3: the mover — central migration + edge eviction (doc 17 §7.4)"
 $PVFS --data-dir "$DMOUNT/.pvfs" place "$DROOT" central --to "$DATA/central-store" >/dev/null \
-  && ok "owner placed the library central"
+  && ok "owner placed the library central" || fail "owner placed the library central"
 TIERJ="$($PVFS --json --data-dir "$DMOUNT/.pvfs" tier)"
 [ "$(jget "$TIERJ" migrated)" -ge 1 ] && ok "mover migrated the edge file" || fail "tier: $TIERJ"
 [ "$(jget "$TIERJ" retired)" -ge 1 ] && ok "mover retired the edge location" || fail "tier retired: $TIERJ"
 EDGE2="$(printf '%s' "$EDGE" | cut -c1-2)"
 [ "$(cat "$DATA/central-store/$EDGE2/$EDGE")" = "edge-bytes" ] \
   && ok "verified copy sits in the central store" || fail "central copy missing"
-$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | grep -q "file://$DATA/central-store" \
-  && ok "central location recorded in the log"
-if $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | grep -q "pvfs-host://$REPPIN"; then
+$PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | qgrep "file://$DATA/central-store" \
+  && ok "central location recorded in the log" || fail "central location recorded in the log"
+if $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | qgrep "pvfs-host://$REPPIN"; then
   fail "edge location still live in the catalog"
 else
   ok "edge location gone from the live catalog"
@@ -583,7 +610,7 @@ sleep 1
 $PVFS remote --socket "$SOCK" mkdir "$DROOT" hot-news >/dev/null
 FOUND=""
 for _ in $(seq 1 80); do
-  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | grep -q hot-news; then
+  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | qgrep hot-news; then
     FOUND=1; break
   fi
   sleep 0.25
@@ -593,7 +620,7 @@ done
 $PVFS remote --socket "$SOCK" mkdir "$DROOT" hot-news-2 >/dev/null
 FOUND2=""
 for _ in $(seq 1 80); do
-  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | grep -q hot-news-2; then
+  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | qgrep hot-news-2; then
     FOUND2=1; break
   fi
   sleep 0.25
@@ -621,8 +648,8 @@ if [ -n "$BOBKEY" ] && [ "$BOBKEY" != "$CLIENTKEY" ]; then ok "Bob has a distinc
 # Owner sets up sharing directly (before serving): authorize Bob; grant rw on /shared only.
 SHARED_ID="$(pick_id "$($PVFS --json --data-dir "$U2/.pvfs" ls "$U2ROOT")" shared)"
 PRIVATE_ID="$(pick_id "$($PVFS --json --data-dir "$U2/.pvfs" ls "$U2ROOT")" private)"
-$PVFS --data-dir "$U2/.pvfs" device authorize-member --pubkey "$BOBKEY" >/dev/null && ok "owner authorized Bob as a member"
-$PVFS --data-dir "$U2/.pvfs" acl set "$SHARED_ID" "key:$BOBKEY" rw >/dev/null && ok "owner granted Bob rw on /shared"
+$PVFS --data-dir "$U2/.pvfs" device authorize-member --pubkey "$BOBKEY" >/dev/null && ok "owner authorized Bob as a member" || fail "owner authorized Bob as a member"
+$PVFS --data-dir "$U2/.pvfs" acl set "$SHARED_ID" "key:$BOBKEY" rw >/dev/null && ok "owner granted Bob rw on /shared" || fail "owner granted Bob rw on /shared"
 # Serve the multi-user forest.
 U2SOCK="$PVFS_SOCKET_DIR/$U2FID.sock"
 "$PVFSD" --mount "$U2" >/dev/null 2>&1 &
@@ -630,7 +657,7 @@ U2PID=$!
 for _ in $(seq 1 50); do [ -S "$U2SOCK" ] && break; sleep 0.1; done
 [ -S "$U2SOCK" ] && ok "multi-user daemon serving" || fail "multi-user socket missing"
 # Bob, signing as himself over the socket, reads + writes /shared (granted)...
-bob remote --socket "$U2SOCK" ls "$SHARED_ID" | grep -q note.txt && ok "Bob reads /shared (granted)"
+bob remote --socket "$U2SOCK" ls "$SHARED_ID" | qgrep note.txt && ok "Bob reads /shared (granted)" || fail "Bob reads /shared (granted)"
 BOBDIR="$(jget "$(bob --json remote --socket "$U2SOCK" mkdir "$SHARED_ID" bob-was-here)" created)"
 [ ${#BOBDIR} -eq 64 ] && ok "Bob writes under /shared (granted rw)" || fail "Bob mkdir under /shared: $BOBDIR"
 # ...but is denied /private (no grant) — denial now exits 5 (forbidden), not a generic 2.
@@ -654,9 +681,9 @@ DPID=""
 
 say "item 14: authorization audit (read-only)"
 # DMOUNT has tag grants/memberships, all under live authorities → audit is clean.
-$PVFS --data-dir "$DMOUNT/.pvfs" audit | grep -q "no stale authorizations" \
+$PVFS --data-dir "$DMOUNT/.pvfs" audit | qgrep "no stale authorizations" \
   && ok "audit reports a clean forest" || fail "audit clean-case text"
-$PVFS --json --data-dir "$DMOUNT/.pvfs" audit | grep -q '"inert_grants":\[\],"inert_memberships":\[\]' \
+$PVFS --json --data-dir "$DMOUNT/.pvfs" audit | qgrep '"inert_grants":\[\],"inert_memberships":\[\]' \
   && ok "audit json reports no inert rows" || fail "audit json shape"
 
 say "companion: phrase-free admit via the signing agent (doc 14 phase 3)"
@@ -744,11 +771,11 @@ assert_rc 4 "identity key already authorized on re-run" -- \
 # Tag the member under the identity key's authority (doc 10 §9.1) — no device key involved.
 $PVFS --data-dir "$CMOUNT/.pvfs" tag add "$CMEMBER" vip --via-companion --companion-socket "$CSOCK" >/dev/null \
   && ok "companion identity-signed tag add" || fail "companion tag add"
-$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | grep -q "\"tag\":\"vip\",\"authority\":\"$IDPUB\",\"active\":true" \
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | qgrep "\"tag\":\"vip\",\"authority\":\"$IDPUB\",\"active\":true" \
   && ok "tag authority is the identity key (active)" || fail "tag ls authority"
 $PVFS --data-dir "$CMOUNT/.pvfs" tag rm "$CMEMBER" vip --via-companion --companion-socket "$CSOCK" >/dev/null \
   && ok "companion identity-signed tag rm" || fail "companion tag rm"
-$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | grep -q '"tag":"vip"' \
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$CMEMBER" | qgrep '"tag":"vip"' \
   && fail "tag rm did not land" || ok "tag removed"
 # Revoke the member via the companion — socket auto-detected from the env, no flag.
 PVFS_COMPANION_SOCKET="$CSOCK" $PVFS --data-dir "$CMOUNT/.pvfs" device revoke --via-companion --pubkey "$CMEMBER" >/dev/null \
@@ -783,7 +810,7 @@ OLDID="$(jget "$RJSON" old)"; NEWID="$(jget "$RJSON" new)"
 [ -n "$NEWID" ] && [ "$OLDID" != "$NEWID" ] && ok "identity replaced (companion rotated + swap committed)" \
   || fail "identity replace: $RJSON"
 printf '%s' "$RJSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["handoff"]))' > "$DATA/handoff.json"
-$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$M2" | grep -q "\"tag\":\"crew\",\"authority\":\"$NEWID\",\"active\":true" \
+$PVFS --json --data-dir "$CMOUNT/.pvfs" tag ls "$M2" | qgrep "\"tag\":\"crew\",\"authority\":\"$NEWID\",\"active\":true" \
   && ok "grant re-homed to the new identity" || fail "reissue authority"
 # A second forest where the OLD key was a member: replace from the handoff.
 F2="$DATA/handoff-forest"; mkdir -p "$F2"
@@ -793,7 +820,7 @@ $PVFS --data-dir "$F2/.pvfs" device authorize-member --pubkey "$OLDID" >/dev/nul
 $PVFS --data-dir "$F2/.pvfs" tag add "$OLDID" vip >/dev/null 2>&1 || true
 $PVFS --data-dir "$F2/.pvfs" member replace "$DATA/handoff.json" >/dev/null \
   && ok "member replaced from the dual-signed handoff" || fail "member replace"
-$PVFS --json --data-dir "$F2/.pvfs" tag ls "$NEWID" | grep -q '"tag":"vip"' \
+$PVFS --json --data-dir "$F2/.pvfs" tag ls "$NEWID" | qgrep '"tag":"vip"' \
   && ok "tags re-granted to the new key" || fail "F2 regrant"
 python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); h["replaced_at_ms"]+=1; print(json.dumps(h))' \
   "$DATA/handoff.json" > "$DATA/handoff-bad.json"
@@ -830,7 +857,7 @@ assert_rc 3 "de-registering an unknown recovery key is NotFound" -- \
   sh -c "printf '%s' '$NEWMN' | $PVFS forest recovery-key --forest '$RCF' --revoke '$RK2'"
 # forest_id is unchanged across the rotation (identity is the log, not the key).
 RCFID="$(jget "$RCINIT" forest_id)"
-$PVFS --json --data-dir "$RCF/.pvfs" forest info | grep -q "\"forest_id\":\"$RCFID\"" \
+$PVFS --json --data-dir "$RCF/.pvfs" forest info | qgrep "\"forest_id\":\"$RCFID\"" \
   && ok "forest_id survives the rotation" || fail "forest_id changed"
 
 # identity agent (doc 14 §6): port file + token gate + headless connect denial.
@@ -846,10 +873,10 @@ http_status() { # http_status <method> <path> <token> — prints the status line
   head -n1 <&3
   exec 3<&-
 }
-http_status POST /connect badtoken | grep -q " 401 " && ok "web: bad token refused" || fail "web 401"
-http_status POST /connect "$WTOK" | grep -q " 403 " && ok "web: headless connect denied" || fail "web connect gate"
-http_status GET /identity "$WTOK" | grep -q " 403 " && ok "web: unconnected origin blocked" || fail "web identity gate"
-"$COMPANION" origins --vault "$CVAULT" | grep -q "no connected origins" && ok "origins list empty" || fail "origins list"
+http_status POST /connect badtoken | qgrep " 401 " && ok "web: bad token refused" || fail "web 401"
+http_status POST /connect "$WTOK" | qgrep " 403 " && ok "web: headless connect denied" || fail "web connect gate"
+http_status GET /identity "$WTOK" | qgrep " 403 " && ok "web: unconnected origin blocked" || fail "web identity gate"
+"$COMPANION" origins --vault "$CVAULT" | qgrep "no connected origins" && ok "origins list empty" || fail "origins list"
 
 # status: flagless via env defaults — reports the sealing and the live agent.
 PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status > "$DATA/status.txt" 2>&1 || true
@@ -857,7 +884,7 @@ grep -q "passphrase-sealed" "$DATA/status.txt" && ok "status reports the vault s
 grep -q "agent : running" "$DATA/status.txt" && ok "status sees the running agent" || fail "status agent up"
 kill -TERM "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
 CPID=""
-PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status 2>/dev/null | grep -q "agent : not running" \
+PVFS_COMPANION_VAULT="$CVAULT" PVFS_COMPANION_SOCKET="$CSOCK" "$COMPANION" status 2>/dev/null | qgrep "agent : not running" \
   && ok "status sees the stopped agent" || fail "status agent down"
 # (The headless root-signing denial without --allow-root is covered by the
 #  pvfs-companion unit/integration tests, not the smoke suite.)
@@ -868,8 +895,8 @@ TSOCK="$DATA/tenant.sock"
 # Provision two app-users, each with their own seed + password.
 AMN="$(jget "$($PVFS --json forest init --mount "$DATA/tf-alice")" mnemonic)"
 BMN="$(jget "$($PVFS --json forest init --mount "$DATA/tf-bob")" mnemonic)"
-printf '%s' "$AMN" | PVFS_COMPANION_PASSPHRASE=alicepw "$COMPANION" tenant-init --store "$TSTORE" --user alice >/dev/null 2>&1 && ok "provisioned tenant alice"
-printf '%s' "$BMN" | PVFS_COMPANION_PASSPHRASE=bobpw "$COMPANION" tenant-init --store "$TSTORE" --user bob >/dev/null 2>&1 && ok "provisioned tenant bob"
+printf '%s' "$AMN" | PVFS_COMPANION_PASSPHRASE=alicepw "$COMPANION" tenant-init --store "$TSTORE" --user alice >/dev/null 2>&1 && ok "provisioned tenant alice" || fail "provisioned tenant alice"
+printf '%s' "$BMN" | PVFS_COMPANION_PASSPHRASE=bobpw "$COMPANION" tenant-init --store "$TSTORE" --user bob >/dev/null 2>&1 && ok "provisioned tenant bob" || fail "provisioned tenant bob"
 "$COMPANION" serve-tenant --store "$TSTORE" --socket "$TSOCK" >/dev/null 2>&1 &
 TPID=$!
 for _ in $(seq 1 50); do [ -S "$TSOCK" ] && break; sleep 0.1; done
@@ -901,7 +928,7 @@ assert_rc 5 "tampered ciphertext refused at cat" -- $PVFS secure cat "$SNODE" --
 assert_rc 5 "tampered ciphertext fails verify" -- $PVFS secure verify "$SNODE"
 printf 'ct-v3' | $PVFS secure put "$SNODE" - --raw >/dev/null && ok "a fresh put repairs the blob" || fail "repair put"
 $PVFS secure verify "$SNODE" >/dev/null && ok "verify clean after repair" || fail "verify after repair"
-$PVFS --json secure status "$SNODE" | grep -q '"size":5' && ok "ledger head tracks size" || fail "secure status"
+$PVFS --json secure status "$SNODE" | qgrep '"size":5' && ok "ledger head tracks size" || fail "secure status"
 
 # Companion envelope (doc 12 §8.5): encrypt to the owner, decrypt via the agent.
 say "P3: secure blobs — companion envelope (doc 12 §8.5)"
@@ -925,7 +952,7 @@ grep -q 'dear diary' "$ESTORE/note.enc" && fail "plaintext leaked to disk" || ok
 [ "$($PVFS --data-dir "$DATA/enc-forest/.pvfs" secure cat "$ENODE" --companion-socket "$ESOCK")" = "dear diary" ] \
   && ok "secure cat (companion-decrypted) round-trips" || fail "encrypted cat"
 # --raw shows it really is an opaque envelope, not the message.
-$PVFS --data-dir "$DATA/enc-forest/.pvfs" secure cat "$ENODE" --raw | grep -q 'dear diary' && fail "raw exposed plaintext" || ok "raw cat yields the opaque envelope"
+$PVFS --data-dir "$DATA/enc-forest/.pvfs" secure cat "$ENODE" --raw | qgrep 'dear diary' && fail "raw exposed plaintext" || ok "raw cat yields the opaque envelope"
 # Grant a second key, then that key can find its wrap (unwrap needs its own companion; here we assert the wrap lands).
 GRANTEE="$(jget "$(XDG_CONFIG_HOME="$DATA/grantee" $PVFS --json whoami)" pubkey)"
 $PVFS --data-dir "$DATA/enc-forest/.pvfs" secure grant "$ENODE" "$GRANTEE" --companion-socket "$ESOCK" >/dev/null \
@@ -936,7 +963,18 @@ kill -TERM "$EPID" 2>/dev/null || true; wait "$EPID" 2>/dev/null || true
 EPID=""
 
 say "json error shape"
-$PVFS --json node deadbeef 2>&1 | grep -q '"error":"NotFound"' && ok "json error variant"
+# A well-formed but nonexistent 64-hex id is NotFound; short garbage like
+# "deadbeef" is not a valid id / URI / path, so it is BadInput. The failing
+# command exits nonzero (by contract), so capture output and rc separately —
+# `cmd | grep` fails via pipefail even when the shape matches, which is why
+# the old one-liner variant of this check could never fire.
+NOID="$(printf 'ab%.0s' $(seq 1 32))"
+NORC=0; NOJSON="$($PVFS --json node "$NOID" 2>&1)" || NORC=$?
+[ "$NORC" -eq 3 ] && printf '%s' "$NOJSON" | qgrep '"error":"NotFound"' \
+  && ok "json NotFound error variant (rc=3)" || fail "json NotFound variant (rc=$NORC): $NOJSON"
+BADRC=0; BADJSON="$($PVFS --json node deadbeef 2>&1)" || BADRC=$?
+[ "$BADRC" -eq 2 ] && printf '%s' "$BADJSON" | qgrep '"error":"BadInput"' \
+  && ok "json BadInput error variant (rc=2)" || fail "json BadInput variant (rc=$BADRC): $BADJSON"
 
 echo
 echo "smoke results: $PASS passed, $FAIL failed"
