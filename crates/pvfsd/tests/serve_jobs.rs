@@ -92,14 +92,22 @@ fn daemon_without_runner_reports_off() {
     assert!(rows.is_empty());
 }
 
+/// One process-wide config dir: tests run on threads, and the client
+/// identity is resolved through env — two tests racing `XDG_CONFIG_HOME`
+/// to different dirs would flake. Same dir → same identity, no race.
+fn test_config_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("XDG_CONFIG_HOME", d.path());
+    d.path()
+}
+
 /// P5.1's "done means": events authored on the owner appear on a replica via
 /// the daemon's `follow` job — no CLI follower process anywhere.
 #[test]
 fn follow_job_keeps_a_replica_fresh() {
-    // the job dials with the box's client identity — point it at a private
-    // config dir and authorize that identity on the owner's forest
-    let cfg = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+    // the job dials with the box's client identity — authorize it on the owner
+    test_config_dir();
     let client_mn = identity::client_identity_mnemonic().unwrap();
     let client_key = identity::device_key(&client_mn, "", 0).unwrap();
     let client_pub = crypto::pubkey_bytes(&client_key);
@@ -218,6 +226,175 @@ fn follow_job_keeps_a_replica_fresh() {
             "follow row never settled: {row:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    shutdown.store(true, Ordering::SeqCst);
+    runner.join().unwrap();
+}
+
+/// P5.2's "done means": content on the owner reaches a consumer's export
+/// view hands-free — follow folds it, sync pulls the bytes, export
+/// materializes it, all as daemon jobs.
+#[test]
+fn sync_and_export_jobs_keep_a_consumer_view_fresh() {
+    use pvfs_core::FilePayload;
+
+    test_config_dir();
+    let client_mn = identity::client_identity_mnemonic().unwrap();
+    let client_key = identity::device_key(&client_mn, "", 0).unwrap();
+    let client_pub = crypto::pubkey_bytes(&client_key);
+
+    // ---- owner: a folder with one real file, served on a unix socket
+    let odir = tempfile::tempdir().unwrap();
+    let (mut owner, owner_mn) = Engine::init(odir.path()).unwrap();
+    let root = owner.identity.root_node_id.clone();
+    owner.authorize_member(&owner_mn, &client_pub).unwrap();
+    owner
+        .set_acl(&root, &Principal::Key(client_pub.clone()), acl::ACL_RWA)
+        .unwrap();
+    let library = owner
+        .add_node(
+            &root,
+            pvfs_core::NodeSpec {
+                node_type: pvfs_core::TYPE_FOLDER.into(),
+                label: "library".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    let bytes_dir = tempfile::tempdir().unwrap();
+    let clip_path = bytes_dir.path().join("clip.mkv");
+    std::fs::write(&clip_path, b"movie-bytes").unwrap();
+    let clip = owner
+        .add_node(
+            &library,
+            pvfs_core::NodeSpec {
+                node_type: pvfs_core::TYPE_FILE.into(),
+                label: "clip.mkv".into(),
+                payload: FilePayload {
+                    content_hash: blake3::hash(b"movie-bytes").to_hex().to_string(),
+                    size_bytes: 11,
+                    mime_type: "video/x-matroska".into(),
+                    original_name: "clip.mkv".into(),
+                }
+                .encode(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    owner
+        .add_location(
+            &clip,
+            &pvfs_core::storage::path_to_uri(&std::fs::canonicalize(&clip_path).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("owner.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(owner));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+
+    // ---- consumer: replica + placement + a kept-fresh export + all jobs on
+    let mut client = Client::connect_signed(&sock, &client_pub, |d| {
+        crypto::sign_digest(&client_key, d).unwrap()
+    })
+    .unwrap();
+    let rdir = tempfile::tempdir().unwrap();
+    let rdata = rdir.path().join(".pvfs");
+    {
+        let mut store = ReplicaStore::open(&rdata).unwrap();
+        let mut from = 1;
+        loop {
+            let (_tip, events) = client.log_read(from, 64).unwrap();
+            if events.is_empty() {
+                break;
+            }
+            let rows: Vec<EventRow> = events
+                .iter()
+                .map(|w| EventRow {
+                    seq: w.seq,
+                    kind: w.kind.clone(),
+                    body: hex::decode(&w.body).unwrap(),
+                    chain_hash: hex::decode(&w.chain_hash).unwrap(),
+                    written_at: w.written_at,
+                })
+                .collect();
+            from = store.append(&rows).unwrap() + 1;
+        }
+    }
+    ReplicaSource {
+        transport: "socket".into(),
+        target: sock.to_string_lossy().into_owned(),
+        pin: String::new(),
+    }
+    .save(&rdata)
+    .unwrap();
+    pvfs_core::sync::set_placement(&rdata, &library, true).unwrap();
+    let view = tempfile::tempdir().unwrap();
+    pvfs_core::serve::upsert_export(
+        &rdata,
+        pvfs_core::serve::ExportEntry {
+            node: library.clone(),
+            mode: "copy".into(),
+            fetch: false,
+            prune: true,
+            dest: view.path().to_path_buf(),
+        },
+    )
+    .unwrap();
+    for job in ["follow", "sync", "export"] {
+        serve_cfg::set_job(&rdata, job, true).unwrap();
+    }
+    let jobs = Arc::new(JobsState::load(rdata.clone()).unwrap());
+    let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let runner = {
+        let j = Arc::clone(&jobs);
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+    };
+
+    // ---- startup passes: bytes fetched from the source, view materialized
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let exported_clip = view.path().join("clip.mkv");
+    loop {
+        if std::fs::read(&exported_clip).map(|b| b == b"movie-bytes").unwrap_or(false) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sync+export never materialized the view; rows: {:?}",
+            jobs.snapshot()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    // ---- live: an owner-side mkdir flows through follow → export refresh
+    client
+        .mkdir(&library, "new-season", |d| {
+            crypto::sign_digest(&client_key, d).unwrap()
+        })
+        .unwrap();
+    let new_dir = view.path().join("new-season");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if new_dir.is_dir() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live change never reached the export view; rows: {:?}",
+            jobs.snapshot()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     shutdown.store(true, Ordering::SeqCst);

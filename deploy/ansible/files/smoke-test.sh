@@ -651,9 +651,16 @@ done
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null || true
 FPID=""
 
-say "P5.1: the follow job — a serving replica daemon stays fresh by itself (doc 18 §5)"
+say "P5.1/P5.2: daemon jobs — follow, sync, export keep a consumer fresh (doc 18 §5)"
 $PVFS --data-dir "$REPMOUNT/.pvfs" serve enable follow >/dev/null \
   && ok "follow enabled on the replica" || fail "enable follow"
+$PVFS --data-dir "$REPMOUNT/.pvfs" serve enable sync >/dev/null \
+  && $PVFS --data-dir "$REPMOUNT/.pvfs" serve enable export >/dev/null \
+  && ok "sync + export jobs enabled" || fail "enable sync/export"
+$PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/kept-view" --mode copy --prune --keep-fresh >/dev/null \
+  && ok "export --keep-fresh recorded the view" || fail "export --keep-fresh"
+$PVFS --data-dir "$REPMOUNT/.pvfs" serve exports | qgrep kept-view \
+  && ok "serve exports lists it" || fail "serve exports"
 REPJSOCK="$DATA/replica-jobs.sock"
 "$PVFSD" --mount "$REPMOUNT" --socket "$REPJSOCK" >/dev/null 2>"$DATA/repjobs.log" &
 JPID=$!
@@ -668,10 +675,33 @@ for _ in $(seq 1 80); do
 done
 [ -n "$JFOUND" ] && ok "daemon follow job folded the owner's event (no CLI follower)" \
   || fail "follow job: $(tail -3 "$DATA/repjobs.log")"
+# the fold nudges the export job — the kept-fresh view refreshes by itself
+VFOUND=""
+for _ in $(seq 1 80); do
+  [ -d "$DATA/kept-view/job-news" ] && { VFOUND=1; break; }
+  sleep 0.25
+done
+[ -n "$VFOUND" ] && ok "export job refreshed the kept-fresh view" \
+  || fail "export view stale: $(ls "$DATA/kept-view" 2>/dev/null | tail -3)"
+# a new file's BYTES flow too: catalog on the owner → view serves the content
+printf 'fresh-bytes' > "$DATA/fresh-bytes.bin"
+FB="$(jget "$($PVFS --json remote --socket "$SOCK" add-file "$DROOT" fresh-bytes.bin --size 11)" created)"
+$PVFS remote --socket "$SOCK" add-location "$FB" "file://$DATA/fresh-bytes.bin" >/dev/null
+BFOUND=""
+for _ in $(seq 1 80); do
+  if [ "$(cat "$DATA/kept-view/fresh-bytes.bin" 2>/dev/null)" = "fresh-bytes" ]; then
+    BFOUND=1; break
+  fi
+  sleep 0.25
+done
+[ -n "$BFOUND" ] && ok "new owner file reached the view (follow → sync → export)" \
+  || fail "byte flow to the view"
 kill -TERM "$JPID" 2>/dev/null; wait "$JPID" 2>/dev/null || true
 JPID=""
 $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable follow >/dev/null \
-  && ok "follow disabled again" || fail "disable follow"
+  && $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable sync >/dev/null \
+  && $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable export >/dev/null \
+  && ok "jobs disabled again" || fail "disable jobs"
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

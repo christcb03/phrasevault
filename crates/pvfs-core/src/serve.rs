@@ -83,9 +83,118 @@ pub fn set_job(data_dir: &Path, job: &str, enabled: bool) -> Result<bool> {
     Ok(true)
 }
 
+// ---- kept-fresh exports (the export job's work list, doc 18 §5 P5.2) --------
+
+const EXPORTS_FILE: &str = "serve.exports";
+const EXPORTS_HEADER: &str = "pvfs-serve-exports 1";
+
+/// One export the daemon keeps fresh: re-run `export` for `node` into `dest`
+/// whenever content changes. Recorded by `pvfs export --keep-fresh` — the
+/// entry captures exactly the flags that run was invoked with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportEntry {
+    pub node: String,
+    pub mode: String,
+    pub fetch: bool,
+    pub prune: bool,
+    pub dest: std::path::PathBuf,
+}
+
+pub fn exports_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(EXPORTS_FILE)
+}
+
+/// Kept-fresh exports, file order. Missing file = none.
+pub fn load_exports(data_dir: &Path) -> Result<Vec<ExportEntry>> {
+    let text = match std::fs::read_to_string(exports_path(data_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(PvfsError::io("read serve.exports", e)),
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(EXPORTS_HEADER) {
+        return Err(bad("serve", "unrecognized serve.exports file"));
+    }
+    let mut out = Vec::new();
+    for line in lines.filter(|l| !l.trim().is_empty()) {
+        // "<node> <mode> <fetch 0|1> <prune 0|1> <dest…>" — dest may hold spaces
+        let mut parts = line.splitn(5, ' ');
+        match (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
+            (Some(node), Some(mode), Some(fetch), Some(prune), Some(dest))
+                if !dest.is_empty() =>
+            {
+                out.push(ExportEntry {
+                    node: node.to_string(),
+                    mode: mode.to_string(),
+                    fetch: fetch == "1",
+                    prune: prune == "1",
+                    dest: std::path::PathBuf::from(dest),
+                });
+            }
+            _ => return Err(bad("serve", &format!("corrupt serve.exports line: {line:?}"))),
+        }
+    }
+    Ok(out)
+}
+
+fn save_exports(data_dir: &Path, entries: &[ExportEntry]) -> Result<()> {
+    let mut text = String::from(EXPORTS_HEADER);
+    text.push('\n');
+    for e in entries {
+        text.push_str(&format!(
+            "{} {} {} {} {}\n",
+            e.node,
+            e.mode,
+            u8::from(e.fetch),
+            u8::from(e.prune),
+            e.dest.display()
+        ));
+    }
+    crate::storage::atomic_overwrite(&exports_path(data_dir), text.as_bytes())
+}
+
+/// Record (or update — same node+dest replaces) a kept-fresh export.
+pub fn upsert_export(data_dir: &Path, entry: ExportEntry) -> Result<()> {
+    let mut entries = load_exports(data_dir)?;
+    entries.retain(|e| !(e.node == entry.node && e.dest == entry.dest));
+    entries.push(entry);
+    save_exports(data_dir, &entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_round_trip_and_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_exports(dir.path()).unwrap().is_empty());
+        let e = ExportEntry {
+            node: "a".repeat(64),
+            mode: "symlink".into(),
+            fetch: true,
+            prune: true,
+            dest: std::path::PathBuf::from("/srv/plex library"), // space kept
+        };
+        upsert_export(dir.path(), e.clone()).unwrap();
+        assert_eq!(load_exports(dir.path()).unwrap(), vec![e.clone()]);
+        // same node+dest replaces rather than duplicates
+        let e2 = ExportEntry {
+            mode: "copy".into(),
+            ..e.clone()
+        };
+        upsert_export(dir.path(), e2.clone()).unwrap();
+        assert_eq!(load_exports(dir.path()).unwrap(), vec![e2]);
+        // corrupt file refuses
+        std::fs::write(exports_path(dir.path()), "wrong\n").unwrap();
+        assert!(load_exports(dir.path()).is_err());
+    }
 
     #[test]
     fn missing_file_means_no_jobs() {

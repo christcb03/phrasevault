@@ -22,9 +22,14 @@ const FOLLOW_POLL_MS: u64 = 5_000;
 /// How long after a fatal job error before the supervisor tries again.
 const FATAL_RETRY: Duration = Duration::from_secs(60);
 
-/// Jobs that run as their own long-lived thread (the rest fire per tick —
-/// none yet; P5.2+).
+/// Jobs that run as their own long-lived thread.
 const CONTINUOUS: [&str; 1] = ["follow"];
+/// Jobs that run as short passes — on a content nudge (a follow fold, a
+/// fetching sync) or a safety interval, whichever comes first. A pass also
+/// runs once at daemon start, catching up after downtime.
+const PERIODIC: [&str; 2] = ["sync", "export"];
+const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -38,6 +43,9 @@ fn now_ms() -> u64 {
 pub struct JobsState {
     data_dir: PathBuf,
     rows: Mutex<Vec<ServeJobWire>>,
+    /// Content changed (a follow fold): sync and export should run soon.
+    nudge_sync: AtomicBool,
+    nudge_export: AtomicBool,
 }
 
 impl JobsState {
@@ -48,6 +56,8 @@ impl JobsState {
         let s = JobsState {
             data_dir,
             rows: Mutex::new(Vec::new()),
+            nudge_sync: AtomicBool::new(false),
+            nudge_export: AtomicBool::new(false),
         };
         s.reload()?;
         Ok(s)
@@ -123,6 +133,32 @@ impl JobsState {
     fn row(&self, name: &str) -> Option<ServeJobWire> {
         self.rows.lock().unwrap().iter().find(|r| r.name == name).cloned()
     }
+
+    /// Content changed — run the content-consuming passes soon.
+    fn nudge_content(&self) {
+        self.nudge_sync.store(true, Ordering::SeqCst);
+        self.nudge_export.store(true, Ordering::SeqCst);
+    }
+
+    fn take_nudge(&self, name: &str) -> bool {
+        match name {
+            "sync" => self.nudge_sync.swap(false, Ordering::SeqCst),
+            "export" => self.nudge_export.swap(false, Ordering::SeqCst),
+            _ => false,
+        }
+    }
+
+    /// A completed pass: back to idle, stamped; issues (per-file failures or
+    /// a failed pass) land in `last_error` until a clean pass clears them.
+    fn mark_pass(&self, name: &str, issue: Option<String>) {
+        self.with_row(name, |r| {
+            r.state = "idle".into();
+            if issue.is_none() {
+                r.last_ok_ms = Some(now_ms());
+            }
+            r.last_error = issue;
+        });
+    }
 }
 
 /// A continuous job's thread and its stop flag.
@@ -143,7 +179,11 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 let cb_state = Arc::clone(&st);
                 let r = follow::run(&data_dir, FOLLOW_POLL_MS, &flag, |ev| match ev {
                     FollowEvent::Connected { .. } => cb_state.set_state("follow", "running"),
-                    FollowEvent::CaughtUp { .. } => cb_state.mark_ok("follow"),
+                    FollowEvent::CaughtUp { .. } => {
+                        cb_state.mark_ok("follow");
+                        // fresh content — the consuming passes should run now
+                        cb_state.nudge_content();
+                    }
                     FollowEvent::Retrying { reason } => cb_state.mark_retry("follow", &reason),
                 });
                 match r {
@@ -166,6 +206,88 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
     Managed { stop, handle }
 }
 
+/// One sync pass: fetch missing bytes for every `sync`-placed subtree.
+/// Nothing placed is a clean no-op — the job idles until placement exists.
+fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsError> {
+    let data_dir = state.data_dir().clone();
+    let roots = pvfs_core::sync::load_placement(&data_dir)?;
+    if roots.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let mut engine = pvfs_core::Engine::open(&data_dir)?;
+    let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
+    let r = pvfs_client::fetch::sync_pull(&mut engine, &mut fetcher, &roots);
+    engine.close()?;
+    r
+}
+
+/// One export pass: re-run every kept-fresh export (`pvfs export
+/// --keep-fresh`), fetching first where the entry asked for it.
+fn export_pass(state: &JobsState) -> Result<u64, PvfsError> {
+    let data_dir = state.data_dir().clone();
+    let entries = pvfs_core::serve::load_exports(&data_dir)?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut engine = pvfs_core::Engine::open(&data_dir)?;
+    let mut fetcher: Option<pvfs_client::fetch::Fetcher> = None;
+    let mut exported = 0u64;
+    for e in &entries {
+        if e.fetch {
+            let f = fetcher.get_or_insert_with(|| pvfs_client::fetch::Fetcher::new(&data_dir));
+            // per-file fetch failures are the export's skips, not a pass error
+            let _ = pvfs_client::fetch::sync_pull(&mut engine, f, std::slice::from_ref(&e.node));
+        }
+        let spec = pvfs_core::ExportSpec {
+            mode: pvfs_core::ExportMode::parse(&e.mode)?,
+            prune: e.prune,
+        };
+        let report = engine.export_tree(&e.node, &e.dest, &spec)?;
+        exported += report.exported as u64;
+    }
+    engine.close()?;
+    Ok(exported)
+}
+
+fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
+    let stop = Arc::new(AtomicBool::new(false)); // passes are short; uniform bookkeeping
+    let st = Arc::clone(state);
+    let handle = match name {
+        "sync" => std::thread::spawn(move || {
+            st.set_state("sync", "running");
+            match sync_pass(&st) {
+                Ok((fetched, failed)) => {
+                    let issue = failed.first().map(|(label, e)| {
+                        format!("{} fetch failures (first: {label} — {e})", failed.len())
+                    });
+                    st.mark_pass("sync", issue);
+                    if fetched > 0 {
+                        // new bytes landed — refresh the export views now
+                        st.nudge_export.store(true, Ordering::SeqCst);
+                    }
+                }
+                Err(e) => st.mark_pass("sync", Some(e.to_string())),
+            }
+        }),
+        "export" => std::thread::spawn(move || {
+            st.set_state("export", "running");
+            match export_pass(&st) {
+                Ok(_) => st.mark_pass("export", None),
+                Err(e) => st.mark_pass("export", Some(e.to_string())),
+            }
+        }),
+        other => unreachable!("no pass body for job {other}"),
+    };
+    Managed { stop, handle }
+}
+
+fn interval(name: &str) -> Duration {
+    match name {
+        "sync" => SYNC_INTERVAL,
+        _ => EXPORT_INTERVAL,
+    }
+}
+
 /// The supervisor loop. Polls `reload` (SIGHUP) and `shutdown` (SIGTERM/INT);
 /// reconciles configured jobs against live threads each tick; a failed reload
 /// keeps the previous config and logs — a running fleet box must not lose its
@@ -174,6 +296,7 @@ pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
     let mut running: HashMap<String, Managed> = HashMap::new();
     let mut draining: Vec<Managed> = Vec::new();
     let mut retry_at: HashMap<String, Instant> = HashMap::new();
+    let mut next_due: HashMap<String, Instant> = HashMap::new();
 
     while !shutdown.load(Ordering::SeqCst) {
         if reload.swap(false, Ordering::SeqCst) {
@@ -213,6 +336,29 @@ pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
                     draining.push(m);
                 }
                 retry_at.remove(name);
+            }
+        }
+
+        for name in PERIODIC {
+            let enabled = state.row(name).map(|r| r.enabled).unwrap_or(false);
+            if !enabled {
+                next_due.remove(name);
+                continue;
+            }
+            let live = running
+                .get(name)
+                .map(|m| !m.handle.is_finished())
+                .unwrap_or(false);
+            if live {
+                continue; // a set nudge stays set; consumed after this pass ends
+            }
+            if let Some(m) = running.remove(name) {
+                let _ = m.handle.join();
+            }
+            let due = next_due.get(name).map_or(true, |t| Instant::now() >= *t);
+            if state.take_nudge(name) || due {
+                next_due.insert(name.to_string(), Instant::now() + interval(name));
+                running.insert(name.to_string(), spawn_pass(name, &state));
             }
         }
 

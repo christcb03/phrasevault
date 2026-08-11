@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use pvfs_client::fetch::{sync_pull, Fetcher};
 use pvfs_client::Client;
 use pvfs_core::{
     acl, crypto, identity, mount, BindSpec, ByteRange, Engine, FilePayload, HashPolicy, NodeSpec,
@@ -203,6 +204,10 @@ enum Cmd {
         /// first fetch missing bytes from the replica's source (F3, doc 17 §6)
         #[arg(long)]
         fetch: bool,
+        /// record this export for the daemon's export job to keep fresh
+        /// (P5.2, doc 18 §5) — re-run with the same flags on content change
+        #[arg(long)]
+        keep_fresh: bool,
     },
     /// Set a subtree's placement: `sync` keeps bytes local (doc 17 §6);
     /// `central --to <dir>` makes the mover keep verified copies there
@@ -609,6 +614,8 @@ enum ServeCmd {
     Disable { job: String },
     /// List the jobs this data dir is configured to run
     Ls,
+    /// List the exports the export job keeps fresh (`pvfs export --keep-fresh`)
+    Exports,
     /// Ask the running daemon for live job-runner state
     Status,
 }
@@ -690,12 +697,6 @@ fn remote_payload_bytes(arg: &str) -> Result<Vec<u8>, PvfsError> {
     }
 }
 
-/// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
-fn pvfs_config_dir() -> Result<PathBuf, PvfsError> {
-    // One source of truth in core since P5.1 (the daemon reads it too).
-    identity::config_dir()
-}
-
 /// Load (or create on first use) this machine's client identity (doc 07 §2),
 /// stored as a recovery phrase at `<config>/identity.phrase` (mode 0600). The
 /// signing key is `device_key(0)` of that phrase.
@@ -703,30 +704,13 @@ fn pvfs_config_dir() -> Result<PathBuf, PvfsError> {
 /// pairs in `<config>/instances`, one `name addr pin` line each. Manual,
 /// explicit trust — adding an entry IS the pinning step.
 fn instances_path() -> Result<PathBuf, PvfsError> {
-    Ok(pvfs_config_dir()?.join("instances"))
+    // Reads moved to pvfs-client (P5.2) so daemon jobs resolve holders the
+    // same way; the CLI still owns writes, against the same path.
+    pvfs_client::fetch::instances_path()
 }
 
 fn load_instances() -> Result<Vec<(String, String, String)>, PvfsError> {
-    let path = instances_path()?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(PvfsError::io("read instances", e)),
-    };
-    let mut out = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let mut parts = line.split_whitespace();
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some(n), Some(a), Some(p)) => out.push((n.into(), a.into(), p.into())),
-            _ => {
-                return Err(PvfsError::BadInput {
-                    field: "instances".into(),
-                    reason: format!("corrupt registry line: {line:?}"),
-                })
-            }
-        }
-    }
-    Ok(out)
+    pvfs_client::fetch::load_instances()
 }
 
 fn save_instances(list: &[(String, String, String)]) -> Result<(), PvfsError> {
@@ -808,98 +792,6 @@ fn replica_client(src: &pvfs_core::ReplicaSource) -> Result<Client, PvfsError> {
     }
 }
 
-/// Fetches missing bytes from wherever they can be reached (F5.2, doc 17
-/// §7.3). Per file, candidates are tried in order: every `pvfs-host://`
-/// location whose pin the instance registry knows (that host *definitely*
-/// holds the bytes), then the replica's recorded source (which resolves its
-/// own locations). Connections are pooled per target; dead targets are
-/// remembered and not re-dialed.
-struct Fetcher {
-    pool: std::collections::HashMap<String, Client>,
-    dead: std::collections::HashSet<String>,
-    instances: Vec<(String, String, String)>,
-    source: Option<pvfs_core::ReplicaSource>,
-}
-
-impl Fetcher {
-    fn new(data_dir: &std::path::Path) -> Fetcher {
-        Fetcher {
-            pool: std::collections::HashMap::new(),
-            dead: std::collections::HashSet::new(),
-            instances: load_instances().unwrap_or_default(),
-            source: pvfs_core::ReplicaSource::load(data_dir).ok(),
-        }
-    }
-
-    /// Where `id`'s bytes might be fetched from, best candidate first.
-    fn candidates(&self, engine: &Engine, id: &str) -> Vec<pvfs_core::ReplicaSource> {
-        let mut out: Vec<pvfs_core::ReplicaSource> = Vec::new();
-        for loc in engine.locations(&id.to_string()).unwrap_or_default() {
-            if let Some((pin, _path)) = pvfs_core::storage::parse_host_uri(&loc) {
-                if let Some((_, addr, _)) = self.instances.iter().find(|(_, _, p)| p == pin) {
-                    out.push(pvfs_core::ReplicaSource {
-                        transport: "tcp".into(),
-                        target: addr.clone(),
-                        pin: pin.to_string(),
-                    });
-                }
-            }
-        }
-        if let Some(src) = &self.source {
-            out.push(src.clone());
-        }
-        out.dedup_by(|a, b| a.transport == b.transport && a.target == b.target);
-        out
-    }
-
-    /// Fetch one file into the sync store, verified. `Err` is the last
-    /// candidate's failure (or why there were none).
-    fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), String> {
-        let candidates = self.candidates(engine, id);
-        if candidates.is_empty() {
-            return Err("no reachable source holds this file (register the holding \
-                        instance with `pvfs instance add`)"
-                .into());
-        }
-        let mut last_err = String::new();
-        for cand in candidates {
-            let key = format!("{}:{}", cand.transport, cand.target);
-            if self.dead.contains(&key) {
-                continue;
-            }
-            if !self.pool.contains_key(&key) {
-                match replica_client(&cand) {
-                    Ok(c) => {
-                        self.pool.insert(key.clone(), c);
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                        self.dead.insert(key);
-                        continue;
-                    }
-                }
-            }
-            let client = self.pool.get_mut(&key).expect("inserted above");
-            let mut sink = match engine.sync_begin(&id.to_string()) {
-                Ok(s) => s,
-                Err(e) => return Err(e.to_string()),
-            };
-            match client.cat(id, &mut sink) {
-                Ok(_) => match engine.sync_commit(sink) {
-                    Ok(_) => return Ok(()),
-                    Err(e) => last_err = e.to_string(),
-                },
-                Err(e) => {
-                    // a failed stream may leave the connection out of step
-                    last_err = e.to_string();
-                    self.pool.remove(&key);
-                }
-            }
-        }
-        Err(last_err)
-    }
-}
-
 /// A logged location that resolves on THIS host (central-satisfying, F5.3):
 /// a `file://` path that exists, or a `pvfs-host://` under our own pin whose
 /// path exists. Synthesized sync-store entries never count — they aren't
@@ -914,26 +806,6 @@ fn logged_local_location(uri: &str, own_pin: &Option<String>) -> bool {
     false
 }
 
-/// Fetch missing bytes under `roots`, streaming each file into the managed
-/// sync store (hash-verified on commit). Returns `(fetched, failures)` —
-/// per-file failures never abort the pass.
-fn sync_pull(
-    engine: &mut Engine,
-    fetcher: &mut Fetcher,
-    roots: &[String],
-) -> Result<(u64, Vec<(String, String)>), PvfsError> {
-    let mut fetched = 0u64;
-    let mut failed = Vec::new();
-    for root in roots {
-        for (id, label) in engine.missing_bytes(root)? {
-            match fetcher.fetch(engine, &id) {
-                Ok(()) => fetched += 1,
-                Err(e) => failed.push((label, e)),
-            }
-        }
-    }
-    Ok((fetched, failed))
-}
 
 /// Pull the source log from `from` until caught up, ingesting verbatim rows
 /// (chain-verified per batch). Returns the number of events ingested.
@@ -3291,6 +3163,39 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
+                ServeCmd::Exports => {
+                    let entries = pvfs_core::serve::load_exports(&data_dir)?;
+                    if json {
+                        let rows: Vec<String> = entries
+                            .iter()
+                            .map(|e| {
+                                format!(
+                                    "{{\"node\":\"{}\",\"mode\":\"{}\",\"fetch\":{},\"prune\":{},\"dest\":\"{}\"}}",
+                                    e.node,
+                                    e.mode,
+                                    e.fetch,
+                                    e.prune,
+                                    json_escape(&e.dest.display().to_string())
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", rows.join(","));
+                    } else if entries.is_empty() {
+                        println!("no kept-fresh exports (record one: pvfs export <node> <dest> --keep-fresh)");
+                    } else {
+                        for e in &entries {
+                            let mut flags = vec![e.mode.clone()];
+                            if e.fetch {
+                                flags.push("fetch".into());
+                            }
+                            if e.prune {
+                                flags.push("prune".into());
+                            }
+                            println!("{}  {}  [{}]", e.node, e.dest.display(), flags.join(","));
+                        }
+                    }
+                    Ok(())
+                }
                 ServeCmd::Status => {
                     let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
                         field: "serve".into(),
@@ -3358,7 +3263,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             };
             let data_dir = engine.data_dir().to_path_buf();
             let mut fetcher = Fetcher::new(&data_dir);
-            if fetcher.source.is_none() && fetcher.instances.is_empty() {
+            if !fetcher.has_any_source() {
                 return Err(PvfsError::BadInput {
                     field: "sync".into(),
                     reason: "nothing to fetch from — this forest has no replica source and \
@@ -3964,6 +3869,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             mode,
             prune,
             fetch,
+            keep_fresh,
         } => {
             let (mut engine, id) = engine_and_node(ctx, &target)?;
             if fetch {
@@ -4020,6 +3926,25 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
                 for s in &report.skipped {
                     eprintln!("skipped: {} — {}", s.path, s.reason);
+                }
+            }
+            if keep_fresh {
+                // record with an absolute dest — the daemon's job runs from
+                // its own cwd, not this shell's
+                let abs = std::fs::canonicalize(&dest)
+                    .map_err(|e| PvfsError::io("resolve export dest", e))?;
+                pvfs_core::serve::upsert_export(
+                    engine.data_dir(),
+                    pvfs_core::serve::ExportEntry {
+                        node: id.clone(),
+                        mode: mode.clone(),
+                        fetch,
+                        prune,
+                        dest: abs,
+                    },
+                )?;
+                if !json {
+                    eprintln!("recorded for the export job (enable it: pvfs serve enable export)");
                 }
             }
             engine.close()

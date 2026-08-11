@@ -22,6 +22,7 @@ use pvfs_proto::{
 
 pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo, ServeJobWire};
 
+pub mod fetch;
 pub mod follow;
 
 /// The client's transport: both arms speak identical frames.
