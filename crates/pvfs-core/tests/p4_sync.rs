@@ -107,6 +107,55 @@ fn abandoned_sink_cleans_up() {
     assert!(leftovers.is_empty(), "no partial files: {leftovers:?}");
 }
 
+// kill -9 mid-fetch never runs the sink's Drop; the startup sweep removes the
+// leftover tmp but nothing else in the store (2026-08-11 chaos finding)
+#[test]
+fn startup_sweep_removes_orphaned_tmps() {
+    let (dir, mut engine) = new_forest();
+    let root = engine.identity.root_node_id.clone();
+    let file = engine
+        .add_node(&root, file_spec("d.bin", b"data-bytes", true))
+        .unwrap();
+
+    // simulate the kill: an in-flight sink whose Drop never runs
+    let mut sink = engine.sync_begin(&file).unwrap();
+    sink.write_all(b"half").unwrap();
+    std::mem::forget(sink);
+    let orphans = walkdir_files(&dir.path().join("synced"));
+    assert_eq!(orphans.len(), 1, "orphan tmp on disk: {orphans:?}");
+
+    // committed bytes and non-tmp names must survive the sweep
+    let kept = engine
+        .add_node(&root, file_spec("keep.bin", b"keep-bytes", true))
+        .unwrap();
+    let mut s = engine.sync_begin(&kept).unwrap();
+    s.write_all(b"keep-bytes").unwrap();
+    let published = engine.sync_commit(s).unwrap();
+    let stray_dir = dir.path().join("synced").join("zz");
+    std::fs::create_dir_all(&stray_dir).unwrap();
+    let stray = stray_dir.join("notes.txt");
+    std::fs::write(&stray, b"not a fetch tmp").unwrap();
+
+    assert_eq!(sync::sweep_orphan_tmps(dir.path()).unwrap(), 1);
+    assert!(!orphans[0].exists(), "orphan tmp removed");
+    assert!(published.exists(), "committed store file untouched");
+    assert!(stray.exists(), "non-tmp name untouched");
+
+    // a fresh in-flight tmp begun after the sweep is untouched and commits
+    let mut sink = engine.sync_begin(&file).unwrap();
+    sink.write_all(b"data").unwrap();
+    assert_eq!(walkdir_files(&dir.path().join("synced")).len(), 3, "new tmp present");
+    sink.write_all(b"-bytes").unwrap();
+    engine.sync_commit(sink).unwrap();
+    let mut out = Vec::new();
+    engine.cat(&file, None, &mut out).unwrap();
+    assert_eq!(out, b"data-bytes");
+
+    // a forest that never synced (no store dir) sweeps to a clean zero
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(sync::sweep_orphan_tmps(empty.path()).unwrap(), 0);
+}
+
 fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
