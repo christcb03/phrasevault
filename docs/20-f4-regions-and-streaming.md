@@ -132,5 +132,15 @@ phase validates on presubuntu before its commit, as always.
   replication once, on real per-region logs, instead of shipping a throwaway
   verification mode for the single-log era. Per §5's rule (no half-landed phases),
   nothing of P7.1 was committed.
-- **P7.3 (FUSE mount): in build the same night** — independent of the region
-  decision.
+- **P7.3 landed** (`7239d8a`, validated: 212 tests incl. a real kernel
+  mount+read, 306 smoke incl. mounting a replica through the VFS, clippy clean):
+  the pvfs-fuse crate (pure-Rust fuser; runtime dep = fusermount3, added to the
+  pipeline prepare stage), `pvfs mount`/`umount` (Linux-gated), live byte
+  resolution with verified read-through at open. As-built deviation: the first
+  open of an unfetched file blocks for the verified fetch — serve-while-fetching
+  is the recorded refinement, a natural companion to the swarm work (§6).
+- **Also this night, before P7:** P6 landed whole (doc 19, `7c868c0`), a latent
+  concurrent-fold race in projection catch-up was found by the smoke suite and
+  fixed (`58adaa2`), and the tmp-sweep session's fix merged (`b24d8f8`).
+- **Morning decisions for Chris:** (1) §7's P7.1→P7.2 merge proposal; (2) doc 19's
+  packaging intent — 1.4.0 = P5 + P6 + fixes, with P7.0/P7.3 riding or waiting.
