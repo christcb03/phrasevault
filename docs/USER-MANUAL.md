@@ -342,6 +342,15 @@ records an **instance-qualified location** — `pvfs-host://<the-box's-pin>/<pat
 knows *which machine* holds the bytes (the box needs a transport pin: run `pvfsd --listen` once).
 Any machine that registered the box (`pvfs instance add`) fetches from it on demand.
 
+**Admitting a box — one step.** An ACL grant alone does not confer authorship: the owner must
+also authorize the box's client identity as a *member*, or its writes are refused at ingest
+(`author not authorized` — default-deny working as designed). `pvfs fleet enroll` does both in
+one visible, logged, revocable step: it prompts for the box's key (`pvfs whoami` on that box)
+and grants `r` (consumer), `rw` (ingest), or `rwa` (replicator) at the root. **The owner's own
+boxes need enrolling too** on a private forest: every outbound connection — the mover's pulls
+and read-through included — authenticates as that box's client identity, never the forest
+device key (which never dials). Revoke any time: `pvfs acl set <root> key:<pubkey> ""`.
+
 ### 7.10 Tiered storage: migrate to a central store, reclaim the edge
 
 The ingest box shouldn't hold the bytes forever. On the **owner**, declare the central store and
@@ -374,6 +383,36 @@ everyone:    replica sync / read-through                  (available immediately
 owner NAS:   pvfs tier                                    (bytes migrate home)
 ingest box:  pvfs replica sync && pvfs evict              (3 TB stays free)
 ```
+
+### 7.11 The fleet runs itself — daemon jobs (doc 18)
+
+Every recurring loop above can run inside `pvfsd` instead of cron. Jobs are per-box
+deployment state (`serve.jobs`, edited by `pvfs serve enable|disable`, reloaded on
+SIGHUP or restart); `pvfs serve status` shows live state — running/idle/backoff, the
+last success, the last error:
+
+```bash
+# any replica: fold owner events within seconds (the F5.4 follower, in-daemon)
+pvfs serve enable follow
+
+# consumers: fetch bytes for sync-placed subtrees when content changes
+pvfs serve enable sync
+
+# consumers: record an export once, then let the daemon keep the view fresh
+pvfs export <library-node> /srv/plex-library --mode symlink --prune --keep-fresh
+pvfs serve enable export        # pvfs serve exports lists what's kept fresh
+
+# the owner: run the mover on an interval
+pvfs serve enable tier
+
+# the ingest box: reclaim retired bytes as the folds arrive
+pvfs serve enable evict
+```
+
+A follow fold nudges sync, export, and evict immediately (a fetching sync re-nudges
+export), with a 5-minute safety interval and a catch-up pass at daemon start behind
+it — so the §7.10 pipeline converges in seconds end to end with zero cron entries.
+Jobs dial with the box's client identity: enroll it first (§7.9).
 
 ---
 

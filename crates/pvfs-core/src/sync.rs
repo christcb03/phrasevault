@@ -130,6 +130,52 @@ pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path) -> Result<()> {
     save_placement(data_dir, &p)
 }
 
+// ---- edge eviction (F5.3's reclaim half; shared by CLI and daemon, P5.3) ----
+
+/// What one evict pass did. `skipped` carries `(uri, reason)` — expected
+/// holds (no other live location) and real failures alike; the caller
+/// decides how loudly to surface them.
+#[derive(Debug, Default)]
+pub struct EvictReport {
+    pub evicted: u64,
+    pub freed_bytes: u64,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Delete local bytes whose catalog location was retired by the mover —
+/// only ever when the catalog records another **live** location (synthesized
+/// sync-store entries never count: they aren't catalog truth).
+pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
+    let mut report = EvictReport::default();
+    for (id, uri, path) in engine.retired_own_host_locations()? {
+        let live_elsewhere = engine
+            .locations(&id)?
+            .iter()
+            .any(|u| !u.starts_with(SYNC_URI_PREFIX));
+        if !live_elsewhere {
+            report
+                .skipped
+                .push((uri, "no other live location recorded".into()));
+            continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_file() => {
+                let size = md.len();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.evicted += 1;
+                        report.freed_bytes += size;
+                    }
+                    Err(e) => report.skipped.push((uri, e.to_string())),
+                }
+            }
+            Ok(_) => report.skipped.push((uri, "not a regular file".into())),
+            Err(_) => {} // already gone — nothing to reclaim
+        }
+    }
+    Ok(report)
+}
+
 // ---- the sync sink ----------------------------------------------------------
 
 /// An in-flight fetch into the sync store: hashes while bytes stream in;

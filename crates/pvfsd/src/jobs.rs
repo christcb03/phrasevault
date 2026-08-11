@@ -26,10 +26,13 @@ const FATAL_RETRY: Duration = Duration::from_secs(60);
 const CONTINUOUS: [&str; 1] = ["follow"];
 /// Jobs that run as short passes — on a content nudge (a follow fold, a
 /// fetching sync) or a safety interval, whichever comes first. A pass also
-/// runs once at daemon start, catching up after downtime.
-const PERIODIC: [&str; 2] = ["sync", "export"];
+/// runs once at daemon start, catching up after downtime. `tier` (owner) is
+/// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
+const PERIODIC: [&str; 4] = ["sync", "export", "tier", "evict"];
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
+const TIER_INTERVAL: Duration = Duration::from_secs(300);
+const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -43,9 +46,11 @@ fn now_ms() -> u64 {
 pub struct JobsState {
     data_dir: PathBuf,
     rows: Mutex<Vec<ServeJobWire>>,
-    /// Content changed (a follow fold): sync and export should run soon.
+    /// Content changed (a follow fold): the consuming passes should run soon.
     nudge_sync: AtomicBool,
     nudge_export: AtomicBool,
+    /// A fold may carry the mover's retirements — evict follows content too.
+    nudge_evict: AtomicBool,
 }
 
 impl JobsState {
@@ -58,6 +63,7 @@ impl JobsState {
             rows: Mutex::new(Vec::new()),
             nudge_sync: AtomicBool::new(false),
             nudge_export: AtomicBool::new(false),
+            nudge_evict: AtomicBool::new(false),
         };
         s.reload()?;
         Ok(s)
@@ -138,12 +144,14 @@ impl JobsState {
     fn nudge_content(&self) {
         self.nudge_sync.store(true, Ordering::SeqCst);
         self.nudge_export.store(true, Ordering::SeqCst);
+        self.nudge_evict.store(true, Ordering::SeqCst);
     }
 
     fn take_nudge(&self, name: &str) -> bool {
         match name {
             "sync" => self.nudge_sync.swap(false, Ordering::SeqCst),
             "export" => self.nudge_export.swap(false, Ordering::SeqCst),
+            "evict" => self.nudge_evict.swap(false, Ordering::SeqCst),
             _ => false,
         }
     }
@@ -276,6 +284,43 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("export", Some(e.to_string())),
             }
         }),
+        "tier" => std::thread::spawn(move || {
+            st.set_state("tier", "running");
+            let r = (|| -> Result<Option<pvfs_client::fetch::TierReport>, PvfsError> {
+                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
+                let mut fetcher = pvfs_client::fetch::Fetcher::new(st.data_dir());
+                let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
+                engine.close()?;
+                r
+            })();
+            match r {
+                // None = nothing placed central — a clean idle pass
+                Ok(report) => {
+                    let issue = report.and_then(|t| {
+                        t.failed.first().map(|(label, e)| {
+                            format!("{} migrations failed (first: {label} — {e})", t.failed.len())
+                        })
+                    });
+                    st.mark_pass("tier", issue);
+                }
+                Err(e) => st.mark_pass("tier", Some(e.to_string())),
+            }
+        }),
+        "evict" => std::thread::spawn(move || {
+            st.set_state("evict", "running");
+            let r = (|| -> Result<pvfs_core::sync::EvictReport, PvfsError> {
+                let engine = pvfs_core::Engine::open(st.data_dir())?;
+                let r = pvfs_core::sync::evict_pass(&engine);
+                engine.close()?;
+                r
+            })();
+            match r {
+                // held-back files (no other live location) are expected, not
+                // errors — the next mover pass unblocks them
+                Ok(_) => st.mark_pass("evict", None),
+                Err(e) => st.mark_pass("evict", Some(e.to_string())),
+            }
+        }),
         other => unreachable!("no pass body for job {other}"),
     };
     Managed { stop, handle }
@@ -284,7 +329,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
 fn interval(name: &str) -> Duration {
     match name {
         "sync" => SYNC_INTERVAL,
-        _ => EXPORT_INTERVAL,
+        "export" => EXPORT_INTERVAL,
+        "tier" => TIER_INTERVAL,
+        _ => EVICT_INTERVAL,
     }
 }
 

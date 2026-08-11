@@ -141,6 +141,113 @@ impl Fetcher {
     }
 }
 
+/// A logged location that resolves on THIS host (central-satisfying, F5.3):
+/// a `file://` path that exists, or a `pvfs-host://` under our own pin whose
+/// path exists. Synthesized sync-store entries never count — they aren't
+/// catalog truth.
+fn logged_local_location(uri: &str, own_pin: &Option<String>) -> bool {
+    if let Ok(p) = pvfs_core::storage::uri_to_path(uri) {
+        return p.is_file();
+    }
+    if let Some((pin, path)) = pvfs_core::storage::parse_host_uri(uri) {
+        return own_pin.as_deref() == Some(pin) && std::path::Path::new(path).is_file();
+    }
+    false
+}
+
+/// What one mover pass did (F5.3). `failed` carries `(label, reason)` —
+/// a failed migration never retires anything.
+#[derive(Debug, Default)]
+pub struct TierReport {
+    pub migrated: u64,
+    pub satisfied: u64,
+    pub retired: u64,
+    pub failed: Vec<(String, String)>,
+}
+
+/// One mover pass, owner-side (F5.3, shared by `pvfs tier` and the daemon's
+/// `tier` job): ensure a verified central copy for every file under a
+/// `central`-placed subtree — satisfied in place by the owner's own disks,
+/// else fetched (locally or by read-through) and streamed into the store —
+/// then retire foreign-instance locations. `Ok(None)` = nothing placed
+/// central (a clean no-op for the job; the CLI turns it into guidance).
+pub fn tier_pass(
+    engine: &mut Engine,
+    fetcher: &mut Fetcher,
+) -> Result<Option<TierReport>, PvfsError> {
+    if engine.is_replica() {
+        return Err(PvfsError::BadInput {
+            field: "tier".into(),
+            reason: "the mover runs on the owner — edges reclaim space with `pvfs evict`".into(),
+        });
+    }
+    let data_dir = engine.data_dir().to_path_buf();
+    let central = pvfs_core::sync::load_central(&data_dir)?;
+    if central.is_empty() {
+        return Ok(None);
+    }
+    let own_pin = pvfs_core::storage::host_pin(&data_dir);
+    let mut report = TierReport::default();
+    for (root, dest) in central {
+        for entry in engine.walk(&root)?.entries {
+            if entry.node.node_type != pvfs_core::TYPE_FILE {
+                continue;
+            }
+            let id = entry.node.id;
+            let label = entry.node.label;
+            let has_central = engine
+                .locations(&id)?
+                .iter()
+                .any(|u| logged_local_location(u, &own_pin));
+            if has_central {
+                report.satisfied += 1;
+            } else {
+                // reach the bytes (locally or via read-through)…
+                if engine.readable_path(&id)?.is_none() {
+                    if let Err(e) = fetcher.fetch(engine, &id) {
+                        report.failed.push((label, e));
+                        continue; // never retire without a central copy
+                    }
+                }
+                // …then land a verified copy in the central store
+                let cpath = dest.join(&id[..2]).join(&id);
+                if let Err(e) = (|| -> Result<(), PvfsError> {
+                    if let Some(dir) = cpath.parent() {
+                        std::fs::create_dir_all(dir)
+                            .map_err(|e| PvfsError::io("create central dir", e))?;
+                    }
+                    let tmp = cpath.with_file_name(format!(".{id}.tmp"));
+                    let mut f = std::fs::File::create(&tmp)
+                        .map_err(|e| PvfsError::io("create central copy", e))?;
+                    if let Err(e) = engine.cat(&id, None, &mut f) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                    std::fs::rename(&tmp, &cpath)
+                        .map_err(|e| PvfsError::io("place central copy", e))?;
+                    engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)
+                })() {
+                    report.failed.push((label, e.to_string()));
+                    continue;
+                }
+                report.migrated += 1;
+            }
+            // central copy live → retire foreign-instance locations
+            for u in engine.locations(&id)? {
+                if let Some((pin, _)) = pvfs_core::storage::parse_host_uri(&u) {
+                    if own_pin.as_deref() != Some(pin) {
+                        match engine.remove_location(&id, &u) {
+                            Ok(()) => report.retired += 1,
+                            Err(e) => report.failed.push((id.clone(), e.to_string())),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(report))
+}
+
 /// Fetch missing bytes under `roots`, streaming each file into the managed
 /// sync store (hash-verified on commit). Returns `(fetched, failures)` —
 /// per-file failures never abort the pass.

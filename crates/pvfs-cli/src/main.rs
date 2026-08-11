@@ -155,6 +155,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RemoteCmd,
     },
+    /// Fleet setup (P5.4, doc 18 §4): admit another box's client identity
+    /// in one visible, logged, revocable step
+    #[command(subcommand)]
+    Fleet(FleetCmd),
     /// Manage named network instances: address + transport pin (F1)
     #[command(subcommand)]
     Instance(InstanceCmd),
@@ -621,6 +625,22 @@ enum ServeCmd {
 }
 
 #[derive(Subcommand)]
+enum FleetCmd {
+    /// Authorize a box's client identity as a member AND grant it rights at
+    /// the forest root — the one-step admit for private fleets (doc 17 §9
+    /// Q5, resolution (c)). Run on the owner; prompts for anything omitted.
+    /// The owner's OWN boxes need this too: every outbound fetch (the mover
+    /// included) authenticates as a client identity, never the device key.
+    Enroll {
+        /// The box's client identity — `pvfs whoami` on that box
+        pubkey: Option<String>,
+        /// Rights at the root: r (consumer), rw (ingest), rwa (replicator)
+        #[arg(long)]
+        rights: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum InstanceCmd {
     /// Remember a network instance: `pvfs remote --instance <name>` then dials it
     Add {
@@ -790,20 +810,6 @@ fn replica_client(src: &pvfs_core::ReplicaSource) -> Result<Client, PvfsError> {
         _ => Client::connect_signed(std::path::Path::new(&src.target), &pubkey, sign)
             .map_err(remote_err),
     }
-}
-
-/// A logged location that resolves on THIS host (central-satisfying, F5.3):
-/// a `file://` path that exists, or a `pvfs-host://` under our own pin whose
-/// path exists. Synthesized sync-store entries never count — they aren't
-/// catalog truth.
-fn logged_local_location(uri: &str, own_pin: &Option<String>) -> bool {
-    if let Ok(p) = pvfs_core::storage::uri_to_path(uri) {
-        return p.is_file();
-    }
-    if let Some((pin, path)) = pvfs_core::storage::parse_host_uri(uri) {
-        return own_pin.as_deref() == Some(pin) && std::path::Path::new(path).is_file();
-    }
-    false
 }
 
 
@@ -2952,84 +2958,24 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             Ok(())
         }
         Cmd::Tier => {
+            // The pass itself is shared with pvfsd's `tier` job (P5.3).
             let mut engine = Engine::open(&ctx?)?;
-            if engine.is_replica() {
-                return Err(PvfsError::BadInput {
-                    field: "tier".into(),
-                    reason: "the mover runs on the owner — edges reclaim space with `pvfs evict`"
-                        .into(),
-                });
-            }
             let data_dir = engine.data_dir().to_path_buf();
-            let central = pvfs_core::sync::load_central(&data_dir)?;
-            if central.is_empty() {
+            let mut fetcher = Fetcher::new(&data_dir);
+            let report = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher)?;
+            let Some(report) = report else {
                 return Err(PvfsError::BadInput {
                     field: "tier".into(),
                     reason: "nothing placed central — run `pvfs place <target> central --to <dir>`"
                         .into(),
                 });
-            }
-            let own_pin = pvfs_core::storage::host_pin(&data_dir);
-            let mut fetcher = Fetcher::new(&data_dir);
-            let (mut migrated, mut satisfied, mut retired) = (0u64, 0u64, 0u64);
-            let mut failed: Vec<(String, String)> = Vec::new();
-            for (root, dest) in central {
-                for entry in engine.walk(&root)?.entries {
-                    if entry.node.node_type != pvfs_core::TYPE_FILE {
-                        continue;
-                    }
-                    let id = entry.node.id;
-                    let label = entry.node.label;
-                    let has_central = engine
-                        .locations(&id)?
-                        .iter()
-                        .any(|u| logged_local_location(u, &own_pin));
-                    if has_central {
-                        satisfied += 1;
-                    } else {
-                        // reach the bytes (locally or via read-through)…
-                        if engine.readable_path(&id)?.is_none() {
-                            if let Err(e) = fetcher.fetch(&mut engine, &id) {
-                                failed.push((label, e));
-                                continue; // never retire without a central copy
-                            }
-                        }
-                        // …then land a verified copy in the central store
-                        let cpath = dest.join(&id[..2]).join(&id);
-                        if let Err(e) = (|| -> Result<(), PvfsError> {
-                            if let Some(dir) = cpath.parent() {
-                                std::fs::create_dir_all(dir)
-                                    .map_err(|e| PvfsError::io("create central dir", e))?;
-                            }
-                            let tmp = cpath.with_file_name(format!(".{id}.tmp"));
-                            let mut f = std::fs::File::create(&tmp)
-                                .map_err(|e| PvfsError::io("create central copy", e))?;
-                            if let Err(e) = engine.cat(&id, None, &mut f) {
-                                let _ = std::fs::remove_file(&tmp);
-                                return Err(e);
-                            }
-                            std::fs::rename(&tmp, &cpath)
-                                .map_err(|e| PvfsError::io("place central copy", e))?;
-                            engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)
-                        })() {
-                            failed.push((label, e.to_string()));
-                            continue;
-                        }
-                        migrated += 1;
-                    }
-                    // central copy live → retire foreign-instance locations
-                    for u in engine.locations(&id)? {
-                        if let Some((pin, _)) = pvfs_core::storage::parse_host_uri(&u) {
-                            if own_pin.as_deref() != Some(pin) {
-                                match engine.remove_location(&id, &u) {
-                                    Ok(()) => retired += 1,
-                                    Err(e) => failed.push((id.clone(), e.to_string())),
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            };
+            let (migrated, satisfied, retired, failed) = (
+                report.migrated,
+                report.satisfied,
+                report.retired,
+                report.failed,
+            );
             engine.close()?;
             if json {
                 let fails: Vec<String> = failed
@@ -3064,37 +3010,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
         }
         Cmd::Evict => {
+            // The pass itself is shared with pvfsd's `evict` job (P5.3).
             let engine = Engine::open(&ctx?)?;
-            let rows = engine.retired_own_host_locations()?;
-            let (mut evicted, mut freed) = (0u64, 0u64);
-            let mut skipped: Vec<(String, String)> = Vec::new();
-            for (id, uri, path) in rows {
-                // belt-and-braces: never delete unless the catalog records
-                // another LIVE location (synthesized sync-store entries don't
-                // count — they aren't catalog truth)
-                let live_elsewhere = engine
-                    .locations(&id)?
-                    .iter()
-                    .any(|u| !u.starts_with(pvfs_core::sync::SYNC_URI_PREFIX));
-                if !live_elsewhere {
-                    skipped.push((uri, "no other live location recorded".into()));
-                    continue;
-                }
-                match std::fs::symlink_metadata(&path) {
-                    Ok(md) if md.file_type().is_file() => {
-                        let size = md.len();
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => {
-                                evicted += 1;
-                                freed += size;
-                            }
-                            Err(e) => skipped.push((uri, e.to_string())),
-                        }
-                    }
-                    Ok(_) => skipped.push((uri, "not a regular file".into())),
-                    Err(_) => {} // already gone — nothing to reclaim
-                }
-            }
+            let report = pvfs_core::sync::evict_pass(&engine)?;
+            let (evicted, freed, skipped) = (report.evicted, report.freed_bytes, report.skipped);
             engine.close()?;
             if json {
                 let skips: Vec<String> = skipped
@@ -3402,6 +3321,79 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Ok(())
             }
         },
+        Cmd::Fleet(FleetCmd::Enroll { pubkey, rights }) => {
+            let state_dir = ctx?;
+            let pubkey = match pubkey {
+                Some(p) => p,
+                None => prompt_line(
+                    "the box's client identity (run `pvfs whoami` on the box)",
+                    None,
+                )?,
+            };
+            let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
+                field: "pubkey".into(),
+                reason: "must be hex (pvfs whoami prints it)".into(),
+            })?;
+            let rights = match rights {
+                Some(r) => r,
+                None => prompt_line("rights at the root — r (consumer), rw (ingest), rwa (replicator)", Some("r"))?,
+            };
+            let r = acl::parse_rights(&rights)?;
+            if r == 0 {
+                return Err(PvfsError::BadInput {
+                    field: "rights".into(),
+                    reason: "enrolling grants at least r — to revoke, use `pvfs acl set`".into(),
+                });
+            }
+            let root = {
+                let engine = Engine::open(&state_dir)?;
+                let root = engine.identity.root_node_id.clone();
+                engine.close()?;
+                root
+            };
+            // 1) membership — the authoring/authentication capability. A key
+            //    already enrolled is fine: idempotent re-runs just re-grant.
+            let already = |e: &PvfsError| matches!(e, PvfsError::AlreadyExists { .. });
+            if let Some((mut client, sign)) = daemon_client(&state_dir)? {
+                match client.authorize_member(&pubkey, |d| sign(d)).map_err(remote_err) {
+                    Ok(_) => {}
+                    Err(e) if already(&e) => {}
+                    Err(e) => return Err(e),
+                }
+                // 2) rights at the root, same connection
+                client
+                    .set_acl_expiring(
+                        &root,
+                        &format!("key:{pubkey}"),
+                        &acl::rights_to_str(r),
+                        0,
+                        |d| sign(d),
+                    )
+                    .map_err(remote_err)?;
+            } else {
+                let mut engine = Engine::open(&state_dir)?;
+                match engine.authorize_member_by_device(&pk) {
+                    Ok(_) => {}
+                    Err(e) if already(&e) => {}
+                    Err(e) => {
+                        let _ = engine.close();
+                        return Err(e);
+                    }
+                }
+                engine.set_acl_expiring(&root, &acl::Principal::Key(pk.clone()), r, 0)?;
+                engine.close()?;
+            }
+            if json {
+                println!(
+                    "{{\"enrolled\":\"{pubkey}\",\"rights\":\"{}\"}}",
+                    acl::rights_to_str(r)
+                );
+            } else {
+                println!("enrolled {pubkey} with {} at the root", acl::rights_to_str(r));
+                println!("revoke any time: pvfs acl set {root} key:{pubkey} \"\"");
+            }
+            Ok(())
+        }
         Cmd::Instance(cmd) => {
             match cmd {
                 InstanceCmd::Add { name, addr, pin } => {
@@ -4507,6 +4499,36 @@ fn forest_state_dir(
             Ok(mount::state_dir(&r.mount))
         }
         None => ctx,
+    }
+}
+
+/// Prompt for a missing value (Chris's rule: bare commands ask, flags are
+/// for scripts). Non-interactive runs must pass the argument instead.
+fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(PvfsError::BadInput {
+            field: "prompt".into(),
+            reason: format!("missing {what} — pass it as an argument in non-interactive runs"),
+        });
+    }
+    match default {
+        Some(d) => eprint!("{what} [{d}]: "),
+        None => eprint!("{what}: "),
+    }
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| PvfsError::io("read input", e))?;
+    let v = line.trim();
+    match (v.is_empty(), default) {
+        (false, _) => Ok(v.to_string()),
+        (true, Some(d)) => Ok(d.to_string()),
+        (true, None) => Err(PvfsError::BadInput {
+            field: "prompt".into(),
+            reason: format!("{what} is required"),
+        }),
     }
 }
 

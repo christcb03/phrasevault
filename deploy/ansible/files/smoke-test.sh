@@ -703,6 +703,16 @@ $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable follow >/dev/null \
   && $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable export >/dev/null \
   && ok "jobs disabled again" || fail "disable jobs"
 
+say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
+mkdir -p "$DATA/config3"
+E3KEY="$(jget "$(XDG_CONFIG_HOME="$DATA/config3" $PVFS --json whoami)" pubkey)"
+$PVFS --forest "$DMOUNT" fleet enroll "$E3KEY" --rights rw >/dev/null \
+  && ok "fleet enroll admits the box (member + rw, one step)" || fail "fleet enroll"
+XDG_CONFIG_HOME="$DATA/config3" $PVFS remote --socket "$SOCK" mkdir "$DROOT" enrolled-dir >/dev/null \
+  && ok "enrolled identity writes through the daemon at once" || fail "enrolled write"
+$PVFS --forest "$DMOUNT" fleet enroll "$E3KEY" --rights r >/dev/null \
+  && ok "re-enroll is idempotent (rights just updated)" || fail "re-enroll"
+
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to
 # show per-identity ACL enforcement over the socket — not just the owner's own

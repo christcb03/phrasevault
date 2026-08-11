@@ -401,6 +401,48 @@ fn sync_and_export_jobs_keep_a_consumer_view_fresh() {
     runner.join().unwrap();
 }
 
+/// P5.3 wiring: tier and evict run as passes and settle their status rows.
+/// On an owned forest with nothing placed and nothing retired, both are
+/// clean no-ops — idle, stamped, no error. (The real migrate/reclaim
+/// choreography is the fleet test's job; the CLI passes share this code.)
+#[test]
+fn tier_and_evict_jobs_settle_idle_on_a_quiet_owner() {
+    test_config_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _mn) = Engine::init(dir.path()).unwrap();
+    let data_dir = engine.data_dir().to_path_buf();
+    drop(engine);
+    for job in ["tier", "evict"] {
+        serve_cfg::set_job(&data_dir, job, true).unwrap();
+    }
+    let jobs = Arc::new(JobsState::load(data_dir.clone()).unwrap());
+    let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let runner = {
+        let j = Arc::clone(&jobs);
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let rows = jobs.snapshot();
+        let settled = ["tier", "evict"].iter().all(|n| {
+            rows.iter().any(|r| {
+                r.name == *n && r.state == "idle" && r.last_ok_ms.is_some() && r.last_error.is_none()
+            })
+        });
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tier/evict never settled: {rows:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    shutdown.store(true, Ordering::SeqCst);
+    runner.join().unwrap();
+}
+
 #[test]
 fn corrupt_jobs_file_refuses_load_but_reload_keeps_config() {
     let dir = tempfile::tempdir().unwrap();
