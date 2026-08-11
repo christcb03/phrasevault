@@ -261,13 +261,26 @@ impl Filesystem for PvfsFs {
 /// `mountpoint`, blocking until unmounted (`fusermount3 -u`, or the process
 /// ends with auto-unmount).
 pub fn mount(data_dir: &Path, target: &NodeId, mountpoint: &Path) -> Result<(), PvfsError> {
+    // AutoUnmount implies allow_other on fusermount, which stock
+    // /etc/fuse.conf forbids for users — try the convenient shape first,
+    // fall back to the universally-permitted one.
     let fs = PvfsFs::new(data_dir, target)?;
-    let opts = [
-        MountOption::RO,
-        MountOption::FSName("pvfs".into()),
-        MountOption::AutoUnmount,
-    ];
-    fuser::mount2(fs, mountpoint, &opts).map_err(|e| PvfsError::io("fuse mount", e))
+    match fuser::mount2(fs, mountpoint, &opts(true)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let fs = PvfsFs::new(data_dir, target)?;
+            fuser::mount2(fs, mountpoint, &opts(false)).map_err(|e| PvfsError::io("fuse mount", e))
+        }
+        Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+fn opts(auto_unmount: bool) -> Vec<MountOption> {
+    let mut o = vec![MountOption::RO, MountOption::FSName("pvfs".into())];
+    if auto_unmount {
+        o.push(MountOption::AutoUnmount);
+    }
+    o
 }
 
 /// Mount on a background thread (tests, and the CLI's future --daemon):
@@ -278,10 +291,13 @@ pub fn spawn_mount(
     mountpoint: &Path,
 ) -> Result<fuser::BackgroundSession, PvfsError> {
     let fs = PvfsFs::new(data_dir, target)?;
-    let opts = [
-        MountOption::RO,
-        MountOption::FSName("pvfs".into()),
-        MountOption::AutoUnmount,
-    ];
-    fuser::spawn_mount2(fs, mountpoint, &opts).map_err(|e| PvfsError::io("fuse mount", e))
+    match fuser::spawn_mount2(fs, mountpoint, &opts(true)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let fs = PvfsFs::new(data_dir, target)?;
+            fuser::spawn_mount2(fs, mountpoint, &opts(false))
+                .map_err(|e| PvfsError::io("fuse mount", e))
+        }
+        Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
 }
