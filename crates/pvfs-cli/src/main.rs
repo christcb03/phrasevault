@@ -692,15 +692,8 @@ fn remote_payload_bytes(arg: &str) -> Result<Vec<u8>, PvfsError> {
 
 /// `$XDG_CONFIG_HOME/pvfs` (or `$HOME/.config/pvfs`) — host-local client config.
 fn pvfs_config_dir() -> Result<PathBuf, PvfsError> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .ok_or_else(|| PvfsError::BadInput {
-            field: "config".into(),
-            reason: "set XDG_CONFIG_HOME or HOME".into(),
-        })?;
-    Ok(base.join("pvfs"))
+    // One source of truth in core since P5.1 (the daemon reads it too).
+    identity::config_dir()
 }
 
 /// Load (or create on first use) this machine's client identity (doc 07 §2),
@@ -980,27 +973,8 @@ fn replica_pull(
 }
 
 fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
-    let path = pvfs_config_dir()?.join("identity.phrase");
-    if path.exists() {
-        let phrase = std::fs::read_to_string(&path).map_err(|e| PvfsError::io("read identity", e))?;
-        return identity::parse_mnemonic(phrase.trim());
-    }
-    let dir = path.parent().unwrap();
-    std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
-    let mn = identity::generate_mnemonic()?;
-    let f = std::fs::File::create(&path).map_err(|e| PvfsError::io("create identity", e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| PvfsError::io("chmod identity", e))?;
-    }
-    {
-        use std::io::Write as _;
-        (&f).write_all(format!("{mn}\n").as_bytes())
-            .map_err(|e| PvfsError::io("write identity", e))?;
-    }
-    Ok(mn)
+    // Moved to core (P5.1) so pvfsd's background jobs share the identity.
+    identity::client_identity_mnemonic()
 }
 
 fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
@@ -3501,6 +3475,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Ok(())
             }
             ReplicaCmd::Follow { mount } => {
+                // The loop itself is shared with pvfsd's `follow` job (P5.1,
+                // doc 18 §5) — this command is the ad-hoc, foreground driver.
                 let data_dir = mount.join(".pvfs");
                 let dial = pvfs_core::ReplicaSource::load(&data_dir)?;
                 eprintln!(
@@ -3508,76 +3484,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     mount.display(),
                     dial.target
                 );
-                loop {
-                    // (re)connect with backoff; each session long-polls
-                    let mut client = match replica_client(&dial) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("follow: reconnecting ({e})");
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            continue;
-                        }
-                    };
-                    loop {
-                        // transient lock contention (a local command folding
-                        // concurrently) must not kill the follower
-                        let from = match pvfs_core::ReplicaStore::open(&data_dir)
-                            .and_then(|s| s.tip())
-                        {
-                            Ok(t) => t + 1,
-                            Err(e) => {
-                                eprintln!("follow: store busy ({e})");
-                                break; // back off + retry
-                            }
-                        };
-                        let (_tip, events) = match client.log_wait(from, 512, 25_000) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("follow: connection lost ({e})");
-                                break; // reconnect
-                            }
-                        };
-                        if events.is_empty() {
-                            continue; // timeout tick — poll again
-                        }
-                        let rows: Result<Vec<pvfs_core::log_store::EventRow>, PvfsError> = events
-                            .iter()
-                            .map(|w| {
-                                Ok(pvfs_core::log_store::EventRow {
-                                    seq: w.seq,
-                                    kind: w.kind.clone(),
-                                    body: hex::decode(&w.body).map_err(|_| {
-                                        PvfsError::BadInput {
-                                            field: "replica".into(),
-                                            reason: "shipped event body not hex".into(),
-                                        }
-                                    })?,
-                                    chain_hash: hex::decode(&w.chain_hash).map_err(|_| {
-                                        PvfsError::BadInput {
-                                            field: "replica".into(),
-                                            reason: "shipped chain hash not hex".into(),
-                                        }
-                                    })?,
-                                    written_at: w.written_at,
-                                })
-                            })
-                            .collect();
-                        let tip = match pvfs_core::ReplicaStore::open(&data_dir)
-                            .and_then(|mut s| s.append(&rows?))
-                        {
-                            Ok(t) => t,
-                            Err(e) => {
-                                eprintln!("follow: ingest failed ({e})");
-                                break; // back off; the next pass re-fetches from the real tip
-                            }
-                        };
-                        // fold now (best-effort), so local reads and any
-                        // serving daemon see it; the next open folds anyway
-                        let _ = Engine::open(&data_dir).and_then(|e| e.close());
-                        eprintln!("follow: caught up to seq {tip}");
+                let never = std::sync::atomic::AtomicBool::new(false);
+                pvfs_client::follow::run(&data_dir, 25_000, &never, |ev| match ev {
+                    pvfs_client::follow::FollowEvent::Connected { .. } => {}
+                    pvfs_client::follow::FollowEvent::CaughtUp { tip } => {
+                        eprintln!("follow: caught up to seq {tip}")
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
+                    pvfs_client::follow::FollowEvent::Retrying { reason } => {
+                        eprintln!("follow: retrying ({reason})")
+                    }
+                })?;
+                Ok(())
             }
         },
         Cmd::Instance(cmd) => {

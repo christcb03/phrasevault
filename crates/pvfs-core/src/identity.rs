@@ -35,6 +35,48 @@ pub fn generate_mnemonic() -> Result<Mnemonic> {
     Mnemonic::generate_in(Language::English, 24).map_err(identity_err("mnemonic generation"))
 }
 
+/// The per-user pvfs config dir: `$XDG_CONFIG_HOME/pvfs`, else `~/.config/pvfs`.
+pub fn config_dir() -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .ok_or_else(|| PvfsError::Identity {
+            detail: "set XDG_CONFIG_HOME or HOME".into(),
+        })?;
+    Ok(base.join("pvfs"))
+}
+
+/// Load (or create on first use, mode 0600) this machine's **client identity**
+/// phrase (`<config>/identity.phrase`, doc 07 §2) — the principal every
+/// network connection authenticates as. Forest device keys never dial
+/// (doc 18 §4); this is the key that does. Moved here from the CLI so the
+/// daemon's background jobs (P5) share one identity with the CLI.
+pub fn client_identity_mnemonic() -> Result<Mnemonic> {
+    let path = config_dir()?.join("identity.phrase");
+    if path.exists() {
+        let phrase =
+            std::fs::read_to_string(&path).map_err(|e| PvfsError::io("read identity", e))?;
+        return parse_mnemonic(phrase.trim());
+    }
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
+    let mn = generate_mnemonic()?;
+    let f = std::fs::File::create(&path).map_err(|e| PvfsError::io("create identity", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| PvfsError::io("chmod identity", e))?;
+    }
+    {
+        let mut f = &f;
+        f.write_all(format!("{mn}\n").as_bytes())
+            .map_err(|e| PvfsError::io("write identity", e))?;
+    }
+    Ok(mn)
+}
+
 /// Parse a user-supplied mnemonic phrase.
 pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic> {
     Mnemonic::parse_in_normalized(Language::English, phrase)

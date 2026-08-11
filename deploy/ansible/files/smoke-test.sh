@@ -25,6 +25,7 @@ TPID=""
 EPID=""
 RPID=""
 FPID=""
+JPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
@@ -34,6 +35,7 @@ cleanup() {
   [ -n "$EPID" ] && kill "$EPID" 2>/dev/null
   [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
   [ -n "$FPID" ] && kill "$FPID" 2>/dev/null
+  [ -n "$JPID" ] && kill "$JPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -648,6 +650,28 @@ done
 [ -n "$FOUND2" ] && ok "follower keeps following (second event landed)" || fail "follow second event"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null || true
 FPID=""
+
+say "P5.1: the follow job — a serving replica daemon stays fresh by itself (doc 18 §5)"
+$PVFS --data-dir "$REPMOUNT/.pvfs" serve enable follow >/dev/null \
+  && ok "follow enabled on the replica" || fail "enable follow"
+REPJSOCK="$DATA/replica-jobs.sock"
+"$PVFSD" --mount "$REPMOUNT" --socket "$REPJSOCK" >/dev/null 2>"$DATA/repjobs.log" &
+JPID=$!
+for _ in $(seq 1 50); do [ -S "$REPJSOCK" ] && break; sleep 0.1; done
+$PVFS remote --socket "$SOCK" mkdir "$DROOT" job-news >/dev/null
+JFOUND=""
+for _ in $(seq 1 80); do
+  if $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" 2>/dev/null | qgrep job-news; then
+    JFOUND=1; break
+  fi
+  sleep 0.25
+done
+[ -n "$JFOUND" ] && ok "daemon follow job folded the owner's event (no CLI follower)" \
+  || fail "follow job: $(tail -3 "$DATA/repjobs.log")"
+kill -TERM "$JPID" 2>/dev/null; wait "$JPID" 2>/dev/null || true
+JPID=""
+$PVFS --data-dir "$REPMOUNT/.pvfs" serve disable follow >/dev/null \
+  && ok "follow disabled again" || fail "disable follow"
 
 say "P2: two distinct user identities over the socket (doc 08 RtO #4)"
 # A second, independent forest served to a SECOND client identity ("Bob"), to

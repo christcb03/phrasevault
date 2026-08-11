@@ -15,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
+# P5.1 (doc 18 §5): the daemon's `follow` job runs pvfs-client's shared
+# follower loop — the daemon is a *client* of the replica's source.
+pvfs-client = { path = "../pvfs-client" }
 pvfs-proto = { path = "../pvfs-proto" }
 blake3.workspace = true
 hex.workspace = true
