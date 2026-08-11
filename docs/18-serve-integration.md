@@ -37,10 +37,19 @@ unchanged.
 - Jobs are **deployment state, never log events** (same rule as placement, doc 17 §6):
   a per-data-dir `serve.jobs` file; `pvfs serve enable|disable|ls [job]` edits it;
   `pvfsd` reads it at start and on SIGHUP.
-  - *As-built note (P5.0):* `pvfs serve` already existed — the P1 **watcher** daemon
-    (live indexing + reconciliation). The job verbs nest under it as subcommands; bare
-    `pvfs serve` stays the watcher. Candidate for a later phase: the watcher becomes a
-    `watch` job like any other.
+  - *As-built note (P5.0, superseded by punch E 2026-08-11):* `pvfs serve` already
+    existed — the P1 watcher. RESOLVED: the watcher is now the `watch` JOB (shared
+    loop in `pvfs_client::watch`; ad-hoc foreground = `pvfs serve watch`), and bare
+    `pvfs serve` prints job status (live when a daemon runs, configured otherwise).
+    PVOS was checked — nothing invoked the bare form.
+  - *Punch A (2026-08-11):* the runner watches `serve.jobs` itself (mtime, per
+    tick) — `serve enable` takes effect within a second; SIGHUP remains a manual
+    trigger.
+  - *Punch F (2026-08-11, Chris):* `ServeStatus` is **member-gated** — job states
+    and error strings are operational detail. `pvfs serve status` signs with the
+    device key (owner boxes) or the client identity (enrolled boxes).
+  - *Punch H (2026-08-11):* daemon commits and watch-job ingests nudge `tier`, so
+    owner-side content migrates in seconds like everything else.
 - Cadence: *follow* is continuous (the F5.4 loop, absorbed); *sync*/*export*/*evict*
   fire on fold + a slow safety interval; *tier* on interval (owner) + on local commits.
 - One job runner, serialized per forest (the engine is single-writer locally anyway);

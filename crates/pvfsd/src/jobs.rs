@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pvfs_client::follow::{self, FollowEvent};
+use pvfs_client::watch::{self, WatchEvent};
 use pvfs_core::{serve, PvfsError};
 use pvfs_proto::ServeJobWire;
 
@@ -23,7 +24,7 @@ const FOLLOW_POLL_MS: u64 = 5_000;
 const FATAL_RETRY: Duration = Duration::from_secs(60);
 
 /// Jobs that run as their own long-lived thread.
-const CONTINUOUS: [&str; 1] = ["follow"];
+const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// Jobs that run as short passes — on a content nudge (a follow fold, a
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
@@ -51,6 +52,8 @@ pub struct JobsState {
     nudge_export: AtomicBool,
     /// A fold may carry the mover's retirements — evict follows content too.
     nudge_evict: AtomicBool,
+    /// Punch H: the daemon's own commits (write-through ingest) wake the mover.
+    nudge_tier: AtomicBool,
 }
 
 impl JobsState {
@@ -64,6 +67,7 @@ impl JobsState {
             nudge_sync: AtomicBool::new(false),
             nudge_export: AtomicBool::new(false),
             nudge_evict: AtomicBool::new(false),
+            nudge_tier: AtomicBool::new(false),
         };
         s.reload()?;
         Ok(s)
@@ -152,8 +156,15 @@ impl JobsState {
             "sync" => self.nudge_sync.swap(false, Ordering::SeqCst),
             "export" => self.nudge_export.swap(false, Ordering::SeqCst),
             "evict" => self.nudge_evict.swap(false, Ordering::SeqCst),
+            "tier" => self.nudge_tier.swap(false, Ordering::SeqCst),
             _ => false,
         }
+    }
+
+    /// Punch H: called by the daemon's commit path — new content on the
+    /// owner should migrate without waiting out the interval.
+    pub(crate) fn nudge_tier(&self) {
+        self.nudge_tier.store(true, Ordering::SeqCst);
     }
 
     /// A completed pass: back to idle, stamped; issues (per-file failures or
@@ -206,6 +217,39 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                     ),
                     // not a replica / no identity: the supervisor retries later
                     Err(e) => st.mark_fatal("follow", &e.to_string()),
+                }
+            })
+        }
+        "watch" => {
+            let st = Arc::clone(state);
+            let flag = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                st.set_state("watch", "running");
+                let data_dir = st.data_dir().clone();
+                let cb = Arc::clone(&st);
+                let r = watch::run(&data_dir, 3600, 2000, &flag, |ev| match ev {
+                    WatchEvent::Ingested(_, a, c, rm) => {
+                        cb.mark_ok("watch");
+                        if a + c + rm > 0 {
+                            // local ingest = new content: views, placed
+                            // subtrees, the mover — all should wake
+                            cb.nudge_content();
+                            cb.nudge_tier();
+                        }
+                    }
+                    WatchEvent::ScanError(e) => cb.mark_retry("watch", &e),
+                    WatchEvent::Watching(_) => cb.set_state("watch", "running"),
+                });
+                match r {
+                    Ok(()) => st.set_state(
+                        "watch",
+                        if st.row("watch").is_some_and(|r| r.enabled) {
+                            "idle"
+                        } else {
+                            "disabled"
+                        },
+                    ),
+                    Err(e) => st.mark_fatal("watch", &e.to_string()),
                 }
             })
         }
@@ -344,8 +388,18 @@ pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
     let mut draining: Vec<Managed> = Vec::new();
     let mut retry_at: HashMap<String, Instant> = HashMap::new();
     let mut next_due: HashMap<String, Instant> = HashMap::new();
+    let jobs_file = serve::jobs_path(state.data_dir());
+    let mtime_of = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last_mtime = mtime_of(&jobs_file);
 
     while !shutdown.load(Ordering::SeqCst) {
+        // punch A: `serve enable` takes effect within a tick — the runner
+        // notices the file change itself; SIGHUP stays as a manual trigger.
+        let m = mtime_of(&jobs_file);
+        if m != last_mtime {
+            last_mtime = m;
+            reload.store(true, Ordering::SeqCst);
+        }
         if reload.swap(false, Ordering::SeqCst) {
             if let Err(e) = state.reload() {
                 eprintln!("pvfsd: serve.jobs reload failed (config kept): {e}");

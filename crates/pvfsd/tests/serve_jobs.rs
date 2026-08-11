@@ -16,9 +16,13 @@ use pvfsd::{serve, Daemon};
 #[test]
 fn serve_status_reports_config_runner_and_reload() {
     let dir = tempfile::tempdir().unwrap();
-    let (engine, _mn) = Engine::init(dir.path()).unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
     let data_dir = engine.data_dir().to_path_buf();
     serve_cfg::set_job(&data_dir, "sync", true).unwrap();
+    // punch F: status is member-gated — authorize the test client
+    let mkey = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let mpub = crypto::pubkey_bytes(&mkey);
+    engine.authorize_member(&owner_mn, &mpub).unwrap();
 
     let daemon = Arc::new(Daemon::new(engine));
     let jobs = Arc::new(JobsState::load(data_dir.clone()).unwrap());
@@ -42,8 +46,11 @@ fn serve_status_reports_config_runner_and_reload() {
         });
     }
 
-    // ---- status over the socket: every known job, config reflected
-    let mut client = Client::connect_public(&sock).unwrap();
+    // ---- status over the socket (member-signed): every known job listed
+    let mut client = Client::connect_signed(&sock, &mpub, |d| {
+        crypto::sign_digest(&mkey, d).unwrap()
+    })
+    .unwrap();
     let (runner_state, rows) = client.serve_status().unwrap();
     assert_eq!(runner_state, "on");
     assert_eq!(rows.len(), serve_cfg::JOB_NAMES.len());
@@ -74,9 +81,12 @@ fn serve_status_reports_config_runner_and_reload() {
 }
 
 #[test]
-fn daemon_without_runner_reports_off() {
+fn daemon_without_runner_reports_off_and_gates_anon() {
     let dir = tempfile::tempdir().unwrap();
-    let (engine, _mn) = Engine::init(dir.path()).unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let mkey = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let mpub = crypto::pubkey_bytes(&mkey);
+    engine.authorize_member(&owner_mn, &mpub).unwrap();
     let daemon = Arc::new(Daemon::new(engine));
 
     let sockdir = tempfile::tempdir().unwrap();
@@ -86,7 +96,17 @@ fn daemon_without_runner_reports_off() {
         let _ = serve(listener, daemon);
     });
 
-    let mut client = Client::connect_public(&sock).unwrap();
+    // punch F: anonymous status is refused outright
+    let mut anon = Client::connect_public(&sock).unwrap();
+    assert!(matches!(
+        anon.serve_status(),
+        Err(pvfs_client::ClientError::Server { code, .. }) if code == "forbidden"
+    ));
+    // a member sees runner off (no runner attached in this test)
+    let mut client = Client::connect_signed(&sock, &mpub, |d| {
+        crypto::sign_digest(&mkey, d).unwrap()
+    })
+    .unwrap();
     let (runner_state, rows) = client.serve_status().unwrap();
     assert_eq!(runner_state, "off");
     assert!(rows.is_empty());

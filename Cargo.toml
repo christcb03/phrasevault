@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", features = ["user", "fs"] }
 clap = { version = "4.4", features = ["derive"] }
 tempfile = "3"
+notify = "6"
 # default-features off = the pure-Rust mount path (no libfuse at build time;
 # runtime needs only fusermount3 from the fuse3 package)
 fuser = { version = "0.14", default-features = false }

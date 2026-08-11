@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+# punch E: the shared watcher loop (live indexing of bound folders)
+notify.workspace = true
 blake3.workspace = true
 hex.workspace = true
 # F1 network transport (doc 17 §4): TLS connect pinned to the instance's

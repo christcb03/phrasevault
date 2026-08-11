@@ -137,6 +137,12 @@ impl Fetcher {
                 }
             }
         }
+        if last_err.contains("forbidden") {
+            last_err.push_str(
+                " — this box's identity may not be enrolled on the forest: \
+                 on the owner, run `pvfs fleet enroll <this box's 'pvfs whoami' pubkey>`",
+            );
+        }
         Err(last_err)
     }
 }

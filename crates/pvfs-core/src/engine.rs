@@ -475,6 +475,20 @@ impl Engine {
         })
     }
 
+    /// True when `pubkey` is an authorized, unrevoked member/device key —
+    /// the bar for member-gated operational reads (punch F, doc 18).
+    pub fn is_active_member(&self, pubkey: &[u8]) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL)",
+                params![pubkey],
+                |r| r.get(0),
+            )
+            .map_err(map_db("member check"))?;
+        Ok(n != 0)
+    }
+
     /// True for a replica forest (local writes refused).
     pub fn is_replica(&self) -> bool {
         self.replica

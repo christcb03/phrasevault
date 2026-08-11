@@ -267,15 +267,11 @@ enum Cmd {
         #[arg(long, requires = "delete")]
         purge: bool,
     },
-    /// Run the watcher daemon (live indexing + scheduled reconciliation) —
-    /// or manage pvfsd's background jobs (P5, doc 18) via a subcommand
+    /// pvfsd's background jobs (doc 18): bare `pvfs serve` shows status;
+    /// subcommands manage jobs, kept-fresh exports, and the foreground watcher
     Serve {
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
-        #[arg(long, default_value_t = 3600)]
-        reconcile_secs: u64,
-        #[arg(long, default_value_t = 2000)]
-        debounce_ms: u64,
     },
     /// SSH to a host with this machine's companion socket reverse-forwarded
     /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
@@ -640,6 +636,14 @@ enum ServeCmd {
     Exports,
     /// Ask the running daemon for live job-runner state
     Status,
+    /// Run the watcher in the foreground (live indexing + reconciliation) —
+    /// ad-hoc; as a daemon job use `pvfs serve enable watch` (punch E)
+    Watch {
+        #[arg(long, default_value_t = 3600)]
+        reconcile_secs: u64,
+        #[arg(long, default_value_t = 2000)]
+        debounce_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -883,6 +887,18 @@ fn client_identity_mnemonic() -> Result<pvfs_core::Mnemonic, PvfsError> {
     identity::client_identity_mnemonic()
 }
 
+/// Punch B: the identity-model refusals get actionable guidance.
+fn enroll_hint(msg: &str) -> String {
+    if msg.contains("author not authorized") || msg.contains("not an authorized member") {
+        format!(
+            "{msg} — this box's identity may not be enrolled: on the owner, run \
+             `pvfs fleet enroll <this box's 'pvfs whoami' pubkey>`"
+        )
+    } else {
+        msg.to_string()
+    }
+}
+
 fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
     // Preserve the daemon's error semantics so `pvfs remote …` exit codes stay
     // meaningful for scripts: a denied op exits 5 (Forbidden), a missing node 3
@@ -892,7 +908,7 @@ fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
             "forbidden" => {
                 return PvfsError::Forbidden {
                     action: "remote".into(),
-                    reason: message.clone(),
+                    reason: enroll_hint(message),
                 }
             }
             "not_found" => {
@@ -912,7 +928,7 @@ fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
     }
     PvfsError::BadInput {
         field: "remote".into(),
-        reason: e.to_string(),
+        reason: enroll_hint(&e.to_string()),
     }
 }
 
@@ -3189,47 +3205,40 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
+                ServeCmd::Watch {
+                    reconcile_secs,
+                    debounce_ms,
+                } => {
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    pvfs_client::watch::run(
+                        &data_dir,
+                        reconcile_secs,
+                        debounce_ms,
+                        &never,
+                        |ev| match ev {
+                            pvfs_client::watch::WatchEvent::Ingested(f, a, c, r) => {
+                                if !json && a + c + r > 0 {
+                                    println!("ingested {f}: +{a} !{c} -{r}");
+                                }
+                            }
+                            pvfs_client::watch::WatchEvent::ScanError(e) => {
+                                eprintln!("scan error: {e}")
+                            }
+                            pvfs_client::watch::WatchEvent::Watching(n) => {
+                                if !json {
+                                    println!("watching {n} bound folder(s); Ctrl-C to stop");
+                                }
+                            }
+                        },
+                    )
+                }
                 ServeCmd::Status => {
                     let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
                         field: "serve".into(),
                         reason: "no running daemon for this forest (status is live state)"
                             .into(),
                     })?;
-                    let mut client = Client::connect_public(&sock).map_err(remote_err)?;
-                    let (runner, jobs) = client.serve_status().map_err(remote_err)?;
-                    if json {
-                        let rows: Vec<String> = jobs
-                            .iter()
-                            .map(|j| {
-                                format!(
-                                    "{{\"job\":\"{}\",\"enabled\":{},\"state\":\"{}\",\"last_ok_ms\":{},\"last_error\":{}}}",
-                                    json_escape(&j.name),
-                                    j.enabled,
-                                    json_escape(&j.state),
-                                    j.last_ok_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
-                                    j.last_error
-                                        .as_ref()
-                                        .map(|e| format!("\"{}\"", json_escape(e)))
-                                        .unwrap_or_else(|| "null".into()),
-                                )
-                            })
-                            .collect();
-                        println!(
-                            "{{\"runner\":\"{}\",\"jobs\":[{}]}}",
-                            json_escape(&runner),
-                            rows.join(",")
-                        );
-                    } else {
-                        println!("runner: {runner}");
-                        for j in &jobs {
-                            let mut line = format!("{:<8} {}", j.name, j.state);
-                            if let Some(e) = &j.last_error {
-                                line.push_str(&format!("  (last error: {e})"));
-                            }
-                            println!("{line}");
-                        }
-                    }
-                    Ok(())
+                    serve_status_print(&data_dir, &sock, json)
                 }
             }
         }
@@ -4225,11 +4234,37 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Serve {
-            cmd: None,
-            reconcile_secs,
-            debounce_ms,
-        } => serve(&ctx?, json, reconcile_secs, debounce_ms),
+        Cmd::Serve { cmd: None } => {
+            // punch E: bare `pvfs serve` answers the question people are
+            // asking — what are the jobs doing (the watcher moved to
+            // `serve watch` / the `watch` job; PVOS verified un-affected).
+            let engine = Engine::open(&ctx?)?;
+            let data_dir = engine.data_dir().to_path_buf();
+            engine.close()?;
+            match try_daemon_socket(&data_dir) {
+                Some(sock) => serve_status_print(&data_dir, &sock, json),
+                None => {
+                    let enabled = pvfs_core::serve::load_jobs(&data_dir)?;
+                    if json {
+                        let rows: Vec<String> = pvfs_core::serve::JOB_NAMES
+                            .iter()
+                            .map(|n| {
+                                let en = enabled.iter().any(|j| j == n);
+                                format!("{{\"job\":\"{n}\",\"enabled\":{en}}}")
+                            })
+                            .collect();
+                        println!("{{\"runner\":\"off\",\"jobs\":[{}]}}", rows.join(","));
+                    } else {
+                        eprintln!("no running daemon — configured jobs:");
+                        for n in pvfs_core::serve::JOB_NAMES {
+                            let en = enabled.iter().any(|j| j == n);
+                            println!("{n:<8} {}", if en { "enabled" } else { "-" });
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
         Cmd::Forest(cmd) => forest_cmd(cmd, ctx, json),
         Cmd::Ssh {
             target,
@@ -4707,6 +4742,62 @@ fn forest_state_dir(
     }
 }
 
+/// Fetch + print live job status from the local daemon, signed (punch F:
+/// ServeStatus is member-gated) — the forest device key when this box owns
+/// the forest, else the client identity (which must be enrolled).
+fn serve_status_print(
+    state_dir: &std::path::Path,
+    sock: &std::path::Path,
+    json: bool,
+) -> Result<(), PvfsError> {
+    let key = match identity::DeviceKeyCache::load(state_dir) {
+        Ok(cache) => cache.signing_key,
+        Err(_) => {
+            let mn = client_identity_mnemonic()?;
+            identity::device_key(&mn, "", 0)?
+        }
+    };
+    let pubkey = crypto::pubkey_bytes(&key);
+    let mut client = Client::connect_signed(sock, &pubkey, |d| {
+        crypto::sign_digest(&key, d).unwrap_or_default()
+    })
+    .map_err(remote_err)?;
+    let (runner, jobs) = client.serve_status().map_err(remote_err)?;
+    if json {
+        let rows: Vec<String> = jobs
+            .iter()
+            .map(|j| {
+                format!(
+                    "{{\"job\":\"{}\",\"enabled\":{},\"state\":\"{}\",\"last_ok_ms\":{},\"last_error\":{}}}",
+                    json_escape(&j.name),
+                    j.enabled,
+                    json_escape(&j.state),
+                    j.last_ok_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+                    j.last_error
+                        .as_ref()
+                        .map(|e| format!("\"{}\"", json_escape(e)))
+                        .unwrap_or_else(|| "null".into()),
+                )
+            })
+            .collect();
+        println!(
+            "{{\"runner\":\"{}\",\"jobs\":[{}]}}",
+            json_escape(&runner),
+            rows.join(",")
+        );
+    } else {
+        println!("runner: {runner}");
+        for j in &jobs {
+            let mut line = format!("{:<8} {}", j.name, j.state);
+            if let Some(e) = &j.last_error {
+                line.push_str(&format!("  (last error: {e})"));
+            }
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
 /// Prompt for a missing value (Chris's rule: bare commands ask, flags are
 /// for scripts). Non-interactive runs must pass the argument instead.
 fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
@@ -4790,109 +4881,6 @@ fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
         })?)
     };
     Ok(ByteRange { start, end })
-}
-
-/// Minimal P1 daemon: live watcher + scheduled reconciliation (doc 04 §6).
-fn serve(dir: &Path, json: bool, reconcile_secs: u64, debounce_ms: u64) -> Result<(), PvfsError> {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let lock_path = dir.join("serve.lock");
-    let _lock = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .map_err(|e| PvfsError::BadInput {
-            field: "serve".into(),
-            reason: format!(
-                "another daemon may be running ({}): {e} — delete the file if stale",
-                lock_path.display()
-            ),
-        })?;
-
-    let result = (|| {
-        let mut engine = Engine::open(dir)?;
-        // initial reconciliation
-        let reports = engine.scan(None)?;
-        if !json {
-            for r in &reports {
-                println!(
-                    "reconciled {}: +{} ~{} !{} -{}",
-                    r.folder_id, r.stats.added, r.stats.unchanged, r.stats.changed, r.stats.removed
-                );
-            }
-        }
-
-        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-        let mut watcher = notify::recommended_watcher(tx).map_err(|e| PvfsError::BadInput {
-            field: "watcher".into(),
-            reason: e.to_string(),
-        })?;
-        let mut watching = 0usize;
-        for b in engine.bindings()? {
-            if !b.auto_index {
-                continue;
-            }
-            let path = pvfs_core::storage::uri_to_path(&b.source_uri)?;
-            notify::Watcher::watch(
-                &mut watcher,
-                &path,
-                if b.recursive {
-                    notify::RecursiveMode::Recursive
-                } else {
-                    notify::RecursiveMode::NonRecursive
-                },
-            )
-            .map_err(|e| PvfsError::BadInput {
-                field: "watcher".into(),
-                reason: format!("{}: {e}", path.display()),
-            })?;
-            watching += 1;
-        }
-        if !json {
-            println!("serving: watching {watching} bound folder(s); reconcile every {reconcile_secs}s; Ctrl-C to stop");
-        }
-
-        let debounce = Duration::from_millis(debounce_ms);
-        let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
-        let mut dirty_since: Option<Instant> = None;
-        let mut last_reconcile = Instant::now();
-
-        loop {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ok(_event)) => dirty_since = Some(Instant::now()),
-                Ok(Err(_)) => dirty_since = Some(Instant::now()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            let due_debounce = dirty_since
-                .map(|t| t.elapsed() >= debounce)
-                .unwrap_or(false);
-            let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
-            if due_debounce || due_reconcile {
-                dirty_since = None;
-                last_reconcile = Instant::now();
-                match engine.scan(None) {
-                    Ok(reports) => {
-                        if !json {
-                            for r in reports.iter().filter(|r| {
-                                r.stats.added + r.stats.changed + r.stats.removed > 0
-                            }) {
-                                println!(
-                                    "ingested {}: +{} !{} -{}",
-                                    r.folder_id, r.stats.added, r.stats.changed, r.stats.removed
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("scan error: {e}"),
-                }
-            }
-        }
-        engine.close()
-    })();
-    let _ = std::fs::remove_file(&lock_path);
-    result
 }
 
 fn emit_id(json: bool, key: &str, id: &str) {

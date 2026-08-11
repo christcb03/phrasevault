@@ -81,3 +81,7 @@ Packaging: see the header — decided 2026-08-11, no cut until the region arc la
    Route whatever local allows; no new policy on the wire.
 2. Should `loc rm` of the *last* location warn (the file goes UNAVAILABLE)? Local
    behavior is silent today; wire mirrors local. Revisit with UX polish.
+3. **Known divergence (punch I, documented not changed):** unlinking an
+   already-removed link is a silent no-op locally but returns *not-found* over the
+   wire — the two-phase protocol has no signed no-op event to commit. Retries of a
+   wire unlink should treat not-found as success.

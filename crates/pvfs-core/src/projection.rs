@@ -1384,6 +1384,12 @@ fn replay_range(
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
 /// replay everything from the genesis seed. Temp tables start empty.
 pub fn full_rebuild(conn: &mut Connection) -> Result<ForestIdentity> {
+    // punch C: the post-upgrade/crash rebuild can run minutes on a grown
+    // forest — say so instead of looking hung.
+    eprintln!(
+        "pvfs: rebuilding the index from the signed log (one-time after an \
+         upgrade or unclean shutdown; large forests take a few minutes)"
+    );
     let identity = decode_genesis(conn)?;
     for t in MAIN_OBJECTS {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))

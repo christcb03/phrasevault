@@ -24,6 +24,7 @@ pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo, ServeJobWire};
 
 pub mod fetch;
 pub mod follow;
+pub mod watch;
 
 /// The client's transport: both arms speak identical frames.
 enum Stream {

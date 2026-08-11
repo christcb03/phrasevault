@@ -252,8 +252,8 @@ mkdir -p "$OCCUPIED"; printf 'x' > "$OCCUPIED/keep.txt"
 assert_rc 2 "export refuses foreign non-empty dir → 2" -- $PVFS export "$LFOLDER" "$OCCUPIED"
 [ -f "$OCCUPIED/keep.txt" ] && ok "foreign dir untouched" || fail "foreign dir untouched"
 
-say "P1: serve daemon (watcher)"
-$PVFS serve --debounce-ms 300 >/dev/null 2>&1 &
+say "P1: the watcher (punch E: now `serve watch` / the watch job)"
+$PVFS serve watch --debounce-ms 300 >/dev/null 2>&1 &
 SERVE_PID=$!
 sleep 2
 printf 'watched-file' > "$LIB/movies/watched.mkv"

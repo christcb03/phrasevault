@@ -318,18 +318,28 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
                 root: e.identity.root_node_id.clone(),
             }
         }
-        // Operational metadata, same tier as Info: job names and run states,
-        // never catalog content (doc 18 §2).
-        ClientMsg::ServeStatus => match daemon.jobs.get() {
-            Some(j) => ServerMsg::ServeJobs {
-                runner: "on".into(),
-                jobs: j.snapshot(),
-            },
-            None => ServerMsg::ServeJobs {
-                runner: "off".into(),
-                jobs: Vec::new(),
-            },
-        },
+        // Punch F (Chris, 2026-08-11): member-gated — job states and error
+        // strings are operational detail, not public metadata.
+        ClientMsg::ServeStatus => {
+            let member = match principal {
+                Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+                _ => false,
+            };
+            if !member {
+                err("forbidden", "serve status is member-gated (enroll this box)")
+            } else {
+                match daemon.jobs.get() {
+                    Some(j) => ServerMsg::ServeJobs {
+                        runner: "on".into(),
+                        jobs: j.snapshot(),
+                    },
+                    None => ServerMsg::ServeJobs {
+                        runner: "off".into(),
+                        jobs: Vec::new(),
+                    },
+                }
+            }
+        }
         ClientMsg::Ls { node } => match do_ls(daemon, principal, &node) {
             Ok(children) => ServerMsg::Ls { children },
             Err(msg) => msg,
@@ -886,7 +896,14 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
     }
     let mut e = daemon.engine.lock().unwrap();
     match e.commit_member_write(events) {
-        Ok(()) => ServerMsg::Committed { id: state.result_id },
+        Ok(()) => {
+            // Punch H: a committed write is new content on the owner — wake
+            // the mover instead of waiting out its interval.
+            if let Some(j) = daemon.jobs.get() {
+                j.nudge_tier();
+            }
+            ServerMsg::Committed { id: state.result_id }
+        }
         Err(e) => err_from(e),
     }
 }

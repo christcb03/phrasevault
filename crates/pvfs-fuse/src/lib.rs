@@ -24,7 +24,6 @@ const TTL: Duration = Duration::from_secs(1);
 pub struct PvfsFs {
     engine: Engine,
     fetcher: Fetcher,
-    mounted_at: SystemTime,
     uid: u32,
     gid: u32,
     ino_to_node: HashMap<u64, NodeId>,
@@ -42,7 +41,6 @@ impl PvfsFs {
         let mut fs = PvfsFs {
             engine,
             fetcher,
-            mounted_at: SystemTime::now(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             ino_to_node: HashMap::new(),
@@ -73,6 +71,9 @@ impl PvfsFs {
             kind: "node",
             id: node.clone(),
         })?;
+        // punch D: catalog timestamps, not "when you mounted" — mtime-based
+        // tools (rsync -u, make) then judge freshness meaningfully.
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(entry.created_at);
         let (kind, size, perm) = if entry.node_type == TYPE_FILE {
             let size = FilePayload::decode(&entry.payload)
                 .map(|p| p.size_bytes)
@@ -85,10 +86,10 @@ impl PvfsFs {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime: self.mounted_at,
-            mtime: self.mounted_at,
-            ctime: self.mounted_at,
-            crtime: self.mounted_at,
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            crtime: ts,
             kind,
             perm,
             nlink: 1,
