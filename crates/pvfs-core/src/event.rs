@@ -460,6 +460,7 @@ impl Event {
             | Event::RecoveryKeyRegistered { sig: s, .. }
             | Event::RecoveryKeyRevoked { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
+            | Event::LinkReordered { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
             _ => {}

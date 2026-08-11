@@ -472,10 +472,31 @@ REP_JSON="$($PVFS --json replica add "$REPMOUNT" --connect "$NETADDR" --pin "$NE
 $PVFS --data-dir "$REPMOUNT/.pvfs" ls "$DROOT" | qgrep albums && ok "replica lists the tree" || fail "replica lists the tree"
 [ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$ATXT_ID")" = "hi" ] \
   && ok "replica cat reads through (same-host locations)" || fail "replica cat"
-# the replica's own engine never writes its log — asserted via an op with no
-# write-through route (F5.0 routes add/loc/admin to the source instead)
-assert_rc 5 "replica engine refuses local log writes → 5" -- \
-  $PVFS --data-dir "$REPMOUNT/.pvfs" link "$DROOT" "$ATXT_ID" --type ref
+# P6.0 (doc 19 §2): the once-refused ops now write through, member-signed.
+# (The replica's own engine still never writes its log — every op routes;
+# the temp-node refusal in F5.0 below stays the no-route proof.)
+P6DIR="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind folder --label p6-scratch)" node_id)"
+P6LINK="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" link "$P6DIR" "$ATXT_ID" --type ref)" link_id)"
+[ ${#P6LINK} -eq 64 ] && ok "member link wrote through (ref link created)" || fail "p6 link: $P6LINK"
+$PVFS remote --socket "$SOCK" --anon ls "$P6DIR" | qgrep a.txt \
+  && ok "…and the ref landed in the owner's log" || fail "p6 link not on owner"
+$PVFS --data-dir "$REPMOUNT/.pvfs" unlink "$P6LINK" >/dev/null \
+  && ok "member unlink wrote through" || fail "p6 unlink"
+$PVFS remote --socket "$SOCK" --anon ls "$P6DIR" | qgrep a.txt \
+  && fail "unlinked ref still visible" || ok "unlinked ref gone from the owner"
+printf 'p6-bytes' > "$DATA/p6.bin"
+P6F="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$P6DIR" --kind file --label p6.bin --size 8)" node_id)"
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$P6F" "file://$DATA/p6.bin" >/dev/null
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc ls "$P6F" | qgrep p6.bin \
+  && ok "loc add visible" || fail "p6 loc add"
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc rm "$P6F" "file://$DATA/p6.bin" >/dev/null \
+  && ok "member loc rm wrote through (P6.0 retraction)" || fail "p6 loc rm"
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc ls "$P6F" | qgrep p6.bin \
+  && fail "retracted location still listed" || ok "retracted location gone"
+# …and re-recording after a retraction works (also keeps the file fetchable
+# for the F3 sync pass below — a placed subtree must not hold a dead file)
+$PVFS --data-dir "$REPMOUNT/.pvfs" loc add "$P6F" "file://$DATA/p6.bin" >/dev/null \
+  && ok "location re-recorded after the retraction" || fail "re-add after loc rm"
 # F0 + F2: a replica exports like any forest — the cross-host media view
 $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
 [ "$(cat "$DATA/replica-view/albums/a.txt")" = "hi" ] \
@@ -529,6 +550,15 @@ $PVFS --data-dir "$REPMOUNT/.pvfs" stat "$MOVIE" | qgrep "pvfs-sync" \
 $PVFS --data-dir "$REPMOUNT/.pvfs" export "$DROOT" "$DATA/replica-view" >/dev/null
 [ "$(cat "$DATA/replica-view/movie.mkv")" = "far-away-bytes" ] \
   && ok "re-export serves the synced file to non-PVFS apps" || fail "export after sync"
+# P6.1 (doc 19 §3): the sync store can move to the big disk; earlier files keep serving
+$PVFS --data-dir "$REPMOUNT/.pvfs" sync --to "$DATA/big-disk" >/dev/null \
+  && ok "sync --to points new fetches at the big disk" || fail "sync --to set"
+$PVFS --data-dir "$REPMOUNT/.pvfs" sync --to | qgrep big-disk \
+  && ok "bare --to prints the configured root" || fail "sync --to print"
+[ "$($PVFS --data-dir "$REPMOUNT/.pvfs" cat "$MOVIE" 2>/dev/null)" = "far-away-bytes" ] \
+  && ok "files in the default store keep serving after the move" || fail "old store unreadable"
+$PVFS --data-dir "$REPMOUNT/.pvfs" sync --to default >/dev/null \
+  && ok "--to default restores the in-data-dir store" || fail "sync --to default"
 
 say "F5.0: write-through — the replica accepts writes via its source (doc 17 §7)"
 WTID="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" add "$DROOT" --kind file --label ingest.mkv --size 11 --mime video/x-matroska)" node_id)"

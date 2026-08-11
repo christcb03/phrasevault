@@ -226,7 +226,14 @@ enum Cmd {
     },
     /// Fetch missing bytes from wherever they're reachable — for one
     /// subtree, or every subtree placed `sync`
-    Sync { target: Option<String> },
+    Sync {
+        target: Option<String>,
+        /// Sync-store root (P6.1, doc 19 §3): a directory to land fetched
+        /// bytes in (the big disk), `default` to go back to `.pvfs/`, or
+        /// bare `--to` to print the current root. Config-only — no fetch.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DIR")]
+        to: Option<String>,
+    },
     /// Owner-side mover (doc 17 §7.4): ensure central copies for
     /// `central`-placed subtrees, then retire edge locations
     Tier,
@@ -1658,30 +1665,68 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             nonce,
         } => {
             let mut engine = Engine::open(&ctx?)?;
+            if engine.is_replica() {
+                // P6.0 (doc 19 §2): link ops write through to the source.
+                if nonce != 0 {
+                    return Err(PvfsError::BadInput {
+                        field: "nonce".into(),
+                        reason: "nonce links are owner-local — omit --nonce on a replica".into(),
+                    });
+                }
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                let id = client
+                    .link(&parent, &child, &link_type, "", |d| sign(d))
+                    .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+                emit_id(json, "link_id", &id);
+                return Ok(());
+            }
             let id = engine.link(&parent, &child, &link_type, None, nonce)?;
             emit_id(json, "link_id", &id);
             engine.close()
         }
         Cmd::Unlink { link_id } => {
             let mut engine = Engine::open(&ctx?)?;
-            engine.remove_link(&link_id)?;
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client.unlink(&link_id, |d| sign(d)).map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.remove_link(&link_id)?;
+                engine.close()?;
+            }
             if json {
                 println!("{{\"removed\":true}}");
             } else {
                 println!("removed {link_id}");
             }
-            engine.close()
+            Ok(())
         }
         Cmd::Reorder { link_id, key } => {
             let mut engine = Engine::open(&ctx?)?;
             let key = OrderKey::parse(&key)?;
-            engine.reorder_link(&link_id, &key)?;
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client
+                    .reorder(&link_id, key.as_str(), |d| sign(d))
+                    .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.reorder_link(&link_id, &key)?;
+                engine.close()?;
+            }
             if json {
                 println!("{{\"reordered\":true}}");
             } else {
                 println!("reordered {link_id}");
             }
-            engine.close()
+            Ok(())
         }
         Cmd::Ls { target: None } => {
             // forest inventory (doc 05 §6.1)
@@ -1843,13 +1888,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         }
                         return Ok(());
                     }
-                    LocCmd::Rm { .. } => {
-                        return Err(PvfsError::BadInput {
-                            field: "loc".into(),
-                            reason: "location removal has no write-through op yet — \
-                                     run it against the owner (doc 17 §7, F5.3)"
-                                .into(),
-                        });
+                    LocCmd::Rm { file, uri } => {
+                        // P6.0 (doc 19 §2): retraction writes through too.
+                        let data_dir = engine.data_dir().to_path_buf();
+                        engine.close()?;
+                        let (mut client, sign) = replica_write_client(&data_dir)?;
+                        client
+                            .remove_location(file, uri, |d| sign(d))
+                            .map_err(remote_err)?;
+                        replica_catch_up(&data_dir, &mut client);
+                        if json {
+                            println!("{{\"removed\":true}}");
+                        } else {
+                            println!("removed");
+                        }
+                        return Ok(());
                     }
                     _ => {} // reads run locally
                 }
@@ -3159,7 +3212,52 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
         }
-        Cmd::Sync { target } => {
+        Cmd::Sync { target, to: Some(to) } => {
+            // store-root config (P6.1) — never fetches
+            if target.is_some() {
+                return Err(PvfsError::BadInput {
+                    field: "sync".into(),
+                    reason: "--to is config-only — run it without a target".into(),
+                });
+            }
+            let dir = ctx?;
+            match to.as_str() {
+                "" => {
+                    let root = pvfs_core::sync::sync_store_root(&dir)?;
+                    match (&root, json) {
+                        (Some(r), true) => {
+                            println!("{{\"store\":\"{}\"}}", json_escape(&r.display().to_string()))
+                        }
+                        (Some(r), false) => println!("{}", r.display()),
+                        (None, true) => println!("{{\"store\":null}}"),
+                        (None, false) => println!("default (.pvfs/synced)"),
+                    }
+                }
+                "default" => {
+                    pvfs_core::sync::set_sync_store_root(&dir, None)?;
+                    if json {
+                        println!("{{\"store\":null}}");
+                    } else {
+                        println!("sync store back to default (.pvfs/synced); \
+                                  files on the old root keep serving");
+                    }
+                }
+                d => {
+                    std::fs::create_dir_all(d).map_err(|e| PvfsError::io("create sync store", e))?;
+                    let abs = std::fs::canonicalize(d)
+                        .map_err(|e| PvfsError::io("resolve sync store", e))?;
+                    pvfs_core::sync::set_sync_store_root(&dir, Some(&abs))?;
+                    if json {
+                        println!("{{\"store\":\"{}\"}}", json_escape(&abs.display().to_string()));
+                    } else {
+                        println!("new fetches land in {}; earlier files keep serving \
+                                  from the default store", abs.display());
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Sync { target, to: None } => {
             let (mut engine, roots) = match target {
                 Some(t) => {
                     let (e, id) = engine_and_node(ctx, &t)?;

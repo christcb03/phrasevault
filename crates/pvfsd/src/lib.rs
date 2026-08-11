@@ -786,6 +786,24 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
             }
             WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
             WriteOp::AddLocation { file, uri } => e.prepare_add_location(&author, &file, &uri),
+            WriteOp::RemoveLocation { file, uri } => {
+                e.prepare_remove_location(&author, &file, &uri)
+            }
+            WriteOp::Link {
+                parent,
+                child,
+                link_type,
+                order_key,
+            } => {
+                let key = if order_key.is_empty() {
+                    None
+                } else {
+                    Some(order_key.as_str())
+                };
+                e.prepare_link(&author, &parent, &child, &link_type, key)
+            }
+            WriteOp::Unlink { link_id } => e.prepare_remove_link(&author, &link_id),
+            WriteOp::Reorder { link_id, key } => e.prepare_reorder_link(&author, &link_id, &key),
             WriteOp::Mv { node, new_parent } => e.prepare_move_node(&author, &node, &new_parent),
             WriteOp::SetAcl {
                 node,

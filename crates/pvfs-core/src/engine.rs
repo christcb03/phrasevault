@@ -1214,7 +1214,7 @@ impl Engine {
         let mut out: Vec<String> = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("locations"))?;
-        if crate::sync::sync_store_path(&self.data_dir, file).is_file() {
+        if crate::sync::sync_store_lookup(&self.data_dir, file)?.is_some() {
             out.push(crate::sync::sync_uri(file));
         }
         Ok(out)
@@ -2168,6 +2168,213 @@ impl Engine {
                     event: Event::LinkCreated(link),
                 },
             ],
+        })
+    }
+
+    /// Phase 1 of a member `loc rm` (P6.0, doc 19 §2): retract a recorded
+    /// location. The author must hold write on the file — the same bar as
+    /// adding one. Temp nodes stay forest-local (no wire op).
+    pub fn prepare_remove_location(
+        &self,
+        author_pub: &[u8],
+        file: &NodeId,
+        uri: &str,
+    ) -> Result<PreparedWrite> {
+        let n = fetch_node(&self.conn, file)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: file.clone(),
+        })?;
+        if n.is_temp {
+            return Err(bad("file", "temp nodes are forest-local (no wire ops)"));
+        }
+        let active: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM file_locations WHERE file_id = ?1 AND uri = ?2 AND removed_at IS NULL",
+                params![file, uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("location lookup"))?;
+        if active.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "location",
+                id: format!("{file} {uri}"),
+            });
+        }
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, file)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "remove location".into(),
+                reason: format!("you lack write (w) on {file}"),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_file_location_removed(file, uri, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: file.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::FileLocationRemoved {
+                    file_id: file.clone(),
+                    uri: uri.to_string(),
+                    removed_at: t,
+                    removed_by: author_pub.to_vec(),
+                    removal_sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1 of a member `link` (P6.0, doc 19 §2): the same construction and
+    /// checks as the local op — one-home rule + cycle check for `contains`,
+    /// write on the parent — authored by the member. Temp endpoints refuse
+    /// (forest-local by design).
+    pub fn prepare_link(
+        &self,
+        author_pub: &[u8],
+        parent: &NodeId,
+        child: &NodeId,
+        link_type: &str,
+        order_key: Option<&str>,
+    ) -> Result<PreparedWrite> {
+        if link_type.is_empty() {
+            return Err(bad("link_type", "must not be empty"));
+        }
+        let parent_node = fetch_node(&self.conn, parent)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: parent.clone(),
+        })?;
+        let child_node = fetch_node(&self.conn, child)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: child.clone(),
+        })?;
+        if parent_node.is_temp || child_node.is_temp {
+            return Err(bad("link", "temp nodes are forest-local (no wire ops)"));
+        }
+        if link_type == LINK_CONTAINS {
+            if let Some((_, existing_parent)) = active_home(&self.conn, child)? {
+                return Err(PvfsError::AlreadyContained {
+                    child: child.clone(),
+                    existing_parent: existing_parent.unwrap_or_else(|| "(tree root)".into()),
+                });
+            }
+            self.check_no_cycle(parent, child)?;
+        }
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "link".into(),
+                reason: format!("you lack write (w) on {parent}"),
+            });
+        }
+        let order = match order_key {
+            Some(k) => OrderKey::parse(k)?,
+            None => OrderKey::after(max_order_key(&self.conn, parent)?.as_ref())?,
+        };
+        let mut link = Link {
+            id: String::new(),
+            parent_id: Some(parent.clone()),
+            child_id: child.clone(),
+            link_type: link_type.into(),
+            link_nonce: 0,
+            order_key: order.as_str().into(),
+            created_at: now_ms(),
+            author: author_pub.to_vec(),
+            sig: Vec::new(),
+            removed_at: None,
+            superseded_by: None,
+            suspended_at: None,
+        };
+        let link_digest = link.id_digest();
+        link.id = hex::encode(link_digest);
+        Ok(PreparedWrite {
+            result_id: link.id.clone(),
+            events: vec![PreparedEvent {
+                digest: link_digest,
+                event: Event::LinkCreated(link),
+            }],
+        })
+    }
+
+    /// The durable link + its parent, with the member's write-on-parent check —
+    /// shared by the unlink/reorder prepares. Links on the tree root (no
+    /// parent) stay owner-only.
+    fn link_for_member_edit(
+        &self,
+        author_pub: &[u8],
+        link_id: &LinkId,
+        action: &'static str,
+    ) -> Result<Link> {
+        let l = fetch_link(&self.conn, link_id)?.ok_or(PvfsError::NotFound {
+            kind: "link",
+            id: link_id.clone(),
+        })?;
+        let parent = l.parent_id.clone().ok_or_else(|| PvfsError::Forbidden {
+            action: action.into(),
+            reason: "root links are owner-only".into(),
+        })?;
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, &parent)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: action.into(),
+                reason: format!("you lack write (w) on {parent}"),
+            });
+        }
+        Ok(l)
+    }
+
+    /// Phase 1 of a member `unlink` (P6.0, doc 19 §2). Already-removed links
+    /// report NotFound — the wire has no signed no-op.
+    pub fn prepare_remove_link(
+        &self,
+        author_pub: &[u8],
+        link_id: &LinkId,
+    ) -> Result<PreparedWrite> {
+        let l = self.link_for_member_edit(author_pub, link_id, "unlink")?;
+        if l.removed_at.is_some() {
+            return Err(PvfsError::NotFound {
+                kind: "link",
+                id: link_id.clone(),
+            });
+        }
+        let t = now_ms();
+        let digest = event::msg_link_removed(link_id, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: link_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::LinkRemoved {
+                    link_id: link_id.clone(),
+                    removed_at: t,
+                    removed_by: author_pub.to_vec(),
+                    removal_sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1 of a member `reorder` (P6.0, doc 19 §2).
+    pub fn prepare_reorder_link(
+        &self,
+        author_pub: &[u8],
+        link_id: &LinkId,
+        new_key: &str,
+    ) -> Result<PreparedWrite> {
+        let key = OrderKey::parse(new_key)?;
+        let _ = self.link_for_member_edit(author_pub, link_id, "reorder")?;
+        let digest = event::msg_link_reordered(link_id, key.as_str(), author_pub);
+        Ok(PreparedWrite {
+            result_id: link_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::LinkReordered {
+                    link_id: link_id.clone(),
+                    new_order_key: key.as_str().into(),
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
         })
     }
 

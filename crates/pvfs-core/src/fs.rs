@@ -962,7 +962,14 @@ impl Engine {
             return path_to_uri(&self.data_dir.join(SPOOL_DIR).join(name));
         }
         if let Some(id) = crate::sync::parse_sync_uri(uri) {
-            return path_to_uri(&crate::sync::sync_store_path(&self.data_dir, id));
+            // read path: whichever root holds the file (configured, then
+            // default — doc 19 §3); a not-yet-fetched file resolves to where
+            // a new fetch would land
+            let p = match crate::sync::sync_store_lookup(&self.data_dir, id)? {
+                Some(p) => p,
+                None => crate::sync::sync_store_path(&self.data_dir, id)?,
+            };
+            return path_to_uri(&p);
         }
         // Instance-qualified (F5.1): local only when the pin is our own;
         // a foreign pin is a remote candidate (fetch via sync, doc 17 §7.3).

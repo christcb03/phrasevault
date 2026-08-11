@@ -28,10 +28,81 @@ const SYNC_DIR: &str = "synced";
 const PLACEMENT_FILE: &str = "placement";
 const PLACEMENT_HEADER: &str = "pvfs-placement 1";
 
-/// Where a file's synced bytes live under `data_dir`.
-pub fn sync_store_path(data_dir: &Path, id: &str) -> PathBuf {
-    let shard = if id.len() >= 2 { &id[..2] } else { "xx" };
-    data_dir.join(SYNC_DIR).join(shard).join(id)
+const STORE_FILE: &str = "sync.store";
+const STORE_HEADER: &str = "pvfs-sync-store 1";
+
+fn shard_of(id: &str) -> &str {
+    if id.len() >= 2 {
+        &id[..2]
+    } else {
+        "xx"
+    }
+}
+
+/// The default (in-data-dir) store location for a file.
+fn default_store_path(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join(SYNC_DIR).join(shard_of(id)).join(id)
+}
+
+pub fn store_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(STORE_FILE)
+}
+
+/// The configured sync-store root, if any (P6.1, doc 19 §3): `pvfs sync
+/// --to <dir>` records it — deployment state, never log events. A corrupt
+/// file refuses loudly rather than silently landing bytes elsewhere.
+pub fn sync_store_root(data_dir: &Path) -> Result<Option<PathBuf>> {
+    let text = match std::fs::read_to_string(store_config_path(data_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(PvfsError::io("read sync.store", e)),
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(STORE_HEADER) {
+        return Err(bad("sync", "unrecognized sync.store file"));
+    }
+    match lines.map(str::trim).find(|l| !l.is_empty()) {
+        Some(dir) => Ok(Some(PathBuf::from(dir))),
+        None => Err(bad("sync", "sync.store names no directory")),
+    }
+}
+
+/// Set (Some) or clear (None) the store root.
+pub fn set_sync_store_root(data_dir: &Path, root: Option<&Path>) -> Result<()> {
+    match root {
+        Some(r) => crate::storage::atomic_overwrite(
+            &store_config_path(data_dir),
+            format!("{STORE_HEADER}\n{}\n", r.display()).as_bytes(),
+        ),
+        None => match std::fs::remove_file(store_config_path(data_dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PvfsError::io("clear sync.store", e)),
+        },
+    }
+}
+
+/// Where a **new** fetch lands: the configured root when set, else the
+/// default store under the data dir.
+pub fn sync_store_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
+    Ok(match sync_store_root(data_dir)? {
+        Some(root) => root.join(shard_of(id)).join(id),
+        None => default_store_path(data_dir, id),
+    })
+}
+
+/// Where an **existing** synced file is, if anywhere: the configured root
+/// first, then the default store — files fetched before a `--to` move keep
+/// serving with no migration pass (doc 19 §3).
+pub fn sync_store_lookup(data_dir: &Path, id: &str) -> Result<Option<PathBuf>> {
+    if let Some(root) = sync_store_root(data_dir)? {
+        let p = root.join(shard_of(id)).join(id);
+        if p.is_file() {
+            return Ok(Some(p));
+        }
+    }
+    let p = default_store_path(data_dir, id);
+    Ok(if p.is_file() { Some(p) } else { None })
 }
 
 /// The synthesized location URI for a store-resident file.
@@ -226,8 +297,16 @@ impl Drop for SyncSink {
 /// daemon restart — pvfsd sweeps unconditionally at startup, before any job
 /// can begin a fetch. Returns how many files were removed.
 pub fn sweep_orphan_tmps(data_dir: &Path) -> Result<u64> {
-    let store = data_dir.join(SYNC_DIR);
-    let shards = match std::fs::read_dir(&store) {
+    let mut removed = sweep_store_tmps(&data_dir.join(SYNC_DIR))?;
+    // a configured root (P6.1) collects the same litter
+    if let Some(root) = sync_store_root(data_dir)? {
+        removed += sweep_store_tmps(&root)?;
+    }
+    Ok(removed)
+}
+
+fn sweep_store_tmps(store: &Path) -> Result<u64> {
+    let shards = match std::fs::read_dir(store) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(PvfsError::io("scan sync store", e)),
@@ -283,7 +362,7 @@ impl Engine {
             return Err(bad("sync", "sync fetches file nodes"));
         }
         let payload = FilePayload::decode(&n.payload)?;
-        let dest = sync_store_path(&self.data_dir, id);
+        let dest = sync_store_path(&self.data_dir, id)?;
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create sync store", e))?;
         }
@@ -367,5 +446,69 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod store_root_tests {
+    use super::*;
+
+    #[test]
+    fn root_config_round_trip_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let id = "ab".repeat(32);
+        // unset: default store, nothing found
+        assert!(sync_store_root(data).unwrap().is_none());
+        assert_eq!(
+            sync_store_path(data, &id).unwrap(),
+            data.join("synced").join("ab").join(&id)
+        );
+        assert!(sync_store_lookup(data, &id).unwrap().is_none());
+        // configured: new-fetch path moves to the root
+        let big = dir.path().join("big disk");
+        set_sync_store_root(data, Some(&big)).unwrap();
+        assert_eq!(sync_store_root(data).unwrap().as_deref(), Some(big.as_path()));
+        assert_eq!(
+            sync_store_path(data, &id).unwrap(),
+            big.join("ab").join(&id)
+        );
+        // lookup prefers the configured root, falls back to default
+        std::fs::create_dir_all(data.join("synced").join("ab")).unwrap();
+        std::fs::write(data.join("synced").join("ab").join(&id), b"old").unwrap();
+        assert_eq!(
+            sync_store_lookup(data, &id).unwrap().unwrap(),
+            data.join("synced").join("ab").join(&id),
+            "pre-move files keep serving from the default store"
+        );
+        std::fs::create_dir_all(big.join("ab")).unwrap();
+        std::fs::write(big.join("ab").join(&id), b"new").unwrap();
+        assert_eq!(
+            sync_store_lookup(data, &id).unwrap().unwrap(),
+            big.join("ab").join(&id),
+            "the configured root wins when both hold the file"
+        );
+        // clear: back to default, idempotent
+        set_sync_store_root(data, None).unwrap();
+        set_sync_store_root(data, None).unwrap();
+        assert!(sync_store_root(data).unwrap().is_none());
+        // corrupt file refuses loudly
+        std::fs::write(store_config_path(data), "not-a-store-file\n").unwrap();
+        assert!(sync_store_root(data).is_err());
+        assert!(sync_store_path(data, &id).is_err());
+    }
+
+    #[test]
+    fn sweep_covers_a_configured_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let big = dir.path().join("big");
+        set_sync_store_root(data, Some(&big)).unwrap();
+        let id = "cd".repeat(32);
+        std::fs::create_dir_all(big.join("cd")).unwrap();
+        std::fs::write(big.join("cd").join(format!(".{id}.tmp")), b"partial").unwrap();
+        std::fs::write(big.join("cd").join(&id), b"content").unwrap();
+        assert_eq!(sweep_orphan_tmps(data).unwrap(), 1);
+        assert!(big.join("cd").join(&id).exists(), "content never touched");
     }
 }

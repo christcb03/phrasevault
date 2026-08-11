@@ -485,6 +485,71 @@ impl Client {
         )
     }
 
+    /// Retract a recorded location (P6.0). Returns the file id.
+    pub fn remove_location<F>(&mut self, file: &str, uri: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::RemoveLocation {
+                file: file.into(),
+                uri: uri.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Create a link `parent → child` (P6.0). Empty `order_key` = append.
+    /// Returns the new link id.
+    pub fn link<F>(
+        &mut self,
+        parent: &str,
+        child: &str,
+        link_type: &str,
+        order_key: &str,
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::Link {
+                parent: parent.into(),
+                child: child.into(),
+                link_type: link_type.into(),
+                order_key: order_key.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Soft-remove a link (P6.0). Returns the link id.
+    pub fn unlink<F>(&mut self, link_id: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::Unlink {
+                link_id: link_id.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Change a link's sibling order (P6.0). Returns the link id.
+    pub fn reorder<F>(&mut self, link_id: &str, key: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::Reorder {
+                link_id: link_id.into(),
+                key: key.into(),
+            },
+            sign,
+        )
+    }
+
     /// Re-home `node` under `new_parent`. Returns the node id.
     pub fn mv<F>(&mut self, node: &str, new_parent: &str, sign: F) -> Result<String>
     where

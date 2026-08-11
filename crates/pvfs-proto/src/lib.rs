@@ -134,6 +134,22 @@ pub enum WriteOp {
     Rm { node: String },
     /// Record where a file node's bytes live.
     AddLocation { file: String, uri: String },
+    /// Retract a recorded location (P6.0, doc 19 §2). Write on the file.
+    RemoveLocation { file: String, uri: String },
+    /// Create a link `parent → child` (P6.0). Write on the parent; the
+    /// `contains` one-home/cycle rules apply exactly as locally. `order_key`
+    /// empty = append after the last sibling.
+    Link {
+        parent: String,
+        child: String,
+        link_type: String,
+        #[serde(default)]
+        order_key: String,
+    },
+    /// Soft-remove a link (P6.0). Write on the link's parent.
+    Unlink { link_id: String },
+    /// Change a link's sibling order (P6.0). Write on the link's parent.
+    Reorder { link_id: String, key: String },
     /// Re-home `node` under `new_parent`.
     Mv { node: String, new_parent: String },
     /// Set a principal's rights on a node. `principal` = `public`|`any`|`tag:<name>`|
