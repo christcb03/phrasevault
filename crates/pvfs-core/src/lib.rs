@@ -28,6 +28,7 @@ pub mod node;
 pub mod orderkey;
 pub mod projection;
 pub mod replica;
+pub mod serve;
 pub mod storage;
 pub mod sync;
 pub mod walk;

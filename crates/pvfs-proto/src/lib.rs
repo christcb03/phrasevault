@@ -66,6 +66,28 @@ pub enum ServerMsg {
     },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
+    /// The job runner's live state (response to `ClientMsg::ServeStatus`; P5).
+    /// `runner` is `"on"` when a runner thread is attached, `"off"` when this
+    /// daemon predates jobs or was started without one.
+    ServeJobs {
+        runner: String,
+        jobs: Vec<ServeJobWire>,
+    },
+}
+
+/// One serve job's live state (P5, doc 18 §2): configured name, whether
+/// `serve.jobs` enables it, what the runner last did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServeJobWire {
+    pub name: String,
+    pub enabled: bool,
+    /// `"idle"` | `"running"` | `"backoff"` | `"disabled"` (P5.0 runners report
+    /// `"idle"` for enabled jobs — bodies land per phase, doc 18 §5).
+    pub state: String,
+    /// Unix ms of the last successful run, if any.
+    pub last_ok_ms: Option<u64>,
+    /// The last failure message, cleared by the next success.
+    pub last_error: Option<String>,
 }
 
 /// One shipped log row, verbatim (F2 log shipping, doc 17 §5): the replica
@@ -184,6 +206,9 @@ pub enum ClientMsg {
         prepared_id: String,
         sigs: Vec<String>,
     },
+    /// Live job-runner state (P5, doc 18 §2). Answered like `Info` — operational
+    /// metadata, no catalog content.
+    ServeStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 # 18 — Serve integration: the fleet runs itself (P5, doc 17's F0.1 + F3.1)
 
-**Status: DESIGN DRAFT (2026-08-10) — awaiting two decisions (§4, §2) before code.**
+**Status: IN BUILD (decisions landed 2026-08-10; §4 = option (c), Chris).**
 Prerequisite reading: doc 17 (the built federation arc), HANDOFF.md §2 findings.
 
 ## 1. Goal
@@ -36,6 +36,10 @@ unchanged.
 - Jobs are **deployment state, never log events** (same rule as placement, doc 17 §6):
   a per-data-dir `serve.jobs` file; `pvfs serve enable|disable|ls [job]` edits it;
   `pvfsd` reads it at start and on SIGHUP.
+  - *As-built note (P5.0):* `pvfs serve` already existed — the P1 **watcher** daemon
+    (live indexing + reconciliation). The job verbs nest under it as subcommands; bare
+    `pvfs serve` stays the watcher. Candidate for a later phase: the watcher becomes a
+    `watch` job like any other.
 - Cadence: *follow* is continuous (the F5.4 loop, absorbed); *sync*/*export*/*evict*
   fire on fold + a slow safety interval; *tier* on interval (owner) + on local commits.
 - One job runner, serialized per forest (the engine is single-writer locally anyway);
@@ -59,7 +63,8 @@ the box's *client identity* (`~/.config/pvfs/identity.phrase`, the `whoami` key)
 `device.key` never authenticates a network connection. The 2026-08-10 two-machine test
 showed the consequence: on a private forest, the owner's own `tier` is a stranger to
 its own edge box until the owner's client identity is `authorize-member`'d + granted
-`r`. Three ways to resolve it (decision pending — see the chat/close-out discussion):
+`r`. Three ways were on the table; **DECIDED 2026-08-10 (Chris): option (c)** — the model
+stays, the friction goes:
 
 - **(a) Document the grants.** Status quo mechanics; USER-MANUAL teaches the two-step
   per box. Pure default-deny; most setup friction; the surprise stays discoverable
@@ -75,9 +80,10 @@ its own edge box until the owner's client identity is `authorize-member`'d + gra
   for a box's client key in one visible, logged, revocable event) becomes part of box
   setup; serve jobs then run under exactly the authority the log shows they have.
 
-P5 proceeds with **(c)** unless Chris picks otherwise — it is the only option that is
-both zero-code-risk on the trust path and consistent with "no authority outside
-explicit ACL grants."
+Rationale for (c): the only option that keeps `device.key` off the network, keeps the
+mover least-privilege, and removes the setup surprise — at the cost of one CLI helper,
+zero change to the trust path. (a) was the same posture with worse ergonomics; (b)
+traded the strongest key's isolation for convenience (c) provides more safely.
 
 ## 5. Phases + turnkey checklist
 

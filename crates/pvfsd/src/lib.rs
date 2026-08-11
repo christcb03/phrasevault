@@ -7,6 +7,7 @@
 //! Data plane (bytes): engine lock released before streaming raw bytes so
 //! concurrent cat transfers don't block each other.
 
+pub mod jobs;
 pub mod nettls;
 
 use std::collections::HashMap;
@@ -62,6 +63,9 @@ pub struct Daemon {
     /// connection and **consumed on first use** (doc 08 §4 item 7): a captured
     /// auth signature can never be replayed, even against a network listener.
     nonces: Mutex<HashMap<String, u64>>,
+    /// The P5 job runner's state, when the binary attached one (doc 18 §2).
+    /// Absent in embedded/test daemons — `ServeStatus` then reports `"off"`.
+    jobs: std::sync::OnceLock<Arc<jobs::JobsState>>,
 }
 
 impl Daemon {
@@ -80,7 +84,14 @@ impl Daemon {
             forest_id,
             prepared: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
+            jobs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the job runner's state so `ServeStatus` answers live (set once,
+    /// by the binary, before serving).
+    pub fn attach_jobs(&self, jobs: Arc<jobs::JobsState>) {
+        let _ = self.jobs.set(jobs);
     }
 
     /// Issue a fresh challenge nonce, registered for single use.
@@ -307,6 +318,18 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
                 root: e.identity.root_node_id.clone(),
             }
         }
+        // Operational metadata, same tier as Info: job names and run states,
+        // never catalog content (doc 18 §2).
+        ClientMsg::ServeStatus => match daemon.jobs.get() {
+            Some(j) => ServerMsg::ServeJobs {
+                runner: "on".into(),
+                jobs: j.snapshot(),
+            },
+            None => ServerMsg::ServeJobs {
+                runner: "off".into(),
+                jobs: Vec::new(),
+            },
+        },
         ClientMsg::Ls { node } => match do_ls(daemon, principal, &node) {
             Ok(children) => ServerMsg::Ls { children },
             Err(msg) => msg,

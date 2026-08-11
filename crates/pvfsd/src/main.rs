@@ -42,19 +42,29 @@ impl Drop for SocketGuard {
 /// stop accepting, checkpoint the WAL, and exit cleanly (doc 08 §4 item 4).
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Set by the SIGHUP handler; the job runner re-reads `serve.jobs` (doc 18 §2).
+static RELOAD: AtomicBool = AtomicBool::new(false);
+
 /// Async-signal-safe: a lone atomic store is all the handler does.
 extern "C" fn on_signal(_sig: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+/// Async-signal-safe: a lone atomic store is all the handler does.
+extern "C" fn on_hup(_sig: i32) {
+    RELOAD.store(true, Ordering::SeqCst);
+}
+
 /// Install `on_signal` for SIGTERM and SIGINT (no `SA_RESTART`, so the poll loop's
-/// sleep is interrupted promptly).
+/// sleep is interrupted promptly), and `on_hup` for SIGHUP (job-config reload).
 fn install_signal_handlers() -> Result<(), Box<dyn std::error::Error>> {
     let action = SigAction::new(SigHandler::Handler(on_signal), SaFlags::empty(), SigSet::empty());
-    // Safety: `on_signal` only does an async-signal-safe atomic store.
+    let hup = SigAction::new(SigHandler::Handler(on_hup), SaFlags::empty(), SigSet::empty());
+    // Safety: both handlers only do an async-signal-safe atomic store.
     unsafe {
         sigaction(Signal::SIGTERM, &action)?;
         sigaction(Signal::SIGINT, &action)?;
+        sigaction(Signal::SIGHUP, &hup)?;
     }
     Ok(())
 }
@@ -118,6 +128,15 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // SIGTERM/SIGINT → stop accepting, checkpoint, exit cleanly (doc 08 §4 item 4).
     install_signal_handlers()?;
 
+    // The P5 job runner (doc 18 §2): reads `serve.jobs`, reloads on SIGHUP.
+    // A corrupt config refuses startup — loud beats silently jobless.
+    let jobs = Arc::new(pvfsd::jobs::JobsState::load(data_dir.clone())?);
+    daemon.attach_jobs(Arc::clone(&jobs));
+    let jobs_thread = {
+        let j = Arc::clone(&jobs);
+        std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD))
+    };
+
     // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,
     // sharing the daemon and the shutdown flag.
     let mut tls_thread = None;
@@ -156,6 +175,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(t) = tls_thread {
         let _ = t.join();
     }
+    let _ = jobs_thread.join();
     eprintln!("pvfsd: shutting down (checkpointing)");
     daemon.shutdown_checkpoint()?;
     Ok(())

@@ -375,11 +375,10 @@ smoke suite.
    "sync on first read" promotion).
 4. **Export of folder refs (F0/F4):** revisit once region links exist — a folder ref to a replicated
    region could export as a real subtree scoped to that region's log.
-5. **Outbound fetch identity (found by the 2026-08-10 two-machine test):** every outbound
-   connection — the owner's own mover and read-through included — authenticates as the box's
-   *client identity*, never the forest device key. On a private forest (no `public r`),
-   `pvfs tier` on the owner cannot pull from an edge box until the owner's client identity is
-   `authorize-member`'d and granted read. Single-host smoke never sees this (it grants
-   `public r` early). Decide: document the per-box grants as the model (explicit-ACL posture,
-   works today), or teach engines opened with `device.key` to dial with it. Same question
-   applies to any future scheduled `serve` sync jobs (F0.1/F3.1).
+5. **Outbound fetch identity (found by the 2026-08-10 two-machine test) — ✅ DECIDED
+   (2026-08-10, doc 18 §4):** every outbound connection — the owner's own mover and
+   read-through included — authenticates as the box's *client identity*, never the forest
+   device key, and **that stays the model**. The friction (on a private forest even the
+   owner's boxes must be authorize-member'd + granted read) is answered with tooling, not a
+   trust-path change: `pvfs fleet enroll` makes the per-box grant a one-step, logged,
+   revocable operation (doc 18 P5.4). `device.key` never dials.

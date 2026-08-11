@@ -437,6 +437,26 @@ assert_rc 0 "auto-routed acl set tag principal accepted" -- \
 $PVFS --json remote --socket "$SOCK" info | qgrep "\"forest_id\":\"$DFID\"" \
   && ok "daemon still serving after auto-routed admin" || fail "daemon still serving after auto-routed admin"
 
+say "P5.0: serve jobs — config, live status, SIGHUP reload (doc 18 §2)"
+$PVFS --data-dir "$DMOUNT/.pvfs" serve ls | qgrep "follow" && ok "serve ls lists known jobs" || fail "serve ls"
+$PVFS --data-dir "$DMOUNT/.pvfs" serve enable sync >/dev/null && ok "serve enable edits serve.jobs" || fail "serve enable"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" serve ls | qgrep '"job":"sync","enabled":true' \
+  && ok "serve ls shows the enabled job" || fail "serve ls enabled"
+assert_rc 2 "unknown job refused → 2" -- $PVFS --data-dir "$DMOUNT/.pvfs" serve enable defrag
+$PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | qgrep '"runner":"on"' \
+  && ok "live status: runner attached" || fail "serve status runner"
+# the daemon started before the enable — SIGHUP folds the new config in
+kill -HUP "$DPID"
+STATUS_OK=""
+for _ in $(seq 1 20); do
+  if $PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | qgrep '"job":"sync","enabled":true,"state":"idle"'; then
+    STATUS_OK=1; break
+  fi
+  sleep 0.25
+done
+[ -n "$STATUS_OK" ] && ok "SIGHUP reloaded serve.jobs into the runner" || fail "SIGHUP reload"
+$PVFS --data-dir "$DMOUNT/.pvfs" serve disable sync >/dev/null && ok "serve disable" || fail "serve disable"
+
 say "F2: replica — verified log shipping (doc 17 §5)"
 REPMOUNT="$DATA/replica"
 # the gate: log shipping needs admin on the forest root (client has only rw)

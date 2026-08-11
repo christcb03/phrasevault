@@ -240,8 +240,11 @@ enum Cmd {
         #[arg(long, requires = "delete")]
         purge: bool,
     },
-    /// Run the watcher daemon (live indexing + scheduled reconciliation)
+    /// Run the watcher daemon (live indexing + scheduled reconciliation) —
+    /// or manage pvfsd's background jobs (P5, doc 18) via a subcommand
     Serve {
+        #[command(subcommand)]
+        cmd: Option<ServeCmd>,
         #[arg(long, default_value_t = 3600)]
         reconcile_secs: u64,
         #[arg(long, default_value_t = 2000)]
@@ -595,6 +598,19 @@ enum ReplicaCmd {
     /// Follow the source live (F5.4): long-poll for new events, ingest and
     /// fold them within seconds, reconnect on failure. Runs until killed.
     Follow { mount: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ServeCmd {
+    /// Enable a job in `serve.jobs` (follow|sync|export|tier|evict). The
+    /// daemon picks it up on SIGHUP or restart.
+    Enable { job: String },
+    /// Disable a job in `serve.jobs`
+    Disable { job: String },
+    /// List the jobs this data dir is configured to run
+    Ls,
+    /// Ask the running daemon for live job-runner state
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -3257,6 +3273,94 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Serve { cmd: Some(cmd), .. } => {
+            // enable/disable/ls edit the local `serve.jobs` (deployment state,
+            // doc 18 §2); status asks the running daemon over its socket.
+            // (Bare `pvfs serve` — no subcommand — stays the P1 watcher, below.)
+            let engine = Engine::open(&ctx?)?;
+            let data_dir = engine.data_dir().to_path_buf();
+            engine.close()?;
+            match cmd {
+                ServeCmd::Enable { .. } | ServeCmd::Disable { .. } => {
+                    let (job, enable) = match cmd {
+                        ServeCmd::Enable { job } => (job, true),
+                        ServeCmd::Disable { job } => (job, false),
+                        _ => unreachable!(),
+                    };
+                    let changed = pvfs_core::serve::set_job(&data_dir, &job, enable)?;
+                    let verb = if enable { "enabled" } else { "disabled" };
+                    if json {
+                        println!("{{\"job\":\"{job}\",\"{verb}\":true,\"changed\":{changed}}}");
+                    } else if changed {
+                        println!("{job} {verb} — the daemon picks it up on SIGHUP or restart");
+                    } else {
+                        println!("{job} already {verb}");
+                    }
+                    Ok(())
+                }
+                ServeCmd::Ls => {
+                    let enabled = pvfs_core::serve::load_jobs(&data_dir)?;
+                    if json {
+                        let rows: Vec<String> = pvfs_core::serve::JOB_NAMES
+                            .iter()
+                            .map(|n| {
+                                let en = enabled.iter().any(|j| j == n);
+                                format!("{{\"job\":\"{n}\",\"enabled\":{en}}}")
+                            })
+                            .collect();
+                        println!("[{}]", rows.join(","));
+                    } else {
+                        for n in pvfs_core::serve::JOB_NAMES {
+                            let en = enabled.iter().any(|j| j == n);
+                            println!("{n:<8} {}", if en { "enabled" } else { "-" });
+                        }
+                    }
+                    Ok(())
+                }
+                ServeCmd::Status => {
+                    let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
+                        field: "serve".into(),
+                        reason: "no running daemon for this forest (status is live state)"
+                            .into(),
+                    })?;
+                    let mut client = Client::connect_public(&sock).map_err(remote_err)?;
+                    let (runner, jobs) = client.serve_status().map_err(remote_err)?;
+                    if json {
+                        let rows: Vec<String> = jobs
+                            .iter()
+                            .map(|j| {
+                                format!(
+                                    "{{\"job\":\"{}\",\"enabled\":{},\"state\":\"{}\",\"last_ok_ms\":{},\"last_error\":{}}}",
+                                    json_escape(&j.name),
+                                    j.enabled,
+                                    json_escape(&j.state),
+                                    j.last_ok_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+                                    j.last_error
+                                        .as_ref()
+                                        .map(|e| format!("\"{}\"", json_escape(e)))
+                                        .unwrap_or_else(|| "null".into()),
+                                )
+                            })
+                            .collect();
+                        println!(
+                            "{{\"runner\":\"{}\",\"jobs\":[{}]}}",
+                            json_escape(&runner),
+                            rows.join(",")
+                        );
+                    } else {
+                        println!("runner: {runner}");
+                        for j in &jobs {
+                            let mut line = format!("{:<8} {}", j.name, j.state);
+                            if let Some(e) = &j.last_error {
+                                line.push_str(&format!("  (last error: {e})"));
+                            }
+                            println!("{line}");
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
         Cmd::Sync { target } => {
             let (mut engine, roots) = match target {
                 Some(t) => {
@@ -4083,6 +4187,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Serve {
+            cmd: None,
             reconcile_secs,
             debounce_ms,
         } => serve(&ctx?, json, reconcile_secs, debounce_ms),

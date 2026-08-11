@@ -20,7 +20,7 @@ use pvfs_proto::{
     WriteOp,
 };
 
-pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo};
+pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo, ServeJobWire};
 
 /// The client's transport: both arms speak identical frames.
 enum Stream {
@@ -220,6 +220,14 @@ impl Client {
                 root,
             }),
             other => Err(unexpected("Info", &other)),
+        }
+    }
+
+    /// The daemon's live job-runner state (P5, doc 18 §2): `("on"|"off", rows)`.
+    pub fn serve_status(&mut self) -> Result<(String, Vec<ServeJobWire>)> {
+        match self.request(ClientMsg::ServeStatus)? {
+            ServerMsg::ServeJobs { runner, jobs } => Ok((runner, jobs)),
+            other => Err(unexpected("ServeJobs", &other)),
         }
     }
 
