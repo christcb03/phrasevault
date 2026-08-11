@@ -6,6 +6,7 @@ members = [
     "crates/pvfs-client",
     "crates/pvfsd",
     "crates/pvfs-companion",
+    "crates/pvfs-fuse",
 ]
 resolver = "2"
 
@@ -28,6 +29,9 @@ uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", features = ["user", "fs"] }
 clap = { version = "4.4", features = ["derive"] }
 tempfile = "3"
+# default-features off = the pure-Rust mount path (no libfuse at build time;
+# runtime needs only fusermount3 from the fuse3 package)
+fuser = { version = "0.14", default-features = false }
 # Companion web-agent TLS (PVOS M3.6 §4a — close the loopback-exception
 # reliance): rustls with the ring provider (aws-lc-sys wants cmake; the
 # pipeline hosts don't have it), rcgen for the localhost cert.

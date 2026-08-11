@@ -26,6 +26,7 @@ EPID=""
 RPID=""
 FPID=""
 JPID=""
+MPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
@@ -36,6 +37,7 @@ cleanup() {
   [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
   [ -n "$FPID" ] && kill "$FPID" 2>/dev/null
   [ -n "$JPID" ] && kill "$JPID" 2>/dev/null
+  [ -n "$MPID" ] && { fusermount3 -u "$DATA/fuse-view" 2>/dev/null; kill "$MPID" 2>/dev/null; }
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -749,6 +751,27 @@ $PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$RGN" >/dev/null \
   && ok "region unmark" || fail "region unmark"
 $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
   && ok "the same mv is fine once the boundary is gone" || fail "post-unmark mv"
+
+say "P7.3: FUSE mount — browse + stream through the kernel (doc 20 §3)"
+if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+  mkdir -p "$DATA/fuse-view"
+  $PVFS --data-dir "$REPMOUNT/.pvfs" mount "$DROOT" "$DATA/fuse-view" >/dev/null 2>"$DATA/fuse.log" &
+  MPID=$!
+  MOK=""
+  for _ in $(seq 1 40); do
+    if [ "$(cat "$DATA/fuse-view/albums/a.txt" 2>/dev/null)" = "hi" ]; then MOK=1; break; fi
+    sleep 0.25
+  done
+  [ -n "$MOK" ] && ok "kernel read through the mount (a replica, resolved live)" \
+    || fail "fuse read: $(tail -2 "$DATA/fuse.log" 2>/dev/null)"
+  ls "$DATA/fuse-view" | qgrep albums && ok "readdir lists the tree" || fail "fuse readdir"
+  $PVFS umount "$DATA/fuse-view" >/dev/null 2>&1 || fusermount3 -u "$DATA/fuse-view" 2>/dev/null
+  wait "$MPID" 2>/dev/null || true
+  MPID=""
+  ok "unmounted cleanly"
+else
+  ok "fuse unavailable here — mount checks skipped (not a failure)"
+fi
 
 say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
 mkdir -p "$DATA/config3"

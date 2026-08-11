@@ -158,6 +158,14 @@ enum Cmd {
     /// Region boundaries (P7.0, doc 20): per-app replication/compaction units
     #[command(subcommand)]
     Region(RegionCmd),
+    /// Mount a tree read-only as a real filesystem (P7.3, doc 20 §3):
+    /// directories from the catalog, file reads resolve live — local bytes,
+    /// the sync store, else verified read-through. Blocks until unmounted.
+    #[cfg(target_os = "linux")]
+    Mount { target: String, dir: PathBuf },
+    /// Unmount a pvfs mount (fusermount -u)
+    #[cfg(target_os = "linux")]
+    Umount { dir: PathBuf },
     /// Fleet setup (P5.4, doc 18 §4): admit another box's client identity
     /// in one visible, logged, revocable step
     #[command(subcommand)]
@@ -3432,6 +3440,40 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Ok(())
             }
         },
+        #[cfg(target_os = "linux")]
+        Cmd::Mount { target, dir } => {
+            let (engine, id) = engine_and_node(ctx, &target)?;
+            let data_dir = engine.data_dir().to_path_buf();
+            engine.close()?;
+            std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create mountpoint", e))?;
+            eprintln!(
+                "mounting {id} at {} (read-only; `pvfs umount {}` to stop)",
+                dir.display(),
+                dir.display()
+            );
+            pvfs_fuse::mount(&data_dir, &id, &dir)?;
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Cmd::Umount { dir } => {
+            let tried = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&dir)
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("fusermount").arg("-u").arg(&dir).status()
+                })
+                .map_err(|e| PvfsError::io("fusermount", e))?;
+            if tried.success() {
+                println!("unmounted {}", dir.display());
+                Ok(())
+            } else {
+                Err(PvfsError::BadInput {
+                    field: "umount".into(),
+                    reason: format!("fusermount failed for {}", dir.display()),
+                })
+            }
+        }
         Cmd::Region(cmd) => {
             match cmd {
                 RegionCmd::Mark { target } => {

@@ -118,4 +118,19 @@ phase validates on presubuntu before its commit, as always.
 
 ## 7. Close-out
 
-(To be written as phases land tonight.)
+- **P7.0 landed** (`616d058`, validated: 211 tests, 303 smoke, clippy clean): the
+  region vocabulary end to end — signed mark/unmark events with admin-gated replay,
+  the regions projection (schema v4), membership, CLI, and the cross-region mv
+  refusal.
+- **P7.1 deliberately NOT started — a design finding instead (2026-08-11, night):**
+  implementing the filtered ship exposed that §2.1's interim demands
+  **sparse-sequence replay** in the replica store: region rows arrive with seq gaps,
+  so chain verification (which assumes dense rows) must grow a gap-tolerant mode
+  used *only* by this interim — exactly the machinery physical per-region logs
+  (P7.2) delete, since each region then owns a dense chain and the standard replay
+  just works. PROPOSAL for review: **merge P7.1 into P7.2** — build region-scoped
+  replication once, on real per-region logs, instead of shipping a throwaway
+  verification mode for the single-log era. Per §5's rule (no half-landed phases),
+  nothing of P7.1 was committed.
+- **P7.3 (FUSE mount): in build the same night** — independent of the region
+  decision.

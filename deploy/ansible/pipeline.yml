@@ -35,7 +35,8 @@
       ansible.builtin.apt:
         # libdbus-1-dev: the Linux secret-service backend of pvfs-companion
         # (feature os-keychain) links against libdbus at build time.
-        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev]
+        # fuse3: fusermount3 for the P7.3 streaming mount (doc 20 §3)
+        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev, fuse3]
         state: present
         update_cache: true
       tags: [prepare]

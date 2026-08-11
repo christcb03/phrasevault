@@ -1,0 +1,17 @@
+[package]
+name = "pvfs-fuse"
+description = "PVFS read-only streaming FUSE mount (P7.3, doc 20 §3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pvfs-core = { path = "../pvfs-core" }
+# read-through at open (F5.2): the mount is a fetch client like any other
+pvfs-client = { path = "../pvfs-client" }
+fuser.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+blake3.workspace = true
