@@ -125,6 +125,38 @@ and folder refs are skipped with a per-entry reason. `--mode hardlink` serves ap
 symlinks (same filesystem only); `--mode copy` streams through the verified read path, so a
 corrupted location can never land bytes in the export (it gets quarantined instead, like any read).
 
+### 6.2 The live mount (`pvfs mount`, Linux)
+
+Where an export materializes a snapshot, `pvfs mount <node> <dir>` presents the tree as a **live
+read-only filesystem** (FUSE): browse with `ls`, open files with anything. Bytes resolve at open —
+local path, sync store, or a verified fetch from a serving holder — so a pointer-mode library
+streams on demand. `pvfs umount <dir>` (or Ctrl-C on the foreground mount) releases it. Needs the
+distro's `fuse3` package.
+
+### 6.3 Regions (`pvfs region`)
+
+A **region** makes a subtree its own replication and audit unit:
+
+```bash
+pvfs region mark <node>      # the subtree becomes a region
+pvfs region ls [node]        # list boundaries / show which region a node is in
+pvfs region unmark <node>    # fold it back into the enclosing region
+```
+
+Since P7.2a, a mark is physical: the region gets **its own signed log** under the data dir
+(`regions/<id>/g-*.db`), created by one commit that also records a verifiable **baseline** of the
+subtree's state at that instant. From then on everything inside the region authors in its log; the
+enclosing log periodically attests the region's head, so one root hash still covers the whole
+forest, and every rebuild re-verifies each baseline against the replayed history. `unmark` seals
+the region's log in place (kept for verification) and returns the subtree to the enclosing log;
+re-marking later starts a fresh generation.
+
+What you'll notice day to day: nothing — reads and writes behave identically. The visible edges
+are deliberate refusals: **moving a node across a region boundary** (including re-homing an
+orphan into another region) and **purging a subtree that still contains a region boundary** are
+refused with guidance (`unmark` first). Cross-region moves arrive with the paired-event protocol
+(doc 20 §2).
+
 ---
 
 ## 7. Sharing a forest with other users
@@ -530,6 +562,8 @@ run `pvfs member replace <file>`).
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
 | `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
 | `pvfs export <target> <dir> [--mode symlink\|hardlink\|copy] [--prune]` | Materialize a tree as a native directory for non-PVFS apps (§6.1). |
+| `pvfs mount <target> <dir>` · `pvfs umount <dir>` | Live read-only FUSE view — bytes stream on demand (§6.2, Linux). |
+| `pvfs region mark\|ls\|unmark <node>` | Make a subtree its own signed-log replication/audit unit (§6.3). |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs audit` | Authorization health check: tag grants/memberships under a revoked authority, `key:` grants to revoked devices, and expired grants. |
 | `pvfs secure create <parent> <label> [--path P]` | Create an encrypted-at-rest blob (managed storage; `--path` pins a location). |
@@ -609,5 +643,7 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
   and **follow their source live** (`pvfs replica follow` — new events in seconds); locations name
   their holding instance, reads **fetch on demand** from any pinned holder, and the
   **tiered-storage mover** migrates bytes to a central store with safe edge eviction (§7.10) — the
-  full ingest-box → NAS pipeline. Still ahead ([doc 17](17-federation-and-sync.md) §8):
-  region-granular replication, a FUSE mount, swarm transfer, and failover.
+  full ingest-box → NAS pipeline. The F4 arc is landing ([doc 20](20-f4-regions-and-streaming.md)):
+  the FUSE mount (§6.2) and physical region logs (§6.3) are **built**; still ahead there:
+  region-scoped replication over the wire, cross-region moves, attachment policies (doc 21),
+  swarm transfer, and failover.

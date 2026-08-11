@@ -13,7 +13,12 @@ use crate::log_store;
 // projection (a pure cache of the log) is dropped and replayed on upgrade.
 // v3 (doc 13 Q-E1, 1.2): `acl` carries `expires_at` (0 = never); an expired grant
 // is masked on the read path. Same drop-and-replay upgrade.
-pub const SCHEMA_VERSION: u32 = 4; // 4: + regions (P7.0, doc 20 §2)
+// v4: + regions (P7.0, doc 20 §2).
+// v5 (P7.2a, doc 20 §2.3): physical region logs — `nodes.region_id`
+// (fold-maintained, sticky for orphans), the extended `regions` row (baseline
+// commitment + generation file + committed head), and per-log `applied_marks`
+// replacing the single last_applied pair. Same drop-and-replay upgrade.
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -25,7 +30,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   creation_nonce INTEGER NOT NULL,
   created_at     INTEGER NOT NULL,
   author         BLOB NOT NULL,
-  sig            BLOB NOT NULL
+  sig            BLOB NOT NULL,
+  region_id      TEXT               -- P7.2a: owning region (NULL = top); sticky for orphans
 );
 
 CREATE TABLE IF NOT EXISTS links (
@@ -69,8 +75,24 @@ CREATE TABLE IF NOT EXISTS acl (
   PRIMARY KEY (node_id, principal_kind, principal_id, authority)
 );
 CREATE TABLE IF NOT EXISTS regions (
-  node_id   TEXT    NOT NULL PRIMARY KEY,  -- the region boundary (P7.0, doc 13 §B)
-  marked_at INTEGER NOT NULL
+  node_id        TEXT    NOT NULL PRIMARY KEY,  -- the region boundary (P7.0, doc 13 §B)
+  marked_at      INTEGER NOT NULL,
+  -- P7.2a (doc 20 §2.3): the physical-log generation. state_root NULL = not yet
+  -- split (a legacy P7.0 mark; the writer splits it lazily at open).
+  state_root     TEXT,                          -- hex canonical state commitment
+  baseline_seq   INTEGER NOT NULL DEFAULT 0,    -- seq of the RegionBaseline row in its host log
+  baseline_log   TEXT    NOT NULL DEFAULT '',   -- log id hosting the baseline ('' = top); immutable
+  parent_log     TEXT    NOT NULL DEFAULT '',   -- where future heads/unmark author; reparented on enclosing unmark
+  log_file       TEXT,                          -- generation file, relative to the data dir
+  committed_seq  INTEGER NOT NULL DEFAULT 0,    -- last SubRegionHead the enclosing log attests
+  committed_head TEXT    NOT NULL DEFAULT ''
+);
+
+-- P7.2a: per-log replay positions ('' = the top log, else the region root id).
+CREATE TABLE IF NOT EXISTS applied_marks (
+  log_id     TEXT PRIMARY KEY,
+  seq        INTEGER NOT NULL,
+  chain_hash TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS member_tags (
@@ -192,6 +214,7 @@ const MAIN_OBJECTS: &[&str] = &[
     "device_keys",
     "acl",
     "regions",
+    "applied_marks",
     "member_tags",
     "temp_nodes",
     "temp_links",
@@ -230,16 +253,241 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         .map_err(map_db("create index schema"))?;
     if meta_get(conn, "schema_version")?.is_none() {
         meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
-        meta_set(conn, "last_applied_seq", "0")?;
-        meta_set(conn, "last_applied_chain_hash", "")?;
         meta_set(conn, "clean_shutdown", "1")?;
     }
+    conn.execute(
+        "INSERT OR IGNORE INTO applied_marks (log_id, seq, chain_hash) VALUES ('', 0, '')",
+        [],
+    )
+    .map_err(map_db("seed applied mark"))?;
     Ok(())
+}
+
+// ---- per-log applied marks (P7.2a) ------------------------------------------
+
+pub fn applied_get(conn: &Connection, log_id: &str) -> Result<(u64, String)> {
+    conn.query_row(
+        "SELECT seq, chain_hash FROM applied_marks WHERE log_id = ?1",
+        params![log_id],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(map_db("read applied mark"))
+    .map(|v| v.unwrap_or((0, String::new())))
+}
+
+pub fn applied_set(conn: &Connection, log_id: &str, seq: u64, chain_hash: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO applied_marks (log_id, seq, chain_hash) VALUES (?1, ?2, ?3)
+         ON CONFLICT(log_id) DO UPDATE SET seq = excluded.seq, chain_hash = excluded.chain_hash",
+        params![log_id, seq as i64, chain_hash],
+    )
+    .map_err(map_db("write applied mark"))?;
+    Ok(())
+}
+
+/// Attached-db name for a log during replay/append: the top log keeps its
+/// historical name; region logs attach under `r<region-root-id>`.
+pub fn attach_name(log_id: &str) -> String {
+    if log_id.is_empty() {
+        log_store::TOP_LOG.into()
+    } else {
+        format!("r{log_id}")
+    }
+}
+
+/// A region generation's file, relative to the data dir (doc 20 §2.3): named
+/// at birth from the baseline row's host + seq, never renamed.
+pub fn region_log_rel_path(region_root: &str, baseline_log: &str, baseline_seq: u64) -> String {
+    let host = if baseline_log.is_empty() {
+        "top".to_string()
+    } else {
+        baseline_log.chars().take(8).collect()
+    };
+    format!("regions/{region_root}/g-{host}-{baseline_seq}.db")
+}
+
+// ---- canonical region state (P7.2a, doc 20 §2.3 / doc 11 §6) ----------------
+
+/// The deterministic commitment to a subtree's current logged state: fixed
+/// section order, items canonically `Enc`-encoded and sorted by primary key,
+/// section hashes folded under a domain tag. Membership is the contains-closure
+/// under `root` computed from links (stopping at nested marks) — never from
+/// `nodes.region_id`, so the mark-time compute (before the column exists) and
+/// the replay-time verify (after) agree by construction. Local observations
+/// (pending changes, quarantine, scan state) and forest-scoped tables are
+/// excluded: only log-derived state is committed.
+pub fn canonical_state_root(conn: &Connection, root: &str) -> Result<[u8; 32]> {
+    use crate::encoding::Enc;
+    let m = map_db("canonical state");
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.canon_members;
+         CREATE TEMP TABLE canon_members (id TEXT PRIMARY KEY);",
+    )
+    .map_err(&m)?;
+    conn.execute(
+        "WITH RECURSIVE sub(id) AS (
+           SELECT ?1
+           UNION
+           SELECT l.child_id FROM links l JOIN sub s ON l.parent_id = s.id
+           WHERE l.link_type = ?2 AND l.removed_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM regions r WHERE r.node_id = l.child_id)
+         )
+         INSERT INTO canon_members SELECT id FROM sub",
+        params![root, crate::link::LINK_CONTAINS],
+    )
+    .map_err(&m)?;
+
+    let mut sections: Vec<[u8; 32]> = Vec::with_capacity(7);
+    let section = |domain: &str, sql: &str, encode: &mut dyn FnMut(&rusqlite::Row<'_>, &mut Enc) -> rusqlite::Result<()>| -> Result<[u8; 32]> {
+        let mut h = blake3::Hasher::new();
+        h.update(domain.as_bytes());
+        let mut stmt = conn.prepare(sql).map_err(&m)?;
+        let mut rows = stmt.query([]).map_err(&m)?;
+        while let Some(row) = rows.next().map_err(&m)? {
+            let mut e = Enc::new();
+            encode(row, &mut e).map_err(&m)?;
+            h.update(&e.finish());
+        }
+        Ok(*h.finalize().as_bytes())
+    };
+
+    sections.push(section(
+        "pvfs:regionstate:nodes:",
+        "SELECT id, node_type, label, visibility, payload, creation_nonce, created_at, author, sig
+         FROM nodes WHERE id IN (SELECT id FROM canon_members) ORDER BY id",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .string(&r.get::<_, String>(1)?)
+                .string(&r.get::<_, String>(2)?)
+                .string(&r.get::<_, String>(3)?)
+                .bytes(&r.get::<_, Vec<u8>>(4)?)
+                .u64(r.get::<_, i64>(5)? as u64)
+                .u64(r.get::<_, i64>(6)? as u64)
+                .bytes(&r.get::<_, Vec<u8>>(7)?)
+                .bytes(&r.get::<_, Vec<u8>>(8)?);
+            Ok(())
+        },
+    )?);
+    sections.push(section(
+        "pvfs:regionstate:links:",
+        "SELECT id, IFNULL(parent_id,''), child_id, link_type, link_nonce, order_key, created_at,
+                author, sig, IFNULL(removed_at,0), IFNULL(superseded_by,''), IFNULL(suspended_at,0)
+         FROM links WHERE parent_id IN (SELECT id FROM canon_members) ORDER BY id",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .string(&r.get::<_, String>(1)?)
+                .string(&r.get::<_, String>(2)?)
+                .string(&r.get::<_, String>(3)?)
+                .u64(r.get::<_, i64>(4)? as u64)
+                .string(&r.get::<_, String>(5)?)
+                .u64(r.get::<_, i64>(6)? as u64)
+                .bytes(&r.get::<_, Vec<u8>>(7)?)
+                .bytes(&r.get::<_, Vec<u8>>(8)?)
+                .u64(r.get::<_, i64>(9)? as u64)
+                .string(&r.get::<_, String>(10)?)
+                .u64(r.get::<_, i64>(11)? as u64);
+            Ok(())
+        },
+    )?);
+    sections.push(section(
+        "pvfs:regionstate:locations:",
+        "SELECT file_id, uri, added_at, IFNULL(removed_at,0) FROM file_locations
+         WHERE file_id IN (SELECT id FROM canon_members) ORDER BY file_id, uri",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .string(&r.get::<_, String>(1)?)
+                .u64(r.get::<_, i64>(2)? as u64)
+                .u64(r.get::<_, i64>(3)? as u64);
+            Ok(())
+        },
+    )?);
+    sections.push(section(
+        "pvfs:regionstate:acl:",
+        "SELECT node_id, principal_kind, principal_id, authority, rights, set_at, expires_at
+         FROM acl WHERE node_id IN (SELECT id FROM canon_members)
+         ORDER BY node_id, principal_kind, principal_id, authority",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .u64(r.get::<_, i64>(1)? as u64)
+                .bytes(&r.get::<_, Vec<u8>>(2)?)
+                .bytes(&r.get::<_, Vec<u8>>(3)?)
+                .u64(r.get::<_, i64>(4)? as u64)
+                .u64(r.get::<_, i64>(5)? as u64)
+                .u64(r.get::<_, i64>(6)? as u64);
+            Ok(())
+        },
+    )?);
+    sections.push(section(
+        "pvfs:regionstate:bindings:",
+        "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at,
+                IFNULL(unbound_at,0)
+         FROM folder_bindings WHERE folder_id IN (SELECT id FROM canon_members) ORDER BY folder_id",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .string(&r.get::<_, String>(1)?)
+                .u64(r.get::<_, i64>(2)? as u64)
+                .u64(r.get::<_, i64>(3)? as u64)
+                .string(&r.get::<_, String>(4)?)
+                .string(&r.get::<_, String>(5)?)
+                .u64(r.get::<_, i64>(6)? as u64)
+                .u64(r.get::<_, i64>(7)? as u64);
+            Ok(())
+        },
+    )?);
+    sections.push(section(
+        "pvfs:regionstate:blobs:",
+        "SELECT blob_id, content_hash, size, updated_at, author FROM secure_blobs
+         WHERE blob_id IN (SELECT id FROM canon_members) ORDER BY blob_id",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .bytes(&r.get::<_, Vec<u8>>(1)?)
+                .u64(r.get::<_, i64>(2)? as u64)
+                .u64(r.get::<_, i64>(3)? as u64)
+                .bytes(&r.get::<_, Vec<u8>>(4)?);
+            Ok(())
+        },
+    )?);
+    // Immediate nested regions appear as their identities + last attested
+    // heads (Q-B1: their interiors are their own logs' business).
+    sections.push(section(
+        "pvfs:regionstate:nested:",
+        "SELECT r.node_id, r.marked_at, r.baseline_seq, IFNULL(r.state_root,''),
+                r.committed_seq, r.committed_head
+         FROM regions r
+         WHERE EXISTS (SELECT 1 FROM links l JOIN canon_members cm ON l.parent_id = cm.id
+                       WHERE l.child_id = r.node_id AND l.link_type = 'contains'
+                         AND l.removed_at IS NULL)
+         ORDER BY r.node_id",
+        &mut |r, e| {
+            e.string(&r.get::<_, String>(0)?)
+                .u64(r.get::<_, i64>(1)? as u64)
+                .u64(r.get::<_, i64>(2)? as u64)
+                .string(&r.get::<_, String>(3)?)
+                .u64(r.get::<_, i64>(4)? as u64)
+                .string(&r.get::<_, String>(5)?);
+            Ok(())
+        },
+    )?);
+    conn.execute_batch("DROP TABLE IF EXISTS temp.canon_members;")
+        .map_err(&m)?;
+
+    let mut e = Enc::new();
+    for s in &sections {
+        e.bytes(s);
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"pvfs:regionstate:v1:");
+    h.update(&e.finish());
+    Ok(*h.finalize().as_bytes())
 }
 
 // ---- fold rules (spec §9.2) -------------------------------------------------
 
-pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
+/// Fold one event into the projection. `log_id` is the log the event lives in
+/// ('' = top) and `seq` its position there — the region-event arms need both
+/// (a baseline is identified by its own row position, doc 20 §2.3).
+pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Result<()> {
     let m = map_db("fold event");
     match event {
         Event::ForestCreated {
@@ -480,6 +728,20 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
                 ],
             )
             .map_err(&m)?;
+            // P7.2a: homing assigns the child its parent's region. A move
+            // refreshes it harmlessly (cross-region moves are refused); an
+            // orphan keeps its last region (doc 20 §2.3 — stickiness is what
+            // routes its eventual purge into the right log).
+            if l.link_type == crate::link::LINK_CONTAINS && l.parent_id.is_some() {
+                tx.execute(
+                    "UPDATE nodes SET region_id =
+                       (SELECT CASE WHEN EXISTS (SELECT 1 FROM regions r WHERE r.node_id = ?1)
+                               THEN ?1 ELSE (SELECT region_id FROM nodes WHERE id = ?1) END)
+                     WHERE id = ?2",
+                    params![l.parent_id, l.child_id],
+                )
+                .map_err(&m)?;
+            }
         }
         Event::LinkRemoved {
             link_id, removed_at, ..
@@ -560,16 +822,110 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             .map_err(&m)?;
         }
         Event::RegionMarked { node_id, marked_at, .. } => {
+            // The enclosing region: the marked node's home parent's region
+            // (NULL/absent = top). Captured at mark time; reparented if the
+            // enclosing region later unmarks.
+            let enclosing: Option<String> = tx
+                .query_row(
+                    "SELECT n.region_id FROM links l JOIN nodes n ON n.id = l.parent_id
+                     WHERE l.child_id = ?1 AND l.link_type = ?2 AND l.removed_at IS NULL
+                     LIMIT 1",
+                    params![node_id, crate::link::LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(&m)?
+                .flatten();
+            let enclosing = enclosing.unwrap_or_default();
             tx.execute(
-                "INSERT INTO regions (node_id, marked_at) VALUES (?1, ?2)
+                "INSERT INTO regions (node_id, marked_at, parent_log) VALUES (?1, ?2, ?3)
                  ON CONFLICT(node_id) DO UPDATE SET marked_at = excluded.marked_at",
-                params![node_id, *marked_at as i64],
+                params![node_id, *marked_at as i64, enclosing],
+            )
+            .map_err(&m)?;
+            // Assign the contains-closure (stopping at nested marks) its region.
+            tx.execute(
+                "WITH RECURSIVE sub(id) AS (
+                   SELECT ?1
+                   UNION
+                   SELECT l.child_id FROM links l JOIN sub s ON l.parent_id = s.id
+                   WHERE l.link_type = ?2 AND l.removed_at IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM regions r WHERE r.node_id = l.child_id)
+                 )
+                 UPDATE nodes SET region_id = ?1 WHERE id IN (SELECT id FROM sub)",
+                params![node_id, crate::link::LINK_CONTAINS],
             )
             .map_err(&m)?;
         }
         Event::RegionUnmarked { node_id, .. } => {
+            let enclosing: Option<String> = tx
+                .query_row(
+                    "SELECT parent_log FROM regions WHERE node_id = ?1",
+                    params![node_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(&m)?;
+            let enclosing = enclosing.unwrap_or_default();
+            let enclosing_or_null: Option<&str> =
+                if enclosing.is_empty() { None } else { Some(enclosing.as_str()) };
+            // The former interior folds back into the enclosing region; nested
+            // marked regions keep their own identity but future heads/unmarks
+            // author one level up now.
+            tx.execute(
+                "UPDATE nodes SET region_id = ?1 WHERE region_id = ?2",
+                params![enclosing_or_null, node_id],
+            )
+            .map_err(&m)?;
+            tx.execute(
+                "UPDATE regions SET parent_log = ?1 WHERE parent_log = ?2",
+                params![enclosing, node_id],
+            )
+            .map_err(&m)?;
             tx.execute("DELETE FROM regions WHERE node_id = ?1", params![node_id])
                 .map_err(&m)?;
+            // The generation is over; its applied mark must not leak into a
+            // future re-mark of the same node.
+            tx.execute("DELETE FROM applied_marks WHERE log_id = ?1", params![node_id])
+                .map_err(&m)?;
+        }
+        Event::RegionBaseline { node_id, state_root, .. } => {
+            // The split (doc 20 §2.3): verify the commitment against the state
+            // this projection holds at this replay position — every rebuild is
+            // doc 11 §5's full verification — then stamp the generation.
+            let computed = canonical_state_root(tx, node_id)?;
+            if computed.as_slice() != state_root.as_slice() {
+                return Err(PvfsError::Corruption {
+                    db: "log.db".into(),
+                    detail: format!(
+                        "region baseline for {node_id} does not match the replayed \
+                         state (committed {}, computed {})",
+                        hex::encode(state_root),
+                        hex::encode(computed)
+                    ),
+                    seq: Some(seq),
+                });
+            }
+            let file = region_log_rel_path(node_id, log_id, seq);
+            tx.execute(
+                "UPDATE regions SET state_root = ?1, baseline_seq = ?2, baseline_log = ?3,
+                   log_file = ?4, committed_seq = 0, committed_head = ''
+                 WHERE node_id = ?5",
+                params![hex::encode(state_root), seq as i64, log_id, file, node_id],
+            )
+            .map_err(&m)?;
+            // A fresh generation replays from its own genesis — a leftover
+            // applied mark from a previous generation of this region root
+            // would silently skip the new log's rows.
+            tx.execute("DELETE FROM applied_marks WHERE log_id = ?1", params![node_id])
+                .map_err(&m)?;
+        }
+        Event::SubRegionHead { node_id, head_seq, head_hash, .. } => {
+            tx.execute(
+                "UPDATE regions SET committed_seq = ?1, committed_head = ?2 WHERE node_id = ?3",
+                params![*head_seq as i64, hex::encode(head_hash), node_id],
+            )
+            .map_err(&m)?;
         }
         Event::NodePurged { node_id, .. } => {
             tx.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
@@ -683,10 +1039,14 @@ fn quick_check(conn: &Connection, db: &str) -> Result<bool> {
 }
 
 /// Verify the per-event signature and the root-only rule for device events,
-/// then fold. Used by both catch-up replay and full rebuild.
+/// then fold. Used by both catch-up replay and full rebuild. `log_id` is the
+/// log being replayed ('' = top): region logs are default-deny for
+/// forest-scoped kinds — a tampered region file cannot smuggle in a device
+/// certificate, rotation, or second genesis.
 fn replay_one(
     tx: &Transaction<'_>,
     identity: &ForestIdentity,
+    log_id: &str,
     row: &log_store::EventRow,
     prev_chain: &[u8; 32],
 ) -> Result<[u8; 32]> {
@@ -701,6 +1061,22 @@ fn replay_one(
     }
     let ev = Event::decode(&row.kind, &row.body)?;
     ev.verify_sig()?;
+    if !log_id.is_empty() {
+        if let Event::ForestCreated { .. }
+        | Event::DeviceAuthorized { .. }
+        | Event::DeviceRevoked { .. }
+        | Event::RootRotated { .. }
+        | Event::RecoveryKeyRegistered { .. }
+        | Event::RecoveryKeyRevoked { .. }
+        | Event::MemberTagged { .. } = &ev
+        {
+            return Err(PvfsError::Corruption {
+                db: format!("region log {log_id}"),
+                detail: format!("forest-scoped event {} in a region log", ev.kind()),
+                seq: Some(row.seq),
+            });
+        }
+    }
     match &ev {
         Event::ForestCreated { .. } if row.seq != 1 => {
             return Err(PvfsError::Corruption {
@@ -744,7 +1120,7 @@ fn replay_one(
         _ => check_member_event(tx, &ev, row.written_at)
             .map_err(|_| unauthorized(row.seq, ev.kind()))?,
     }
-    fold(tx, &ev)?;
+    fold(tx, log_id, row.seq, &ev)?;
     Ok(expect)
 }
 
@@ -768,10 +1144,16 @@ fn unauthorized(seq: u64, kind: &str) -> PvfsError {
 /// after the grant lapses, and a rebuild is deterministic.
 pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Result<()> {
     let author = ev.author();
+    // As-of-time, not current-state (P7.2a, doc 20 §2.3): tree replay applies
+    // parallel logs after the top log completes, so "authored before the
+    // revocation" must be judged by the owner-stamped, chain-bound `written_at`
+    // — the same instant every other check here already uses. A live commit
+    // passes the wall clock, so a currently revoked key still fails.
     let active: i64 = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NULL)",
-            params![author],
+            "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1
+               AND authorized_at <= ?2 AND (revoked_at IS NULL OR revoked_at > ?2))",
+            params![author, as_of_ms as i64],
             |r| r.get(0),
         )
         .map_err(map_db("device authorization check"))?;
@@ -788,7 +1170,10 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
         }
         // Region boundaries (P7.0, doc 13 §B): admin on the node — a region
         // maps to an authority; drawing or erasing its border is that tier.
-        Event::RegionMarked { node_id, .. } | Event::RegionUnmarked { node_id, .. } => {
+        Event::RegionMarked { node_id, .. }
+        | Event::RegionUnmarked { node_id, .. }
+        | Event::RegionBaseline { node_id, .. }
+        | Event::SubRegionHead { node_id, .. } => {
             require_right(conn, author, node_id, acl::ACL_A, "mark region", as_of_ms)?
         }
         Event::LinkCreated(l) => {
@@ -1308,14 +1693,85 @@ pub fn contains_parent(conn: &Connection, node_id: &str) -> Result<Option<String
     Ok(p.flatten())
 }
 
-/// Replay events `from..=to` inside one transaction, updating meta at the end.
-fn replay_range(
+/// Maximum region nesting depth for tree replay: each level holds one extra
+/// ATTACHed log file, and SQLite's attach budget is small (doc 20 §2.3).
+const MAX_REGION_DEPTH: usize = 8;
+
+/// The chain-genesis seed for `log_id` ('' = top; else a split region, whose
+/// seed binds the baseline row position + state commitment, doc 20 §2.3).
+pub(crate) fn log_genesis(
+    conn: &Connection,
+    identity: &ForestIdentity,
+    log_id: &str,
+) -> Result<[u8; 32]> {
+    if log_id.is_empty() {
+        return Ok(log_store::genesis_seed(
+            &identity.instance_id,
+            &identity.forest_id,
+        ));
+    }
+    let (baseline_seq, state_root): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT baseline_seq, state_root FROM regions WHERE node_id = ?1",
+            params![log_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read region row"))?
+        .ok_or_else(|| PvfsError::Corruption {
+            db: format!("region log {log_id}"),
+            detail: "no active region row for this log".into(),
+            seq: None,
+        })?;
+    let root_hex = state_root.ok_or_else(|| PvfsError::Corruption {
+        db: format!("region log {log_id}"),
+        detail: "region is not split (no baseline)".into(),
+        seq: None,
+    })?;
+    let root = hex::decode(&root_hex).map_err(|_| PvfsError::Corruption {
+        db: format!("region log {log_id}"),
+        detail: "bad state_root encoding".into(),
+        seq: None,
+    })?;
+    Ok(log_store::region_genesis_seed(
+        &identity.instance_id,
+        &identity.forest_id,
+        log_id,
+        baseline_seq as u64,
+        &root,
+    ))
+}
+
+pub(crate) fn attach_log(
+    conn: &Connection,
+    data_dir: &std::path::Path,
+    log_id: &str,
+    rel_file: &str,
+) -> Result<()> {
+    let name = attach_name(log_id);
+    let path = data_dir.join(rel_file).to_string_lossy().into_owned();
+    conn.execute(&format!("ATTACH DATABASE ?1 AS {name}"), params![path])
+        .map_err(map_db("attach region log"))?;
+    conn.execute_batch(&log_store::log_schema(&name))
+        .map_err(map_db("region log schema"))?;
+    Ok(())
+}
+
+pub(crate) fn detach_log(conn: &Connection, log_id: &str) -> Result<()> {
+    conn.execute(&format!("DETACH DATABASE {}", attach_name(log_id)), [])
+        .map_err(map_db("detach region log"))?;
+    Ok(())
+}
+
+/// Replay `log_id`'s rows up to `to` inside one transaction, starting from the
+/// applied mark.
+fn replay_segment(
     conn: &mut Connection,
     identity: &ForestIdentity,
-    mut chain: [u8; 32],
-    mut from: u64,
+    log_id: &str,
     to: u64,
-) -> Result<[u8; 32]> {
+) -> Result<()> {
+    let db = attach_name(log_id);
     // IMMEDIATE: take the write lock before reading the applied mark. Two
     // concurrent opens (a replica's follow thread + a job pass, P5) both saw
     // the same mark under a deferred tx and double-applied the tail — the
@@ -1324,66 +1780,184 @@ fn replay_range(
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(map_db("begin replay"))?;
     // Re-read under the lock: whoever held it before us may have caught up.
-    let applied: u64 = tx
-        .query_row(
-            "SELECT v FROM projection_meta WHERE k = 'last_applied_seq'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_db("read applied mark"))?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if applied >= from {
-        if applied >= to {
-            // fully applied by a concurrent opener — nothing to do
-            let row = log_store::read_event(&tx, to)?.ok_or_else(|| PvfsError::Corruption {
-                db: "log.db".into(),
-                detail: format!("missing event at seq {to}"),
-                seq: Some(to),
-            })?;
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&row.chain_hash);
-            drop(tx);
-            return Ok(a);
-        }
-        let row = log_store::read_event(&tx, applied)?.ok_or_else(|| PvfsError::Corruption {
-            db: "log.db".into(),
-            detail: format!("missing event at seq {applied}"),
-            seq: Some(applied),
-        })?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(&row.chain_hash);
-        chain = a;
-        from = applied + 1;
+    let (applied, chain_hex) = applied_get(&tx, log_id)?;
+    if applied >= to {
+        return Ok(());
     }
-    for seq in from..=to {
-        let row = log_store::read_event(&tx, seq)?.ok_or_else(|| PvfsError::Corruption {
-            db: "log.db".into(),
+    let mut chain = if applied == 0 {
+        log_genesis(&tx, identity, log_id)?
+    } else {
+        let bytes = hex::decode(&chain_hex).unwrap_or_default();
+        if bytes.len() != 32 {
+            return Err(PvfsError::Corruption {
+                db: format!("log {log_id}"),
+                detail: "applied chain hash wrong length".into(),
+                seq: Some(applied),
+            });
+        }
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&bytes);
+        a
+    };
+    for seq in (applied + 1)..=to {
+        let row = log_store::read_event_in(&tx, &db, seq)?.ok_or_else(|| PvfsError::Corruption {
+            db: format!("log {log_id}"),
             detail: format!("missing event at seq {seq}"),
             seq: Some(seq),
         })?;
-        chain = replay_one(&tx, identity, &row, &chain)?;
+        chain = replay_one(&tx, identity, log_id, &row, &chain)?;
     }
-    tx.execute(
-        "INSERT INTO projection_meta (k, v) VALUES ('last_applied_seq', ?1)
-         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        params![to.to_string()],
-    )
-    .map_err(map_db("update meta"))?;
-    tx.execute(
-        "INSERT INTO projection_meta (k, v) VALUES ('last_applied_chain_hash', ?1)
-         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        params![hex::encode(chain)],
-    )
-    .map_err(map_db("update meta"))?;
-    tx.commit().map_err(map_db("commit replay"))?;
-    Ok(chain)
+    applied_set(&tx, log_id, to, &hex::encode(chain))?;
+    tx.commit().map_err(map_db("commit replay"))
+}
+
+/// Tree replay (doc 20 §2.3): replay one log root-down. Pauses at every
+/// `RegionUnmarked` to replay that region's sealed generation first (after the
+/// unmark, the former interior is enclosing scope again), verifies the sealed
+/// tip against the final head commitment, then folds the unmark. Active child
+/// regions replay after this log completes — routing keeps enclosing events
+/// out of their interiors, which is what makes end-of-log safe for them.
+/// The caller has already attached this log (the top log always is).
+fn replay_log(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    identity: &ForestIdentity,
+    log_id: &str,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_REGION_DEPTH {
+        return Err(PvfsError::Corruption {
+            db: format!("region log {log_id}"),
+            detail: format!("region nesting exceeds the replay bound ({MAX_REGION_DEPTH})"),
+            seq: None,
+        });
+    }
+    let db = attach_name(log_id);
+    let tip = log_store::max_seq_in(conn, &db)?;
+    loop {
+        let (applied, _) = applied_get(conn, log_id)?;
+        if applied >= tip {
+            break;
+        }
+        let pause: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(seq) FROM {db}.events WHERE kind = ?1 AND seq > ?2 AND seq <= ?3"
+                ),
+                params![
+                    crate::event::K_REGION_UNMARKED,
+                    applied as i64,
+                    tip as i64
+                ],
+                |r| r.get(0),
+            )
+            .map_err(map_db("scan for unmarks"))?;
+        match pause {
+            Some(u) => {
+                let u = u as u64;
+                if u > applied + 1 {
+                    replay_segment(conn, identity, log_id, u - 1)?;
+                }
+                let row =
+                    log_store::read_event_in(conn, &db, u)?.ok_or_else(|| PvfsError::Corruption {
+                        db: format!("log {log_id}"),
+                        detail: format!("missing event at seq {u}"),
+                        seq: Some(u),
+                    })?;
+                let ev = Event::decode(&row.kind, &row.body)?;
+                if let Event::RegionUnmarked { node_id, .. } = &ev {
+                    let node_id = node_id.clone();
+                    replay_sealed_child(conn, data_dir, identity, &node_id, depth)?;
+                }
+                replay_segment(conn, identity, log_id, u)?; // folds the unmark
+            }
+            None => replay_segment(conn, identity, log_id, tip)?,
+        }
+    }
+    // Active split regions whose baselines live in this log.
+    let children: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, log_file FROM regions
+                 WHERE baseline_log = ?1 AND state_root IS NOT NULL AND log_file IS NOT NULL
+                 ORDER BY baseline_seq",
+            )
+            .map_err(map_db("list child regions"))?;
+        let rows = stmt
+            .query_map(params![log_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(map_db("list child regions"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("list child regions"))?
+    };
+    for (child, file) in children {
+        if !data_dir.join(&file).exists() {
+            continue; // marked but never written to — genesis-only, nothing to replay
+        }
+        attach_log(conn, data_dir, &child, &file)?;
+        let res = replay_log(conn, data_dir, identity, &child, depth + 1);
+        detach_log(conn, &child)?;
+        res?;
+    }
+    Ok(())
+}
+
+/// The pause step: replay an unmarking region's sealed generation and verify
+/// its tip equals the final head commitment folded just before the unmark.
+fn replay_sealed_child(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    identity: &ForestIdentity,
+    child: &str,
+    depth: usize,
+) -> Result<()> {
+    let region: Option<(Option<String>, Option<String>, i64, String)> = conn
+        .query_row(
+            "SELECT log_file, state_root, committed_seq, committed_head
+             FROM regions WHERE node_id = ?1",
+            params![child],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(map_db("read region row"))?;
+    let Some((log_file, state_root, committed_seq, committed_head)) = region else {
+        return Ok(()); // no active row (legacy or tampered) — the fold alone decides
+    };
+    if state_root.is_none() {
+        return Ok(()); // legacy P7.0 mark, never split: its events are all here
+    }
+    let committed_seq = committed_seq as u64;
+    let (fin_seq, fin_chain) = match log_file {
+        Some(file) if data_dir.join(&file).exists() => {
+            attach_log(conn, data_dir, child, &file)?;
+            let res = replay_log(conn, data_dir, identity, child, depth + 1);
+            let applied = applied_get(conn, child);
+            detach_log(conn, child)?;
+            res?;
+            applied?
+        }
+        _ => (0, String::new()),
+    };
+    let fin_chain = if fin_seq == 0 {
+        hex::encode(log_genesis(conn, identity, child)?)
+    } else {
+        fin_chain
+    };
+    if fin_seq != committed_seq || fin_chain != committed_head {
+        return Err(PvfsError::Corruption {
+            db: format!("region log {child}"),
+            detail: format!(
+                "sealed generation tip (seq {fin_seq}) does not match the final \
+                 head commitment (seq {committed_seq})"
+            ),
+            seq: Some(fin_seq),
+        });
+    }
+    Ok(())
 }
 
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
-/// replay everything from the genesis seed. Temp tables start empty.
-pub fn full_rebuild(conn: &mut Connection) -> Result<ForestIdentity> {
+/// tree-replay every log from its genesis seed. Temp tables start empty.
+pub fn full_rebuild(conn: &mut Connection, data_dir: &std::path::Path) -> Result<ForestIdentity> {
     // punch C: the post-upgrade/crash rebuild can run minutes on a grown
     // forest — say so instead of looking hung.
     eprintln!(
@@ -1396,9 +1970,7 @@ pub fn full_rebuild(conn: &mut Connection) -> Result<ForestIdentity> {
             .map_err(map_db("drop projection table"))?;
     }
     create_schema(conn)?;
-    let top = log_store::max_seq(conn)?;
-    let genesis = log_store::genesis_seed(&identity.instance_id, &identity.forest_id);
-    replay_range(conn, &identity, genesis, 1, top)?;
+    replay_log(conn, data_dir, &identity, "", 0)?;
     meta_set(conn, "clean_shutdown", "0")?;
     Ok(identity)
 }
@@ -1424,7 +1996,7 @@ pub fn read_view_check(conn: &Connection) -> Result<ForestIdentity> {
     decode_genesis(conn)
 }
 
-pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
+pub fn startup_check(conn: &mut Connection, data_dir: &std::path::Path) -> Result<ForestIdentity> {
     // Step 1 — structural check.
     if !quick_check(conn, "log")? {
         return Err(PvfsError::Corruption {
@@ -1435,20 +2007,15 @@ pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
     }
     let index_ok = quick_check(conn, "main")?;
     if !index_ok {
-        return full_rebuild(conn);
+        return full_rebuild(conn, data_dir);
     }
     create_schema(conn)?; // ensure tables exist on first open of a fresh index
 
     let identity = decode_genesis(conn)?;
-    let genesis = log_store::genesis_seed(&identity.instance_id, &identity.forest_id);
 
     // Step 2 — positions.
     let sl = log_store::max_seq(conn)?;
-    let si: u64 = meta_get(conn, "last_applied_seq")?
-        .unwrap_or_else(|| "0".into())
-        .parse()
-        .unwrap_or(0);
-    let hi = meta_get(conn, "last_applied_chain_hash")?.unwrap_or_default();
+    let (si, hi) = applied_get(conn, "")?;
     let clean = meta_get(conn, "clean_shutdown")?.unwrap_or_else(|| "1".into());
 
     let version: u32 = meta_get(conn, "schema_version")?
@@ -1461,7 +2028,7 @@ pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
         // §6 — `full_rebuild` recreates `projection_meta`, so the version is reset to
         // current). A **newer** schema than this binary understands is a hard stop.
         if version < SCHEMA_VERSION {
-            return full_rebuild(conn);
+            return full_rebuild(conn, data_dir);
         }
         return Err(PvfsError::SchemaVersion {
             found: version,
@@ -1469,44 +2036,115 @@ pub fn startup_check(conn: &mut Connection) -> Result<ForestIdentity> {
         });
     }
 
-    // Step 3 — verify the index agrees with the log at its applied point.
+    // Step 3 — verify the index agrees with the top log at its applied point.
     if si > sl {
-        return full_rebuild(conn);
+        return full_rebuild(conn, data_dir);
     }
     if si > 0 {
         match log_store::read_event(conn, si)? {
             Some(row) if hex::encode(&row.chain_hash) == hi => {}
-            _ => return full_rebuild(conn),
+            _ => return full_rebuild(conn, data_dir),
         }
     }
 
     // Unclean shutdown forces a full agreement check (spec §9.3 crash flag).
     if clean != "1" {
-        return full_rebuild(conn);
+        return full_rebuild(conn, data_dir);
     }
 
-    // Step 4 — catch up.
-    if si < sl {
-        let chain = if si == 0 {
-            genesis
-        } else {
-            let row = log_store::read_event(conn, si)?.ok_or_else(|| PvfsError::Corruption {
-                db: "log.db".into(),
-                detail: format!("missing event at seq {si}"),
-                seq: Some(si),
-            })?;
-            let mut a = [0u8; 32];
-            if row.chain_hash.len() != 32 {
-                return Err(PvfsError::Corruption {
-                    db: "log.db".into(),
-                    detail: "chain hash wrong length".into(),
-                    seq: Some(si),
-                });
+    // Step 3b (P7.2a) — every active region log agrees with its applied mark:
+    // a foreign append while we were closed must not linger unfolded, and a
+    // truncated or swapped file must not pass silently.
+    let mut behind = si < sl;
+    let region_rows: Vec<(String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT node_id, log_file FROM regions WHERE state_root IS NOT NULL")
+            .map_err(map_db("list regions"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(map_db("list regions"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("list regions"))?
+    };
+    for (rid, file) in region_rows {
+        let (ra, rh) = applied_get(conn, &rid)?;
+        let path = match file {
+            Some(f) => data_dir.join(f),
+            None => {
+                if ra > 0 {
+                    return full_rebuild(conn, data_dir);
+                }
+                continue;
             }
-            a.copy_from_slice(&row.chain_hash);
-            a
         };
-        replay_range(conn, &identity, chain, si + 1, sl)?;
+        if !path.exists() {
+            if ra > 0 {
+                return full_rebuild(conn, data_dir);
+            }
+            continue;
+        }
+        let rconn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_db("open region log"))?;
+        let rtip: u64 = rconn
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|v| v as u64)
+            .unwrap_or(0);
+        if rtip < ra {
+            return full_rebuild(conn, data_dir);
+        }
+        if ra > 0 {
+            let chain: Option<Vec<u8>> = rconn
+                .query_row(
+                    "SELECT chain_hash FROM events WHERE seq = ?1",
+                    params![ra as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("read region chain"))?;
+            match chain {
+                Some(c) if hex::encode(&c) == rh => {}
+                _ => return full_rebuild(conn, data_dir),
+            }
+        }
+        if rtip > ra {
+            behind = true;
+        }
+    }
+
+    // Step 4 — catch up (tree replay walks every log from its applied mark).
+    if behind {
+        replay_log(conn, data_dir, &identity, "", 0)?;
+        // Actives whose baseline lives in a sealed generation are unreachable
+        // from the tree walk once the seal is applied (the pause is in the
+        // past) — sweep their tails directly. Order-free: an active region's
+        // tail depends only on its own baseline + log.
+        let actives: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT node_id, log_file FROM regions
+                     WHERE state_root IS NOT NULL AND log_file IS NOT NULL",
+                )
+                .map_err(map_db("list regions"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(map_db("list regions"))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_db("list regions"))?
+        };
+        for (rid, file) in actives {
+            if !data_dir.join(&file).exists() {
+                continue;
+            }
+            attach_log(conn, data_dir, &rid, &file)?;
+            let res = replay_log(conn, data_dir, &identity, &rid, 1);
+            detach_log(conn, &rid)?;
+            res?;
+        }
     }
     Ok(identity)
 }
@@ -1563,7 +2201,11 @@ mod enforcement_tests {
         let last = log_store::read_event(&conn, max).unwrap().unwrap();
         let prev = <[u8; 32]>::try_from(last.chain_hash.as_slice()).unwrap();
         let tx = conn.transaction().unwrap();
-        log_store::append_event(&tx, &prev, max + 1, ev, 2_000_000).unwrap();
+        // A realistic append stamp — clearly after any authorize/revoke the
+        // test performed, since replay judges membership as-of `written_at`
+        // (P7.2a, doc 20 §2.3).
+        let t = crate::engine::now_ms() + 60_000;
+        log_store::append_event(&tx, &prev, max + 1, ev, t).unwrap();
         tx.commit().unwrap();
     }
 

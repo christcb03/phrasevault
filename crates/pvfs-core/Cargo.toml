@@ -20,3 +20,4 @@ nix = { workspace = true, features = ["user", "fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true

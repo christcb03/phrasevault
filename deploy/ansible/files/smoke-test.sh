@@ -752,6 +752,50 @@ $PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$RGN" >/dev/null \
 $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
   && ok "the same mv is fine once the boundary is gone" || fail "post-unmark mv"
 
+say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
+PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
+PRIN="$($PVFS add "$PR" --kind folder --label inner)"
+$PVFS region mark "$PR" >/dev/null && ok "mark (the split commit)" || fail "region mark"
+if ls "$DATA/forest/regions/$PR/"g-*.db >/dev/null 2>&1; then
+  fail "generation file must not exist before the first region write"
+else
+  ok "no generation file before the first region write"
+fi
+PRDEEP="$($PVFS add "$PRIN" --kind folder --label deep)"
+GEN1="$(ls "$DATA/forest/regions/$PR/"g-*.db 2>/dev/null | head -1)"
+[ -n "$GEN1" ] && ok "first region write created the generation file" || fail "generation file"
+$PVFS --json region ls "$PRDEEP" | qgrep "\"region\":\"$PR\"" \
+  && ok "membership rides the physical split" || fail "split membership"
+# cross-region orphan adoption is refused (it IS a cross-region move)
+XADOPT="$($PVFS add "$ROOT" --kind folder --label adoptee)"
+XLINK="$($PVFS --json ls "$ROOT" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "adoptee": print(e["link_id"])')"
+$PVFS unlink "$XLINK" >/dev/null
+assert_rc 2 "cross-region orphan adoption refused → 2" -- \
+  $PVFS link "$PR" "$XADOPT" --type contains
+$PVFS purge "$XADOPT" >/dev/null
+# tree rebuild: baseline verification + region-log replay reproduce the state
+rm "$DATA/forest/index.db"
+$PVFS ls "$PRIN" 2>/dev/null | qgrep deep \
+  && ok "tree rebuild replays the region log (baseline verified)" || fail "tree rebuild"
+# unmark = seal: the generation file stays, writes author in the top log again
+$PVFS region unmark "$PR" >/dev/null && ok "unmark (the seal commit)" || fail "region unmark"
+[ -f "$GEN1" ] && ok "sealed generation file remains" || fail "sealed generation vanished"
+$PVFS add "$PRIN" --kind folder --label post-seal >/dev/null \
+  && ok "post-seal write lands in the enclosing log" || fail "post-seal write"
+# re-mark: a fresh generation, distinct from the sealed one
+$PVFS region mark "$PR" >/dev/null
+$PVFS add "$PRIN" --kind folder --label gen2 >/dev/null
+GEN2="$(ls "$DATA/forest/regions/$PR/"g-*.db 2>/dev/null | grep -Fvx "$GEN1" | head -1)"
+[ -n "$GEN2" ] && ok "re-mark started a fresh generation" || fail "fresh generation"
+# a rebuild now walks: top log, the sealed generation at its unmark, gen 2
+rm "$DATA/forest/index.db"
+$PVFS ls "$PRIN" 2>/dev/null | qgrep gen2 \
+  && ok "rebuild replays sealed + active generations in order" || fail "sealed+active rebuild"
+$PVFS region unmark "$PR" >/dev/null
+
 say "P7.3: FUSE mount — browse + stream through the kernel (doc 20 §3)"
 if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   mkdir -p "$DATA/fuse-view"

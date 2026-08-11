@@ -45,6 +45,25 @@ pub struct ChildEntry {
     pub order_key: String,
 }
 
+/// A split region's generation state (P7.2a, doc 20 §2.3).
+#[derive(Debug, Clone)]
+pub struct RegionInfo {
+    pub marked_at: u64,
+    /// The baseline row's position in its host log — the generation identity.
+    pub baseline_seq: u64,
+    /// Log id hosting the baseline ('' = top); immutable for the generation.
+    pub baseline_log: String,
+    /// Where future heads/unmark author ('' = top); reparented on enclosing unmark.
+    pub parent_log: String,
+    /// Generation file, relative to the data dir.
+    pub log_file: Option<String>,
+    /// Last head the enclosing log attests (0/"" until the first commitment).
+    pub committed_seq: u64,
+    pub committed_head: String,
+    /// The region log's live tip.
+    pub tip_seq: u64,
+}
+
 /// One event awaiting a member's signature (doc 07 §5): the assembled, unsigned
 /// event and the 32-byte digest its author must sign.
 #[derive(Debug, Clone)]
@@ -368,18 +387,9 @@ impl Engine {
             for ev in &events {
                 seq += 1;
                 chain = log_store::append_event(&tx, &chain, seq, ev, t)?;
-                projection::fold(&tx, ev)?;
+                projection::fold(&tx, "", seq, ev)?;
             }
-            tx.execute(
-                "UPDATE projection_meta SET v = ?1 WHERE k = 'last_applied_seq'",
-                params![seq.to_string()],
-            )
-            .map_err(map_db("init meta"))?;
-            tx.execute(
-                "UPDATE projection_meta SET v = ?1 WHERE k = 'last_applied_chain_hash'",
-                params![hex::encode(chain)],
-            )
-            .map_err(map_db("init meta"))?;
+            projection::applied_set(&tx, "", seq, &hex::encode(chain))?;
             tx.commit().map_err(map_db("commit init"))?;
         }
         projection::meta_set(&conn, "clean_shutdown", "0")?;
@@ -415,7 +425,7 @@ impl Engine {
         }
         let device = DeviceKeyCache::load(data_dir)?;
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn)?;
+        let identity = projection::startup_check(&mut conn, data_dir)?;
         projection::meta_set(&conn, "clean_shutdown", "0")?;
         let mut engine = Engine {
             conn,
@@ -427,7 +437,66 @@ impl Engine {
         };
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
+        engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
         Ok(engine)
+    }
+
+    /// P7.2a upgrade path (doc 20 §2.3): a region marked before physical logs
+    /// existed is split lazily at first writer open — baseline commitment now,
+    /// fresh generation from here. Outer regions split before nested ones so
+    /// each baseline's host log exists when it authors.
+    fn split_unsplit_regions(&mut self) -> Result<()> {
+        loop {
+            let next: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT r.node_id FROM regions r
+                     WHERE r.state_root IS NULL
+                       AND (r.parent_log = '' OR EXISTS (
+                         SELECT 1 FROM regions p
+                         WHERE p.node_id = r.parent_log AND p.state_root IS NOT NULL))
+                     LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("find unsplit region"))?;
+            let Some(node) = next else {
+                let stuck: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM regions WHERE state_root IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(map_db("count unsplit"))?;
+                if stuck > 0 {
+                    return Err(PvfsError::Corruption {
+                        db: "index.db".into(),
+                        detail: format!(
+                            "{stuck} region(s) cannot split: their enclosing region \
+                             rows are missing"
+                        ),
+                        seq: None,
+                    });
+                }
+                return Ok(());
+            };
+            let state_root = projection::canonical_state_root(&self.conn, &node)?;
+            let t = now_ms();
+            let me = self.device.pubkey();
+            let sig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_region_baseline(&node, &state_root, t, &me),
+            )?;
+            self.append_durable(vec![Event::RegionBaseline {
+                node_id: node,
+                state_root: state_root.to_vec(),
+                at: t,
+                author: me,
+                sig,
+            }])?;
+        }
     }
 
     /// An additional **read-only view** of an already-open forest, for the
@@ -463,7 +532,7 @@ impl Engine {
     pub fn open_replica(data_dir: &Path) -> Result<Engine> {
         let device = DeviceKeyCache::ephemeral()?;
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn)?;
+        let identity = projection::startup_check(&mut conn, data_dir)?;
         projection::meta_set(&conn, "clean_shutdown", "0")?;
         Ok(Engine {
             conn,
@@ -514,7 +583,7 @@ impl Engine {
         let device_pub = crypto::pubkey_bytes(&device_key);
 
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn)?;
+        let identity = projection::startup_check(&mut conn, data_dir)?;
         // Compare against the CURRENT lineage root (doc 15 §C2), not the genesis
         // root: after a root rotation only the new seed recovers, and the old
         // (compromised) seed is rejected here rather than writing a device cert
@@ -552,6 +621,7 @@ impl Engine {
             }])?;
         }
         engine.device.save(data_dir)?;
+        engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
         projection::meta_set(&engine.conn, "clean_shutdown", "0")?;
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 — rebuild empties temp ⇒ spool emptied
@@ -560,6 +630,11 @@ impl Engine {
 
     /// Graceful close — sets the clean-shutdown flag (spec §9.3).
     pub fn close(mut self) -> Result<()> {
+        // P7.2a: leave every region head attested at rest (doc 20 §2.3).
+        // Best-effort — closing must succeed even if a head can't author.
+        if !self.replica {
+            let _ = self.commit_region_heads();
+        }
         projection::meta_set(&self.conn, "clean_shutdown", "1")?;
         self.closed = true;
         Ok(())
@@ -645,8 +720,168 @@ impl Engine {
         Ok(())
     }
 
+    /// The log a node's events author in (P7.2a routing): a marked node is
+    /// its own region's root; otherwise the fold-maintained sticky column
+    /// ('' = the top log). Nodes not yet in the projection resolve through
+    /// the batch's own homing links (`batch_homes`).
+    fn resolve_region(
+        &self,
+        node: &str,
+        batch_homes: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let mut cur = node.to_string();
+        for _ in 0..batch_homes.len() + 1 {
+            let marked: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM regions WHERE node_id = ?1",
+                    params![cur],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("region lookup"))?;
+            if marked.is_some() {
+                return Ok(cur);
+            }
+            let known: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT region_id FROM nodes WHERE id = ?1",
+                    params![cur],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("region lookup"))?;
+            if let Some(region) = known {
+                return Ok(region.unwrap_or_default());
+            }
+            match batch_homes.get(&cur) {
+                Some(parent) => cur = parent.clone(),
+                None => return Ok(String::new()),
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// The log where a region's boundary events (mark/unmark/baseline/head)
+    /// author: the enclosing region — the active row's `parent_log` when the
+    /// region exists, else the home parent's region (a first mark).
+    fn enclosing_log(&self, node: &str) -> Result<String> {
+        let parent_log: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT parent_log FROM regions WHERE node_id = ?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region lookup"))?;
+        if let Some(p) = parent_log {
+            return Ok(p);
+        }
+        let parent: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT parent_id FROM links WHERE child_id = ?1 AND link_type = ?2
+                   AND removed_at IS NULL LIMIT 1",
+                params![node, LINK_CONTAINS],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region lookup"))?
+            .flatten();
+        match parent {
+            Some(p) => self.resolve_region(&p, &std::collections::HashMap::new()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// P7.2a event routing (doc 20 §2.3): the target log per event, computed
+    /// against pre-transaction state plus the batch's own homing links.
+    fn route_events(&self, events: &[Event]) -> Result<Vec<String>> {
+        use std::collections::HashMap;
+        let mut batch_homes: HashMap<String, String> = HashMap::new();
+        for ev in events {
+            if let Event::LinkCreated(l) = ev {
+                if l.link_type == LINK_CONTAINS {
+                    if let Some(p) = &l.parent_id {
+                        batch_homes.insert(l.child_id.clone(), p.clone());
+                    }
+                }
+            }
+        }
+        let mut routes = Vec::with_capacity(events.len());
+        for ev in events {
+            let route = match ev {
+                // Forest-scoped kinds always author in the top log.
+                Event::ForestCreated { .. }
+                | Event::DeviceAuthorized { .. }
+                | Event::DeviceRevoked { .. }
+                | Event::RootRotated { .. }
+                | Event::RecoveryKeyRegistered { .. }
+                | Event::RecoveryKeyRevoked { .. }
+                | Event::MemberTagged { .. } => String::new(),
+                // Region boundary events author in the enclosing region.
+                Event::RegionMarked { node_id, .. }
+                | Event::RegionUnmarked { node_id, .. }
+                | Event::RegionBaseline { node_id, .. }
+                | Event::SubRegionHead { node_id, .. } => self.enclosing_log(node_id)?,
+                Event::NodeCreated(n) => self.resolve_region(&n.id, &batch_homes)?,
+                Event::LinkCreated(l) => match &l.parent_id {
+                    Some(p) => self.resolve_region(p, &batch_homes)?,
+                    None => String::new(),
+                },
+                Event::LinkRemoved { link_id, .. }
+                | Event::LinkReordered { link_id, .. }
+                | Event::LinkSuspended { link_id, .. }
+                | Event::LinkUnsuspended { link_id, .. } => self.route_by_link(link_id, &batch_homes)?,
+                Event::LinkSuperseded { old_link_id, .. } => {
+                    self.route_by_link(old_link_id, &batch_homes)?
+                }
+                Event::FileLocationAdded { file_id, .. }
+                | Event::FileLocationRemoved { file_id, .. } => {
+                    self.resolve_region(file_id, &batch_homes)?
+                }
+                Event::NodePurged { node_id, .. }
+                | Event::FolderBound { folder_id: node_id, .. }
+                | Event::FolderUnbound { folder_id: node_id, .. }
+                | Event::AclSet { node_id, .. } => self.resolve_region(node_id, &batch_homes)?,
+                Event::SecureBlobUpdated { blob_id, .. } => {
+                    self.resolve_region(blob_id, &batch_homes)?
+                }
+            };
+            routes.push(route);
+        }
+        Ok(routes)
+    }
+
+    /// Link-state events route by the link's containing side (root links by
+    /// the child, matching their authorization rule).
+    fn route_by_link(
+        &self,
+        link_id: &str,
+        batch_homes: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let row: Option<(Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT parent_id, child_id FROM links WHERE id = ?1",
+                params![link_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("link route lookup"))?;
+        match row {
+            Some((Some(parent), _)) => self.resolve_region(&parent, batch_homes),
+            Some((None, child)) => self.resolve_region(&child, batch_homes),
+            None => Ok(String::new()),
+        }
+    }
+
     /// Append durable events + fold, atomically (spec §9.1), with optional
-    /// extra temp-table work in the same transaction.
+    /// extra temp-table work in the same transaction. P7.2a: each event is
+    /// routed to its region's log (doc 20 §2.3); a batch may span logs, and
+    /// per-log applied marks advance together with the folds.
     pub(crate) fn append_durable_with(
         &mut self,
         events: Vec<Event>,
@@ -659,51 +894,93 @@ impl Engine {
                     .into(),
             });
         }
-        let genesis = log_store::genesis_seed(&self.identity.instance_id, &self.identity.forest_id);
-        let tx = self.conn.transaction().map_err(map_db("begin write"))?;
-        let mut seq = log_store::max_seq(&tx)?;
-        let mut chain = if seq == 0 {
-            genesis
-        } else {
-            let row = log_store::read_event(&tx, seq)?.ok_or_else(|| PvfsError::Corruption {
-                db: "log.db".into(),
-                detail: format!("missing event at seq {seq}"),
-                seq: Some(seq),
+        let routes = self.route_events(&events)?;
+        // Attach every non-top target before the transaction (ATTACH cannot
+        // run inside one). The region must be split — the writer splits all
+        // active regions at open, so an unsplit target here is a logic error.
+        let mut targets: Vec<String> = routes
+            .iter()
+            .filter(|r| !r.is_empty())
+            .cloned()
+            .collect();
+        targets.sort();
+        targets.dedup();
+        for tgt in &targets {
+            let file: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT log_file FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                    params![tgt],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("region log lookup"))?;
+            let file = file.flatten().ok_or_else(|| PvfsError::Corruption {
+                db: format!("region log {tgt}"),
+                detail: "write routed to a region that has no split log".into(),
+                seq: None,
             })?;
-            let mut a = [0u8; 32];
-            if row.chain_hash.len() != 32 {
-                return Err(PvfsError::Corruption {
-                    db: "log.db".into(),
-                    detail: "chain hash wrong length".into(),
-                    seq: Some(seq),
-                });
+            if let Some(dir) = self.data_dir.join(&file).parent() {
+                std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create region dir", e))?;
             }
-            a.copy_from_slice(&row.chain_hash);
-            a
-        };
-        let t = now_ms();
-        for ev in &events {
-            seq += 1;
-            chain = log_store::append_event(&tx, &chain, seq, ev, t)?;
-            projection::fold(&tx, ev)?;
+            projection::attach_log(&self.conn, &self.data_dir, tgt, &file)?;
         }
-        if !events.is_empty() {
-            tx.execute(
-                "INSERT INTO projection_meta (k, v) VALUES ('last_applied_seq', ?1)
-                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                params![seq.to_string()],
-            )
-            .map_err(map_db("update meta"))?;
-            tx.execute(
-                "INSERT INTO projection_meta (k, v) VALUES ('last_applied_chain_hash', ?1)
-                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                params![hex::encode(chain)],
-            )
-            .map_err(map_db("update meta"))?;
+        let result = (|| {
+            let tx = self.conn.transaction().map_err(map_db("begin write"))?;
+            let t = now_ms();
+            // Per-log cursors, loaded lazily from each log's tip.
+            let mut cursors: std::collections::HashMap<String, (u64, [u8; 32])> =
+                std::collections::HashMap::new();
+            for (ev, route) in events.iter().zip(&routes) {
+                if !cursors.contains_key(route) {
+                    let db = projection::attach_name(route);
+                    let seq = log_store::max_seq_in(&tx, &db)?;
+                    let chain = if seq == 0 {
+                        projection::log_genesis(&tx, &self.identity, route)?
+                    } else {
+                        let row = log_store::read_event_in(&tx, &db, seq)?.ok_or_else(|| {
+                            PvfsError::Corruption {
+                                db: format!("log {route}"),
+                                detail: format!("missing event at seq {seq}"),
+                                seq: Some(seq),
+                            }
+                        })?;
+                        if row.chain_hash.len() != 32 {
+                            return Err(PvfsError::Corruption {
+                                db: format!("log {route}"),
+                                detail: "chain hash wrong length".into(),
+                                seq: Some(seq),
+                            });
+                        }
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&row.chain_hash);
+                        a
+                    };
+                    cursors.insert(route.clone(), (seq, chain));
+                }
+                let cur = cursors.get_mut(route).expect("cursor just inserted");
+                cur.0 += 1;
+                cur.1 = log_store::append_event_in(
+                    &tx,
+                    &projection::attach_name(route),
+                    &cur.1,
+                    cur.0,
+                    ev,
+                    t,
+                )?;
+                projection::fold(&tx, route, cur.0, ev)?;
+            }
+            for (log_id, (seq, chain)) in &cursors {
+                projection::applied_set(&tx, log_id, *seq, &hex::encode(chain))?;
+            }
+            temp_ops(&tx)?;
+            tx.commit().map_err(map_db("commit write"))?;
+            Ok(())
+        })();
+        for tgt in &targets {
+            let _ = projection::detach_log(&self.conn, tgt);
         }
-        temp_ops(&tx)?;
-        tx.commit().map_err(map_db("commit write"))?;
-        Ok(())
+        result
     }
 
     pub(crate) fn append_durable(&mut self, events: Vec<Event>) -> Result<()> {
@@ -970,6 +1247,17 @@ impl Engine {
                 });
             }
             self.check_no_cycle(parent, child)?;
+            // P7.2a (doc 20 §2.3): adopting an orphan across a region boundary
+            // IS a cross-region move — its history lives in its sticky region's
+            // log. Refused until the paired-event protocol (P7.2c).
+            let none = std::collections::HashMap::new();
+            if self.resolve_region(child, &none)? != self.resolve_region(parent, &none)? {
+                return Err(bad(
+                    "link",
+                    "node and new parent are in different regions — cross-region \
+                     moves land with the paired-event protocol (doc 20 §2)",
+                ));
+            }
         }
 
         let order = match order {
@@ -1398,6 +1686,32 @@ impl Engine {
                 kind: "node",
                 id: id.clone(),
             })?;
+            // P7.2a (doc 20 §2.3): purging through a region boundary would
+            // scatter one cascade across logs and orphan a live region log.
+            let marked_inside: Option<String> = self
+                .conn
+                .query_row(
+                    "WITH RECURSIVE sub(nid) AS (
+                       SELECT ?1
+                       UNION
+                       SELECT l.child_id FROM links l JOIN sub s ON l.parent_id = s.nid
+                       WHERE l.link_type = ?2 AND l.removed_at IS NULL
+                     )
+                     SELECT r.node_id FROM regions r JOIN sub s ON r.node_id = s.nid LIMIT 1",
+                    params![id, LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("purge region check"))?;
+            if let Some(region) = marked_inside {
+                return Err(bad(
+                    "purge",
+                    &format!(
+                        "subtree contains region boundary {region} — `pvfs region \
+                         unmark` it first, then purge (doc 20 §2.3)"
+                    ),
+                ));
+            }
             let inbound = active_inbound_count(&self.conn, id)?;
             if inbound > 0 {
                 return Err(PvfsError::NotOrphan {
@@ -2283,6 +2597,16 @@ impl Engine {
                 });
             }
             self.check_no_cycle(parent, child)?;
+            // P7.2a: same boundary rule as the local path — adoption across
+            // regions is a cross-region move (doc 20 §2.3).
+            let none = std::collections::HashMap::new();
+            if self.resolve_region(child, &none)? != self.resolve_region(parent, &none)? {
+                return Err(bad(
+                    "link",
+                    "node and new parent are in different regions — cross-region \
+                     moves land with the paired-event protocol (doc 20 §2)",
+                ));
+            }
         }
         let author = crate::acl::Principal::Key(author_pub.to_vec());
         if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
@@ -2406,6 +2730,10 @@ impl Engine {
     /// Mark `node` as a region boundary — its contains-closure (minus nested
     /// regions) becomes its own replication/compaction unit. Device-signed;
     /// replay requires admin (a) on the node. Idempotent re-marks re-stamp.
+    /// P7.2a (doc 20 §2.3): a fresh mark IS the split — the same commit
+    /// carries the baseline commitment, and the region's own log begins from
+    /// it. A re-mark of an already-split region only re-stamps: its live
+    /// generation must not be reset under itself.
     pub fn region_mark(&mut self, node: &NodeId) -> Result<()> {
         self.ensure_device_active()?;
         let n = fetch_node(&self.conn, node)?.ok_or(PvfsError::NotFound {
@@ -2415,47 +2743,224 @@ impl Engine {
         if n.is_temp {
             return Err(bad("region", "temp nodes are forest-local (no region marks)"));
         }
+        let already_split: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region lookup"))?;
         let t = now_ms();
         let me = self.device.pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
             &event::msg_region_marked(node, t, &me),
         )?;
-        self.append_durable(vec![Event::RegionMarked {
+        let mut events = vec![Event::RegionMarked {
             node_id: node.clone(),
             marked_at: t,
-            author: me,
+            author: me.clone(),
             sig,
-        }])
+        }];
+        if already_split.is_none() {
+            let state_root = projection::canonical_state_root(&self.conn, node)?;
+            let bsig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_region_baseline(node, &state_root, t, &me),
+            )?;
+            events.push(Event::RegionBaseline {
+                node_id: node.clone(),
+                state_root: state_root.to_vec(),
+                at: t,
+                author: me,
+                sig: bsig,
+            });
+        }
+        self.append_durable(events)
     }
 
     /// Remove a region boundary; the subtree folds back into the enclosing
     /// region. Unmarking an unmarked node errors NotFound (nothing to erase).
+    /// P7.2a: the same commit carries the **final head commitment** — the seal.
+    /// The generation file stays in place for verification; nothing routes to
+    /// it once the region row is gone.
     pub fn region_unmark(&mut self, node: &NodeId) -> Result<()> {
         self.ensure_device_active()?;
-        let marked: Option<i64> = self
+        let row: Option<(Option<String>, Option<String>)> = self
             .conn
-            .query_row("SELECT 1 FROM regions WHERE node_id = ?1", params![node], |r| r.get(0))
+            .query_row(
+                "SELECT state_root, log_file FROM regions WHERE node_id = ?1",
+                params![node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()
             .map_err(map_db("region lookup"))?;
-        if marked.is_none() {
+        let Some((state_root, log_file)) = row else {
             return Err(PvfsError::NotFound {
                 kind: "region",
                 id: node.clone(),
             });
-        }
+        };
         let t = now_ms();
         let me = self.device.pubkey();
+        let mut events = Vec::with_capacity(2);
+        if state_root.is_some() {
+            let (head_seq, head_hash) = self.region_log_tip(node, log_file.as_deref())?;
+            let hsig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_sub_region_head(node, head_seq, &head_hash, t, &me),
+            )?;
+            events.push(Event::SubRegionHead {
+                node_id: node.clone(),
+                head_seq,
+                head_hash,
+                at: t,
+                author: me.clone(),
+                sig: hsig,
+            });
+        }
         let sig = crypto::sign_digest(
             &self.device.signing_key,
             &event::msg_region_unmarked(node, t, &me),
         )?;
-        self.append_durable(vec![Event::RegionUnmarked {
+        events.push(Event::RegionUnmarked {
             node_id: node.clone(),
             unmarked_at: t,
             author: me,
             sig,
-        }])
+        });
+        self.append_durable(events)
+    }
+
+    /// A split region's current log tip `(seq, chain_hash)` — the genesis seed
+    /// when the generation has no rows yet (or no file at all).
+    fn region_log_tip(&self, node: &str, log_file: Option<&str>) -> Result<(u64, Vec<u8>)> {
+        let genesis = || -> Result<Vec<u8>> {
+            Ok(projection::log_genesis(&self.conn, &self.identity, node)?.to_vec())
+        };
+        let Some(file) = log_file else {
+            return Ok((0, genesis()?));
+        };
+        let path = self.data_dir.join(file);
+        if !path.exists() {
+            return Ok((0, genesis()?));
+        }
+        let rconn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_db("open region log"))?;
+        let tip: u64 = rconn
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|v| v as u64)
+            .unwrap_or(0);
+        if tip == 0 {
+            return Ok((0, genesis()?));
+        }
+        let chain: Vec<u8> = rconn
+            .query_row(
+                "SELECT chain_hash FROM events WHERE seq = ?1",
+                params![tip as i64],
+                |r| r.get(0),
+            )
+            .map_err(map_db("read region tip"))?;
+        Ok((tip, chain))
+    }
+
+    /// Commit a `SubRegionHead` for every active split region whose log has
+    /// advanced past its last attested head (doc 20 §2.3). Called at close and
+    /// on demand; the daemon's periodic trigger lands with P7.2b.
+    pub fn commit_region_heads(&mut self) -> Result<usize> {
+        if self.replica {
+            return Ok(0);
+        }
+        let rows: Vec<(String, Option<String>, u64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT node_id, log_file, committed_seq, committed_head
+                     FROM regions WHERE state_root IS NOT NULL",
+                )
+                .map_err(map_db("list regions"))?;
+            let it = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get(3)?,
+                    ))
+                })
+                .map_err(map_db("list regions"))?;
+            it.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_db("list regions"))?
+        };
+        let mut events = Vec::new();
+        let t = now_ms();
+        let me = self.device.pubkey();
+        for (node, file, committed_seq, committed_head) in rows {
+            let (tip, chain) = self.region_log_tip(&node, file.as_deref())?;
+            if tip == committed_seq && hex::encode(&chain) == committed_head {
+                continue;
+            }
+            if tip == 0 && committed_head.is_empty() {
+                continue; // nothing written and nothing attested yet
+            }
+            let sig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_sub_region_head(&node, tip, &chain, t, &me),
+            )?;
+            events.push(Event::SubRegionHead {
+                node_id: node,
+                head_seq: tip,
+                head_hash: chain,
+                at: t,
+                author: me.clone(),
+                sig,
+            });
+        }
+        let n = events.len();
+        if n > 0 {
+            self.append_durable(events)?;
+        }
+        Ok(n)
+    }
+
+    /// A split region's generation state (P7.2a): the baseline position, the
+    /// generation file, the last attested head, and the log's live tip.
+    pub fn region_info(&self, node: &NodeId) -> Result<Option<RegionInfo>> {
+        let row: Option<RegionInfo> = self
+            .conn
+            .query_row(
+                "SELECT marked_at, baseline_seq, baseline_log, parent_log, log_file,
+                        committed_seq, committed_head
+                 FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                params![node],
+                |r| {
+                    Ok(RegionInfo {
+                        marked_at: r.get::<_, i64>(0)? as u64,
+                        baseline_seq: r.get::<_, i64>(1)? as u64,
+                        baseline_log: r.get(2)?,
+                        parent_log: r.get(3)?,
+                        log_file: r.get(4)?,
+                        committed_seq: r.get::<_, i64>(5)? as u64,
+                        committed_head: r.get(6)?,
+                        tip_seq: 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db("region info"))?;
+        let Some(mut info) = row else {
+            return Ok(None);
+        };
+        let (tip_seq, _) = self.region_log_tip(node, info.log_file.as_deref())?;
+        info.tip_seq = tip_seq;
+        Ok(Some(info))
     }
 
     /// All marked region boundaries, `(node_id, marked_at)`.
@@ -2473,37 +2978,26 @@ impl Engine {
 
     /// The region `node` belongs to: the nearest marked ancestor (a marked
     /// node is its own region's root), else the forest root — the implicit
-    /// top region (doc 13 §B).
+    /// top region (doc 13 §B). P7.2a: an O(1) read of the fold-maintained
+    /// column (which also makes an orphan's region sticky) instead of the
+    /// containment walk.
     pub fn region_of(&self, node: &NodeId) -> Result<NodeId> {
-        let mut cur = node.clone();
-        for _ in 0..100_000 {
-            let marked: Option<i64> = self
+        let region = self.resolve_region(node, &std::collections::HashMap::new())?;
+        if region.is_empty() {
+            let exists: Option<i64> = self
                 .conn
-                .query_row("SELECT 1 FROM regions WHERE node_id = ?1", params![cur], |r| {
-                    r.get(0)
-                })
+                .query_row("SELECT 1 FROM nodes WHERE id = ?1", params![node], |r| r.get(0))
                 .optional()
                 .map_err(map_db("region lookup"))?;
-            if marked.is_some() {
-                return Ok(cur);
+            if exists.is_none() {
+                return Err(PvfsError::NotFound {
+                    kind: "node",
+                    id: node.clone(),
+                });
             }
-            let parent: Option<Option<String>> = self
-                .conn
-                .query_row(
-                    "SELECT parent_id FROM links
-                     WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
-                    params![cur, LINK_CONTAINS],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db("region walk"))?;
-            match parent {
-                Some(Some(p)) => cur = p,
-                // tree root (no parent) or unhomed node: the top region
-                _ => return Ok(self.identity.root_node_id.clone()),
-            }
+            return Ok(self.identity.root_node_id.clone());
         }
-        Err(bad("region", "containment walk exceeded depth bound"))
+        Ok(region)
     }
 
     // ---- admin ops over the daemon (doc 09 §3c), all prepared for an external

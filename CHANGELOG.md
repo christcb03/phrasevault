@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Physical region logs (P7.2a, doc 20 §2.3):** a marked region now owns its
+  own signed, dense hash-chained log (`regions/<id>/g-*.db`). The mark commit
+  carries a deterministic **baseline commitment** of the subtree's state (the
+  doc 11 verifiable-snapshot subset), the region log's genesis binds it, and
+  the enclosing log attests region heads (`SubRegionHead`, final one sealing
+  the generation at unmark — files stay in place; a re-mark starts a fresh
+  generation). Replay walks the tree of logs root-down, re-verifying every
+  baseline and seal on every rebuild; membership checks became as-of-time to
+  make parallel logs replay soundly. Legacy P7.0 marks split lazily at first
+  writer open. New refusals guard causal isolation until P7.2c's paired-event
+  protocol: cross-region orphan adoption, and purging a subtree that still
+  contains a boundary. Projection schema v5 (one-time rebuild on first open).
 - **Serve integration — the fleet runs itself (P5, doc 18):** `pvfsd` grows a job
   supervisor — `serve.jobs` deployment config (`pvfs serve enable|disable|ls|status|
   exports`, SIGHUP reload, corrupt-config-refuses-start), the F5.4 follower absorbed

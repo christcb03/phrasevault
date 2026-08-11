@@ -30,6 +30,8 @@ pub const K_RECOVERY_KEY_REGISTERED: &str = "RecoveryKeyRegistered";
 pub const K_RECOVERY_KEY_REVOKED: &str = "RecoveryKeyRevoked";
 pub const K_REGION_MARKED: &str = "RegionMarked";
 pub const K_REGION_UNMARKED: &str = "RegionUnmarked";
+pub const K_REGION_BASELINE: &str = "RegionBaseline";
+pub const K_SUB_REGION_HEAD: &str = "SubRegionHead";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -146,6 +148,29 @@ pub enum Event {
     RegionUnmarked {
         node_id: String,
         unmarked_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// P7.2a (doc 20 §2.3): the mark-time state commitment for `node_id`'s
+    /// region — `state_root` is the canonical subtree state hash the new
+    /// region log's genesis seed binds (with this row's own seq). Appended
+    /// in the enclosing region's log, right after the mark it belongs to.
+    RegionBaseline {
+        node_id: String,
+        state_root: Vec<u8>,
+        at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// P7.2a (doc 20 §2.3): head commitment — the enclosing log attests that
+    /// region `node_id`'s log reaches (`head_seq`, `head_hash`). The
+    /// hash-linked tree of logs; the final one (in the unmark commit) seals
+    /// the generation.
+    SubRegionHead {
+        node_id: String,
+        head_seq: u64,
+        head_hash: Vec<u8>,
+        at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -311,6 +336,24 @@ pub fn msg_region_unmarked(node_id: &str, unmarked_at: u64, author: &[u8]) -> [u
     crypto::domain_digest("pvfs:regionunmarked:v1:", &e.finish())
 }
 
+pub fn msg_region_baseline(node_id: &str, state_root: &[u8], at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).bytes(state_root).u64(at).bytes(author);
+    crypto::domain_digest("pvfs:regionbaseline:v1:", &e.finish())
+}
+
+pub fn msg_sub_region_head(
+    node_id: &str,
+    head_seq: u64,
+    head_hash: &[u8],
+    at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).u64(head_seq).bytes(head_hash).u64(at).bytes(author);
+    crypto::domain_digest("pvfs:subregionhead:v1:", &e.finish())
+}
+
 pub fn msg_file_location_removed(
     file_id: &str,
     uri: &str,
@@ -437,6 +480,8 @@ impl Event {
             Event::FileLocationAdded { .. } => K_FILE_LOCATION_ADDED,
             Event::RegionMarked { .. } => K_REGION_MARKED,
             Event::RegionUnmarked { .. } => K_REGION_UNMARKED,
+            Event::RegionBaseline { .. } => K_REGION_BASELINE,
+            Event::SubRegionHead { .. } => K_SUB_REGION_HEAD,
             Event::FileLocationRemoved { .. } => K_FILE_LOCATION_REMOVED,
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
@@ -465,6 +510,8 @@ impl Event {
             | Event::FileLocationAdded { author, .. }
             | Event::RegionMarked { author, .. }
             | Event::RegionUnmarked { author, .. }
+            | Event::RegionBaseline { author, .. }
+            | Event::SubRegionHead { author, .. }
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
@@ -497,6 +544,8 @@ impl Event {
             | Event::FileLocationAdded { sig: s, .. }
             | Event::RegionMarked { sig: s, .. }
             | Event::RegionUnmarked { sig: s, .. }
+            | Event::RegionBaseline { sig: s, .. }
+            | Event::SubRegionHead { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -649,6 +698,30 @@ impl Event {
                 sig,
             } => {
                 e.string(node_id).u64(*unmarked_at).bytes(author).bytes(sig);
+            }
+            Event::RegionBaseline {
+                node_id,
+                state_root,
+                at,
+                author,
+                sig,
+            } => {
+                e.string(node_id).bytes(state_root).u64(*at).bytes(author).bytes(sig);
+            }
+            Event::SubRegionHead {
+                node_id,
+                head_seq,
+                head_hash,
+                at,
+                author,
+                sig,
+            } => {
+                e.string(node_id)
+                    .u64(*head_seq)
+                    .bytes(head_hash)
+                    .u64(*at)
+                    .bytes(author)
+                    .bytes(sig);
             }
             Event::FileLocationRemoved {
                 file_id,
@@ -870,6 +943,21 @@ impl Event {
             K_REGION_UNMARKED => Event::RegionUnmarked {
                 node_id: d.string()?,
                 unmarked_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_REGION_BASELINE => Event::RegionBaseline {
+                node_id: d.string()?,
+                state_root: d.bytes()?,
+                at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_SUB_REGION_HEAD => Event::SubRegionHead {
+                node_id: d.string()?,
+                head_seq: d.u64()?,
+                head_hash: d.bytes()?,
+                at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -1106,6 +1194,29 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_region_unmarked(node_id, *unmarked_at, author),
+                sig,
+            ),
+            Event::RegionBaseline {
+                node_id,
+                state_root,
+                at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_region_baseline(node_id, state_root, *at, author),
+                sig,
+            ),
+            Event::SubRegionHead {
+                node_id,
+                head_seq,
+                head_hash,
+                at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_sub_region_head(node_id, *head_seq, head_hash, *at, author),
                 sig,
             ),
             Event::FileLocationRemoved {
