@@ -4,8 +4,10 @@
 clippy clean.** As-built notes: the `set_sig` accessor was missing `LinkReordered`
 (caught by the new authorization test — a member's signature was silently dropped);
 the smoke's daemon-jobs section exposed a latent concurrent-fold race in projection
-catch-up, fixed separately (`58adaa2`). Packaging intent stands: 1.4.0 = P5 + P6 +
-the tmp sweep, Chris to confirm.
+catch-up, fixed separately (`58adaa2`). Packaging DECIDED (Chris,
+2026-08-11): no 1.4 cut yet — nothing is deployed beyond testing, so Unreleased
+accumulates until the region arc (doc 20) completes, then one release tells the
+whole story.
 Prerequisite reading: doc 17 §7 (the write-through model), doc 18 (the job supervisor
 these ops ultimately serve).
 

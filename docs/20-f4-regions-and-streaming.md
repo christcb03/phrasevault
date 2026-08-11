@@ -131,7 +131,8 @@ phase validates on presubuntu before its commit, as always.
   just works. PROPOSAL for review: **merge P7.1 into P7.2** — build region-scoped
   replication once, on real per-region logs, instead of shipping a throwaway
   verification mode for the single-log era. Per §5's rule (no half-landed phases),
-  nothing of P7.1 was committed.
+  nothing of P7.1 was committed. **DECIDED (Chris, 2026-08-11): merged — build the
+  final physical-log version directly; no interim attestation mode.**
 - **P7.3 landed** (`7239d8a`, validated: 212 tests incl. a real kernel
   mount+read, 306 smoke incl. mounting a replica through the VFS, clippy clean):
   the pvfs-fuse crate (pure-Rust fuser; runtime dep = fusermount3, added to the
