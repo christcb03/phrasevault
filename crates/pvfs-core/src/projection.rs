@@ -1291,10 +1291,50 @@ fn replay_range(
     conn: &mut Connection,
     identity: &ForestIdentity,
     mut chain: [u8; 32],
-    from: u64,
+    mut from: u64,
     to: u64,
 ) -> Result<[u8; 32]> {
-    let tx = conn.transaction().map_err(map_db("begin replay"))?;
+    // IMMEDIATE: take the write lock before reading the applied mark. Two
+    // concurrent opens (a replica's follow thread + a job pass, P5) both saw
+    // the same mark under a deferred tx and double-applied the tail — the
+    // loser detonated the one-home invariant as a phantom "corruption".
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(map_db("begin replay"))?;
+    // Re-read under the lock: whoever held it before us may have caught up.
+    let applied: u64 = tx
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'last_applied_seq'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read applied mark"))?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if applied >= from {
+        if applied >= to {
+            // fully applied by a concurrent opener — nothing to do
+            let row = log_store::read_event(&tx, to)?.ok_or_else(|| PvfsError::Corruption {
+                db: "log.db".into(),
+                detail: format!("missing event at seq {to}"),
+                seq: Some(to),
+            })?;
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&row.chain_hash);
+            drop(tx);
+            return Ok(a);
+        }
+        let row = log_store::read_event(&tx, applied)?.ok_or_else(|| PvfsError::Corruption {
+            db: "log.db".into(),
+            detail: format!("missing event at seq {applied}"),
+            seq: Some(applied),
+        })?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&row.chain_hash);
+        chain = a;
+        from = applied + 1;
+    }
     for seq in from..=to {
         let row = log_store::read_event(&tx, seq)?.ok_or_else(|| PvfsError::Corruption {
             db: "log.db".into(),
