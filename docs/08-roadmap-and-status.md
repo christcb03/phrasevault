@@ -159,6 +159,21 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | Item | State |
 |------|--------|
 | **P5 serve integration** ([doc 18](18-serve-integration.md)) — the fleet runs itself: pvfsd job supervisor (`serve.jobs`, SIGHUP reload, `pvfs serve` verbs + live status), follow/sync/export/tier/evict as fold-nudged daemon jobs, `pvfs export --keep-fresh`, and **`pvfs fleet enroll`** (doc 17 §9 Q5 → resolution (c)) | ✅ built + fleet-validated 47/47 (2026-08-11) |
+| **Chaos validation** ([deploy/chaos-test.sh](../deploy/chaos-test.sh)) — kill -9 either side mid-transfer, edge reboot mid-2GiB-fetch, follower through source death: no partial ever published, clean recovery throughout | ✅ run green (2026-08-11) |
+
+**The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
+`v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):
+
+1. **Write-through completeness:** `loc rm`, `link`/`unlink`/`reorder` wire ops (deliberately
+   unrouted in F5.0).
+2. **`pvfs sync --to <dir>`** custom sync-store destinations (today: managed store under `.pvfs/`).
+3. **Mode B crosslink** (doc 03 §6 Q4): a grant that lets a replica's held copy be recorded in the
+   owner's log as catalog-visible redundancy (today only the owner's own `tier` does that).
+4. **F4 tier** (doc 17 §8): region-granular logs (doc 13 §B — the decided design), FUSE
+   read-through mount (open-and-stream without prefetch), swarm transfer (resumable/chunked —
+   also the answer to interrupted-transfer restarts, per the chaos run), standby failover.
+5. Doc 18 §6 leftovers: the P1 watcher as a `watch` job, tier's local-commit nudge, backoff tuning.
+6. Long-deferred polish: Touch ID unlock (doc 14), stable macOS .app signing identity.
 
 ### 3.3 — the 1.3.0 line (released 2026-08-10)
 
@@ -166,7 +181,8 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 > + pvos-test): release build, 194 tests, 268 smoke checks, systemd daemon stage, clippy clean.
 > The **two-machine fleet test** (`deploy/fleet-test.sh`) passed **40/40** — USER-MANUAL
 > §7.7–§7.10 across real machines, plus a 3 GiB ingest → tier → evict → stream cycle at
-> ~37 MB/s over the LAN. Findings and packaging notes: [HANDOFF.md](HANDOFF.md) §2–§3.
+> ~37 MB/s over the LAN. Findings: doc 17 §9 Q5 and USER-MANUAL §7.9 (the authorize-member
+> rule); the retired HANDOFF.md's full record is in git history at `v1.3`.
 > Workspace at `1.3.0`; `v1.2` (pre-arc) and `v1.3` tags pending (Chris tags manually).
 
 | Item | State |

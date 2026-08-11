@@ -1,7 +1,8 @@
 # 18 — Serve integration: the fleet runs itself (P5, doc 17's F0.1 + F3.1)
 
 **Status: BUILT + FLEET-VALIDATED (P5.0–P5.4, 2026-08-10 → 08-11 — see §7 close-out).**
-Prerequisite reading: doc 17 (the built federation arc), HANDOFF.md §2 findings.
+Prerequisite reading: doc 17 (the built federation arc; §9 Q5 is the identity finding
+this milestone resolved — originally recorded in the since-retired HANDOFF.md).
 
 ## 1. Goal
 
@@ -53,7 +54,7 @@ unchanged.
 
 No new wire ops, no scheduling DSL, no multi-forest orchestrator: one daemon, one
 forest, a handful of named jobs. Write-through completeness (`loc rm`, link ops) and
-Mode B crosslinks stay on the HANDOFF §4 list; F4 (region logs, FUSE) untouched.
+Mode B crosslinks stay on the standing list (doc 08 §3.4); F4 (region logs, FUSE) untouched.
 
 ## 4. THE input decision — job identity (doc 17 §9 Q5)
 
