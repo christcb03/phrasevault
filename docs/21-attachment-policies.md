@@ -1,8 +1,7 @@
 # 21 — Attachment policies: three kinds of storage enrollment (P8 candidate)
 
-**Status: DESIGN DRAFT (2026-08-11) — Chris's requirements from the punch-list
-review, mapped to machinery. NEEDS REVIEW before build; supersedes the narrow
-"sync --to migrator" question (punch G).**
+**Status: APPROVED (Chris, 2026-08-11) — §3 resolved below; build slot = P8, after
+the region arc (doc 20 §2.1). Supersedes the narrow "sync --to migrator" question.**
 
 ## 1. The requirement (Chris, verbatim intent)
 
@@ -33,15 +32,19 @@ store placed, or takes `--to <store>` inline). The kind is recorded with the
 binding (deployment state); the watch/tier/evict jobs read it — enrollment is
 one command and the daemon does the rest.
 
-## 3. What needs deciding at review
+## 3. Decisions (review of 2026-08-11)
 
-1. Naming (`--kind` values above vs `staging|permanent|mirrored`…).
-2. `central-keep` placement: new placement mode (proposed) vs a per-binding flag
-   the mover consults. Lean: placement mode — the mover already walks placements.
-3. Does *mirror* also imply the copy participates in read-through candidates
-   (a second live location — it would, for free, via the logged location)? Lean: yes.
-4. Interaction with regions (doc 20): a space enrolled into a marked region —
-   nothing special falls out; confirm at build.
+1. Naming: `--kind in-place|migrate|mirror` as proposed.
+2. `central-keep` is a placement mode (the mover already walks placements).
+3. **Mirror copies serve reads — and more (Chris):** not only do both copies
+   participate as read-through candidates (free, via the logged location), reads
+   should eventually pull **from every known holder in parallel, BitTorrent-style,
+   for the fastest possible read**. That is the swarm data plane — specified in
+   doc 20 §6 (its own arc, P9, after regions): chunked fetch-by-hash where every
+   logged location (mirrors included) is a seed. Doc 21's mirror kind is what
+   *populates* the holder set; P8 ships with today's single-candidate read-through
+   and inherits swarm reads automatically when P9 lands.
+4. Regions: nothing special expected; confirm at P8 build.
 
 ## 4. Build shape (once approved)
 

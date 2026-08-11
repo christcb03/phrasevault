@@ -24,43 +24,46 @@ built this pass.
 
 ## 2. Region logs — the shape (doc 13 §B, made concrete)
 
-### 2.1 Vocabulary first, plumbing second (PROPOSAL)
+### 2.1 The build plan (rewritten 2026-08-11 after the merge decision)
 
-Doc 13 §B is a storage architecture; landing it all at once would rewrite the log
-store, replay, replication, and compaction in one motion. Proposed instead, two
-steps that are each verifiable end-to-end:
+P7.0 (logical regions) is BUILT. The interim P7.1 was struck (see §7 — its
+sparse-sequence verification mode is machinery physical logs delete), so the arc
+that remains is **P7.2: region replication on physical per-region logs**, built
+directly. Chris confirmed 2026-08-11. The shape:
 
-- **P7.0 — logical regions.** Two new signed events in the (still single) forest
-  log: `RegionMarked { node_id }` / `RegionUnmarked { node_id }` (owner/admin-
-  authored, replayed like any structural event), a `pvfs region mark|unmark|ls`
-  CLI, and projection state answering "which region does node X belong to"
-  (nearest marked ancestor, forest root = the implicit top region). Everything
-  downstream — region-scoped *replication* first of all — keys off this
-  vocabulary while the bytes still live in one chain.
-- **P7.1 — region-scoped replication over the single log.** `pvfs replica add
-  --region <node>`: the daemon ships only events whose touched nodes fall inside
-  the region (selective subscription, Q-B3), **plus** a per-batch **filtered-log
-  proof**: the shipped rows' chain positions + the tip hash, so the replica can
-  verify "these are real rows of the pinned chain, in order, none withheld
-  *within the region*" — the Q-B2 answer for the single-log era: the proof is
-  the owner's signed attestation of the filter (a `RegionTail { region, seq_set_hash,
-  tip }` statement per batch) rather than a chain prefix. A region replica opens
-  with `ls`/`cat`/ACLs scoped to the region; out-of-region refs are dangling-but-
-  verifiable.
-- **P7.2 — physical per-region logs (the doc 13 §B end state).** The log store
-  becomes region-addressable (`log.db` per region under `.pvfs/regions/<region-id>/`),
-  parents carry `SubRegionHead { region, head_hash, seq }` commitments, replay
-  walks the tree of logs root-down, and region replication ships a real log +
-  the parent head-commitment path (the manifest proof). Mark/unmark become the
-  split/merge ops. **This phase only starts overnight if P7.0/P7.1 validate
-  early**; it is the deepest engine change since P0 and does not rush well.
+- **Storage.** The existing `log.db` IS the top region's log. A marked region gets
+  `​.pvfs/regions/<region-root-id>/log.db` — same schema, its own dense chain.
+- **Split at mark (PROPOSAL).** History is never rewritten: at `region mark`, the
+  parent log records the mark (as today) plus a **baseline commitment** — a doc 11
+  verifiable snapshot of the subtree state at that head. The region's log begins
+  from that baseline; new region events append there. Replicating a region ships
+  baseline + region log — never the parent's history. (Doc 11's snapshot mechanics
+  are the dependency to confirm first at build.)
+- **Head commitments.** Each region's log periodically (and at every parent-side
+  op touching the region) records `SubRegionHead { region, seq, head_hash }` in
+  its PARENT's log — the hash-linked tree of logs; the forest root hash still
+  attests everything (doc 13 §B).
+- **Replay** walks the tree root-down: parent log first, each committed child head
+  verified against the child log's actual chain. Whole-forest `verify` externally
+  unchanged.
+- **Wire.** `LogInfo`/`LogRead`/`LogWait` grow an optional `region` scope;
+  `pvfs replica add --region <node>` ships baseline + region log + the parent
+  head-commitment path (the manifest proof). Region replicas serve/ACL-scope to
+  the region; cross-region refs stay dangling-but-verifiable.
+- **Cross-region moves (PROPOSAL — the doc 13 §B deferred question).** A move
+  across a boundary = `LinkRemoved` authored in the source region + `LinkCreated`
+  in the destination region, same author, each event carrying the other region's
+  head hash at authoring time (the causal cross-reference). Replay accepts the
+  pair only when both sides exist or the missing side is an unfetched region.
+  Until this lands mid-arc, the P7.0 refusal stays.
+- **Unmark = merge back:** the region log is sealed with a final head commitment;
+  subsequent events author in the parent. Sealed logs remain for verification.
 
-Rationale: P7.1 delivers doc 13 §B's *user-visible promise* (replicate one app's
-region, verifiably) with the integrity argument moved from "chain prefix" to
-"owner-signed filter attestation" — sound because the owner already signs every
-row; the replica trusts the same key for the filter it trusts for the rows. P7.2
-then swaps the substrate under an unchanged UX, and its verification strengthens
-to structural (heads in parent logs) rather than attested.
+Sub-phases, each validated before commit, none half-landed:
+P7.2a storage + split/merge + tree replay, single host; P7.2b wire + `replica add
+--region` + scoped serving; P7.2c cross-region moves; P7.2d fleet-test region
+phase across both machines. This is the deepest engine change since P0 — the
+sub-phase gates are the safety mechanism.
 
 ### 2.2 Settled details (following doc 13 §B verbatim)
 
@@ -93,8 +96,10 @@ to structural (heads in parent logs) rather than attested.
 | Phase | Deliverable | Done means |
 |---|---|---|
 | **P7.0** | region mark/unmark events + CLI + projection membership | mark, ls, unmark round-trip; replay preserves marks; cross-region mv refused; tests + smoke |
-| **P7.1** | region-scoped replication (filtered ship + attested proof) | `replica add --region` ships a strict subset, verifies, serves scoped; out-of-region access refused; two-machine check in fleet-test |
-| **P7.2** | physical per-region logs + head commitments (STRETCH — only on early green) | tree-of-logs replay; whole-forest verify unchanged externally; region ship = real log + manifest path |
+| **P7.2a** | physical region logs: storage + split/merge + tree replay | mark splits (baseline + new log), unmark seals; whole-forest verify unchanged; replay walks the tree |
+| **P7.2b** | wire scope + `replica add --region` + scoped serving | a region replicates without the parent's history; manifest proof verifies; out-of-region refused |
+| **P7.2c** | cross-region moves (paired events with head refs) | the P7.0 refusal lifts; replay accepts the pair |
+| **P7.2d** | fleet-test region phase, both machines | ship one app's region to the edge; it follows/serves/exports scoped |
 | **P7.3** | `pvfs-fuse` read-only streaming mount | mount a replica, `ls`/`cat` through the kernel, a pointer-mode file streams via read-through; pipeline gains the fuse dep; smoke mounts + reads |
 | **P7.4** | §6 design notes only (swarm, failover) | doc section, no code |
 | **Validate** | pipeline both hosts + fleet-test region phase + clippy, per landed phase | all green; honest §7 close-out of exactly what landed |
@@ -107,10 +112,15 @@ phase validates on presubuntu before its commit, as always.
 
 ## 6. Design notes for the deferred pair
 
-- **Swarm transfer:** the Fetcher's candidate list is already multi-source; swarm =
-  chunked fetch-by-hash (BLAKE3 tree chunks) from several holders at once, which
-  also buys resumable transfers (the chaos run's one caveat). Wants the region work
-  settled first so chunk manifests can live per-region.
+- **Swarm transfer (PROMOTED to a wanted arc — Chris, 2026-08-11, via doc 21 §3):
+  P9, after regions.** Reads pull **from every known holder in parallel,
+  BitTorrent-style**: files get a BLAKE3 chunk manifest (chunked at the sync
+  sink); the Fetcher's candidate list — source, registry-pinned holders, and
+  doc 21 mirror copies — becomes a seed set, chunks are pulled concurrently from
+  all of them, each chunk verified on arrival. Falls out for free: **resumable
+  transfers** (the chaos caveat) and **serve-while-fetching** mount reads
+  (punch J) — a read is served the moment its chunks land. Wants regions settled
+  first so manifests can live per-region.
 - **Standby failover (doc 03 §6 Q3):** explicit promotion only — a signed
   `WriterPromoted` event authored with the recovery phrase (never automatic), all
   replicas refuse the old writer's events after fold. Design compatible with

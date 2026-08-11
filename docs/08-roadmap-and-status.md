@@ -161,6 +161,13 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | **P5 serve integration** ([doc 18](18-serve-integration.md)) — the fleet runs itself: pvfsd job supervisor (`serve.jobs`, SIGHUP reload, `pvfs serve` verbs + live status), follow/sync/export/tier/evict as fold-nudged daemon jobs, `pvfs export --keep-fresh`, and **`pvfs fleet enroll`** (doc 17 §9 Q5 → resolution (c)) | ✅ built + fleet-validated 47/47 (2026-08-11) |
 | **Chaos validation** ([deploy/chaos-test.sh](../deploy/chaos-test.sh)) — kill -9 either side mid-transfer, edge reboot mid-2GiB-fetch, follower through source death: no partial ever published, clean recovery throughout | ✅ run green (2026-08-11) |
 | **P6 write-through completeness + `sync --to`** ([doc 19](19-write-through-completeness.md)) — loc rm/link/unlink/reorder over the wire, member-signed; the sync store moves to the big disk with both roots readable; plus the concurrent-fold race fix | ✅ built + validated (2026-08-11) |
+| **P7.0 region boundaries + P7.3 FUSE streaming mount** ([doc 20](20-f4-regions-and-streaming.md)) | ✅ built + validated (2026-08-11) |
+| **Punch batch** (surprise-behavior review): job auto-reload, enroll-guidance errors, rebuild notice, catalog mtimes on the mount, watcher→`watch` job + bare `pvfs serve` = status, member-gated `serve status`, tier commit-nudges | ✅ built + validated (2026-08-11) |
+
+**The queue (decided 2026-08-11):** ① **P7.2** region replication on physical
+per-region logs (doc 20 §2.1 — the next code arc); ② **P8** attachment policies
+(doc 21, approved); ③ **P9** swarm data plane (doc 20 §6 — parallel multi-holder
+chunk reads, resume, serve-while-fetching). Release cut waits for the region arc.
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):
