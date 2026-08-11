@@ -13,7 +13,7 @@ use crate::log_store;
 // projection (a pure cache of the log) is dropped and replayed on upgrade.
 // v3 (doc 13 Q-E1, 1.2): `acl` carries `expires_at` (0 = never); an expired grant
 // is masked on the read path. Same drop-and-replay upgrade.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4; // 4: + regions (P7.0, doc 20 §2)
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS acl (
   set_at         INTEGER NOT NULL,
   expires_at     INTEGER NOT NULL DEFAULT 0, -- (doc 13 Q-E1) ms epoch; 0 = never
   PRIMARY KEY (node_id, principal_kind, principal_id, authority)
+);
+CREATE TABLE IF NOT EXISTS regions (
+  node_id   TEXT    NOT NULL PRIMARY KEY,  -- the region boundary (P7.0, doc 13 §B)
+  marked_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS member_tags (
@@ -187,6 +191,7 @@ const MAIN_OBJECTS: &[&str] = &[
     "file_locations",
     "device_keys",
     "acl",
+    "regions",
     "member_tags",
     "temp_nodes",
     "temp_links",
@@ -554,6 +559,18 @@ pub fn fold(tx: &Transaction<'_>, event: &Event) -> Result<()> {
             )
             .map_err(&m)?;
         }
+        Event::RegionMarked { node_id, marked_at, .. } => {
+            tx.execute(
+                "INSERT INTO regions (node_id, marked_at) VALUES (?1, ?2)
+                 ON CONFLICT(node_id) DO UPDATE SET marked_at = excluded.marked_at",
+                params![node_id, *marked_at as i64],
+            )
+            .map_err(&m)?;
+        }
+        Event::RegionUnmarked { node_id, .. } => {
+            tx.execute("DELETE FROM regions WHERE node_id = ?1", params![node_id])
+                .map_err(&m)?;
+        }
         Event::NodePurged { node_id, .. } => {
             tx.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
                 .map_err(&m)?;
@@ -768,6 +785,11 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
     match ev {
         Event::AclSet { node_id, .. } => {
             require_right(conn, author, node_id, acl::ACL_A, "set acl", as_of_ms)?
+        }
+        // Region boundaries (P7.0, doc 13 §B): admin on the node — a region
+        // maps to an authority; drawing or erasing its border is that tier.
+        Event::RegionMarked { node_id, .. } | Event::RegionUnmarked { node_id, .. } => {
+            require_right(conn, author, node_id, acl::ACL_A, "mark region", as_of_ms)?
         }
         Event::LinkCreated(l) => {
             if let Some(parent) = &l.parent_id {

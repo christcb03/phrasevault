@@ -2123,6 +2123,15 @@ impl Engine {
             });
         }
         self.check_no_cycle(new_parent, node_id)?;
+        // P7.0 (doc 20 §2): cross-region moves are refused until physical
+        // region logs answer the both-logs authoring question (doc 13 §B).
+        if self.region_of(&old_parent)? != self.region_of(new_parent)? {
+            return Err(bad(
+                "mv",
+                "source and destination are in different regions — cross-region \
+                 moves land with physical region logs (doc 20 §2)",
+            ));
+        }
         let author = crate::acl::Principal::Key(author_pub.to_vec());
         for parent in [&old_parent, new_parent] {
             if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
@@ -2376,6 +2385,111 @@ impl Engine {
                 },
             }],
         })
+    }
+
+    // ---- regions (P7.0, doc 20 §2 / doc 13 §B) --------------------------------
+
+    /// Mark `node` as a region boundary — its contains-closure (minus nested
+    /// regions) becomes its own replication/compaction unit. Device-signed;
+    /// replay requires admin (a) on the node. Idempotent re-marks re-stamp.
+    pub fn region_mark(&mut self, node: &NodeId) -> Result<()> {
+        self.ensure_device_active()?;
+        let n = fetch_node(&self.conn, node)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: node.clone(),
+        })?;
+        if n.is_temp {
+            return Err(bad("region", "temp nodes are forest-local (no region marks)"));
+        }
+        let t = now_ms();
+        let me = self.device.pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_region_marked(node, t, &me),
+        )?;
+        self.append_durable(vec![Event::RegionMarked {
+            node_id: node.clone(),
+            marked_at: t,
+            author: me,
+            sig,
+        }])
+    }
+
+    /// Remove a region boundary; the subtree folds back into the enclosing
+    /// region. Unmarking an unmarked node errors NotFound (nothing to erase).
+    pub fn region_unmark(&mut self, node: &NodeId) -> Result<()> {
+        self.ensure_device_active()?;
+        let marked: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM regions WHERE node_id = ?1", params![node], |r| r.get(0))
+            .optional()
+            .map_err(map_db("region lookup"))?;
+        if marked.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "region",
+                id: node.clone(),
+            });
+        }
+        let t = now_ms();
+        let me = self.device.pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_region_unmarked(node, t, &me),
+        )?;
+        self.append_durable(vec![Event::RegionUnmarked {
+            node_id: node.clone(),
+            unmarked_at: t,
+            author: me,
+            sig,
+        }])
+    }
+
+    /// All marked region boundaries, `(node_id, marked_at)`.
+    pub fn regions(&self) -> Result<Vec<(NodeId, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id, marked_at FROM regions ORDER BY marked_at")
+            .map_err(map_db("regions"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+            .map_err(map_db("regions"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("regions"))
+    }
+
+    /// The region `node` belongs to: the nearest marked ancestor (a marked
+    /// node is its own region's root), else the forest root — the implicit
+    /// top region (doc 13 §B).
+    pub fn region_of(&self, node: &NodeId) -> Result<NodeId> {
+        let mut cur = node.clone();
+        for _ in 0..100_000 {
+            let marked: Option<i64> = self
+                .conn
+                .query_row("SELECT 1 FROM regions WHERE node_id = ?1", params![cur], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(map_db("region lookup"))?;
+            if marked.is_some() {
+                return Ok(cur);
+            }
+            let parent: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM links
+                     WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL LIMIT 1",
+                    params![cur, LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("region walk"))?;
+            match parent {
+                Some(Some(p)) => cur = p,
+                // tree root (no parent) or unhomed node: the top region
+                _ => return Ok(self.identity.root_node_id.clone()),
+            }
+        }
+        Err(bad("region", "containment walk exceeded depth bound"))
     }
 
     // ---- admin ops over the daemon (doc 09 §3c), all prepared for an external

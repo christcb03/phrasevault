@@ -733,6 +733,23 @@ $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable follow >/dev/null \
   && $PVFS --data-dir "$REPMOUNT/.pvfs" serve disable export >/dev/null \
   && ok "jobs disabled again" || fail "disable jobs"
 
+say "P7.0: region boundaries — mark, membership, mv refusal (doc 20 §2)"
+RGN="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" region-app)" created)"
+RGNFILE="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$RGN" inner)" created)"
+$PVFS --data-dir "$DMOUNT/.pvfs" region mark "$RGN" >/dev/null \
+  && ok "region mark" || fail "region mark"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" region ls "$RGNFILE" | qgrep "\"region\":\"$RGN\"" \
+  && ok "membership resolves to the nearest boundary" || fail "region membership"
+$PVFS --data-dir "$DMOUNT/.pvfs" region ls | qgrep "$RGN" \
+  && ok "region ls lists the boundary" || fail "region ls"
+# a member mv across the boundary is refused with guidance
+assert_rc 2 "cross-region mv refused → 2" -- \
+  $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT"
+$PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$RGN" >/dev/null \
+  && ok "region unmark" || fail "region unmark"
+$PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
+  && ok "the same mv is fine once the boundary is gone" || fail "post-unmark mv"
+
 say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
 mkdir -p "$DATA/config3"
 E3KEY="$(jget "$(XDG_CONFIG_HOME="$DATA/config3" $PVFS --json whoami)" pubkey)"

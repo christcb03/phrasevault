@@ -160,6 +160,7 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 |------|--------|
 | **P5 serve integration** ([doc 18](18-serve-integration.md)) — the fleet runs itself: pvfsd job supervisor (`serve.jobs`, SIGHUP reload, `pvfs serve` verbs + live status), follow/sync/export/tier/evict as fold-nudged daemon jobs, `pvfs export --keep-fresh`, and **`pvfs fleet enroll`** (doc 17 §9 Q5 → resolution (c)) | ✅ built + fleet-validated 47/47 (2026-08-11) |
 | **Chaos validation** ([deploy/chaos-test.sh](../deploy/chaos-test.sh)) — kill -9 either side mid-transfer, edge reboot mid-2GiB-fetch, follower through source death: no partial ever published, clean recovery throughout | ✅ run green (2026-08-11) |
+| **P6 write-through completeness + `sync --to`** ([doc 19](19-write-through-completeness.md)) — loc rm/link/unlink/reorder over the wire, member-signed; the sync store moves to the big disk with both roots readable; plus the concurrent-fold race fix | ✅ built + validated (2026-08-11) |
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):

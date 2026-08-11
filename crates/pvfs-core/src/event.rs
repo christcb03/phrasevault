@@ -28,6 +28,8 @@ pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
 pub const K_ROOT_ROTATED: &str = "RootRotated";
 pub const K_RECOVERY_KEY_REGISTERED: &str = "RecoveryKeyRegistered";
 pub const K_RECOVERY_KEY_REVOKED: &str = "RecoveryKeyRevoked";
+pub const K_REGION_MARKED: &str = "RegionMarked";
+pub const K_REGION_UNMARKED: &str = "RegionUnmarked";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -127,6 +129,23 @@ pub enum Event {
     NodePurged {
         node_id: String,
         purged_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// P7.0 (doc 20 §2, doc 13 §B): `node_id` becomes a region boundary —
+    /// its contains-closure (minus nested regions) is its own replication/
+    /// compaction unit. Admin-authored structural event.
+    RegionMarked {
+        node_id: String,
+        marked_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// P7.0: the boundary is removed; the subtree folds back into the
+    /// enclosing region.
+    RegionUnmarked {
+        node_id: String,
+        unmarked_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -280,6 +299,18 @@ pub fn msg_file_location_added(file_id: &str, uri: &str, added_at: u64, author: 
     crypto::domain_digest("pvfs:filelocationadded:v1:", &e.finish())
 }
 
+pub fn msg_region_marked(node_id: &str, marked_at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).u64(marked_at).bytes(author);
+    crypto::domain_digest("pvfs:regionmarked:v1:", &e.finish())
+}
+
+pub fn msg_region_unmarked(node_id: &str, unmarked_at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).u64(unmarked_at).bytes(author);
+    crypto::domain_digest("pvfs:regionunmarked:v1:", &e.finish())
+}
+
 pub fn msg_file_location_removed(
     file_id: &str,
     uri: &str,
@@ -404,6 +435,8 @@ impl Event {
             Event::LinkSuspended { .. } => K_LINK_SUSPENDED,
             Event::LinkUnsuspended { .. } => K_LINK_UNSUSPENDED,
             Event::FileLocationAdded { .. } => K_FILE_LOCATION_ADDED,
+            Event::RegionMarked { .. } => K_REGION_MARKED,
+            Event::RegionUnmarked { .. } => K_REGION_UNMARKED,
             Event::FileLocationRemoved { .. } => K_FILE_LOCATION_REMOVED,
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
@@ -430,6 +463,8 @@ impl Event {
             | Event::LinkSuspended { author, .. }
             | Event::LinkUnsuspended { author, .. }
             | Event::FileLocationAdded { author, .. }
+            | Event::RegionMarked { author, .. }
+            | Event::RegionUnmarked { author, .. }
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
@@ -460,6 +495,8 @@ impl Event {
             | Event::RecoveryKeyRegistered { sig: s, .. }
             | Event::RecoveryKeyRevoked { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
+            | Event::RegionMarked { sig: s, .. }
+            | Event::RegionUnmarked { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -596,6 +633,22 @@ impl Event {
                 sig,
             } => {
                 e.string(file_id).string(uri).u64(*added_at).bytes(author).bytes(sig);
+            }
+            Event::RegionMarked {
+                node_id,
+                marked_at,
+                author,
+                sig,
+            } => {
+                e.string(node_id).u64(*marked_at).bytes(author).bytes(sig);
+            }
+            Event::RegionUnmarked {
+                node_id,
+                unmarked_at,
+                author,
+                sig,
+            } => {
+                e.string(node_id).u64(*unmarked_at).bytes(author).bytes(sig);
             }
             Event::FileLocationRemoved {
                 file_id,
@@ -805,6 +858,18 @@ impl Event {
                 file_id: d.string()?,
                 uri: d.string()?,
                 added_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_REGION_MARKED => Event::RegionMarked {
+                node_id: d.string()?,
+                marked_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_REGION_UNMARKED => Event::RegionUnmarked {
+                node_id: d.string()?,
+                unmarked_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -1021,6 +1086,26 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_file_location_added(file_id, uri, *added_at, author),
+                sig,
+            ),
+            Event::RegionMarked {
+                node_id,
+                marked_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_region_marked(node_id, *marked_at, author),
+                sig,
+            ),
+            Event::RegionUnmarked {
+                node_id,
+                unmarked_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_region_unmarked(node_id, *unmarked_at, author),
                 sig,
             ),
             Event::FileLocationRemoved {

@@ -1,6 +1,11 @@
 # 19 — Write-through completeness + sync --to (P6)
 
-**Status: IN BUILD (doc drafted 2026-08-11; design follows doc 17 §7.1's deferrals).**
+**Status: BUILT + VALIDATED (2026-08-11, commit `7c868c0`) — 209 tests, 297 smoke,
+clippy clean.** As-built notes: the `set_sig` accessor was missing `LinkReordered`
+(caught by the new authorization test — a member's signature was silently dropped);
+the smoke's daemon-jobs section exposed a latent concurrent-fold race in projection
+catch-up, fixed separately (`58adaa2`). Packaging intent stands: 1.4.0 = P5 + P6 +
+the tmp sweep, Chris to confirm.
 Prerequisite reading: doc 17 §7 (the write-through model), doc 18 (the job supervisor
 these ops ultimately serve).
 

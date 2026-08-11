@@ -155,6 +155,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RemoteCmd,
     },
+    /// Region boundaries (P7.0, doc 20): per-app replication/compaction units
+    #[command(subcommand)]
+    Region(RegionCmd),
     /// Fleet setup (P5.4, doc 18 §4): admit another box's client identity
     /// in one visible, logged, revocable step
     #[command(subcommand)]
@@ -629,6 +632,16 @@ enum ServeCmd {
     Exports,
     /// Ask the running daemon for live job-runner state
     Status,
+}
+
+#[derive(Subcommand)]
+enum RegionCmd {
+    /// Mark a node as a region boundary (its subtree becomes a unit)
+    Mark { target: String },
+    /// Remove a region boundary (the subtree folds back in)
+    Unmark { target: String },
+    /// List marked regions, and which region a node is in with a target
+    Ls { target: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -3419,6 +3432,58 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Ok(())
             }
         },
+        Cmd::Region(cmd) => {
+            match cmd {
+                RegionCmd::Mark { target } => {
+                    let (mut engine, id) = engine_and_node(ctx, &target)?;
+                    engine.region_mark(&id)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"marked\":true}}");
+                    } else {
+                        println!("{id} is now a region boundary");
+                    }
+                    engine.close()
+                }
+                RegionCmd::Unmark { target } => {
+                    let (mut engine, id) = engine_and_node(ctx, &target)?;
+                    engine.region_unmark(&id)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"marked\":false}}");
+                    } else {
+                        println!("{id} is no longer a region boundary");
+                    }
+                    engine.close()
+                }
+                RegionCmd::Ls { target: Some(t) } => {
+                    let (engine, id) = engine_and_node(ctx, &t)?;
+                    let region = engine.region_of(&id)?;
+                    if json {
+                        println!("{{\"node\":\"{id}\",\"region\":\"{region}\"}}");
+                    } else {
+                        println!("{region}");
+                    }
+                    engine.close()
+                }
+                RegionCmd::Ls { target: None } => {
+                    let engine = Engine::open(&ctx?)?;
+                    let regions = engine.regions()?;
+                    if json {
+                        let rows: Vec<String> = regions
+                            .iter()
+                            .map(|(id, at)| format!("{{\"region\":\"{id}\",\"marked_at\":{at}}}"))
+                            .collect();
+                        println!("[{}]", rows.join(","));
+                    } else if regions.is_empty() {
+                        println!("no marked regions (the forest root is the implicit top region)");
+                    } else {
+                        for (id, _) in &regions {
+                            println!("{id}");
+                        }
+                    }
+                    engine.close()
+                }
+            }
+        }
         Cmd::Fleet(FleetCmd::Enroll { pubkey, rights }) => {
             let state_dir = ctx?;
             let pubkey = match pubkey {
