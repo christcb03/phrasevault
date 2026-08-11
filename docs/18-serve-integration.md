@@ -1,6 +1,6 @@
 # 18 — Serve integration: the fleet runs itself (P5, doc 17's F0.1 + F3.1)
 
-**Status: IN BUILD (decisions landed 2026-08-10; §4 = option (c), Chris).**
+**Status: BUILT + FLEET-VALIDATED (P5.0–P5.4, 2026-08-10 → 08-11 — see §7 close-out).**
 Prerequisite reading: doc 17 (the built federation arc), HANDOFF.md §2 findings.
 
 ## 1. Goal
@@ -106,3 +106,26 @@ Design-first close-out rule applies: deviations recorded here, honestly, when P5
    `pvfs export --keep-fresh`. (Lean: the latter — the export manifest already exists.)
 4. Backoff/jitter numbers and whether *sync* failures should quarantine a candidate
    instance the way the Fetcher's dead-target set does within one pass.
+
+## 7. Close-out (2026-08-11)
+
+All five phases landed (P5.0 `50689da`, P5.1 `91f2718`, P5.2 `13615e4`, P5.3+P5.4
+`d82e4f1`). Validated: **205 cargo tests + 286 smoke checks green on both hosts**
+(presubuntu + pvos-test) through the full pipeline — release build, install, systemd
+daemon stage — with clippy `-D warnings` clean throughout. `deploy/fleet-test.sh`
+grew phase G (daemon mode) and passed **47/47**: the §7.10 ingest → tier → evict →
+still-streams loop ran across two real machines entirely as serve jobs (fold-nudged,
+zero cron), phase B now admits boxes via `pvfs fleet enroll`, tier moved 3 GiB over
+the LAN at ~56 MB/s, and the post-evict stream-back verified bit-perfect at ~59 MB/s.
+
+Deviations from the plan, honestly:
+- `pvfs serve` already existed — the P1 **watcher** daemon. The job verbs nested
+  under it (bare `pvfs serve` unchanged); unifying the watcher as a `watch` job
+  stays open (§2 note).
+- `tier` is interval-only (300 s, due immediately on enable/reload) — §2's
+  local-commit nudge is deferred to the §6 list.
+- Export config took the `serve.exports` shape (written by `export --keep-fresh`)
+  rather than §6 Q3's manifest-only lean: the daemon needs a per-data-dir work list
+  it can find without scanning the filesystem for export dirs.
+- `ServeStatus` answers Info-tier (anon-readable operational metadata, like `Info`);
+  revisit only if job rows ever carry content-derived detail.

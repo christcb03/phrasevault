@@ -3,6 +3,19 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
+## Unreleased
+
+- **Serve integration — the fleet runs itself (P5, doc 18):** `pvfsd` grows a job
+  supervisor — `serve.jobs` deployment config (`pvfs serve enable|disable|ls|status|
+  exports`, SIGHUP reload, corrupt-config-refuses-start), the F5.4 follower absorbed
+  as the `follow` job, and `sync` / `export` / `tier` / `evict` as fold-nudged passes
+  with 5-minute safety intervals and a catch-up pass at start. `pvfs export
+  --keep-fresh` records a view the export job re-runs on change. **`pvfs fleet
+  enroll`** admits a box's client identity (member + root rights) in one visible,
+  logged, revocable step — the doc 17 §9 Q5 resolution (c): client identities dial,
+  forest device keys never do. The fetch/tier/follow engines moved to `pvfs-client`
+  (evict to core) so the CLI and daemon run one implementation.
+
 ## 1.3.0 — 2026-08-10
 
 Validated end to end: the Ansible pipeline on two hosts (194 tests + 268

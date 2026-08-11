@@ -81,18 +81,16 @@ gate "owner setup"
 say "B: edge identity + owner grant"
 EDGEKEY=$(jkey "$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --json whoami')" pubkey)
 printf '%s' "$EDGEKEY" | grep -qE '^[0-9a-f]{64,66}$' && ok "edge client identity: $EDGEKEY" || fail "edge whoami: $EDGEKEY"
-ssh "$OWNER" '"$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" device authorize-member --pubkey '"$EDGEKEY" >/dev/null \
-  && ok "owner authorized the edge key as a member (authoring capability)" \
-  || fail "owner authorize-member"
-ssh "$OWNER" '"$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" acl set '"$ROOT key:$EDGEKEY"' rwa' >/dev/null \
-  && ok "owner granted edge key rwa at the root (auto-routed via live daemon)" \
-  || fail "owner acl grant"
+# P5.4: fleet enroll — membership + rights in one logged step (doc 18 §4)
+ssh "$OWNER" '"$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" fleet enroll '"$EDGEKEY"' --rights rwa' >/dev/null \
+  && ok "fleet enroll admitted the edge box (member + rwa, one step)" \
+  || fail "fleet enroll edge"
 # the owner box's own outbound fetches (mover, read-through) authenticate as its
-# CLIENT identity, not the forest device key — it needs read rights like anyone
+# CLIENT identity, not the forest device key — enroll it like any other box
 OWNERKEY=$(jkey "$(ssh "$OWNER" '"$HOME/.local/bin/pvfs" --json whoami')" pubkey)
-ssh "$OWNER" '"$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" device authorize-member --pubkey '"$OWNERKEY"' && "$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" acl set '"$ROOT key:$OWNERKEY"' r' >/dev/null \
-  && ok "owner's client identity granted read (needed for its own read-through/mover)" \
-  || fail "owner client identity grant"
+ssh "$OWNER" '"$HOME/.local/bin/pvfs" --forest "$HOME/fleet-test/owner" fleet enroll '"$OWNERKEY"' --rights r' >/dev/null \
+  && ok "fleet enroll admitted the owner's own client identity (read)" \
+  || fail "fleet enroll owner"
 gate grant
 
 say "C: §7.7 replicate over the LAN (pvos-test)"
@@ -261,6 +259,69 @@ eval "$(echo "$S3" | grep -E '^(FREED_MB|EVICT_SECS|STREAM_SECS)=')"
 echo "$S3" | grep -o 'EVICTJSON=.*' | head -1
 [ "${FREED_MB:-0}" -gt 2500 ] && ok "evict freed ${FREED_MB} MB on the edge in ${EVICT_SECS}s" || fail "evict freed only ${FREED_MB:-?} MB"
 echo "$S3" | grep -q "S3=ok" && ok "3 GiB streamed back bit-perfect in ${STREAM_SECS}s (~$(( STREAM_SECS > 0 ? 3072 / STREAM_SECS : 3072 )) MB/s)" || fail "scale stream hash mismatch"
+
+say "G: doc 18 — daemon mode: the fleet runs itself (serve jobs, zero cron)"
+G_OUT=$(ssh "$EDGE" "LIB=$LIB bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
+for j in follow sync export; do "\$B/pvfs" --data-dir "\$R" serve enable \$j >/dev/null || echo "G1=no(\$j)"; done
+"\$B/pvfs" --data-dir "\$R" export "\$LIB" "\$FT/daemon-view" --mode copy --prune --keep-fresh >/dev/null 2>&1 \
+  && echo "G1=ok" || echo "G1=no(export)"
+pkill -HUP -f "pvfsd --mount \$FT/replica" && echo "G2=ok" || echo "G2=no"
+sleep 1
+"\$B/pvfs" --json --data-dir "\$R" serve status | grep -q '"runner":"on"' && echo "G3=ok" || echo "G3=no"
+EOS
+)
+echo "$G_OUT" | grep -q "G1=ok" && ok "edge: jobs enabled + kept-fresh view recorded" || fail "edge jobs setup: $G_OUT"
+echo "$G_OUT" | grep -q "G3=ok" && ok "edge daemon reloaded jobs on SIGHUP (runner on)" || fail "edge SIGHUP"
+# a new file appears on the owner — the edge view must refresh with NO command run
+NEWSHA=$(ssh "$OWNER" 'FT=$HOME/fleet-test; head -c 262144 /dev/urandom > "$FT/library/movies/beta.mkv"
+"$HOME/.local/bin/pvfs" --data-dir "$FT/owner/.pvfs" scan '"$LIB"' >/dev/null
+sha256sum "$FT/library/movies/beta.mkv" | cut -d" " -f1')
+VOK=""
+for _ in $(seq 1 120); do
+  GOT=$(ssh "$EDGE" 'sha256sum "$HOME/fleet-test/daemon-view/movies/beta.mkv" 2>/dev/null | cut -d" " -f1')
+  [ "$GOT" = "$NEWSHA" ] && { VOK=1; break; }
+  sleep 1
+done
+[ -n "$VOK" ] && ok "owner's new file reached the edge view hands-free (follow → sync → export over the LAN)" \
+  || fail "daemon-mode view never refreshed"
+# ingest → tier (job) → evict (job): the §7.10 loop with zero cron
+ING=$(ssh "$EDGE" "LIB=$LIB bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
+head -c 1048576 /dev/urandom > "\$FT/downloads/auto-episode.mkv"
+echo "ISHA=\$(sha256sum "\$FT/downloads/auto-episode.mkv" | cut -d' ' -f1)"
+NID=\$("\$B/pvfs" --json --data-dir "\$R" add "\$LIB" --kind file --label auto-episode.mkv --size 1048576 | jget node_id)
+"\$B/pvfs" --data-dir "\$R" loc add "\$NID" --here "\$FT/downloads/auto-episode.mkv" >/dev/null
+"\$B/pvfs" --data-dir "\$R" serve enable evict >/dev/null
+pkill -HUP -f "pvfsd --mount \$FT/replica"   # the running supervisor learns of evict
+echo "NID=\$NID"
+EOS
+)
+eval "$(echo "$ING" | grep -E '^(NID|ISHA)=')"
+[ "${#NID}" -eq 64 ] && ok "edge ingested a new file (write-through + --here)" || fail "daemon-mode ingest: $ING"
+ssh "$OWNER" 'B=$HOME/.local/bin; FT=$HOME/fleet-test
+"$B/pvfs" --data-dir "$FT/owner/.pvfs" serve enable tier >/dev/null
+pkill -HUP -f "pvfsd --mount $FT/owner"' \
+  && ok "owner: tier job enabled via SIGHUP (pass due immediately)" || fail "owner tier enable"
+TOK=""
+for _ in $(seq 1 120); do
+  ssh "$OWNER" "test -f \$HOME/fleet-test/central-store/${NID:0:2}/$NID" && { TOK=1; break; }
+  sleep 1
+done
+[ -n "$TOK" ] && ok "tier job migrated the ingested bytes to central (no command run)" \
+  || fail "tier job never migrated $NID"
+EOK=""
+for _ in $(seq 1 120); do
+  if ! ssh "$EDGE" 'test -f "$HOME/fleet-test/downloads/auto-episode.mkv"'; then EOK=1; break; fi
+  sleep 1
+done
+[ -n "$EOK" ] && ok "evict job reclaimed the edge bytes (fold-nudged, no command run)" \
+  || fail "evict job never reclaimed the download"
+SSHA=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/replica/.pvfs" cat '"$NID"' 2>/dev/null | sha256sum | cut -d" " -f1')
+[ "$SSHA" = "$ISHA" ] && ok "and the file still streams bit-perfect on the edge (via central)" \
+  || fail "post-daemon-evict stream mismatch"
 
 say "cleanup — stop fleet daemons (dirs kept for inspection)"
 ssh "$OWNER" 'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'

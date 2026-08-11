@@ -154,6 +154,12 @@ takeover/restart e2e, the read-pool cross-connection visibility test, and the
 new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 `v1.2` tag pending (Chris tags manually).
 
+### 3.4 — Unreleased (the post-1.3 line)
+
+| Item | State |
+|------|--------|
+| **P5 serve integration** ([doc 18](18-serve-integration.md)) — the fleet runs itself: pvfsd job supervisor (`serve.jobs`, SIGHUP reload, `pvfs serve` verbs + live status), follow/sync/export/tier/evict as fold-nudged daemon jobs, `pvfs export --keep-fresh`, and **`pvfs fleet enroll`** (doc 17 §9 Q5 → resolution (c)) | ✅ built + fleet-validated 47/47 (2026-08-11) |
+
 ### 3.3 — the 1.3.0 line (released 2026-08-10)
 
 > **Validation state: complete.** The real Ansible pipeline ran green on two hosts (presubuntu
