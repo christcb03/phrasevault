@@ -73,7 +73,7 @@ against it. As-built decisions:
 | **P6.1** | `sync.store` config + `--to` plumbing through sync/cat/export read paths | fetch lands on the configured disk; pre-move files still serve; jobs honor it |
 | **Validate** | pipeline both hosts + smoke + a fleet-test ingest-retraction check + clippy | all green; doc 08 §3.4 updated |
 
-Packaging intent (Chris to confirm at close): **1.4.0 = P5 + P6 + the tmp-sweep fix.**
+Packaging: see the header — decided 2026-08-11, no cut until the region arc lands.
 
 ## 5. Open questions
 
