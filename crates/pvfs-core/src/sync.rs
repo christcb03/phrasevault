@@ -219,6 +219,57 @@ impl Drop for SyncSink {
     }
 }
 
+/// Remove orphaned fetch tmps (`.{id}.tmp`) from the sync store. A process
+/// killed mid-fetch (SIGKILL, power loss) never runs its sink's Drop, and a
+/// tmp for a file that is never re-fetched would leak its disk forever.
+/// Sinks are process-local, so nothing legitimately holds a tmp across a
+/// daemon restart — pvfsd sweeps unconditionally at startup, before any job
+/// can begin a fetch. Returns how many files were removed.
+pub fn sweep_orphan_tmps(data_dir: &Path) -> Result<u64> {
+    let store = data_dir.join(SYNC_DIR);
+    let shards = match std::fs::read_dir(&store) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(PvfsError::io("scan sync store", e)),
+    };
+    let mut removed = 0;
+    for shard in shards {
+        let shard = shard.map_err(|e| PvfsError::io("scan sync store", e))?;
+        let is_dir = shard
+            .file_type()
+            .map_err(|e| PvfsError::io("scan sync store", e))?
+            .is_dir();
+        if !is_dir {
+            continue;
+        }
+        let entries =
+            std::fs::read_dir(shard.path()).map_err(|e| PvfsError::io("scan sync shard", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| PvfsError::io("scan sync shard", e))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if !is_fetch_tmp_name(name) || !is_file {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PvfsError::io("remove orphaned sync tmp", e)),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// `.{64-hex}.tmp` — exactly the names [`Engine::sync_begin`] mints for
+/// in-flight fetches; anything else in the store is content, never touched.
+fn is_fetch_tmp_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".tmp"))
+        .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 impl Engine {
     /// Begin fetching `id`'s bytes into the managed sync store. The caller
     /// streams into the returned sink (it implements `Write`) and then calls

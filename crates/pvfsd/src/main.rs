@@ -99,6 +99,17 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
 
+    // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
+    // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
+    // the file is never re-fetched. Sinks are process-local, so nothing holds
+    // a tmp across restarts — sweep before the job runner can begin a fetch.
+    // Best-effort: a failed sweep is worth a warning, never a refused start.
+    match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
+        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
+    }
+
     let socket = match &cli.socket {
         Some(s) => s.clone(),
         None => {
