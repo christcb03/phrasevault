@@ -199,21 +199,39 @@ pub enum ClientMsg {
     /// server writes the bytes and replies `Prepared` (the `SecureBlobUpdated`
     /// digest to sign), after which the client `Commit`s as usual.
     SecurePut { node: String },
-    /// The log's chain tip (F2). Gated like `LogRead`.
-    LogInfo,
+    /// The log's chain tip (F2). Gated like `LogRead`. P7.2b: `region` scopes
+    /// the request to one region **generation** — `""` (the default; absent on
+    /// the wire) is the top log, else `<region-root-hex>/g-<host>-<seq>.db`
+    /// (the generation's file name, doc 20 §2.3/§2.4). Additive: old peers
+    /// serialize/parse the top-log form unchanged.
+    LogInfo {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        region: String,
+    },
     /// Ship raw log rows `[from_seq ..]`, at most `max` per batch (F2).
     /// Gated: the caller needs **admin rights on the forest root** — a full
     /// log reveals the whole forest's history, so replication is an
-    /// owner/admin capability (doc 17 §5), not a member read.
-    LogRead { from_seq: u64, max: u32 },
+    /// owner/admin capability (doc 17 §5), not a member read. P7.2b: a
+    /// region-scoped request (see `LogInfo.region`) is instead gated on
+    /// admin rights on **that region's root** — a region maps to an
+    /// authority, so its holder replicates it without whole-forest rights.
+    LogRead {
+        from_seq: u64,
+        max: u32,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        region: String,
+    },
     /// Long-poll `LogRead` (F5.4, doc 17 §7.5): reply immediately when the
     /// tip has reached `from_seq`, else block up to `timeout_ms` (server-
     /// capped) waiting for new events; an empty `LogEvents` means "still
-    /// nothing — poll again". Same gate as `LogRead`.
+    /// nothing — poll again". Same gate as `LogRead` (region-scoped when
+    /// `region` is set).
     LogWait {
         from_seq: u64,
         max: u32,
         timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        region: String,
     },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },

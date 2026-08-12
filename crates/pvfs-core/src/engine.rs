@@ -574,6 +574,69 @@ impl Engine {
         log_store::read_range(&self.conn, from_seq, max)
     }
 
+    /// A cheap signal that **any** log (top or region) advanced: the total of
+    /// the per-log applied marks. Not monotone across unmarks (a seal drops a
+    /// row) — consumers compare for *change*, not order. The daemon's
+    /// `LogWait` uses it to wake followers for region sweeps (P7.2b).
+    pub fn log_activity(&self) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT IFNULL(TOTAL(seq),0) FROM applied_marks",
+                [],
+                |r| r.get::<_, f64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(map_db("log activity"))
+    }
+
+    /// A region generation's `(tip, rows [from_seq..])` for log shipping
+    /// (P7.2b, doc 20 §2.4). `rel_file` is the validated `regions/…` path
+    /// from [`crate::replica::parse_region_addr`]; the caller gates access
+    /// (admin on the region root). `NotFound` when this instance does not
+    /// hold the generation.
+    pub fn region_log_events(
+        &self,
+        rel_file: &str,
+        from_seq: u64,
+        max: usize,
+    ) -> Result<(u64, Vec<log_store::EventRow>)> {
+        let path = self.data_dir.join(rel_file);
+        if !path.exists() {
+            return Err(PvfsError::NotFound {
+                kind: "region log",
+                id: rel_file.into(),
+            });
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_db("open region log"))?;
+        let tip: i64 = conn
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| r.get(0))
+            .map_err(map_db("read region tip"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, kind, body, chain_hash, written_at FROM events
+                 WHERE seq >= ?1 ORDER BY seq LIMIT ?2",
+            )
+            .map_err(map_db("read region range"))?;
+        let rows = stmt
+            .query_map(params![from_seq as i64, max as i64], |r| {
+                Ok(log_store::EventRow {
+                    seq: r.get::<_, i64>(0)? as u64,
+                    kind: r.get(1)?,
+                    body: r.get(2)?,
+                    chain_hash: r.get(3)?,
+                    written_at: r.get::<_, i64>(4)? as u64,
+                })
+            })
+            .map_err(map_db("read region range"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("read region range"))?;
+        Ok((tip as u64, rows))
+    }
+
     /// Recover onto a machine from the mnemonic: re-derive the device key and
     /// (if needed) self-authorize it with the identity root (spec §10).
     pub fn recover(data_dir: &Path, mnemonic: &Mnemonic, device_index: u64) -> Result<Engine> {

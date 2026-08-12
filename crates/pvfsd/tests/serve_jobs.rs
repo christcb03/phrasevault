@@ -163,7 +163,7 @@ fn follow_job_keeps_a_replica_fresh() {
         let mut store = ReplicaStore::open(&rdata).unwrap();
         let mut from = 1;
         loop {
-            let (_tip, events) = client.log_read(from, 64).unwrap();
+            let (_tip, events) = client.log_read(from, 64, "").unwrap();
             if events.is_empty() {
                 break;
             }
@@ -184,6 +184,7 @@ fn follow_job_keeps_a_replica_fresh() {
         transport: "socket".into(),
         target: sock.to_string_lossy().into_owned(),
         pin: String::new(),
+        region: String::new(),
     }
     .save(&rdata)
     .unwrap();
@@ -334,7 +335,7 @@ fn sync_and_export_jobs_keep_a_consumer_view_fresh() {
         let mut store = ReplicaStore::open(&rdata).unwrap();
         let mut from = 1;
         loop {
-            let (_tip, events) = client.log_read(from, 64).unwrap();
+            let (_tip, events) = client.log_read(from, 64, "").unwrap();
             if events.is_empty() {
                 break;
             }
@@ -355,6 +356,7 @@ fn sync_and_export_jobs_keep_a_consumer_view_fresh() {
         transport: "socket".into(),
         target: sock.to_string_lossy().into_owned(),
         pin: String::new(),
+        region: String::new(),
     }
     .save(&rdata)
     .unwrap();

@@ -24,6 +24,7 @@ pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo, ServeJobWire};
 
 pub mod fetch;
 pub mod follow;
+pub mod regions;
 pub mod watch;
 
 /// The client's transport: both arms speak identical frames.
@@ -250,9 +251,12 @@ impl Client {
     }
 
     /// The served log's chain tip (F2 log shipping). Requires admin rights on
-    /// the forest root.
-    pub fn log_info(&mut self) -> Result<u64> {
-        match self.request(ClientMsg::LogInfo)? {
+    /// the forest root — or, for a region-scoped request (P7.2b: `region` =
+    /// the generation address, `""` = top), on that region's root.
+    pub fn log_info(&mut self, region: &str) -> Result<u64> {
+        match self.request(ClientMsg::LogInfo {
+            region: region.into(),
+        })? {
             ServerMsg::LogInfo { tip_seq } => Ok(tip_seq),
             other => Err(unexpected("LogInfo", &other)),
         }
@@ -260,9 +264,18 @@ impl Client {
 
     /// One batch of raw signed log rows from `from_seq` (F2). Returns
     /// `(tip_seq, events)`; keep calling from `last.seq + 1` until caught up.
-    /// Requires admin rights on the forest root.
-    pub fn log_read(&mut self, from_seq: u64, max: u32) -> Result<(u64, Vec<LogEventWire>)> {
-        match self.request(ClientMsg::LogRead { from_seq, max })? {
+    /// Gated like [`log_info`](Self::log_info).
+    pub fn log_read(
+        &mut self,
+        from_seq: u64,
+        max: u32,
+        region: &str,
+    ) -> Result<(u64, Vec<LogEventWire>)> {
+        match self.request(ClientMsg::LogRead {
+            from_seq,
+            max,
+            region: region.into(),
+        })? {
             ServerMsg::LogEvents { tip_seq, events } => Ok((tip_seq, events)),
             other => Err(unexpected("LogEvents", &other)),
         }
@@ -276,11 +289,13 @@ impl Client {
         from_seq: u64,
         max: u32,
         timeout_ms: u64,
+        region: &str,
     ) -> Result<(u64, Vec<LogEventWire>)> {
         match self.request(ClientMsg::LogWait {
             from_seq,
             max,
             timeout_ms,
+            region: region.into(),
         })? {
             ServerMsg::LogEvents { tip_seq, events } => Ok((tip_seq, events)),
             other => Err(unexpected("LogEvents", &other)),

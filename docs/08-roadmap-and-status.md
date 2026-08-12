@@ -163,10 +163,11 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | **P6 write-through completeness + `sync --to`** ([doc 19](19-write-through-completeness.md)) — loc rm/link/unlink/reorder over the wire, member-signed; the sync store moves to the big disk with both roots readable; plus the concurrent-fold race fix | ✅ built + validated (2026-08-11) |
 | **P7.0 region boundaries + P7.3 FUSE streaming mount** ([doc 20](20-f4-regions-and-streaming.md)) | ✅ built + validated (2026-08-11) |
 | **Punch batch** (surprise-behavior review): job auto-reload, enroll-guidance errors, rebuild notice, catalog mtimes on the mount, watcher→`watch` job + bare `pvfs serve` = status, member-gated `serve status`, tier commit-nudges | ✅ built + validated (2026-08-11) |
-| **P7.2a physical region logs** ([doc 20](20-f4-regions-and-streaming.md) §2.3) — per-region signed logs with baseline commitments, head attestations, sealed generations, tree replay (schema v5); every rebuild re-verifies each baseline. ⚠ until P7.2b: mark no regions on replicated forests | ✅ built + validated both hosts (2026-08-11) |
+| **P7.2a physical region logs** ([doc 20](20-f4-regions-and-streaming.md) §2.3) — per-region signed logs with baseline commitments, head attestations, sealed generations, tree replay (schema v5); every rebuild re-verifies each baseline | ✅ built + validated both hosts (2026-08-11) |
+| **P7.2b region logs over the wire** ([doc 20](20-f4-regions-and-streaming.md) §2.4) — generation-addressed log shipping (region-root gated), whole-forest replicas ship every generation (the P7.2a hazard is gone), `replica add --region`, follower region sweeps, daemon head attestation tick | ✅ built + validated both hosts (2026-08-11) |
 
 **The queue (decided 2026-08-11):** ① **P7.2** region replication on physical
-per-region logs (doc 20 §2.1 — **P7.2a landed**; next: P7.2b wire scope, P7.2c
+per-region logs (doc 20 §2.1 — **P7.2a + P7.2b landed**; next: P7.2c
 cross-region moves, P7.2d fleet phase); ② **P8** attachment policies (doc 21,
 approved); ③ **P9** swarm data plane (doc 20 §6 — parallel multi-holder chunk
 reads, resume, serve-while-fetching). Release cut waits for the region arc.

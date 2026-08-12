@@ -323,6 +323,64 @@ SSHA=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/replica
 [ "$SSHA" = "$ISHA" ] && ok "and the file still streams bit-perfect on the edge (via central)" \
   || fail "post-daemon-evict stream mismatch"
 
+say "H: doc 20 §2.4 — ship one app's region to the edge (P7.2b/P7.2d)"
+# owner: two app subtrees become regions; a write + real bytes land inside one
+H_OWNER=$(ssh "$OWNER" "ROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+PH=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label photos-app)
+MU=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label music-app)
+"\$B/pvfs" --data-dir "\$D" region mark "\$PH" >/dev/null \
+  && "\$B/pvfs" --data-dir "\$D" region mark "\$MU" >/dev/null \
+  && echo "H1=ok" || echo "H1=no"
+AL=\$("\$B/pvfs" --data-dir "\$D" add "\$PH" --kind folder --label albums)
+TR=\$("\$B/pvfs" --data-dir "\$D" add "\$MU" --kind folder --label tracks)
+printf 'region-pic-bytes' > "\$FT/library/pic.txt"
+PIC=\$("\$B/pvfs" --data-dir "\$D" add "\$AL" --kind file --label pic.txt --size 16)
+"\$B/pvfs" --data-dir "\$D" loc add "\$PIC" "file://\$FT/library/pic.txt" >/dev/null
+ls "\$D/regions/\$PH/"g-*.db >/dev/null 2>&1 && echo "H2=ok" || echo "H2=no"
+echo "PH=\$PH"; echo "MU=\$MU"; echo "AL=\$AL"; echo "TR=\$TR"; echo "PIC=\$PIC"
+echo "PICSHA=\$(sha256sum "\$FT/library/pic.txt" | cut -d' ' -f1)"
+EOS
+)
+eval "$(echo "$H_OWNER" | grep -E '^(PH|MU|AL|TR|PIC|PICSHA)=')"
+echo "$H_OWNER" | grep -q "H1=ok" && ok "owner marked two app regions on the served forest" || fail "region marks: $H_OWNER"
+echo "$H_OWNER" | grep -q "H2=ok" && ok "region writes created the generation file" || fail "owner generation file"
+# the edge's FOLLOW JOB (running since G) must sweep the region hands-free
+HFOK=""
+for _ in $(seq 1 60); do
+  GOT=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/replica/.pvfs" ls '"$AL"' 2>/dev/null | grep -c pic.txt')
+  [ "$GOT" = "1" ] && { HFOK=1; break; }
+  sleep 1
+done
+[ -n "$HFOK" ] && ok "region content reached the edge replica hands-free (follow sweep over the LAN)" \
+  || fail "follow job never swept the region"
+ssh "$EDGE" 'ls "$HOME/fleet-test/replica/.pvfs/regions/'"$PH"'/"g-*.db >/dev/null 2>&1' \
+  && ok "generation file landed on the edge replica" || fail "edge generation file"
+# region bytes stream cross-machine through the verified read path
+HSHA=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/replica/.pvfs" cat '"$PIC"' 2>/dev/null | sha256sum | cut -d" " -f1')
+[ "$HSHA" = "$PICSHA" ] && ok "region file streams to the edge, hash-verified" || fail "region cat: $HSHA"
+# a region-scoped replica: photos only; music stays attested-but-unfetched
+H_EDGE=$(ssh "$EDGE" "PH=$PH AL=$AL TR=$TR bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test
+"\$B/pvfs" replica add "\$FT/photos-replica" --instance owner --region "\$PH" >/dev/null 2>&1 \
+  && echo "H5=ok" || echo "H5=no"
+S="\$FT/photos-replica/.pvfs"
+"\$B/pvfs" --data-dir "\$S" ls "\$AL" 2>/dev/null | grep -q pic.txt && echo "H6=ok" || echo "H6=no"
+"\$B/pvfs" --data-dir "\$S" ls "\$TR" 2>/dev/null | grep -q . && echo "H7=no" || echo "H7=ok"
+EOS
+)
+echo "$H_EDGE" | grep -q "H5=ok" && ok "replica add --region built a scoped replica" || fail "scoped replica add: $H_EDGE"
+echo "$H_EDGE" | grep -q "H6=ok" && ok "scoped replica replays the target region" || fail "scoped replica content"
+echo "$H_EDGE" | grep -q "H7=ok" && ok "sibling region's interior stays unfetched (attested by its head)" || fail "sibling isolation"
+# seal photos; the whole-forest replica verifies the seal on its next sync
+ssh "$OWNER" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/owner/.pvfs" region unmark '"$PH" >/dev/null \
+  && ok "owner sealed the photos region" || fail "owner unmark"
+ssh "$EDGE" '"$HOME/.local/bin/pvfs" replica sync "$HOME/fleet-test/replica" >/dev/null 2>&1' \
+  && ok "edge replica synced + verified the sealed generation" || fail "edge seal sync"
+gate regions
+
 say "cleanup — stop fleet daemons (dirs kept for inspection)"
 ssh "$OWNER" 'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'
 ssh "$EDGE"  'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'

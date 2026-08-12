@@ -25,7 +25,8 @@ pub fn log_schema(db: &str) -> String {
   body       BLOB NOT NULL,
   chain_hash BLOB NOT NULL,
   written_at INTEGER NOT NULL
-);"
+);
+CREATE INDEX IF NOT EXISTS {db}.idx_events_kind ON events(kind);"
     )
 }
 
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS log.events (
   chain_hash BLOB NOT NULL,
   written_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS log.idx_events_kind ON events(kind);
 ";
 
 /// Forest-specific genesis seed (spec §7.1).

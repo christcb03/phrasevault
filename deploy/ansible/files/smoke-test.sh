@@ -796,6 +796,24 @@ $PVFS ls "$PRIN" 2>/dev/null | qgrep gen2 \
   && ok "rebuild replays sealed + active generations in order" || fail "sealed+active rebuild"
 $PVFS region unmark "$PR" >/dev/null
 
+say "P7.2b: region logs over the wire — the replica ships generations (doc 20 §2.4)"
+WREG="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" wire-region)" created)"
+$PVFS --data-dir "$DMOUNT/.pvfs" region mark "$WREG" >/dev/null \
+  && ok "mark on the served forest" || fail "wire-region mark"
+# this write routes into the region's own log on the daemon side
+$PVFS --json remote --socket "$SOCK" mkdir "$WREG" inside >/dev/null \
+  && ok "daemon write routed into the region log" || fail "daemon region write"
+$PVFS replica sync "$REPMOUNT" >/dev/null \
+  && ok "replica sync ships the generation" || fail "replica region sync"
+ls "$REPMOUNT/.pvfs/regions/$WREG/"g-*.db >/dev/null 2>&1 \
+  && ok "generation file landed on the replica" || fail "replica generation file"
+$PVFS --data-dir "$REPMOUNT/.pvfs" ls "$WREG" | qgrep inside \
+  && ok "region content replays on the replica" || fail "replica region replay"
+# seal it; the final head + sealed generation verify on the replica too
+$PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$WREG" >/dev/null
+$PVFS replica sync "$REPMOUNT" >/dev/null \
+  && ok "the seal ships and verifies on the replica" || fail "replica seal sync"
+
 say "P7.3: FUSE mount — browse + stream through the kernel (doc 20 §3)"
 if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   mkdir -p "$DATA/fuse-view"

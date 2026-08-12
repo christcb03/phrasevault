@@ -1925,6 +1925,17 @@ fn replay_sealed_child(
     if state_root.is_none() {
         return Ok(()); // legacy P7.0 mark, never split: its events are all here
     }
+    // P7.2b (doc 20 §2.4): a REPLICA that doesn't hold this generation treats
+    // it as an unfetched region — the seal stays attested by the enclosing
+    // log, its contents unverifiable until the log is fetched. Owner/writer
+    // opens keep the strict refusal below (every generation must be present).
+    let held = log_file
+        .as_deref()
+        .map(|f| data_dir.join(f).exists())
+        .unwrap_or(false);
+    if !held && crate::replica::marker_path(data_dir).exists() && committed_seq > 0 {
+        return Ok(());
+    }
     let committed_seq = committed_seq as u64;
     let (fin_seq, fin_chain) = match log_file {
         Some(file) if data_dir.join(&file).exists() => {

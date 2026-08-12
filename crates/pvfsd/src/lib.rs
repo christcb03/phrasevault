@@ -349,22 +349,37 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             Err(msg) => msg,
         },
         ClientMsg::Payload { node } => do_payload(daemon, principal, &node),
-        ClientMsg::LogInfo => match check_replication_gate(daemon, principal) {
-            Ok(()) => {
+        ClientMsg::LogInfo { region } => match check_replication_gate(daemon, principal, &region) {
+            Ok(scope) => {
                 let e = daemon.reader();
-                match e.log_tip() {
+                let tip = match &scope {
+                    None => e.log_tip(),
+                    // an active generation's file appears at its first write —
+                    // absent reads as tip 0, not an error
+                    Some((_, rel_file)) => match e.region_log_events(rel_file, 1, 1) {
+                        Ok((t, _)) => Ok(t),
+                        Err(pvfs_core::PvfsError::NotFound { .. }) => Ok(0),
+                        Err(pve) => Err(pve),
+                    },
+                };
+                match tip {
                     Ok(tip_seq) => ServerMsg::LogInfo { tip_seq },
                     Err(pve) => err_from(pve),
                 }
             }
             Err(msg) => msg,
         },
-        ClientMsg::LogRead { from_seq, max } => do_log_read(daemon, principal, from_seq, max),
+        ClientMsg::LogRead {
+            from_seq,
+            max,
+            region,
+        } => do_log_read(daemon, principal, from_seq, max, &region),
         ClientMsg::LogWait {
             from_seq,
             max,
             timeout_ms,
-        } => do_log_wait(daemon, principal, from_seq, max, timeout_ms),
+            region,
+        } => do_log_wait(daemon, principal, from_seq, max, timeout_ms, &region),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
@@ -383,16 +398,34 @@ const LOG_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Log shipping is an owner/admin capability (doc 17 §5): the full log holds
 /// the whole forest's history, so the caller must hold **admin rights on the
-/// forest root** — true for the owner's devices (rights short-circuit) and
-/// for anyone the owner granted `a` at the root.
-fn check_replication_gate(daemon: &Daemon, principal: &Principal) -> Result<(), ServerMsg> {
+/// forest root**. P7.2b (doc 20 §2.4): a region-scoped request is gated on
+/// admin rights on **that region's root** instead — a region maps to an
+/// authority, so its holder replicates it without whole-forest rights.
+/// Returns the parsed scope: `None` = top log, `Some((root, rel_file))` = one
+/// region generation.
+fn check_replication_gate(
+    daemon: &Daemon,
+    principal: &Principal,
+    region: &str,
+) -> Result<Option<(String, String)>, ServerMsg> {
     let e = daemon.reader();
-    let root = e.identity.root_node_id.clone();
-    match e.effective_rights(principal, &root) {
-        Ok(r) if r & acl::ACL_A != 0 => Ok(()),
+    let (gate_node, scope) = if region.is_empty() {
+        (e.identity.root_node_id.clone(), None)
+    } else {
+        match pvfs_core::replica::parse_region_addr(region) {
+            Some((root, rel_file)) => (root.clone(), Some((root, rel_file))),
+            None => return Err(err("bad_input", "malformed region generation address")),
+        }
+    };
+    match e.effective_rights(principal, &gate_node) {
+        Ok(r) if r & acl::ACL_A != 0 => Ok(scope),
         Ok(_) => Err(err(
             "forbidden",
-            "log replication requires admin rights on the forest root",
+            if region.is_empty() {
+                "log replication requires admin rights on the forest root"
+            } else {
+                "region log replication requires admin rights on the region root"
+            },
         )),
         Err(pve) => Err(err_from(pve)),
     }
@@ -400,11 +433,17 @@ fn check_replication_gate(daemon: &Daemon, principal: &Principal) -> Result<(), 
 
 /// Ship raw log rows (F2). The replica re-verifies everything, so this is a
 /// plain gated read of the events table.
-fn do_log_read(daemon: &Daemon, principal: &Principal, from_seq: u64, max: u32) -> ServerMsg {
-    if let Err(msg) = check_replication_gate(daemon, principal) {
-        return msg;
+fn do_log_read(
+    daemon: &Daemon,
+    principal: &Principal,
+    from_seq: u64,
+    max: u32,
+    region: &str,
+) -> ServerMsg {
+    match check_replication_gate(daemon, principal, region) {
+        Err(msg) => msg,
+        Ok(scope) => log_rows_msg(daemon, from_seq, max, scope.as_ref()),
     }
-    log_rows_msg(daemon, from_seq, max)
 }
 
 /// The longest a `LogWait` may block (the client re-polls after an empty
@@ -424,21 +463,43 @@ fn do_log_wait(
     from_seq: u64,
     max: u32,
     timeout_ms: u64,
+    region: &str,
 ) -> ServerMsg {
-    if let Err(msg) = check_replication_gate(daemon, principal) {
-        return msg;
-    }
+    let scope = match check_replication_gate(daemon, principal, region) {
+        Err(msg) => return msg,
+        Ok(s) => s,
+    };
     let deadline = now_ms() + timeout_ms.min(LOG_WAIT_CAP_MS);
+    // P7.2b: a top-scoped wait also wakes when ANY log advances (the
+    // applied-marks activity signal) — the empty reply tells the follower to
+    // sweep its region generations (doc 20 §2.4), keeping region freshness in
+    // seconds without per-region long-polls.
+    let activity0 = daemon.reader().log_activity().unwrap_or(0);
     loop {
-        let tip = {
+        let (tip, activity) = {
             let e = daemon.reader();
-            match e.log_tip() {
-                Ok(t) => t,
-                Err(pve) => return err_from(pve),
-            }
+            let tip = match &scope {
+                None => match e.log_tip() {
+                    Ok(t) => t,
+                    Err(pve) => return err_from(pve),
+                },
+                Some((_, rel_file)) => match e.region_log_events(rel_file, 1, 1) {
+                    Ok((t, _)) => t,
+                    // active-but-unwritten generation: wait for its first write
+                    Err(pvfs_core::PvfsError::NotFound { .. }) => 0,
+                    Err(pve) => return err_from(pve),
+                },
+            };
+            (tip, e.log_activity().unwrap_or(activity0))
         }; // lock released before any sleep
         if tip >= from_seq {
-            return log_rows_msg(daemon, from_seq, max);
+            return log_rows_msg(daemon, from_seq, max, scope.as_ref());
+        }
+        if scope.is_none() && activity != activity0 {
+            return ServerMsg::LogEvents {
+                tip_seq: tip,
+                events: Vec::new(),
+            };
         }
         if now_ms() >= deadline {
             return ServerMsg::LogEvents {
@@ -451,17 +512,35 @@ fn do_log_wait(
 }
 
 /// Read + convert one batch of rows (shared by `LogRead` / `LogWait`; the
-/// caller has already passed the replication gate).
-fn log_rows_msg(daemon: &Daemon, from_seq: u64, max: u32) -> ServerMsg {
+/// caller has already passed the replication gate). `scope` = `None` for the
+/// top log, else the region generation to serve.
+fn log_rows_msg(
+    daemon: &Daemon,
+    from_seq: u64,
+    max: u32,
+    scope: Option<&(String, String)>,
+) -> ServerMsg {
     let e = daemon.reader();
     let cap = (max as usize).clamp(1, LOG_BATCH_ROWS);
-    let rows = match e.log_events(from_seq, cap) {
-        Ok(r) => r,
-        Err(pve) => return err_from(pve),
-    };
-    let tip_seq = match e.log_tip() {
-        Ok(t) => t,
-        Err(pve) => return err_from(pve),
+    let (tip_seq, rows) = match scope {
+        None => {
+            let rows = match e.log_events(from_seq, cap) {
+                Ok(r) => r,
+                Err(pve) => return err_from(pve),
+            };
+            let tip = match e.log_tip() {
+                Ok(t) => t,
+                Err(pve) => return err_from(pve),
+            };
+            (tip, rows)
+        }
+        Some((_, rel_file)) => match e.region_log_events(rel_file, from_seq, cap) {
+            Ok(v) => v,
+            Err(pvfs_core::PvfsError::NotFound { .. }) => {
+                return err("region_not_held", "this instance does not hold that region log")
+            }
+            Err(pve) => return err_from(pve),
+        },
     };
     let mut events = Vec::with_capacity(rows.len());
     let mut bytes = 0usize;

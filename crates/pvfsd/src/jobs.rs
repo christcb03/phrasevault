@@ -391,8 +391,20 @@ pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
     let jobs_file = serve::jobs_path(state.data_dir());
     let mtime_of = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut last_mtime = mtime_of(&jobs_file);
+    // P7.2b (doc 20 §2.4): keep region heads attested at rest. Gated on the
+    // regions dir existing (created lazily by the first region write), so
+    // region-free forests never pay the transient open.
+    const HEADS_EVERY: Duration = Duration::from_secs(60);
+    let mut heads_at = Instant::now() + HEADS_EVERY;
 
     while !shutdown.load(Ordering::SeqCst) {
+        if Instant::now() >= heads_at {
+            heads_at = Instant::now() + HEADS_EVERY;
+            if state.data_dir().join("regions").exists() {
+                // a transient writer open commits dirty heads at close
+                let _ = pvfs_core::Engine::open(state.data_dir()).and_then(|e| e.close());
+            }
+        }
         // punch A: `serve enable` takes effect within a tick — the runner
         // notices the file change itself; SIGHUP stays as a manual trigger.
         let m = mtime_of(&jobs_file);

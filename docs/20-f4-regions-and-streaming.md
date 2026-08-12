@@ -179,6 +179,55 @@ wire region scope, replicas following a forest do not receive region-routed
 events — mark no regions on fleet-replicated forests between the two phases;
 the arc is not releasable half-way (why the release cut waits).
 
+### 2.4 P7.2b build mechanics (2026-08-11, written at build start)
+
+**No baseline artifact.** The doc 03 §6 Q7 accumulator problem dissolves for
+now: P7.2a never rewrites the parent log, so a region's pre-mark history still
+ships with the (small) top log — structure outside regions, marks, heads,
+memberships. A region replica therefore replays the top log to materialize the
+mark-time state, verifies the baseline exactly as the owner does, then replays
+the region log on top. The serialized-state artifact becomes necessary only
+when doc 11 compaction starts discarding parent history — it lands there.
+
+**Wire (additive, PROTO_VERSION unchanged).** `LogInfo`/`LogRead`/`LogWait`
+grow `#[serde(default)] region: String` ('' = the top log — old clients still
+parse). Shipping a region's log is gated on **admin on that region's root**
+(the whole-forest gate stays admin-on-forest-root): a region maps to an
+authority, so its holder can replicate their region without whole-forest
+rights. A request for a region log the serving side doesn't hold errors
+`region_not_held`.
+
+**Replica shape.** A whole-forest replica now mirrors the owner's layout —
+`replica add`/`sync`/`follow` ship the top log **and every region log** (this
+removes the P7.2a inter-phase hazard). `pvfs replica add --region <node>`
+ships the top log + the target's log chain (the target and its nested
+regions) and records the scope in the replica marker; sibling regions' logs
+are simply absent. Honest scope note: because the top log still ships whole
+(memberships and structure live there), `--region` reduces **bytes**, not
+**rights** — the add itself still needs forest-root admin for the top log;
+the region-root gate on region logs is where the lesser-privilege story will
+attach once top-log filtering exists (doc 03 §6 Q7 / doc 11 territory). **Replica replay treats an absent region log as an
+unfetched region** — attested by its committed head, contents unverifiable
+until fetched, exactly the §2.1 posture for cross-region refs. The strict
+refusal (P7.2a behavior) remains for owner/writer opens, where every log must
+be present.
+
+**Follow stays fresh in seconds.** The daemon's commit signal wakes `LogWait`
+waiters on *any* log's commit; a follower woken with no new top rows sweeps
+its known region logs (`LogRead {region}` from each local tip). New region =
+a mark arrives on the top log first, so the sweep set is always current.
+**The deferred head-commitment job lands here**: the daemon attests dirty
+region heads on a short interval (piggybacking the P5 runner), so heads stay
+fresh at rest, replicas can verify seals promptly, and `SubRegionHead`
+rows double as region-activity hints on the top log.
+
+**Scoped serving** needs no new enforcement: a region replica's projection
+simply doesn't contain out-of-scope nodes (NotFound), ACLs answer from folded
+grants identically, and log shipping refuses absent logs. Sub-phases:
+**P7.2b-i** wire scope + gates + whole-forest replicas ship all logs;
+**P7.2b-ii** `--region` scoped replicas + absent-log-tolerant replica replay;
+**P7.2b-iii** follower sweep + daemon head job; each validated before commit.
+
 ## 3. The FUSE mount — P7.3
 
 - New crate `pvfs-fuse` (the `fuser` crate, pure Rust; runtime needs the distro's
@@ -286,5 +335,31 @@ phase validates on presubuntu before its commit, as always.
     already holds `device.key`, so nothing new is reachable through it.
   - `RegionInfo`/`Engine::region_info` expose generation state engine-side;
     the CLI surface for it rides P7.2b with the wire scope.
+- **P7.2b landed** (2026-08-11, validated: **223 cargo tests + 323 smoke on
+  both hosts, clippy clean** — 4 new wire tests, 6 new smoke checks). Built to
+  §2.4; as-built notes:
+  - The wire grew exactly one additive concept: the **generation address**
+    (`<root>/g-<host>-<seq>.db`) on `LogInfo`/`LogRead`/`LogWait`, strictly
+    parsed, gated on region-root admin, `region_not_held` when absent.
+    Generation discovery is a client-side scan for `RegionBaseline` rows, so
+    each shipped region chain verifies against its committed genesis **before
+    ingest** — no new server-side enumeration op was needed.
+  - The follower wake rides the per-log applied marks: a top-scoped `LogWait`
+    also returns (empty) when any region log advances, and the follower sweeps
+    its generations — region freshness stays in seconds with zero extra
+    long-polls. Sealed generations are re-probed each sweep (one tiny LogInfo
+    each); a sealed-set skip is a recorded optimization, not built.
+  - The daemon attests dirty region heads via a 60-second supervisor tick
+    (transient engine open — close commits heads), gated on the regions dir
+    existing; job passes were already attesting at close for free. The
+    SIGTERM checkpoint itself still doesn't commit heads — the tick bounds
+    staleness instead.
+  - The P7.2a inter-phase hazard is gone two ways: whole-forest replicas ship
+    every generation, and replica replay treats an absent generation as an
+    **unfetched region** (attested by its committed head, skipped) — owner
+    opens keep the strict refusal.
+  - `--region` reduces bytes, not rights (§2.4's honest note): the top log
+    still ships whole under the forest-root gate. Lesser-privilege region
+    replication needs top-log filtering (doc 03 §6 Q7) — future work.
 - **Morning decisions for Chris:** (1) §7's P7.1→P7.2 merge proposal; (2) doc 19's
   packaging intent — 1.4.0 = P5 + P6 + fixes, with P7.0/P7.3 riding or waiting.

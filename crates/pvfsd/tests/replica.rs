@@ -45,7 +45,7 @@ fn pull_all(client: &mut Client, data_dir: &std::path::Path, from: u64) -> u64 {
     let mut from = from;
     let mut total = 0;
     loop {
-        let (_tip, events) = client.log_read(from, 3).unwrap();
+        let (_tip, events) = client.log_read(from, 3, "").unwrap();
         if events.is_empty() {
             return total;
         }
@@ -126,7 +126,7 @@ fn replica_end_to_end() {
     // ---- the gate: anon and non-admin members are refused
     let mut anon = Client::connect_public(&sock).unwrap();
     assert!(
-        matches!(anon.log_info(), Err(ClientError::Server { code, .. }) if code == "forbidden"),
+        matches!(anon.log_info(""), Err(ClientError::Server { code, .. }) if code == "forbidden"),
         "anonymous log shipping must be forbidden"
     );
     let mut member = Client::connect_signed(&sock, &mem_pub, |d| {
@@ -134,7 +134,7 @@ fn replica_end_to_end() {
     })
     .unwrap();
     assert!(
-        matches!(member.log_read(1, 10), Err(ClientError::Server { code, .. }) if code == "forbidden"),
+        matches!(member.log_read(1, 10, ""), Err(ClientError::Server { code, .. }) if code == "forbidden"),
         "non-admin member log shipping must be forbidden"
     );
 
@@ -143,7 +143,7 @@ fn replica_end_to_end() {
         crypto::sign_digest(&rep_key, d).unwrap()
     })
     .unwrap();
-    let tip = rep.log_info().unwrap();
+    let tip = rep.log_info("").unwrap();
     assert!(tip > 0);
 
     let replica_mount = tempfile::tempdir().unwrap();
@@ -154,6 +154,7 @@ fn replica_end_to_end() {
         transport: "socket".into(),
         target: sock.to_string_lossy().into_owned(),
         pin: String::new(),
+        region: String::new(),
     }
     .save(&data_dir)
     .unwrap();
@@ -299,6 +300,7 @@ fn replica_sync_fetches_missing_bytes() {
         transport: "socket".into(),
         target: sock.to_string_lossy().into_owned(),
         pin: String::new(),
+        region: String::new(),
     }
     .save(&data_dir)
     .unwrap();

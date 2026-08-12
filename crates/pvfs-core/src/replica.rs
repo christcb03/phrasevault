@@ -36,6 +36,10 @@ pub struct ReplicaSource {
     pub target: String,
     /// The source's transport pin (F1) — empty for `socket`.
     pub pin: String,
+    /// P7.2b: region scope — the region root this replica is scoped to, or
+    /// empty for a whole-forest replica. `replica sync`/`follow` keep the
+    /// recorded scope.
+    pub region: String,
 }
 
 pub fn marker_path(data_dir: &Path) -> PathBuf {
@@ -47,10 +51,13 @@ impl ReplicaSource {
         if self.transport != "tcp" && self.transport != "socket" {
             return Err(bad("transport", "must be tcp or socket"));
         }
-        let text = format!(
+        let mut text = format!(
             "{MARKER_HEADER}\ntransport {}\ntarget {}\npin {}\n",
             self.transport, self.target, self.pin
         );
+        if !self.region.is_empty() {
+            text.push_str(&format!("region {}\n", self.region));
+        }
         std::fs::write(marker_path(data_dir), text)
             .map_err(|e| PvfsError::io("write replica marker", e))
     }
@@ -62,7 +69,8 @@ impl ReplicaSource {
         if lines.next() != Some(MARKER_HEADER) {
             return Err(bad("replica", "unrecognized replica marker"));
         }
-        let (mut transport, mut target, mut pin) = (String::new(), String::new(), String::new());
+        let (mut transport, mut target, mut pin, mut region) =
+            (String::new(), String::new(), String::new(), String::new());
         for line in lines {
             if let Some(v) = line.strip_prefix("transport ") {
                 transport = v.into();
@@ -70,6 +78,8 @@ impl ReplicaSource {
                 target = v.into();
             } else if let Some(v) = line.strip_prefix("pin ") {
                 pin = v.into();
+            } else if let Some(v) = line.strip_prefix("region ") {
+                region = v.into();
             }
         }
         if transport.is_empty() || target.is_empty() {
@@ -79,8 +89,39 @@ impl ReplicaSource {
             transport,
             target,
             pin,
+            region,
         })
     }
+}
+
+/// A region **generation** address on the wire (P7.2b, doc 20 §2.4):
+/// `<region-root-hex>/g-<host>-<seq>.db`, exactly the generation file's path
+/// under `regions/`. Strictly validated — the region root (for the ACL gate)
+/// and the relative file path come only from a parse that admits no
+/// traversal.
+pub fn parse_region_addr(addr: &str) -> Option<(String, String)> {
+    let (root, file) = addr.split_once('/')?;
+    if root.len() != 64 || !root.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return None;
+    }
+    let rest = file.strip_prefix("g-")?.strip_suffix(".db")?;
+    let (host, seq) = rest.rsplit_once('-')?;
+    let host_ok = host == "top"
+        || (!host.is_empty()
+            && host.len() <= 8
+            && host.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    if !host_ok || seq.is_empty() || !seq.chars().all(|c| c.is_ascii_digit()) || seq.starts_with('0')
+    {
+        return None;
+    }
+    Some((root.to_string(), format!("regions/{root}/{file}")))
+}
+
+/// The wire address for a generation identified by its baseline row (the
+/// inverse of [`parse_region_addr`]).
+pub fn region_addr(region_root: &str, baseline_log: &str, baseline_seq: u64) -> String {
+    let rel = crate::projection::region_log_rel_path(region_root, baseline_log, baseline_seq);
+    rel.strip_prefix("regions/").unwrap_or(&rel).to_string()
 }
 
 /// The replica's local log store during ingest (`replica add` / `sync`).
@@ -88,6 +129,7 @@ impl ReplicaSource {
 /// the projection is rebuilt by the verified replay at the next open.
 pub struct ReplicaStore {
     conn: Connection,
+    data_dir: PathBuf,
 }
 
 impl ReplicaStore {
@@ -100,12 +142,199 @@ impl ReplicaStore {
             let _ = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700));
         }
         let conn = crate::engine::open_connection(data_dir)?;
-        Ok(ReplicaStore { conn })
+        Ok(ReplicaStore {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+        })
     }
 
     /// Highest ingested seq (0 = empty).
     pub fn tip(&self) -> Result<u64> {
         log_store::max_seq(&self.conn)
+    }
+
+    /// `(instance_id, forest_id)` from the ingested genesis row — the inputs
+    /// region-generation genesis seeds bind (P7.2b).
+    pub fn identity(&self) -> Result<(String, String)> {
+        let row = log_store::read_event(&self.conn, 1)?.ok_or_else(|| {
+            bad("replica", "store has no genesis row yet — ship the top log first")
+        })?;
+        match Event::decode(&row.kind, &row.body)? {
+            Event::ForestCreated {
+                instance_id,
+                forest_id,
+                ..
+            } => Ok((instance_id, forest_id)),
+            _ => Err(bad("replica", "first event is not ForestCreated")),
+        }
+    }
+
+    /// Highest ingested seq of a region generation (0 = absent/empty).
+    /// `rel_file` is the `regions/…` path from [`parse_region_addr`].
+    pub fn region_tip(&self, rel_file: &str) -> Result<u64> {
+        let path = self.data_dir.join(rel_file);
+        if !path.exists() {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(crate::error::map_db("open region log"))?;
+        let tip: i64 = conn
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(tip as u64)
+    }
+
+    /// Ingest shipped rows into a region generation file, chain-verified from
+    /// `genesis` — the seed the client computed from the generation's
+    /// **committed baseline row** (root, seq, state_root), so a shipped region
+    /// chain is verified against the enclosing log's commitment before any
+    /// row lands (P7.2b, doc 20 §2.4). Same contiguity rules as [`append`].
+    pub fn append_region(
+        &mut self,
+        rel_file: &str,
+        genesis: &[u8; 32],
+        rows: &[EventRow],
+    ) -> Result<u64> {
+        let path = self.data_dir.join(rel_file);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create region dir", e))?;
+        }
+        let mut conn =
+            Connection::open(&path).map_err(crate::error::map_db("open region log"))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+               seq        INTEGER PRIMARY KEY,
+               kind       TEXT NOT NULL,
+               body       BLOB NOT NULL,
+               chain_hash BLOB NOT NULL,
+               written_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);",
+        )
+        .map_err(crate::error::map_db("region log schema"))?;
+        let tip: i64 = conn
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| r.get(0))
+            .map_err(crate::error::map_db("read region tip"))?;
+        let tip = tip as u64;
+        if rows.is_empty() {
+            return Ok(tip);
+        }
+        let mut prev: [u8; 32] = if tip == 0 {
+            *genesis
+        } else {
+            let chain: Vec<u8> = conn
+                .query_row(
+                    "SELECT chain_hash FROM events WHERE seq = ?1",
+                    rusqlite::params![tip as i64],
+                    |r| r.get(0),
+                )
+                .map_err(crate::error::map_db("read region tip"))?;
+            chain
+                .as_slice()
+                .try_into()
+                .map_err(|_| PvfsError::Corruption {
+                    db: rel_file.into(),
+                    detail: "chain hash wrong length".into(),
+                    seq: Some(tip),
+                })?
+        };
+        let tx = conn
+            .transaction()
+            .map_err(crate::error::map_db("begin region ingest"))?;
+        let mut expect_seq = tip;
+        for row in rows {
+            expect_seq += 1;
+            if row.seq != expect_seq {
+                return Err(bad(
+                    "replica",
+                    &format!(
+                        "non-contiguous region ship: expected seq {expect_seq}, got {}",
+                        row.seq
+                    ),
+                ));
+            }
+            let step = log_store::chain_step(&prev, row.seq, &row.kind, &row.body, row.written_at);
+            if step.as_slice() != row.chain_hash.as_slice() {
+                return Err(PvfsError::LogChainBroken {
+                    seq: row.seq,
+                    expected: hex::encode(step),
+                    actual: hex::encode(&row.chain_hash),
+                });
+            }
+            tx.execute(
+                "INSERT INTO events (seq, kind, body, chain_hash, written_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    row.seq as i64,
+                    row.kind,
+                    row.body,
+                    row.chain_hash,
+                    row.written_at as i64
+                ],
+            )
+            .map_err(crate::error::map_db("ingest region event"))?;
+            prev = step;
+        }
+        tx.commit()
+            .map_err(crate::error::map_db("commit region ingest"))?;
+        Ok(expect_seq)
+    }
+
+    /// Every `RegionBaseline` row in an ingested log — `(region_root,
+    /// baseline_seq, state_root)` — the recursive generation-discovery step
+    /// (doc 20 §2.4): scan the top log, pull those generations, scan them,
+    /// repeat. `rel_file` = `None` for the top log.
+    pub fn scan_baselines(&self, rel_file: Option<&str>) -> Result<Vec<(String, u64, Vec<u8>)>> {
+        let rows: Vec<(i64, String, Vec<u8>)> = match rel_file {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT seq, kind, body FROM log.events WHERE kind = ?1 ORDER BY seq")
+                    .map_err(crate::error::map_db("scan baselines"))?;
+                let it = stmt
+                    .query_map(rusqlite::params![crate::event::K_REGION_BASELINE], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(crate::error::map_db("scan baselines"))?;
+                it.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(crate::error::map_db("scan baselines"))?
+            }
+            Some(rel) => {
+                let path = self.data_dir.join(rel);
+                if !path.exists() {
+                    return Ok(Vec::new());
+                }
+                let conn = Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(crate::error::map_db("open region log"))?;
+                let mut stmt = conn
+                    .prepare("SELECT seq, kind, body FROM events WHERE kind = ?1 ORDER BY seq")
+                    .map_err(crate::error::map_db("scan baselines"))?;
+                let it = stmt
+                    .query_map(rusqlite::params![crate::event::K_REGION_BASELINE], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(crate::error::map_db("scan baselines"))?;
+                it.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(crate::error::map_db("scan baselines"))?
+            }
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, kind, body) in rows {
+            if let Event::RegionBaseline {
+                node_id, state_root, ..
+            } = Event::decode(&kind, &body)?
+            {
+                out.push((node_id, seq as u64, state_root));
+            }
+        }
+        Ok(out)
     }
 
     /// Append shipped rows **verbatim**, verifying that each links from the

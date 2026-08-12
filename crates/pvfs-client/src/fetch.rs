@@ -82,6 +82,7 @@ impl Fetcher {
                         transport: "tcp".into(),
                         target: addr.clone(),
                         pin: pin.to_string(),
+                        region: String::new(),
                     });
                 }
             }

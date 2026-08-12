@@ -45,7 +45,7 @@ pub fn dial_source(src: &ReplicaSource) -> Result<Client, PvfsError> {
     }
 }
 
-fn wire_rows(events: &[pvfs_proto::LogEventWire]) -> Result<Vec<EventRow>, PvfsError> {
+pub(crate) fn wire_rows(events: &[pvfs_proto::LogEventWire]) -> Result<Vec<EventRow>, PvfsError> {
     events
         .iter()
         .map(|w| {
@@ -111,7 +111,7 @@ pub fn run(
                     break; // back off + retry
                 }
             };
-            let (_tip, events) = match client.log_wait(from, 512, poll_ms) {
+            let (_tip, events) = match client.log_wait(from, 512, poll_ms, "") {
                 Ok(r) => r,
                 Err(e) => {
                     notify(FollowEvent::Retrying {
@@ -121,7 +121,27 @@ pub fn run(
                 }
             };
             if events.is_empty() {
-                continue; // timeout tick — poll again
+                // Timeout tick — or a region-commit wake (P7.2b, doc 20 §2.4):
+                // the source's top log is quiet but a region log may have
+                // advanced. Sweep the generations; fold only if rows landed.
+                let scope = (!dial.region.is_empty()).then_some(dial.region.as_str());
+                match crate::regions::sync_generations(&mut client, data_dir, scope) {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        let _ = Engine::open(data_dir).and_then(|e| e.close());
+                        let tip = ReplicaStore::open(data_dir)
+                            .and_then(|s| s.tip())
+                            .unwrap_or(0);
+                        notify(FollowEvent::CaughtUp { tip });
+                    }
+                    Err(e) => {
+                        notify(FollowEvent::Retrying {
+                            reason: format!("region sweep failed ({e})"),
+                        });
+                        break;
+                    }
+                }
+                continue;
             }
             let rows = match wire_rows(&events) {
                 Ok(r) => r,
@@ -141,6 +161,15 @@ pub fn run(
                     break; // the next pass re-fetches from the real tip
                 }
             };
+            // New top rows may name new regions (a mark just arrived) —
+            // sweep before folding so the fold sees complete logs.
+            let scope = (!dial.region.is_empty()).then_some(dial.region.as_str());
+            if let Err(e) = crate::regions::sync_generations(&mut client, data_dir, scope) {
+                notify(FollowEvent::Retrying {
+                    reason: format!("region sweep failed ({e})"),
+                });
+                break;
+            }
             // fold now (best-effort), so local reads and any serving daemon
             // see it; the next open folds anyway
             let _ = Engine::open(data_dir).and_then(|e| e.close());

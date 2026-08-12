@@ -615,6 +615,12 @@ enum ReplicaCmd {
         /// A local daemon socket (same-host replication)
         #[arg(long, conflicts_with_all = ["instance", "connect", "pin"])]
         socket: Option<PathBuf>,
+        /// P7.2b (doc 20 §2.4): replicate one region only — the marked node's
+        /// id. Ships the (small) top log plus that region's generations;
+        /// sibling regions stay attested-but-unfetched. Needs admin on the
+        /// region root rather than the forest root for the region logs.
+        #[arg(long)]
+        region: Option<String>,
     },
     /// Pull new events from the replica's recorded source and re-verify
     Sync { mount: PathBuf },
@@ -801,6 +807,7 @@ fn resolve_replica_dial(
             transport: "socket".into(),
             target: s.to_string_lossy().into_owned(),
             pin: String::new(),
+            region: String::new(),
         });
     }
     if let Some(addr) = connect {
@@ -812,6 +819,7 @@ fn resolve_replica_dial(
             transport: "tcp".into(),
             target: addr,
             pin,
+            region: String::new(),
         });
     }
     if let Some(name) = instance {
@@ -820,6 +828,7 @@ fn resolve_replica_dial(
             transport: "tcp".into(),
             target: addr,
             pin,
+            region: String::new(),
         });
     }
     Err(PvfsError::BadInput {
@@ -854,7 +863,7 @@ fn replica_pull(
 ) -> Result<u64, PvfsError> {
     let mut total = 0u64;
     loop {
-        let (_tip, events) = client.log_read(from, 512).map_err(remote_err)?;
+        let (_tip, events) = client.log_read(from, 512, "").map_err(remote_err)?;
         if events.is_empty() {
             return Ok(total);
         }
@@ -1309,6 +1318,11 @@ fn replica_catch_up(data_dir: &std::path::Path, client: &mut Client) {
         let from = store.tip()? + 1;
         replica_pull(client, &mut store, from)?;
         drop(store);
+        let scope = pvfs_core::ReplicaSource::load(data_dir)
+            .map(|s| s.region)
+            .unwrap_or_default();
+        let scope = if scope.is_empty() { None } else { Some(scope) };
+        pvfs_client::regions::sync_generations(client, data_dir, scope.as_deref())?;
         // Fold the tail into the projection NOW — so this process's next
         // read and any daemon currently serving this replica (its readers
         // see committed projection rows) pick the change up immediately.
@@ -3361,8 +3375,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 connect,
                 pin,
                 socket,
+                region,
             } => {
                 let data_dir = dest.join(".pvfs");
+                if region.as_deref().is_some_and(|r| r.len() != 64 || !r.chars().all(|c| c.is_ascii_hexdigit())) {
+                    return Err(PvfsError::BadInput {
+                        field: "region".into(),
+                        reason: "--region takes the marked node's 64-hex id".into(),
+                    });
+                }
                 if data_dir.exists() {
                     return Err(PvfsError::AlreadyExists {
                         kind: "forest",
@@ -3381,6 +3402,29 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 };
                 drop(store);
+                // P7.2b (doc 20 §2.4): ship every region generation the top
+                // log names, chain-verified against its committed baseline.
+                let scope = region.as_deref().filter(|r| !r.is_empty());
+                let shipped_region =
+                    match pvfs_client::regions::sync_generations(&mut client, &data_dir, scope) {
+                        Ok(n) => n as u64,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&data_dir);
+                            return Err(e);
+                        }
+                    };
+                let shipped = shipped + shipped_region;
+                let mut dial = dial;
+                if let Some(r) = region.as_deref().filter(|r| !r.is_empty()) {
+                    if shipped_region == 0 {
+                        let _ = std::fs::remove_dir_all(&data_dir);
+                        return Err(PvfsError::NotFound {
+                            kind: "region",
+                            id: format!("{r} (no generations shipped — is it marked on the source?)"),
+                        });
+                    }
+                    dial.region = r.to_string();
+                }
                 dial.save(&data_dir)?;
                 // The open replays the whole shipped log — chain, signatures,
                 // replay authorization. A replica that opens is proven.
@@ -3415,6 +3459,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let from = store.tip()? + 1;
                 let shipped = replica_pull(&mut client, &mut store, from)?;
                 drop(store);
+                let scope = if dial.region.is_empty() { None } else { Some(dial.region.as_str()) };
+                let shipped =
+                    shipped + pvfs_client::regions::sync_generations(&mut client, &data_dir, scope)? as u64;
                 // Re-open: the startup check verifies + folds the new tail.
                 let engine = Engine::open(&data_dir)?;
                 let tip = engine.log_tip()?;

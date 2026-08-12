@@ -5,6 +5,16 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Region logs over the wire (P7.2b, doc 20 §2.4):** `LogInfo`/`LogRead`/
+  `LogWait` gain an additive **generation address** scope, gated on admin of
+  the region's root; replicas discover generations by scanning shipped
+  `RegionBaseline` rows and chain-verify each region log against its committed
+  genesis before ingest. Whole-forest `replica add`/`sync`/`follow` ship every
+  generation; `pvfs replica add --region <node>` scopes a replica to one
+  region (absent siblings replay as attested-but-unfetched — replicas only;
+  owners keep the strict check). Followers wake on any log's activity and
+  sweep their generations, and the daemon attests dirty region heads on a
+  60-second tick.
 - **Physical region logs (P7.2a, doc 20 §2.3):** a marked region now owns its
   own signed, dense hash-chained log (`regions/<id>/g-*.db`). The mark commit
   carries a deterministic **baseline commitment** of the subtree's state (the

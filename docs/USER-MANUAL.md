@@ -319,6 +319,13 @@ Three things to know:
 - **Replicas are read-only.** The owner's instance stays the forest's only writer; local writes and
   writes via a replica's daemon are refused. ACLs answer identically on a replica (the grants are
   in the log), and file bytes read through wherever the recorded locations resolve.
+- **Regions ship too.** A replica mirrors the source's per-region logs (§6.3): `add`, `sync`, and
+  `follow` all discover and pull every region generation, each chain-verified against the baseline
+  the enclosing log committed. `pvfs replica add <dir> --region <node>` scopes the replica to one
+  region — the small top log plus that region's generations; other regions' contents simply stay
+  unfetched (still attested by their heads). The scope note that matters: `--region` saves **bytes**,
+  not rights — the top log still requires forest-root admin; region logs alone gate on admin of the
+  region's root.
 
 ### 7.8 Pointer or sync — pulling bytes local
 
@@ -592,7 +599,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
-| `pvfs replica add <mount> --instance <name>` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest (§7.7). |
+| `pvfs replica add <mount> --instance <name> [--region <node>]` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest — whole, or scoped to one region (§7.7). |
 | `pvfs replica follow <mount>` | Follow the source live (long-poll): new events land within seconds; run as a service. |
 | `pvfs place <target> sync\|pointer\|central --to <dir>` · `pvfs sync [target]` | Placement policy · fetch missing bytes, verified (§7.8, §7.10). |
 | `pvfs tier` · `pvfs evict` | Owner: migrate to the central store + retire edge locations · edge: reclaim space safely (§7.10). |
