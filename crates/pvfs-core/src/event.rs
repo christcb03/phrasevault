@@ -32,6 +32,8 @@ pub const K_REGION_MARKED: &str = "RegionMarked";
 pub const K_REGION_UNMARKED: &str = "RegionUnmarked";
 pub const K_REGION_BASELINE: &str = "RegionBaseline";
 pub const K_SUB_REGION_HEAD: &str = "SubRegionHead";
+pub const K_NODE_MOVED_OUT: &str = "NodeMovedOut";
+pub const K_NODE_MOVED_IN: &str = "NodeMovedIn";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -173,6 +175,35 @@ pub enum Event {
         at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
+    },
+    /// P7.2c (doc 20 §2.5): the source half of a cross-region move — the
+    /// node's home link `link_id` is removed at `removed_at`, the node
+    /// departing for `dest_region` (whose last committed head is the causal
+    /// cross-reference; `(0, "")` = the top region). Authors in the source
+    /// region's log.
+    NodeMovedOut {
+        node_id: String,
+        link_id: String,
+        removed_at: u64,
+        dest_region: String,
+        dest_head_seq: u64,
+        dest_head_hash: Vec<u8>,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// P7.2c: the destination half — the new home `link`, licensed to
+    /// supersede `removed_link_id` (empty = an orphan adoption, no source
+    /// link removed) at the same shared `removed_at`. Authors in the
+    /// destination region's log and flips the node's sticky region. The
+    /// link's own signature authorizes (exactly `LinkCreated`'s posture);
+    /// the auxiliary fields are chain-bound, like a link's order key.
+    NodeMovedIn {
+        link: Link,
+        removed_link_id: String,
+        removed_at: u64,
+        src_region: String,
+        src_head_seq: u64,
+        src_head_hash: Vec<u8>,
     },
     FolderBound {
         folder_id: String,
@@ -354,6 +385,27 @@ pub fn msg_sub_region_head(
     crypto::domain_digest("pvfs:subregionhead:v1:", &e.finish())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn msg_node_moved_out(
+    node_id: &str,
+    link_id: &str,
+    removed_at: u64,
+    dest_region: &str,
+    dest_head_seq: u64,
+    dest_head_hash: &[u8],
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id)
+        .string(link_id)
+        .u64(removed_at)
+        .string(dest_region)
+        .u64(dest_head_seq)
+        .bytes(dest_head_hash)
+        .bytes(author);
+    crypto::domain_digest("pvfs:nodemovedout:v1:", &e.finish())
+}
+
 pub fn msg_file_location_removed(
     file_id: &str,
     uri: &str,
@@ -482,6 +534,8 @@ impl Event {
             Event::RegionUnmarked { .. } => K_REGION_UNMARKED,
             Event::RegionBaseline { .. } => K_REGION_BASELINE,
             Event::SubRegionHead { .. } => K_SUB_REGION_HEAD,
+            Event::NodeMovedOut { .. } => K_NODE_MOVED_OUT,
+            Event::NodeMovedIn { .. } => K_NODE_MOVED_IN,
             Event::FileLocationRemoved { .. } => K_FILE_LOCATION_REMOVED,
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
@@ -512,6 +566,7 @@ impl Event {
             | Event::RegionUnmarked { author, .. }
             | Event::RegionBaseline { author, .. }
             | Event::SubRegionHead { author, .. }
+            | Event::NodeMovedOut { author, .. }
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
@@ -520,6 +575,7 @@ impl Event {
             | Event::SecureBlobUpdated { author, .. } => author,
             Event::NodeCreated(n) => &n.author,
             Event::LinkCreated(l) => &l.author,
+            Event::NodeMovedIn { link, .. } => &link.author,
             Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
                 removed_by
             }
@@ -533,6 +589,7 @@ impl Event {
         match self {
             Event::NodeCreated(n) => n.sig = sig,
             Event::LinkCreated(l) => l.sig = sig,
+            Event::NodeMovedIn { link, .. } => link.sig = sig,
             Event::AclSet { sig: s, .. }
             | Event::MemberTagged { sig: s, .. }
             | Event::SecureBlobUpdated { sig: s, .. }
@@ -546,6 +603,7 @@ impl Event {
             | Event::RegionUnmarked { sig: s, .. }
             | Event::RegionBaseline { sig: s, .. }
             | Event::SubRegionHead { sig: s, .. }
+            | Event::NodeMovedOut { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -722,6 +780,48 @@ impl Event {
                     .u64(*at)
                     .bytes(author)
                     .bytes(sig);
+            }
+            Event::NodeMovedOut {
+                node_id,
+                link_id,
+                removed_at,
+                dest_region,
+                dest_head_seq,
+                dest_head_hash,
+                author,
+                sig,
+            } => {
+                e.string(node_id)
+                    .string(link_id)
+                    .u64(*removed_at)
+                    .string(dest_region)
+                    .u64(*dest_head_seq)
+                    .bytes(dest_head_hash)
+                    .bytes(author)
+                    .bytes(sig);
+            }
+            Event::NodeMovedIn {
+                link: l,
+                removed_link_id,
+                removed_at,
+                src_region,
+                src_head_seq,
+                src_head_hash,
+            } => {
+                e.string(&l.id)
+                    .opt_string(l.parent_id.as_deref())
+                    .string(&l.child_id)
+                    .string(&l.link_type)
+                    .u64(l.link_nonce)
+                    .string(&l.order_key)
+                    .u64(l.created_at)
+                    .bytes(&l.author)
+                    .bytes(&l.sig)
+                    .string(removed_link_id)
+                    .u64(*removed_at)
+                    .string(src_region)
+                    .u64(*src_head_seq)
+                    .bytes(src_head_hash);
             }
             Event::FileLocationRemoved {
                 file_id,
@@ -961,6 +1061,37 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
+            K_NODE_MOVED_OUT => Event::NodeMovedOut {
+                node_id: d.string()?,
+                link_id: d.string()?,
+                removed_at: d.u64()?,
+                dest_region: d.string()?,
+                dest_head_seq: d.u64()?,
+                dest_head_hash: d.bytes()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_NODE_MOVED_IN => Event::NodeMovedIn {
+                link: Link {
+                    id: d.string()?,
+                    parent_id: d.opt_string()?,
+                    child_id: d.string()?,
+                    link_type: d.string()?,
+                    link_nonce: d.u64()?,
+                    order_key: d.string()?,
+                    created_at: d.u64()?,
+                    author: d.bytes()?,
+                    sig: d.bytes()?,
+                    removed_at: None,
+                    superseded_by: None,
+                    suspended_at: None,
+                },
+                removed_link_id: d.string()?,
+                removed_at: d.u64()?,
+                src_region: d.string()?,
+                src_head_seq: d.u64()?,
+                src_head_hash: d.bytes()?,
+            },
             K_FILE_LOCATION_REMOVED => Event::FileLocationRemoved {
                 file_id: d.string()?,
                 uri: d.string()?,
@@ -1122,6 +1253,7 @@ impl Event {
             ),
             Event::NodeCreated(n) => n.verify(),
             Event::LinkCreated(l) => l.verify(),
+            Event::NodeMovedIn { link, .. } => link.verify(),
             Event::LinkRemoved {
                 link_id,
                 removed_at,
@@ -1217,6 +1349,28 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_sub_region_head(node_id, *head_seq, head_hash, *at, author),
+                sig,
+            ),
+            Event::NodeMovedOut {
+                node_id,
+                link_id,
+                removed_at,
+                dest_region,
+                dest_head_seq,
+                dest_head_hash,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_node_moved_out(
+                    node_id,
+                    link_id,
+                    *removed_at,
+                    dest_region,
+                    *dest_head_seq,
+                    dest_head_hash,
+                    author,
+                ),
                 sig,
             ),
             Event::FileLocationRemoved {

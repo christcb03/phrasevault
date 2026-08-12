@@ -18,7 +18,9 @@ use crate::log_store;
 // (fold-maintained, sticky for orphans), the extended `regions` row (baseline
 // commitment + generation file + committed head), and per-log `applied_marks`
 // replacing the single last_applied pair. Same drop-and-replay upgrade.
-pub const SCHEMA_VERSION: u32 = 5;
+// v6 (P7.2c, doc 20 §2.5): cross-region moves — `pending_moves` (the pair
+// tracker) and `purged_nodes` (resurrection tombstones). Same upgrade.
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -93,6 +95,26 @@ CREATE TABLE IF NOT EXISTS applied_marks (
   log_id     TEXT PRIMARY KEY,
   seq        INTEGER NOT NULL,
   chain_hash TEXT NOT NULL
+);
+
+-- P7.2c (doc 20 §2.5): one row per cross-region move half still awaiting its
+-- counterpart. Cleared when both halves fold; surviving rows are tolerated on
+-- replicas (an unfetched region) and are corruption on an owner.
+CREATE TABLE IF NOT EXISTS pending_moves (
+  removed_link_id TEXT PRIMARY KEY,
+  node_id         TEXT NOT NULL,
+  removed_at      INTEGER NOT NULL,   -- the shared move timestamp t
+  out_seen        INTEGER NOT NULL DEFAULT 0,
+  in_seen         INTEGER NOT NULL DEFAULT 0,
+  src_region      TEXT NOT NULL DEFAULT '',
+  dest_region     TEXT NOT NULL DEFAULT ''
+);
+
+-- P7.2c: purge tombstones — with per-region logs a purge and its node's
+-- creation can replay in either order; the tombstone makes the outcome
+-- order-free. Compaction (doc 11) is where this set eventually shrinks.
+CREATE TABLE IF NOT EXISTS purged_nodes (
+  node_id TEXT PRIMARY KEY
 );
 
 CREATE TABLE IF NOT EXISTS member_tags (
@@ -215,6 +237,8 @@ const MAIN_OBJECTS: &[&str] = &[
     "acl",
     "regions",
     "applied_marks",
+    "pending_moves",
+    "purged_nodes",
     "member_tags",
     "temp_nodes",
     "temp_links",
@@ -656,6 +680,19 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             .map_err(&m)?;
         }
         Event::NodeCreated(n) => {
+            // P7.2c tombstones: a purge and this creation can replay in either
+            // order once logs are parallel — never resurrect a purged id.
+            let purged: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM purged_nodes WHERE node_id = ?1",
+                    params![n.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(&m)?;
+            if purged.is_some() {
+                return Ok(());
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO nodes
                  (id, node_type, label, visibility, payload, creation_nonce, created_at, author, sig)
@@ -675,6 +712,42 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             .map_err(&m)?;
         }
         Event::LinkCreated(l) => {
+            // P7.2c: if a NodeMovedIn already folded referencing THIS link as
+            // the moved-away home (the destination log replayed first), the
+            // link enters the projection already removed at the shared move
+            // timestamp — dense history, one-home never violated, and the
+            // outcome is identical in either replay order (doc 20 §2.5).
+            let moved_away: Option<i64> = tx
+                .query_row(
+                    "SELECT removed_at FROM pending_moves WHERE removed_link_id = ?1 AND in_seen = 1",
+                    params![l.id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(&m)?;
+            if let Some(t) = moved_away {
+                tx.execute(
+                    "INSERT INTO links
+                     (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,
+                      removed_at, superseded_by, suspended_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)
+                     ON CONFLICT(id) DO UPDATE SET removed_at = excluded.removed_at",
+                    params![
+                        l.id,
+                        l.parent_id,
+                        l.child_id,
+                        l.link_type,
+                        l.link_nonce as i64,
+                        l.order_key,
+                        l.created_at as i64,
+                        l.author,
+                        l.sig,
+                        t
+                    ],
+                )
+                .map_err(&m)?;
+                return Ok(());
+            }
             // One-home invariant (spec §5.2): a node may have at most one active
             // `contains` link at any time. Enforce at fold so a tampered or
             // crafted log cannot violate the invariant on rebuild/replay — it is
@@ -710,11 +783,20 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                     }
                 }
             }
+            // Link ids exclude created_at/author (doc 03 §3.2), so re-homing a
+            // node under a former parent regenerates the SAME id — recreation
+            // must REACTIVATE the soft-removed row (the same rule locations
+            // have), or a move back to a previous parent silently loses the
+            // home. Found by the P7.2c smoke round-trip.
             tx.execute(
-                "INSERT OR IGNORE INTO links
+                "INSERT INTO links
                  (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,
                   removed_at, superseded_by, suspended_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL)
+                 ON CONFLICT(id) DO UPDATE SET
+                   order_key = excluded.order_key, created_at = excluded.created_at,
+                   author = excluded.author, sig = excluded.sig,
+                   removed_at = NULL, superseded_by = NULL, suspended_at = NULL",
                 params![
                     l.id,
                     l.parent_id,
@@ -927,11 +1009,171 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             )
             .map_err(&m)?;
         }
+        Event::NodeMovedOut {
+            node_id,
+            link_id,
+            removed_at,
+            dest_region,
+            ..
+        } => {
+            // The source half (doc 20 §2.5): remove the old home at the shared
+            // move timestamp — unconditionally, so both fold orders converge on
+            // the same value — and record/clear the pair.
+            tx.execute(
+                "UPDATE links SET removed_at = ?1 WHERE id = ?2",
+                params![*removed_at as i64, link_id],
+            )
+            .map_err(&m)?;
+            tx.execute(
+                "INSERT INTO pending_moves (removed_link_id, node_id, removed_at, out_seen, dest_region)
+                 VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT(removed_link_id) DO UPDATE SET out_seen = 1, dest_region = excluded.dest_region",
+                params![link_id, node_id, *removed_at as i64, dest_region],
+            )
+            .map_err(&m)?;
+            tx.execute(
+                "DELETE FROM pending_moves WHERE removed_link_id = ?1 AND out_seen = 1 AND in_seen = 1",
+                params![link_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::NodeMovedIn {
+            link: l,
+            removed_link_id,
+            removed_at,
+            src_region,
+            ..
+        } => {
+            // The destination half: retire the old home if it's here already
+            // (same shared timestamp either way), refuse a GENUINE double-home,
+            // insert the new link, flip the node's sticky region.
+            if !removed_link_id.is_empty() {
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM links WHERE child_id = ?1 AND link_type = ?2
+                           AND removed_at IS NULL LIMIT 1",
+                        params![l.child_id, crate::link::LINK_CONTAINS],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(&m)?;
+                match existing {
+                    Some(id) if id == *removed_link_id => {
+                        tx.execute(
+                            "UPDATE links SET removed_at = ?1 WHERE id = ?2",
+                            params![*removed_at as i64, removed_link_id],
+                        )
+                        .map_err(&m)?;
+                    }
+                    Some(id) if id != l.id => {
+                        return Err(PvfsError::Corruption {
+                            db: "log.db".into(),
+                            detail: format!(
+                                "cross-region move-in for {} names {removed_link_id} but the \
+                                 active home is {id}",
+                                l.child_id
+                            ),
+                            seq: Some(seq),
+                        });
+                    }
+                    _ => {} // source not replayed yet (or idempotent refold)
+                }
+                tx.execute(
+                    "INSERT INTO pending_moves (removed_link_id, node_id, removed_at, in_seen, src_region)
+                     VALUES (?1, ?2, ?3, 1, ?4)
+                     ON CONFLICT(removed_link_id) DO UPDATE SET in_seen = 1, src_region = excluded.src_region",
+                    params![removed_link_id, l.child_id, *removed_at as i64, src_region],
+                )
+                .map_err(&m)?;
+                tx.execute(
+                    "DELETE FROM pending_moves WHERE removed_link_id = ?1 AND out_seen = 1 AND in_seen = 1",
+                    params![removed_link_id],
+                )
+                .map_err(&m)?;
+            } else {
+                // orphan adoption: there must be no active home at all
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM links WHERE child_id = ?1 AND link_type = ?2
+                           AND removed_at IS NULL LIMIT 1",
+                        params![l.child_id, crate::link::LINK_CONTAINS],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(&m)?;
+                if let Some(id) = existing {
+                    if id != l.id {
+                        return Err(PvfsError::Corruption {
+                            db: "log.db".into(),
+                            detail: format!(
+                                "cross-region adoption of {} but it has active home {id}",
+                                l.child_id
+                            ),
+                            seq: Some(seq),
+                        });
+                    }
+                }
+            }
+            // same reactivation rule as LinkCreated: a round-trip move
+            // regenerates the original link id (doc 03 §3.2)
+            tx.execute(
+                "INSERT INTO links
+                 (id, parent_id, child_id, link_type, link_nonce, order_key, created_at, author, sig,
+                  removed_at, superseded_by, suspended_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL)
+                 ON CONFLICT(id) DO UPDATE SET
+                   order_key = excluded.order_key, created_at = excluded.created_at,
+                   author = excluded.author, sig = excluded.sig,
+                   removed_at = NULL, superseded_by = NULL, suspended_at = NULL",
+                params![
+                    l.id,
+                    l.parent_id,
+                    l.child_id,
+                    l.link_type,
+                    l.link_nonce as i64,
+                    l.order_key,
+                    l.created_at as i64,
+                    l.author,
+                    l.sig
+                ],
+            )
+            .map_err(&m)?;
+            // The single writer of the node's final region (doc 20 §2.5) — and
+            // of its SUBTREE's: descendants created before the move carry the
+            // old region. Source-first replay fixes them here (the CTE);
+            // destination-first replay creates them later under an
+            // already-flipped parent (homing inheritance) — both orders
+            // converge. Nested marked regions keep their own identity.
+            if let Some(parent) = &l.parent_id {
+                tx.execute(
+                    "WITH RECURSIVE dest(v) AS (
+                       SELECT CASE WHEN EXISTS (SELECT 1 FROM regions r WHERE r.node_id = ?1)
+                              THEN ?1 ELSE (SELECT region_id FROM nodes WHERE id = ?1) END
+                     ),
+                     sub(id) AS (
+                       SELECT ?2
+                       UNION
+                       SELECT lk.child_id FROM links lk JOIN sub s ON lk.parent_id = s.id
+                       WHERE lk.link_type = ?3 AND lk.removed_at IS NULL
+                         AND NOT EXISTS (SELECT 1 FROM regions r WHERE r.node_id = lk.child_id)
+                     )
+                     UPDATE nodes SET region_id = (SELECT v FROM dest)
+                     WHERE id IN (SELECT id FROM sub)",
+                    params![parent, l.child_id, crate::link::LINK_CONTAINS],
+                )
+                .map_err(&m)?;
+            }
+        }
         Event::NodePurged { node_id, .. } => {
             tx.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
                 .map_err(&m)?;
             tx.execute(
                 "DELETE FROM file_locations WHERE file_id = ?1",
+                params![node_id],
+            )
+            .map_err(&m)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO purged_nodes (node_id) VALUES (?1)",
                 params![node_id],
             )
             .map_err(&m)?;
@@ -1179,6 +1421,29 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
         Event::LinkCreated(l) => {
             if let Some(parent) = &l.parent_id {
                 require_right(conn, author, parent, acl::ACL_W, "create link", as_of_ms)?;
+            }
+        }
+        // P7.2c: each half of a cross-region move carries the same right its
+        // in-region counterpart would — write on the parent it touches.
+        Event::NodeMovedIn { link, .. } => {
+            if let Some(parent) = &link.parent_id {
+                require_right(conn, author, parent, acl::ACL_W, "move in", as_of_ms)?;
+            }
+        }
+        Event::NodeMovedOut { link_id, node_id, .. } => {
+            let row: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT parent_id FROM links WHERE id = ?1",
+                    params![link_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("acl link lookup"))?;
+            match row.flatten() {
+                Some(parent) => {
+                    require_right(conn, author, &parent, acl::ACL_W, "move out", as_of_ms)?
+                }
+                None => require_right(conn, author, node_id, acl::ACL_A, "move out", as_of_ms)?,
             }
         }
         Event::LinkRemoved { link_id, .. } => {
@@ -1982,8 +2247,39 @@ pub fn full_rebuild(conn: &mut Connection, data_dir: &std::path::Path) -> Result
     }
     create_schema(conn)?;
     replay_log(conn, data_dir, &identity, "", 0)?;
+    check_pending_moves(conn, data_dir)?;
     meta_set(conn, "clean_shutdown", "0")?;
     Ok(identity)
+}
+
+/// P7.2c pairing enforcement (doc 20 §2.5): after replay, a move half whose
+/// counterpart never folded is corruption on an **owner** (it holds every
+/// log, so the pair must be complete) and tolerated on a **replica** (the
+/// counterpart may live in an unfetched region). A live commit authors both
+/// halves in one transaction, so owners only hit this on tampering.
+fn check_pending_moves(conn: &Connection, data_dir: &std::path::Path) -> Result<()> {
+    if crate::replica::marker_path(data_dir).exists() {
+        return Ok(());
+    }
+    let orphan: Option<(String, String)> = conn
+        .query_row(
+            "SELECT removed_link_id, node_id FROM pending_moves LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_db("pending moves check"))?;
+    if let Some((link_id, node_id)) = orphan {
+        return Err(PvfsError::Corruption {
+            db: "log.db".into(),
+            detail: format!(
+                "cross-region move of {node_id} (link {link_id}) has only one \
+                 half — its counterpart event is missing"
+            ),
+            seq: None,
+        });
+    }
+    Ok(())
 }
 
 /// The §9.3 startup check. Runs on every open, after both files are attached.
@@ -2007,7 +2303,17 @@ pub fn read_view_check(conn: &Connection) -> Result<ForestIdentity> {
     decode_genesis(conn)
 }
 
-pub fn startup_check(conn: &mut Connection, data_dir: &std::path::Path) -> Result<ForestIdentity> {
+/// `others_alive`: another writer engine currently holds the forest (the
+/// live-writer flock, P7.2c close-out) — `clean_shutdown = 0` then means "a
+/// writer is live", not "the last writer crashed", so this open catches up
+/// instead of force-rebuilding (and can never lose a minutes-long lock race
+/// against the live writer's folds). Every OTHER rebuild trigger (structural
+/// damage, schema change, agreement mismatch) is unchanged.
+pub fn startup_check(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    others_alive: bool,
+) -> Result<ForestIdentity> {
     // Step 1 — structural check.
     if !quick_check(conn, "log")? {
         return Err(PvfsError::Corruption {
@@ -2058,8 +2364,9 @@ pub fn startup_check(conn: &mut Connection, data_dir: &std::path::Path) -> Resul
         }
     }
 
-    // Unclean shutdown forces a full agreement check (spec §9.3 crash flag).
-    if clean != "1" {
+    // Unclean shutdown forces a full agreement check (spec §9.3 crash flag) —
+    // unless the "unclean" flag simply reflects a LIVE writer (see above).
+    if clean != "1" && !others_alive {
         return full_rebuild(conn, data_dir);
     }
 
@@ -2130,6 +2437,7 @@ pub fn startup_check(conn: &mut Connection, data_dir: &std::path::Path) -> Resul
     // Step 4 — catch up (tree replay walks every log from its applied mark).
     if behind {
         replay_log(conn, data_dir, &identity, "", 0)?;
+        check_pending_moves(conn, data_dir)?;
         // Actives whose baseline lives in a sealed generation are unreachable
         // from the tree walk once the seal is applied (the pause is in the
         // past) — sweep their tails directly. Order-free: an active region's

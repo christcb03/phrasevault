@@ -383,7 +383,12 @@ fn interval(name: &str) -> Duration {
 /// reconciles configured jobs against live threads each tick; a failed reload
 /// keeps the previous config and logs — a running fleet box must not lose its
 /// jobs to a half-edited file.
-pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
+pub fn run(
+    state: Arc<JobsState>,
+    shutdown: &AtomicBool,
+    reload: &AtomicBool,
+    daemon: Option<Arc<crate::Daemon>>,
+) {
     let mut running: HashMap<String, Managed> = HashMap::new();
     let mut draining: Vec<Managed> = Vec::new();
     let mut retry_at: HashMap<String, Instant> = HashMap::new();
@@ -401,8 +406,10 @@ pub fn run(state: Arc<JobsState>, shutdown: &AtomicBool, reload: &AtomicBool) {
         if Instant::now() >= heads_at {
             heads_at = Instant::now() + HEADS_EVERY;
             if state.data_dir().join("regions").exists() {
-                // a transient writer open commits dirty heads at close
-                let _ = pvfs_core::Engine::open(state.data_dir()).and_then(|e| e.close());
+                // through the daemon's own engine — never a second one
+                if let Some(d) = &daemon {
+                    let _ = d.commit_region_heads();
+                }
             }
         }
         // punch A: `serve enable` takes effect within a tick — the runner

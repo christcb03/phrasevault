@@ -151,11 +151,12 @@ forest, and every rebuild re-verifies each baseline against the replayed history
 the region's log in place (kept for verification) and returns the subtree to the enclosing log;
 re-marking later starts a fresh generation.
 
-What you'll notice day to day: nothing — reads and writes behave identically. The visible edges
-are deliberate refusals: **moving a node across a region boundary** (including re-homing an
-orphan into another region) and **purging a subtree that still contains a region boundary** are
-refused with guidance (`unmark` first). Cross-region moves arrive with the paired-event protocol
-(doc 20 §2).
+What you'll notice day to day: nothing — reads, writes, and **moves across region boundaries**
+all behave identically. A cross-boundary `mv` (or re-homing an orphan into another region)
+authors one half in each region's log — a paired, causally cross-referenced protocol
+(doc 20 §2.5) — and the node's region membership (with its whole subtree's) follows the move.
+The one deliberate refusal left: **purging a subtree that still contains a region boundary**
+(`unmark` first — a purge cascade is one region's business).
 
 ---
 

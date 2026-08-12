@@ -744,13 +744,21 @@ $PVFS --json --data-dir "$DMOUNT/.pvfs" region ls "$RGNFILE" | qgrep "\"region\"
   && ok "membership resolves to the nearest boundary" || fail "region membership"
 $PVFS --data-dir "$DMOUNT/.pvfs" region ls | qgrep "$RGN" \
   && ok "region ls lists the boundary" || fail "region ls"
-# a member mv across the boundary is refused with guidance
-assert_rc 2 "cross-region mv refused → 2" -- \
-  $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT"
+# P7.2c (doc 20 §2.5): a mv across the boundary is the PAIRED protocol now —
+# NodeMovedOut in the source region's log, NodeMovedIn in the destination's
+$PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
+  && ok "cross-region mv out of the region (paired protocol)" || fail "cross-region mv out"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" region ls "$RGNFILE" | qgrep "\"region\":\"$RGN\"" \
+  && fail "moved node still claims the old region" \
+  || ok "the node's sticky region flipped to the destination"
+$PVFS remote --socket "$SOCK" mv "$RGNFILE" "$RGN" >/dev/null \
+  && ok "and back in (the reverse crossing)" || fail "cross-region mv back"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" region ls "$RGNFILE" | qgrep "\"region\":\"$RGN\"" \
+  && ok "membership follows the move" || fail "post-move membership"
 $PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$RGN" >/dev/null \
   && ok "region unmark" || fail "region unmark"
 $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
-  && ok "the same mv is fine once the boundary is gone" || fail "post-unmark mv"
+  && ok "a plain mv once the boundary is gone" || fail "post-unmark mv"
 
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
@@ -766,16 +774,18 @@ GEN1="$(ls "$DATA/forest/regions/$PR/"g-*.db 2>/dev/null | head -1)"
 [ -n "$GEN1" ] && ok "first region write created the generation file" || fail "generation file"
 $PVFS --json region ls "$PRDEEP" | qgrep "\"region\":\"$PR\"" \
   && ok "membership rides the physical split" || fail "split membership"
-# cross-region orphan adoption is refused (it IS a cross-region move)
+# cross-region orphan adoption IS a cross-region move — since P7.2c it
+# authors as a NodeMovedIn and the sticky region flips (doc 20 §2.5)
 XADOPT="$($PVFS add "$ROOT" --kind folder --label adoptee)"
 XLINK="$($PVFS --json ls "$ROOT" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "adoptee": print(e["link_id"])')"
 $PVFS unlink "$XLINK" >/dev/null
-assert_rc 2 "cross-region orphan adoption refused → 2" -- \
-  $PVFS link "$PR" "$XADOPT" --type contains
-$PVFS purge "$XADOPT" >/dev/null
+$PVFS link "$PR" "$XADOPT" --type contains >/dev/null \
+  && ok "cross-region orphan adoption (paired protocol)" || fail "orphan adoption"
+$PVFS --json region ls "$XADOPT" | qgrep "\"region\":\"$PR\"" \
+  && ok "adoption flipped the orphan's region" || fail "adoption region flip"
 # tree rebuild: baseline verification + region-log replay reproduce the state
 rm "$DATA/forest/index.db"
 $PVFS ls "$PRIN" 2>/dev/null | qgrep deep \

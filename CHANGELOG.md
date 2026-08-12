@@ -5,6 +5,25 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Cross-region moves (P7.2c, doc 20 §2.5):** `mv` across a region boundary
+  works — the paired protocol authors `NodeMovedOut` in the source region's
+  log and `NodeMovedIn` in the destination's, one commit, one shared
+  timestamp, each half carrying the other region's last committed head. Replay
+  converges in either inter-log order; the moved subtree's sticky regions
+  follow; orphan adoption across a boundary is the same protocol. New purge
+  tombstones keep a purge that replays before its node's creation from
+  resurrecting it (schema v6). Also fixes a latent pre-region bug: moving a
+  node back under a former parent regenerates the same content-addressed link
+  id, and recreation now reactivates the soft-removed row instead of being
+  silently ignored.
+- **The live-writer flock:** every open writer engine holds a shared `flock`
+  on `writer.lock`; an engine opening a forest whose `clean_shutdown` flag is
+  down now distinguishes "another writer is live" (catch up — no rebuild, no
+  minutes-long lock holds under a running daemon) from "the last writer
+  crashed" (full rebuild, exactly as before — chaos-suite re-validated). Ends
+  the full-projection-rebuild-per-CLI-command era on daemon-served forests,
+  and the SQLITE_BUSY races that came with it. Serve config verbs
+  (`enable`/`disable`/`ls`/`status`) no longer open an engine at all.
 - **Region logs over the wire (P7.2b, doc 20 §2.4):** `LogInfo`/`LogRead`/
   `LogWait` gain an additive **generation address** scope, gated on admin of
   the region's root; replicas discover generations by scanning shipped

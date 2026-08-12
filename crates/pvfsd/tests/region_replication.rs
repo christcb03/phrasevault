@@ -247,6 +247,76 @@ fn region_gate_admits_region_admin_without_forest_rights() {
 }
 
 #[test]
+fn cross_region_move_over_the_wire_replays_and_replicates() {
+    // P7.2c (doc 20 §2.5): a wire mv across a boundary authors the paired
+    // protocol; every later engine open replays the pair (destination log
+    // first — the convergence order), and a whole-forest replica reproduces
+    // the move from shipped logs alone.
+    let fx = fixture();
+    let mut writer = admin_client(&fx);
+    let k = fx.rep_key.clone();
+    let sign = move |d: &[u8; 32]| crypto::sign_digest(&k, d).unwrap();
+
+    // photos_child leaves its region for the top-region root, then a fresh
+    // SUBTREE (wanderer/cargo) makes the reverse crossing — descendants'
+    // sticky regions must follow the move (doc 20 §2.5)
+    writer.mv(&fx.photos_child, &fx.root, &sign).unwrap();
+    let wanderer = writer.mkdir(&fx.root, "wanderer", &sign).unwrap();
+    let cargo = writer.mkdir(&wanderer, "cargo", &sign).unwrap();
+    writer.mv(&wanderer, &fx.photos, &sign).unwrap();
+
+    // a second engine open on the owner dir = full tree replay of the pairs
+    let owner_dir = fx._dir.path().to_path_buf();
+    let e = Engine::open(&owner_dir).unwrap();
+    assert_eq!(
+        e.region_of(&fx.photos_child).unwrap(),
+        e.identity.root_node_id,
+        "moved-out node joined the top region"
+    );
+    assert_eq!(
+        e.region_of(&wanderer).unwrap(),
+        fx.photos,
+        "moved-in node joined the destination region"
+    );
+    assert_eq!(
+        e.region_of(&cargo).unwrap(),
+        fx.photos,
+        "the moved subtree's descendants follow (source-first replay order)"
+    );
+    drop(e);
+
+    // and the whole story replicates
+    let mount = tempfile::tempdir().unwrap();
+    let data_dir = mount.path().join(".pvfs");
+    pull_top(&mut writer, &data_dir);
+    ReplicaSource {
+        transport: "socket".into(),
+        target: fx.sock.to_string_lossy().into_owned(),
+        pin: String::new(),
+        region: String::new(),
+    }
+    .save(&data_dir)
+    .unwrap();
+    pvfs_client::regions::sync_generations(&mut writer, &data_dir, None).unwrap();
+    let replica = Engine::open(&data_dir).unwrap();
+    assert_eq!(
+        replica.region_of(&wanderer).unwrap(),
+        fx.photos,
+        "the paired move reproduces on a replica from shipped logs"
+    );
+    assert_eq!(
+        replica.region_of(&cargo).unwrap(),
+        fx.photos,
+        "descendants converge in the destination-first replay order too"
+    );
+    assert_eq!(
+        replica.region_of(&fx.photos_child).unwrap(),
+        replica.identity.root_node_id
+    );
+    replica.close().unwrap();
+}
+
+#[test]
 fn top_logwait_wakes_on_region_commits() {
     let fx = fixture();
     let mut waiter = admin_client(&fx);

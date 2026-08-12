@@ -243,6 +243,64 @@ grants identically, and log shipping refuses absent logs. Sub-phases:
 **P7.2b-ii** `--region` scoped replicas + absent-log-tolerant replica replay;
 **P7.2b-iii** follower sweep + daemon head job; each validated before commit.
 
+### 2.5 P7.2c build mechanics (2026-08-11, written at build start)
+
+The paired-event protocol, answering §2.1's three recorded constraints — and a
+fourth found while designing it.
+
+**Two new self-contained kinds** (constraint 1 — landed bodies can't grow):
+
+- `NodeMovedOut { node_id, link_id, removed_at, dest_region, dest_head_seq,
+  dest_head_hash }` — authors in the **source** region's log; folds like the
+  link removal it replaces.
+- `NodeMovedIn { link, removed_link_id, removed_at, src_region, src_head_seq,
+  src_head_hash }` — authors in the **destination**'s log; folds like the
+  link creation, flips the node's sticky `region_id`, and is the licensed
+  exception to the one-home fold check.
+
+One engine commit authors both (the P7.2a router already spans logs), with
+**one shared timestamp** — that's what makes fold order immaterial
+(constraint 2): whichever side folds first, the old link's `removed_at`
+converges to the same `t`, and `region_id` has a single writer (`MovedIn`).
+Head refs are the other region's **last committed head** at authoring
+(deterministic from the projection, like a baseline's nested-heads section);
+a move to/from the top region uses the `(0, "")` sentinel — the top log is
+never unfetched.
+
+**Pairing is tracked, not assumed.** Each half folds a row into a new
+`pending_moves` table keyed by `removed_link_id`; the pair clears when both
+halves have folded (a live commit clears within its own transaction). After
+replay, an unmatched half whose counterpart log **is held and caught up past
+the referenced head** is corruption; a counterpart that is absent or behind
+(a scoped replica) is tolerated — §2.1's "the missing side is an unfetched
+region", verbatim. `pending_moves` also resolves the late-arriving-original
+problem: when the source log's *original* `LinkCreated` for a moved-away
+link folds after the destination's `MovedIn` did, the fold finds the link id
+in `pending_moves` and inserts it **already removed at the recorded `t`** —
+dense history, invariant intact, no order sensitivity.
+
+**Purge tombstones (the fourth constraint, found at design time).** With
+moves crossing logs, a node's creation and its purge can live in different
+regions' logs, and replay order between siblings is free — a purge folding
+before the creation would no-op and the node would *resurrect*, diverging
+replay from live state and poisoning every later baseline. Fix:
+`NodePurged` folds the id into a permanent `purged_nodes` set and
+`NodeCreated` refuses to resurrect a purged id. Order-free, deterministic,
+and it hardens the existing single-log orphan-purge path for free.
+Compaction (doc 11) is where the set eventually shrinks.
+
+**Lifted refusals.** `mv` across a boundary becomes the paired protocol
+(local and wire paths share the prepare); **orphan adoption** across a
+boundary is a `MovedIn` with an empty `removed_link_id` (no source link to
+remove, no pairing to wait for — the tombstone set covers the ordering
+hazard that motivated the refusal). The purge-through-boundary refusal
+STAYS — a cascade is still one region's business ("unmark first").
+
+**Authorization** mirrors the in-region move rule on both sides: write on
+the source parent authorizes `MovedOut`, write on the destination parent
+authorizes `MovedIn` (root-link edits stay owner/admin). Projection schema
+v6 (`pending_moves`, `purged_nodes`) — the usual one-time rebuild.
+
 ## 3. The FUSE mount — P7.3
 
 - New crate `pvfs-fuse` (the `fuser` crate, pure Rust; runtime needs the distro's
@@ -376,6 +434,48 @@ phase validates on presubuntu before its commit, as always.
   - `--region` reduces bytes, not rights (§2.4's honest note): the top log
     still ships whole under the forest-root gate. Lesser-privilege region
     replication needs top-log filtering (doc 03 §6 Q7) — future work.
+- **P7.2c landed** (2026-08-11, validated: **225 cargo tests + 327 smoke,
+  clippy clean** — the paired protocol built to §2.5). The P7.0 mv refusal
+  and the P7.2a adoption refusal are LIFTED: cross-region `mv` works over
+  the wire (round-trip exercised in smoke against a live daemon, whose every
+  rebuild replays the pair destination-first — the convergence order), and
+  orphan adoption flips the sticky region. As-built findings, honestly:
+  - **A latent pre-region bug surfaced**: link ids exclude `created_at`
+    (doc 03 §3.2), so moving a node back under a former parent regenerates
+    the SAME link id — and the fold's `INSERT OR IGNORE` silently dropped
+    the recreation, leaving the node homeless. Any A→B→A wire move since P6
+    would have hit it. Fixed with reactivation-on-conflict (the same rule
+    locations have had since P0); the round-trip smoke check now guards it.
+  - **Subtree stickiness follows the move**: `MovedIn` reassigns the moved
+    node's contains-closure (stopping at nested marks) — required for
+    source-first replay convergence, while destination-first convergence
+    rides homing inheritance; both orders proven in tests (owner rebuild =
+    source-first assertions, replica build = destination-first).
+  - The pairing check collapsed to the simple form: any unmatched half after
+    replay is corruption on an owner (it holds every log) and tolerated on a
+    replica (an unfetched region) — the per-head caught-up refinement in
+    §2.5's first draft wasn't needed.
+  - Projection schema v6 (`pending_moves`, `purged_nodes`); the tombstone
+    test proves a purge folding before its node's creation stays purged.
+  - **A second latent bug class caught by the slow box**: transient engine
+    opens under a live daemon force a full projection rebuild
+    (`clean_shutdown` is 0 the whole time the daemon runs) and can lose
+    SQLITE_BUSY races against daemon folds. It bit twice: the P7.2b heads
+    tick (now attests through the daemon's OWN writer engine —
+    `Daemon::commit_region_heads` — never a second one), and a silently
+    lost `pvfs serve enable evict` in the fleet test (the serve config
+    verbs now never open an engine at all — they only need the data dir;
+    the fleet script also asserts the enable persisted). When the owner's
+    60-second heads tick made the amplification permanent (every tick wakes
+    every follower, every fold rebuilt the replica, every CLI open lost the
+    lock race), the structural fix landed in this same phase: **the
+    live-writer flock** — every writer engine holds a shared `flock` on
+    `writer.lock` for its lifetime; an open that finds `clean_shutdown = 0`
+    probes for live writers and, finding them, runs the ordinary agreement
+    check + catch-up instead of the crash rebuild. A genuinely dead writer
+    (kill -9 — the flock dies with the process) still rebuilds, which the
+    chaos suite re-validated. Transient opens under a live daemon went from
+    O(log)-with-lock-contention to a catch-up, forest-wide.
 - **P7.2d landed** (2026-08-11): `deploy/fleet-test.sh` phase H — **57/57
   across both machines**: two app regions marked on the live served forest,
   region content reaching the edge **hands-free through the follow job's

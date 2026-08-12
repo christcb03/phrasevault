@@ -3145,10 +3145,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         Cmd::Serve { cmd: Some(cmd), .. } => {
             // enable/disable/ls edit the local `serve.jobs` (deployment state,
             // doc 18 §2); status asks the running daemon over its socket.
-            // (Bare `pvfs serve` — no subcommand — stays the P1 watcher, below.)
-            let engine = Engine::open(&ctx?)?;
-            let data_dir = engine.data_dir().to_path_buf();
-            engine.close()?;
+            // None of them needs an ENGINE — and opening one under a live
+            // daemon forces a projection rebuild that can lose a busy race
+            // and fail the command (found by the fleet test: a lost
+            // `serve enable evict`). Validate the forest by its log file.
+            let data_dir = ctx?;
+            if !data_dir.join("log.db").exists() {
+                return Err(PvfsError::NotFound {
+                    kind: "forest",
+                    id: data_dir.to_string_lossy().into_owned(),
+                });
+            }
             match cmd {
                 ServeCmd::Enable { .. } | ServeCmd::Disable { .. } => {
                     let (job, enable) = match cmd {
@@ -4285,9 +4292,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // punch E: bare `pvfs serve` answers the question people are
             // asking — what are the jobs doing (the watcher moved to
             // `serve watch` / the `watch` job; PVOS verified un-affected).
-            let engine = Engine::open(&ctx?)?;
-            let data_dir = engine.data_dir().to_path_buf();
-            engine.close()?;
+            // No engine open — see the subcommand arm's note.
+            let data_dir = ctx?;
+            if !data_dir.join("log.db").exists() {
+                return Err(PvfsError::NotFound {
+                    kind: "forest",
+                    id: data_dir.to_string_lossy().into_owned(),
+                });
+            }
             match try_daemon_socket(&data_dir) {
                 Some(sock) => serve_status_print(&data_dir, &sock, json),
                 None => {

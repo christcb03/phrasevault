@@ -78,16 +78,27 @@ fn cross_region_moves_are_refused_and_member_marks_need_admin() {
     e.set_acl(&root, &Principal::Key(member_pub.clone()), acl::ACL_R | acl::ACL_W)
         .unwrap();
 
-    // mv clip (region photos) under music (top region) → refused at prepare
-    let err = e.prepare_move_node(&member_pub, &clip, &music).unwrap_err();
-    assert!(
-        err.to_string().contains("region"),
-        "cross-region mv must name the reason: {err}"
-    );
+    // mv clip (region photos) under music (top region): since P7.2c this
+    // prepares the PAIRED protocol — a NodeMovedOut for the source region's
+    // log and a NodeMovedIn for the destination's (doc 20 §2.5)
+    let prepared = e.prepare_move_node(&member_pub, &clip, &music).unwrap();
+    assert_eq!(prepared.events.len(), 2, "a cross-region move is a pair");
+    assert!(matches!(
+        prepared.events[0].event,
+        pvfs_core::event::Event::NodeMovedOut { .. }
+    ));
+    assert!(matches!(
+        prepared.events[1].event,
+        pvfs_core::event::Event::NodeMovedIn { .. }
+    ));
 
-    // an in-region move is untouched by the guard
+    // an in-region move still prepares the plain remove+create pair
     let sub = e.add_node(&photos, folder("sub")).unwrap();
-    assert!(e.prepare_move_node(&member_pub, &clip, &sub).is_ok());
+    let plain = e.prepare_move_node(&member_pub, &clip, &sub).unwrap();
+    assert!(matches!(
+        plain.events[1].event,
+        pvfs_core::event::Event::LinkCreated(_)
+    ));
     let _ = sub;
 
     // replay-side authorization: a member without admin cannot have authored

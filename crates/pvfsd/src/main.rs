@@ -145,7 +145,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     daemon.attach_jobs(Arc::clone(&jobs));
     let jobs_thread = {
         let j = Arc::clone(&jobs);
-        std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD))
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD, Some(d)))
     };
 
     // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,

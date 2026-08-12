@@ -33,7 +33,7 @@ fn serve_status_reports_config_runner_and_reload() {
     let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     let runner = {
         let j = Arc::clone(&jobs);
-        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload, None))
     };
 
     let sockdir = tempfile::tempdir().unwrap();
@@ -196,7 +196,7 @@ fn follow_job_keeps_a_replica_fresh() {
     let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     let runner = {
         let j = Arc::clone(&jobs);
-        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload, None))
     };
 
     // ---- author on the owner; the follower must fold it within seconds
@@ -381,7 +381,7 @@ fn sync_and_export_jobs_keep_a_consumer_view_fresh() {
     let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     let runner = {
         let j = Arc::clone(&jobs);
-        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload, None))
     };
 
     // ---- startup passes: bytes fetched from the source, view materialized
@@ -442,7 +442,7 @@ fn tier_and_evict_jobs_settle_idle_on_a_quiet_owner() {
     let reload: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
     let runner = {
         let j = Arc::clone(&jobs);
-        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload))
+        std::thread::spawn(move || pvfsd::jobs::run(j, shutdown, reload, None))
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {

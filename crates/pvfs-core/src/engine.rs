@@ -95,6 +95,10 @@ pub struct Engine {
     /// A replica forest (doc 03 §1.1): full verified copy, local writes
     /// refused — the owner instance is the forest's only writer.
     pub(crate) replica: bool,
+    /// Shared flock on `writer.lock`, held for the engine's lifetime; its
+    /// release — clean close or crash — is what makes writer liveness
+    /// observable to other opens (P7.2c close-out finding).
+    _writer_lock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -129,6 +133,30 @@ fn open_connection_read_only(data_dir: &Path) -> Result<Connection> {
     conn.execute("ATTACH DATABASE ?1 AS log", params![log_path])
         .map_err(map_db("attach log.db read-only"))?;
     Ok(conn)
+}
+
+/// The live-writer marker (doc 20 §7 P7.2c close-out): every open writer
+/// engine holds a SHARED flock on `writer.lock` for its lifetime, dropped
+/// automatically on close or crash. `probe_other_writers` answers "is any
+/// writer alive right now?" by trying an exclusive lock on a separate fd —
+/// which is what lets a transient open under a live daemon skip the
+/// crash-rebuild (`clean_shutdown` is 0 the whole time a daemon runs) and
+/// just catch up, while a genuinely dead writer (kill -9, the chaos suite)
+/// still triggers the full rebuild.
+fn probe_other_writers(data_dir: &Path) -> bool {
+    let path = data_dir.join("writer.lock");
+    let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return false; // cannot probe — behave as before (rebuild)
+    };
+    // exclusive REFUSED = someone holds a shared lock = writers alive;
+    // an acquired probe lock is dropped (released) immediately
+    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).is_err()
+}
+
+fn take_writer_lock(data_dir: &Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
+    let path = data_dir.join("writer.lock");
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockShared).ok()
 }
 
 pub(crate) fn open_connection(data_dir: &Path) -> Result<Connection> {
@@ -404,6 +432,7 @@ impl Engine {
             conn,
             data_dir: data_dir.to_path_buf(),
             device,
+            _writer_lock: take_writer_lock(data_dir),
             identity: ForestIdentity {
                 instance_id,
                 forest_id,
@@ -424,8 +453,10 @@ impl Engine {
             return Self::open_replica(data_dir);
         }
         let device = DeviceKeyCache::load(data_dir)?;
+        let others = probe_other_writers(data_dir);
+        let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn, data_dir)?;
+        let identity = projection::startup_check(&mut conn, data_dir, others)?;
         projection::meta_set(&conn, "clean_shutdown", "0")?;
         let mut engine = Engine {
             conn,
@@ -434,6 +465,7 @@ impl Engine {
             identity,
             closed: false,
             replica: false,
+            _writer_lock: lock,
         };
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
@@ -520,6 +552,7 @@ impl Engine {
             // shutdown bookkeeping belongs to the writer engine alone.
             closed: true,
             replica: false,
+            _writer_lock: None,
         })
     }
 
@@ -531,8 +564,10 @@ impl Engine {
     /// engine plumbing and every log write is refused.
     pub fn open_replica(data_dir: &Path) -> Result<Engine> {
         let device = DeviceKeyCache::ephemeral()?;
+        let others = probe_other_writers(data_dir);
+        let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn, data_dir)?;
+        let identity = projection::startup_check(&mut conn, data_dir, others)?;
         projection::meta_set(&conn, "clean_shutdown", "0")?;
         Ok(Engine {
             conn,
@@ -541,6 +576,7 @@ impl Engine {
             identity,
             closed: false,
             replica: true,
+            _writer_lock: lock,
         })
     }
 
@@ -645,8 +681,11 @@ impl Engine {
         let device_key = identity::device_key(mnemonic, "", device_index)?;
         let device_pub = crypto::pubkey_bytes(&device_key);
 
+        let others = probe_other_writers(data_dir);
+        let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
-        let identity = projection::startup_check(&mut conn, data_dir)?;
+        let identity = projection::startup_check(&mut conn, data_dir, others)?;
+        let _writer_lock_held = lock; // moved into the engine below
         // Compare against the CURRENT lineage root (doc 15 §C2), not the genesis
         // root: after a root rotation only the new seed recovers, and the old
         // (compromised) seed is rejected here rather than writing a device cert
@@ -668,6 +707,7 @@ impl Engine {
             identity,
             closed: false,
             replica: false,
+            _writer_lock: _writer_lock_held,
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();
@@ -891,6 +931,12 @@ impl Engine {
                 | Event::SubRegionHead { node_id, .. } => self.enclosing_log(node_id)?,
                 Event::NodeCreated(n) => self.resolve_region(&n.id, &batch_homes)?,
                 Event::LinkCreated(l) => match &l.parent_id {
+                    Some(p) => self.resolve_region(p, &batch_homes)?,
+                    None => String::new(),
+                },
+                // P7.2c: each half authors in its own region's log.
+                Event::NodeMovedOut { link_id, .. } => self.route_by_link(link_id, &batch_homes)?,
+                Event::NodeMovedIn { link, .. } => match &link.parent_id {
                     Some(p) => self.resolve_region(p, &batch_homes)?,
                     None => String::new(),
                 },
@@ -1310,17 +1356,6 @@ impl Engine {
                 });
             }
             self.check_no_cycle(parent, child)?;
-            // P7.2a (doc 20 §2.3): adopting an orphan across a region boundary
-            // IS a cross-region move — its history lives in its sticky region's
-            // log. Refused until the paired-event protocol (P7.2c).
-            let none = std::collections::HashMap::new();
-            if self.resolve_region(child, &none)? != self.resolve_region(parent, &none)? {
-                return Err(bad(
-                    "link",
-                    "node and new parent are in different regions — cross-region \
-                     moves land with the paired-event protocol (doc 20 §2)",
-                ));
-            }
         }
 
         let order = match order {
@@ -1362,6 +1397,25 @@ impl Engine {
         let id = l.id.clone();
         if parent_node.is_temp || child_node.is_temp {
             self.temp_write(|tx| insert_temp_link(tx, &l))?;
+        } else if l.link_type == LINK_CONTAINS && {
+            let none = std::collections::HashMap::new();
+            self.resolve_region(child, &none)? != self.resolve_region(parent, &none)?
+        } {
+            // P7.2c (doc 20 §2.5): adopting an orphan across a region boundary
+            // IS a cross-region move — author it as one, so the node's sticky
+            // region flips and replay stays order-free. No source link exists,
+            // so there is no pair to wait for.
+            let none = std::collections::HashMap::new();
+            let src_region = self.resolve_region(child, &none)?;
+            let (src_head_seq, src_head_hash) = self.region_committed_head(&src_region)?;
+            self.append_durable(vec![Event::NodeMovedIn {
+                removed_at: l.created_at,
+                link: l,
+                removed_link_id: String::new(),
+                src_region,
+                src_head_seq,
+                src_head_hash,
+            }])?;
         } else {
             self.append_durable(vec![Event::LinkCreated(l)])?;
         }
@@ -2514,15 +2568,9 @@ impl Engine {
             });
         }
         self.check_no_cycle(new_parent, node_id)?;
-        // P7.0 (doc 20 §2): cross-region moves are refused until physical
-        // region logs answer the both-logs authoring question (doc 13 §B).
-        if self.region_of(&old_parent)? != self.region_of(new_parent)? {
-            return Err(bad(
-                "mv",
-                "source and destination are in different regions — cross-region \
-                 moves land with physical region logs (doc 20 §2)",
-            ));
-        }
+        let none = std::collections::HashMap::new();
+        let src_region = self.resolve_region(&old_parent, &none)?;
+        let dest_region = self.resolve_region(new_parent, &none)?;
         let author = crate::acl::Principal::Key(author_pub.to_vec());
         for parent in [&old_parent, new_parent] {
             if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
@@ -2533,7 +2581,6 @@ impl Engine {
             }
         }
         let t = now_ms();
-        let rm_digest = event::msg_link_removed(&old_link_id, t, author_pub);
         let order = OrderKey::after(max_order_key(&self.conn, new_parent)?.as_ref())?;
         let mut link = Link {
             id: String::new(),
@@ -2551,6 +2598,52 @@ impl Engine {
         };
         let link_digest = link.id_digest();
         link.id = hex::encode(link_digest);
+        if src_region != dest_region {
+            // P7.2c (doc 20 §2.5): the paired-event protocol — one commit,
+            // one shared timestamp, each half in its own region's log with
+            // the other side's last committed head as the causal reference.
+            let (src_head_seq, src_head_hash) = self.region_committed_head(&src_region)?;
+            let (dest_head_seq, dest_head_hash) = self.region_committed_head(&dest_region)?;
+            let out_digest = event::msg_node_moved_out(
+                node_id,
+                &old_link_id,
+                t,
+                &dest_region,
+                dest_head_seq,
+                &dest_head_hash,
+                author_pub,
+            );
+            return Ok(PreparedWrite {
+                result_id: node_id.clone(),
+                events: vec![
+                    PreparedEvent {
+                        digest: out_digest,
+                        event: Event::NodeMovedOut {
+                            node_id: node_id.clone(),
+                            link_id: old_link_id.clone(),
+                            removed_at: t,
+                            dest_region,
+                            dest_head_seq,
+                            dest_head_hash,
+                            author: author_pub.to_vec(),
+                            sig: Vec::new(),
+                        },
+                    },
+                    PreparedEvent {
+                        digest: link_digest,
+                        event: Event::NodeMovedIn {
+                            link,
+                            removed_link_id: old_link_id,
+                            removed_at: t,
+                            src_region,
+                            src_head_seq,
+                            src_head_hash,
+                        },
+                    },
+                ],
+            });
+        }
+        let rm_digest = event::msg_link_removed(&old_link_id, t, author_pub);
         Ok(PreparedWrite {
             result_id: node_id.clone(),
             events: vec![
@@ -2569,6 +2662,28 @@ impl Engine {
                 },
             ],
         })
+    }
+
+    /// A region's last committed head, for a move's causal cross-reference
+    /// (P7.2c). The top region uses the `(0, empty)` sentinel — it is never
+    /// unfetched.
+    fn region_committed_head(&self, region: &str) -> Result<(u64, Vec<u8>)> {
+        if region.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT committed_seq, committed_head FROM regions WHERE node_id = ?1",
+                params![region],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("region head lookup"))?;
+        match row {
+            Some((seq, head)) => Ok((seq as u64, hex::decode(&head).unwrap_or_default())),
+            None => Ok((0, Vec::new())),
+        }
     }
 
     /// Phase 1 of a member `loc rm` (P6.0, doc 19 §2): retract a recorded
@@ -2660,16 +2775,6 @@ impl Engine {
                 });
             }
             self.check_no_cycle(parent, child)?;
-            // P7.2a: same boundary rule as the local path — adoption across
-            // regions is a cross-region move (doc 20 §2.3).
-            let none = std::collections::HashMap::new();
-            if self.resolve_region(child, &none)? != self.resolve_region(parent, &none)? {
-                return Err(bad(
-                    "link",
-                    "node and new parent are in different regions — cross-region \
-                     moves land with the paired-event protocol (doc 20 §2)",
-                ));
-            }
         }
         let author = crate::acl::Principal::Key(author_pub.to_vec());
         if projection::effective_rights(&self.conn, &author, parent)? & crate::acl::ACL_W == 0 {
@@ -2698,6 +2803,30 @@ impl Engine {
         };
         let link_digest = link.id_digest();
         link.id = hex::encode(link_digest);
+        // P7.2c: a contains link that re-homes the child across a region
+        // boundary is an orphan adoption — author it as a cross-region
+        // move-in so the sticky region flips (doc 20 §2.5).
+        let none = std::collections::HashMap::new();
+        if link_type == LINK_CONTAINS
+            && self.resolve_region(child, &none)? != self.resolve_region(parent, &none)?
+        {
+            let src_region = self.resolve_region(child, &none)?;
+            let (src_head_seq, src_head_hash) = self.region_committed_head(&src_region)?;
+            return Ok(PreparedWrite {
+                result_id: link.id.clone(),
+                events: vec![PreparedEvent {
+                    digest: link_digest,
+                    event: Event::NodeMovedIn {
+                        removed_at: link.created_at,
+                        link,
+                        removed_link_id: String::new(),
+                        src_region,
+                        src_head_seq,
+                        src_head_hash,
+                    },
+                }],
+            });
+        }
         Ok(PreparedWrite {
             result_id: link.id.clone(),
             events: vec![PreparedEvent {

@@ -117,6 +117,15 @@ impl Daemon {
         }
     }
 
+    /// P7.2b heads tick (doc 20 §2.4): attest dirty region heads through the
+    /// daemon's OWN writer engine. A transient second engine would run a full
+    /// projection rebuild under a live daemon (`clean_shutdown` is 0 while it
+    /// runs) and starve concurrent commits on a slow box — found by the
+    /// pvos-test pipeline.
+    pub fn commit_region_heads(&self) -> pvfs_core::Result<usize> {
+        self.engine.lock().unwrap().commit_region_heads()
+    }
+
     /// Check out an engine for a **read**: round-robin over the read pool, so
     /// up to `READ_POOL` metadata reads run concurrently (plus writes on the
     /// writer). Falls back to the writer lock when the pool is empty.

@@ -294,12 +294,14 @@ head -c 1048576 /dev/urandom > "\$FT/downloads/auto-episode.mkv"
 echo "ISHA=\$(sha256sum "\$FT/downloads/auto-episode.mkv" | cut -d' ' -f1)"
 NID=\$("\$B/pvfs" --json --data-dir "\$R" add "\$LIB" --kind file --label auto-episode.mkv --size 1048576 | jget node_id)
 "\$B/pvfs" --data-dir "\$R" loc add "\$NID" --here "\$FT/downloads/auto-episode.mkv" >/dev/null
-"\$B/pvfs" --data-dir "\$R" serve enable evict >/dev/null
+"\$B/pvfs" --data-dir "\$R" serve enable evict >/dev/null || echo "EVICT_ENABLE_FAILED"
+grep -q evict "\$R/serve.jobs" || echo "EVICT_ENABLE_FAILED"
 pkill -HUP -f "pvfsd --mount \$FT/replica"   # the running supervisor learns of evict
 echo "NID=\$NID"
 EOS
 )
 eval "$(echo "$ING" | grep -E '^(NID|ISHA)=')"
+echo "$ING" | grep -q EVICT_ENABLE_FAILED && fail "serve enable evict did not persist"
 [ "${#NID}" -eq 64 ] && ok "edge ingested a new file (write-through + --here)" || fail "daemon-mode ingest: $ING"
 ssh "$OWNER" 'B=$HOME/.local/bin; FT=$HOME/fleet-test
 "$B/pvfs" --data-dir "$FT/owner/.pvfs" serve enable tier >/dev/null

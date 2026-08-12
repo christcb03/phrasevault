@@ -195,15 +195,28 @@ fn causal_isolation_guards_purge_and_orphan_adoption() {
     e.remove_link(&home).unwrap();
     assert_eq!(e.region_of(&stray).unwrap(), photos, "orphan keeps its region");
 
-    // adopting the region's orphan under a top-region parent is a
-    // cross-region move — refused until P7.2c
-    let err = e.link(&music, &stray, pvfs_core::LINK_CONTAINS, None, 1).unwrap_err();
-    assert!(err.to_string().contains("region"), "adoption guard: {err}");
+    // adopting the region's orphan under a top-region parent is a cross-region
+    // move — since P7.2c it authors as a NodeMovedIn and the sticky region flips
+    e.link(&music, &stray, pvfs_core::LINK_CONTAINS, None, 1)
+        .expect("cross-region adoption is the paired protocol now");
+    assert_eq!(
+        e.region_of(&stray).unwrap(),
+        e.identity.root_node_id,
+        "adoption flipped the orphan's region to the destination"
+    );
+    // put it back to an orphan inside the region for the purge check below
+    let adopt_home = e
+        .children(&music)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == stray)
+        .unwrap()
+        .link_id;
+    e.remove_link(&adopt_home).unwrap();
 
-    // purging it IS allowed (all-region cascade) and routes to the region log
-    let top_before = e.log_tip().unwrap();
+    // purging it IS allowed (all-region cascade); the tombstone keeps replay
+    // order-free (doc 20 §2.5)
     e.purge(std::slice::from_ref(&stray)).unwrap();
-    assert_eq!(e.log_tip().unwrap(), top_before, "orphan purge stayed in its region log");
     assert!(e.get_node(&stray).unwrap().is_none());
 
     // purging a subtree that CONTAINS a boundary is refused
@@ -291,6 +304,53 @@ fn legacy_p70_marks_split_lazily_at_open() {
     let e3 = Engine::open(dir.path()).unwrap();
     assert!(e3.region_info(&photos).unwrap().is_some());
     e3.close().unwrap();
+}
+
+#[test]
+fn purge_tombstone_keeps_cross_log_replay_order_free() {
+    // The P7.2c resurrection scenario (doc 20 §2.5): a node is CREATED in
+    // region A's log, moves to the top region (adoption), and is purged there
+    // — so its creation and its purge live in different logs. Tree replay
+    // folds the top log (with the purge) before A's log (with the creation);
+    // without the tombstone the node would resurrect and every later baseline
+    // would diverge.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let area = e.add_node(&root, folder("area")).unwrap();
+    e.region_mark(&area).unwrap();
+    let doomed = e.add_node(&area, folder("doomed")).unwrap(); // created in A's log
+    let home = e
+        .children(&area)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == doomed)
+        .unwrap()
+        .link_id;
+    e.remove_link(&home).unwrap(); // orphan (still region A, sticky)
+    e.link(&root, &doomed, pvfs_core::LINK_CONTAINS, None, 7)
+        .unwrap(); // adoption → region flips to top
+    assert_eq!(e.region_of(&doomed).unwrap(), root);
+    let adopt_home = e
+        .children(&root)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == doomed)
+        .unwrap()
+        .link_id;
+    e.remove_link(&adopt_home).unwrap();
+    e.purge(std::slice::from_ref(&doomed)).unwrap(); // purge in the TOP log
+    assert!(e.get_node(&doomed).unwrap().is_none());
+    e.close().unwrap();
+
+    // full rebuild: top log (purge) replays before region A's log (creation)
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let e2 = Engine::open(dir.path()).unwrap();
+    assert!(
+        e2.get_node(&doomed).unwrap().is_none(),
+        "the tombstone must prevent resurrection across parallel logs"
+    );
+    e2.close().unwrap();
 }
 
 #[test]
