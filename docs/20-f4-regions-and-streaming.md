@@ -57,6 +57,21 @@ directly. Chris confirmed 2026-08-11. The shape:
   head hash at authoring time (the causal cross-reference). Replay accepts the
   pair only when both sides exist or the missing side is an unfetched region.
   Until this lands mid-arc, the P7.0 refusal stays.
+  *Constraints the P7.2c design must answer, discovered building a+b
+  (2026-08-11):* (1) **event-shape compat** — landed `LinkRemoved`/
+  `LinkCreated` bodies can't grow fields without breaking decode of existing
+  logs, so the head refs ride new kinds or adjacent companion events;
+  (2) **fold-order tolerance** — the one-home check assumes
+  remove-before-create in one log; with the pair split across two logs
+  replay order between them is free, so the destination fold must tolerate
+  (while the verifier still catches genuine double-homes) — the head refs
+  are what license the exception; (3) **region-column handoff** — the moved
+  node's sticky `region_id` flips source→destination at the create fold
+  while its pre-move history stays in the source log: the causal-isolation
+  invariant gets a controlled exception exactly at move points, and tree
+  replay's parent-then-children argument must be re-verified under it.
+  Lifting the **orphan-adoption refusal** is the same protocol (adoption IS
+  a cross-region move of an orphan).
 - **Unmark = merge back:** the region log is sealed with a final head commitment;
   subsequent events author in the parent. Sealed logs remain for verification.
 
