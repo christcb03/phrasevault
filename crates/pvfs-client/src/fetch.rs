@@ -189,23 +189,49 @@ pub fn tier_pass(
         });
     }
     let data_dir = engine.data_dir().to_path_buf();
-    let central = pvfs_core::sync::load_central(&data_dir)?;
+    let central = pvfs_core::sync::load_central_all(&data_dir)?;
     if central.is_empty() {
         return Ok(None);
     }
     let own_pin = pvfs_core::storage::host_pin(&data_dir);
     let mut report = TierReport::default();
-    for (root, dest) in central {
+    for (root, dest, keep) in central {
+        // P8 (doc 21): a MIGRATE-kind binding's own staging dir drains too —
+        // its file:// locations retire once the central copy is live, and the
+        // evict pass then reclaims the staged bytes. Resolved per root from
+        // the binding, so in-place binds elsewhere are never touched.
+        let staging_prefix: Option<String> = if keep {
+            None
+        } else {
+            // trailing slash: "file:///a/b" must not match "file:///a/bXX/…"
+            engine
+                .binding_for(&root)?
+                .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
+        };
         for entry in engine.walk(&root)?.entries {
             if entry.node.node_type != pvfs_core::TYPE_FILE {
                 continue;
             }
             let id = entry.node.id;
             let label = entry.node.label;
-            let has_central = engine
-                .locations(&id)?
-                .iter()
-                .any(|u| logged_local_location(u, &own_pin));
+            // What satisfies this root: for a MIRROR (keep) root the whole
+            // point is a copy IN THE STORE — the source's own local location
+            // never satisfies it. For migrate/central roots any local copy
+            // does (the F5.3 owner-disk rule) — except a staged one, which is
+            // exactly what's about to be retired; counting it would strand
+            // the catalog entry with no live location.
+            let dest_prefix = format!(
+                "{}/",
+                pvfs_core::storage::path_to_uri(&dest)?.trim_end_matches('/')
+            );
+            let has_central = engine.locations(&id)?.iter().any(|u| {
+                if keep {
+                    u.starts_with(&dest_prefix)
+                } else {
+                    logged_local_location(u, &own_pin)
+                        && !staging_prefix.as_deref().is_some_and(|p| u.starts_with(p))
+                }
+            });
             if has_central {
                 report.satisfied += 1;
             } else {
@@ -239,14 +265,26 @@ pub fn tier_pass(
                 }
                 report.migrated += 1;
             }
-            // central copy live → retire foreign-instance locations
+            // MIRROR kind (central-keep, P8): the copy is the whole point —
+            // nothing is ever retired, the source keeps serving, and the
+            // logged store location doubles as a future swarm seed.
+            if keep {
+                continue;
+            }
+            // central copy live → retire foreign-instance locations, plus —
+            // for a migrate-kind binding — the staging dir's own file:// ones
             for u in engine.locations(&id)? {
-                if let Some((pin, _)) = pvfs_core::storage::parse_host_uri(&u) {
-                    if own_pin.as_deref() != Some(pin) {
-                        match engine.remove_location(&id, &u) {
-                            Ok(()) => report.retired += 1,
-                            Err(e) => report.failed.push((id.clone(), e.to_string())),
-                        }
+                let foreign = matches!(
+                    pvfs_core::storage::parse_host_uri(&u),
+                    Some((pin, _)) if own_pin.as_deref() != Some(pin)
+                );
+                let staged = staging_prefix
+                    .as_deref()
+                    .is_some_and(|p| u.starts_with(p));
+                if foreign || staged {
+                    match engine.remove_location(&id, &u) {
+                        Ok(()) => report.retired += 1,
+                        Err(e) => report.failed.push((id.clone(), e.to_string())),
                     }
                 }
             }

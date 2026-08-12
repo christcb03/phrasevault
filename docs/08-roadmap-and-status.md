@@ -168,11 +168,13 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | **P7.2d fleet region phase** ([deploy/fleet-test.sh](../deploy/fleet-test.sh) phase H) — ship one app's region to the edge across two real machines: hands-free follow sweep, verified cross-machine region streams, scoped replica isolation, seal verification | ✅ 57/57 (2026-08-11) |
 | **P7.2c cross-region moves** ([doc 20](20-f4-regions-and-streaming.md) §2.5) — the paired protocol (`NodeMovedOut`/`NodeMovedIn`, shared timestamp, mutual head refs), order-free replay, subtree stickiness, purge tombstones; lifts the P7.0 mv refusal + the adoption refusal (schema v6); plus the latent link-id reactivation fix | ✅ built + validated both hosts (2026-08-11) |
 
-**THE REGION ARC (P7.2) IS COMPLETE.** The queue's remainder: ② **P8**
-attachment policies (doc 21, approved); ③ **P9** swarm data plane (doc 20 §6 —
-parallel multi-holder chunk reads, resume, serve-while-fetching). The
-**release cut** was waiting on this arc — it is now Chris's call (doc 19 §4's
-packaging note: 1.4.0 = P5 + P6 + the P7 region/mount arc + fixes).
+| **P8 attachment policies** ([doc 21](21-attachment-policies.md)) — `bind --kind in-place\|migrate\|mirror`: one-command enrollment; migrate-kind staging drains itself (tier lands + retires, evict reclaims — with the consent-scoped eviction rail), mirror-kind keeps a verified second copy that survives source death and seeds the future swarm | ✅ built + validated both hosts + fleet phase I (2026-08-12) |
+
+**THE REGION ARC (P7.2) AND P8 ARE COMPLETE.** The queue's remainder: ③ **P9**
+swarm data plane (doc 20 §6 — parallel multi-holder chunk reads, resume,
+serve-while-fetching; punch J rides here). The **release cut** is Chris's
+call (doc 19 §4's packaging note — 1.4.0 = P5 + P6 + the P7 region/mount arc
++ P8 + fixes).
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):

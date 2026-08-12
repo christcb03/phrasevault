@@ -824,6 +824,48 @@ $PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$WREG" >/dev/null
 $PVFS replica sync "$REPMOUNT" >/dev/null \
   && ok "the seal ships and verifies on the replica" || fail "replica seal sync"
 
+say "P8: attachment policies — bind --kind migrate|mirror (doc 21)"
+# migrate: the staging dir drains — tier lands + retires, evict reclaims
+mkdir -p "$DATA/staging" "$DATA/mirror-src"
+printf 'drain-me' > "$DATA/staging/episode.mkv"
+MIG="$($PVFS add "$ROOT" --kind folder --label staging)"
+$PVFS bind "$MIG" "$DATA/staging" --kind migrate --to "$DATA/drain-store" --hash-policy on_add >/dev/null \
+  && ok "bind --kind migrate records the store" || fail "bind migrate"
+$PVFS scan "$MIG" >/dev/null
+EP="$($PVFS --json ls "$MIG" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "episode.mkv": print(e["id"])')"
+$PVFS tier >/dev/null 2>&1 && ok "tier pass over the migrate binding" || fail "tier migrate"
+[ -f "$DATA/drain-store/${EP:0:2}/$EP" ] && ok "central copy landed" || fail "no central copy"
+$PVFS loc ls "$EP" | qgrep "$DATA/staging" \
+  && fail "staged location still live after tier" || ok "staged location retired"
+$PVFS evict >/dev/null 2>&1
+[ -f "$DATA/staging/episode.mkv" ] \
+  && fail "staging bytes not reclaimed" || ok "evict drained the staging dir"
+$PVFS cat "$EP" | qgrep drain-me && ok "file streams from the central store" || fail "post-drain stream"
+# mirror: tier keeps a second verified copy; nothing retired, nothing evicted
+printf 'keep-me' > "$DATA/mirror-src/song.mp3"
+MIR="$($PVFS add "$ROOT" --kind folder --label mirror-space)"
+$PVFS bind "$MIR" "$DATA/mirror-src" --kind mirror --to "$DATA/mirror-store" --hash-policy on_add >/dev/null \
+  && ok "bind --kind mirror records the store" || fail "bind mirror"
+$PVFS scan "$MIR" >/dev/null
+SONG="$($PVFS --json ls "$MIR" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "song.mp3": print(e["id"])')"
+$PVFS tier >/dev/null 2>&1
+[ -f "$DATA/mirror-store/${SONG:0:2}/$SONG" ] && ok "mirror copy landed" || fail "no mirror copy"
+$PVFS loc ls "$SONG" | qgrep "$DATA/mirror-src" \
+  && ok "source location stays live (never retired)" || fail "mirror source retired"
+$PVFS evict >/dev/null 2>&1
+[ -f "$DATA/mirror-src/song.mp3" ] \
+  && ok "evict never touches a mirror source" || fail "mirror source evicted"
+# the backup story: the source dies, the mirror serves
+rm "$DATA/mirror-src/song.mp3"
+$PVFS cat "$SONG" 2>/dev/null | qgrep keep-me \
+  && ok "content survives source deletion via the mirror" || fail "mirror read-through"
+
 say "P7.3: FUSE mount — browse + stream through the kernel (doc 20 §3)"
 if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   mkdir -p "$DATA/fuse-view"

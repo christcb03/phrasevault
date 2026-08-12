@@ -125,6 +125,29 @@ and folder refs are skipped with a per-entry reason. `--mode hardlink` serves ap
 symlinks (same filesystem only); `--mode copy` streams through the verified read path, so a
 corrupted location can never land bytes in the export (it gets quarantined instead, like any read).
 
+### 6.1b Three ways to enroll a space (`pvfs bind --kind`, doc 21)
+
+When you bind a directory, its **kind** decides what happens to the bytes:
+
+```bash
+pvfs bind <folder> /mnt/library                                  # in-place (default): bytes stay put
+pvfs bind <folder> /mnt/ingest  --kind migrate --to /tank/store  # staging: the disk drains itself
+pvfs bind <folder> /mnt/photos  --kind mirror  --to /tank/backup # backup: a verified second copy
+```
+
+- **in-place** — today's bind, unchanged.
+- **migrate** — the space is staging. The mover (`pvfs tier`, or the daemon's
+  `tier` job) lands a verified copy in the store, retires the staged location,
+  and `evict` reclaims the bytes — an ingest disk that stays empty, enrolled
+  with one command.
+- **mirror** — the mover keeps a verified second copy in the store and **never
+  retires anything**: the source keeps serving, the copy is a live backup (if
+  the source dies, reads fall through to the mirror), and every mirror copy is
+  a future swarm seed (doc 20 §6). Omit `--to` and the command asks.
+
+The kind is placement state under the hood (`pvfs place … central|central-keep`
+work too); the store may not live inside the bound space.
+
 ### 6.2 The live mount (`pvfs mount`, Linux)
 
 Where an export materializes a snapshot, `pvfs mount <node> <dir>` presents the tree as a **live
@@ -568,7 +591,7 @@ run `pvfs member replace <file>`).
 | `pvfs walk <target>` · `pvfs node <target>` | Walk a tree · show one node. |
 | `pvfs add <parent> --kind … --label …` | Add a node. |
 | `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
-| `pvfs bind <folder> <dir>` · `pvfs scan <folder>` | Bind a real directory · index it. |
+| `pvfs bind <folder> <dir> [--kind in-place\|migrate\|mirror --to <store>]` · `pvfs scan <folder>` | Enroll a real directory — as-is, self-draining staging, or mirrored backup (§6.1b) · index it. |
 | `pvfs export <target> <dir> [--mode symlink\|hardlink\|copy] [--prune]` | Materialize a tree as a native directory for non-PVFS apps (§6.1). |
 | `pvfs mount <target> <dir>` · `pvfs umount <dir>` | Live read-only FUSE view — bytes stream on demand (§6.2, Linux). |
 | `pvfs region mark\|ls\|unmark <node>` | Make a subtree its own signed-log replication/audit unit (§6.3). |

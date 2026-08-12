@@ -188,6 +188,16 @@ enum Cmd {
         extensions: String,
         #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
         hash_policy: String,
+        /// P8 (doc 21): how this space is enrolled — in-place (bytes stay,
+        /// today's bind), migrate (staging: the mover drains it to a central
+        /// store), or mirror (the mover keeps a verified second copy, source
+        /// untouched).
+        #[arg(long, default_value = "in-place", value_parser = ["in-place", "migrate", "mirror"])]
+        kind: String,
+        /// Central store directory for --kind migrate|mirror (prompted for
+        /// when omitted).
+        #[arg(long)]
+        to: Option<PathBuf>,
     },
     /// Remove a folder's directory binding
     Unbind { folder: String },
@@ -229,10 +239,10 @@ enum Cmd {
     /// (owner-side, doc 17 §7.4)
     Place {
         target: String,
-        #[arg(value_parser = ["pointer", "sync", "central"])]
+        #[arg(value_parser = ["pointer", "sync", "central", "central-keep"])]
         mode: String,
         /// central-store directory (with `central`)
-        #[arg(long, required_if_eq("mode", "central"))]
+        #[arg(long, required_if_eq_any([("mode", "central"), ("mode", "central-keep")]))]
         to: Option<PathBuf>,
     },
     /// Fetch missing bytes from wherever they're reachable — for one
@@ -3044,13 +3054,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
-            if mode == "central" {
+            if mode == "central" || mode == "central-keep" {
                 let dest = to.expect("clap required_if_eq");
                 std::fs::create_dir_all(&dest)
                     .map_err(|e| PvfsError::io("create central store", e))?;
                 let dest = std::fs::canonicalize(&dest)
                     .map_err(|e| PvfsError::io("resolve central store", e))?;
-                pvfs_core::sync::set_central(&data_dir, &id, &dest)?;
+                pvfs_core::sync::set_central(&data_dir, &id, &dest, mode == "central-keep")?;
             } else {
                 pvfs_core::sync::set_placement(&data_dir, &id, mode == "sync")?;
             }
@@ -3948,7 +3958,36 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             no_auto_index,
             extensions,
             hash_policy,
+            kind,
+            to,
         } => {
+            // P8 (doc 21): resolve the store BEFORE binding — a bad store
+            // path must not leave a half-enrolled space. Prompted when
+            // omitted (prompts over flags).
+            let store = if kind == "in-place" {
+                None
+            } else {
+                let dest = match to {
+                    Some(d) => d,
+                    None => PathBuf::from(prompt_line(
+                        &format!("central store directory for the {kind}d bytes"),
+                        None,
+                    )?),
+                };
+                std::fs::create_dir_all(&dest)
+                    .map_err(|e| PvfsError::io("create central store", e))?;
+                let dest = std::fs::canonicalize(&dest)
+                    .map_err(|e| PvfsError::io("resolve central store", e))?;
+                let src = std::fs::canonicalize(&bind_dir)
+                    .map_err(|e| PvfsError::io("canonicalize dir", e))?;
+                if dest.starts_with(&src) {
+                    return Err(PvfsError::BadInput {
+                        field: "to".into(),
+                        reason: "the central store cannot live inside the bound space".into(),
+                    });
+                }
+                Some(dest)
+            };
             let mut engine = Engine::open(&ctx?)?;
             let abs = std::fs::canonicalize(&bind_dir)
                 .map_err(|e| PvfsError::io("canonicalize dir", e))?;
@@ -3963,8 +4002,18 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     hash_policy: HashPolicy::parse(&hash_policy)?,
                 },
             )?;
+            let data_dir = engine.data_dir().to_path_buf();
+            if let Some(dest) = &store {
+                pvfs_core::sync::set_central(&data_dir, &folder, dest, kind == "mirror")?;
+            }
             if json {
-                println!("{{\"bound\":true,\"source_uri\":\"{}\"}}", json_escape(&source_uri));
+                println!(
+                    "{{\"bound\":true,\"kind\":\"{}\",\"source_uri\":\"{}\"}}",
+                    json_escape(&kind),
+                    json_escape(&source_uri)
+                );
+            } else if let Some(dest) = &store {
+                println!("bound {folder} -> {source_uri} ({kind}; store {})", dest.display());
             } else {
                 println!("bound {folder} -> {source_uri}");
             }

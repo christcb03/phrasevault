@@ -383,6 +383,39 @@ ssh "$EDGE" '"$HOME/.local/bin/pvfs" replica sync "$HOME/fleet-test/replica" >/d
   && ok "edge replica synced + verified the sealed generation" || fail "edge seal sync"
 gate regions
 
+say "I: doc 21 — attachment kinds on the owner: staging drains, mirror survives (P8)"
+I_OUT=$(ssh "$OWNER" "ROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+mkdir -p "\$FT/staging" "\$FT/mirror-src"
+head -c 262144 /dev/urandom > "\$FT/staging/incoming.mkv"
+head -c 262144 /dev/urandom > "\$FT/mirror-src/precious.raw"
+PSHA=\$(sha256sum "\$FT/mirror-src/precious.raw" | cut -d' ' -f1)
+MIGF=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label staging-app)
+MIRF=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label mirror-app)
+"\$B/pvfs" --data-dir "\$D" bind "\$MIGF" "\$FT/staging" --kind migrate --to "\$FT/drain-store" --hash-policy on_add >/dev/null \
+  && echo "I1=ok" || echo "I1=no"
+"\$B/pvfs" --data-dir "\$D" bind "\$MIRF" "\$FT/mirror-src" --kind mirror --to "\$FT/mirror-store" --hash-policy on_add >/dev/null \
+  && echo "I2=ok" || echo "I2=no"
+"\$B/pvfs" --data-dir "\$D" scan "\$MIGF" >/dev/null
+"\$B/pvfs" --data-dir "\$D" scan "\$MIRF" >/dev/null
+PREC=\$("\$B/pvfs" --json --data-dir "\$D" ls "\$MIRF" | pick precious.raw)
+"\$B/pvfs" --data-dir "\$D" tier >/dev/null 2>&1
+"\$B/pvfs" --data-dir "\$D" evict >/dev/null 2>&1
+[ -f "\$FT/staging/incoming.mkv" ] && echo "I3=no" || echo "I3=ok"
+[ -f "\$FT/mirror-src/precious.raw" ] && echo "I4=ok" || echo "I4=no"
+rm -f "\$FT/mirror-src/precious.raw"
+GSHA=\$("\$B/pvfs" --data-dir "\$D" cat "\$PREC" 2>/dev/null | sha256sum | cut -d' ' -f1)
+[ "\$GSHA" = "\$PSHA" ] && echo "I5=ok" || echo "I5=no(\$GSHA)"
+EOS
+)
+echo "$I_OUT" | grep -q "I1=ok" && ok "bind --kind migrate (one command enrolls the staging disk)" || fail "bind migrate: $I_OUT"
+echo "$I_OUT" | grep -q "I2=ok" && ok "bind --kind mirror (one command enrolls the backup space)" || fail "bind mirror"
+echo "$I_OUT" | grep -q "I3=ok" && ok "the staging disk drained (tier landed + retired, evict reclaimed)" || fail "staging did not drain"
+echo "$I_OUT" | grep -q "I4=ok" && ok "the mirror source keeps its bytes" || fail "mirror source touched"
+echo "$I_OUT" | grep -q "I5=ok" && ok "content survives source deletion, bit-perfect via the mirror copy" || fail "mirror survival"
+gate attachments
+
 say "cleanup — stop fleet daemons (dirs kept for inspection)"
 ssh "$OWNER" 'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'
 ssh "$EDGE"  'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'

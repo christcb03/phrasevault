@@ -5,6 +5,16 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Attachment policies (P8, doc 21):** `pvfs bind <folder> <dir> --kind
+  in-place|migrate|mirror [--to <store>]` — enrollment chooses the space's
+  fate in one command. `migrate` = staging: the mover lands a verified copy
+  in the store, retires the staged location (a new capability — the binding's
+  own `file://` locations retire once a non-staged copy is live), and evict
+  reclaims the bytes. `mirror` = the new `central-keep` placement mode: the
+  mover maintains a verified second copy and never retires the source — a
+  live backup that also seeds the future swarm (doc 20 §6). Placement file
+  grows `central-keep` lines; `pvfs place <node> central-keep --to <dir>`
+  exposes the mode directly.
 - **Cross-region moves (P7.2c, doc 20 §2.5):** `mv` across a region boundary
   works — the paired protocol authors `NodeMovedOut` in the source region's
   log and `NodeMovedIn` in the destination's, one commit, one shared

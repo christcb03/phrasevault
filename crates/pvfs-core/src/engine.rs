@@ -1645,22 +1645,27 @@ impl Engine {
     /// this host may now delete, once it confirms another live location.
     /// Empty when this instance has no transport pin.
     pub fn retired_own_host_locations(&self) -> Result<Vec<(NodeId, String, PathBuf)>> {
-        let Some(pin) = crate::storage::host_pin(&self.data_dir) else {
-            return Ok(Vec::new());
-        };
-        let prefix = format!("{}{pin}/", crate::storage::HOST_URI_PREFIX);
+        // Two shapes of "this box's bytes were retired by the mover":
+        // pvfs-host:// under our own pin (the F5.3 edge flow), and — P8
+        // (doc 21) — plain file:// staged locations that a migrate-kind
+        // binding's tier pass retired. file:// is local by definition.
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT DISTINCT file_id, uri FROM file_locations l1
-                 WHERE uri LIKE ?1 || '%' AND removed_at IS NOT NULL
+                 WHERE (uri LIKE ?1 || '%' OR uri LIKE 'file://%')
+                   AND removed_at IS NOT NULL
                    AND NOT EXISTS (SELECT 1 FROM file_locations l2
                                    WHERE l2.file_id = l1.file_id AND l2.uri = l1.uri
                                      AND l2.removed_at IS NULL)",
             )
             .map_err(map_db("retired locations"))?;
+        let own_prefix = crate::storage::host_pin(&self.data_dir)
+            .map(|pin| format!("{}{pin}/", crate::storage::HOST_URI_PREFIX))
+            // no pin minted: a LIKE prefix that matches nothing host-shaped
+            .unwrap_or_else(|| "\u{0}".into());
         let rows = stmt
-            .query_map(params![prefix], |r| {
+            .query_map(params![own_prefix], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(map_db("retired locations"))?;
@@ -1669,6 +1674,8 @@ impl Engine {
             let (file_id, uri) = row.map_err(map_db("retired locations"))?;
             if let Some((_, path)) = crate::storage::parse_host_uri(&uri) {
                 out.push((file_id, uri.clone(), PathBuf::from(path)));
+            } else if let Ok(path) = crate::storage::uri_to_path(&uri) {
+                out.push((file_id, uri.clone(), path));
             }
         }
         Ok(out)

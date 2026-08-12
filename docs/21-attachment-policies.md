@@ -1,7 +1,8 @@
-# 21 — Attachment policies: three kinds of storage enrollment (P8 candidate)
+# 21 — Attachment policies: three kinds of storage enrollment (P8)
 
-**Status: APPROVED (Chris, 2026-08-11) — §3 resolved below; build slot = P8, after
-the region arc (doc 20 §2.1). Supersedes the narrow "sync --to migrator" question.**
+**Status: BUILT + VALIDATED (P8, 2026-08-12 — see §5 close-out).**
+Approved by Chris 2026-08-11; §3 resolved below. Supersedes the narrow
+"sync --to migrator" question.
 
 ## 1. The requirement (Chris, verbatim intent)
 
@@ -52,3 +53,33 @@ P8.0 `--kind` recorded + in-place/migrate wired over existing machinery (mostly
 plumbing + jobs); P8.1 `central-keep` mode + mirror semantics in tier/evict;
 validate with a fleet-test phase (ingest disk drains; mirror survives source
 deletion). Rough size: one evening.
+
+## 5. Close-out (2026-08-12)
+
+Built as §2's mapping promised — placement grew `central-keep`, the mover
+walks both lists, `bind --kind` is enrollment sugar that records the
+placement (prompting for the store when `--to` is omitted; a store inside the
+bound space is refused). Validated: full pipeline on both hosts, the smoke
+suite's new P8 section (11 checks: drain, retire, reclaim, mirror copy,
+never-retire, never-evict, source-death survival), and fleet phase I.
+Deviations and findings, honestly:
+
+- **Single-box migrate needed a real semantic addition, not just plumbing**:
+  §2's table said "tier migrates + retires the space's locations", but the
+  mover only retired foreign `pvfs-host://` locations (the §7.10 two-box
+  flow). A migrate-kind binding's own `file://` staging locations now retire
+  too — with two safety rails found by the smoke suite: a staged copy never
+  satisfies the "central copy exists" check (it would have retired the only
+  live copy), and retired `file://` locations are evictable ONLY under a
+  migrate-kind binding's source dir (a manual `loc rm` of an in-place path
+  must never cost the user their file — draining is consent given at
+  enrollment, not a property of retraction).
+- **The mirror satisfaction test is store-specific**: any local copy
+  satisfies a plain `central` root (the F5.3 owner-disk rule), but a mirror
+  root is only satisfied by a copy IN ITS STORE — the source's own location
+  satisfying it would have meant no second copy ever landed.
+- Regions interaction (§3.4): confirmed nothing special — placement is
+  deployment state, and the mover's logged location events route to each
+  file's region like any other write.
+- Punch J's swarm inheritance stands as designed: mirror copies are logged
+  locations, so they join the P9 seed set with zero further work here.

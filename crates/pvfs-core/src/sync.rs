@@ -130,6 +130,11 @@ pub fn placement_path(data_dir: &Path) -> PathBuf {
 pub struct Placement {
     pub sync: Vec<NodeId>,
     pub central: Vec<(NodeId, PathBuf)>,
+    /// P8 (doc 21): `central-keep` — the mirror mode. The mover lands and
+    /// logs the verified central copy but NEVER retires the source, so the
+    /// space keeps its bytes and the tree gains a backup replica (and a
+    /// future swarm seed, doc 20 §6).
+    pub central_keep: Vec<(NodeId, PathBuf)>,
 }
 
 pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
@@ -146,6 +151,11 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
     for line in lines.filter(|l| !l.trim().is_empty()) {
         if let Some(id) = line.strip_prefix("sync ") {
             out.sync.push(id.to_string());
+        } else if let Some(rest) = line.strip_prefix("central-keep ") {
+            match rest.split_once(' ') {
+                Some((id, dir)) => out.central_keep.push((id.to_string(), PathBuf::from(dir))),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
         } else if let Some(rest) = line.strip_prefix("central ") {
             match rest.split_once(' ') {
                 Some((id, dir)) => out.central.push((id.to_string(), PathBuf::from(dir))),
@@ -168,6 +178,20 @@ pub fn load_central(data_dir: &Path) -> Result<Vec<(NodeId, PathBuf)>> {
     Ok(load_placement_full(data_dir)?.central)
 }
 
+/// Every mover-walked subtree: `(root, store, keep)` — `keep` = the mirror
+/// mode (`central-keep`, P8): copy + log, never retire.
+pub fn load_central_all(data_dir: &Path) -> Result<Vec<(NodeId, PathBuf, bool)>> {
+    let p = load_placement_full(data_dir)?;
+    let mut out: Vec<(NodeId, PathBuf, bool)> = Vec::new();
+    for (id, dir) in p.central {
+        out.push((id, dir, false));
+    }
+    for (id, dir) in p.central_keep {
+        out.push((id, dir, true));
+    }
+    Ok(out)
+}
+
 fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     let mut text = String::from(PLACEMENT_HEADER);
     text.push('\n');
@@ -176,6 +200,9 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     }
     for (r, d) in &p.central {
         text.push_str(&format!("central {r} {}\n", d.display()));
+    }
+    for (r, d) in &p.central_keep {
+        text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
     crate::storage::atomic_overwrite(&placement_path(data_dir), text.as_bytes())
 }
@@ -186,6 +213,7 @@ pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
     p.sync.retain(|r| r != id);
     p.central.retain(|(r, _)| r != id);
+    p.central_keep.retain(|(r, _)| r != id);
     if sync {
         p.sync.push(id.clone());
     }
@@ -193,11 +221,17 @@ pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
 }
 
 /// Place `id` as `central` with its store directory (owner-side, F5.3).
-pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path) -> Result<()> {
+/// `keep` = the P8 mirror mode: the mover copies + logs but never retires.
+pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path, keep: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
     p.sync.retain(|r| r != id);
     p.central.retain(|(r, _)| r != id);
-    p.central.push((id.clone(), dest.to_path_buf()));
+    p.central_keep.retain(|(r, _)| r != id);
+    if keep {
+        p.central_keep.push((id.clone(), dest.to_path_buf()));
+    } else {
+        p.central.push((id.clone(), dest.to_path_buf()));
+    }
     save_placement(data_dir, &p)
 }
 
@@ -218,7 +252,20 @@ pub struct EvictReport {
 /// sync-store entries never count: they aren't catalog truth).
 pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
     let mut report = EvictReport::default();
+    // P8 (doc 21): retired plain file:// locations are evictable ONLY under a
+    // migrate-kind binding's source dir — that binding consented to draining
+    // at enrollment. A manually retracted (`loc rm`) in-place location must
+    // never cost the user their file, even with a live copy elsewhere.
+    let staging_prefixes: Vec<String> = load_central_all(engine.data_dir())?
+        .into_iter()
+        .filter(|(_, _, keep)| !keep)
+        .filter_map(|(root, _, _)| engine.binding_for(&root).ok().flatten())
+        .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
+        .collect();
     for (id, uri, path) in engine.retired_own_host_locations()? {
+        if uri.starts_with("file://") && !staging_prefixes.iter().any(|p| uri.starts_with(p)) {
+            continue; // not a migrate-kind staging location — never touch it
+        }
         let live_elsewhere = engine
             .locations(&id)?
             .iter()
