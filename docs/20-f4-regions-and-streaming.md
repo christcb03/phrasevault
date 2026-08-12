@@ -361,5 +361,19 @@ phase validates on presubuntu before its commit, as always.
   - `--region` reduces bytes, not rights (§2.4's honest note): the top log
     still ships whole under the forest-root gate. Lesser-privilege region
     replication needs top-log filtering (doc 03 §6 Q7) — future work.
+- **P7.2d landed** (2026-08-11): `deploy/fleet-test.sh` phase H — **57/57
+  across both machines**: two app regions marked on the live served forest,
+  region content reaching the edge **hands-free through the follow job's
+  sweep**, the generation file on the edge, a region file streamed
+  cross-machine hash-verified, `replica add --region` with sibling-interior
+  isolation, and the seal verifying on the edge's next sync. Honest gap: an
+  `export` run *from the scoped replica* wasn't separately exercised (export
+  from a whole-forest replica is phase-G-proven and export has no
+  region-specific code path). Ops note from the run: the fleet's
+  `~/.local/bin` binaries install under the pipeline's **daemon** tag —
+  run it after building when the fleet test will be used, or the previous
+  binaries serve. **The region arc's remaining sub-phase is P7.2c**
+  (cross-region moves — the paired-event protocol), after which the P7.0
+  refusals lift and the release cut can be discussed.
 - **Morning decisions for Chris:** (1) §7's P7.1→P7.2 merge proposal; (2) doc 19's
   packaging intent — 1.4.0 = P5 + P6 + fixes, with P7.0/P7.3 riding or waiting.
