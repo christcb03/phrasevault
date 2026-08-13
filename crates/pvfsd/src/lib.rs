@@ -278,8 +278,8 @@ pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, mut stream: S)
         // Cat uses the data plane: it writes multiple frames to the stream
         // directly rather than returning a single ServerMsg.
         match req {
-            ClientMsg::Cat { node } => {
-                do_cat(daemon, &principal, &mut stream, &node)?;
+            ClientMsg::Cat { node, offset, len } => {
+                do_cat(daemon, &principal, &mut stream, &node, offset, len)?;
                 continue;
             }
             ClientMsg::SecureCat { node } => {
@@ -391,6 +391,23 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
         } => do_log_wait(daemon, principal, from_seq, max, timeout_ms, &region),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
+        // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
+        ClientMsg::ChunkManifest { node } => {
+            let e = daemon.reader();
+            match e.effective_rights(principal, &node) {
+                Ok(r) if r & acl::ACL_R != 0 => {}
+                Ok(_) => return err("forbidden", "access denied"),
+                Err(pve) => return err_from(pve),
+            }
+            match e.chunk_manifest(&node) {
+                Ok((size, chunk_size, hashes)) => ServerMsg::ChunkManifest {
+                    size,
+                    chunk_size,
+                    hashes: hashes.iter().map(hex::encode).collect(),
+                },
+                Err(pve) => err_from(pve),
+            }
+        }
         // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
         ClientMsg::Cat { .. }
         | ClientMsg::SecureCat { .. }
@@ -599,6 +616,8 @@ fn do_cat<S: io::Read + io::Write>(
     principal: &Principal,
     stream: &mut S,
     node: &str,
+    offset: u64,
+    len: u64,
 ) -> io::Result<()> {
     let id: NodeId = node.to_string();
 
@@ -639,7 +658,17 @@ fn do_cat<S: io::Read + io::Write>(
             return Ok(());
         }
     };
-    write_msg(stream, &ServerMsg::CatStart { size })?;
+    // P9 (doc 22): (0,0) = the whole file (old peers unchanged); a range
+    // must lie within the file. `size` in CatStart is what WILL be sent.
+    let want = if offset == 0 && len == 0 {
+        size
+    } else if offset.checked_add(len).is_some_and(|end| end <= size) && len > 0 {
+        len
+    } else {
+        write_msg(stream, &err("bad_input", "range outside the file"))?;
+        return Ok(());
+    };
+    write_msg(stream, &ServerMsg::CatStart { size: want })?;
 
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
@@ -649,12 +678,20 @@ fn do_cat<S: io::Read + io::Write>(
             return Err(e);
         }
     };
+    if offset > 0 {
+        use std::io::Seek as _;
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
+            write_data_frame(stream, &[])?;
+            return Err(e);
+        }
+    }
 
     let mut buf = vec![0u8; DATA_CHUNK];
     let mut written: u64 = 0;
-    loop {
+    while written < want {
         use std::io::Read as _;
-        let got = file.read(&mut buf).map_err(|e| {
+        let cap = (DATA_CHUNK as u64).min(want - written) as usize;
+        let got = file.read(&mut buf[..cap]).map_err(|e| {
             io::Error::new(e.kind(), format!("cat read: {e}"))
         })?;
         if got == 0 {

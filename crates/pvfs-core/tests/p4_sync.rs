@@ -142,9 +142,11 @@ fn startup_sweep_removes_orphaned_tmps() {
     assert!(stray.exists(), "non-tmp name untouched");
 
     // a fresh in-flight tmp begun after the sweep is untouched and commits
+    // (4 files: the published store file + its P9 manifest sidecar, the
+    // stray, and the new tmp)
     let mut sink = engine.sync_begin(&file).unwrap();
     sink.write_all(b"data").unwrap();
-    assert_eq!(walkdir_files(&dir.path().join("synced")).len(), 3, "new tmp present");
+    assert_eq!(walkdir_files(&dir.path().join("synced")).len(), 4, "new tmp present");
     sink.write_all(b"-bytes").unwrap();
     engine.sync_commit(sink).unwrap();
     let mut out = Vec::new();
@@ -243,4 +245,59 @@ fn host_qualified_locations_resolve_by_pin() {
     // stat degrades to unavailable, never errors
     let st = engine.stat_node(&foreign).unwrap();
     assert!(st.locations.iter().all(|l| !l.exists));
+}
+
+// ---- P9 (doc 22): chunk manifests + the swarm publish gate ------------------
+
+#[test]
+fn manifest_sidecar_roundtrips_and_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("blob.bin");
+    // 2.5 chunks of deterministic bytes
+    let data: Vec<u8> = (0..(sync::SWARM_CHUNK * 5 / 2) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&f, &data).unwrap();
+    let m1 = sync::manifest_for(&f).unwrap();
+    assert_eq!(m1.len(), 3, "ceil(2.5) chunks");
+    assert!(sync::manifest_sidecar_path(&f).exists(), "sidecar cached");
+    // per-chunk hashes match independent computation
+    for (i, h) in m1.iter().enumerate() {
+        let off = i * sync::SWARM_CHUNK as usize;
+        let end = (off + sync::SWARM_CHUNK as usize).min(data.len());
+        assert_eq!(blake3::hash(&data[off..end]).as_bytes(), h, "chunk {i}");
+    }
+    // second call reads the cache (same result)
+    assert_eq!(sync::manifest_for(&f).unwrap(), m1);
+    // a stale sidecar for different-size content is recomputed
+    std::fs::write(&f, &data[..data.len() / 2]).unwrap();
+    let m2 = sync::manifest_for(&f).unwrap();
+    assert_eq!(m2.len(), 2, "recomputed for the new size");
+}
+
+#[test]
+fn swarm_commit_keeps_the_whole_file_gate() {
+    let (dir, mut engine) = new_forest();
+    let root = engine.identity.root_node_id.clone();
+    let content = b"swarm-gate-bytes".repeat(1024);
+    let file = engine
+        .add_node(&root, file_spec("s.bin", &content, true))
+        .unwrap();
+    let part = sync::swarm_part_path(dir.path(), &file).unwrap();
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+
+    let manifest = vec![*blake3::hash(&content).as_bytes()]; // single chunk
+
+    // a corrupt assembly is refused and the partial KEPT for resume
+    std::fs::write(&part, b"garbage").unwrap();
+    assert!(engine.swarm_commit(&file, &part, &manifest).is_err());
+    assert!(part.exists(), "failed publish leaves the partial for resume");
+
+    // the true bytes publish atomically and then serve
+    std::fs::write(&part, &content).unwrap();
+    let dest = engine.swarm_commit(&file, &part, &manifest).unwrap();
+    assert!(dest.exists() && !part.exists());
+    let mut out = Vec::new();
+    engine.cat(&file, None, &mut out).unwrap();
+    assert_eq!(out, content);
 }

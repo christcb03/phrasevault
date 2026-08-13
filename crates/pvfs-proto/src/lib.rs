@@ -66,6 +66,13 @@ pub enum ServerMsg {
     },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
+    /// P9 (doc 22): the chunk manifest for a file this holder can read —
+    /// `hashes[i]` is the hex BLAKE3 of bytes `[i*chunk_size, ...)`.
+    ChunkManifest {
+        size: u64,
+        chunk_size: u64,
+        hashes: Vec<String>,
+    },
     /// The job runner's live state (response to `ClientMsg::ServeStatus`; P5).
     /// `runner` is `"on"` when a runner thread is attached, `"off"` when this
     /// daemon predates jobs or was started without one.
@@ -189,8 +196,21 @@ pub enum ClientMsg {
     /// Read a node's inline payload (read-ACL-gated; hex on the wire).
     Payload { node: String },
     /// Stream a file node's bytes. Server responds: CatStart, then binary data
-    /// frames (`write_data_frame`), then CatDone.
-    Cat { node: String },
+    /// frames (`write_data_frame`), then CatDone. P9 (doc 22): `offset`/`len`
+    /// select a byte range — `(0, 0)` (the defaults, absent on the wire) is
+    /// the whole file, so old peers interoperate unchanged.
+    Cat {
+        node: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        len: u64,
+    },
+    /// P9 (doc 22): the file's chunk manifest — BLAKE3 per 8 MiB chunk,
+    /// computed from the holder's bytes (sidecar-cached). UNSIGNED and
+    /// advisory: it steers parallel pulls and resume; the catalog hash
+    /// remains the trust anchor. Read-gated like `Cat`.
+    ChunkManifest { node: String },
     /// Stream a **secure** blob's ciphertext (doc 12 §8), verified against the
     /// signed ledger first. Same wire shape as `Cat` (CatStart → frames → CatDone).
     SecureCat { node: String },
@@ -331,6 +351,10 @@ pub fn read_data_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
     Ok(Some(body))
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 fn invalid<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {

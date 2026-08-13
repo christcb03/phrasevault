@@ -343,6 +343,12 @@ Three things to know:
 - **Replicas are read-only.** The owner's instance stays the forest's only writer; local writes and
   writes via a replica's daemon are refused. ACLs answer identically on a replica (the grants are
   in the log), and file bytes read through wherever the recorded locations resolve.
+- **Fetches swarm (P9.0, doc 22).** When two or more registered holders have a
+  file, `pvfs sync` / self-healing `cat` / the daemon's `sync` job pull it as
+  parallel verified chunks from ALL of them at once, and a killed transfer
+  resumes where it left off. Nothing to configure: holders come from the
+  instance registry and the file's logged locations (mirror copies included),
+  and verification is unchanged — the catalog hash still gates every publish.
 - **Regions ship too.** A replica mirrors the source's per-region logs (§6.3): `add`, `sync`, and
   `follow` all discover and pull every region generation, each chain-verified against the baseline
   the enclosing log committed. `pvfs replica add <dir> --region <node>` scopes the replica to one

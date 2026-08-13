@@ -250,6 +250,20 @@ impl Client {
         }
     }
 
+    /// P9 (doc 22): a holder's chunk manifest for `node` — advisory, unsigned
+    /// (the catalog hash stays the trust anchor). Errors when the holder has
+    /// no bytes or predates the swarm.
+    pub fn chunk_manifest(&mut self, node: &str) -> Result<(u64, u64, Vec<String>)> {
+        match self.request(ClientMsg::ChunkManifest { node: node.into() })? {
+            ServerMsg::ChunkManifest {
+                size,
+                chunk_size,
+                hashes,
+            } => Ok((size, chunk_size, hashes)),
+            other => Err(unexpected("ChunkManifest", &other)),
+        }
+    }
+
     /// The served log's chain tip (F2 log shipping). Requires admin rights on
     /// the forest root — or, for a region-scoped request (P7.2b: `region` =
     /// the generation address, `""` = top), on that region's root.
@@ -305,7 +319,27 @@ impl Client {
     /// Stream a file node's bytes to `out` using the raw binary data plane
     /// (doc 07 §6, PROTO_VERSION 2). Returns the total number of bytes written.
     pub fn cat(&mut self, node: &str, out: &mut dyn std::io::Write) -> Result<u64> {
-        write_msg(&mut self.stream, &ClientMsg::Cat { node: node.into() })?;
+        self.cat_range(node, 0, 0, out)
+    }
+
+    /// P9 (doc 22): stream a byte range — `(0, 0)` = the whole file. The
+    /// swarm fetcher pulls chunks with this; old servers only understand the
+    /// whole-file form (the caller falls back on error).
+    pub fn cat_range(
+        &mut self,
+        node: &str,
+        offset: u64,
+        len: u64,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::Cat {
+                node: node.into(),
+                offset,
+                len,
+            },
+        )?;
         // Server responds: CatStart (JSON) → binary data frames → CatDone (JSON).
         let size = match read_msg::<_, ServerMsg>(&mut self.stream)? {
             Some(ServerMsg::CatStart { size }) => size,

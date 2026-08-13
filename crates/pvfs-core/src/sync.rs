@@ -116,6 +116,108 @@ pub fn parse_sync_uri(uri: &str) -> Option<&str> {
         .filter(|id| !id.is_empty() && !id.contains('/') && !id.contains(".."))
 }
 
+// ---- chunk manifests (P9, doc 22) --------------------------------------------
+//
+// UNSIGNED and advisory: per-chunk BLAKE3 steers parallel pulls, early
+// bad-holder rejection, and resume. The catalog hash stays the only trust
+// anchor — the whole-file verify-then-rename gate below is unchanged.
+
+/// Swarm chunk size (doc 22 §3).
+pub const SWARM_CHUNK: u64 = 8 * 1024 * 1024;
+const MANIFEST_HEADER: &str = "pvfs-manifest 1";
+
+/// The sidecar next to a stored/served file.
+pub fn manifest_sidecar_path(file: &Path) -> PathBuf {
+    let mut os = file.as_os_str().to_os_string();
+    os.push(".manifest");
+    PathBuf::from(os)
+}
+
+/// Compute a file's chunk manifest by reading it.
+pub fn compute_manifest(path: &Path) -> Result<Vec<[u8; 32]>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for manifest", e))?;
+    let mut hashes = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut hasher = blake3::Hasher::new();
+    let mut in_chunk: u64 = 0;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| PvfsError::io("read for manifest", e))?;
+        if n == 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off < n {
+            let room = (SWARM_CHUNK - in_chunk) as usize;
+            let take = room.min(n - off);
+            hasher.update(&buf[off..off + take]);
+            in_chunk += take as u64;
+            off += take;
+            if in_chunk == SWARM_CHUNK {
+                hashes.push(*hasher.finalize().as_bytes());
+                hasher = blake3::Hasher::new();
+                in_chunk = 0;
+            }
+        }
+    }
+    if in_chunk > 0 {
+        hashes.push(*hasher.finalize().as_bytes());
+    }
+    Ok(hashes)
+}
+
+fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
+    let mut text = format!("{MANIFEST_HEADER}\n{SWARM_CHUNK}\n");
+    for h in hashes {
+        text.push_str(&hex::encode(h));
+        text.push('\n');
+    }
+    crate::storage::atomic_overwrite(&manifest_sidecar_path(file), text.as_bytes())
+}
+
+fn read_manifest_sidecar(file: &Path) -> Option<Vec<[u8; 32]>> {
+    let text = std::fs::read_to_string(manifest_sidecar_path(file)).ok()?;
+    let mut lines = text.lines();
+    if lines.next() != Some(MANIFEST_HEADER) {
+        return None;
+    }
+    if lines.next()?.parse::<u64>().ok()? != SWARM_CHUNK {
+        return None; // chunk size changed — recompute
+    }
+    let mut out = Vec::new();
+    for l in lines.filter(|l| !l.trim().is_empty()) {
+        let bytes = hex::decode(l.trim()).ok()?;
+        out.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
+    }
+    Some(out)
+}
+
+/// A served file's manifest: the sidecar when present and plausible for the
+/// file's size, else computed and cached (best-effort — a read-only store
+/// still answers, just without the cache).
+pub fn manifest_for(path: &Path) -> Result<Vec<[u8; 32]>> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| PvfsError::io("stat for manifest", e))?
+        .len();
+    let expect = if size == 0 { 0 } else { size.div_ceil(SWARM_CHUNK) } as usize;
+    if let Some(m) = read_manifest_sidecar(path) {
+        if m.len() == expect {
+            return Ok(m);
+        }
+    }
+    let m = compute_manifest(path)?;
+    let _ = write_manifest_sidecar(path, &m);
+    Ok(m)
+}
+
+/// The resumable swarm partial for a fetch (doc 22 §3). Deliberately NOT a
+/// `.tmp` name — the startup sweep leaves it alone, which is what makes
+/// kill-anywhere resume free.
+pub fn swarm_part_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
+    let dest = sync_store_path(data_dir, id)?;
+    Ok(dest.with_file_name(format!(".{id}.swarmpart")))
+}
+
 // ---- placement policy (deployment file) -------------------------------------
 
 pub fn placement_path(data_dir: &Path) -> PathBuf {
@@ -308,6 +410,11 @@ pub struct SyncSink {
     written: u64,
     expected_hash: String,
     expected_size: u64,
+    /// P9 (doc 22): chunk hashes computed INLINE while bytes stream — the
+    /// sidecar costs no second read of the published file.
+    chunk_hasher: blake3::Hasher,
+    in_chunk: u64,
+    chunk_hashes: Vec<[u8; 32]>,
 }
 
 impl Write for SyncSink {
@@ -319,6 +426,18 @@ impl Write for SyncSink {
         f.write_all(buf)?;
         self.hasher.update(buf);
         self.written += buf.len() as u64;
+        let mut off = 0usize;
+        while off < buf.len() {
+            let take = ((SWARM_CHUNK - self.in_chunk) as usize).min(buf.len() - off);
+            self.chunk_hasher.update(&buf[off..off + take]);
+            self.in_chunk += take as u64;
+            off += take;
+            if self.in_chunk == SWARM_CHUNK {
+                self.chunk_hashes.push(*self.chunk_hasher.finalize().as_bytes());
+                self.chunk_hasher = blake3::Hasher::new();
+                self.in_chunk = 0;
+            }
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -424,7 +543,71 @@ impl Engine {
             written: 0,
             expected_hash: payload.content_hash,
             expected_size: payload.size_bytes,
+            chunk_hasher: blake3::Hasher::new(),
+            in_chunk: 0,
+            chunk_hashes: Vec::new(),
         })
+    }
+
+    /// P9 (doc 22): a file's chunk manifest, served from any readable local
+    /// copy (sidecar-cached). Errors NotFound when this box holds no bytes.
+    pub fn chunk_manifest(&self, id: &NodeId) -> Result<(u64, u64, Vec<[u8; 32]>)> {
+        let path = self.readable_path(id)?.ok_or(PvfsError::NotFound {
+            kind: "file bytes",
+            id: id.clone(),
+        })?;
+        let size = std::fs::metadata(&path)
+            .map_err(|e| PvfsError::io("stat for manifest", e))?
+            .len();
+        Ok((size, SWARM_CHUNK, manifest_for(&path)?))
+    }
+
+    /// P9 (doc 22): verify and publish an assembled swarm partial — the SAME
+    /// trust gate as [`sync_commit`](Self::sync_commit): whole-file hash (or
+    /// size for unhashed nodes) against the catalog, then the atomic rename.
+    /// On failure the partial is LEFT IN PLACE for resume.
+    pub fn swarm_commit(
+        &mut self,
+        id: &NodeId,
+        part: &Path,
+        manifest: &[[u8; 32]],
+    ) -> Result<PathBuf> {
+        let n = fetch_node(&self.conn, id)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: id.clone(),
+        })?;
+        let payload = FilePayload::decode(&n.payload)?;
+        let dest = sync_store_path(&self.data_dir, id)?;
+        let mut f = std::fs::File::open(part).map_err(|e| PvfsError::io("open swarm part", e))?;
+        let mut hasher = blake3::Hasher::new();
+        std::io::copy(&mut f, &mut hasher).map_err(|e| PvfsError::io("hash swarm part", e))?;
+        drop(f);
+        let actual = hasher.finalize().to_hex().to_string();
+        if payload.content_hash.is_empty() {
+            // the fetcher only swarms hashed files; refuse a bypass
+            return Err(bad("sync", "swarm publish requires a hashed file"));
+        }
+        if actual != payload.content_hash {
+            return Err(PvfsError::Integrity {
+                kind: "sync",
+                id: id.clone(),
+                reason: IntegrityReason::IdMismatch {
+                    expected: payload.content_hash,
+                    actual,
+                },
+            });
+        }
+        std::fs::rename(part, &dest).map_err(|e| PvfsError::io("publish swarm file", e))?;
+        // every chunk was verified against this manifest during assembly and
+        // the whole just passed the catalog gate — cache it without a re-read
+        let _ = write_manifest_sidecar(&dest, manifest);
+        self.conn
+            .execute(
+                "DELETE FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
+                rusqlite::params![id, sync_uri(id)],
+            )
+            .map_err(crate::error::map_db("lift sync quarantine"))?;
+        Ok(dest)
     }
 
     /// Verify and publish a completed fetch. With a known content hash the
@@ -464,6 +647,14 @@ impl Engine {
             });
         }
         std::fs::rename(&sink.tmp, &sink.dest).map_err(|e| PvfsError::io("publish sync file", e))?;
+        // P9 (doc 22): the sidecar comes from the hashes computed INLINE as
+        // the bytes streamed — a 3 GiB publish must not cost a 3 GiB re-read
+        // (found by the fleet's view-refresh window). Best-effort.
+        let mut chunks = std::mem::take(&mut sink.chunk_hashes);
+        if sink.in_chunk > 0 {
+            chunks.push(*sink.chunk_hasher.finalize().as_bytes());
+        }
+        let _ = write_manifest_sidecar(&sink.dest, &chunks);
         // A prior copy may have been quarantined (verify-on-read); fresh
         // verified bytes lift it. Projection-local — fine on a replica.
         self.conn

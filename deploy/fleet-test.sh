@@ -416,6 +416,94 @@ echo "$I_OUT" | grep -q "I4=ok" && ok "the mirror source keeps its bytes" || fai
 echo "$I_OUT" | grep -q "I5=ok" && ok "content survives source deletion, bit-perfect via the mirror copy" || fail "mirror survival"
 gate attachments
 
+say "J: doc 22 — the swarm: one file, two real holders, parallel verified chunks (P9.0)"
+# a 1 GiB hashed target on the owner — OUTSIDE the tiered library, in its own
+# in-place binding: the mover must never retire the second holder's location
+# (phase G's tier job consolidates LIB by design — found the hard way)
+J_OWNER=$(ssh "$OWNER" "ROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+mkdir -p "\$FT/swarmdata"
+head -c 1073741824 /dev/urandom > "\$FT/swarmdata/swarm.mkv"
+SZ=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label swarm-zone)
+"\$B/pvfs" --data-dir "\$D" bind "\$SZ" "\$FT/swarmdata" --hash-policy on_add >/dev/null 2>&1
+"\$B/pvfs" --data-dir "\$D" scan "\$SZ" >/dev/null 2>&1
+SW=\$("\$B/pvfs" --json --data-dir "\$D" ls "\$SZ" | pick swarm.mkv)
+echo "SW=\$SW"
+echo "SWSHA=\$(sha256sum "\$FT/swarmdata/swarm.mkv" | cut -d' ' -f1)"
+EOS
+)
+eval "$(echo "$J_OWNER" | grep -E '^(SW|SWSHA)=')"
+[ "${#SW}" -eq 64 ] && ok "owner cataloged the 1 GiB swarm target" || fail "swarm target: $J_OWNER"
+# the edge becomes the second holder: wait for the catalog row to arrive via
+# the follow job, self-heal-fetch JUST this file, log the copy --here
+J_EDGE=$(ssh "$EDGE" "SW=$SW bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
+SEEN=no
+for _ in \$(seq 1 45); do
+  "\$B/pvfs" --data-dir "\$R" node "\$SW" >/dev/null 2>&1 && { SEEN=yes; break; }
+  sleep 1
+done
+[ "\$SEEN" = yes ] || echo "J1=no(catalog never arrived)"
+"\$B/pvfs" --data-dir "\$R" cat "\$SW" > /dev/null 2>&1
+SP="\$R/synced/\${SW:0:2}/\$SW"
+[ -f "\$SP" ] && echo "J1=ok" || echo "J1=no"
+"\$B/pvfs" --data-dir "\$R" loc add "\$SW" --here "\$SP" >/dev/null 2>&1 && echo "J2=ok" || echo "J2=no"
+echo "EDGEPIN=\$(cat "\$R/nettls/pin" 2>/dev/null || echo MISSING)"
+EOS
+)
+eval "$(echo "$J_EDGE" | grep -E '^EDGEPIN=')"
+echo "$J_EDGE" | grep -q "J1=ok" && ok "edge holds a second copy" || fail "edge copy: $J_EDGE"
+echo "$J_EDGE" | grep -q "J2=ok" && ok "edge logged its copy (--here, write-through)" || fail "edge loc add"
+# a consumer on the EDGE box (where the owner's file:// path does NOT
+# resolve — fetching is the only way) registers BOTH holders and swarm-pulls
+J_CONS=$(ssh "$EDGE" "SW=$SW EDGEPIN=$EDGEPIN bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test
+"\$B/pvfs" instance add edgelocal "127.0.0.1:7431" "\$EDGEPIN" >/dev/null 2>&1 || true
+"\$B/pvfs" replica add "\$FT/consumer" --instance owner >/dev/null 2>&1 && echo "J3=ok" || echo "J3=no"
+C="\$FT/consumer/.pvfs"
+T0=\$(date +%s)
+"\$B/pvfs" --data-dir "\$C" cat "\$SW" > /dev/null 2>"\$FT/swarm.log" && echo "J4=ok" || echo "J4=no"
+echo "SECS=\$(( \$(date +%s) - T0 ))"
+grep -q "swarm: .* 2 holder" "\$FT/swarm.log" && echo "J5=ok" || echo "J5=no(\$(grep swarm "\$FT/swarm.log" | head -1))"
+GSHA=\$("\$B/pvfs" --data-dir "\$C" cat "\$SW" 2>/dev/null | sha256sum | cut -d' ' -f1)
+echo "GSHA=\$GSHA"
+EOS
+)
+eval "$(echo "$J_CONS" | grep -E '^(SECS|GSHA)=')"
+echo "$J_CONS" | grep -q "J3=ok" && ok "consumer replica built on the edge" || fail "consumer: $J_CONS"
+echo "$J_CONS" | grep -q "J4=ok" && ok "swarm fetch completed in ${SECS}s" || fail "swarm fetch"
+echo "$J_CONS" | grep -q "J5=ok" && ok "BOTH holders contributed chunks (the swarm swarmed)" || fail "single-holder pull: $J_CONS"
+[ "$GSHA" = "$SWSHA" ] && ok "1 GiB reassembled bit-perfect from two holders" || fail "swarm sha mismatch"
+# kill -9 mid-swarm, then resume: the chaos caveat, retired
+J_KILL=$(ssh "$EDGE" "SW=$SW bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test
+"\$B/pvfs" replica add "\$FT/consumer2" --instance owner >/dev/null 2>&1
+C="\$FT/consumer2/.pvfs"
+( "\$B/pvfs" --data-dir "\$C" cat "\$SW" > /dev/null 2>"\$FT/swarm2.log" ) &
+CATPID=\$!
+# deterministic kill: wait for the swarm partial to EXIST (the pull is live),
+# then kill mid-flight
+PARTOK=no
+for _ in \$(seq 1 40); do
+  ls "\$C/synced/\${SW:0:2}/".*.swarmpart >/dev/null 2>&1 && { PARTOK=yes; break; }
+  sleep 0.5
+done
+sleep 2
+pkill -9 -P \$CATPID 2>/dev/null; kill -9 \$CATPID 2>/dev/null; wait \$CATPID 2>/dev/null
+[ "\$PARTOK" = yes ] && ls "\$C/synced/\${SW:0:2}/".*.swarmpart >/dev/null 2>&1 && echo "J6=ok" || echo "J6=no"
+"\$B/pvfs" --data-dir "\$C" cat "\$SW" > /dev/null 2>>"\$FT/swarm2.log" && echo "J7=ok" || echo "J7=no"
+grep -q "swarm: resumed" "\$FT/swarm2.log" && echo "J8=ok" || echo "J8=no"
+EOS
+)
+echo "$J_KILL" | grep -q "J6=ok" && ok "kill -9 left the resumable partial in place" || fail "no swarm partial: $J_KILL"
+echo "$J_KILL" | grep -q "J7=ok" && ok "the retry completed" || fail "swarm retry"
+echo "$J_KILL" | grep -q "J8=ok" && ok "and REUSED the killed run's chunks (resume proven)" || fail "no resume"
+gate swarm
+
 say "cleanup — stop fleet daemons (dirs kept for inspection)"
 ssh "$OWNER" 'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'
 ssh "$EDGE"  'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'

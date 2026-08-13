@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The swarm data plane (P9.0, doc 22):** a fetch with two or more reachable
+  holders pulls a hashed file as **parallel verified chunks from every holder
+  at once** — 8 MiB BLAKE3 chunks, one worker per holder, bad chunks requeued
+  to other seeds, dead holders dropped. Chunk manifests are computed at the
+  sync sink (sidecar-cached) and served over two additive wire ops (ranged
+  `Cat`, `ChunkManifest`); they are deliberately advisory — the catalog hash
+  and the whole-file verify-then-rename gate remain the only trust anchor.
+  Transfers are **resumable**: a kill at any point leaves a `.swarmpart` the
+  next attempt re-verifies locally and completes (the long-standing chaos
+  caveat, retired). Single-holder, small, and unhashed fetches keep the
+  existing single-stream path byte-for-byte.
 - **Attachment policies (P8, doc 21):** `pvfs bind <folder> <dir> --kind
   in-place|migrate|mirror [--to <store>]` — enrollment chooses the space's
   fate in one command. `migrate` = staging: the mover lands a verified copy

@@ -95,13 +95,26 @@ impl Fetcher {
     }
 
     /// Fetch one file into the sync store, verified. `Err` is the last
-    /// candidate's failure (or why there were none).
+    /// candidate's failure (or why there were none). P9 (doc 22): with two or
+    /// more reachable holders and a hashed multi-chunk file, the bytes arrive
+    /// as a parallel chunk swarm; anything else takes the single-stream path.
     pub fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), String> {
         let candidates = self.candidates(engine, id);
         if candidates.is_empty() {
             return Err("no reachable source holds this file (register the holding \
                         instance with `pvfs instance add`)"
                 .into());
+        }
+        if candidates.len() >= 2 {
+            match self.swarm_fetch(engine, id, &candidates) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {} // not swarm-eligible — single-stream below
+                Err(e) => {
+                    // the partial (if any) stays for resume; a fresh attempt
+                    // may still succeed single-stream from one good holder
+                    eprintln!("swarm: falling back to single-stream ({e})");
+                }
+            }
         }
         let mut last_err = String::new();
         for cand in candidates {
@@ -145,6 +158,193 @@ impl Fetcher {
             );
         }
         Err(last_err)
+    }
+
+    /// The all-holder parallel pull (P9, doc 22 §3). `Ok(true)` = published;
+    /// `Ok(false)` = not swarm-eligible (small/unhashed/one live holder) —
+    /// caller takes the single-stream path; `Err` leaves any partial in place
+    /// for a later resume.
+    fn swarm_fetch(
+        &mut self,
+        engine: &mut Engine,
+        id: &str,
+        candidates: &[ReplicaSource],
+    ) -> Result<bool, String> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::Mutex;
+
+        const CHUNK: u64 = pvfs_core::sync::SWARM_CHUNK;
+        let data_dir = engine.data_dir().to_path_buf();
+
+        // Swarm only for HASHED files (doc 22 §2): without a catalog hash the
+        // final gate would be size-only, and per-chunk hashes from an unsigned
+        // manifest are not a substitute for the trust anchor.
+        let hashed = engine
+            .get_node(&id.to_string())
+            .ok()
+            .flatten()
+            .and_then(|n| pvfs_core::FilePayload::decode(&n.payload).ok())
+            .is_some_and(|p| !p.content_hash.is_empty());
+        if !hashed {
+            return Ok(false);
+        }
+
+        // Dial every candidate; each worker owns its connection.
+        let mut holders: Vec<(String, Client)> = Vec::new();
+        for cand in candidates {
+            let key = format!("{}:{}", cand.transport, cand.target);
+            if self.dead.contains(&key) || holders.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            match dial_source(cand) {
+                Ok(c) => holders.push((key, c)),
+                Err(_) => {
+                    self.dead.insert(key);
+                }
+            }
+        }
+        if holders.len() < 2 {
+            return Ok(false);
+        }
+
+        // Manifest from the first holder that answers; advisory only (§2 of
+        // doc 22) — the whole-file gate at commit is the trust boundary.
+        let mut manifest: Option<(u64, Vec<[u8; 32]>)> = None;
+        for (_, client) in holders.iter_mut() {
+            if let Ok((size, chunk_size, hashes)) = client.chunk_manifest(id) {
+                if chunk_size != CHUNK {
+                    continue;
+                }
+                let mut decoded = Vec::with_capacity(hashes.len());
+                for h in &hashes {
+                    match hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                        Some(a) => decoded.push(a),
+                        None => break,
+                    }
+                }
+                let expect = if size == 0 { 0 } else { size.div_ceil(CHUNK) } as usize;
+                if decoded.len() == expect {
+                    manifest = Some((size, decoded));
+                    break;
+                }
+            }
+        }
+        let Some((size, manifest)) = manifest else {
+            return Ok(false); // no swarm-capable holder — single-stream
+        };
+        if manifest.len() < 2 {
+            return Ok(false); // one chunk: a plain stream is strictly better
+        }
+
+        // The resumable partial: verify what a previous attempt already
+        // landed (a local read), fetch only the rest.
+        let part = pvfs_core::sync::swarm_part_path(&data_dir, id).map_err(|e| e.to_string())?;
+        if let Some(dir) = part.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)
+            .map_err(|e| e.to_string())?;
+        f.set_len(size).map_err(|e| e.to_string())?;
+        let mut have = vec![false; manifest.len()];
+        let mut resumed = 0usize;
+        {
+            let mut f = &f;
+            let mut buf = vec![0u8; CHUNK as usize];
+            for (i, want) in manifest.iter().enumerate() {
+                let off = i as u64 * CHUNK;
+                let clen = (size - off).min(CHUNK) as usize;
+                f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+                if f.read_exact(&mut buf[..clen]).is_ok()
+                    && blake3::hash(&buf[..clen]).as_bytes() == want
+                {
+                    have[i] = true;
+                    resumed += 1;
+                }
+            }
+        }
+        drop(f);
+        if resumed > 0 {
+            eprintln!("swarm: resumed {resumed}/{} chunks from a previous attempt", manifest.len());
+        }
+
+        let queue: Mutex<Vec<usize>> = Mutex::new(
+            (0..manifest.len()).filter(|i| !have[*i]).rev().collect(),
+        );
+        let counts: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+        let manifest_ref = &manifest;
+        let queue_ref = &queue;
+        let counts_ref = &counts;
+        let part_ref = &part;
+
+        std::thread::scope(|scope| {
+            for (key, mut client) in holders.drain(..) {
+                scope.spawn(move || {
+                    let Ok(mut out) = std::fs::OpenOptions::new().write(true).open(part_ref)
+                    else {
+                        return;
+                    };
+                    let mut pulled = 0u64;
+                    let mut strikes = 0u32;
+                    loop {
+                        let idx = match queue_ref.lock().unwrap().pop() {
+                            Some(i) => i,
+                            None => break,
+                        };
+                        let off = idx as u64 * CHUNK;
+                        let clen = (size - off).min(CHUNK);
+                        let mut buf = Vec::with_capacity(clen as usize);
+                        let ok = client.cat_range(id, off, clen, &mut buf).is_ok()
+                            && buf.len() as u64 == clen
+                            && blake3::hash(&buf).as_bytes() == &manifest_ref[idx];
+                        if !ok {
+                            // requeue; a transient (a holder mid-fold) must
+                            // not retire a good seed — three strikes does
+                            queue_ref.lock().unwrap().push(idx);
+                            strikes += 1;
+                            if strikes >= 3 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            continue;
+                        }
+                        if out.seek(SeekFrom::Start(off)).is_err()
+                            || out.write_all(&buf).is_err()
+                        {
+                            queue_ref.lock().unwrap().push(idx);
+                            break;
+                        }
+                        pulled += 1;
+                    }
+                    if pulled > 0 {
+                        counts_ref.lock().unwrap().push((key, pulled));
+                    }
+                });
+            }
+        });
+
+        let leftover = queue.lock().unwrap().len();
+        if leftover > 0 {
+            return Err(format!(
+                "{leftover} chunk(s) unfetched — every holder failed; partial kept for resume"
+            ));
+        }
+        let stats = counts.into_inner().unwrap();
+        engine
+            .swarm_commit(&id.to_string(), &part, &manifest)
+            .map_err(|e| e.to_string())?;
+        let total: u64 = stats.iter().map(|(_, n)| n).sum();
+        let desc: Vec<String> = stats.iter().map(|(k, n)| format!("{k}={n}")).collect();
+        eprintln!(
+            "swarm: {total} chunk(s) from {} holder(s) [{}]",
+            stats.len(),
+            desc.join(", ")
+        );
+        Ok(true)
     }
 }
 

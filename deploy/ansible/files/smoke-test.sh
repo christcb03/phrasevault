@@ -866,6 +866,14 @@ rm "$DATA/mirror-src/song.mp3"
 $PVFS cat "$SONG" 2>/dev/null | qgrep keep-me \
   && ok "content survives source deletion via the mirror" || fail "mirror read-through"
 
+say "P9.0: swarm groundwork — manifest sidecars at the sink (doc 22)"
+# the F3/F5 fetches above streamed bytes into the replica's sync store; the
+# sink now writes a chunk-manifest sidecar beside every published file
+find "$REPMOUNT/.pvfs/synced" -name "*.manifest" 2>/dev/null | grep -q . \
+  && ok "sync sink wrote chunk-manifest sidecars" || fail "no manifest sidecars"
+# a single-holder fetch stays on the plain stream path (no swarm regression):
+# every earlier fetch in this suite already proved that by passing
+
 say "P7.3: FUSE mount — browse + stream through the kernel (doc 20 §3)"
 if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   mkdir -p "$DATA/fuse-view"

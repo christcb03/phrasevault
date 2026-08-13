@@ -279,11 +279,24 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
         meta_set(conn, "clean_shutdown", "1")?;
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO applied_marks (log_id, seq, chain_hash) VALUES ('', 0, '')",
-        [],
-    )
-    .map_err(map_db("seed applied mark"))?;
+    // Seed only when absent: INSERT OR IGNORE takes a write lock even when
+    // the row exists, which made EVERY engine open contend with a busy
+    // daemon's folds (found by the P9 fleet run). The probe is a plain read.
+    let seeded: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM applied_marks WHERE log_id = ''",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_db("probe applied mark"))?;
+    if seeded.is_none() {
+        conn.execute(
+            "INSERT OR IGNORE INTO applied_marks (log_id, seq, chain_hash) VALUES ('', 0, '')",
+            [],
+        )
+        .map_err(map_db("seed applied mark"))?;
+    }
     Ok(())
 }
 
