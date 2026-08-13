@@ -31,17 +31,17 @@ M2PID=""
 IPID=""
 
 cleanup() {
-  [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
-  [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null
-  [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
-  [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
-  [ -n "$EPID" ] && kill "$EPID" 2>/dev/null
-  [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
-  [ -n "$FPID" ] && kill "$FPID" 2>/dev/null
-  [ -n "$JPID" ] && kill "$JPID" 2>/dev/null
-  [ -n "$MPID" ] && { fusermount3 -u "$DATA/fuse-view" 2>/dev/null; kill "$MPID" 2>/dev/null; }
-  [ -n "$M2PID" ] && { fusermount3 -u "$DATA/fuse-view2" 2>/dev/null; kill "$M2PID" 2>/dev/null; }
-  [ -n "$IPID" ] && kill "$IPID" 2>/dev/null
+  [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true
+  [ -n "$U2PID" ] && kill "$U2PID" 2>/dev/null || true
+  [ -n "$CPID" ] && kill "$CPID" 2>/dev/null || true
+  [ -n "$TPID" ] && kill "$TPID" 2>/dev/null || true
+  [ -n "$EPID" ] && kill "$EPID" 2>/dev/null || true
+  [ -n "$RPID" ] && kill "$RPID" 2>/dev/null || true
+  [ -n "$FPID" ] && kill "$FPID" 2>/dev/null || true
+  [ -n "$JPID" ] && kill "$JPID" 2>/dev/null || true
+  [ -n "$MPID" ] && { fusermount3 -u "$DATA/fuse-view" 2>/dev/null || true; kill "$MPID" 2>/dev/null || true; }
+  [ -n "$M2PID" ] && { fusermount3 -u "$DATA/fuse-view2" 2>/dev/null || true; kill "$M2PID" 2>/dev/null || true; }
+  [ -n "$IPID" ] && kill "$IPID" 2>/dev/null || true
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -891,7 +891,7 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   [ -n "$MOK" ] && ok "kernel read through the mount (a replica, resolved live)" \
     || fail "fuse read: $(tail -2 "$DATA/fuse.log" 2>/dev/null)"
   ls "$DATA/fuse-view" | qgrep albums && ok "readdir lists the tree" || fail "fuse readdir"
-  $PVFS umount "$DATA/fuse-view" >/dev/null 2>&1 || fusermount3 -u "$DATA/fuse-view" 2>/dev/null
+  $PVFS umount "$DATA/fuse-view" >/dev/null 2>&1 || fusermount3 -u "$DATA/fuse-view" 2>/dev/null || true
   wait "$MPID" 2>/dev/null || true
   MPID=""
   ok "unmounted cleanly"
@@ -926,7 +926,7 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
     && ok "early bytes are the right bytes" || fail "early byte mismatch"
   cmp -s "$DATA/fuse-view2/stream-zone/stream.bin" "$DATA/dstream/stream.bin" \
     && ok "full read completes bit-perfect" || fail "full streaming read"
-  fusermount3 -u "$DATA/fuse-view2" 2>/dev/null; kill $M2PID 2>/dev/null; M2PID=""
+  fusermount3 -u "$DATA/fuse-view2" 2>/dev/null || true; kill $M2PID 2>/dev/null || true; M2PID=""
 else
   ok "skipped streaming mount (no fuse3 on this host)"
 fi
@@ -1008,7 +1008,7 @@ $PVFS --data-dir "$IGD" ingest verified "$SID" "$NODE_A" --range 6291456-1258291
   && ok "verified ranges accepted" || fail "ingest verified"
 
 # kill -9 mid-ingest → restart → the session and its bitmap survive (§9.3)
-kill -9 "$IPID" 2>/dev/null; wait "$IPID" 2>/dev/null || true
+kill -9 "$IPID" 2>/dev/null || true; wait "$IPID" 2>/dev/null || true
 rm -f "$ISOCK"
 "$PVFSD" --mount "$IGM" >/dev/null 2>>"$DATA/pvfsd-ingest.log" &
 IPID=$!
@@ -1076,7 +1076,7 @@ for e in json.load(sys.stdin):
 $PVFS --data-dir "$IGD" export "$PACK_ID" "$DATA/ig-view" --mode copy >/dev/null \
   && cmp -s "$DATA/ig-view/d/a.bin" "$DATA/ig-src-a" \
   && ok "export serves the ingested file like any other" || fail "export of ingested file"
-kill -TERM "$IPID" 2>/dev/null; wait "$IPID" 2>/dev/null || true; IPID=""
+kill -TERM "$IPID" 2>/dev/null || true; wait "$IPID" 2>/dev/null || true; IPID=""
 
 say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
 mkdir -p "$DATA/config3"
