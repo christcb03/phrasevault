@@ -135,6 +135,13 @@ pub struct IngestFileWire {
     /// Additive: absent on the wire when empty, so P10.0 peers interop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hot: Vec<(u64, u64)>,
+    /// P10.2 (doc 23 §13): the file's ingest partial path — the same-box
+    /// fast path. Filled only on Unix-socket connections (a TCP caller
+    /// gets `None`; server paths are useless and leaky off-box). A direct
+    /// writer creates sparse, writes at offsets, and reports ranges via
+    /// `IngestVerified` as usual. Additive: absent for older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_path: Option<String>,
 }
 
 /// One ingest session (P10.0): identity plus per-file state.

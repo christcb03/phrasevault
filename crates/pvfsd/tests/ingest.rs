@@ -244,6 +244,102 @@ fn ingest_session_end_to_end() {
     assert!(forbidden(anon.ingest_list()));
 }
 
+// P10.2 (doc 23 §13): the same-box fast path — IngestBegin returns each
+// file's partial path over the Unix socket; a direct writer creates sparse,
+// writes at offsets, marks via IngestVerified, and commit round-trips. The
+// bytes' author never matters; the hashes do.
+#[test]
+fn fast_path_direct_writes_round_trip() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let media = engine.add_node(&root, folder("media")).unwrap();
+    let app_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let app_pub = crypto::pubkey_bytes(&app_key);
+    engine.authorize_member(&owner_mn, &app_pub).unwrap();
+    engine
+        .set_acl(&media, &Principal::Key(app_pub.clone()), acl::ACL_RWA)
+        .unwrap();
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(engine));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let mut app = Client::connect_signed(&sock, &app_pub, |d| {
+        crypto::sign_digest(&app_key, d).unwrap()
+    })
+    .unwrap();
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&app_key, d).unwrap();
+
+    let size = (SWARM_CHUNK + 4096) as usize; // 2 chunks, short tail
+    let data = bytes(size);
+    let s = app
+        .ingest_begin(
+            &media,
+            "",
+            "bittorrent",
+            "fa57c0de",
+            262_144,
+            &[("direct.bin".to_string(), size as u64)],
+            false,
+            sign,
+        )
+        .unwrap();
+    let node = s.files[0].node.clone();
+    // the Unix-socket answer carries the partial path, dir pre-created
+    let ppath = s.files[0]
+        .partial_path
+        .clone()
+        .expect("partial_path filled over the Unix socket");
+    let ppath = std::path::PathBuf::from(ppath);
+    assert!(
+        ppath.file_name().unwrap().to_str().unwrap().ends_with(".swarmpart"),
+        "the path is the swarm-partial convention"
+    );
+    assert!(ppath.parent().unwrap().is_dir(), "shard dir pre-created at activate");
+
+    // the BT engine's storage shim, in miniature: create sparse, write the
+    // tail first, then the head — the daemon never sees an IngestWrite
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&ppath)
+        .unwrap();
+    f.set_len(size as u64).unwrap();
+    f.seek(SeekFrom::Start(SWARM_CHUNK)).unwrap();
+    f.write_all(&data[SWARM_CHUNK as usize..]).unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(&data[..SWARM_CHUNK as usize]).unwrap();
+    drop(f);
+
+    let (v, done, total) = app
+        .ingest_verified(&s.session, &node, &[(0, size as u64)])
+        .unwrap();
+    assert_eq!((v, done, total), (size as u64, 2, 2), "direct bytes mark chunks");
+    // list still hands the path back (reattach after an app restart)
+    let listed = app.ingest_list().unwrap();
+    assert_eq!(
+        listed[0].files[0].partial_path.as_deref(),
+        Some(ppath.to_str().unwrap()),
+        "IngestList re-serves the path for reattach"
+    );
+
+    let new = app.ingest_commit(&s.session, &node, sign).unwrap();
+    let mut got = Vec::new();
+    app.cat(&new, &mut got).unwrap();
+    assert_eq!(got, data, "fast-path bytes round-trip bit-perfect");
+    assert!(!ppath.exists(), "commit renamed the partial away (D62 contract)");
+}
+
 // P10.1 (doc 23 §11): in-flight reads go through ranged Cat — marked chunks
 // serve immediately, unmarked ranges BLOCK server-side and surface as hot
 // ranges in IngestList (the §8.1 demand signal), and the early-serve license

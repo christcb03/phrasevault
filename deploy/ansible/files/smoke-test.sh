@@ -975,11 +975,15 @@ head -c 4000 /dev/urandom > "$DATA/ig-src-b"
 
 # begin: the whole torrent cataloged before a byte arrives (one signed commit)
 IJSON="$($PVFS --json --data-dir "$IGD" ingest begin "$MEDIA" --name pack \
-  --infohash aa11bb22cc33 --file "d/a.bin:12582912" --file "b.bin:4000")"
+  --infohash aa11bb22cc33 --file "d/a.bin:12582912" --file "b.bin:4000" --file "c.bin:2000")"
 SID="$(jget "$IJSON" session)"
 [ ${#SID} -eq 32 ] && ok "ingest begin opened a session" || fail "ingest begin: $IJSON"
 NODE_A="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["node"] for f in d["files"] if f["rel_path"]=="d/a.bin"))' "$IJSON")"
 NODE_B="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["node"] for f in d["files"] if f["rel_path"]=="b.bin"))' "$IJSON")"
+# P10.2 (doc 23 §13): the same-box fast path — begin hands out partial paths
+PPATH_C="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["partial_path"] or "" for f in d["files"] if f["rel_path"]=="c.bin"))' "$IJSON")"
+NODE_C="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["node"] for f in d["files"] if f["rel_path"]=="c.bin"))' "$IJSON")"
+case "$PPATH_C" in *".swarmpart") ok "begin returned the partial path (same-box fast path)";; *) fail "no partial path: $IJSON";; esac
 $PVFS --data-dir "$IGD" ls "$MEDIA" | qgrep pack \
   && ok "catalog exists before any byte" || fail "no pack folder in the tree"
 ORIGINS=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download' AND CAST(payload AS TEXT) LIKE '%aa11bb22cc33%'")
@@ -1058,6 +1062,17 @@ ATT=$(ig_count "SELECT COUNT(*) FROM chunk_manifests WHERE file_id='$NEW_A'")
 [ "$ATT" -eq 1 ] && ok "attestation folded (the early-serve license)" || fail "no attestation row"
 COMPLETE=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download.closed' AND CAST(payload AS TEXT) LIKE '%complete%'")
 [ "$COMPLETE" -eq 0 ] && ok "no complete record while a file is still open" || fail "premature closing record"
+
+# P10.2: one file never touches ingest write — bytes land DIRECTLY at the
+# returned partial path (the D62 storage-shim contract), verified as usual
+head -c 2000 /dev/urandom > "$DATA/ig-src-c"
+dd if="$DATA/ig-src-c" of="$PPATH_C" conv=notrunc bs=2000 2>/dev/null \
+  && ok "direct write landed at the fast-path partial" || fail "fast-path write"
+$PVFS --data-dir "$IGD" ingest verified "$SID" "$NODE_C" --range 0-2000 >/dev/null
+NEW_C="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_C")" committed)"
+$PVFS --data-dir "$IGD" cat "$NEW_C" > "$DATA/ig-got-c" 2>/dev/null
+cmp -s "$DATA/ig-got-c" "$DATA/ig-src-c" \
+  && ok "fast-path file round-trips through the same gates" || fail "fast-path roundtrip"
 
 # commit the last file: the ledger closes {complete}, deployment state goes
 NEW_B="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_B")" committed)"

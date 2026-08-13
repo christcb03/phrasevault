@@ -2720,10 +2720,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             .iter()
                             .map(|f| {
                                 format!(
-                                    "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{}}}",
+                                    "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"partial_path\":{}}}",
                                     f.node,
                                     json_escape(&f.rel_path),
-                                    f.size
+                                    f.size,
+                                    match &f.partial_path {
+                                        Some(pp) => format!("\"{}\"", json_escape(pp)),
+                                        None => "null".into(),
+                                    }
                                 )
                             })
                             .collect();
@@ -2737,7 +2741,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         println!("session {} (root {}, origin record {})", s.session, s.root, s.origin);
                         for f in &s.files {
-                            println!("  {}  {}  {} B", f.node, f.rel_path, f.size);
+                            match &f.partial_path {
+                                Some(pp) => println!("  {}  {}  {} B  partial {}", f.node, f.rel_path, f.size, pp),
+                                None => println!("  {}  {}  {} B", f.node, f.rel_path, f.size),
+                            }
                         }
                     }
                     Ok(())
@@ -2871,7 +2878,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                             .map(|(s, e)| format!("[{s},{e}]"))
                                             .collect();
                                         format!(
-                                            "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"bytes_verified\":{},\"chunks_done\":{},\"chunks_total\":{},\"committed\":{},\"hot\":[{}]}}",
+                                            "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"bytes_verified\":{},\"chunks_done\":{},\"chunks_total\":{},\"committed\":{},\"hot\":[{}],\"partial_path\":{}}}",
                                             f.node,
                                             json_escape(&f.rel_path),
                                             f.size,
@@ -2882,7 +2889,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                                 Some(c) => format!("\"{c}\""),
                                                 None => "null".into(),
                                             },
-                                            hot.join(",")
+                                            hot.join(","),
+                                            match &f.partial_path {
+                                                Some(pp) => format!("\"{}\"", json_escape(pp)),
+                                                None => "null".into(),
+                                            }
                                         )
                                     })
                                     .collect();

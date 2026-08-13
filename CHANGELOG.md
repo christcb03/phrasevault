@@ -5,6 +5,11 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Same-box fast path (P10.2, doc 23 §13, for the PVOS Torrents app):**
+  `IngestBegin`/`IngestList` return each file's partial path over the Unix
+  socket (additive `IngestFileWire.partial_path`; TCP callers get none),
+  so a same-box downloader writes the partial directly — one home for the
+  bytes, no spool — and still marks/commits through the unchanged gates.
 - **In-flight streaming (P10.1, doc 23 §11):** everything an ingest session
   has verified serves **while the download runs**, through one seam —
   ranged `Cat` on the ingesting daemon. Marked chunks stream immediately;

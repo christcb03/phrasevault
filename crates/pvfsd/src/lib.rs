@@ -241,7 +241,7 @@ pub fn serve_until(
                 stream.set_nonblocking(false)?;
                 let d = Arc::clone(&daemon);
                 std::thread::spawn(move || {
-                    let _ = serve_connection(&d, stream);
+                    let _ = serve_connection(&d, stream, true);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -279,7 +279,7 @@ pub fn serve_tls_until(
                         Err(_) => return,
                     };
                     let tls_stream = rustls::StreamOwned::new(conn, stream);
-                    let _ = serve_connection(&d, tls_stream);
+                    let _ = serve_connection(&d, tls_stream, false);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -293,7 +293,13 @@ pub fn serve_tls_until(
 
 /// Handshake then request loop for one connection. Generic over the stream —
 /// a Unix socket and a TLS-wrapped TCP stream serve identically (F1).
-pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, mut stream: S) -> io::Result<()> {
+/// `local` = the Unix-socket transport: the only difference it makes is
+/// P10.2's same-box answers (ingest partial paths are filled locally only).
+pub fn serve_connection<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    mut stream: S,
+    local: bool,
+) -> io::Result<()> {
     // 1. challenge (nonce registered single-use, doc 08 §4 item 7)
     let (nonce, expiry_ms) = daemon.issue_nonce();
     write_msg(
@@ -368,7 +374,7 @@ pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, mut stream: S)
                 continue;
             }
             req => {
-                let resp = handle(daemon, &principal, req);
+                let resp = handle(daemon, &principal, req, local);
                 write_msg(&mut stream, &resp)?;
             }
         }
@@ -394,7 +400,7 @@ fn resolve_auth(
     Ok(Principal::Key(pk))
 }
 
-fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
+fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool) -> ServerMsg {
     match req {
         ClientMsg::Info => {
             let e = daemon.reader();
@@ -504,6 +510,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             piece_size,
             files,
             allow_shortfall,
+            local,
         ),
         ClientMsg::IngestVerified {
             session,
@@ -517,7 +524,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
             session,
             keep_catalog,
         } => do_ingest_abort(daemon, principal, &session, keep_catalog),
-        ClientMsg::IngestList => do_ingest_list(daemon, principal),
+        ClientMsg::IngestList => do_ingest_list(daemon, principal, local),
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
@@ -1109,6 +1116,18 @@ fn ingest_author(principal: &Principal) -> Result<Vec<u8>, ServerMsg> {
     }
 }
 
+/// P10.2 (doc 23 §13): the same-box fast-path answer — the file's partial
+/// path, but only over the Unix socket. TCP callers get `None`: a server
+/// path is useless off-box and handing it out would leak layout.
+fn ingest_partial_path(daemon: &Daemon, node: &str, local: bool) -> Option<String> {
+    if !local {
+        return None;
+    }
+    ingest::part_path(&daemon.data_dir, node)
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
 fn closed_label(session: &str) -> String {
     let tag8: String = session.chars().take(8).collect();
     format!(".pvos.download.closed-{tag8}")
@@ -1160,6 +1179,7 @@ fn do_ingest_begin(
     piece_size: u64,
     files: Vec<IngestFileSpecWire>,
     allow_shortfall: bool,
+    local: bool,
 ) -> ServerMsg {
     let author = match ingest_author(principal) {
         Ok(a) => a,
@@ -1225,6 +1245,7 @@ fn do_ingest_begin(
             chunks_total: f.size.div_ceil(pvfs_core::sync::SWARM_CHUNK),
             committed: None,
             hot: Vec::new(),
+            partial_path: ingest_partial_path(daemon, &f.node, local),
         })
         .collect();
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
@@ -1651,7 +1672,7 @@ fn do_ingest_abort(
 
 /// `IngestList`: the live sessions with per-file progress. Active-member
 /// gated (the ServeStatus bar): operational state, not public metadata.
-fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
+fn do_ingest_list(daemon: &Daemon, principal: &Principal, local: bool) -> ServerMsg {
     let member = match principal {
         Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
         _ => false,
@@ -1702,6 +1723,11 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
                     Err(_) => (0, 0),
                 }
             };
+            let partial_path = if f.committed.is_none() {
+                ingest_partial_path(daemon, &f.node, local)
+            } else {
+                None // committed = published; the partial was renamed away
+            };
             files.push(IngestFileWire {
                 node: f.node.clone(),
                 rel_path: f.rel_path.clone(),
@@ -1711,6 +1737,7 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
                 chunks_total,
                 committed: f.committed.clone(),
                 hot: hot_for(&f.node),
+                partial_path,
             });
         }
         out.push(IngestSessionWire {
@@ -1953,6 +1980,16 @@ fn finish_ingest_followup(
     match followup {
         IngestFollowup::Activate(rec) => {
             drop(e);
+            // P10.2 (doc 23 §13): the fast path hands out partial paths —
+            // make sure their shard directories exist so a direct writer's
+            // first open(create) just works. Best-effort.
+            for f in &rec.files {
+                if let Ok(p) = ingest::part_path(&daemon.data_dir, &f.node) {
+                    if let Some(dir) = p.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                }
+            }
             let mut st = daemon.ingest.lock().unwrap();
             st.sessions.push(*rec);
             if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {

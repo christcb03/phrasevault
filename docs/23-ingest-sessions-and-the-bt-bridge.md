@@ -439,3 +439,44 @@ it.
 crash/rebuild path (the replica append was transactional before and
 after; the ingest wait loop holds no locks). The commit-freeze and
 publish semantics are unchanged from §10.
+
+## 13. P10.2 — the same-box fast path (requested by PVOS D62, 2026-08-13)
+
+§3's parked "same-box fast path (optimization, later)" is promoted: the
+D62 Torrents app gives torrent bytes exactly one home by pointing its
+BT engine's storage at the ingest partial — no spool, no double disk.
+
+**The change, additive:** `IngestFileWire` grows
+`partial_path: Option<String>` (serde-defaulted — P10.0/P10.1 peers
+interop unchanged), filled by `IngestBegin` and `IngestList` **only on
+Unix-socket connections**. A TCP caller gets `None`: a server-internal
+filesystem path is useless off-box and handing it out anyway would leak
+layout to remote members — same-box capability, same-box answer. The
+path is deterministic (`.{node}.swarmpart` beside the store destination),
+returned before any byte exists; the session's activation pre-creates
+the shard directory so the app's first `open(create)` just works.
+`IngestWrite` stays, unchanged, for cross-box callers.
+
+**Contract for direct writers:** create sparse, write at offsets, and
+report ranges via `IngestVerified` exactly as before — the daemon still
+hashes covered chunks from the partial and the commit still re-reads the
+whole file, so the trust story is untouched (the bytes' author never
+matters; the hashes do). Commit renames the partial away — the app's
+storage layer must tolerate the file vanishing at commit (D62 records
+this constraint on its side).
+
+**Done means:** e2e — begin over the socket returns the path, bytes
+written directly to it (out of order) mark chunks via `IngestVerified`
+and commit round-trips bit-perfect; smoke drives one file of the fake
+torrent purely through the fast path; pipelines green on both hosts;
+PVOS (path-dependent on these crates) still builds.
+
+> **P10.2 close-out (2026-08-13):** built as specified above — no
+> deviations. 236 cargo + 372 smoke green on both hosts via the pipeline,
+> clippy `-D warnings` clean; the e2e fast-path test writes directly at
+> the returned path (tail-first), marks via `IngestVerified`, commits
+> bit-perfect, and confirms the partial is renamed away at commit (the
+> D62 storage-shim contract); the smoke drives one file of the fake
+> torrent purely through the fast path; PVOS `cargo check`s clean against
+> the changed crates (scratch tree — its own deploy copy was left alone).
+> The B1 gate on the PVOS side is now open.
