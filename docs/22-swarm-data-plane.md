@@ -29,10 +29,31 @@ catalog hash fall back to today's single-stream path.
 **Serving bytes EARLY is different**: handing a reader chunk N before the
 whole file verifies means trusting the chunk layout itself. That requires the
 owner to attest the manifest (a logged `ChunkManifestRecorded { file_id,
-chunk_size, manifest_root }` event; the manifest travels as a sidecar and
-verifies against the root, chunks against the manifest — custody closed).
-That is **P9.1**, where punch J's serve-while-fetching lands; P9.0 keeps the
-mount's block-until-verified behavior.
+content_hash, chunk_size, manifest_root }` event; the manifest travels as a
+sidecar and verifies against the root, chunks against the manifest — custody
+closed). That is **P9.1**, where punch J's serve-while-fetching lands; P9.0
+keeps the mount's block-until-verified behavior.
+
+*P9.1 mechanics (2026-08-13, written at build start):*
+- **Authorization is admin-tier** (replay requires `a` on the file, like
+  region ops): early serving trusts the attested layout INSTEAD of the
+  whole-file gate, so a write-tier member must not be able to attest — a
+  bogus root would leak garbage bytes to early readers before the final
+  verify caught it. The attestation also **binds the content hash** it
+  describes; consumers check it against the node's payload before trusting.
+- **Attested at hashing time**: wherever the engine computes a file's content
+  hash from its bytes (scan under `on_add`, the lazy hash fill), it computes
+  the chunk root in the same read and appends the attestation in the same
+  commit. Files hashed before P9.1 carry no attestation and keep the
+  blocking mount behavior (a re-scan/re-hash attests them).
+- **No new wire**: the manifest ships as before; the TRUSTED root arrives
+  with the log. A consumer verifies manifest-against-root, then
+  chunks-against-manifest, and may serve each chunk the moment it lands.
+- **The mount serves while fetching**: opening an unfetched attested file
+  starts a background chunked fetch (chunked even with ONE holder — same
+  wire cost, and it buys progress + resume); each `read` waits only for the
+  chunks covering its range. Unattested files block-until-verified exactly
+  as today.
 
 ## 3. Mechanics (P9.0)
 
@@ -110,7 +131,21 @@ chunks** and completed from both holders. Findings, honestly:
   stream. Requeue-with-strikes keeps good seeds in the pool.
 - Ops note: the fleet's G-phase 120-second windows are tight on the slow box
   when runs are stacked back-to-back; a clean run passes end to end.
-- **P9.1 remains** (the arc's second phase): the `ChunkManifestRecorded`
-  attestation and FUSE serve-while-fetching (punch J) — the mount still
-  blocks first reads until the whole file verifies, by design, until the
-  manifest itself is owner-attested.
+- **P9.1 landed (2026-08-13)** — validated: 227 cargo + 344 smoke on both
+  hosts, clippy clean, fleet **75/75**, with the arc-closing checks on real
+  hardware: the edge's mount **served the first MiB of an unfetched 1 GiB
+  file in ~2 s while the fetch was still in flight**, on the attested
+  streaming path (punch J, retired). As built: `ChunkManifestRecorded`
+  (admin-gated replay, binds the content hash; folded into
+  `chunk_manifests`, schema v7) is authored wherever a content hash is
+  computed from bytes — scan under `on_add`, resolve-replace, the lazy hash
+  fill — in the same read (no second pass). The mount's open of an
+  unfetched attested file spawns a background chunked fetch (chunked even
+  with one holder) and each `read` waits only for its covering chunks via
+  the shared `SwarmProgress`; unattested files keep block-until-verified.
+  Files hashed before P9.1 attest on their next re-hash. Honest note: the
+  single-box smoke cannot exercise serve-early (a same-host replica
+  resolves the owner's `file://` path locally and rightly never fetches) —
+  the fleet carries that proof; the smoke pins attestation shipping and
+  read correctness. And pvos-test earned its keep once more: it has no
+  `sqlite3` CLI, which taught the smoke to probe through python instead.

@@ -34,6 +34,7 @@ pub const K_REGION_BASELINE: &str = "RegionBaseline";
 pub const K_SUB_REGION_HEAD: &str = "SubRegionHead";
 pub const K_NODE_MOVED_OUT: &str = "NodeMovedOut";
 pub const K_NODE_MOVED_IN: &str = "NodeMovedIn";
+pub const K_CHUNK_MANIFEST_RECORDED: &str = "ChunkManifestRecorded";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -204,6 +205,19 @@ pub enum Event {
         src_region: String,
         src_head_seq: u64,
         src_head_hash: Vec<u8>,
+    },
+    /// P9.1 (doc 22 §2): the OWNER attests a file's chunk layout —
+    /// `manifest_root = BLAKE3("pvfs:manifest:v1:" || concat(chunk hashes))`
+    /// for the bytes whose whole-file hash is `content_hash`. Admin-tier on
+    /// replay: early serving trusts this INSTEAD of the whole-file gate.
+    ChunkManifestRecorded {
+        file_id: String,
+        content_hash: String,
+        chunk_size: u64,
+        manifest_root: Vec<u8>,
+        at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
     },
     FolderBound {
         folder_id: String,
@@ -385,6 +399,24 @@ pub fn msg_sub_region_head(
     crypto::domain_digest("pvfs:subregionhead:v1:", &e.finish())
 }
 
+pub fn msg_chunk_manifest_recorded(
+    file_id: &str,
+    content_hash: &str,
+    chunk_size: u64,
+    manifest_root: &[u8],
+    at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(file_id)
+        .string(content_hash)
+        .u64(chunk_size)
+        .bytes(manifest_root)
+        .u64(at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:chunkmanifest:v1:", &e.finish())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn msg_node_moved_out(
     node_id: &str,
@@ -536,6 +568,7 @@ impl Event {
             Event::SubRegionHead { .. } => K_SUB_REGION_HEAD,
             Event::NodeMovedOut { .. } => K_NODE_MOVED_OUT,
             Event::NodeMovedIn { .. } => K_NODE_MOVED_IN,
+            Event::ChunkManifestRecorded { .. } => K_CHUNK_MANIFEST_RECORDED,
             Event::FileLocationRemoved { .. } => K_FILE_LOCATION_REMOVED,
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
@@ -567,6 +600,7 @@ impl Event {
             | Event::RegionBaseline { author, .. }
             | Event::SubRegionHead { author, .. }
             | Event::NodeMovedOut { author, .. }
+            | Event::ChunkManifestRecorded { author, .. }
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
@@ -604,6 +638,7 @@ impl Event {
             | Event::RegionBaseline { sig: s, .. }
             | Event::SubRegionHead { sig: s, .. }
             | Event::NodeMovedOut { sig: s, .. }
+            | Event::ChunkManifestRecorded { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
@@ -822,6 +857,23 @@ impl Event {
                     .string(src_region)
                     .u64(*src_head_seq)
                     .bytes(src_head_hash);
+            }
+            Event::ChunkManifestRecorded {
+                file_id,
+                content_hash,
+                chunk_size,
+                manifest_root,
+                at,
+                author,
+                sig,
+            } => {
+                e.string(file_id)
+                    .string(content_hash)
+                    .u64(*chunk_size)
+                    .bytes(manifest_root)
+                    .u64(*at)
+                    .bytes(author)
+                    .bytes(sig);
             }
             Event::FileLocationRemoved {
                 file_id,
@@ -1092,6 +1144,15 @@ impl Event {
                 src_head_seq: d.u64()?,
                 src_head_hash: d.bytes()?,
             },
+            K_CHUNK_MANIFEST_RECORDED => Event::ChunkManifestRecorded {
+                file_id: d.string()?,
+                content_hash: d.string()?,
+                chunk_size: d.u64()?,
+                manifest_root: d.bytes()?,
+                at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
             K_FILE_LOCATION_REMOVED => Event::FileLocationRemoved {
                 file_id: d.string()?,
                 uri: d.string()?,
@@ -1254,6 +1315,26 @@ impl Event {
             Event::NodeCreated(n) => n.verify(),
             Event::LinkCreated(l) => l.verify(),
             Event::NodeMovedIn { link, .. } => link.verify(),
+            Event::ChunkManifestRecorded {
+                file_id,
+                content_hash,
+                chunk_size,
+                manifest_root,
+                at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_chunk_manifest_recorded(
+                    file_id,
+                    content_hash,
+                    *chunk_size,
+                    manifest_root,
+                    *at,
+                    author,
+                ),
+                sig,
+            ),
             Event::LinkRemoved {
                 link_id,
                 removed_at,

@@ -170,6 +170,17 @@ impl Fetcher {
         id: &str,
         candidates: &[ReplicaSource],
     ) -> Result<bool, String> {
+        self.swarm_fetch_opts(engine, id, candidates, 2, None)
+    }
+
+    fn swarm_fetch_opts(
+        &mut self,
+        engine: &mut Engine,
+        id: &str,
+        candidates: &[ReplicaSource],
+        min_holders: usize,
+        progress: Option<&SwarmProgress>,
+    ) -> Result<bool, String> {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::sync::Mutex;
 
@@ -203,7 +214,7 @@ impl Fetcher {
                 }
             }
         }
-        if holders.len() < 2 {
+        if holders.len() < min_holders {
             return Ok(false);
         }
 
@@ -232,6 +243,20 @@ impl Fetcher {
         let Some((size, manifest)) = manifest else {
             return Ok(false); // no swarm-capable holder — single-stream
         };
+        // P9.1 (doc 22 §2): a progress consumer serves bytes EARLY, so the
+        // manifest must verify against the OWNER-ATTESTED root — an unsigned
+        // holder manifest is only ever advisory.
+        if progress.is_some() {
+            let attested = engine
+                .attested_manifest_root(&id.to_string())
+                .map_err(|e| e.to_string())?;
+            match attested {
+                Some((cs, root))
+                    if cs == CHUNK
+                        && pvfs_core::sync::manifest_root(&manifest) == root.as_slice() => {}
+                _ => return Ok(false), // unattested/mismatched — blocking path
+            }
+        }
         if manifest.len() < 2 {
             return Ok(false); // one chunk: a plain stream is strictly better
         }
@@ -250,6 +275,9 @@ impl Fetcher {
             .open(&part)
             .map_err(|e| e.to_string())?;
         f.set_len(size).map_err(|e| e.to_string())?;
+        if let Some(pr) = progress {
+            pr.set_layout(size, CHUNK, manifest.len(), part.clone());
+        }
         let mut have = vec![false; manifest.len()];
         let mut resumed = 0usize;
         {
@@ -264,6 +292,9 @@ impl Fetcher {
                 {
                     have[i] = true;
                     resumed += 1;
+                    if let Some(pr) = progress {
+                        pr.mark(i);
+                    }
                 }
             }
         }
@@ -280,6 +311,7 @@ impl Fetcher {
         let queue_ref = &queue;
         let counts_ref = &counts;
         let part_ref = &part;
+        let progress_ref = &progress;
 
         std::thread::scope(|scope| {
             for (key, mut client) in holders.drain(..) {
@@ -317,6 +349,9 @@ impl Fetcher {
                         {
                             queue_ref.lock().unwrap().push(idx);
                             break;
+                        }
+                        if let Some(pr) = progress_ref {
+                            pr.mark(idx);
                         }
                         pulled += 1;
                     }
@@ -512,4 +547,123 @@ pub fn sync_pull(
         }
     }
     Ok((fetched, failed))
+}
+
+
+/// P9.1 (doc 22 §2): shared progress of a chunked background fetch — which
+/// chunks are verified-present in the partial, and how it ended. The mount's
+/// read path waits on this to serve bytes the moment their chunks land.
+pub struct SwarmProgress {
+    state: std::sync::Mutex<ProgressState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ProgressState {
+    size: u64,
+    chunk: u64,
+    part: Option<PathBuf>,
+    done: Vec<bool>,
+    finished: Option<Result<PathBuf, String>>,
+}
+
+impl Default for SwarmProgress {
+    fn default() -> Self {
+        SwarmProgress {
+            state: std::sync::Mutex::new(ProgressState::default()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl SwarmProgress {
+    fn set_layout(&self, size: u64, chunk: u64, n: usize, part: PathBuf) {
+        let mut st = self.state.lock().unwrap();
+        st.size = size;
+        st.chunk = chunk;
+        st.part = Some(part);
+        st.done = vec![false; n];
+        self.cv.notify_all();
+    }
+
+    fn mark(&self, idx: usize) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(d) = st.done.get_mut(idx) {
+            *d = true;
+        }
+        self.cv.notify_all();
+    }
+
+    fn finish(&self, r: Result<PathBuf, String>) {
+        let mut st = self.state.lock().unwrap();
+        st.finished = Some(r);
+        self.cv.notify_all();
+    }
+
+    /// Wait until the chunks covering `[off, off+len)` are verified-present.
+    /// `Ok(path)` names where to read: the published file once finished, else
+    /// the partial. Errors when the fetch failed or `timeout` lapsed.
+    pub fn wait_range(
+        &self,
+        off: u64,
+        len: u64,
+        timeout: std::time::Duration,
+    ) -> Result<PathBuf, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(fin) = &st.finished {
+                return fin.clone();
+            }
+            if st.chunk > 0 {
+                let size = st.size;
+                let chunk = st.chunk;
+                let first = (off.min(size) / chunk) as usize;
+                let last = (off.saturating_add(len).min(size).saturating_sub(1) / chunk) as usize;
+                let covered = len == 0
+                    || off >= size
+                    || (first..=last).all(|i| st.done.get(i).copied().unwrap_or(false));
+                if covered {
+                    if let Some(p) = &st.part {
+                        return Ok(p.clone());
+                    }
+                }
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err("timed out waiting for chunks".into());
+            }
+            let (g, _) = self.cv.wait_timeout(st, left).unwrap();
+            st = g;
+        }
+    }
+}
+
+/// P9.1: the mount's background fetch — its OWN engine and fetcher (transient
+/// opens are cheap since the live-writer flock), chunked even with one holder,
+/// attested-manifest required; falls back to a blocking whole-file fetch for
+/// anything ineligible. Marks `progress` throughout and finishes it with the
+/// published path or the error.
+pub fn fetch_streaming(data_dir: &std::path::Path, id: &str, progress: &SwarmProgress) {
+    let result = (|| -> Result<PathBuf, String> {
+        let mut engine = Engine::open(data_dir).map_err(|e| e.to_string())?;
+        let mut fetcher = Fetcher::new(data_dir);
+        let candidates = fetcher.candidates(&engine, id);
+        if candidates.is_empty() {
+            return Err("no reachable source holds this file".into());
+        }
+        match fetcher.swarm_fetch_opts(&mut engine, id, &candidates, 1, Some(progress)) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                // ineligible or failed mid-swarm: the blocking path (any
+                // partial stays for a later resume)
+                fetcher.fetch(&mut engine, id)?;
+            }
+        }
+        engine
+            .readable_path(&id.to_string())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "fetched but not readable".into())
+    })();
+    progress.finish(result);
 }

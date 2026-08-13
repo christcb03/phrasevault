@@ -494,13 +494,17 @@ impl Engine {
                 return Ok(());
             }
         }
-        // brand-new file ⇒ pointer node + location
-        let content_hash = match b.hash_policy {
-            HashPolicy::OnAdd => LocalBackend.hash(uri)?,
-            _ => String::new(),
+        // brand-new file ⇒ pointer node + location. P9.1: hashing computes
+        // the chunk manifest in the same read and attests it after the node
+        // exists (doc 22 §2).
+        let (content_hash, chunks) = match b.hash_policy {
+            HashPolicy::OnAdd => {
+                crate::sync::hash_with_manifest(&crate::storage::uri_to_path(uri)?)?
+            }
+            _ => (String::new(), Vec::new()),
         };
         let payload = FilePayload {
-            content_hash,
+            content_hash: content_hash.clone(),
             size_bytes: f.size,
             mime_type: guess_mime(&f.name),
             original_name: f.name.clone(),
@@ -516,6 +520,7 @@ impl Engine {
                 creation_nonce: None,
             },
         )?;
+        self.attest_manifest(&id, &content_hash, &chunks)?;
         self.add_location(&id, uri)?;
         self.set_scan_state(uri, f.size, f.mtime_ms, &id)?;
         stats.added += 1;
@@ -711,17 +716,20 @@ impl Engine {
                 id: uri.to_string(),
             });
         }
-        let content_hash = match hash_policy {
-            HashPolicy::OnAdd => LocalBackend.hash(uri)?,
-            _ => String::new(),
+        let (content_hash, chunks) = match hash_policy {
+            HashPolicy::OnAdd => {
+                crate::sync::hash_with_manifest(&crate::storage::uri_to_path(uri)?)?
+            }
+            _ => (String::new(), Vec::new()),
         };
         let new_payload = FilePayload {
-            content_hash,
+            content_hash: content_hash.clone(),
             size_bytes: st.size,
             mime_type: old_payload.mime_type.clone(),
             original_name: old_payload.original_name.clone(),
         };
         let new_id = self.successor_node(&old, new_payload.encode(), &[uri.to_string()])?;
+        self.attest_manifest(&new_id, &content_hash, &chunks)?;
         self.set_scan_state(uri, st.size, st.mtime_ms, &new_id)?;
         Ok(new_id)
     }
@@ -1061,16 +1069,19 @@ impl Engine {
                 id: id.clone(),
             })?;
         let resolved = self.resolve_uri(&uri)?;
-        let content_hash = LocalBackend.hash(&resolved)?;
+        let (content_hash, chunks) =
+            crate::sync::hash_with_manifest(&crate::storage::uri_to_path(&resolved)?)?;
         let st = LocalBackend.stat(&resolved)?;
         let new_payload = FilePayload {
-            content_hash,
+            content_hash: content_hash.clone(),
             size_bytes: st.size,
             mime_type: payload.mime_type,
             original_name: payload.original_name,
         };
         let all_locations = self.locations(id)?;
-        self.successor_node(&n, new_payload.encode(), &all_locations)
+        let new_id = self.successor_node(&n, new_payload.encode(), &all_locations)?;
+        self.attest_manifest(&new_id, &content_hash, &chunks)?;
+        Ok(new_id)
     }
 
     /// Node + per-location availability (doc 04 §9 `stat`).

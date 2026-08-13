@@ -172,10 +172,11 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 
 | **P9.0 the swarm data plane** ([doc 22](22-swarm-data-plane.md)) — all-holder parallel verified chunk pulls (8 MiB BLAKE3, advisory manifests, the catalog-hash gate unchanged), stateless kill-anywhere resume; fleet phase J: 1 GiB from two real holders concurrently, kill -9 resumed 22/128 chunks | ✅ built + validated both hosts + fleet 72/72 (2026-08-12) |
 
-**EVERY ITEM IN THE DECIDED QUEUE IS BUILT** except P9.1 (manifest
-attestation + FUSE serve-while-fetching — punch J's serve-early behavior,
-doc 22 §2). The **release cut** is Chris's call (doc 19 §4's packaging note —
-1.4.0 = P5 + P6 + the P7 region/mount arc + P8 + P9.0 + fixes).
+| **P9.1 serve-while-fetching** ([doc 22](22-swarm-data-plane.md) §2) — owner-attested chunk layouts (`ChunkManifestRecorded`, admin-gated, schema v7) authored at hashing time; the mount streams an unfetched attested file as its chunks verify (first MiB of 1 GiB in ~2 s on the fleet — punch J retired) | ✅ built + validated both hosts + fleet 75/75 (2026-08-13) |
+
+**THE ENTIRE DECIDED QUEUE IS BUILT.** The **release cut** is Chris's call
+(doc 19 §4's packaging note — 1.4.0 = P5 + P6 + the P7 region/mount arc +
+P8 + P9 + fixes).
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):

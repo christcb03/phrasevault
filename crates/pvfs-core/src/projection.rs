@@ -20,7 +20,9 @@ use crate::log_store;
 // replacing the single last_applied pair. Same drop-and-replay upgrade.
 // v6 (P7.2c, doc 20 §2.5): cross-region moves — `pending_moves` (the pair
 // tracker) and `purged_nodes` (resurrection tombstones). Same upgrade.
-pub const SCHEMA_VERSION: u32 = 6;
+// v7 (P9.1, doc 22 §2): `chunk_manifests` — owner-attested chunk layouts
+// that license serve-while-fetching. Same upgrade.
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -108,6 +110,16 @@ CREATE TABLE IF NOT EXISTS pending_moves (
   in_seen         INTEGER NOT NULL DEFAULT 0,
   src_region      TEXT NOT NULL DEFAULT '',
   dest_region     TEXT NOT NULL DEFAULT ''
+);
+
+-- P9.1 (doc 22 §2): owner-attested chunk layouts. Early serving trusts the
+-- root INSTEAD of the whole-file gate, so rows land only via the admin-gated
+-- event; consumers additionally match content_hash against the node payload.
+CREATE TABLE IF NOT EXISTS chunk_manifests (
+  file_id       TEXT PRIMARY KEY,
+  content_hash  TEXT NOT NULL,
+  chunk_size    INTEGER NOT NULL,
+  manifest_root BLOB NOT NULL
 );
 
 -- P7.2c: purge tombstones — with per-region logs a purge and its node's
@@ -239,6 +251,7 @@ const MAIN_OBJECTS: &[&str] = &[
     "applied_marks",
     "pending_moves",
     "purged_nodes",
+    "chunk_manifests",
     "member_tags",
     "temp_nodes",
     "temp_links",
@@ -1022,6 +1035,22 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             )
             .map_err(&m)?;
         }
+        Event::ChunkManifestRecorded {
+            file_id,
+            content_hash,
+            chunk_size,
+            manifest_root,
+            ..
+        } => {
+            tx.execute(
+                "INSERT INTO chunk_manifests (file_id, content_hash, chunk_size, manifest_root)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(file_id) DO UPDATE SET content_hash = excluded.content_hash,
+                   chunk_size = excluded.chunk_size, manifest_root = excluded.manifest_root",
+                params![file_id, content_hash, *chunk_size as i64, manifest_root],
+            )
+            .map_err(&m)?;
+        }
         Event::NodeMovedOut {
             node_id,
             link_id,
@@ -1489,6 +1518,11 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
             // forest root" requirement was over-broad (it existed only because tags
             // were unscoped) and is dropped. A key-scoped membership only unlocks
             // nodes whose `Tag` grant that same key authored — i.e. nodes it controls.
+        }
+        // P9.1 (doc 22 §2): attesting a chunk layout licenses EARLY serving,
+        // which bypasses the whole-file gate — owner/admin tier only.
+        Event::ChunkManifestRecorded { file_id, .. } => {
+            require_right(conn, author, file_id, acl::ACL_A, "attest manifest", as_of_ms)?
         }
         Event::SecureBlobUpdated { blob_id, .. } => {
             // Advancing a blob's ledger is a write (doc 12 §8.2) — the same right

@@ -502,6 +502,33 @@ EOS
 echo "$J_KILL" | grep -q "J6=ok" && ok "kill -9 left the resumable partial in place" || fail "no swarm partial: $J_KILL"
 echo "$J_KILL" | grep -q "J7=ok" && ok "the retry completed" || fail "swarm retry"
 echo "$J_KILL" | grep -q "J8=ok" && ok "and REUSED the killed run's chunks (resume proven)" || fail "no resume"
+# P9.1: the streaming mount — first MiB while the 1 GiB fetch is in flight
+J_MOUNT=$(ssh "$EDGE" "SW=$SW DROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test
+if [ ! -e /dev/fuse ]; then echo "J9=skip"; exit 0; fi
+"\$B/pvfs" replica add "\$FT/consumer3" --instance owner >/dev/null 2>&1
+C="\$FT/consumer3/.pvfs"
+mkdir -p "\$FT/stream-view"
+"\$B/pvfs" --data-dir "\$C" mount "\$DROOT" "\$FT/stream-view" >/dev/null 2>"\$FT/fuse.log" &
+MPID=\$!
+for _ in \$(seq 1 40); do [ -d "\$FT/stream-view/swarm-zone" ] && break; sleep 0.25; done
+T0=\$(date +%s)
+head -c 1048576 "\$FT/stream-view/swarm-zone/swarm.mkv" > "\$FT/first-mib" 2>/dev/null && echo "J9=ok" || echo "J9=no"
+echo "FIRSTSECS=\$(( \$(date +%s) - T0 ))"
+ls "\$C/synced/\${SW:0:2}/".*.swarmpart >/dev/null 2>&1 && echo "J10=ok" || echo "J10=no"
+grep -q "mount: streaming" "\$FT/fuse.log" && echo "J11=ok" || echo "J11=no"
+fusermount3 -u "\$FT/stream-view" 2>/dev/null; kill \$MPID 2>/dev/null
+EOS
+)
+if echo "$J_MOUNT" | grep -q "J9=skip"; then
+  ok "streaming mount skipped (no fuse on the edge)"
+else
+  eval "$(echo "$J_MOUNT" | grep -E '^FIRSTSECS=')"
+  echo "$J_MOUNT" | grep -q "J9=ok" && ok "mount served the first MiB in ${FIRSTSECS}s" || fail "streaming mount read: $J_MOUNT"
+  echo "$J_MOUNT" | grep -q "J10=ok" && ok "…while the 1 GiB fetch was still in flight (punch J, retired)" || fail "no in-flight partial"
+  echo "$J_MOUNT" | grep -q "J11=ok" && ok "the mount took the attested streaming path" || fail "mount did not stream"
+fi
 gate swarm
 
 say "cleanup — stop fleet daemons (dirs kept for inspection)"

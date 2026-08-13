@@ -8,6 +8,7 @@
 //! daemon. Writes/xattrs/mtimes: refused/synthetic (doc 20 §3).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -16,7 +17,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEntry, ReplyOpen, Request,
 };
-use pvfs_client::fetch::Fetcher;
+use pvfs_client::fetch::{Fetcher, SwarmProgress};
 use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, TYPE_FILE};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -31,6 +32,12 @@ pub struct PvfsFs {
     next_ino: u64,
     /// Open handles: fh → the resolved on-disk file serving reads.
     handles: HashMap<u64, std::fs::File>,
+    /// P9.1 (doc 22 §2): handles streaming while a background chunked fetch
+    /// verifies — reads wait per-range on the shared progress.
+    streaming: HashMap<u64, Arc<SwarmProgress>>,
+    /// One background fetch per node, shared across its open handles.
+    active: HashMap<NodeId, Arc<SwarmProgress>>,
+    data_dir: std::path::PathBuf,
     next_fh: u64,
 }
 
@@ -47,6 +54,9 @@ impl PvfsFs {
             node_to_ino: HashMap::new(),
             next_ino: 2,
             handles: HashMap::new(),
+            streaming: HashMap::new(),
+            active: HashMap::new(),
+            data_dir: data_dir.to_path_buf(),
             next_fh: 1,
         };
         fs.ino_to_node.insert(1, target.clone());
@@ -203,7 +213,40 @@ impl Filesystem for PvfsFs {
         let Some(node) = self.ino_to_node.get(&ino).cloned() else {
             return reply.error(libc::ENOENT);
         };
-        let path = match self.resolve_bytes(&node) {
+        // P9.1 (doc 22 §2): an unfetched file with an OWNER-ATTESTED chunk
+        // layout streams — the open returns immediately, a background chunked
+        // fetch verifies, and each read waits only for its own range.
+        // Unattested files keep the safe block-until-verified path.
+        let local = self.engine.readable_path(&node).ok().flatten();
+        if local.is_none()
+            && self
+                .engine
+                .attested_manifest_root(&node)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            let progress = match self.active.get(&node) {
+                Some(p) => Arc::clone(p),
+                None => {
+                    eprintln!("mount: streaming {node} while its fetch verifies (doc 22 §2)");
+                    let p: Arc<SwarmProgress> = Arc::new(SwarmProgress::default());
+                    let bg = Arc::clone(&p);
+                    let dir = self.data_dir.clone();
+                    let id = node.clone();
+                    std::thread::spawn(move || {
+                        pvfs_client::fetch::fetch_streaming(&dir, &id, &bg);
+                    });
+                    self.active.insert(node.clone(), Arc::clone(&p));
+                    p
+                }
+            };
+            let fh = self.next_fh;
+            self.next_fh += 1;
+            self.streaming.insert(fh, progress);
+            return reply.opened(fh, 0);
+        }
+        let path = match local.map(Ok).unwrap_or_else(|| self.resolve_bytes(&node)) {
             Ok(p) => p,
             Err(_) => return reply.error(libc::EIO),
         };
@@ -230,6 +273,29 @@ impl Filesystem for PvfsFs {
         reply: ReplyData,
     ) {
         use std::os::unix::fs::FileExt;
+        // streaming handle: wait for the covering chunks, then serve from
+        // wherever the fetch says the verified bytes are right now
+        if let Some(progress) = self.streaming.get(&fh) {
+            let path = match progress.wait_range(
+                offset as u64,
+                size as u64,
+                std::time::Duration::from_secs(120),
+            ) {
+                Ok(p) => p,
+                Err(_) => return reply.error(libc::EIO),
+            };
+            let Ok(f) = std::fs::File::open(&path) else {
+                return reply.error(libc::EIO);
+            };
+            let mut buf = vec![0u8; size as usize];
+            return match f.read_at(&mut buf, offset as u64) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    reply.data(&buf);
+                }
+                Err(_) => reply.error(libc::EIO),
+            };
+        }
         let Some(f) = self.handles.get(&fh) else {
             return reply.error(libc::EBADF);
         };
@@ -254,6 +320,7 @@ impl Filesystem for PvfsFs {
         reply: fuser::ReplyEmpty,
     ) {
         self.handles.remove(&fh);
+        self.streaming.remove(&fh);
         reply.ok();
     }
 }

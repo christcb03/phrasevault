@@ -958,6 +958,9 @@ impl Engine {
                 Event::SecureBlobUpdated { blob_id, .. } => {
                     self.resolve_region(blob_id, &batch_homes)?
                 }
+                Event::ChunkManifestRecorded { file_id, .. } => {
+                    self.resolve_region(file_id, &batch_homes)?
+                }
             };
             routes.push(route);
         }
@@ -2669,6 +2672,69 @@ impl Engine {
                 },
             ],
         })
+    }
+
+    /// P9.1 (doc 22 §2): attest a freshly hashed file's chunk layout —
+    /// authored by this device (owner/admin tier), same commit cadence as
+    /// the hashing paths that call it. No-op for empty content.
+    pub(crate) fn attest_manifest(
+        &mut self,
+        file_id: &NodeId,
+        content_hash: &str,
+        chunks: &[[u8; 32]],
+    ) -> Result<()> {
+        if content_hash.is_empty() {
+            return Ok(());
+        }
+        let root = crate::sync::manifest_root(chunks);
+        let t = now_ms();
+        let me = self.device.pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_chunk_manifest_recorded(
+                file_id,
+                content_hash,
+                crate::sync::SWARM_CHUNK,
+                &root,
+                t,
+                &me,
+            ),
+        )?;
+        self.append_durable(vec![Event::ChunkManifestRecorded {
+            file_id: file_id.clone(),
+            content_hash: content_hash.into(),
+            chunk_size: crate::sync::SWARM_CHUNK,
+            manifest_root: root.to_vec(),
+            at: t,
+            author: me,
+            sig,
+        }])
+    }
+
+    /// P9.1: the attested chunk layout for a file, cross-checked against the
+    /// node's payload hash — `None` when unattested or stale (a successor
+    /// changed the content). What licenses serve-while-fetching.
+    pub fn attested_manifest_root(&self, id: &NodeId) -> Result<Option<(u64, Vec<u8>)>> {
+        let row: Option<(String, i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT content_hash, chunk_size, manifest_root FROM chunk_manifests WHERE file_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(map_db("attested manifest"))?;
+        let Some((attested_hash, chunk_size, root)) = row else {
+            return Ok(None);
+        };
+        let Some(n) = fetch_node(&self.conn, id)? else {
+            return Ok(None);
+        };
+        let payload = crate::node::FilePayload::decode(&n.payload)?;
+        if payload.content_hash != attested_hash {
+            return Ok(None);
+        }
+        Ok(Some((chunk_size as u64, root)))
     }
 
     /// A region's last committed head, for a move's causal cross-reference

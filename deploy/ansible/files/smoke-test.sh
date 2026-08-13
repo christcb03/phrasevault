@@ -895,6 +895,38 @@ else
   ok "fuse unavailable here — mount checks skipped (not a failure)"
 fi
 
+say "P9.1: serve-while-fetching — the streaming mount (doc 22 §2)"
+if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+  mkdir -p "$DATA/dstream"
+  head -c 268435456 /dev/urandom > "$DATA/dstream/stream.bin"
+  DSF="$($PVFS --data-dir "$DMOUNT/.pvfs" add "$DROOT" --kind folder --label stream-zone)"
+  $PVFS --data-dir "$DMOUNT/.pvfs" bind "$DSF" "$DATA/dstream" --hash-policy on_add >/dev/null
+  $PVFS --data-dir "$DMOUNT/.pvfs" scan "$DSF" >/dev/null
+  $PVFS replica sync "$REPMOUNT" >/dev/null 2>&1
+  mkdir -p "$DATA/fuse-view2"
+  $PVFS --data-dir "$REPMOUNT/.pvfs" mount "$DROOT" "$DATA/fuse-view2" >/dev/null 2>"$DATA/fuse2.log" &
+  M2PID=$!
+  MOK2=""
+  for _ in $(seq 1 40); do [ -d "$DATA/fuse-view2/stream-zone" ] && { MOK2=1; break; }; sleep 0.25; done
+  [ -n "$MOK2" ] && ok "second mount up (attested catalog synced)" || fail "second mount"
+  # single-box reality: the replica resolves the owner's file:// path
+  # LOCALLY, so the mount rightly serves without fetching — the actual
+  # serve-while-fetching path is proven cross-machine by fleet phase J.
+  # Here: the attestation exists on the replica, and reads are correct.
+  MCOUNT=$(python3 -c "import sqlite3;print(sqlite3.connect('$REPMOUNT/.pvfs/index.db').execute('SELECT COUNT(*) FROM chunk_manifests').fetchone()[0])" 2>/dev/null || echo 0)
+  [ "$MCOUNT" -ge 1 ] \
+    && ok "the attestation shipped and folded on the replica" || fail "no attested manifest on the replica"
+  head -c 1048576 "$DATA/fuse-view2/stream-zone/stream.bin" > "$DATA/first-mib" 2>/dev/null \
+    && ok "first MiB served" || fail "streaming first read"
+  cmp -s <(head -c 1048576 "$DATA/dstream/stream.bin") "$DATA/first-mib" \
+    && ok "early bytes are the right bytes" || fail "early byte mismatch"
+  cmp -s "$DATA/fuse-view2/stream-zone/stream.bin" "$DATA/dstream/stream.bin" \
+    && ok "full read completes bit-perfect" || fail "full streaming read"
+  fusermount3 -u "$DATA/fuse-view2" 2>/dev/null; kill $M2PID 2>/dev/null; M2PID=""
+else
+  ok "skipped streaming mount (no fuse3 on this host)"
+fi
+
 say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
 mkdir -p "$DATA/config3"
 E3KEY="$(jget "$(XDG_CONFIG_HOME="$DATA/config3" $PVFS --json whoami)" pubkey)"

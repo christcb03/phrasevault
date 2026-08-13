@@ -166,6 +166,51 @@ pub fn compute_manifest(path: &Path) -> Result<Vec<[u8; 32]>> {
     Ok(hashes)
 }
 
+/// The attested root over a chunk-hash list (doc 22 §2/§3).
+pub fn manifest_root(hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"pvfs:manifest:v1:");
+    for c in hashes {
+        h.update(c);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// One read, both answers: the whole-file hash (hex) and the chunk manifest —
+/// what the hashing paths use so attestation costs no second read (P9.1).
+pub fn hash_with_manifest(path: &Path) -> Result<(String, Vec<[u8; 32]>)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for hash", e))?;
+    let mut whole = blake3::Hasher::new();
+    let mut hashes = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut hasher = blake3::Hasher::new();
+    let mut in_chunk: u64 = 0;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| PvfsError::io("read for hash", e))?;
+        if n == 0 {
+            break;
+        }
+        whole.update(&buf[..n]);
+        let mut off = 0usize;
+        while off < n {
+            let take = ((SWARM_CHUNK - in_chunk) as usize).min(n - off);
+            hasher.update(&buf[off..off + take]);
+            in_chunk += take as u64;
+            off += take;
+            if in_chunk == SWARM_CHUNK {
+                hashes.push(*hasher.finalize().as_bytes());
+                hasher = blake3::Hasher::new();
+                in_chunk = 0;
+            }
+        }
+    }
+    if in_chunk > 0 {
+        hashes.push(*hasher.finalize().as_bytes());
+    }
+    Ok((whole.finalize().to_hex().to_string(), hashes))
+}
+
 fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
     let mut text = format!("{MANIFEST_HEADER}\n{SWARM_CHUNK}\n");
     for h in hashes {

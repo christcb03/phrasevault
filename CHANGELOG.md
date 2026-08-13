@@ -5,6 +5,15 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Serve-while-fetching (P9.1, doc 22 §2):** the streaming mount delivers on
+  punch J — opening an unfetched file whose chunk layout the owner attested
+  starts a background chunked fetch, and each read waits only for the chunks
+  covering its range (first MiB of a 1 GiB file in ~2 s on the fleet, fetch
+  still in flight). The attestation (`ChunkManifestRecorded`, projection
+  schema v7) is admin-gated on replay and binds the content hash; it is
+  authored wherever a content hash is computed from bytes, in the same read.
+  Unattested files keep the safe block-until-verified mount behavior and
+  attest on their next re-hash.
 - **The swarm data plane (P9.0, doc 22):** a fetch with two or more reachable
   holders pulls a hashed file as **parallel verified chunks from every holder
   at once** — 8 MiB BLAKE3 chunks, one worker per holder, bad chunks requeued

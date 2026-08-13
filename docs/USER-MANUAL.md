@@ -153,8 +153,11 @@ work too); the store may not live inside the bound space.
 Where an export materializes a snapshot, `pvfs mount <node> <dir>` presents the tree as a **live
 read-only filesystem** (FUSE): browse with `ls`, open files with anything. Bytes resolve at open —
 local path, sync store, or a verified fetch from a serving holder — so a pointer-mode library
-streams on demand. `pvfs umount <dir>` (or Ctrl-C on the foreground mount) releases it. Needs the
-distro's `fuse3` package.
+streams on demand. Files whose chunk layout the owner has attested (automatic for anything hashed
+since P9.1) **stream while they fetch**: playback starts as soon as the first chunks verify, with
+the fetch continuing behind the reads. Unattested files fetch fully first — the safe default.
+`pvfs umount <dir>` (or Ctrl-C on the foreground mount) releases it. Needs the distro's `fuse3`
+package.
 
 ### 6.3 Regions (`pvfs region`)
 
