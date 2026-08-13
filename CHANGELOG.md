@@ -5,6 +5,24 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **In-flight streaming (P10.1, doc 23 §11):** everything an ingest session
+  has verified serves **while the download runs**, through one seam —
+  ranged `Cat` on the ingesting daemon. Marked chunks stream immediately;
+  a request for unverified bytes *waits* server-side (60 s cap, lock-free)
+  and registers as a **hot range** in `IngestList` — the demand signal the
+  BT app maps to sequential piece priority, so hitting play reprioritizes
+  the torrent. FUSE mounts (local or replica) proxy reads of in-flight
+  files through the same op, gated by the early-serve license: the session
+  opener must hold admin on the target, the attestation bar. Fleet phase K
+  proved the arc across two machines: out-of-order ingest, mid-ingest
+  chunk pulls, a blocked edge reader surfacing as demand and unblocking on
+  verify, an in-flight consumer mount, and a bit-perfect post-commit read
+  — **89/89**.
+- **Replica-ingest race fixed (latent since P7.2b):** the follow job's
+  sweep and a manual `replica sync` shipping the same tail concurrently
+  could die on a PRIMARY KEY collision. Both ingest paths now take the
+  write transaction first and verify-then-skip rows another writer already
+  landed; a diverging row for an existing seq still refuses at its seq.
 - **External-ingest sessions (P10.0, doc 23):** the seam a downloader app
   (first consumer: the PVOS BitTorrent app) uses to land bytes **as they
   arrive**. Six wire ops: `IngestBegin` catalogs the whole torrent up front

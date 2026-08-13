@@ -349,3 +349,93 @@ progress sidecars, ranged `Cat` does not serve marked chunks of in-flight
 partials, and `IngestList` has no hot ranges — in-flight bytes are not yet
 readable by anyone but the ingesting app. The `done <idx> <hash>` sidecar
 lines are already the serving manifest P10.1 needs.
+
+## 11. P10.1 build spec (turnkey)
+
+**One seam serves everyone.** Every in-flight read — local mount, remote
+mount, a fleet box pulling early chunks — goes through **ranged `Cat` on
+the ingesting daemon**. That is where the partial and the authoritative
+bitmap live, so it is where three things happen exactly once:
+
+1. **The early-serve license** (§3): before serving an in-flight file,
+   `do_cat` checks the session owner (= the origin record's author) holds
+   admin on the file. No attestation exists yet by design; this is the
+   §4 trust chain's enforcement point.
+2. **The wait**: a request whose covering chunks are not yet marked
+   blocks server-side (200 ms polls of the sidecar, 60 s cap, engine lock
+   never held), then streams from the partial. `CatStart` is sent only
+   when bytes are ready, so old clients interoperate unchanged.
+3. **Demand feedback (§8.1)**: every wait registers its byte range in the
+   daemon's ingest state; `IngestList` reports them as per-file
+   **`hot` ranges** (additive wire field). Hitting play on a
+   half-downloaded file surfaces in the app's next poll — the signal it
+   maps to sequential piece priority. Ranges expire with the wait.
+
+**The mount becomes a thin proxy for in-flight files.** `open` on an
+unhashed pointer node with no local bytes dials the serving daemon — the
+replica's recorded source on a replica mount, the forest's own
+conventional socket (device-key-signed) on the owner box — and each
+`read` forwards as a ranged `Cat`, which waits server-side. No local
+partial, no second progress plumbing, license enforced in one place.
+(`mount: ingest-stream` on stderr is the which-path-ran marker.)
+
+**Deliberately not in P10.1:** full swarm-fetch of in-flight files
+(parallel multi-holder pulls against a partial manifest) — the serving
+seam is the same ranged `Cat` the swarm workers speak, so that
+integration stays open without new wire ops. `ChunkManifest` still
+answers only for on-disk bytes.
+
+**Touch list:** `pvfs-proto` (`IngestFileWire.hot`, additive) ·
+`pvfsd` (`do_cat` in-flight source + license + wait, hot-range registry,
+`IngestList` reporting) · `pvfs-fuse` (proxy handles) · `pvfs-cli`
+(`remote cat --offset --len`, `ingest list` prints hot) · e2e test
+(blocked reader surfaces a hot range, unblocks on `IngestVerified`,
+license-refusal negative) · smoke §P10.1 · fleet **phase K**: owner
+ingests out of order; the edge blocks reading chunk 0, the hot range
+shows in `IngestList`, the owner verifies chunk 0 and the edge's bytes
+arrive correct; a third box pulls the already-marked chunk mid-ingest.
+
+## 12. P10.1 close-out (honest, 2026-08-13)
+
+**Validated:** 235 cargo tests + 369 smoke checks green on both hosts via
+the pipeline, clippy `-D warnings` clean, and the two-machine fleet at
+**89/89** — phase K ran the §11 arc on real machines: the owner ingested
+out of order, the edge pulled the marked chunk mid-ingest bit-perfect,
+its blocked read on the unmarked chunk surfaced as `hot [[0,4096]]` in
+the owner's `IngestList`, verifying that chunk unblocked it with the
+right bytes, a consumer FUSE mount proxied the in-flight file over the
+LAN (`mount: ingest-stream`), and the commit closed the ledger with the
+edge reading the finished file whole. The e2e test carries the
+license-negative: a `w`-only member's session is refused early serving.
+
+**Latent defect found and fixed by this phase's validation — the
+P7.2b replica-ingest race.** Fleet phase H failed intermittently
+(`PRIMARY KEY constraint failed`, twice in four runs): the follow job's
+sweep and a manual `replica sync` legitimately ship the same tail
+concurrently, and both `ReplicaStore::append` and `append_region` read
+the tip *before* taking the write transaction. Fixed: immediate
+transaction first (10 s busy wait), tip read inside it, and overlap rows
+verified byte-identical against the stored chain then skipped — a
+diverging row for an existing seq still refuses at its exact seq.
+Regression test `overlapping_ship_is_a_verified_noop`. This bug predates
+P10 (shipped with P7.2b); the fleet's tighter timing this phase surfaced
+it.
+
+**Harness findings, recorded for the next author:**
+- The fleet's `jget` reads stdin; the smoke's takes args. Passing JSON as
+  an argument to the fleet's makes it eat the rest of the heredoc and the
+  block dies silently — phase K now documents the convention in place.
+- A consumer mount opened right after `replica sync` replays the fresh
+  tail before answering; phase K's directory poll needed 15 s, not 10.
+- Phase K's `eval` harvests are defaulted so a failed sub-block degrades
+  into readable FAILs instead of `set -u` aborts; G1's export and H's
+  seal sync now capture their stderr into the fail message (that
+  instrumentation is what converted "flaky" into the PK-race diagnosis).
+- One pipeline play failure on presubuntu and one G1 export failure
+  (run 2) did not reproduce and remain unattributed; both paths are now
+  instrumented, so a recurrence will name itself.
+
+**Scope note:** the chaos suite was not re-run — P10.1 touches no
+crash/rebuild path (the replica append was transactional before and
+after; the ingest wait loop holds no locks). The commit-freeze and
+publish semantics are unchanged from §10.

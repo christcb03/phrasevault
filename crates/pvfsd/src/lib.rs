@@ -76,6 +76,19 @@ struct IngestState {
     /// so the hash it computed stays true; expiry mirrors `PREPARE_TTL_MS`
     /// so an abandoned prepare unfreezes by itself.
     committing: HashMap<String, u64>,
+    /// P10.1 (doc 23 §8.1/§11): byte ranges in-flight readers are blocked
+    /// on right now — registered by `cat_ingest_partial`'s wait, reported
+    /// by `IngestList` as the app's sequential-priority demand signal.
+    hot: Vec<HotRange>,
+}
+
+/// One blocked reader's demand (doc 23 §8.1). Expiry mirrors the wait cap
+/// so a crashed reader's range ages out by itself.
+struct HotRange {
+    node: String,
+    start: u64,
+    end: u64,
+    expiry_ms: u64,
 }
 
 /// How many read-only views back the metadata read pool (doc 07 §6). Small on
@@ -139,6 +152,7 @@ impl Daemon {
             ingest: Mutex::new(IngestState {
                 sessions,
                 committing: HashMap::new(),
+                hot: Vec::new(),
             }),
         }
     }
@@ -720,7 +734,14 @@ fn do_cat<S: io::Read + io::Write>(
     let id: NodeId = node.to_string();
 
     // --- control plane: ACL check + path resolution (read view, doc 07 §6) ---
-    let path = {
+    // P10.1 (doc 23 §11): a file with no readable location may be an
+    // IN-FLIGHT ingest — then reads serve marked chunks of the partial,
+    // waiting server-side for coverage, gated on the early-serve license.
+    enum CatSrc {
+        Local(std::path::PathBuf),
+        Ingest { part: std::path::PathBuf, declared: u64 },
+    }
+    let src = {
         let e = daemon.reader();
         // ACL: caller needs read access.
         match e.effective_rights(principal, &id) {
@@ -736,10 +757,50 @@ fn do_cat<S: io::Read + io::Write>(
         }
         // Resolve the first readable local path (no lock held during I/O).
         match e.readable_path(&id) {
-            Ok(Some(p)) => p,
+            Ok(Some(p)) => CatSrc::Local(p),
             Ok(None) => {
-                write_msg(stream, &err("not_found", "no readable location for file"))?;
-                return Ok(());
+                // In-flight ingest? (engine → ingest lock order, as do_commit)
+                let inflight = {
+                    let st = daemon.ingest.lock().unwrap();
+                    st.sessions.iter().find_map(|s| {
+                        s.files
+                            .iter()
+                            .find(|f| f.node == id && f.committed.is_none())
+                            .map(|f| (s.owner_pub.clone(), f.size))
+                    })
+                };
+                match inflight {
+                    None => {
+                        write_msg(stream, &err("not_found", "no readable location for file"))?;
+                        return Ok(());
+                    }
+                    Some((owner_pub, declared)) => {
+                        // The early-serve license (doc 23 §3/§11): the origin
+                        // record's author — the session owner — must hold
+                        // admin on the file, the doc 22 §2 attestation bar.
+                        let licensed = e
+                            .effective_rights(&Principal::Key(owner_pub), &id)
+                            .map(|r| r & acl::ACL_A != 0)
+                            .unwrap_or(false);
+                        if !licensed {
+                            write_msg(
+                                stream,
+                                &err(
+                                    "forbidden",
+                                    "in-flight file is not early-servable (origin author lacks admin)",
+                                ),
+                            )?;
+                            return Ok(());
+                        }
+                        match ingest::part_path(&daemon.data_dir, &id) {
+                            Ok(part) => CatSrc::Ingest { part, declared },
+                            Err(pve) => {
+                                write_msg(stream, &err_from(pve))?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
             Err(pve) => {
                 write_msg(stream, &err_from(pve))?;
@@ -747,6 +808,13 @@ fn do_cat<S: io::Read + io::Write>(
             }
         }
     }; // engine lock released here
+
+    let path = match src {
+        CatSrc::Local(p) => p,
+        CatSrc::Ingest { part, declared } => {
+            return cat_ingest_partial(daemon, stream, &id, &part, declared, offset, len);
+        }
+    };
 
     // --- data plane: stream raw bytes, engine lock free ---
     let size = match std::fs::metadata(&path) {
@@ -800,6 +868,113 @@ fn do_cat<S: io::Read + io::Write>(
     }
     write_msg(stream, &ServerMsg::CatDone { written })?;
     Ok(())
+}
+
+/// How long an in-flight ranged `Cat` waits for its covering chunks before
+/// giving up — below the mount's read deadline so the client can retry.
+const INGEST_CAT_WAIT_MS: u64 = 60_000;
+const INGEST_CAT_POLL_MS: u64 = 200;
+
+/// P10.1 (doc 23 §11): serve a byte range of an IN-FLIGHT ingest partial.
+/// Blocks (engine-lock free) until the covering chunks are marked in the
+/// authoritative progress sidecar, registering the wait as a **hot range**
+/// — the §8.1 demand signal `IngestList` reports. `CatStart` goes out only
+/// once bytes are ready, so the wire shape is unchanged for old peers.
+fn cat_ingest_partial<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    stream: &mut S,
+    id: &str,
+    part: &std::path::Path,
+    declared: u64,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
+    let want = if offset == 0 && len == 0 {
+        declared
+    } else if offset.checked_add(len).is_some_and(|end| end <= declared) && len > 0 {
+        len
+    } else {
+        write_msg(stream, &err("bad_input", "range outside the file"))?;
+        return Ok(());
+    };
+    if want == 0 {
+        write_msg(stream, &ServerMsg::CatStart { size: 0 })?;
+        return write_msg(stream, &ServerMsg::CatDone { written: 0 });
+    }
+    let ppath = match ingest::progress_path(&daemon.data_dir, id) {
+        Ok(p) => p,
+        Err(pve) => {
+            write_msg(stream, &err_from(pve))?;
+            return Ok(());
+        }
+    };
+    let chunk = pvfs_core::sync::SWARM_CHUNK;
+    let (first, last) = (offset / chunk, (offset + want - 1) / chunk);
+    let expiry = now_ms() + INGEST_CAT_WAIT_MS;
+    {
+        let mut st = daemon.ingest.lock().unwrap();
+        st.hot.push(HotRange {
+            node: id.to_string(),
+            start: offset,
+            end: offset + want,
+            expiry_ms: expiry,
+        });
+    }
+    let ready = loop {
+        let covered = ingest::load_progress(&ppath, declared)
+            .map(|p| (first..=last).all(|i| p.done.contains_key(&i)))
+            .unwrap_or(false);
+        if covered {
+            break true;
+        }
+        if now_ms() >= expiry {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(INGEST_CAT_POLL_MS));
+    };
+    {
+        let mut st = daemon.ingest.lock().unwrap();
+        st.hot.retain(|h| {
+            !(h.node == id && h.start == offset && h.end == offset + want && h.expiry_ms == expiry)
+        });
+    }
+    if !ready {
+        write_msg(
+            stream,
+            &err("not_found", "range not yet ingested (wait cap hit) — retry"),
+        )?;
+        return Ok(());
+    }
+    write_msg(stream, &ServerMsg::CatStart { size: want })?;
+    let mut file = match std::fs::File::open(part) {
+        Ok(f) => f,
+        Err(e) => {
+            write_data_frame(stream, &[])?; // abort marker after CatStart
+            return Err(e);
+        }
+    };
+    if offset > 0 {
+        use std::io::Seek as _;
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
+            write_data_frame(stream, &[])?;
+            return Err(e);
+        }
+    }
+    let mut buf = vec![0u8; DATA_CHUNK];
+    let mut written: u64 = 0;
+    while written < want {
+        use std::io::Read as _;
+        let cap = (DATA_CHUNK as u64).min(want - written) as usize;
+        let got = file
+            .read(&mut buf[..cap])
+            .map_err(|e| io::Error::new(e.kind(), format!("ingest cat read: {e}")))?;
+        if got == 0 {
+            break;
+        }
+        write_data_frame(stream, &buf[..got])?;
+        written += got as u64;
+    }
+    write_msg(stream, &ServerMsg::CatDone { written })
 }
 
 /// The most ciphertext the daemon will accept for one secure blob (v1 cap).
@@ -1049,6 +1224,7 @@ fn do_ingest_begin(
             chunks_done: 0,
             chunks_total: f.size.div_ceil(pvfs_core::sync::SWARM_CHUNK),
             committed: None,
+            hot: Vec::new(),
         })
         .collect();
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
@@ -1483,7 +1659,34 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
     if !member {
         return err("forbidden", "ingest list is member-gated (enroll this box)");
     }
-    let sessions = daemon.ingest.lock().unwrap().sessions.clone();
+    let (sessions, hot_now) = {
+        let now = now_ms();
+        let mut st = daemon.ingest.lock().unwrap();
+        st.hot.retain(|h| h.expiry_ms > now); // aged-out waiters
+        let hot: Vec<(String, u64, u64)> = st
+            .hot
+            .iter()
+            .map(|h| (h.node.clone(), h.start, h.end))
+            .collect();
+        (st.sessions.clone(), hot)
+    };
+    // Coalesce one file's demand into sorted, merged byte ranges (§8.1).
+    let hot_for = |node: &str| -> Vec<(u64, u64)> {
+        let mut rs: Vec<(u64, u64)> = hot_now
+            .iter()
+            .filter(|(n, _, _)| n == node)
+            .map(|(_, s, e)| (*s, *e))
+            .collect();
+        rs.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(rs.len());
+        for (s, e) in rs {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        merged
+    };
     let mut out = Vec::with_capacity(sessions.len());
     for s in sessions {
         let mut files = Vec::with_capacity(s.files.len());
@@ -1507,6 +1710,7 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
                 chunks_done,
                 chunks_total,
                 committed: f.committed.clone(),
+                hot: hot_for(&f.node),
             });
         }
         out.push(IngestSessionWire {

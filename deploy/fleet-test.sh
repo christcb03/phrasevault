@@ -265,8 +265,8 @@ G_OUT=$(ssh "$EDGE" "LIB=$LIB bash -s" <<EOS
 set -u; $RHELPERS
 B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
 for j in follow sync export; do "\$B/pvfs" --data-dir "\$R" serve enable \$j >/dev/null || echo "G1=no(\$j)"; done
-"\$B/pvfs" --data-dir "\$R" export "\$LIB" "\$FT/daemon-view" --mode copy --prune --keep-fresh >/dev/null 2>&1 \
-  && echo "G1=ok" || echo "G1=no(export)"
+"\$B/pvfs" --data-dir "\$R" export "\$LIB" "\$FT/daemon-view" --mode copy --prune --keep-fresh >/dev/null 2>"\$FT/g1-export.log" \
+  && echo "G1=ok" || echo "G1=no(export: \$(tail -1 "\$FT/g1-export.log"))"
 pkill -HUP -f "pvfsd --mount \$FT/replica" && echo "G2=ok" || echo "G2=no"
 sleep 1
 "\$B/pvfs" --json --data-dir "\$R" serve status | grep -q '"runner":"on"' && echo "G3=ok" || echo "G3=no"
@@ -379,8 +379,8 @@ echo "$H_EDGE" | grep -q "H7=ok" && ok "sibling region's interior stays unfetche
 # seal photos; the whole-forest replica verifies the seal on its next sync
 ssh "$OWNER" '"$HOME/.local/bin/pvfs" --data-dir "$HOME/fleet-test/owner/.pvfs" region unmark '"$PH" >/dev/null \
   && ok "owner sealed the photos region" || fail "owner unmark"
-ssh "$EDGE" '"$HOME/.local/bin/pvfs" replica sync "$HOME/fleet-test/replica" >/dev/null 2>&1' \
-  && ok "edge replica synced + verified the sealed generation" || fail "edge seal sync"
+SEALSYNC=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" replica sync "$HOME/fleet-test/replica" 2>&1 >/dev/null | tail -1; exit "${PIPESTATUS[0]}"') \
+  && ok "edge replica synced + verified the sealed generation" || fail "edge seal sync: $SEALSYNC"
 gate regions
 
 say "I: doc 21 — attachment kinds on the owner: staging drains, mirror survives (P8)"
@@ -530,6 +530,140 @@ else
   echo "$J_MOUNT" | grep -q "J11=ok" && ok "the mount took the attested streaming path" || fail "mount did not stream"
 fi
 gate swarm
+
+say "K: doc 23 §11 — in-flight ingest streams to the fleet (P10.1)"
+# The whole arc on real machines: the owner ingests OUT OF ORDER (second
+# chunk first); the edge pulls the marked chunk mid-ingest, then BLOCKS on
+# the unmarked first chunk — which surfaces as a hot range on the owner
+# (the §8.1 demand signal) — until the owner verifies it; a consumer mount
+# proxies the in-flight file; the commit closes the ledger.
+K_OWNER=$(ssh "$OWNER" "ROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+IZ=\$("\$B/pvfs" --data-dir "\$D" add "\$ROOT" --kind folder --label ingest-zone)
+head -c 16777216 /dev/urandom > "\$FT/ig-src"
+IJ=\$("\$B/pvfs" --json --data-dir "\$D" ingest begin "\$IZ" --infohash c0ffee00 --file "inflight.bin:16777216" 2>&1)
+# NOTE: the fleet's jget reads JSON from STDIN (unlike the smoke's arg-based
+# one) — always pipe into it, or it eats the rest of this heredoc.
+KSID=\$(printf '%s' "\$IJ" | jget session 2>/dev/null || echo "")
+KNODE=\$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["files"][0]["node"])' "\$IJ" 2>/dev/null || echo "")
+[ "\${#KNODE}" -eq 64 ] && echo "K1=ok" || echo "K1=no(\$IJ)"
+"\$B/pvfs" --data-dir "\$D" ingest write "\$KSID" "\$KNODE" --offset 8388608 --from "\$FT/ig-src" --len 8388608 >/dev/null 2>&1
+"\$B/pvfs" --data-dir "\$D" ingest verified "\$KSID" "\$KNODE" --range 8388608-16777216 >/dev/null 2>&1 && echo "K2=ok" || echo "K2=no"
+echo "KSID=\$KSID"; echo "KNODE=\$KNODE"
+echo "KSHA1=\$(tail -c +8388609 "\$FT/ig-src" | head -c 4096 | sha256sum | cut -d' ' -f1)"
+echo "KSHA0=\$(head -c 4096 "\$FT/ig-src" | sha256sum | cut -d' ' -f1)"
+echo "KSHAF=\$(sha256sum "\$FT/ig-src" | cut -d' ' -f1)"
+EOS
+)
+eval "$(echo "$K_OWNER" | grep -E '^(KSID|KNODE|KSHA1|KSHA0|KSHAF)=')"
+KSID=${KSID:-}; KNODE=${KNODE:-}; KSHA1=${KSHA1:-}; KSHA0=${KSHA0:-}; KSHAF=${KSHAF:-}
+echo "$K_OWNER" | grep -q "K1=ok" && ok "owner opened the ingest session (catalog before bytes)" || fail "ingest begin: $K_OWNER"
+echo "$K_OWNER" | grep -q "K2=ok" && ok "owner wrote + verified the SECOND chunk only (out of order)" || fail "ooo write/verify"
+
+# edge: marked chunk pulls mid-ingest; unmarked chunk 0 blocks in background
+K_EDGE=$(ssh "$EDGE" "KNODE=$KNODE bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
+SEEN=no
+for _ in \$(seq 1 45); do "\$B/pvfs" --data-dir "\$R" node "\$KNODE" >/dev/null 2>&1 && { SEEN=yes; break; }; sleep 1; done
+[ "\$SEEN" = yes ] && echo "K3=ok" || echo "K3=no(catalog never arrived)"
+"\$B/pvfs" remote --instance owner cat "\$KNODE" --offset 8388608 --len 4096 > "\$FT/k-early" 2>/dev/null \
+  && echo "K4=ok" || echo "K4=no"
+echo "GSHA1=\$(sha256sum "\$FT/k-early" 2>/dev/null | cut -d' ' -f1)"
+rm -f "\$FT/k-waited"
+nohup bash -c "\$B/pvfs remote --instance owner cat \$KNODE --offset 0 --len 4096 > \$FT/k-waited 2>/dev/null" >/dev/null 2>&1 &
+echo "K5=ok"
+EOS
+)
+eval "$(echo "$K_EDGE" | grep -E '^GSHA1=')"
+GSHA1=${GSHA1:-}
+echo "$K_EDGE" | grep -q "K3=ok" && ok "edge sees the pointer node (follow shipped it)" || fail "edge catalog: $K_EDGE"
+echo "$K_EDGE" | grep -q "K4=ok" && ok "edge pulled the MARKED chunk mid-ingest (ranged Cat)" || fail "mid-ingest pull"
+[ "$GSHA1" = "$KSHA1" ] && ok "mid-ingest bytes are the right bytes" || fail "mid-ingest sha mismatch"
+
+# owner: the blocked edge reader is visible demand; supplying the bytes frees it
+K_HOT=$(ssh "$OWNER" "KSID=$KSID KNODE=$KNODE bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+HOT=no
+for _ in \$(seq 1 40); do
+  "\$B/pvfs" --json --data-dir "\$D" ingest list 2>/dev/null | grep -q '"hot":\[\[0,4096\]\]' && { HOT=yes; break; }
+  sleep 0.5
+done
+[ "\$HOT" = yes ] && echo "K6=ok" || echo "K6=no"
+"\$B/pvfs" --data-dir "\$D" ingest write "\$KSID" "\$KNODE" --offset 0 --from "\$FT/ig-src" --len 8388608 >/dev/null 2>&1
+"\$B/pvfs" --data-dir "\$D" ingest verified "\$KSID" "\$KNODE" --range 0-8388608 >/dev/null 2>&1 && echo "K7=ok" || echo "K7=no"
+EOS
+)
+echo "$K_HOT" | grep -q "K6=ok" && ok "the edge's blocked read surfaced as a HOT range (§8.1 demand)" || fail "no hot range: $K_HOT"
+echo "$K_HOT" | grep -q "K7=ok" && ok "owner supplied + verified the demanded chunk" || fail "supply chunk 0"
+
+# edge: the waiting read completed correct; a consumer mount proxies in-flight
+K_DONE=$(ssh "$EDGE" "DROOT=$ROOT bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test
+DONE=no
+for _ in \$(seq 1 40); do [ -s "\$FT/k-waited" ] && { DONE=yes; break; }; sleep 0.5; done
+[ "\$DONE" = yes ] && echo "K8=ok" || echo "K8=no"
+echo "GSHA0=\$(sha256sum "\$FT/k-waited" 2>/dev/null | cut -d' ' -f1)"
+if [ ! -e /dev/fuse ]; then echo "K9=skip"; exit 0; fi
+"\$B/pvfs" replica sync "\$FT/consumer" >/dev/null 2>&1
+mkdir -p "\$FT/ig-view"
+"\$B/pvfs" --data-dir "\$FT/consumer/.pvfs" mount "\$DROOT" "\$FT/ig-view" >/dev/null 2>"\$FT/ig-fuse.log" &
+MPID=\$!
+DIRUP=no
+for _ in \$(seq 1 60); do [ -d "\$FT/ig-view/ingest-zone" ] && { DIRUP=yes; break; }; sleep 0.25; done
+echo "KDBG_dir=\$DIRUP"
+echo "KDBG_ls=\$(ls "\$FT/ig-view/ingest-zone" 2>&1 | tr '\n' ',')"
+head -c 4096 "\$FT/ig-view/ingest-zone/inflight.bin" > "\$FT/k-mount" 2>"\$FT/k-mount.err" \
+  && echo "K9=ok" || echo "K9=no(\$(tail -1 "\$FT/k-mount.err" 2>/dev/null))"
+grep -q "mount: ingest-stream" "\$FT/ig-fuse.log" && echo "K10=ok" || echo "K10=no"
+echo "GSHAM=\$(sha256sum "\$FT/k-mount" 2>/dev/null | cut -d' ' -f1)"
+fusermount3 -u "\$FT/ig-view" 2>/dev/null; kill \$MPID 2>/dev/null
+EOS
+)
+eval "$(echo "$K_DONE" | grep -E '^(GSHA0|GSHAM)=')"
+GSHA0=${GSHA0:-}; GSHAM=${GSHAM:-}
+echo "$K_DONE" | grep -q "K8=ok" && ok "the blocked read completed once the bytes verified" || fail "waited read: $K_DONE"
+[ "$GSHA0" = "$KSHA0" ] && ok "waited bytes are the right bytes" || fail "waited sha mismatch"
+if echo "$K_DONE" | grep -q "K9=skip"; then
+  ok "in-flight mount skipped (no fuse on the edge)"
+else
+  echo "$K_DONE" | grep -q "K9=ok" && ok "a consumer mount read the in-flight file" || fail "in-flight mount read"
+  echo "$K_DONE" | grep -q "K10=ok" && ok "…via the ingest-proxy path (ranged Cat to the owner)" || fail "mount took the wrong path"
+  [ "$GSHAM" = "$KSHA0" ] && ok "mount bytes are the right bytes" || fail "mount sha mismatch"
+fi
+
+# owner commits; the edge reads the finished file like any other
+K_COMMIT=$(ssh "$OWNER" "KSID=$KSID KNODE=$KNODE bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; D="\$FT/owner/.pvfs"
+CJ=\$("\$B/pvfs" --json --data-dir "\$D" ingest commit "\$KSID" "\$KNODE" 2>/dev/null)
+NEWNODE=\$(printf '%s' "\$CJ" | jget committed 2>/dev/null || echo "")
+[ "\${#NEWNODE}" -eq 64 ] && echo "K11=ok" || echo "K11=no"
+echo "NEWNODE=\$NEWNODE"
+EOS
+)
+eval "$(echo "$K_COMMIT" | grep -E '^NEWNODE=')"
+NEWNODE=${NEWNODE:-}
+echo "$K_COMMIT" | grep -q "K11=ok" && ok "owner committed (hash-fill + attest + publish + closed record)" || fail "ingest commit: $K_COMMIT"
+K_FINAL=$(ssh "$EDGE" "NEWNODE=$NEWNODE bash -s" <<EOS
+set -u; $RHELPERS
+B=\$HOME/.local/bin; FT=\$HOME/fleet-test; R="\$FT/replica/.pvfs"
+SEEN=no
+for _ in \$(seq 1 45); do "\$B/pvfs" --data-dir "\$R" node "\$NEWNODE" >/dev/null 2>&1 && { SEEN=yes; break; }; sleep 1; done
+[ "\$SEEN" = yes ] || { echo "K12=no(successor never arrived)"; exit 0; }
+FSHA=\$("\$B/pvfs" --data-dir "\$R" cat "\$NEWNODE" 2>/dev/null | sha256sum | cut -d' ' -f1)
+echo "FSHA=\$FSHA"
+echo "K12=ok"
+EOS
+)
+eval "$(echo "$K_FINAL" | grep -E '^FSHA=')"
+FSHA=${FSHA:-}
+echo "$K_FINAL" | grep -q "K12=ok" && [ "$FSHA" = "$KSHAF" ] \
+  && ok "post-commit the file reads whole and bit-perfect on the edge" || fail "final read: $K_FINAL"
+gate ingest-streaming
 
 say "cleanup — stop fleet daemons (dirs kept for inspection)"
 ssh "$OWNER" 'pkill -f "pvfsd --mount $HOME/fleet-test" 2>/dev/null; true'

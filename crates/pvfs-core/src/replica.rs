@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::engine::bad;
 use crate::error::{PvfsError, Result};
@@ -215,17 +215,31 @@ impl ReplicaStore {
              CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);",
         )
         .map_err(crate::error::map_db("region log schema"))?;
-        let tip: i64 = conn
+        if rows.is_empty() {
+            let tip: i64 = conn
+                .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| r.get(0))
+                .map_err(crate::error::map_db("read region tip"))?;
+            return Ok(tip as u64);
+        }
+        // Two writers legitimately race here: the follow job's sweep and a
+        // manual `replica sync` fetch the same tail concurrently (found by
+        // fleet phase H as a PRIMARY KEY failure on the seal sync). Take the
+        // write lock FIRST (immediate transaction, with a busy wait), read
+        // the tip inside it, and treat rows another writer already landed as
+        // overlap: verify they match what's stored, then skip.
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(crate::error::map_db("region busy timeout"))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(crate::error::map_db("begin region ingest"))?;
+        let tip: i64 = tx
             .query_row("SELECT IFNULL(MAX(seq),0) FROM events", [], |r| r.get(0))
             .map_err(crate::error::map_db("read region tip"))?;
         let tip = tip as u64;
-        if rows.is_empty() {
-            return Ok(tip);
-        }
         let mut prev: [u8; 32] = if tip == 0 {
             *genesis
         } else {
-            let chain: Vec<u8> = conn
+            let chain: Vec<u8> = tx
                 .query_row(
                     "SELECT chain_hash FROM events WHERE seq = ?1",
                     rusqlite::params![tip as i64],
@@ -241,11 +255,31 @@ impl ReplicaStore {
                     seq: Some(tip),
                 })?
         };
-        let tx = conn
-            .transaction()
-            .map_err(crate::error::map_db("begin region ingest"))?;
         let mut expect_seq = tip;
         for row in rows {
+            if row.seq <= tip {
+                // Overlap: the racing writer got here first. The stored row
+                // must be byte-identical (same chain hash) — anything else is
+                // a diverging source, not a race.
+                let stored: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT chain_hash FROM events WHERE seq = ?1",
+                        rusqlite::params![row.seq as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(crate::error::map_db("read overlap row"))?;
+                match stored {
+                    Some(h) if h == row.chain_hash => continue,
+                    _ => {
+                        return Err(PvfsError::LogChainBroken {
+                            seq: row.seq,
+                            expected: hex::encode(&row.chain_hash),
+                            actual: "diverges from the already-ingested row".into(),
+                        })
+                    }
+                }
+            }
             expect_seq += 1;
             if row.seq != expect_seq {
                 return Err(bad(
@@ -346,7 +380,20 @@ impl ReplicaStore {
         if rows.is_empty() {
             return self.tip();
         }
-        let tip = self.tip()?;
+        // Same race as `append_region`: the follow job and a manual sync
+        // legitimately ship the same tail concurrently. Write lock first,
+        // tip inside the transaction, overlap verified-then-skipped.
+        self.conn
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(crate::error::map_db("replica busy timeout"))?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(crate::error::map_db("begin replica ingest"))?;
+        let tip: i64 = tx
+            .query_row("SELECT IFNULL(MAX(seq),0) FROM log.events", [], |r| r.get(0))
+            .map_err(crate::error::map_db("read replica tip"))?;
+        let tip = tip as u64;
         let mut prev: [u8; 32] = if tip == 0 {
             // The genesis seed binds (instance_id, forest_id) from the
             // ForestCreated event the first shipped row must carry.
@@ -363,14 +410,14 @@ impl ReplicaStore {
                 _ => return Err(bad("replica", "first event is not ForestCreated")),
             }
         } else {
-            let row = log_store::read_event(&self.conn, tip)?.ok_or_else(|| {
-                PvfsError::Corruption {
-                    db: "log.db".into(),
-                    detail: format!("missing event at seq {tip}"),
-                    seq: Some(tip),
-                }
-            })?;
-            row.chain_hash
+            let chain: Vec<u8> = tx
+                .query_row(
+                    "SELECT chain_hash FROM log.events WHERE seq = ?1",
+                    rusqlite::params![tip as i64],
+                    |r| r.get(0),
+                )
+                .map_err(crate::error::map_db("read replica tip"))?;
+            chain
                 .as_slice()
                 .try_into()
                 .map_err(|_| PvfsError::Corruption {
@@ -380,12 +427,28 @@ impl ReplicaStore {
                 })?
         };
 
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(crate::error::map_db("begin replica ingest"))?;
         let mut expect_seq = tip;
         for row in rows {
+            if row.seq <= tip {
+                let stored: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT chain_hash FROM log.events WHERE seq = ?1",
+                        rusqlite::params![row.seq as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(crate::error::map_db("read overlap row"))?;
+                match stored {
+                    Some(h) if h == row.chain_hash => continue,
+                    _ => {
+                        return Err(PvfsError::LogChainBroken {
+                            seq: row.seq,
+                            expected: hex::encode(&row.chain_hash),
+                            actual: "diverges from the already-ingested row".into(),
+                        })
+                    }
+                }
+            }
             expect_seq += 1;
             if row.seq != expect_seq {
                 return Err(bad(

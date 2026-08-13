@@ -243,3 +243,156 @@ fn ingest_session_end_to_end() {
     let mut anon = Client::connect_public(&sock).unwrap();
     assert!(forbidden(anon.ingest_list()));
 }
+
+// P10.1 (doc 23 §11): in-flight reads go through ranged Cat — marked chunks
+// serve immediately, unmarked ranges BLOCK server-side and surface as hot
+// ranges in IngestList (the §8.1 demand signal), and the early-serve license
+// (origin author holds admin) gates it all.
+#[test]
+fn inflight_reads_wait_and_surface_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let media = engine.add_node(&root, folder("media")).unwrap();
+
+    let app_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let app_pub = crypto::pubkey_bytes(&app_key);
+    engine.authorize_member(&owner_mn, &app_pub).unwrap();
+    engine
+        .set_acl(&media, &Principal::Key(app_pub.clone()), acl::ACL_RWA)
+        .unwrap();
+    // a viewer with read only, and a w-only ingester (license-negative case)
+    let viewer_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let viewer_pub = crypto::pubkey_bytes(&viewer_key);
+    engine.authorize_member(&owner_mn, &viewer_pub).unwrap();
+    engine
+        .set_acl(&media, &Principal::Key(viewer_pub.clone()), acl::ACL_R)
+        .unwrap();
+    let wonly_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let wonly_pub = crypto::pubkey_bytes(&wonly_key);
+    engine.authorize_member(&owner_mn, &wonly_pub).unwrap();
+    engine
+        .set_acl(&media, &Principal::Key(wonly_pub.clone()), acl::ACL_R | acl::ACL_W)
+        .unwrap();
+
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let daemon = Arc::new(Daemon::new(engine));
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let mut app = Client::connect_signed(&sock, &app_pub, |d| {
+        crypto::sign_digest(&app_key, d).unwrap()
+    })
+    .unwrap();
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&app_key, d).unwrap();
+
+    let size = (SWARM_CHUNK * 2) as usize; // exactly 2 chunks
+    let data = bytes(size);
+    let s = app
+        .ingest_begin(
+            &media,
+            "",
+            "bittorrent",
+            "feedc0de",
+            262_144,
+            &[("show.bin".to_string(), size as u64)],
+            false,
+            sign,
+        )
+        .unwrap();
+    let node = s.files[0].node.clone();
+
+    // out of order: only chunk 1 is written + verified
+    let half = SWARM_CHUNK as usize;
+    app.ingest_write(&s.session, &node, half as u64, &data[half..]).unwrap();
+    app.ingest_verified(&s.session, &node, &[(SWARM_CHUNK, size as u64)]).unwrap();
+
+    // a marked chunk serves immediately (the third-box seed path)
+    let mut viewer = Client::connect_signed(&sock, &viewer_pub, |d| {
+        crypto::sign_digest(&viewer_key, d).unwrap()
+    })
+    .unwrap();
+    let mut got = Vec::new();
+    viewer
+        .cat_range(&node, SWARM_CHUNK, 1024, &mut got)
+        .unwrap();
+    assert_eq!(got, data[half..half + 1024], "marked chunk served mid-ingest");
+
+    // an UNMARKED range blocks server-side…
+    let reader = {
+        let sock = sock.clone();
+        let viewer_key = viewer_key.clone();
+        let viewer_pub = viewer_pub.clone();
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let mut c = Client::connect_signed(&sock, &viewer_pub, |d| {
+                crypto::sign_digest(&viewer_key, d).unwrap()
+            })
+            .unwrap();
+            let mut buf = Vec::new();
+            c.cat_range(&node, 0, 2048, &mut buf).map(|_| buf)
+        })
+    };
+    // …and surfaces as a hot range in IngestList (§8.1 demand feedback)
+    let mut hot_seen = Vec::new();
+    for _ in 0..100 {
+        let sessions = app.ingest_list().unwrap();
+        if let Some(f) = sessions
+            .iter()
+            .flat_map(|s| s.files.iter())
+            .find(|f| f.node == node)
+        {
+            if !f.hot.is_empty() {
+                hot_seen = f.hot.clone();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(hot_seen, vec![(0, 2048)], "blocked reader surfaced as demand");
+
+    // the app supplies the demanded bytes → the reader unblocks, correct
+    app.ingest_write(&s.session, &node, 0, &data[..half]).unwrap();
+    app.ingest_verified(&s.session, &node, &[(0, SWARM_CHUNK)]).unwrap();
+    let got = reader.join().unwrap().expect("blocked read completed");
+    assert_eq!(got, data[..2048], "waited bytes are the right bytes");
+    // the wait is gone from the demand report
+    let sessions = app.ingest_list().unwrap();
+    let f = sessions
+        .iter()
+        .flat_map(|s| s.files.iter())
+        .find(|f| f.node == node)
+        .unwrap();
+    assert!(f.hot.is_empty(), "served wait no longer reported");
+
+    // license-negative: a w-only member's session is not early-servable
+    let mut wonly = Client::connect_signed(&sock, &wonly_pub, |d| {
+        crypto::sign_digest(&wonly_key, d).unwrap()
+    })
+    .unwrap();
+    let s2 = wonly
+        .ingest_begin(
+            &media,
+            "",
+            "bittorrent",
+            "0badc0de",
+            262_144,
+            &[("nolic.bin".to_string(), 1024)],
+            false,
+            |d| crypto::sign_digest(&wonly_key, d).unwrap(),
+        )
+        .unwrap();
+    let n2 = s2.files[0].node.clone();
+    wonly.ingest_write(&s2.session, &n2, 0, &bytes(1024)).unwrap();
+    wonly.ingest_verified(&s2.session, &n2, &[(0, 1024)]).unwrap();
+    let mut buf = Vec::new();
+    assert!(
+        forbidden(viewer.cat_range(&n2, 0, 512, &mut buf)),
+        "early-serve refused without the admin-tier origin author"
+    );
+}

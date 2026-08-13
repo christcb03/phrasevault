@@ -791,8 +791,17 @@ enum RemoteCmd {
     Ls { node: String },
     /// Show a node's metadata + your effective rights
     Stat { node: String },
-    /// Stream a file node's bytes to stdout
-    Cat { node: String },
+    /// Stream a file node's bytes to stdout. `--offset/--len` select a
+    /// range (P9 ranged Cat) — on an in-flight ingest file the daemon
+    /// waits for the covering chunks, so early bytes stream mid-download
+    /// (P10.1, doc 23 §11).
+    Cat {
+        node: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 0)]
+        len: u64,
+    },
     /// Create a folder under a parent node (requires your client identity)
     Mkdir { parent: String, label: String },
     /// Create a file node under a parent (requires your client identity)
@@ -2856,8 +2865,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                     .files
                                     .iter()
                                     .map(|f| {
+                                        let hot: Vec<String> = f
+                                            .hot
+                                            .iter()
+                                            .map(|(s, e)| format!("[{s},{e}]"))
+                                            .collect();
                                         format!(
-                                            "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"bytes_verified\":{},\"chunks_done\":{},\"chunks_total\":{},\"committed\":{}}}",
+                                            "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"bytes_verified\":{},\"chunks_done\":{},\"chunks_total\":{},\"committed\":{},\"hot\":[{}]}}",
                                             f.node,
                                             json_escape(&f.rel_path),
                                             f.size,
@@ -2867,7 +2881,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                             match &f.committed {
                                                 Some(c) => format!("\"{c}\""),
                                                 None => "null".into(),
-                                            }
+                                            },
+                                            hot.join(",")
                                         )
                                     })
                                     .collect();
@@ -2892,15 +2907,32 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                         "  {}  {}  {} B  committed → {}",
                                         f.node, f.rel_path, f.size, c
                                     ),
-                                    None => println!(
-                                        "  {}  {}  {}/{} B verified, {}/{} chunks",
-                                        f.node,
-                                        f.rel_path,
-                                        f.bytes_verified,
-                                        f.size,
-                                        f.chunks_done,
-                                        f.chunks_total
-                                    ),
+                                    None => {
+                                        let hot = if f.hot.is_empty() {
+                                            String::new()
+                                        } else {
+                                            // §8.1: a reader is blocked here now —
+                                            // the app should prioritize these bytes
+                                            format!(
+                                                "  HOT {}",
+                                                f.hot
+                                                    .iter()
+                                                    .map(|(s, e)| format!("{s}-{e}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(",")
+                                            )
+                                        };
+                                        println!(
+                                            "  {}  {}  {}/{} B verified, {}/{} chunks{}",
+                                            f.node,
+                                            f.rel_path,
+                                            f.bytes_verified,
+                                            f.size,
+                                            f.chunks_done,
+                                            f.chunks_total,
+                                            hot
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -4206,10 +4238,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{}  {}  {}  [{}]", n.id, n.node_type, n.label, n.rights);
                     }
                 }
-                RemoteCmd::Cat { node } => {
+                RemoteCmd::Cat { node, offset, len } => {
                     let node = remote_node(&mut client, &node)?;
                     let mut stdout = std::io::stdout().lock();
-                    client.cat(&node, &mut stdout).map_err(remote_err)?;
+                    if offset == 0 && len == 0 {
+                        client.cat(&node, &mut stdout).map_err(remote_err)?;
+                    } else {
+                        client
+                            .cat_range(&node, offset, len, &mut stdout)
+                            .map_err(remote_err)?;
+                    }
                 }
                 RemoteCmd::Mkdir { parent, label } => {
                     let parent = remote_node(&mut client, &parent)?;

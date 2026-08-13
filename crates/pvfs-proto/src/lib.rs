@@ -130,6 +130,11 @@ pub struct IngestFileWire {
     pub chunks_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed: Option<String>,
+    /// P10.1 (doc 23 §8.1): byte ranges readers are currently blocked on —
+    /// the demand signal the app maps to sequential piece priority.
+    /// Additive: absent on the wire when empty, so P10.0 peers interop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hot: Vec<(u64, u64)>,
 }
 
 /// One ingest session (P10.0): identity plus per-file state.

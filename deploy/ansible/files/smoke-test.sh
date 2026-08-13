@@ -942,6 +942,9 @@ IGROOT="$(jget "$IGINIT" root_node_id)"
 IGFID="$(jget "$IGINIT" forest_id)"
 IGD="$IGM/.pvfs"
 MEDIA="$($PVFS --data-dir "$IGD" add "$IGROOT" --kind folder --label media)"
+# P10.1: a viewer identity (the client key) reads in-flight bytes remotely
+$PVFS --data-dir "$IGD" device authorize-member --pubkey "$CLIENTKEY" >/dev/null
+$PVFS --data-dir "$IGD" acl set "$MEDIA" "key:$CLIENTKEY" r >/dev/null
 ISOCK="$PVFS_SOCKET_DIR/$IGFID.sock"
 "$PVFSD" --mount "$IGM" >/dev/null 2>"$DATA/pvfsd-ingest.log" &
 IPID=$!
@@ -1015,13 +1018,32 @@ RES="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); f=[f for s in d f
   && ok "kill -9 + restart: session + progress intact (the bitmap is authoritative)" \
   || fail "resume state after restart: $RES"
 
-# finish the bytes; chunk 0 marks only once its whole span is verified
+# P10.1 (doc 23 §11): the marked chunk serves MID-INGEST via ranged Cat
+$PVFS remote --socket "$ISOCK" cat "$NODE_A" --offset 8388608 --len 4096 > "$DATA/ig-early" 2>/dev/null \
+  && cmp -s "$DATA/ig-early" <(tail -c +8388609 "$DATA/ig-src-a" | head -c 4096) \
+  && ok "marked chunk streams mid-ingest (ranged Cat)" || fail "mid-ingest chunk read"
+# an UNMARKED range blocks server-side and surfaces as reader demand (§8.1)
+$PVFS remote --socket "$ISOCK" cat "$NODE_A" --offset 0 --len 4096 > "$DATA/ig-waited" 2>/dev/null &
+BGCAT=$!
+HOTSEEN=""
+for _ in $(seq 1 40); do
+  $PVFS --json --data-dir "$IGD" ingest list | qgrep '"hot":\[\[0,4096\]\]' && { HOTSEEN=1; break; }
+  sleep 0.25
+done
+[ -n "$HOTSEEN" ] && ok "blocked reader surfaces as a hot range (the demand signal)" \
+  || fail "no hot range while a reader waits"
+
+# finish the bytes; chunk 0 marks only once its whole span is verified —
+# and marking it is exactly what unblocks the waiting reader
 $PVFS --data-dir "$IGD" ingest write "$SID" "$NODE_A" --offset 0 \
   --from "$DATA/ig-src-a" --len 6291456 >/dev/null
 $PVFS --data-dir "$IGD" ingest write "$SID" "$NODE_B" --from "$DATA/ig-src-b" >/dev/null
 $PVFS --json --data-dir "$IGD" ingest verified "$SID" "$NODE_A" --range 0-6291456 | qgrep '"chunks_done":2' \
   && ok "verified ranges mark chunks incrementally" || fail "chunk marking"
 $PVFS --data-dir "$IGD" ingest verified "$SID" "$NODE_B" --range 0-4000 >/dev/null
+wait "$BGCAT" 2>/dev/null
+cmp -s "$DATA/ig-waited" <(head -c 4096 "$DATA/ig-src-a") \
+  && ok "the waiting reader got the right bytes once verified" || fail "waited-read mismatch"
 
 # commit file 1: hash-fill successor + attestation + publish
 NEW_A="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_A")" committed)"

@@ -338,6 +338,48 @@ fn replica_sync_fetches_missing_bytes() {
     replica.close().unwrap();
 }
 
+// P10.1-era fix (doc 23 §12): the follow job and a manual sync legitimately
+// ship the same tail concurrently — re-ingesting rows already landed must be
+// a verified no-op, while a DIVERGING row for an existing seq still refuses.
+#[test]
+fn overlapping_ship_is_a_verified_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    engine.add_node(&root, folder("a")).unwrap();
+    let rows: Vec<EventRow> = {
+        let tip = engine.log_tip().unwrap();
+        engine.log_events(1, tip as usize).unwrap()
+    };
+    engine.close().unwrap();
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut store = ReplicaStore::open(&store_dir.path().join(".pvfs")).unwrap();
+    let tip = store.append(&rows).unwrap();
+    // the racing writer's view: the same rows land again, stale tip and all
+    assert_eq!(store.append(&rows).unwrap(), tip, "full overlap is a no-op");
+    // partial overlap: an older slice re-ships harmlessly
+    assert_eq!(store.append(&rows[..2]).unwrap(), tip);
+    // divergence at an existing seq is NOT overlap — refuse loudly
+    let mut forged: Vec<EventRow> = rows
+        .iter()
+        .map(|r| EventRow {
+            seq: r.seq,
+            kind: r.kind.clone(),
+            body: r.body.clone(),
+            chain_hash: r.chain_hash.clone(),
+            written_at: r.written_at,
+        })
+        .collect();
+    let last = forged.len() - 1;
+    forged[last].chain_hash[0] ^= 0x01;
+    let err = store.append(&forged).unwrap_err();
+    assert!(
+        matches!(err, PvfsError::LogChainBroken { seq, .. } if seq == forged[last].seq),
+        "diverging overlap must refuse at its seq, got {err:?}"
+    );
+}
+
 // a tampered shipped row fails ingest at the exact seq
 #[test]
 fn tampered_ship_is_refused() {

@@ -524,6 +524,17 @@ identity needs write on the target folder, and admin on it for the
 attestation that commits carry. Note: committing re-identifies the node (the
 pointer gains its content hash) — `ingest commit` prints the successor id.
 
+**In-flight files stream (P10.1).** While a session is live, verified
+chunks already serve: `pvfs remote cat <node> --offset --len` returns
+marked bytes immediately and *waits* for unmarked ones (the daemon holds
+the request until the app verifies them), and a FUSE mount — local or on a
+replica — proxies reads of in-flight files the same way, so a video starts
+playing while its torrent downloads. Every waiting reader shows up in
+`pvfs ingest list` as a **HOT** byte range: that is the downloader app's
+cue to prioritize those pieces (sequential mode when someone hits play).
+Early serving requires the session opener to hold admin on the target —
+the same bar as the commit attestation.
+
 ## 8. Secure blobs (encrypted-at-rest storage)
 
 A **secure blob** is a node whose bytes are **encrypted so the server can never read them**, and

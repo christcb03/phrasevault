@@ -37,8 +37,19 @@ pub struct PvfsFs {
     streaming: HashMap<u64, Arc<SwarmProgress>>,
     /// One background fetch per node, shared across its open handles.
     active: HashMap<NodeId, Arc<SwarmProgress>>,
+    /// P10.1 (doc 23 §11): handles proxying an IN-FLIGHT ingest file — each
+    /// read forwards as a ranged `Cat` to the serving daemon, which waits
+    /// for chunk coverage and registers our demand as a hot range.
+    proxy: HashMap<u64, ProxyRead>,
     data_dir: std::path::PathBuf,
     next_fh: u64,
+}
+
+/// One in-flight proxy handle: the connection is reused across reads.
+struct ProxyRead {
+    node: NodeId,
+    declared: u64,
+    client: pvfs_client::Client,
 }
 
 impl PvfsFs {
@@ -56,6 +67,7 @@ impl PvfsFs {
             handles: HashMap::new(),
             streaming: HashMap::new(),
             active: HashMap::new(),
+            proxy: HashMap::new(),
             data_dir: data_dir.to_path_buf(),
             next_fh: 1,
         };
@@ -114,6 +126,38 @@ impl PvfsFs {
     /// The on-disk path serving this file's bytes: local/synced, else a
     /// verified read-through fetch (blocks for the fetch; doc 20 §7 notes
     /// serve-while-fetching as the deferred refinement).
+    /// P10.1: is `node` an in-flight ingest file this mount can proxy? An
+    /// unhashed pointer (empty content hash) qualifies; the connection dials
+    /// the replica's recorded source, or the forest's own conventional
+    /// socket signed with the device key. Returns the declared size and a
+    /// connected client, or `None` to fall through to the blocking path.
+    fn ingest_proxy(&self, node: &NodeId) -> Option<(u64, pvfs_client::Client)> {
+        let n = self.engine.node(node).ok().flatten()?;
+        if n.node_type != TYPE_FILE {
+            return None;
+        }
+        let p = FilePayload::decode(&n.payload).ok()?;
+        if !p.content_hash.is_empty() {
+            return None; // hashed files use the attested streaming/swarm paths
+        }
+        let client = if pvfs_core::replica::marker_path(&self.data_dir).exists() {
+            let src = pvfs_core::replica::ReplicaSource::load(&self.data_dir).ok()?;
+            pvfs_client::follow::dial_source(&src).ok()?
+        } else {
+            let sock =
+                pvfs_core::mount::daemon_socket_path(&self.engine.identity.forest_id);
+            let key = pvfs_core::identity::DeviceKeyCache::load(&self.data_dir)
+                .ok()?
+                .signing_key;
+            let pubkey = pvfs_core::crypto::pubkey_bytes(&key);
+            pvfs_client::Client::connect_signed(&sock, &pubkey, |d| {
+                pvfs_core::crypto::sign_digest(&key, d).unwrap_or_default()
+            })
+            .ok()?
+        };
+        Some((p.size_bytes, client))
+    }
+
     fn resolve_bytes(&mut self, node: &NodeId) -> Result<PathBuf, PvfsError> {
         if let Some(p) = self.engine.readable_path(node)? {
             return Ok(p);
@@ -246,6 +290,26 @@ impl Filesystem for PvfsFs {
             self.streaming.insert(fh, progress);
             return reply.opened(fh, 0);
         }
+        // P10.1 (doc 23 §11): an unhashed pointer node with no local bytes
+        // is an in-flight ingest — proxy reads through the serving daemon's
+        // ranged Cat (it enforces the early-serve license, waits for chunk
+        // coverage, and registers our demand as a hot range).
+        if local.is_none() {
+            if let Some((declared, client)) = self.ingest_proxy(&node) {
+                eprintln!("mount: ingest-stream {node} — reads proxy ranged Cat (doc 23 §11)");
+                let fh = self.next_fh;
+                self.next_fh += 1;
+                self.proxy.insert(
+                    fh,
+                    ProxyRead {
+                        node: node.clone(),
+                        declared,
+                        client,
+                    },
+                );
+                return reply.opened(fh, 0);
+            }
+        }
         let path = match local.map(Ok).unwrap_or_else(|| self.resolve_bytes(&node)) {
             Ok(p) => p,
             Err(_) => return reply.error(libc::EIO),
@@ -273,6 +337,25 @@ impl Filesystem for PvfsFs {
         reply: ReplyData,
     ) {
         use std::os::unix::fs::FileExt;
+        // P10.1 proxy handle: forward as a ranged Cat — the serving daemon
+        // waits for chunk coverage server-side. One retry rides out a
+        // wait-cap expiry on a slow ingest.
+        if let Some(pr) = self.proxy.get_mut(&fh) {
+            if offset as u64 >= pr.declared {
+                return reply.data(&[]);
+            }
+            let len = (size as u64).min(pr.declared - offset as u64);
+            let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+            for attempt in 0..2 {
+                buf.clear();
+                match pr.client.cat_range(&pr.node, offset as u64, len, &mut buf) {
+                    Ok(_) => return reply.data(&buf),
+                    Err(_) if attempt == 0 => continue,
+                    Err(_) => break,
+                }
+            }
+            return reply.error(libc::EIO);
+        }
         // streaming handle: wait for the covering chunks, then serve from
         // wherever the fetch says the verified bytes are right now
         if let Some(progress) = self.streaming.get(&fh) {
@@ -321,6 +404,7 @@ impl Filesystem for PvfsFs {
     ) {
         self.handles.remove(&fh);
         self.streaming.remove(&fh);
+        self.proxy.remove(&fh);
         reply.ok();
     }
 }
