@@ -2399,6 +2399,27 @@ impl Engine {
     /// member's signatures (see [`Event::set_author_sig`]).
     pub fn commit_member_write(&mut self, events: Vec<Event>) -> Result<()> {
         let root = self.current_root()?;
+        // P10.0 (doc 23 §9.2): a prepared batch may create a node and place
+        // children under it in the same commit — map batch-born nodes to
+        // their batch parents so authority resolves at the nearest
+        // pre-existing ancestor. Empty for every pre-P10 batch shape.
+        let created: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::NodeCreated(n) => Some(n.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut born: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ev in &events {
+            if let Event::LinkCreated(l) = ev {
+                if created.contains(l.child_id.as_str()) {
+                    if let Some(p) = &l.parent_id {
+                        born.insert(l.child_id.clone(), p.clone());
+                    }
+                }
+            }
+        }
         for ev in &events {
             ev.verify_sig()?;
             match ev {
@@ -2437,7 +2458,7 @@ impl Engine {
                 // Live commit judges ACL expiry at the wall clock (an expired
                 // grant must not admit new writes); replay re-judges at the
                 // row's `written_at`, which is at/after this instant.
-                _ => projection::check_member_event(&self.conn, ev, now_ms())?,
+                _ => projection::check_member_event_batched(&self.conn, ev, now_ms(), &born)?,
             }
         }
         // Idempotent double-commit of the same prepared node ⇒ success, no re-append.

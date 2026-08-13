@@ -91,6 +91,15 @@ pub fn sync_store_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
     })
 }
 
+/// The store's base directory (P10.0 space preflight, doc 23 §8.3): the
+/// configured root when set, else the default in-data-dir store.
+pub fn sync_store_dir(data_dir: &Path) -> Result<PathBuf> {
+    Ok(match sync_store_root(data_dir)? {
+        Some(root) => root,
+        None => data_dir.join(SYNC_DIR),
+    })
+}
+
 /// Where an **existing** synced file is, if anywhere: the configured root
 /// first, then the default store — files fetched before a `--to` move keep
 /// serving with no migration pass (doc 19 §3).
@@ -211,7 +220,7 @@ pub fn hash_with_manifest(path: &Path) -> Result<(String, Vec<[u8; 32]>)> {
     Ok((whole.finalize().to_hex().to_string(), hashes))
 }
 
-fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
+pub(crate) fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
     let mut text = format!("{MANIFEST_HEADER}\n{SWARM_CHUNK}\n");
     for h in hashes {
         text.push_str(&hex::encode(h));

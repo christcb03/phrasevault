@@ -21,6 +21,7 @@ pub mod event;
 pub mod export;
 pub mod fs;
 pub mod identity;
+pub mod ingest;
 pub mod link;
 pub mod log_store;
 pub mod mount;

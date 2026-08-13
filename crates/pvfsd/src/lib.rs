@@ -14,17 +14,20 @@ use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pvfs_core::acl::{self, Principal};
+use pvfs_core::ingest::{self, IngestClose, IngestSessionRec};
 use pvfs_core::{
     crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
 };
 use pvfs_proto::{
     auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ChildInfo, ClientMsg,
-    NodeInfo, ServerMsg, WriteOp, DATA_CHUNK, PROTO_VERSION,
+    IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, WriteOp,
+    DATA_CHUNK, PROTO_VERSION,
 };
 use rand::RngCore;
 
@@ -42,6 +45,37 @@ struct PreparedState {
     events: Vec<PreparedEvent>,
     result_id: String,
     expiry_ms: u64,
+    /// P10.0 (doc 23 §9.4): deployment-state work the daemon performs after
+    /// this prepared write commits — sessions activate, partials publish,
+    /// aborts clean up. `None` for every non-ingest write.
+    followup: Option<IngestFollowup>,
+}
+
+/// What lands when an ingest-flavored prepared write commits (doc 23 §9.4).
+enum IngestFollowup {
+    /// `IngestBegin` committed — the session goes live.
+    Activate(Box<IngestSessionRec>),
+    /// `IngestCommit` committed — publish the partial into the store and
+    /// mark the file done (the successor id re-identifies it).
+    Publish {
+        session: String,
+        old: String,
+        new: String,
+        manifest: Vec<[u8; 32]>,
+    },
+    /// `IngestAbort` committed — partials and progress removed, session gone.
+    Abort { session: String },
+}
+
+/// In-memory mirror of `ingest.sessions` plus commit freezes. Lock order:
+/// **never take the engine lock while holding this one** (handlers resolve
+/// under this lock, drop it, then touch the engine).
+struct IngestState {
+    sessions: Vec<IngestSessionRec>,
+    /// file node id → freeze expiry: a prepared `IngestCommit` froze writes
+    /// so the hash it computed stays true; expiry mirrors `PREPARE_TTL_MS`
+    /// so an abandoned prepare unfreezes by itself.
+    committing: HashMap<String, u64>,
 }
 
 /// How many read-only views back the metadata read pool (doc 07 §6). Small on
@@ -66,11 +100,27 @@ pub struct Daemon {
     /// The P5 job runner's state, when the binary attached one (doc 18 §2).
     /// Absent in embedded/test daemons — `ServeStatus` then reports `"off"`.
     jobs: std::sync::OnceLock<Arc<jobs::JobsState>>,
+    /// P10.0: the forest's data dir, for ingest partial/sidecar paths
+    /// without taking an engine lock.
+    data_dir: PathBuf,
+    /// P10.0: live ingest sessions (mirror of `ingest.sessions`).
+    ingest: Mutex<IngestState>,
 }
 
 impl Daemon {
     pub fn new(engine: Engine) -> Daemon {
         let forest_id = engine.identity.forest_id.clone();
+        let data_dir = engine.data_dir().to_path_buf();
+        // The serve.jobs startup rule (doc 23 §9.3): a corrupt sessions file
+        // refuses to guess — running with silently dropped sessions is the
+        // failure mode we refuse. Missing file = no sessions, normal.
+        let sessions = match ingest::load_sessions(&data_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("pvfsd: ingest.sessions unreadable ({e}) — fix or remove the file");
+                std::process::exit(2);
+            }
+        };
         // Best-effort pool: stop at the first view that fails to open rather
         // than failing the daemon — correctness never depends on the pool.
         let readers: Vec<Mutex<Engine>> = (0..READ_POOL)
@@ -85,6 +135,11 @@ impl Daemon {
             prepared: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
             jobs: std::sync::OnceLock::new(),
+            data_dir,
+            ingest: Mutex::new(IngestState {
+                sessions,
+                committing: HashMap::new(),
+            }),
         }
     }
 
@@ -290,6 +345,14 @@ pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, mut stream: S)
                 do_secure_put(daemon, &principal, &mut stream, &node)?;
                 continue;
             }
+            ClientMsg::IngestWrite {
+                session,
+                file,
+                offset,
+            } => {
+                do_ingest_write(daemon, &principal, &mut stream, &session, &file, offset)?;
+                continue;
+            }
             req => {
                 let resp = handle(daemon, &principal, req);
                 write_msg(&mut stream, &resp)?;
@@ -408,10 +471,45 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg) -> ServerMsg {
                 Err(pve) => err_from(pve),
             }
         }
-        // Cat / SecureCat / SecurePut are handled in serve_connection (data plane).
+        // P10.0 (doc 23 §3): the external-ingest session ops.
+        ClientMsg::IngestBegin {
+            parent,
+            name,
+            kind,
+            infohash,
+            piece_size,
+            files,
+            allow_shortfall,
+        } => do_ingest_begin(
+            daemon,
+            principal,
+            &parent,
+            &name,
+            &kind,
+            &infohash,
+            piece_size,
+            files,
+            allow_shortfall,
+        ),
+        ClientMsg::IngestVerified {
+            session,
+            file,
+            ranges,
+        } => do_ingest_verified(daemon, principal, &session, &file, &ranges),
+        ClientMsg::IngestCommit { session, file } => {
+            do_ingest_commit(daemon, principal, &session, &file)
+        }
+        ClientMsg::IngestAbort {
+            session,
+            keep_catalog,
+        } => do_ingest_abort(daemon, principal, &session, keep_catalog),
+        ClientMsg::IngestList => do_ingest_list(daemon, principal),
+        // Cat / SecureCat / SecurePut / IngestWrite are handled in
+        // serve_connection (data plane).
         ClientMsg::Cat { .. }
         | ClientMsg::SecureCat { .. }
         | ClientMsg::SecurePut { .. }
+        | ClientMsg::IngestWrite { .. }
         | ClientMsg::Auth { .. }
         | ClientMsg::Anonymous => err("bad_input", "unexpected message in request loop"),
     }
@@ -813,6 +911,7 @@ fn do_secure_put<S: io::Read + io::Write>(
             events: prepared.events,
             result_id: result_id.clone(),
             expiry_ms: now_ms() + PREPARE_TTL_MS,
+            followup: None,
         },
     );
     write_msg(
@@ -824,6 +923,600 @@ fn do_secure_put<S: io::Read + io::Write>(
         },
     )?;
     Ok(())
+}
+
+// ---- P10.0: external-ingest sessions (doc 23 §3/§9) -----------------------------
+
+fn ingest_author(principal: &Principal) -> Result<Vec<u8>, ServerMsg> {
+    match principal {
+        Principal::Key(pk) => Ok(pk.clone()),
+        _ => Err(err("forbidden", "ingest requires an authenticated identity")),
+    }
+}
+
+fn closed_label(session: &str) -> String {
+    let tag8: String = session.chars().take(8).collect();
+    format!(".pvos.download.closed-{tag8}")
+}
+
+/// Resolve one session file for a write-side op: session exists, caller owns
+/// it, file exists and is neither committed nor commit-frozen. Returns the
+/// declared size.
+fn ingest_file_open(
+    daemon: &Daemon,
+    session: &str,
+    file: &str,
+    author: &[u8],
+) -> Result<u64, ServerMsg> {
+    let st = daemon.ingest.lock().unwrap();
+    let s = st
+        .sessions
+        .iter()
+        .find(|s| s.id == session)
+        .ok_or_else(|| err("not_found", "no such ingest session"))?;
+    if s.owner_pub != author {
+        return Err(err("forbidden", "session belongs to another principal"));
+    }
+    let f = s
+        .files
+        .iter()
+        .find(|f| f.node == file)
+        .ok_or_else(|| err("not_found", "no such file in the session"))?;
+    if f.committed.is_some() {
+        return Err(err("bad_input", "file already committed"));
+    }
+    if st.committing.get(file).is_some_and(|exp| now_ms() < *exp) {
+        return Err(err("bad_input", "commit in progress — writes are frozen"));
+    }
+    Ok(f.size)
+}
+
+/// `IngestBegin` (doc 23 §9.4): space preflight, then one prepared batch for
+/// the whole catalog + origin record. The session activates when the
+/// member's `Commit` lands (the `Activate` followup).
+#[allow(clippy::too_many_arguments)]
+fn do_ingest_begin(
+    daemon: &Daemon,
+    principal: &Principal,
+    parent: &str,
+    name: &str,
+    kind: &str,
+    infohash: &str,
+    piece_size: u64,
+    files: Vec<IngestFileSpecWire>,
+    allow_shortfall: bool,
+) -> ServerMsg {
+    let author = match ingest_author(principal) {
+        Ok(a) => a,
+        Err(m) => return m,
+    };
+    let specs: Vec<ingest::IngestFileSpec> = files
+        .iter()
+        .map(|f| ingest::IngestFileSpec {
+            rel_path: f.rel_path.clone(),
+            size: f.size,
+        })
+        .collect();
+    // The §8.3 preflight: refuse when the declared bytes cannot land. The
+    // margin keeps the box breathing; `allow_shortfall` is the caller's
+    // explicit "space will free in time" risk.
+    let total: u64 = specs.iter().map(|f| f.size).sum();
+    let store_dir = match pvfs_core::sync::sync_store_dir(&daemon.data_dir) {
+        Ok(d) => d,
+        Err(pve) => return err_from(pve),
+    };
+    match ingest::free_space_at(&store_dir) {
+        Ok(free) => {
+            if !allow_shortfall && total.saturating_add(ingest::INGEST_SPACE_MARGIN) > free {
+                return err(
+                    "bad_input",
+                    &format!(
+                        "declared {total} B (+{} B margin) exceeds {free} B free at {} — free space, choose another store, or pass allow_shortfall",
+                        ingest::INGEST_SPACE_MARGIN,
+                        store_dir.display()
+                    ),
+                );
+            }
+        }
+        Err(pve) => return err_from(pve),
+    }
+    let session = random_id();
+    let (prepared, plan) = {
+        let e = daemon.engine.lock().unwrap();
+        match e.prepare_ingest_begin(
+            &author, &parent.to_string(), name, kind, infohash, piece_size, &session, &specs,
+        ) {
+            Ok(x) => x,
+            Err(pve) => return err_from(pve),
+        }
+    };
+    let rec = IngestSessionRec {
+        id: session.clone(),
+        owner_pub: author.clone(),
+        parent: parent.to_string(),
+        root: plan.root.clone(),
+        origin: plan.origin.clone(),
+        files: plan.files.clone(),
+    };
+    let file_wires: Vec<IngestFileWire> = plan
+        .files
+        .iter()
+        .map(|f| IngestFileWire {
+            node: f.node.clone(),
+            rel_path: f.rel_path.clone(),
+            size: f.size,
+            bytes_verified: 0,
+            chunks_done: 0,
+            chunks_total: f.size.div_ceil(pvfs_core::sync::SWARM_CHUNK),
+            committed: None,
+        })
+        .collect();
+    let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
+    let result_id = prepared.result_id.clone();
+    let prepared_id = random_id();
+    daemon.prepared.lock().unwrap().insert(
+        prepared_id.clone(),
+        PreparedState {
+            author_pub: author,
+            events: prepared.events,
+            result_id: result_id.clone(),
+            expiry_ms: now_ms() + PREPARE_TTL_MS,
+            followup: Some(IngestFollowup::Activate(Box::new(rec))),
+        },
+    );
+    ServerMsg::IngestPrepared(Box::new(pvfs_proto::IngestPreparedWire {
+        session,
+        root: plan.root,
+        origin: plan.origin,
+        files: file_wires,
+        prepared_id,
+        preimages,
+        result_id,
+    }))
+}
+
+/// `IngestWrite` (data plane): bytes land sparse at `offset` in the file's
+/// partial — out-of-order and duplicates are fine. Disk-full is a clean
+/// pause, never poison (doc 23 §8.3): the error goes back, the partial and
+/// the session stay resumable.
+fn do_ingest_write<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    principal: &Principal,
+    stream: &mut S,
+    session: &str,
+    file: &str,
+    offset: u64,
+) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    // Resolve everything up front; on failure the frames are still drained
+    // to the terminator so the connection stays in sync for the next op.
+    let setup = (|| -> Result<(u64, std::fs::File), ServerMsg> {
+        let author = ingest_author(principal)?;
+        let size = ingest_file_open(daemon, session, file, &author)?;
+        if offset > size {
+            return Err(err("bad_input", "offset past the declared size"));
+        }
+        let part = ingest::part_path(&daemon.data_dir, file).map_err(err_from)?;
+        if let Some(dir) = part.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| err("io", &format!("create store dir: {e}")))?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)
+            .map_err(|e| err("io", &format!("open partial: {e}")))?;
+        let len = f.metadata().map_err(|e| err("io", &format!("stat partial: {e}")))?.len();
+        if len < size {
+            f.set_len(size) // sparse: full length, no bytes written
+                .map_err(|e| err("io", &format!("size partial: {e}")))?;
+        }
+        Ok((size, f))
+    })();
+    let (size, mut f) = match setup {
+        Ok(x) => (x.0, Some(x.1)),
+        Err(m) => {
+            // drain to the terminator, then answer
+            loop {
+                match read_data_frame(stream)? {
+                    Some(c) if c.is_empty() => break,
+                    Some(_) => {}
+                    None => return Ok(()),
+                }
+            }
+            return write_msg(stream, &m);
+        }
+    };
+    let mut f = f.take().unwrap();
+    let mut pos = offset;
+    let mut fail: Option<ServerMsg> = None;
+    loop {
+        match read_data_frame(stream)? {
+            Some(chunk) if chunk.is_empty() => break,
+            Some(_) if fail.is_some() => {} // drain to terminator
+            Some(chunk) => {
+                if pos + chunk.len() as u64 > size {
+                    fail = Some(err("bad_input", "write past the declared size"));
+                    continue;
+                }
+                f.seek(SeekFrom::Start(pos))?;
+                if let Err(e) = f.write_all(&chunk) {
+                    if e.raw_os_error() == Some(28) {
+                        // ENOSPC — §8.3's pause: partial kept, resumable.
+                        fail = Some(err(
+                            "io",
+                            "no space left — session paused; resume after space frees",
+                        ));
+                        continue;
+                    }
+                    return Err(e);
+                }
+                pos += chunk.len() as u64;
+            }
+            None => return Ok(()), // client hung up mid-upload; partial stays
+        }
+    }
+    match fail {
+        Some(m) => write_msg(stream, &m),
+        None => write_msg(stream, &ServerMsg::IngestWritten { bytes: pos - offset }),
+    }
+}
+
+/// `IngestVerified`: merge app-verified ranges into the progress sidecar and
+/// BLAKE3 the newly covered chunks from the partial (doc 23 §9.3). Held
+/// under the ingest lock so sidecar updates serialize.
+fn do_ingest_verified(
+    daemon: &Daemon,
+    principal: &Principal,
+    session: &str,
+    file: &str,
+    ranges: &[(u64, u64)],
+) -> ServerMsg {
+    use std::io::{Read, Seek, SeekFrom};
+    let author = match ingest_author(principal) {
+        Ok(a) => a,
+        Err(m) => return m,
+    };
+    let size = match ingest_file_open(daemon, session, file, &author) {
+        Ok(s) => s,
+        Err(m) => return m,
+    };
+    let _st = daemon.ingest.lock().unwrap();
+    let ppath = match ingest::progress_path(&daemon.data_dir, file) {
+        Ok(p) => p,
+        Err(pve) => return err_from(pve),
+    };
+    let mut prog = match ingest::load_progress(&ppath, size) {
+        Ok(p) => p,
+        Err(pve) => return err_from(pve),
+    };
+    if let Err(pve) = prog.add_ranges(ranges) {
+        return err_from(pve);
+    }
+    let newly = prog.newly_covered();
+    if !newly.is_empty() {
+        let part = match ingest::part_path(&daemon.data_dir, file) {
+            Ok(p) => p,
+            Err(pve) => return err_from(pve),
+        };
+        let mut f = match std::fs::File::open(&part) {
+            Ok(f) => f,
+            Err(_) => return err("bad_input", "verified ranges but no bytes written yet"),
+        };
+        for idx in newly {
+            let (s, e) = prog.chunk_span(idx);
+            let mut buf = vec![0u8; (e - s) as usize];
+            if f.seek(SeekFrom::Start(s)).is_err() || f.read_exact(&mut buf).is_err() {
+                return err("io", "partial shorter than a verified range");
+            }
+            prog.done.insert(idx, *blake3::hash(&buf).as_bytes());
+        }
+    }
+    if let Err(pve) = ingest::save_progress(&ppath, &prog) {
+        return err_from(pve);
+    }
+    ServerMsg::IngestProgress {
+        bytes_verified: prog.bytes_verified(),
+        chunks_done: prog.done.len() as u64,
+        chunks_total: prog.chunks_total(),
+    }
+}
+
+/// `IngestCommit` (doc 23 §9.4): freeze writes, hash the partial with no
+/// locks held, prepare the member-signed successor + attestation (+ closed
+/// record iff last file). The `Publish` followup lands the bytes when the
+/// member's `Commit` does. Crash-retry paths re-verify through
+/// `swarm_commit` and answer `Committed` directly (no second log write).
+fn do_ingest_commit(daemon: &Daemon, principal: &Principal, session: &str, file: &str) -> ServerMsg {
+    let author = match ingest_author(principal) {
+        Ok(a) => a,
+        Err(m) => return m,
+    };
+    // Resolve + freeze under the ingest lock.
+    enum CommitPath {
+        Normal { close: Option<IngestClose> },
+        Retry { new: String },
+    }
+    let path = {
+        let mut st = daemon.ingest.lock().unwrap();
+        let s = match st.sessions.iter().find(|s| s.id == session) {
+            Some(s) => s,
+            None => return err("not_found", "no such ingest session"),
+        };
+        if s.owner_pub != author {
+            return err("forbidden", "session belongs to another principal");
+        }
+        let (origin, parent) = (s.origin.clone(), s.parent.clone());
+        let fi = match s.files.iter().find(|f| f.node == file) {
+            Some(f) => f,
+            None => return err("not_found", "no such file in the session"),
+        };
+        match &fi.committed {
+            Some(new) => CommitPath::Retry { new: new.clone() },
+            None => {
+                let others_open = s
+                    .files
+                    .iter()
+                    .any(|f| f.node != file && f.committed.is_none());
+                let close = (!others_open).then(|| IngestClose {
+                    parent,
+                    label: closed_label(session),
+                    payload: ingest::closed_payload(&origin, "complete"),
+                });
+                st.committing.insert(file.to_string(), now_ms() + PREPARE_TTL_MS);
+                CommitPath::Normal { close }
+            }
+        }
+    };
+    let part = match ingest::part_path(&daemon.data_dir, file) {
+        Ok(p) => p,
+        Err(pve) => return err_from(pve),
+    };
+    let unfreeze = || {
+        daemon.ingest.lock().unwrap().committing.remove(file);
+    };
+    match path {
+        CommitPath::Retry { new } => ingest_retry_publish(daemon, session, file, &new, &part),
+        CommitPath::Normal { close } => {
+            if !part.exists() {
+                unfreeze();
+                return err("bad_input", "no bytes written yet");
+            }
+            // The whole-file hash + manifest, one read, no locks (doc 23 §9.4).
+            let (hash, chunks) = match pvfs_core::sync::hash_with_manifest(&part) {
+                Ok(x) => x,
+                Err(pve) => {
+                    unfreeze();
+                    return err_from(pve);
+                }
+            };
+            let size = match std::fs::metadata(&part) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    unfreeze();
+                    return err("io", &format!("stat partial: {e}"));
+                }
+            };
+            let prepared = {
+                let e = daemon.engine.lock().unwrap();
+                e.prepare_ingest_commit(&author, &file.to_string(), &hash, size, &chunks, close.as_ref())
+            };
+            match prepared {
+                Ok((pw, new)) => {
+                    let preimages = pw.events.iter().map(|pe| hex::encode(pe.digest)).collect();
+                    let result_id = pw.result_id.clone();
+                    let prepared_id = random_id();
+                    daemon.prepared.lock().unwrap().insert(
+                        prepared_id.clone(),
+                        PreparedState {
+                            author_pub: author,
+                            events: pw.events,
+                            result_id: result_id.clone(),
+                            expiry_ms: now_ms() + PREPARE_TTL_MS,
+                            followup: Some(IngestFollowup::Publish {
+                                session: session.to_string(),
+                                old: file.to_string(),
+                                new,
+                                manifest: chunks,
+                            }),
+                        },
+                    );
+                    ServerMsg::Prepared {
+                        prepared_id,
+                        preimages,
+                        result_id,
+                    }
+                }
+                Err(PvfsError::BadInput { field, reason })
+                    if field == "file" && reason.starts_with("already hashed") =>
+                {
+                    // Crash window: the log commit landed but the sessions
+                    // file missed it. Resolve the successor and retry-publish.
+                    unfreeze();
+                    let successor = {
+                        let e = daemon.engine.lock().unwrap();
+                        e.ingest_successor(&file.to_string())
+                    };
+                    match successor {
+                        Ok(Some(new)) => {
+                            {
+                                let mut st = daemon.ingest.lock().unwrap();
+                                if let Some(s) = st.sessions.iter_mut().find(|s| s.id == session) {
+                                    if let Some(f) = s.files.iter_mut().find(|f| f.node == file) {
+                                        f.committed = Some(new.clone());
+                                    }
+                                }
+                                let sessions = st.sessions.clone();
+                                if let Err(e2) = ingest::save_sessions(&daemon.data_dir, &sessions) {
+                                    eprintln!("pvfsd: ingest.sessions save failed ({e2})");
+                                }
+                            }
+                            ingest_retry_publish(daemon, session, file, &new, &part)
+                        }
+                        Ok(None) => err("bad_input", "file already hashed outside this session"),
+                        Err(pve) => err_from(pve),
+                    }
+                }
+                Err(pve) => {
+                    unfreeze();
+                    err_from(pve)
+                }
+            }
+        }
+    }
+}
+
+/// The publish-retry path (doc 23 §9.4): the log already carries the
+/// successor; only the bytes still need to land. Full `swarm_commit`
+/// verification — this partial survived a crash, so it earns the re-read.
+fn ingest_retry_publish(
+    daemon: &Daemon,
+    session: &str,
+    file: &str,
+    new: &str,
+    part: &std::path::Path,
+) -> ServerMsg {
+    if part.exists() {
+        let manifest = match pvfs_core::sync::compute_manifest(part) {
+            Ok(m) => m,
+            Err(pve) => return err_from(pve),
+        };
+        let mut e = daemon.engine.lock().unwrap();
+        if let Err(pve) = e.swarm_commit(&new.to_string(), part, &manifest) {
+            return err_from(pve);
+        }
+    }
+    // Bookkeeping: progress gone, session dropped once every file is done.
+    let mut st = daemon.ingest.lock().unwrap();
+    st.committing.remove(file);
+    if let Ok(pp) = ingest::progress_path(&daemon.data_dir, file) {
+        let _ = std::fs::remove_file(pp);
+    }
+    st.sessions
+        .retain(|s| !(s.id == session && s.files.iter().all(|f| f.committed.is_some())));
+    if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
+        eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+    }
+    ServerMsg::Committed { id: new.to_string() }
+}
+
+/// `IngestAbort`: the closing record (+ unlink of the subtree root unless
+/// `keep_catalog`) as one prepared batch; the `Abort` followup removes the
+/// partials and the session when the member's `Commit` lands (§8.4).
+fn do_ingest_abort(
+    daemon: &Daemon,
+    principal: &Principal,
+    session: &str,
+    keep_catalog: bool,
+) -> ServerMsg {
+    let author = match ingest_author(principal) {
+        Ok(a) => a,
+        Err(m) => return m,
+    };
+    let (parent, root, origin) = {
+        let st = daemon.ingest.lock().unwrap();
+        let s = match st.sessions.iter().find(|s| s.id == session) {
+            Some(s) => s,
+            None => return err("not_found", "no such ingest session"),
+        };
+        if s.owner_pub != author {
+            return err("forbidden", "session belongs to another principal");
+        }
+        (s.parent.clone(), s.root.clone(), s.origin.clone())
+    };
+    let prepared = {
+        let e = daemon.engine.lock().unwrap();
+        let mut pw = match e.prepare_add_node(
+            &author,
+            &parent,
+            NodeSpec {
+                node_type: ingest::TYPE_DOWNLOAD_CLOSED.into(),
+                label: closed_label(session),
+                payload: ingest::closed_payload(&origin, "aborted"),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        ) {
+            Ok(p) => p,
+            Err(pve) => return err_from(pve),
+        };
+        if !keep_catalog {
+            match e.prepare_remove_node(&author, &root) {
+                Ok(rm) => pw.events.extend(rm.events),
+                // Root already unlinked (or never linked) — close-only.
+                Err(PvfsError::NotFound { .. }) => {}
+                Err(pve) => return err_from(pve),
+            }
+        }
+        pw
+    };
+    let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
+    let result_id = prepared.result_id.clone();
+    let prepared_id = random_id();
+    daemon.prepared.lock().unwrap().insert(
+        prepared_id.clone(),
+        PreparedState {
+            author_pub: author,
+            events: prepared.events,
+            result_id: result_id.clone(),
+            expiry_ms: now_ms() + PREPARE_TTL_MS,
+            followup: Some(IngestFollowup::Abort {
+                session: session.to_string(),
+            }),
+        },
+    );
+    ServerMsg::Prepared {
+        prepared_id,
+        preimages,
+        result_id,
+    }
+}
+
+/// `IngestList`: the live sessions with per-file progress. Active-member
+/// gated (the ServeStatus bar): operational state, not public metadata.
+fn do_ingest_list(daemon: &Daemon, principal: &Principal) -> ServerMsg {
+    let member = match principal {
+        Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+        _ => false,
+    };
+    if !member {
+        return err("forbidden", "ingest list is member-gated (enroll this box)");
+    }
+    let sessions = daemon.ingest.lock().unwrap().sessions.clone();
+    let mut out = Vec::with_capacity(sessions.len());
+    for s in sessions {
+        let mut files = Vec::with_capacity(s.files.len());
+        for f in &s.files {
+            let chunks_total = f.size.div_ceil(pvfs_core::sync::SWARM_CHUNK);
+            let (bytes_verified, chunks_done) = if f.committed.is_some() {
+                (f.size, chunks_total)
+            } else {
+                match ingest::progress_path(&daemon.data_dir, &f.node)
+                    .and_then(|p| ingest::load_progress(&p, f.size))
+                {
+                    Ok(p) => (p.bytes_verified(), p.done.len() as u64),
+                    Err(_) => (0, 0),
+                }
+            };
+            files.push(IngestFileWire {
+                node: f.node.clone(),
+                rel_path: f.rel_path.clone(),
+                size: f.size,
+                bytes_verified,
+                chunks_done,
+                chunks_total,
+                committed: f.committed.clone(),
+            });
+        }
+        out.push(IngestSessionWire {
+            session: s.id,
+            root: s.root,
+            origin: s.origin,
+            files,
+        });
+    }
+    ServerMsg::IngestSessions { sessions: out }
 }
 
 /// Phase 1: build the signable events for `op` and stash them under a fresh id.
@@ -981,6 +1674,7 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> Serv
             events: prepared.events,
             result_id: result_id.clone(),
             expiry_ms: now_ms() + PREPARE_TTL_MS,
+            followup: None,
         },
     );
     ServerMsg::Prepared {
@@ -1027,9 +1721,108 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
             if let Some(j) = daemon.jobs.get() {
                 j.nudge_tier();
             }
-            ServerMsg::Committed { id: state.result_id }
+            match state.followup {
+                None => ServerMsg::Committed { id: state.result_id },
+                Some(f) => finish_ingest_followup(daemon, e, f, state.result_id),
+            }
         }
-        Err(e) => err_from(e),
+        Err(pve) => {
+            // A failed ingest commit unfreezes its file so writes resume.
+            if let Some(IngestFollowup::Publish { old, .. }) = &state.followup {
+                daemon.ingest.lock().unwrap().committing.remove(old);
+            }
+            err_from(pve)
+        }
+    }
+}
+
+/// The deployment-state half of a committed ingest write (doc 23 §9.4). The
+/// engine guard is still held for the publish rename (O(1) — the hash was
+/// computed at prepare time with writes frozen), then dropped before the
+/// sessions file is touched.
+fn finish_ingest_followup(
+    daemon: &Daemon,
+    mut e: MutexGuard<'_, Engine>,
+    followup: IngestFollowup,
+    result_id: String,
+) -> ServerMsg {
+    match followup {
+        IngestFollowup::Activate(rec) => {
+            drop(e);
+            let mut st = daemon.ingest.lock().unwrap();
+            st.sessions.push(*rec);
+            if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
+                // The catalog commit landed; the session works until restart.
+                eprintln!("pvfsd: ingest.sessions save failed ({pve}) — session is live but not persisted");
+            }
+            ServerMsg::Committed { id: result_id }
+        }
+        IngestFollowup::Publish {
+            session,
+            old,
+            new,
+            manifest,
+        } => {
+            let part = match ingest::part_path(&daemon.data_dir, &old) {
+                Ok(p) => p,
+                Err(pve) => return err_from(pve),
+            };
+            let published = e.ingest_publish(&new, &part, &manifest);
+            drop(e);
+            let mut st = daemon.ingest.lock().unwrap();
+            st.committing.remove(&old);
+            if let Some(s) = st.sessions.iter_mut().find(|s| s.id == session) {
+                if let Some(f) = s.files.iter_mut().find(|f| f.node == old) {
+                    f.committed = Some(new.clone());
+                }
+            }
+            match published {
+                Ok(_) => {
+                    if let Ok(pp) = ingest::progress_path(&daemon.data_dir, &old) {
+                        let _ = std::fs::remove_file(pp);
+                    }
+                    // Last publish done → the session's deployment state goes
+                    // (§8.4 — the closed record rode this very commit).
+                    st.sessions
+                        .retain(|s| !(s.id == session && s.files.iter().all(|f| f.committed.is_some())));
+                    if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
+                        eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+                    }
+                    ServerMsg::Committed { id: result_id }
+                }
+                Err(pve) => {
+                    // The log commit landed; the partial is still in place.
+                    // The retry path re-verifies through swarm_commit.
+                    if let Err(e2) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
+                        eprintln!("pvfsd: ingest.sessions save failed ({e2})");
+                    }
+                    err(
+                        "io",
+                        &format!("committed but publish failed ({pve}) — re-run ingest commit to retry"),
+                    )
+                }
+            }
+        }
+        IngestFollowup::Abort { session } => {
+            drop(e);
+            let mut st = daemon.ingest.lock().unwrap();
+            if let Some(i) = st.sessions.iter().position(|s| s.id == session) {
+                let s = st.sessions.remove(i);
+                for f in s.files.iter().filter(|f| f.committed.is_none()) {
+                    st.committing.remove(&f.node);
+                    if let Ok(p) = ingest::part_path(&daemon.data_dir, &f.node) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    if let Ok(p) = ingest::progress_path(&daemon.data_dir, &f.node) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
+                    eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+                }
+            }
+            ServerMsg::Committed { id: result_id }
+        }
     }
 }
 

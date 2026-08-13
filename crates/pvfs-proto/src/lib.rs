@@ -80,6 +80,73 @@ pub enum ServerMsg {
         runner: String,
         jobs: Vec<ServeJobWire>,
     },
+    /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
+    /// the standard prepared-write fields. The client signs the preimages and
+    /// sends the usual `Commit`; the session activates when that commit
+    /// lands. Boxed so the enum stays small; the wire JSON is unchanged
+    /// (internal tagging flattens the newtype).
+    IngestPrepared(Box<IngestPreparedWire>),
+    /// P10.0: an `IngestWrite` upload landed (bytes received this call).
+    IngestWritten { bytes: u64 },
+    /// P10.0: per-file verification progress after an `IngestVerified`.
+    IngestProgress {
+        bytes_verified: u64,
+        chunks_done: u64,
+        chunks_total: u64,
+    },
+    /// P10.0: the live ingest sessions (response to `ClientMsg::IngestList`).
+    IngestSessions { sessions: Vec<IngestSessionWire> },
+}
+
+/// Phase-1 answer to `IngestBegin` (P10.0): the session layout plus the
+/// standard prepared-write fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestPreparedWire {
+    pub session: String,
+    /// The subtree root: the torrent folder, or the file itself for a
+    /// single bare file.
+    pub root: String,
+    /// The `pvos.download` origin record's node id.
+    pub origin: String,
+    pub files: Vec<IngestFileWire>,
+    pub prepared_id: String,
+    pub preimages: Vec<String>,
+    pub result_id: String,
+}
+
+/// One in-flight ingest file (P10.0, doc 23 §3): the catalog pointer node,
+/// its declared size, verification progress, and — once committed — the
+/// hash-fill successor's id (commits re-identify nodes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestFileWire {
+    pub node: String,
+    pub rel_path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub bytes_verified: u64,
+    #[serde(default)]
+    pub chunks_done: u64,
+    #[serde(default)]
+    pub chunks_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<String>,
+}
+
+/// One ingest session (P10.0): identity plus per-file state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestSessionWire {
+    pub session: String,
+    pub root: String,
+    pub origin: String,
+    pub files: Vec<IngestFileWire>,
+}
+
+/// One declared file in an `IngestBegin` (P10.0): its path inside the
+/// torrent (folders created as needed) and the metainfo size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestFileSpecWire {
+    pub rel_path: String,
+    pub size: u64,
 }
 
 /// One serve job's live state (P5, doc 18 §2): configured name, whether
@@ -263,6 +330,62 @@ pub enum ClientMsg {
     /// Live job-runner state (P5, doc 18 §2). Answered like `Info` — operational
     /// metadata, no catalog content.
     ServeStatus,
+    /// P10.0 (doc 23 §3): open an external-ingest session — catalog the whole
+    /// torrent now (unhashed pointer nodes), bytes arrive later. Phase 1 of a
+    /// member write: answered `IngestPrepared`; the standard `Commit` lands it
+    /// and activates the session. The daemon refuses when the declared total
+    /// exceeds free space at the sync store (doc 23 §8.3) unless
+    /// `allow_shortfall` accepts the caller's risk.
+    IngestBegin {
+        parent: String,
+        /// Torrent name → the root folder's label. May be empty for a single
+        /// bare file (no wrapping folder).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        /// Origin kind for the `pvos.download` record, e.g. `bittorrent`.
+        kind: String,
+        /// The torrent infohash (hex) — the early-serve trust anchor.
+        infohash: String,
+        piece_size: u64,
+        files: Vec<IngestFileSpecWire>,
+        #[serde(default)]
+        allow_shortfall: bool,
+    },
+    /// P10.0: upload bytes into a session file's partial at `offset` — the
+    /// `SecurePut` data-plane shape: binary frames follow, a zero-length
+    /// frame terminates, the daemon replies `IngestWritten`. Out-of-order
+    /// and duplicate writes are fine (the partial is sparse).
+    IngestWrite {
+        session: String,
+        file: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u64,
+    },
+    /// P10.0: the app reports byte ranges whose torrent pieces verified
+    /// against the infohash. The daemon hashes newly covered chunks into the
+    /// progress sidecar and replies `IngestProgress`.
+    IngestVerified {
+        session: String,
+        file: String,
+        /// Half-open `[start, end)` byte ranges.
+        ranges: Vec<(u64, u64)>,
+    },
+    /// P10.0: commit one file — whole-file BLAKE3 → hash-fill successor +
+    /// attestation (+ the `pvos.download.closed` record if this is the
+    /// session's last file), then publish into the store. Phase 1 of a member
+    /// write: answered `Prepared`; `Commit` lands it (`Committed.id` is the
+    /// successor node — commits re-identify).
+    IngestCommit { session: String, file: String },
+    /// P10.0: abort the session — a `pvos.download.closed{aborted}` record
+    /// (+ unlink of the subtree root unless `keep_catalog`), partials and
+    /// progress removed. Phase 1 of a member write: answered `Prepared`.
+    IngestAbort {
+        session: String,
+        #[serde(default)]
+        keep_catalog: bool,
+    },
+    /// P10.0: the live sessions with per-file progress (active-member gated).
+    IngestList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

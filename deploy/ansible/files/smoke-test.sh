@@ -27,6 +27,8 @@ RPID=""
 FPID=""
 JPID=""
 MPID=""
+M2PID=""
+IPID=""
 
 cleanup() {
   [ -n "$DPID" ] && kill "$DPID" 2>/dev/null
@@ -38,6 +40,8 @@ cleanup() {
   [ -n "$FPID" ] && kill "$FPID" 2>/dev/null
   [ -n "$JPID" ] && kill "$JPID" 2>/dev/null
   [ -n "$MPID" ] && { fusermount3 -u "$DATA/fuse-view" 2>/dev/null; kill "$MPID" 2>/dev/null; }
+  [ -n "$M2PID" ] && { fusermount3 -u "$DATA/fuse-view2" 2>/dev/null; kill "$M2PID" 2>/dev/null; }
+  [ -n "$IPID" ] && kill "$IPID" 2>/dev/null
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -926,6 +930,131 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
 else
   ok "skipped streaming mount (no fuse3 on this host)"
 fi
+
+say "P10.0: external-ingest sessions — the fake downloader (doc 23 §3/§9)"
+# A scripted stand-in for the BT app: catalog-at-add, out-of-order writes,
+# verified-range chunk marks, kill -9 resume from the bitmap, commit through
+# hash-fill + attest + publish, closed records for both outcomes.
+IGM="$DATA/ingest-forest"
+mkdir -p "$IGM"
+IGINIT="$($PVFS --json forest init --mount "$IGM")"
+IGROOT="$(jget "$IGINIT" root_node_id)"
+IGFID="$(jget "$IGINIT" forest_id)"
+IGD="$IGM/.pvfs"
+MEDIA="$($PVFS --data-dir "$IGD" add "$IGROOT" --kind folder --label media)"
+ISOCK="$PVFS_SOCKET_DIR/$IGFID.sock"
+"$PVFSD" --mount "$IGM" >/dev/null 2>"$DATA/pvfsd-ingest.log" &
+IPID=$!
+# Wait for an ANSWER, not just the socket file — a stale socket from a
+# previous kill -9 exists before the new daemon binds, and a crash restart
+# rebuilds the projection before serving.
+ig_ready() {
+  for _ in $(seq 1 80); do
+    $PVFS --json --data-dir "$IGD" ingest list >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  return 1
+}
+# Probe the projection with a few retries — a probe racing the daemon's WAL
+# write would otherwise read as a false zero.
+ig_count() {
+  local n=""
+  for _ in 1 2 3 4 5; do
+    n=$(python3 -c "import sqlite3;print(sqlite3.connect('file:$IGD/index.db?mode=ro',uri=True).execute(\"$1\").fetchone()[0])" 2>/dev/null) && break
+    sleep 0.5
+  done
+  echo "${n:-0}"
+}
+ig_ready && ok "ingest daemon up" || fail "ingest daemon not answering"
+
+head -c 12582912 /dev/urandom > "$DATA/ig-src-a"   # 12 MiB = 2 swarm chunks
+head -c 4000 /dev/urandom > "$DATA/ig-src-b"
+
+# begin: the whole torrent cataloged before a byte arrives (one signed commit)
+IJSON="$($PVFS --json --data-dir "$IGD" ingest begin "$MEDIA" --name pack \
+  --infohash aa11bb22cc33 --file "d/a.bin:12582912" --file "b.bin:4000")"
+SID="$(jget "$IJSON" session)"
+[ ${#SID} -eq 32 ] && ok "ingest begin opened a session" || fail "ingest begin: $IJSON"
+NODE_A="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["node"] for f in d["files"] if f["rel_path"]=="d/a.bin"))' "$IJSON")"
+NODE_B="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(f["node"] for f in d["files"] if f["rel_path"]=="b.bin"))' "$IJSON")"
+$PVFS --data-dir "$IGD" ls "$MEDIA" | qgrep pack \
+  && ok "catalog exists before any byte" || fail "no pack folder in the tree"
+ORIGINS=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download' AND CAST(payload AS TEXT) LIKE '%aa11bb22cc33%'")
+[ "$ORIGINS" -ge 1 ] && ok "origin record carries the infohash" || fail "origin record missing"
+
+# §8.3: an impossible declared size refuses loudly; allow_shortfall overrides
+OVER=$($PVFS --data-dir "$IGD" ingest begin "$MEDIA" --name big --infohash beef \
+  --file "z.bin:1152921504606846976" 2>&1) && fail "oversized add accepted" \
+  || { echo "$OVER" | qgrep allow_shortfall && ok "oversized add refuses loudly (§8.3)" || fail "refusal lacks guidance: $OVER"; }
+BJSON="$($PVFS --json --data-dir "$IGD" ingest begin "$MEDIA" --name big --infohash beef \
+  --file "z.bin:1152921504606846976" --allow-shortfall)"
+BSID="$(jget "$BJSON" session)"
+[ ${#BSID} -eq 32 ] && ok "allow_shortfall accepts the caller's risk" || fail "allow_shortfall: $BJSON"
+$PVFS --data-dir "$IGD" ingest abort "$BSID" >/dev/null \
+  && ok "abort runs" || fail "ingest abort"
+ABORTED=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download.closed' AND CAST(payload AS TEXT) LIKE '%aborted%'")
+[ "$ABORTED" -ge 1 ] && ok "abort left a closed{aborted} record — no orphans (§8.4)" || fail "no aborted closing record"
+$PVFS --data-dir "$IGD" ls "$MEDIA" | qgrep big \
+  && fail "aborted subtree still linked" || ok "aborted subtree unlinked"
+
+# the fake downloader writes OUT OF ORDER: the second half first
+$PVFS --data-dir "$IGD" ingest write "$SID" "$NODE_A" --offset 6291456 \
+  --from "$DATA/ig-src-a" --len 6291456 >/dev/null \
+  && ok "out-of-order write lands (second half first)" || fail "ooo write"
+$PVFS --data-dir "$IGD" ingest verified "$SID" "$NODE_A" --range 6291456-12582912 >/dev/null \
+  && ok "verified ranges accepted" || fail "ingest verified"
+
+# kill -9 mid-ingest → restart → the session and its bitmap survive (§9.3)
+kill -9 "$IPID" 2>/dev/null; wait "$IPID" 2>/dev/null || true
+rm -f "$ISOCK"
+"$PVFSD" --mount "$IGM" >/dev/null 2>>"$DATA/pvfsd-ingest.log" &
+IPID=$!
+ig_ready || fail "ingest daemon not answering after kill -9"
+RES="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); f=[f for s in d for f in s["files"] if f["node"]==sys.argv[2]][0]; print(f["chunks_done"], f["bytes_verified"])' "$($PVFS --json --data-dir "$IGD" ingest list 2>/dev/null || echo '[]')" "$NODE_A" 2>/dev/null || echo none)"
+[ "$RES" = "1 6291456" ] \
+  && ok "kill -9 + restart: session + progress intact (the bitmap is authoritative)" \
+  || fail "resume state after restart: $RES"
+
+# finish the bytes; chunk 0 marks only once its whole span is verified
+$PVFS --data-dir "$IGD" ingest write "$SID" "$NODE_A" --offset 0 \
+  --from "$DATA/ig-src-a" --len 6291456 >/dev/null
+$PVFS --data-dir "$IGD" ingest write "$SID" "$NODE_B" --from "$DATA/ig-src-b" >/dev/null
+$PVFS --json --data-dir "$IGD" ingest verified "$SID" "$NODE_A" --range 0-6291456 | qgrep '"chunks_done":2' \
+  && ok "verified ranges mark chunks incrementally" || fail "chunk marking"
+$PVFS --data-dir "$IGD" ingest verified "$SID" "$NODE_B" --range 0-4000 >/dev/null
+
+# commit file 1: hash-fill successor + attestation + publish
+NEW_A="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_A")" committed)"
+{ [ ${#NEW_A} -eq 64 ] && [ "$NEW_A" != "$NODE_A" ]; } \
+  && ok "commit hash-fills (successor re-identifies)" || fail "ingest commit a: $NEW_A"
+$PVFS --data-dir "$IGD" cat "$NEW_A" > "$DATA/ig-got-a" 2>/dev/null
+cmp -s "$DATA/ig-got-a" "$DATA/ig-src-a" \
+  && ok "published bytes round-trip bit-perfect" || fail "roundtrip mismatch"
+[ -f "$IGD/synced/${NEW_A:0:2}/$NEW_A.manifest" ] \
+  && ok "manifest sidecar cached at publish" || fail "no manifest sidecar"
+ATT=$(ig_count "SELECT COUNT(*) FROM chunk_manifests WHERE file_id='$NEW_A'")
+[ "$ATT" -eq 1 ] && ok "attestation folded (the early-serve license)" || fail "no attestation row"
+COMPLETE=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download.closed' AND CAST(payload AS TEXT) LIKE '%complete%'")
+[ "$COMPLETE" -eq 0 ] && ok "no complete record while a file is still open" || fail "premature closing record"
+
+# commit the last file: the ledger closes {complete}, deployment state goes
+NEW_B="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_B")" committed)"
+$PVFS --data-dir "$IGD" cat "$NEW_B" > "$DATA/ig-got-b" 2>/dev/null
+cmp -s "$DATA/ig-got-b" "$DATA/ig-src-b" && ok "second file round-trips" || fail "roundtrip b"
+COMPLETE=$(ig_count "SELECT COUNT(*) FROM nodes WHERE node_type='pvos.download.closed' AND CAST(payload AS TEXT) LIKE '%complete%'")
+[ "$COMPLETE" -eq 1 ] && ok "last commit closed the ledger {complete} (§8.4)" || fail "no complete record"
+$PVFS --json --data-dir "$IGD" ingest list | qgrep -F '[]' \
+  && ok "session deployment state deleted at commit" || fail "session lingers"
+
+# the ingested file is an ordinary PVFS file: it exports like any other
+PACK_ID="$($PVFS --json --data-dir "$IGD" ls "$MEDIA" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "pack": print(e["id"])')"
+$PVFS --data-dir "$IGD" export "$PACK_ID" "$DATA/ig-view" --mode copy >/dev/null \
+  && cmp -s "$DATA/ig-view/d/a.bin" "$DATA/ig-src-a" \
+  && ok "export serves the ingested file like any other" || fail "export of ingested file"
+kill -TERM "$IPID" 2>/dev/null; wait "$IPID" 2>/dev/null || true; IPID=""
 
 say "P5.4: fleet enroll — one-step box admit (doc 18 §4)"
 mkdir -p "$DATA/config3"

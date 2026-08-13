@@ -16,11 +16,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pvfs_proto::{
-    auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ClientMsg, ServerMsg,
-    WriteOp,
+    auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ClientMsg,
+    IngestFileSpecWire, ServerMsg, WriteOp,
 };
 
-pub use pvfs_proto::{ChildInfo, LogEventWire, NodeInfo, ServeJobWire};
+pub use pvfs_proto::{
+    ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
+};
 
 pub mod fetch;
 pub mod follow;
@@ -440,6 +442,181 @@ impl Client {
         match self.request(ClientMsg::Commit { prepared_id, sigs })? {
             ServerMsg::Committed { id } => Ok(id),
             other => Err(unexpected("Committed", &other)),
+        }
+    }
+
+    /// Sign each hex preimage and send the phase-2 `Commit` (doc 07 §5).
+    fn sign_and_commit<F>(
+        &mut self,
+        prepared_id: String,
+        preimages: &[String],
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        let mut sigs = Vec::with_capacity(preimages.len());
+        for preimage in preimages {
+            let bytes = hex::decode(preimage)
+                .map_err(|_| ClientError::Protocol("preimage not hex".into()))?;
+            let digest: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::Protocol("preimage not 32 bytes".into()))?;
+            sigs.push(hex::encode(sign(&digest)));
+        }
+        match self.request(ClientMsg::Commit { prepared_id, sigs })? {
+            ServerMsg::Committed { id } => Ok(id),
+            other => Err(unexpected("Committed", &other)),
+        }
+    }
+
+    // ---- P10.0: external-ingest sessions (doc 23 §3) ---------------------------
+
+    /// Open an ingest session (doc 23 §3): catalogs the whole torrent now —
+    /// unhashed pointer nodes plus the `pvos.download` origin record — in one
+    /// member-signed commit. Returns the session layout; the daemon's session
+    /// is live when this returns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_begin<F>(
+        &mut self,
+        parent: &str,
+        name: &str,
+        kind: &str,
+        infohash: &str,
+        piece_size: u64,
+        files: &[(String, u64)],
+        allow_shortfall: bool,
+        sign: F,
+    ) -> Result<IngestSessionWire>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        let resp = self.request(ClientMsg::IngestBegin {
+            parent: parent.into(),
+            name: name.into(),
+            kind: kind.into(),
+            infohash: infohash.into(),
+            piece_size,
+            files: files
+                .iter()
+                .map(|(rel_path, size)| IngestFileSpecWire {
+                    rel_path: rel_path.clone(),
+                    size: *size,
+                })
+                .collect(),
+            allow_shortfall,
+        })?;
+        let p = match resp {
+            ServerMsg::IngestPrepared(p) => *p,
+            other => return Err(unexpected("IngestPrepared", &other)),
+        };
+        self.sign_and_commit(p.prepared_id, &p.preimages, sign)?;
+        Ok(IngestSessionWire {
+            session: p.session,
+            root: p.root,
+            origin: p.origin,
+            files: p.files,
+        })
+    }
+
+    /// Upload bytes into a session file's partial at `offset` (sparse;
+    /// out-of-order and duplicate writes are fine). Returns bytes landed.
+    pub fn ingest_write(
+        &mut self,
+        session: &str,
+        file: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::IngestWrite {
+                session: session.into(),
+                file: file.into(),
+                offset,
+            },
+        )?;
+        for chunk in data.chunks(pvfs_proto::DATA_CHUNK) {
+            write_data_frame(&mut self.stream, chunk)?;
+        }
+        write_data_frame(&mut self.stream, &[])?; // zero-length terminator
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::IngestWritten { bytes }) => Ok(bytes),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("IngestWritten", &other)),
+            None => Err(ClientError::Protocol("connection closed mid-upload".into())),
+        }
+    }
+
+    /// Report app-verified byte ranges; the daemon marks newly covered
+    /// chunks. Returns `(bytes_verified, chunks_done, chunks_total)`.
+    pub fn ingest_verified(
+        &mut self,
+        session: &str,
+        file: &str,
+        ranges: &[(u64, u64)],
+    ) -> Result<(u64, u64, u64)> {
+        match self.request(ClientMsg::IngestVerified {
+            session: session.into(),
+            file: file.into(),
+            ranges: ranges.to_vec(),
+        })? {
+            ServerMsg::IngestProgress {
+                bytes_verified,
+                chunks_done,
+                chunks_total,
+            } => Ok((bytes_verified, chunks_done, chunks_total)),
+            other => Err(unexpected("IngestProgress", &other)),
+        }
+    }
+
+    /// Commit one file: hash-fill successor + attestation (+ the closing
+    /// record on the session's last file), then publish. Returns the
+    /// successor's node id — commits re-identify. A retry after a crash may
+    /// answer `Committed` directly (already in the log); handled here.
+    pub fn ingest_commit<F>(&mut self, session: &str, file: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        match self.request(ClientMsg::IngestCommit {
+            session: session.into(),
+            file: file.into(),
+        })? {
+            ServerMsg::Prepared {
+                prepared_id,
+                preimages,
+                ..
+            } => self.sign_and_commit(prepared_id, &preimages, sign),
+            ServerMsg::Committed { id } => Ok(id), // retry path: already in the log
+            other => Err(unexpected("Prepared", &other)),
+        }
+    }
+
+    /// Abort a session: closing record (+ unlink of the subtree root unless
+    /// `keep_catalog`), partials removed. Returns the closing record's id.
+    pub fn ingest_abort<F>(&mut self, session: &str, keep_catalog: bool, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        match self.request(ClientMsg::IngestAbort {
+            session: session.into(),
+            keep_catalog,
+        })? {
+            ServerMsg::Prepared {
+                prepared_id,
+                preimages,
+                ..
+            } => self.sign_and_commit(prepared_id, &preimages, sign),
+            other => Err(unexpected("Prepared", &other)),
+        }
+    }
+
+    /// The live ingest sessions with per-file progress (active-member gated).
+    pub fn ingest_list(&mut self) -> Result<Vec<IngestSessionWire>> {
+        match self.request(ClientMsg::IngestList)? {
+            ServerMsg::IngestSessions { sessions } => Ok(sessions),
+            other => Err(unexpected("IngestSessions", &other)),
         }
     }
 

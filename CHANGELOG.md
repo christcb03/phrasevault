@@ -3,6 +3,29 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
+## Unreleased
+
+- **External-ingest sessions (P10.0, doc 23):** the seam a downloader app
+  (first consumer: the PVOS BitTorrent app) uses to land bytes **as they
+  arrive**. Six wire ops: `IngestBegin` catalogs the whole torrent up front
+  (unhashed pointer nodes + a log-resident `pvos.download` origin record
+  carrying the infohash) in one member-signed commit, with a free-space
+  preflight (`allow_shortfall` overrides at the caller's risk);
+  `IngestWrite` streams bytes sparse and out of order into a crash-safe
+  partial (disk-full pauses, never poisons); `IngestVerified` turns the
+  app's piece verification into marked 8 MiB chunks in an authoritative
+  progress sidecar; `IngestCommit` runs the existing gates — hash-fill
+  successor, `ChunkManifestRecorded` attestation, atomic publish — and the
+  session's last commit (or `IngestAbort`) writes a `pvos.download.closed`
+  record, so origin records never dangle. Sessions are deployment state
+  (`ingest.sessions`) and survive kill -9; `pvfs ingest` drives it all from
+  the CLI (bare form lists sessions). Live member commits may now batch
+  nodes with intra-batch parentage (authority resolves at the nearest
+  pre-existing ancestor — replay semantics unchanged), and `LinkSuperseded`
+  joined the member-signable kinds (a latent gap the e2e test caught).
+  Validated: 233 cargo tests + 366 smoke checks green on both hosts,
+  clippy clean; USER-MANUAL §7.12.
+
 ## 1.4.0 — 2026-08-13
 
 Validated end to end: the Ansible pipeline on two hosts (227 tests + 344

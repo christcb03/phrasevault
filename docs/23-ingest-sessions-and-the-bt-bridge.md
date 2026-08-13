@@ -171,3 +171,181 @@ machinery reused from docs 04/22.
    complete | aborted}` — authored when the session's last file commits,
    or at `IngestAbort`. The ledger is self-contained: any box can
    distinguish in-flight from finished from abandoned by the log alone.
+
+## 9. P10.0 build spec (turnkey)
+
+### 9.1 Records are nodes — no new event kinds
+
+The doc 13 pattern is literal: a typed record is a `NodeCreated` with a
+custom `node_type` and an opaque payload. `pvos.download` and
+`pvos.download.closed` are `AddNode`-shaped nodes, dot-labeled so listings
+read clean:
+
+- **Origin**: `node_type = "pvos.download"`, label
+  `.pvos.download-<sid8>`, a child of the `IngestBegin` parent. Payload
+  (JSON, well under the 64 KB daemon cap): `{"kind":"bittorrent",
+  "infohash":"<hex>","piece_size":N,"root":"<node>","total_bytes":N}`.
+  Author + timestamp ride the event itself — not duplicated. Routing:
+  `NodeCreated`+`LinkCreated` under the parent resolves to the parent's
+  region via the batch-homes walk — §8.2's consequence is structural.
+- **Closed**: `node_type = "pvos.download.closed"`, label
+  `.pvos.download.closed-<sid8>`, same parent. Payload
+  `{"origin":"<origin-node>","outcome":"complete"|"aborted"}`. Batched
+  into the last file's commit (or the abort) — one signed write, no
+  second round-trip.
+
+### 9.2 Catalog shape at add
+
+Multi-file (or any `rel_path` with a `/`): one folder node (the torrent
+name) under `parent`, intermediate folders as needed, one unhashed
+pointer file node per entry (`FilePayload{content_hash:"", size_bytes}` —
+the existing `AddFile` shape). Single bare file: the pointer node lands
+directly under `parent`; the origin record's `root` is then the file node
+itself. All of `IngestBegin` is **one prepared batch** (doc 07 §5): the
+daemon returns preimages + the session layout, the client signs, the
+standard `Commit` lands it. The session activates only when that commit
+lands (the prepared-slot registry grows an optional activation hook).
+Authority: `w` on `parent`, checked at prepare; intra-batch parentage
+(files linking to the folder born in the same batch) resolves rights at
+the nearest pre-existing ancestor.
+
+### 9.3 Session state — deployment, never log
+
+`<data>/ingest.sessions` (the `serve.rs` two-tier policy: corrupt at
+startup = refuse, corrupt at reload = keep previous + warn):
+
+```
+pvfs-ingest-sessions 1
+session <sid> <owner-pub-hex> <parent> <root> <origin-node>
+file <sid> <node> <size> [<new-node>]
+```
+
+Per-file progress is a sidecar beside the partial —
+`.{node}.progress` (safe from the tmp sweep, which only eats `.tmp`):
+
+```
+pvfs-ingest-progress 1
+chunk 8388608
+size <declared>
+range <start> <end>          # app-verified bytes, coalesced
+done <chunk-index> <64-hex>  # fully-covered chunks, BLAKE3'd at mark time
+```
+
+The bitmap is **authoritative, not cache** — which bytes the app's SHA-1
+verification blessed is knowledge only the app had; the daemon persists
+it at `IngestVerified` time. The `done` hashes are P10.1's serving
+manifest for free. Partials use `swarm_part_path` (`.{node}.swarmpart`)
+— sparse `set_len`, seek-and-write, survives the sweep and kill -9.
+
+### 9.4 The six ops on the wire
+
+| Op | Kind | Flow |
+|---|---|---|
+| `IngestBegin{parent,name,files,kind,infohash,piece_size,allow_shortfall}` | control | space preflight (`statvfs` on the store root: declared total + 256 MiB margin vs available; refuse unless `allow_shortfall`) → prepare batch → `IngestPrepared{session,root,origin,files[],prepared_id,preimages,result_id}` → client signs → standard `Commit` activates the session |
+| `IngestWrite{session,file,offset}` + frames | data-plane (the `SecurePut` loop: zero-length frame terminates) | session-owner principal only; sparse partial created on first write; refuses past-EOF; ENOSPC = clean error, partial kept → `IngestWritten{bytes}` |
+| `IngestVerified{session,file,ranges}` | control | merge ranges into the sidecar; hash newly covered chunks from the partial; reply `IngestProgress{bytes_verified,chunks_done,chunks_total}` |
+| `IngestCommit{session,file}` | control | hash the partial (`hash_with_manifest`, no locks held) → prepared batch: successor events + `ChunkManifestRecorded` (+ closed record iff last file) → client signs → `Commit` → daemon publishes (`swarm_commit`: rename + sidecar) → `IngestCommitted{node}` (the successor id — handles re-identify) |
+| `IngestAbort{session,keep_catalog}` | control | prepared batch: closed record (+ unlinks unless `keep_catalog`) → `Commit` → partials + sidecars removed, session dropped |
+| `IngestList{}` | control | active-member gate; sessions + per-file `{node,size,bytes_verified,chunks_done,chunks_total,committed}` |
+
+Commit ordering is load-bearing: `swarm_commit` hard-refuses unhashed
+nodes and `attested_manifest_root` goes stale across successors — so
+successor-then-attest-then-publish, always. A crash between the log
+commit and the publish is recoverable: re-`IngestCommit` sees the node
+already hashed and just re-publishes.
+
+### 9.5 Authority
+
+- Catalog writes: `w` on `parent` (prepare-time + `check_member_event`).
+- The attestation inside commit: `a` on the file (existing
+  `ChunkManifestRecorded` arm) — the app identity is admin-tier on its
+  target subtree, the same bar the §4 early-serve license needs.
+- `IngestWrite`/`Verified`/`Commit`/`Abort`: the session owner's
+  principal only. `IngestList`: any active member.
+
+### 9.6 Touch list
+
+`pvfs-proto` (6 ClientMsg + 5 ServerMsg variants, `IngestFileWire`,
+serde-default discipline) · `pvfs-core/src/ingest.rs` (sessions file +
+progress sidecar IO) · `sync.rs` (`free_space_at`) · `engine.rs`
+(`prepare_ingest_begin`, `prepare_ingest_commit`, `prepare_ingest_close`
+— member-signed builders mirroring `prepare_add_node`; commit-time
+authority for intra-batch parents) · `pvfsd` (`sessions` on `Daemon`,
+`IngestWrite` in the data-plane pre-match, five `handle` arms, activation
+hook on the prepared registry) · `pvfs-client` (six methods; the framed
+one modeled on `secure_put`) · `pvfs-cli` (`pvfs ingest
+begin|write|verified|commit|abort|list`, bare `pvfs ingest` = list,
+prompts per the standing rule) · smoke §P10.0 (the fake downloader) ·
+docs 07/USER-MANUAL touch-ups.
+
+### 9.7 Smoke: the fake downloader (done means)
+
+> Built and validated 2026-08-13 — close-out in §10.
+
+Two-file "torrent" from `/dev/urandom` slices: begin (assert pointer
+nodes + origin record in the tree) → oversized begin refuses / passes
+with `allow_shortfall` → out-of-order `ingest write` slices → partial
+`ingest verified` (progress rises; sidecar exists) → **kill -9 the
+daemon mid-ingest, restart, `ingest list` shows the session with
+progress intact** → finish writes + verify → commit file 1 (cat
+roundtrip `cmp`s; manifest sidecar; `chunk_manifests` row via the
+python3 sqlite3 probe) → commit file 2 (closed record, outcome
+complete) → second session: begin, write, abort (partial gone, closed
+record aborted, nodes unlinked). Then the standard pipeline bar: both
+hosts green, clippy `-D warnings`, honest close-out here.
+
+## 10. P10.0 close-out (honest, 2026-08-13)
+
+**Validated:** 233 cargo tests + 366 smoke checks (22 new, the §9.7 fake
+downloader) green on both hosts via the pipeline; clippy `-D warnings`
+clean. The in-process e2e test (`pvfsd/tests/ingest.rs`) runs the whole
+lifecycle: multi-node begin, out-of-order writes, incremental chunk marks,
+commit re-identification with cat round-trip, closed records for both
+outcomes, and the three refusals (no-rights begin, oversized begin,
+past-EOF write). The smoke adds the kill -9 crash: restart reloads the
+session and the bitmap answers `1 chunk, 6291456 B` exactly — resume state
+is the sidecar, proven authoritative.
+
+**Deviations from §9, recorded:**
+
+- *"The file serves, tiers, exports"* — smoke proves serves (cat) and
+  exports; tier is not exercised on an ingested file directly. Argument:
+  after publish the file is a store-resident hashed file identical to any
+  synced one (same layout, same sidecar), and tier/evict semantics are
+  P8-validated on that shape. Fleet phase K (P10.1) can add the explicit
+  cross-machine pass if wanted.
+- The commit-freeze (writes refused while a commit's hash is trusted) is
+  **in-memory with a TTL**, not persisted: a daemon restart drops it, and
+  the crash-retry path compensates by re-verifying through `swarm_commit`'s
+  full read. The normal path's publish skips the re-read on purpose — the
+  daemon hashed those bytes moments earlier with writes frozen — keeping
+  the writer lock O(1) instead of O(file).
+- `IngestList` reports committed files as fully verified rather than
+  reading their (deleted) progress sidecars.
+
+**Latent defects found and fixed by this build:**
+
+1. **`LinkSuperseded` was missing from `set_author_sig`** — the kind was
+   owner-only until the member-signed hash-fill successor needed it, so the
+   member's signature was silently dropped and commit failed "signature
+   invalid". The 9-touchpoint event drill has a real 10th touchpoint:
+   *is the kind in the member-signable `set_author_sig` set?*
+2. **Live commits refused intra-batch parentage** that replay accepts:
+   `commit_member_write` checks every event against the current projection,
+   so a file linking under a folder born in the same batch was Forbidden
+   live but fine on replay. Fixed with the batch-aware check
+   (`check_member_event_batched`): rights on a batch-born node resolve at
+   its nearest pre-existing ancestor — exact, since an unborn node can have
+   no ACLs of its own. Replay is untouched; both paths reach one verdict.
+3. Smoke-harness findings worth keeping: sqlite probes against a live
+   daemon need read-only URIs + retries (a WAL race reads as a false zero),
+   and a daemon restart must poll for an *answer* — the stale socket file
+   from a kill -9 satisfies `-S` before the new daemon binds and while the
+   crash rebuild runs. The P9.1 `M2PID` cleanup-registration gap noted in
+   passing was also fixed.
+
+**Not in P10.0 (P10.1's list, unchanged):** the mount does not yet consult
+progress sidecars, ranged `Cat` does not serve marked chunks of in-flight
+partials, and `IngestList` has no hot ranges — in-flight bytes are not yet
+readable by anyone but the ingesting app. The `done <idx> <hash>` sidecar
+lines are already the serving manifest P10.1 needs.

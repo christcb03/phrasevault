@@ -1427,27 +1427,8 @@ fn unauthorized(seq: u64, kind: &str) -> PvfsError {
 /// replay — so a write authorized by a then-valid expiring grant still replays
 /// after the grant lapses, and a rebuild is deterministic.
 pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Result<()> {
+    require_active_author(conn, ev, as_of_ms)?;
     let author = ev.author();
-    // As-of-time, not current-state (P7.2a, doc 20 §2.3): tree replay applies
-    // parallel logs after the top log completes, so "authored before the
-    // revocation" must be judged by the owner-stamped, chain-bound `written_at`
-    // — the same instant every other check here already uses. A live commit
-    // passes the wall clock, so a currently revoked key still fails.
-    let active: i64 = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1
-               AND authorized_at <= ?2 AND (revoked_at IS NULL OR revoked_at > ?2))",
-            params![author, as_of_ms as i64],
-            |r| r.get(0),
-        )
-        .map_err(map_db("device authorization check"))?;
-    if active == 0 {
-        return Err(PvfsError::Integrity {
-            kind: "event",
-            id: ev.kind().into(),
-            reason: crate::error::IntegrityReason::UnknownAuthor,
-        });
-    }
     match ev {
         Event::AclSet { node_id, .. } => {
             require_right(conn, author, node_id, acl::ACL_A, "set acl", as_of_ms)?
@@ -1527,11 +1508,86 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
         Event::SecureBlobUpdated { blob_id, .. } => {
             // Advancing a blob's ledger is a write (doc 12 §8.2) — the same right
             // a content change needs, enforced identically live and at replay.
-            require_right(conn, author, blob_id, acl::ACL_W, "update secure blob", as_of_ms)?
+            require_right(conn, ev.author(), blob_id, acl::ACL_W, "update secure blob", as_of_ms)?
         }
         _ => {}
     }
     Ok(())
+}
+
+/// The active-unrevoked-device precheck shared by [`check_member_event`] and
+/// its batch-aware variant. As-of-time, not current-state (P7.2a, doc 20
+/// §2.3): tree replay applies parallel logs after the top log completes, so
+/// "authored before the revocation" must be judged by the owner-stamped,
+/// chain-bound `written_at` — the same instant every other check here already
+/// uses. A live commit passes the wall clock, so a currently revoked key
+/// still fails.
+fn require_active_author(conn: &Connection, ev: &Event, as_of_ms: u64) -> Result<()> {
+    let author = ev.author();
+    let active: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1
+               AND authorized_at <= ?2 AND (revoked_at IS NULL OR revoked_at > ?2))",
+            params![author, as_of_ms as i64],
+            |r| r.get(0),
+        )
+        .map_err(map_db("device authorization check"))?;
+    if active == 0 {
+        return Err(PvfsError::Integrity {
+            kind: "event",
+            id: ev.kind().into(),
+            reason: crate::error::IntegrityReason::UnknownAuthor,
+        });
+    }
+    Ok(())
+}
+
+/// Batch-aware variant of [`check_member_event`] for the live commit path
+/// (P10.0, doc 23 §9.2): one prepared batch may place a child under a parent
+/// created earlier in the same batch, or attest a file born in the same
+/// batch. `born` maps each batch-created node to its batch parent; rights on
+/// a batch-born node resolve at its nearest pre-existing ancestor. That is
+/// exact, not approximate — a node that does not yet exist can have no ACL
+/// entries of its own, so its effective rights ARE the inherited ones.
+/// Replay needs no equivalent: it checks-and-folds event by event, so a
+/// parent is always projected before its child's link is judged, and both
+/// paths reach the same verdict.
+pub fn check_member_event_batched(
+    conn: &Connection,
+    ev: &Event,
+    as_of_ms: u64,
+    born: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if born.is_empty() {
+        return check_member_event(conn, ev, as_of_ms);
+    }
+    let resolve = |node: &str| -> String {
+        let mut cur = node.to_string();
+        // The batch is finite and link-acyclic by construction; the bound is
+        // pure defense.
+        for _ in 0..256 {
+            match born.get(&cur) {
+                Some(p) => cur = p.clone(),
+                None => break,
+            }
+        }
+        cur
+    };
+    match ev {
+        Event::LinkCreated(l)
+            if l.parent_id.as_deref().is_some_and(|p| born.contains_key(p)) =>
+        {
+            require_active_author(conn, ev, as_of_ms)?;
+            let target = resolve(l.parent_id.as_deref().unwrap());
+            require_right(conn, ev.author(), &target, acl::ACL_W, "create link", as_of_ms)
+        }
+        Event::ChunkManifestRecorded { file_id, .. } if born.contains_key(file_id) => {
+            require_active_author(conn, ev, as_of_ms)?;
+            let target = resolve(file_id);
+            require_right(conn, ev.author(), &target, acl::ACL_A, "attest manifest", as_of_ms)
+        }
+        _ => check_member_event(conn, ev, as_of_ms),
+    }
 }
 
 /// The **current** root of the lineage (doc 15 §C2): the latest `RootRotated`'s

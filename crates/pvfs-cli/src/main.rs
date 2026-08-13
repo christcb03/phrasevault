@@ -287,6 +287,13 @@ enum Cmd {
     /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
     /// actually your desktop agent — approvals appear on this machine.
     ///
+    /// External-ingest sessions (P10, doc 23): catalog a download now,
+    /// stream bytes in as they verify, commit through the usual gates.
+    /// Bare `pvfs ingest` lists the live sessions.
+    Ingest {
+        #[command(subcommand)]
+        cmd: Option<IngestCmd>,
+    },
     /// Examples:
     ///   pvfs ssh chris@presubuntu
     ///   pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion
@@ -313,6 +320,76 @@ enum Cmd {
 enum TreeCmd {
     /// Create a new tree (root folder node)
     Create { label: String },
+}
+
+#[derive(Subcommand)]
+enum IngestCmd {
+    /// Open a session: catalog the files now (unhashed pointer nodes + the
+    /// pvos.download origin record); bytes arrive via `ingest write`.
+    Begin {
+        /// Target parent (node id, pvfs:// URI, or mount path); prompted for
+        /// when omitted
+        parent: Option<String>,
+        /// Torrent name → the root folder's label (omit for a single bare file)
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Origin kind recorded in the pvos.download record
+        #[arg(long, default_value = "bittorrent")]
+        kind: String,
+        /// The torrent infohash (hex) — the early-serve trust anchor;
+        /// prompted for when omitted
+        #[arg(long)]
+        infohash: Option<String>,
+        /// Torrent piece size in bytes
+        #[arg(long, default_value_t = 262_144)]
+        piece_size: u64,
+        /// A declared file as `rel/path:bytes` (repeatable); prompted for
+        /// when omitted
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Accept the risk when declared sizes exceed free space (doc 23 §8.3)
+        #[arg(long)]
+        allow_shortfall: bool,
+    },
+    /// Upload a byte range into a session file's partial (out-of-order and
+    /// duplicate writes are fine)
+    Write {
+        session: String,
+        /// The file's pointer node id (from `ingest begin` / `ingest list`)
+        file: String,
+        /// Destination offset in the file
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        /// Source to read from (`-` = stdin)
+        #[arg(long, default_value = "-")]
+        from: String,
+        /// Source offset (default: --offset, a same-layout slice)
+        #[arg(long)]
+        from_offset: Option<u64>,
+        /// Bytes to send (default: to source EOF)
+        #[arg(long)]
+        len: Option<u64>,
+    },
+    /// Report app-verified byte ranges; the daemon marks covered chunks
+    Verified {
+        session: String,
+        file: String,
+        /// Half-open byte range `start-end` (repeatable)
+        #[arg(long = "range")]
+        ranges: Vec<String>,
+    },
+    /// Commit one file: hash-fill successor + attestation (+ the closing
+    /// record on the session's last file), then publish into the store
+    Commit { session: String, file: String },
+    /// Abort the session: closing record; unlinks the subtree unless kept
+    Abort {
+        session: String,
+        /// Keep the catalog nodes as bare pointers
+        #[arg(long)]
+        keep_catalog: bool,
+    },
+    /// List live sessions with per-file progress
+    List,
 }
 
 #[derive(Subcommand)]
@@ -2550,6 +2627,283 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             hex::encode(&new),
                             tags.len()
                         );
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Cmd::Ingest { cmd } => {
+            let state_dir = ctx?;
+            // Sessions are daemon state — there is no engine-direct fallback.
+            let Some((mut client, sign)) = daemon_client(&state_dir)? else {
+                return Err(PvfsError::BadInput {
+                    field: "ingest".into(),
+                    reason: "ingest sessions need a running pvfsd for this forest".into(),
+                });
+            };
+            match cmd.unwrap_or(IngestCmd::List) {
+                IngestCmd::Begin {
+                    parent,
+                    name,
+                    kind,
+                    infohash,
+                    piece_size,
+                    files,
+                    allow_shortfall,
+                } => {
+                    let parent = match parent {
+                        Some(p) => p,
+                        None => prompt_line("target parent", None)?,
+                    };
+                    let parent_id = resolve_node_id(Ok(state_dir.clone()), &parent)?;
+                    let infohash = match infohash {
+                        Some(i) => i,
+                        None => prompt_line("infohash (hex)", None)?,
+                    };
+                    let parse_spec = |s: &str| -> Result<(String, u64), PvfsError> {
+                        let (rel, size) = s.rsplit_once(':').ok_or(PvfsError::BadInput {
+                            field: "file".into(),
+                            reason: format!("expected rel/path:bytes, got {s:?}"),
+                        })?;
+                        Ok((
+                            rel.to_string(),
+                            size.parse().map_err(|_| PvfsError::BadInput {
+                                field: "file".into(),
+                                reason: format!("bad size in {s:?}"),
+                            })?,
+                        ))
+                    };
+                    let mut specs: Vec<(String, u64)> = Vec::new();
+                    for f in &files {
+                        specs.push(parse_spec(f)?);
+                    }
+                    if specs.is_empty() {
+                        // Prompts over flags: ask for files until an empty line.
+                        loop {
+                            let s = prompt_line("file (rel/path:bytes, empty to finish)", Some(""))?;
+                            if s.is_empty() {
+                                break;
+                            }
+                            specs.push(parse_spec(&s)?);
+                        }
+                    }
+                    if specs.is_empty() {
+                        return Err(PvfsError::BadInput {
+                            field: "file".into(),
+                            reason: "an ingest session needs at least one file".into(),
+                        });
+                    }
+                    let s = client
+                        .ingest_begin(
+                            &parent_id,
+                            &name,
+                            &kind,
+                            &infohash,
+                            piece_size,
+                            &specs,
+                            allow_shortfall,
+                            |d| sign(d),
+                        )
+                        .map_err(remote_err)?;
+                    if json {
+                        let files: Vec<String> = s
+                            .files
+                            .iter()
+                            .map(|f| {
+                                format!(
+                                    "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{}}}",
+                                    f.node,
+                                    json_escape(&f.rel_path),
+                                    f.size
+                                )
+                            })
+                            .collect();
+                        println!(
+                            "{{\"session\":\"{}\",\"root\":\"{}\",\"origin\":\"{}\",\"files\":[{}]}}",
+                            s.session,
+                            s.root,
+                            s.origin,
+                            files.join(",")
+                        );
+                    } else {
+                        println!("session {} (root {}, origin record {})", s.session, s.root, s.origin);
+                        for f in &s.files {
+                            println!("  {}  {}  {} B", f.node, f.rel_path, f.size);
+                        }
+                    }
+                    Ok(())
+                }
+                IngestCmd::Write {
+                    session,
+                    file,
+                    offset,
+                    from,
+                    from_offset,
+                    len,
+                } => {
+                    use std::io::{Read as _, Seek as _};
+                    let data = if from == "-" {
+                        let mut b = Vec::new();
+                        std::io::stdin()
+                            .read_to_end(&mut b)
+                            .map_err(|e| PvfsError::io("read stdin", e))?;
+                        b
+                    } else {
+                        let mut f = std::fs::File::open(&from)
+                            .map_err(|e| PvfsError::io("open source", e))?;
+                        f.seek(std::io::SeekFrom::Start(from_offset.unwrap_or(offset)))
+                            .map_err(|e| PvfsError::io("seek source", e))?;
+                        let mut b = Vec::new();
+                        match len {
+                            Some(n) => {
+                                b.resize(n as usize, 0);
+                                f.read_exact(&mut b)
+                                    .map_err(|e| PvfsError::io("read source", e))?;
+                            }
+                            None => {
+                                f.read_to_end(&mut b)
+                                    .map_err(|e| PvfsError::io("read source", e))?;
+                            }
+                        }
+                        b
+                    };
+                    let bytes = client
+                        .ingest_write(&session, &file, offset, &data)
+                        .map_err(remote_err)?;
+                    if json {
+                        println!("{{\"written\":{bytes},\"offset\":{offset}}}");
+                    } else {
+                        println!("wrote {bytes} B at {offset}");
+                    }
+                    Ok(())
+                }
+                IngestCmd::Verified {
+                    session,
+                    file,
+                    ranges,
+                } => {
+                    let mut parsed: Vec<(u64, u64)> = Vec::new();
+                    for r in &ranges {
+                        let (a, b) = r.split_once('-').ok_or(PvfsError::BadInput {
+                            field: "range".into(),
+                            reason: format!("expected start-end, got {r:?}"),
+                        })?;
+                        parsed.push((
+                            a.parse().map_err(|_| PvfsError::BadInput {
+                                field: "range".into(),
+                                reason: format!("bad start in {r:?}"),
+                            })?,
+                            b.parse().map_err(|_| PvfsError::BadInput {
+                                field: "range".into(),
+                                reason: format!("bad end in {r:?}"),
+                            })?,
+                        ));
+                    }
+                    if parsed.is_empty() {
+                        return Err(PvfsError::BadInput {
+                            field: "range".into(),
+                            reason: "pass at least one --range start-end".into(),
+                        });
+                    }
+                    let (bytes, done, total) = client
+                        .ingest_verified(&session, &file, &parsed)
+                        .map_err(remote_err)?;
+                    if json {
+                        println!(
+                            "{{\"bytes_verified\":{bytes},\"chunks_done\":{done},\"chunks_total\":{total}}}"
+                        );
+                    } else {
+                        println!("verified {bytes} B — {done}/{total} chunks marked");
+                    }
+                    Ok(())
+                }
+                IngestCmd::Commit { session, file } => {
+                    let new = client
+                        .ingest_commit(&session, &file, |d| sign(d))
+                        .map_err(remote_err)?;
+                    if json {
+                        println!("{{\"committed\":\"{new}\"}}");
+                    } else {
+                        println!("committed → {new}");
+                        println!("note: hashing re-identified the node (successor created)");
+                    }
+                    Ok(())
+                }
+                IngestCmd::Abort {
+                    session,
+                    keep_catalog,
+                } => {
+                    let closed = client
+                        .ingest_abort(&session, keep_catalog, |d| sign(d))
+                        .map_err(remote_err)?;
+                    if json {
+                        println!("{{\"closed\":\"{closed}\",\"kept_catalog\":{keep_catalog}}}");
+                    } else {
+                        println!(
+                            "aborted (closing record {closed}{})",
+                            if keep_catalog { ", catalog kept" } else { ", subtree unlinked" }
+                        );
+                    }
+                    Ok(())
+                }
+                IngestCmd::List => {
+                    let sessions = client.ingest_list().map_err(remote_err)?;
+                    if json {
+                        let rows: Vec<String> = sessions
+                            .iter()
+                            .map(|s| {
+                                let files: Vec<String> = s
+                                    .files
+                                    .iter()
+                                    .map(|f| {
+                                        format!(
+                                            "{{\"node\":\"{}\",\"rel_path\":\"{}\",\"size\":{},\"bytes_verified\":{},\"chunks_done\":{},\"chunks_total\":{},\"committed\":{}}}",
+                                            f.node,
+                                            json_escape(&f.rel_path),
+                                            f.size,
+                                            f.bytes_verified,
+                                            f.chunks_done,
+                                            f.chunks_total,
+                                            match &f.committed {
+                                                Some(c) => format!("\"{c}\""),
+                                                None => "null".into(),
+                                            }
+                                        )
+                                    })
+                                    .collect();
+                                format!(
+                                    "{{\"session\":\"{}\",\"root\":\"{}\",\"origin\":\"{}\",\"files\":[{}]}}",
+                                    s.session,
+                                    s.root,
+                                    s.origin,
+                                    files.join(",")
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", rows.join(","));
+                    } else if sessions.is_empty() {
+                        println!("no ingest sessions");
+                    } else {
+                        for s in &sessions {
+                            println!("session {} (root {})", s.session, s.root);
+                            for f in &s.files {
+                                match &f.committed {
+                                    Some(c) => println!(
+                                        "  {}  {}  {} B  committed → {}",
+                                        f.node, f.rel_path, f.size, c
+                                    ),
+                                    None => println!(
+                                        "  {}  {}  {}/{} B verified, {}/{} chunks",
+                                        f.node,
+                                        f.rel_path,
+                                        f.bytes_verified,
+                                        f.size,
+                                        f.chunks_done,
+                                        f.chunks_total
+                                    ),
+                                }
+                            }
+                        }
                     }
                     Ok(())
                 }

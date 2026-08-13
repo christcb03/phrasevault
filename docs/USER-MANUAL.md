@@ -489,6 +489,41 @@ Jobs dial with the box's client identity: enroll it first (§7.9).
 
 ---
 
+### 7.12 External-ingest sessions — downloads land as they arrive (doc 23)
+
+A downloader app (the PVOS BitTorrent app is the first) hands its bytes to
+PVFS **while they download**: the files appear in the tree immediately as
+size-only pointers, bytes stream into a crash-safe partial in any order, and
+the commit runs the same hash-fill + attestation gates as every other file.
+Every session is book-ended in the signed log by a `pvos.download` record
+(kind, infohash, subtree root) and a `pvos.download.closed` record
+(`complete` or `aborted`) — the fleet can always tell in-flight from
+finished from abandoned.
+
+```bash
+# catalog a "torrent" now — one signed commit, no bytes yet
+pvfs ingest begin MEDIA --name pack --infohash <hex> \
+  --file "Season 1/e01.mkv:1073741824" --file "extras.txt:4000"
+
+# bytes land sparse, out of order, resumable (kill -9 safe)
+pvfs ingest write <session> <node> --offset 8388608 --from part2.bin
+
+# the app reports which byte ranges its piece hashes verified;
+# fully covered 8 MiB chunks are marked (the P10.1 streaming license)
+pvfs ingest verified <session> <node> --range 0-16777216
+
+pvfs ingest            # bare = list sessions with per-file progress
+pvfs ingest commit <session> <node>   # hash-fill + attest + publish
+pvfs ingest abort <session> [--keep-catalog]
+```
+
+The daemon refuses an `ingest begin` whose declared sizes exceed the store's
+free space (pass `--allow-shortfall` to accept the risk), and a full disk
+mid-download pauses the session cleanly instead of poisoning it. The app
+identity needs write on the target folder, and admin on it for the
+attestation that commits carry. Note: committing re-identifies the node (the
+pointer gains its content hash) — `ingest commit` prints the successor id.
+
 ## 8. Secure blobs (encrypted-at-rest storage)
 
 A **secure blob** is a node whose bytes are **encrypted so the server can never read them**, and
@@ -637,6 +672,8 @@ run `pvfs member replace <file>`).
 | `pvfs replica follow <mount>` | Follow the source live (long-poll): new events land within seconds; run as a service. |
 | `pvfs place <target> sync\|pointer\|central --to <dir>` · `pvfs sync [target]` | Placement policy · fetch missing bytes, verified (§7.8, §7.10). |
 | `pvfs tier` · `pvfs evict` | Owner: migrate to the central store + retire edge locations · edge: reclaim space safely (§7.10). |
+| `pvfs ingest begin <parent> --name N --infohash H --file rel:bytes…` | Open an external-ingest session — catalog the files before the bytes (§7.12). |
+| `pvfs ingest write\|verified\|commit\|abort\|list` | Stream bytes in, mark verified ranges, commit through the gates, abort, or list sessions (§7.12; bare `pvfs ingest` = list). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |

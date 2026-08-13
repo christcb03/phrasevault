@@ -640,6 +640,10 @@ impl Event {
             | Event::NodeMovedOut { sig: s, .. }
             | Event::ChunkManifestRecorded { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
+            // P10.0: a member-signed hash-fill successor supersedes the old
+            // home link (doc 23 §9.4) — before that only the owner path
+            // authored this kind, pre-signed.
+            | Event::LinkSuperseded { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
             _ => {}
