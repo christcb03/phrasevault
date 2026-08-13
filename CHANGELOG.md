@@ -3,7 +3,15 @@
 PVFS uses the layered version scheme in [VERSIONING.md](VERSIONING.md): this
 file tracks Layer 0, the file-system engine.
 
-## Unreleased
+## 1.4.0 — 2026-08-13
+
+Validated end to end: the Ansible pipeline on two hosts (227 tests + 344
+smoke checks, clippy clean), the chaos suite (20/20 — crash semantics
+re-validated under the live-writer flock), and the two-machine fleet test
+(`deploy/fleet-test.sh`, **75/75**: regions shipped to the edge hands-free,
+attachment kinds draining and mirroring, a 1 GiB swarm split across two real
+holders with kill -9 resume, and the streaming mount serving its first MiB
+while the fetch ran).
 
 - **Serve-while-fetching (P9.1, doc 22 §2):** the streaming mount delivers on
   punch J — opening an unfetched file whose chunk layout the owner attested

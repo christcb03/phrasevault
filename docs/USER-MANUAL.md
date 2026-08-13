@@ -3,8 +3,9 @@
 PhraseVault File System — a content-addressed, cryptographically-signed file system you own.
 This manual covers everyday use of the `pvfs` command-line tool and sharing forests between users.
 
-> Status: covers features available in **PVFS 1.1** (forests, ACLs/tags, full daemon read/write/admin,
-> secure blobs, companion, key replacement). Post-1.1 work is under [Roadmap](#11-roadmap).
+> Status: covers features available in **PVFS 1.4** (forests, ACLs/tags, full daemon read/write/admin,
+> secure blobs, companion, key replacement, federation + replicas, serve jobs, regions, the streaming
+> mount, attachment kinds, and the swarm data plane). Future work is under [Roadmap](#11-roadmap).
 
 ---
 

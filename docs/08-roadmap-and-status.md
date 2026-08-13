@@ -1,6 +1,6 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-08-10.
+Status: **Living document** — update as phases land. Last updated 2026-08-13 (1.4.0 cut).
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–16; this is the index + the honest "what's not done yet."
@@ -175,8 +175,8 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 | **P9.1 serve-while-fetching** ([doc 22](22-swarm-data-plane.md) §2) — owner-attested chunk layouts (`ChunkManifestRecorded`, admin-gated, schema v7) authored at hashing time; the mount streams an unfetched attested file as its chunks verify (first MiB of 1 GiB in ~2 s on the fleet — punch J retired) | ✅ built + validated both hosts + fleet 75/75 (2026-08-13) |
 
 **THE ENTIRE DECIDED QUEUE IS BUILT.** The **release cut** is Chris's call
-(doc 19 §4's packaging note — 1.4.0 = P5 + P6 + the P7 region/mount arc +
-P8 + P9 + fixes).
+(doc 19 §4's packaging note). **1.4.0 was cut 2026-08-13** — P5 + P6 + the
+P7 region/mount arc + P8 + P9 + fixes; tags pushed by Chris.
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):
