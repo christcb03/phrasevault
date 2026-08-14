@@ -66,6 +66,35 @@ pub struct BindSpec {
     pub hash_policy: HashPolicy,
 }
 
+/// How a space is enrolled (P8, doc 21). Derived at read time from
+/// placement state — see [`Engine::binding_listing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindKind {
+    InPlace,
+    Migrate,
+    Mirror,
+}
+
+impl BindKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BindKind::InPlace => "in-place",
+            BindKind::Migrate => "migrate",
+            BindKind::Mirror => "mirror",
+        }
+    }
+}
+
+/// One row of the enrollment listing: the binding, its tree path from the
+/// root (when attached), and the placement-derived kind + store.
+#[derive(Debug, Clone)]
+pub struct BindingRow {
+    pub binding: Binding,
+    pub folder_path: Option<String>,
+    pub kind: BindKind,
+    pub store: Option<PathBuf>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     pub added: u64,
@@ -263,6 +292,73 @@ impl Engine {
             None => Ok(None),
             Some(r) => Ok(Some(r?)),
         }
+    }
+
+    /// The enrollment listing (doc 21, D64): every live binding joined
+    /// against placement state to recover its kind — `central` → migrate,
+    /// `central-keep` → mirror, neither → in-place. The kind is a derived
+    /// fact: placement is per-instance deployment state, never catalog
+    /// truth (doc 17 §6), so the log stores no kind and the join happens
+    /// at read time. Read-only; works on a read view.
+    pub fn binding_listing(&self) -> Result<Vec<BindingRow>> {
+        let centrals = crate::sync::load_central_all(&self.data_dir)?;
+        let mut out = Vec::new();
+        for binding in self.bindings()? {
+            let (kind, store) = match centrals.iter().find(|(id, _, _)| id == &binding.folder_id)
+            {
+                Some((_, dir, true)) => (BindKind::Mirror, Some(dir.clone())),
+                Some((_, dir, false)) => (BindKind::Migrate, Some(dir.clone())),
+                None => (BindKind::InPlace, None),
+            };
+            let folder_path = self.folder_tree_path(&binding.folder_id)?;
+            out.push(BindingRow {
+                binding,
+                folder_path,
+                kind,
+                store,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Tree path of a node from the forest root ("/media/import"), walking
+    /// contains-links upward. `None` when the node is detached from the
+    /// root (or the walk exceeds any sane depth) — an absent path is
+    /// honest; an invented one is not.
+    fn folder_tree_path(&self, folder: &NodeId) -> Result<Option<String>> {
+        let root = &self.identity.root_node_id;
+        if folder == root {
+            return Ok(Some("/".into()));
+        }
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = folder.clone();
+        for _ in 0..256 {
+            let Some(node) = fetch_node(&self.conn, &current)? else {
+                return Ok(None);
+            };
+            segments.push(node.label);
+            let parent: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM links
+                     WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL
+                       AND parent_id IS NOT NULL
+                     ORDER BY id LIMIT 1",
+                    params![current, LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("binding path walk"))?;
+            match parent {
+                None => return Ok(None),
+                Some(p) if &p == root => {
+                    segments.reverse();
+                    return Ok(Some(format!("/{}", segments.join("/"))));
+                }
+                Some(p) => current = p,
+            }
+        }
+        Ok(None)
     }
 
     // ---- scan & reconcile (doc 04 §4) --------------------------------------------

@@ -39,8 +39,8 @@ pub use engine::{ChildEntry, Engine, NodeSpec, PreparedEvent, PreparedWrite, Reg
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
-    BindSpec, Binding, HashPolicy, NodeStat, PendingChange, ResolveAction, ScanReport, ScanStats,
-    VerifyOutcome,
+    BindKind, BindSpec, Binding, BindingRow, HashPolicy, NodeStat, PendingChange, ResolveAction,
+    ScanReport, ScanStats, VerifyOutcome,
 };
 pub use identity::Mnemonic;
 pub use link::{Link, LinkId, LINK_CONTAINS, LINK_REF};

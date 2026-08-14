@@ -203,6 +203,9 @@ enum Cmd {
     Unbind { folder: String },
     /// Scan bound folders against their directories
     Scan { folder: Option<String> },
+    /// List the forest's space enrollments (doc 21): folder, source dir,
+    /// kind (in-place|migrate|mirror), store, and options
+    Bindings,
     /// Node + per-location availability (target: URI / path / node id)
     Stat { target: String },
     /// Stream a file node's bytes (verifies full reads)
@@ -4472,6 +4475,72 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let unreadable: u64 = reports.iter().map(|r| r.stats.unreadable).sum();
                 if unreadable > 0 {
                     eprintln!("note: {unreadable} path(s) skipped — not readable by your user");
+                }
+            }
+            engine.close()
+        }
+        Cmd::Bindings => {
+            let engine = Engine::open(&ctx?)?;
+            let rows = engine.binding_listing()?;
+            if json {
+                let items: Vec<String> = rows
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{{\"folder_id\":\"{}\",\"folder_path\":{},\"source_uri\":\"{}\",\
+                             \"kind\":\"{}\",\"store\":{},\"recursive\":{},\"auto_index\":{},\
+                             \"extensions\":\"{}\",\"hash_policy\":\"{}\",\"bound_at\":{}}}",
+                            json_escape(&r.binding.folder_id),
+                            match &r.folder_path {
+                                Some(p) => format!("\"{}\"", json_escape(p)),
+                                None => "null".into(),
+                            },
+                            json_escape(&r.binding.source_uri),
+                            r.kind.as_str(),
+                            match &r.store {
+                                Some(s) => format!("\"{}\"", json_escape(&s.display().to_string())),
+                                None => "null".into(),
+                            },
+                            r.binding.recursive,
+                            r.binding.auto_index,
+                            json_escape(&r.binding.extensions.join(",")),
+                            r.binding.hash_policy.as_str(),
+                            r.binding.bound_at,
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else if rows.is_empty() {
+                println!("no bound spaces");
+            } else {
+                for r in &rows {
+                    let place = r.folder_path.as_deref().unwrap_or("(detached)");
+                    let opts = format!(
+                        "{}{}{}hash {}",
+                        if r.binding.recursive { "" } else { "non-recursive, " },
+                        if r.binding.auto_index { "" } else { "no-auto-index, " },
+                        if r.binding.extensions.is_empty() {
+                            String::new()
+                        } else {
+                            format!("ext {}, ", r.binding.extensions.join(","))
+                        },
+                        r.binding.hash_policy.as_str(),
+                    );
+                    match &r.store {
+                        Some(s) => println!(
+                            "{place} <- {} [{}; store {}] ({opts}) {}",
+                            r.binding.source_uri,
+                            r.kind.as_str(),
+                            s.display(),
+                            r.binding.folder_id,
+                        ),
+                        None => println!(
+                            "{place} <- {} [{}] ({opts}) {}",
+                            r.binding.source_uri,
+                            r.kind.as_str(),
+                            r.binding.folder_id,
+                        ),
+                    }
                 }
             }
             engine.close()
