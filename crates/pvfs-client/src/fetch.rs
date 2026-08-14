@@ -600,6 +600,16 @@ impl SwarmProgress {
         self.cv.notify_all();
     }
 
+    /// Whether the fetch ended in failure. The mount consults this on
+    /// open so a failed background fetch is retried instead of serving
+    /// its cached error to every later reader until remount.
+    pub fn failed(&self) -> bool {
+        self.state
+            .lock()
+            .map(|st| st.finished.as_ref().is_some_and(|r| r.is_err()))
+            .unwrap_or(false)
+    }
+
     /// Wait until the chunks covering `[off, off+len)` are verified-present.
     /// `Ok(path)` names where to read: the published file once finished, else
     /// the partial. Errors when the fetch failed or `timeout` lapsed.
@@ -666,4 +676,23 @@ pub fn fetch_streaming(data_dir: &std::path::Path, id: &str, progress: &SwarmPro
             .ok_or_else(|| "fetched but not readable".into())
     })();
     progress.finish(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The mount's evict-on-failure check (doc 22 wart fix): only a fetch
+    // that ended in error reads as failed — in-flight and successful ones
+    // stay reusable.
+    #[test]
+    fn failed_reads_only_error_finishes() {
+        let p = SwarmProgress::default();
+        assert!(!p.failed(), "in-flight is not failed");
+        p.finish(Ok(PathBuf::from("/tmp/x")));
+        assert!(!p.failed(), "success is not failed");
+        let q = SwarmProgress::default();
+        q.finish(Err("no holders".into()));
+        assert!(q.failed(), "an error finish is");
+    }
 }

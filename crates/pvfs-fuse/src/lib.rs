@@ -270,6 +270,12 @@ impl Filesystem for PvfsFs {
                 .flatten()
                 .is_some()
         {
+            // A FAILED background fetch must not stick: evict it so this
+            // open retries, instead of every later reader inheriting the
+            // cached error until remount (P9.1 wart, doc 22).
+            if self.active.get(&node).is_some_and(|p| p.failed()) {
+                self.active.remove(&node);
+            }
             let progress = match self.active.get(&node) {
                 Some(p) => Arc::clone(p),
                 None => {
