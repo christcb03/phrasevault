@@ -3,7 +3,7 @@
 Status: **Living document** — update as phases land. Last updated 2026-08-13 (1.4.0 cut).
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
-docs 02–16; this is the index + the honest "what's not done yet."
+docs 02–23; this is the index + the honest "what's not done yet."
 
 ---
 
@@ -28,12 +28,12 @@ docs 02–16; this is the index + the honest "what's not done yet."
 | **Maintenance** | Inert-grant flagging in `acl ls` / `tag ls` (revoked-authority rows shown `[inert]`) ✅; forest-wide **rights audit** (`pvfs audit`) ✅; revoked-device direct `key:` grants masked at access time ✅ (1.1). No signed sweep — masking handles correctness live, compaction reclaims the rows (items 13–14) | ✅ shipped (follow-on: audit also flagging `key:`→revoked devices) |
 | **P3** | **Secure node type / encryption-at-rest** (reserved key path `m/43'/20566'/2'`): opaque **mutable encrypted blob** + **content-free signed hash-state log** + **companion-gated decryption**; per-blob replication opt-out. PVOS-driven (Messenger app) | ✅ **shipped** (doc 12): kernel ledger, mutable storage (atomic overwrite, integrity-on-read), envelope + companion gating (ECDH wraps, `2'/0'` key, `secure_unwrap` — server-alone = inert ciphertext), daemon path (`SecurePut`/`SecureCat`/`SecureCreate` — create + update secure stores on the fly while serving, managed storage, member-signed, ciphertext-only, multi-user tested), USER-MANUAL §8 + durability/recovery matrix |
 | **1.1 (PVOS M1)** | Daemon `AddNode`/`Payload` (log-resident typed records), `stat` exposes home `parent`, typed `already_exists`, revoked-key `key:` ACL masking | ✅ **shipped** (tagged `v1.1`, 2026-07-09) — see [CHANGELOG](../CHANGELOG.md) |
-| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ◑ **in progress** — phased in [doc 17](17-federation-and-sync.md); **F0 `pvfs export`** (native tree view), **F1 network transport** (`pvfsd --listen`, pinned TLS, single-use nonces), **F2 replicas** (verified log shipping, read-only serving), **F3 placement & sync** (`pvfs place`/`sync` — hash-verified bytes pulled local) built. **The cross-host media scenario works end-to-end.** Remaining: region logs, FUSE, swarm, failover (F4) |
-| **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ future (doc 11) |
+| **P4** | Federation: `@server` ≠ local, remote catalog, sync; **torrent-like swarm**; **sub-forest (tree/region) replication & sharing** (PVOS-driven: per-app backup, peer-hosting, isolated-app cross-host links) | ✅ **shipped through P9** — phased in [doc 17](17-federation-and-sync.md); **F0 `pvfs export`** (native tree view), **F1 network transport** (`pvfsd --listen`, pinned TLS, single-use nonces), **F2 replicas** (verified log shipping, read-only serving), **F3 placement & sync** (`pvfs place`/`sync` — hash-verified bytes pulled local) built. **The cross-host media scenario works end-to-end.** Region logs (P7.2), FUSE (P7.3), swarm (P9) all landed (docs 20/22); of F4 only **standby failover** remains |
+| **Compaction** | Signed **snapshot / log re-genesis** to shrink `log.db` + rebuild time — rebuild a region's DAG from current state; **sealed archive** of the old log for audit + replica verification | ☐ **deferred by decision** (2026-08-13) — trigger: projection rebuild ≈1 min or replica add taking minutes on LAN (doc 11) |
 
 ---
 
-## 2. What works end-to-end today (~151 Rust tests + smoke suite, clippy-clean, CI-green on `main`)
+## 2. What works end-to-end today (237 cargo tests + 372 smoke checks; fleet 89/89, chaos 20/20; clippy-clean, CI-green on `main`)
 
 - **Forests & ownership:** `forest init` (owner-owned `.pvfs/` at `0700`, raw-root refused), import a
   tree (skipping unreadable files), `sudo forest register` for host-wide listing, ownership repair.
@@ -177,25 +177,26 @@ new remote path / add-node / audit smoke sections). Workspace at `1.2.0`;
 **THE ENTIRE DECIDED QUEUE IS BUILT.** **1.4.0 was cut 2026-08-13** — P5 +
 P6 + the P7 region/mount arc + P8 + P9 + fixes; tags pushed by Chris.
 
-**Proposed next arc (P10, awaiting Chris's review):**
+**Next arc — P10: ✅ built on main, unreleased.**
 [doc 23](23-ingest-sessions-and-the-bt-bridge.md) — external-ingest
 sessions: the PVFS API a PVOS BitTorrent app builds on (catalog-at-add,
 out-of-order verified partial writes, stream-while-downloading via the
 progress-sidecar bridge, commit through the existing hash-fill + attestation
-gates, seeding via ranged `Cat`). BitTorrent itself stays app-side.
+gates, seeding via ranged `Cat`). P10.0–P10.2 built on main (plus the
+replica-ingest race fix); BitTorrent itself stays app-side.
 
 **The standing next-work list** (was HANDOFF.md §4; that file retired 2026-08-11 with the
 `v1.2`/`v1.3` tags — its validation record lives in §3.3 above and doc 18 §7):
 
-1. **Write-through completeness:** `loc rm`, `link`/`unlink`/`reorder` wire ops (deliberately
-   unrouted in F5.0).
-2. **`pvfs sync --to <dir>`** custom sync-store destinations (today: managed store under `.pvfs/`).
+1. ~~**Write-through completeness:** `loc rm`, `link`/`unlink`/`reorder` wire ops (deliberately
+   unrouted in F5.0).~~ ✅ shipped (P6, doc 19).
+2. ~~**`pvfs sync --to <dir>`** custom sync-store destinations.~~ ✅ shipped (P6, doc 19).
 3. **Mode B crosslink** (doc 03 §6 Q4): a grant that lets a replica's held copy be recorded in the
    owner's log as catalog-visible redundancy (today only the owner's own `tier` does that).
-4. **F4 tier** (doc 17 §8): region-granular logs (doc 13 §B — the decided design), FUSE
-   read-through mount (open-and-stream without prefetch), swarm transfer (resumable/chunked —
-   also the answer to interrupted-transfer restarts, per the chaos run), standby failover.
-5. Doc 18 §6 leftovers: the P1 watcher as a `watch` job, tier's local-commit nudge, backoff tuning.
+4. **F4 tier** (doc 17 §8): reduced to **standby failover only** — region-granular logs (P7.2),
+   the FUSE read-through mount (P7.3), and swarm transfer (P9) all shipped.
+5. Doc 18 §6 leftovers: backoff tuning (the watcher-as-a-`watch`-job and tier's local-commit
+   nudge shipped in the punch batch).
 6. Long-deferred polish: Touch ID unlock (doc 14), stable macOS .app signing identity.
 
 ### 3.3 — the 1.3.0 line (released 2026-08-10)
@@ -225,8 +226,9 @@ gates, seeding via ranged `Cat`). BitTorrent itself stays app-side.
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03 — **now phased and started**, [doc 17](17-federation-and-sync.md)), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +
-lineage) — single-use challenge nonce (when the socket is network-proxied), arbitrary named groups /
-explicit deny, and cross-OS-user / two-host end-to-end (needs a second account/host; federation track).
+lineage) — ~~single-use challenge nonce (when the socket is network-proxied)~~ (✅ resolved in F1,
+item 7), arbitrary named groups / explicit deny, and ~~cross-OS-user / two-host end-to-end~~
+(✅ fleet-validated across two real machines).
 
 ---
 
@@ -343,7 +345,8 @@ Real, tracked items. None block what's shipped. Each carries its planned fix and
     into a content-addressed archive** (long-term audit), not discarded; that archive doubles as the
     **federation verification artifact** — a replica re-runs the archived log (deterministically) to
     prove the compaction is faithful *and* properly authored, or trusts the signature for the cheap
-    path. Resolves doc 03 §6 Q8.
+    path. Resolves doc 03 §6 Q8. **Deferred by decision (2026-08-13):** build when the trigger
+    trips — projection rebuild ≈1 min or replica add taking minutes on LAN (doc 11 header).
 
 16. **Auto-route admin signs with the forest device key. ✅ RESOLVED (model (a)).**
     `daemon_client()` previously signed auto-routed `acl`/`tag`/`device` ops with the CLI client
@@ -414,12 +417,13 @@ menu-bar "Restart agent" item. Doc 14 §2.
 
 | Crate | Role | Depends on |
 |-------|------|------------|
-| `pvfs-core` (~8.1k LOC) | the kernel — log, nodes, links, ACLs/tags, identity/devices, mounts, storage, projection | — |
+| `pvfs-core` (~16k LOC) | the kernel — log, nodes, links, ACLs/tags, identity/devices, mounts, storage, projection | — |
 | `pvfs-proto` | daemon/client wire protocol (JSON frames, challenge digest, message types) | pvfs-core |
 | `pvfsd` | per-user daemon — socket, challenge-response auth, ACL-enforced read/write/admin serving | pvfs-core, pvfs-proto |
 | `pvfs-client` | client library — connect, handshake, read/write/admin requests | pvfs-core, pvfs-proto |
 | `pvfs-cli` | the `pvfs` CLI (forest/tree/acl/tag/device admin + `whoami`/`remote`) | pvfs-core, pvfs-client, pvfs-companion |
 | `pvfs-companion` | key vault + tiered signer + loopback identity agent (`pvfs-companion` binary) | pvfs-core |
+| `pvfs-fuse` | streaming FUSE mount + ingest proxy (`pvfs mount`) | pvfs-core, pvfs-proto, pvfs-client |
 
 Build/test via the Ansible pipeline to a Linux host (`deploy/ansible/`); CI mirrors it on GitHub.
-See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); status: this doc; design: docs 02–16.
+See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); status: this doc; design: docs 02–23.

@@ -17,7 +17,7 @@ From the operator vision:
 3. A forest is **private to its creator unless shared**. Sharing is opt-in, per component.
 4. The owner can **grant other users read and/or write** to parts of their forest **without giving up control and without granting `sudo`**.
 5. Shared **writes are signed by the actual writer**, not by the owner on their behalf. Authorship is faithful and non-repudiable.
-6. **Mounting a forest as a real OS filesystem** for any app on the host (FUSE) is an **admin/`sudo`** action.
+6. **Mounting a forest as a real OS filesystem** for any app on the host (FUSE) is an **admin/`sudo`** action. *(As built, no: the mount shipped unprivileged — `pvfs mount <target> <dir>`, doc 20 §3.)*
 7. **Registering** a forest into the host-wide listing is a one-time **`sudo`** action (acceptable).
 8. Trust assumption: **any local login account is trusted enough** to *create its own* forest and to *access forests explicitly shared with it*. It is **not** trusted to reach unshared forests.
 
@@ -108,7 +108,7 @@ AclSet { node_id, principal, rights, set_at, expires_at?, author, sig }
 
 - `author` must hold `a` (admin) on `node_id` (the owner's root always qualifies). Enforced both by the daemon (at request time) and by the projection (at apply time), using the same authorization spine as §3.3.
 - Projected into an `acl(node_id, principal, rights, set_at, expires_at)` table for O(1) lookups during traversal.
-- Exact PCE field encoding and digest domain string (`pvfs:aclset:v1:`) are specified alongside implementation in [02] when Phase B lands.
+- Exact PCE field encoding and digest domain strings were specified alongside implementation in [02] when Phase B landed: `pvfs:aclset:v1:` (no expiry), `pvfs:aclset:v2:` when `expires_at` is present.
 - **Expiry (1.2, doc 13 Q-E1):** `expires_at` (ms epoch, `0`/absent = never) makes a grant **time-limited**: once past, it is *inert* — masked by `effective_rights` exactly like a tag grant under a revoked authority (doc 10 §9.2). The row stays for inspection (`acl ls` flags `[expired]`; CLI: `pvfs acl set <node> <principal> <rights> --expires 7d`); compaction removes it (doc 11). On the wire the field is trailing and written only when nonzero, so pre-1.2 events decode unchanged, a no-expiry event stays byte-identical to its 1.0 form (digest domain `pvfs:aclset:v1:`), and an expiring grant signs under `pvfs:aclset:v2:`. Live checks judge expiry at the wall clock; replay judges it at the log row's chain-protected `written_at`, so a write authorized by a then-valid grant replays deterministically forever.
 
 ### 4.4 Why not POSIX bits on nodes
@@ -153,9 +153,9 @@ When the caller's uid **is** the owner (the common case — the owner's media ap
 |---------|-----|-----------|-----------|
 | **Library / same-user** | the owner's own apps | none | direct `Engine` open of `.pvfs/` (owner uid) |
 | **Daemon socket** | other local users' apps | none | connect to owner's socket; peer-cred auth; ACL-enforced; member-signed writes |
-| **FUSE mount** | any app on the host, path-based | **`sudo`/admin** | a privileged mounter exposes a forest as a real filesystem; under the hood a daemon client; node ACLs mapped to POSIX checks |
+| **FUSE mount** | any app on the host, path-based | **`sudo`/admin** *(as built: none)* | a mounter exposes a forest as a real filesystem; under the hood a daemon client; node ACLs mapped to POSIX checks — shipped unprivileged as `pvfs mount` (doc 20 §3) |
 
-This matches the vision: regular users create and use forests (library/daemon, no `sudo`); making a forest look like a system-wide real filesystem is admin-only (FUSE).
+This matches the vision: regular users create and use forests (library/daemon, no `sudo`); the filesystem view shipped unprivileged too (`pvfs mount`, doc 20 §3), not admin-only as originally framed.
 
 ---
 
@@ -197,7 +197,7 @@ enabled = true
 - **No key sharing.** Each writer signs with their own authorized key; revocation is root-signed and kernel-enforced (§3.3). A stolen member key is contained by `DeviceRevoked` **on both paths**: authorship dies at the kernel (§3.3), and the key's direct `key:` ACL grants are **masked at access time** — a revoked key reads nothing, even where its ACL rows linger (they go inert, like a dead tag authority, doc 10 §9.2; compaction reclaims them, doc 11). *Never-authorized* keys are different: their `key:` grants apply without membership — that is the ephemeral guest-key / public-link path (doc 13 §E). So the access rule is: owner ⇒ full; active member ⇒ `key:` + `tag:` + `any` + `public`; never-authorized ⇒ `key:` + `public`; revoked ⇒ `public` only.
 - **Faithful authorship.** Every event names and is signed by its real author; the owner's daemon cannot silently forge another member's writes (it doesn't hold their key), and a replica re-verifies independently.
 - **Daemon compromise.** A compromised owner daemon can mis-serve *that owner's* forest (it holds the owner key) but cannot author as other members, and cannot touch other owners' forests (separate uids, `0700`).
-- **Peer-cred trust.** uid→principal rests on kernel-supplied peer credentials; acceptable under trust assumption (8). Optional connect-time key challenge removes even that assumption later.
+- **Peer-cred trust.** uid→principal rests on kernel-supplied peer credentials; acceptable under trust assumption (8). *(Since built: the connect-time key challenge shipped — doc 07 §2 — so the key is the principal; peer-cred is optional defense-in-depth only.)*
 - **Registry integrity.** Root-only writes; no user-writable registry ⇒ no alias hijack.
 
 ---
@@ -208,8 +208,8 @@ enabled = true
 |-------|-------------|
 | **A — foundation** | **`.pvfs/` `0700` (done)**; `authorize_member(pubkey)` + `forest authorize <member-pubkey>` / `forest revoke` CLI (root-signed, over the existing `DeviceAuthorized`/`DeviceRevoked` events); replay-time author-authorization enforcement (§3.3) shipped **behind a rebuild test**. *No protocol yet — proves the multi-writer kernel.* |
 | **B — ACLs (done)** | `AclSet` event + `acl` projection table + inheritance/evaluation in core (`effective_rights`); apply-time admin check; `Engine::set_acl/effective_rights/acl_entries`; CLI `pvfs acl set|ls|check <node-id> …`. Read/write *enforcement* by caller arrives with the daemon (C). |
-| **C — daemon** | per-user daemon, Unix socket, peer-cred auth, uid→principal binding, member-signed write protocol; registry gains `owner`/`socket`; client connects to shared forests. |
-| **D — FUSE** | `sudo` system mount mapping nodes/ACLs to a real filesystem. |
+| **C — daemon (done)** | per-user daemon, Unix socket, member-signed write protocol; registry gains `owner`/`socket`; client connects to shared forests. **Built with challenge-response key auth** (the key is the principal — doc 07), not peer-cred uid→principal binding. |
+| **D — FUSE (shipped, different shape)** | shipped as the unprivileged `pvfs mount <target> <dir>` (crate `pvfs-fuse`, P7.3 — doc 20 §3), not a `sudo` system mount. |
 
 P0 kernel encodings unchanged through A; B adds one event kind and one table; C/D are new processes around the kernel.
 
@@ -217,9 +217,9 @@ P0 kernel encodings unchanged through A; B adds one event kind and one table; C/
 
 ## 11. Open points
 
-1. **Group principals** — whether ACL groups are PVFS-internal (members listed in-log) or resolved from OS groups by the daemon. Lean: PVFS-internal named groups (portable, federation-safe), with an optional daemon mapping from OS group → PVFS group.
+1. **Group principals** — whether ACL groups are PVFS-internal (members listed in-log) or resolved from OS groups by the daemon. Lean: PVFS-internal named groups (portable, federation-safe), with an optional daemon mapping from OS group → PVFS group. **DECIDED:** `tag:` principals are the group mechanism (doc 10); arbitrary named groups deferred.
 2. **Explicit deny** — v1 is grant-only. Revisit if a "share all but one subtree" need appears.
-3. **uid→principal proof** — peer-cred (v1) vs connect-time key challenge (later).
+3. **uid→principal proof** — peer-cred (v1) vs connect-time key challenge (later). **DECIDED/built:** connect-time key challenge — the key is the principal (doc 07 C6).
 4. **Read-side attribution** — reads are not events; whether to audit-log reads in the daemon is a daemon policy, not a kernel concern.
 5. **Encryption** — per-subtree confidentiality at rest (reserved key path `m/43'/20566'/2'`) is out of scope here; ACLs gate access to *plaintext via the daemon*, not at-rest secrecy. Tracked separately (P3 secure module).
 
@@ -229,7 +229,7 @@ P0 kernel encodings unchanged through A; B adds one event kind and one table; C/
 
 | Topic | Decision |
 |-------|----------|
-| Sharing mechanism | Daemon-mediated (peer-cred auth + per-node ACL); **not** file-permission group sharing |
+| Sharing mechanism | Daemon-mediated (challenge-response key auth + per-node ACL — doc 07); **not** file-permission group sharing |
 | Forest state perms | `.pvfs/` `0700`, `device.key` `0600` — private by default |
 | Writer identity | Each writer authorized via root-signed `DeviceAuthorized`; **writes signed by the writer's own key** |
 | Kernel addition | Enforce author-authorization on apply; add `AclSet` event + `acl` table |

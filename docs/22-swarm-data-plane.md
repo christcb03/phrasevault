@@ -1,7 +1,8 @@
 # 22 — The swarm data plane: all-holder parallel reads (P9)
 
-**Status: BUILD SPEC (2026-08-12) — implementation follows immediately; every
-decision here is recorded before code, deviations land in §6 honestly.**
+**Status: BUILT + FLEET-VALIDATED (P9.0–P9.1, released 1.4.0) — see §6's
+close-outs. Authored as a build spec 2026-08-12; every decision was recorded
+before code, and deviations landed in §6 honestly.**
 Prerequisite reading: doc 20 §6 (the promoted arc + Chris's requirement,
 verbatim: reads pull **from every known holder in parallel, BitTorrent-style,
 for the fastest possible read**), doc 21 §3.3 (mirror copies join the seed

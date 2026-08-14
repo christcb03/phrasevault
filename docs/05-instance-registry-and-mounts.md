@@ -27,6 +27,8 @@ Every forest lives at a **mount directory** chosen by the operator (e.g. `/home/
 
 Optional later: `manifest.json` — cached `instance_id`, `forest_id`, `root_node_id`, bind roots (rebuildable from log).
 
+*Since built:* `.pvfs/` also carries today's local deployment state — `writer.lock`, `nettls/`, the replica marker, `placement`, `sync.store`, `serve.jobs`, `serve.exports`, `ingest.sessions`, `synced/` — all local deployment state, never log events.
+
 **Rule:** All engine files live under `.pvfs/` unless a future spec documents a clear exception.
 
 ---
@@ -92,13 +94,13 @@ pvfs://pvfshome@local/docs/notes
 pvfs://pvfshome@local/                    # forest root
 pvfs:///home/alice/pvfs/photos/2024       # registered mount by path (alias optional)
 pvfs:///media/usb/project/readme.txt      # portable — no registry entry
-pvfs://archive@backup-server/             # remote read (P4+)
+pvfs://archive@backup-server/             # remote read — @server form unimplemented; see doc 17 §4
 ```
 
 ### 4.2 Resolution order
 
 1. Parse URI; default `server` = `local`.
-2. **`server` ≠ local** → resolve via instance discovery (P4); not required for first implementation.
+2. **`server` ≠ local** → resolve via instance discovery (P4); not required for first implementation. *(Cross-host addressing shipped instead as `pvfs instance add` + `remote --instance/--connect --pin` — doc 17 §4; the `@server` mount-URI form remains unimplemented.)*
 3. **`server` = local**:
    - If `<forest>` matches a registry **alias** → `mount` from `/etc/pvfs/`.
    - Else if `<forest>` is an absolute path (or URI path-only form `pvfs:///…`) → use as **mount** if `<path>/.pvfs/log.db` exists (registered or portable).
@@ -142,8 +144,9 @@ Run from the directory that will become the **mount** (or specify `--mount`).
 
 1. Create `<mount>/.pvfs/` and run genesis (`ForestCreated`, device 0, root node) — same kernel as today.
 2. Print recovery phrase once.
-3. Prompt: **Import this directory’s tree into the forest?** (bind + scan of `<mount>/`, excluding `.pvfs/`).
-4. Prompt: **Friendly alias?** (optional; stored only on register, or in local `.pvfs/manifest.json` as hint).
+3. Self-enroll this box's own **client identity** as a member with read on the root (doc 18 §4 addendum) — every outbound dial authenticates as it.
+4. Prompt: **Import this directory’s tree into the forest?** (bind + scan of `<mount>/`, excluding `.pvfs/`).
+5. Prompt: **Friendly alias?** (optional; stored only on register, or in local `.pvfs/manifest.json` as hint).
 
 Does **not** write `/etc/pvfs/` or require root. Produces a **portable** forest until registered.
 
@@ -178,8 +181,8 @@ PVFS follows ordinary POSIX filesystem semantics rather than inventing its own a
 
 - **Owner.** The user who runs `forest init` owns the forest: they own and can write `<mount>/` and `<mount>/.pvfs/`, and they run any daemon that serves it. There is **one daemon per owning user** (P2) — no shared system service reaches across users' forests.
 - **Import honors read permission.** `init`/`scan` never index a file the owner cannot read. Unreadable files and untraversable directories are skipped (reported as `unreadable`), not imported and not fatal. So a forest never references content its owner can't actually open.
-- **Engine state permissions.** `.pvfs/` and `log.db`/`index.db` are created under the owner's umask — normal files. `device.key` is always `0600` (a per-device signing secret, never group-shared). PVFS does **not** force `.pvfs/` to `0700`; tighten with your umask if you want owner-only forests.
-- **Sharing is group-based, like any directory.** To share a forest with a group, give the mount (and, if collaborators need engine access, `.pvfs/`) the desired group and group mode — `chgrp`, `chmod g+rwX`, setgid dirs for inheritance — exactly as you would for any shared project tree. `device.key` stays owner-only regardless.
+- **Engine state permissions.** `device.key` is always `0600` (a per-device signing secret, never group-shared). *(Superseded as built: PVFS **does** force `.pvfs/` to `0700` — doc 06 §2 — so engine state is owner-only by construction, not by umask.)*
+- **Sharing is group-based, like any directory.** To share a forest with a group, give the mount (and, if collaborators need engine access, `.pvfs/`) the desired group and group mode — `chgrp`, `chmod g+rwX`, setgid dirs for inheritance — exactly as you would for any shared project tree. `device.key` stays owner-only regardless. *(Superseded for content: sharing forest content is daemon-mediated via per-node ACLs — doc 06 §2; group bits apply only to the workspace files themselves.)*
 - **Ownership repair is narrow.** `register` and `fix-permissions` only ever fix the **owner** of `.pvfs/` (recursively) and the **mount directory entry** (single entry). They never recursively rewrite ownership or permissions of the workspace files — your `chgrp`/`chmod` choices there are left intact. Both operations are symlink-safe (they never follow a symlink while chowning).
 
 ---
@@ -234,7 +237,7 @@ For “all descendants”, a separate command later (`pvfs walk`, already exists
 |-------|-------------|
 | **P1.5** | `.pvfs/` layout convention; `forest init` / `register`; `/etc/pvfs/` schema; resolver; `pvfs ls` / `pvfs forest *` |
 | **P2** | Daemon reads registry; `serve` per registered mount |
-| **P4** | `@server` ≠ `local`; mount URI → remote catalog |
+| **P4** | `@server` ≠ `local`; mount URI → remote catalog — shipped instead as `pvfs instance add` + `remote --instance/--connect --pin` (doc 17 §4); `@server` URI form unimplemented |
 
 P0 kernel (`Engine::init`, log, bind, scan) unchanged — wrap with mount path + registry layer.
 

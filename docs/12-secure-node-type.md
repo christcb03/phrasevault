@@ -40,7 +40,7 @@ The app's private data is **one opaque encrypted blob** (its own encrypted DB fi
 
 ## 4. Replication
 
-- A secure blob can **opt out of replication** entirely (the Messenger's local store does — each instance keeps its own; delivery is app-level, §5).
+- A secure blob can **opt out of replication** entirely (the Messenger's local store does — each instance keeps its own; delivery is app-level, §5). *(As of 1.4: the `local_only` flag is decided — doc 13 §C — but **not built**; today a secure blob replicates as ciphertext wherever its region replicates.)*
 - If a secure blob *is* replicated, the daemon replicates **ciphertext** as-is (it can't do anything else — it has no key). Note this is the one case where content-addressing is of ciphertext the owner can rewrite; replicas hold whatever ciphertext was shipped.
 
 ## 5. What stays out of scope for PVFS
@@ -59,6 +59,8 @@ App-level concerns PVFS does **not** implement (the app/secure-module-above does
 ---
 
 ## 7. Open questions
+
+> **Settled in §8 — kept for rationale.**
 
 1. **Mutable-location semantics** — exact overwrite/truncate/secure-erase guarantees at the storage layer (and on different backends).
 2. **Hash domain** — does the log hash the ciphertext, or a canonical plaintext digest the client provides (so replicas/recipients can agree on "what" without the server seeing plaintext)? Leaning: **ciphertext hash** (server-verifiable), since the local store isn't shared byte-for-byte anyway.

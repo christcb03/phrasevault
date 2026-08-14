@@ -5,9 +5,9 @@ clippy clean.** As-built notes: the `set_sig` accessor was missing `LinkReordere
 (caught by the new authorization test — a member's signature was silently dropped);
 the smoke's daemon-jobs section exposed a latent concurrent-fold race in projection
 catch-up, fixed separately (`58adaa2`). Packaging DECIDED (Chris,
-2026-08-11): no 1.4 cut yet — nothing is deployed beyond testing, so Unreleased
-accumulates until the region arc (doc 20) completes, then one release tells the
-whole story.
+2026-08-11): no 1.4 cut yet — Unreleased accumulates until the region arc (doc 20)
+completes. (That is exactly what happened: **shipped in 1.4.0, 2026-08-13, tag
+`v1.4`**.)
 Prerequisite reading: doc 17 §7 (the write-through model), doc 18 (the job supervisor
 these ops ultimately serve).
 
@@ -73,7 +73,7 @@ against it. As-built decisions:
 | **P6.1** | `sync.store` config + `--to` plumbing through sync/cat/export read paths | fetch lands on the configured disk; pre-move files still serve; jobs honor it |
 | **Validate** | pipeline both hosts + smoke + a fleet-test ingest-retraction check + clippy | all green; doc 08 §3.4 updated |
 
-Packaging: see the header — decided 2026-08-11, no cut until the region arc lands.
+Packaging: see the header — shipped in 1.4.0 (2026-08-13) once the region arc landed.
 
 ## 5. Open questions
 

@@ -41,7 +41,7 @@ The methods PVOS doc 10 §7 and PVFS doc 14 §7 both name, pinned to the built P
 | `sign-as-user(context)` | tenant `sign_once` / `sign_with_session` **+ context** (§5) | per-user identity | ✅ (phase 7: context accepted + digest-checked on the tenant ops) |
 | lifecycle | `Lock`, `RotateIdentity`, `SecureUnwrap` (doc 12 §8.5) | — | ✅ |
 
-So the surface is **already ~90% built**. Phase 7 is: (a) the **approval-context** field on `Sign` and the tenant sign ops (§3), and (b) the **`pvfsd` challenge consumer** (§6). Everything else exists.
+So the surface is **already ~90% built**. Phase 7 is: (a) the **approval-context** field on `Sign` and the tenant sign ops (§3), and (b) the **`pvfsd` challenge consumer** (§6). Everything else exists. *(Now: the PVFS surface is **complete** — phase 7 items 1/2/4 done; only the PVOS-side `pvos.sso` broker, §7 item 3, remains.)*
 
 ---
 
@@ -138,7 +138,7 @@ The identity separation doc 10 §4.1 requires holds automatically: the **app's o
 
 ## 6. "Sign in with PVFS" — the real `pvfsd` challenge consumer
 
-Today the loopback agent (doc 14 §6) signs a challenge, but nothing closes the loop against a live daemon. The end-to-end flow to wire (phase 7):
+Today the loopback agent (doc 14 §6) signs a challenge, but nothing closes the loop against a live daemon *(since closed: `tests/signin_pvfsd.rs` — §7 item 2)*. The end-to-end flow to wire (phase 7):
 
 1. A web app authenticates its user to **its PVFS daemon**: `pvfsd` issues a doc 07 §2 challenge (`auth_digest(nonce, forest_id, expiry)`).
 2. The app hands the challenge to the companion's loopback `POST /sign-in { challenge }` (origin-gated, doc 14 §6).
@@ -157,7 +157,7 @@ The only new code is a **consumer/example** proving steps 1→4 against a runnin
 1. ☑ **`ApprovalContext` on the sign surface** — the optional `context` field on `AgentRequest::Sign` and the tenant sign ops; the `Prompter` renders it (`approve_with_context`, doc 16 §3.2 wording in the terminal/desktop backends); the audit log records the full context; new `user_action` request type signed by the identity key, **prompt-by-default** (§3.3's allow-list is broker-side only). A context whose `digest_hex` disagrees with the digest being signed is refused as `bad_input` before any prompt, on both the local agent and the tenant ops. *Built.*
 2. ☑ **`pvfsd` challenge consumer** — `crates/pvfs-companion/tests/signin_pvfsd.rs` proves the §6 loop 1→4 against a live `pvfsd`: challenge → loopback `POST /sign-in` → identity-key signature → daemon `Auth` verifies the member, and ACLs bind to the signed-in principal. The signing closure in that test is the app-side reference. *Built.*
 3. ☐ **`pvos.sso` service** — `whoami` / `session` / `sign_as_user`, the policy engine (§3.3), and the digest+context construction (§3.1). *PVOS-side, in `pvosd` — built in the PVOS repo, consuming this API.*
-4. ☑ **`api_version` handshake** — `API_VERSION` (= 1) in `pvfs_companion::proto`, answered by the new `api_version` op on **both** the local agent and the tenant socket; answered even while locked, so negotiation never requires an unlock. *Built.*
+4. ☑ **`api_version` handshake** — `API_VERSION` (= 1 at phase 7; **3 today**: 1 = phase-7 handshake, 2 = relay/pairing, 3 = key-based url trust grants) in `pvfs_companion::proto`, answered by the new `api_version` op on **both** the local agent and the tenant socket; answered even while locked, so negotiation never requires an unlock. *Built.*
 
 PVFS's phase-7 work (items 1, 2, 4) is **done**; item 3 is PVOS's, and this doc is the contract it builds to.
 

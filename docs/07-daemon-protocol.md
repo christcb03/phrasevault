@@ -61,9 +61,13 @@ apply. The one thing that must be **canonical** — the write preimage a client 
 carried as **hex-encoded PCE bytes** inside the JSON, so signing stays on the kernel's canonical
 encoding. (u64 sizes/seqs are sent as JSON strings to dodge the 2⁵³ issue.)
 
-Requests (v1): `Hello`/`Auth` (handshake, §2), `Info`, `Ls{node}`, `Stat{node}`, `Cat{node,range}`,
-and the write pair `PrepareWrite{op}` / `Commit{prepared_id, signature}` (§5). Responses are typed
-results or a typed error reusing `PvfsError` codes.
+Requests (current `ClientMsg` set): `Auth`/`Anonymous` (handshake, §2), then by plane — reads:
+`Info`, `Ls`, `Stat`, `Payload`, `Cat{node,offset,len}` (ranged; waits on chunk coverage for
+in-flight ingest partials, P10.1), `ChunkManifest` · writes: `PrepareWrite` / `Commit` (§5) ·
+secure: `SecureCreate` (via `WriteOp`), `SecurePut`, `SecureCat` · log shipping: `LogInfo`,
+`LogRead`, `LogWait` · serve: `ServeStatus` · ingest (P10, doc 23): `IngestBegin`/`IngestWrite`/
+`IngestVerified`/`IngestCommit`/`IngestAbort`/`IngestList`. Responses are typed results or a typed
+error reusing `PvfsError` codes.
 
 ---
 
@@ -104,6 +108,10 @@ bytes" — no kernel logic in the client (essential for non-Rust clients).
 
 An **unauthorized/Public** caller cannot write at all (no key to sign with) — at most `Public` reads.
 
+*Since built (P10):* the ingest ops ride the same rails — `IngestBegin`/`IngestCommit` prepare
+member-signed batches (`IngestCommit` = the hash-fill + attestation), while `IngestWrite` streams
+on the data plane (doc 23 §9).
+
 ---
 
 ## 6. Concurrency — split control & data planes
@@ -117,7 +125,8 @@ The two planes have opposite needs, so they're built differently:
 - **Data plane (bytes):** once the control plane authorizes a read and resolves the node → storage
   location, streaming the bytes **never touches the engine**. So transfers run **concurrent,
   thread-per-transfer** — and this is exactly where **torrent-like chunk serving** lives later
-  (many peers × many chunks, fully parallel, no SQLite involvement).
+  (many peers × many chunks, fully parallel, no SQLite involvement). *(Since built: the swarm data
+  plane, P9.0/P9.1 — doc 22.)*
 
 **tokio:** not used now. It earns its place only if a torrent *swarm* reaches a scale where
 thread-per-transfer hurts — a later, **data-plane-only** optimization, isolated from the sync
@@ -146,6 +155,10 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
 - **C5 — crates:** `pvfsd` + `pvfs-client` (apps) + `pvfs` admin CLI.
 - **C6 — identity/auth:** generated standalone client identity + challenge-response; the key is the
   principal (federation-ready).
+- **C7 — ingest ops (added P10):** external-ingest sessions ride the same two-phase write rails
+  (doc 23).
+- **C8 — outbound identity (2026-08-13):** every outbound dial authenticates as the box's client
+  identity; `device.key` never dials (doc 18 §4).
 
 ---
 
@@ -171,20 +184,17 @@ identity means listing never reads a peer's `0700` `.pvfs/`.
 4. ☑ `pvfsd`: socket listener, handshake/auth, request dispatch via `effective_rights`/
    `readable_children`. **End-to-end ACL-enforced reads verified** (public + member clients over a
    real socket). *Engine shared behind a `Mutex` for now; read-pool optimization deferred.*
-5. ◑ `pvfs` CLI client: `pvfs whoami` (generated client identity at
+5. ☑ `pvfs` CLI client: `pvfs whoami` (generated client identity at
    `$XDG_CONFIG_HOME/pvfs/identity.phrase`) + `pvfs remote --socket <path> [--anon] info|ls|stat`.
    **Verified via the smoke suite** (owner grants `public r`, starts `pvfsd`, anon + signed clients
-   read). Remaining: transparent remoting (`pvfs --forest <alias>` dials the socket) + registry
-   `owner`/`socket` fields at register time.
+   read).
 6. ☑ Two-phase member-signed writes (`PrepareWrite`/`Commit`) — `Engine::prepare_add_node` /
    `commit_member_write`, the daemon's prepared-state, `pvfs-client::mkdir`, and
    `pvfs remote mkdir`. Authorization (author authorized + write-on-parent) is shared between live
    commit and replay (`projection::check_member_event`). **Verified end-to-end** (Rust + smoke).
-7. ◑ More write ops on the same machinery: ☑ `add-file`, ☑ `rm` (unlink from home),
-   ☑ `add-location` (record where a file's bytes live). Remaining: `mv` (re-home) and `set_acl`
-   over the daemon. Per-event authorization is shared via `projection::require_right`.
-8. ◑ `Cat` (read file bytes) — `pvfs remote cat`, ACL-checked, delivered as ranged hex chunks over
-   the control protocol; the engine lock is held only per chunk, so requests interleave. Remaining:
-   dedicated concurrent **data-plane** threads (raw byte stream, no hex overhead) and streaming hash
-   verification on read (doc 06 §6).
-9. ☐ Federation/torrent hooks (later).
+7. ☑ More write ops on the same machinery: ☑ `add-file`, ☑ `rm` (unlink from home),
+   ☑ `add-location` (record where a file's bytes live), ☑ `mv` (re-home), ☑ `set_acl` over the
+   daemon. Per-event authorization is shared via `projection::require_right`.
+8. ☑ `Cat` (read file bytes) — `pvfs remote cat`, ACL-checked, delivered as ranged hex chunks over
+   the control protocol; the engine lock is held only per chunk, so requests interleave.
+9. ☑ Federation (doc 17) + swarm (doc 22).

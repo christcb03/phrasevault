@@ -5,7 +5,8 @@ This manual covers everyday use of the `pvfs` command-line tool and sharing fore
 
 > Status: covers features available in **PVFS 1.4** (forests, ACLs/tags, full daemon read/write/admin,
 > secure blobs, companion, key replacement, federation + replicas, serve jobs, regions, the streaming
-> mount, attachment kinds, and the swarm data plane). Future work is under [Roadmap](#11-roadmap).
+> mount, attachment kinds, and the swarm data plane) **plus the unreleased ingest-session work on
+> main (§7.12, the upcoming 1.5)**. Future work is under [Roadmap](#11-roadmap).
 
 ---
 
@@ -18,7 +19,7 @@ append-only, signed event log. Unlike a normal directory:
 - Files are **content-addressed** (identified by a BLAKE3 hash), so identical content is recognized
   anywhere.
 - A forest can be **registered** on a host so apps and other users can find it, **shared** with
-  fine-grained per-folder permissions, and (later) accessed over a network via federation.
+  fine-grained per-folder permissions, and accessed over a network via federation (§7.4/§7.7).
 
 Your real files stay where they are on disk; PVFS *indexes and binds* them into the forest.
 
@@ -144,7 +145,7 @@ pvfs bind <folder> /mnt/photos  --kind mirror  --to /tank/backup # backup: a ver
 - **mirror** — the mover keeps a verified second copy in the store and **never
   retires anything**: the source keeps serving, the copy is a live backup (if
   the source dies, reads fall through to the mirror), and every mirror copy is
-  a future swarm seed (doc 20 §6). Omit `--to` and the command asks.
+  a swarm seed today (doc 22). Omit `--to` and the command asks.
 
 The kind is placement state under the hood (`pvfs place … central|central-keep`
 work too); the store may not live inside the bound space.
@@ -419,10 +420,14 @@ Any machine that registered the box (`pvfs instance add`) fetches from it on dem
 also authorize the box's client identity as a *member*, or its writes are refused at ingest
 (`author not authorized` — default-deny working as designed). `pvfs fleet enroll` does both in
 one visible, logged, revocable step: it prompts for the box's key (`pvfs whoami` on that box)
-and grants `r` (consumer), `rw` (ingest), or `rwa` (replicator) at the root. **The owner's own
-boxes need enrolling too** on a private forest: every outbound connection — the mover's pulls
-and read-through included — authenticates as that box's client identity, never the forest
-device key (which never dials). Revoke any time: `pvfs acl set <root> key:<pubkey> ""`.
+and grants `r` (consumer), `rw` (ingest), or `rwa` (replicator) at the root. This is **the
+settled identity model** (doc 18 §4): every outbound connection — the mover's pulls and
+read-through included — authenticates as that box's client identity, never the forest device
+key (which never dials). The creating box enrolls itself: since 1.5 `pvfs forest init`
+self-enrolls its own client identity with read (1.5, on current main), so a private
+forest's own mover works from birth — other boxes still enroll via `fleet enroll`.
+Revoke any time:
+`pvfs acl set <root> key:<pubkey> ""`.
 
 ### 7.10 Tiered storage: migrate to a central store, reclaim the edge
 
@@ -638,7 +643,7 @@ run `pvfs member replace <file>`).
 
 | Command | What it does |
 |---------|--------------|
-| `pvfs forest init [--mount DIR] [--no-import]` | Create a forest (as your user). |
+| `pvfs forest init [--mount DIR] [--no-import]` | Create a forest (as your user); self-enrolls this box's client identity with read (§7.9). |
 | `pvfs forest register <mount> [--alias N]` | Register host-wide (`sudo`). |
 | `pvfs forest unregister <alias\|mount>` | Remove from the registry (keeps `.pvfs/`). |
 | `pvfs forest fix-permissions [--mount DIR]` | Repair `.pvfs/` ownership (`sudo` if root-owned). |
@@ -676,7 +681,7 @@ run `pvfs member replace <file>`).
 | `pvfs remote --socket <path> rm <node>` | Unlink a node from its home via the daemon. |
 | `pvfs remote --socket <path> mv <node> <new-parent>` | Re-home a node under a new parent. |
 | `pvfs remote --socket <path> add-location <file> <uri>` | Record where a file's bytes live. |
-| `pvfs remote --socket <path> cat <node>` | Stream a file node's bytes to stdout (ACL-checked). |
+| `pvfs remote --socket <path> cat <node> [--offset N --len N]` | Stream a file node's bytes to stdout (ACL-checked); ranged reads, and on an in-flight ingest file the daemon waits for the covering chunks (§7.12). |
 | `pvfs remote --connect <host:port> --pin <hex> …` · `--instance <name> …` | The same commands over TCP+TLS to a `pvfsd --listen` server (§7.4). |
 | `pvfs instance add <name> <host:port> <pin>` · `ls` · `rm <name>` | Remember/list/forget pinned network instances. |
 | `pvfs replica add <mount> --instance <name> [--region <node>]` · `pvfs replica sync <mount>` | Build / refresh a verified read-only replica of a served forest — whole, or scoped to one region (§7.7). |
@@ -687,7 +692,8 @@ run `pvfs member replace <file>`).
 | `pvfs ingest write\|verified\|commit\|abort\|list` | Stream bytes in, mark verified ranges, commit through the gates, abort, or list sessions (§7.12; bare `pvfs ingest` = list). |
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
-| *(lib)* `Client::add_node` / `payload` | Daemon `AddNode`/`Payload` — small log-resident typed records (1.1; no CLI wrapper yet). |
+| `pvfs serve enable\|disable\|ls\|status [job]` | Configure/inspect the daemon's background jobs (§7.11); bare `pvfs serve` = status. |
+| `pvfs fleet enroll <pubkey> [--rights r\|rw\|rwa]` | Admit a box: membership + rights in one logged step (§7.9). |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
 mount to set the forest context for tree commands.
@@ -716,14 +722,13 @@ create/read/update over the running daemon.
 
 **1.1 (library / daemon):** apps can create small log-resident typed nodes via `AddNode` and read
 them with `Payload` over `pvfs-client` (used by PVOS for grant records); `stat` reports a node's home
-parent. Operator CLI wrappers for those ops are optional polish — the smoke/integration tests and
-client library cover the wire path.
+parent. The operator CLI wrappers shipped too: `pvfs remote add-node` / `payload` (§10).
 
 Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
 
 - **Polish** — Touch ID unlock.
-- **Compaction** — collapse a large forest's history into a fresh, compact snapshot to reclaim space
-  and speed up rebuilds (signed by you; old history sealed for audit).
+- **Compaction** — deliberately deferred by decision (2026-08-13, doc 11): revisit when a
+  projection rebuild crosses ~a minute or a replica add takes minutes on LAN.
 - **Federation / network sharing** — reach and sync forests across hosts. The first arc is
   **built** ([doc 17](17-federation-and-sync.md)): the native tree view (`pvfs export`, §6.1), the
   network transport (`pvfsd --listen` + pinned TLS, §7.4), verified read-only replicas
@@ -732,7 +737,8 @@ Coming next (see [08-roadmap-and-status.md](08-roadmap-and-status.md)):
   and **follow their source live** (`pvfs replica follow` — new events in seconds); locations name
   their holding instance, reads **fetch on demand** from any pinned holder, and the
   **tiered-storage mover** migrates bytes to a central store with safe edge eviction (§7.10) — the
-  full ingest-box → NAS pipeline. The F4 arc is landing ([doc 20](20-f4-regions-and-streaming.md)):
-  the FUSE mount (§6.2) and physical region logs (§6.3) are **built**; still ahead there:
-  region-scoped replication over the wire, cross-region moves, attachment policies (doc 21),
-  swarm transfer, and failover.
+  full ingest-box → NAS pipeline. The F4 arc is **complete** (1.4.0, [doc 20](20-f4-regions-and-streaming.md)):
+  the FUSE mount (§6.2), physical region logs (§6.3), region-scoped replication over the wire,
+  cross-region moves, attachment kinds (doc 21) and the swarm (doc 22) all shipped; only standby
+  failover remains a design note. On main beyond 1.4: external-ingest sessions + in-flight
+  streaming (doc 23, §7.12).

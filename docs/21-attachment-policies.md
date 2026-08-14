@@ -39,13 +39,13 @@ one command and the daemon does the rest.
 2. `central-keep` is a placement mode (the mover already walks placements).
 3. **Mirror copies serve reads — and more (Chris):** not only do both copies
    participate as read-through candidates (free, via the logged location), reads
-   should eventually pull **from every known holder in parallel, BitTorrent-style,
-   for the fastest possible read**. That is the swarm data plane — specified in
-   doc 20 §6 (its own arc, P9, after regions): chunked fetch-by-hash where every
-   logged location (mirrors included) is a seed. Doc 21's mirror kind is what
-   *populates* the holder set; P8 ships with today's single-candidate read-through
-   and inherits swarm reads automatically when P9 lands.
-4. Regions: nothing special expected; confirm at P8 build.
+   should pull **from every known holder in parallel, BitTorrent-style, for the
+   fastest possible read**. That is the swarm data plane — built as P9 (doc 22,
+   shipped 1.4.0): chunked fetch-by-hash where every logged location (mirrors
+   included) is a seed. Doc 21's mirror kind is what *populates* the holder set;
+   P8 shipped first with single-candidate read-through and inherited swarm reads
+   when P9 landed, exactly as planned.
+4. Regions: nothing special expected; confirmed at the P8 build (see §5).
 
 ## 4. Build shape (once approved)
 

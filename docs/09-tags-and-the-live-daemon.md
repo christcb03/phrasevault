@@ -60,7 +60,9 @@ node's `Tag` grant must share an authority, and that authority must still be an 
 **Principle:** while a forest has a running `pvfsd`, it is the *only* process that opens that
 forest's engine. Every mutation — member writes **and** admin ops (authorize a member, set an ACL,
 assign a tag, move a node) — is submitted **to the daemon** and written by its one engine. The CLI
-and any API are **clients**; they do not open a second engine on a served forest.
+and any API are **clients**; they do not open a second engine on a served forest. *(Since built:
+writer engines hold a shared flock on `<data_dir>/writer.lock`; a CLI open that finds a live writer
+catches up instead of crash-rebuilding.)*
 
 Why: it eliminates the two-writer hazard (two processes on one SQLite store), makes every change
 take effect immediately (the daemon makes it and serves the next request under it), and is the only
@@ -101,7 +103,7 @@ Control and data are separated. The control plane authorizes a read (ACL check, 
 location); the **bytes then stream raw** — no hex, no JSON envelope — over the connection (a length
 header then the raw bytes), on a transfer path that doesn't tie up the request loop. This halves
 the bytes vs. today's hex chunks, allows concurrent transfers, and is the seam for later
-**torrent-like** multi-peer chunk serving (doc 07 §6).
+**torrent-like** multi-peer chunk serving (doc 07 §6). *(Since built: the swarm data plane, doc 22.)*
 
 ---
 
@@ -159,9 +161,10 @@ it does not block the live-daemon work.
 | **3c** | ☑ Admin ops over the daemon — `SetAcl`/`TagMember`/`AuthorizeMember`/`Revoke` `WriteOp`s; engine `prepare_*` + a commit that routes device certs through `check_device_cert`; `pvfs-client` `set_acl`/`tag_member`/`authorize_member`/`revoke`. Owner does **live admin over the socket** (authorize a member + grant → member writes immediately, no restart). Pluggable-signer seam (device key now; companion later). |
 | **3d** | ☑ CLI **auto-routes**: `acl`/`tag`/`device` mutations look for a daemon serving that forest → submit to it (device-signed); else write directly. Path/URI args too. Root-signed (`--mnemonic`) stays direct (the daemon can't proxy the phrase). |
 | **4** | ☑ Raw binary data plane for `cat` (PROTO_VERSION 2; lock released before I/O → concurrent transfers). |
-| **5** | Companion app (§6): root custodian + localhost identity agent / auto-login. Its own track (1.0 scope TBD — doc 08 §3). |
+| **5** | ☑ Companion app (§6): root custodian + localhost identity agent / auto-login. Shipped as its own track (doc 14 phases 1–7, doc 16). |
 
 Kernel **event encodings** unchanged: the `MemberTagged` event was additive, and per-key tags
 (doc 10, P2-G) added no wire fields (the authority is the existing author). The **projection** schema
 did bump to `SCHEMA_VERSION` 2 for P2-G's `authority` columns — older projections self-heal by
-replaying from the log.
+replaying from the log; the schema is 7 today (v5 region logs, v6 cross-region moves, v7 chunk
+manifests).

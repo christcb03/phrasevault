@@ -1,10 +1,10 @@
 # PVFS — Requirements Driven by PVOS (13)
 
-Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consolidated set of things PVFS must do for PVOS. **P3 secure node shipped (1.0, doc 12)**; **1.1** delivered `AddNode`/`Payload` + revoked-key containment for PVOS M1. Remaining heavy lift is **P4 federation** (doc 03) and compaction (doc 11). Written from the PVOS side so the PVFS work has one clear target.
+Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consolidated set of things PVFS must do for PVOS. **P3 secure node shipped (1.0, doc 12)**; **1.1** delivered `AddNode`/`Payload` + revoked-key containment for PVOS M1. The heavy lifts are done or decided: **P4 federation shipped** (doc 17 + the F4 arc); compaction **deferred by decision** (doc 11). Written from the PVOS side so the PVFS work has one clear target.
 Date: 2026-06-21 (status refreshed 2026-07-11)
-Related: doc 03 (federation — future), doc 10 (per-key tags — done, P2-G), doc 11 (compaction — future), doc 12 (secure node — shipped), doc 16 (joint agent API — PVFS side done).
+Related: doc 03 (federation — shipped, doc 17), doc 10 (per-key tags — done, P2-G), doc 11 (compaction — deferred by decision), doc 12 (secure node — shipped), doc 16 (joint agent API — PVFS side done).
 
-Most of what PVOS needs already exists (P0–P2-G). The PVFS-impacting work concentrates in **two big workstreams (P3 secure node, P4 federation)** plus **three smaller additions**. This doc enumerates every open question; §A is flagged as the **most impactful** (settle it first).
+Most of what PVOS needs already exists (P0–P2-G). The PVFS-impacting work concentrates in **two big workstreams (P3 secure node, P4 federation)** plus **three smaller additions** — *both big workstreams delivered: P3 in 1.0, P4 through 1.4*. This doc enumerates every open question; §A is flagged as the **most impactful** (settle it first).
 
 ---
 
@@ -49,7 +49,7 @@ PVOS needs replicate/share/host at **tree/region** granularity, not just whole f
 - **Falls out for free:** per-region **compaction** (doc 11) and **backup** (compact/replicate a region independently; the parent just commits the new head), and a clean unit for later **per-region active-active** (§A).
 - **Compatible with §A:** single-writer base unchanged — each region is written by the one writer; head-commitments are part of that flow.
 
-**Deferred implementation details (PVFS side):**
+**Deferred implementation details (PVFS side)** *(since built in P7.2a–c — doc 20 §2.3–2.5)*:
 - The **mark/unmark region-boundary** op (split a subtree into its own log / merge back) — a signed structural event in the parent log.
 - Cross-region **causal ordering** (a partial order via head-hash references; no global total order across independent regions — which is exactly what *enables* independent replication).
 - Where a cross-region **move** (re-home across a boundary) is authored and how both logs reflect it.
@@ -64,7 +64,7 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 - **Q-C2:** Secure blobs (P3) that *are* replicated travel as **ciphertext only** (the daemon has no key). Confirm the daemon replicates opaque bytes + the content-free hash-ledger.
 
 ### C — Resolved (2026-06-21)
-- **Q-C1:** Add a per-node/per-region **`local_only` (no-replicate) flag.** A node — especially a **region root** — can be marked local-only; its region's log never replicates. Distinct from `temp` (which is *also* auto-purged when orphaned); `local_only` keeps the data, just never ships it. The Messenger's secure blob lives in a `local_only` region.
+- **Q-C1:** Add a per-node/per-region **`local_only` (no-replicate) flag.** A node — especially a **region root** — can be marked local-only; its region's log never replicates. Distinct from `temp` (which is *also* auto-purged when orphaned); `local_only` keeps the data, just never ships it. The Messenger's secure blob lives in a `local_only` region. *(Decided, **not built** as of 1.4 — no `local_only` in the codebase.)*
 - **Q-C2:** Confirmed — a replicated **secure** blob travels as **ciphertext + the content-free hash-ledger**; the daemon has no key and replicates opaque bytes.
 
 ---
@@ -108,6 +108,8 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 
 ## G. Secure node type (P3) — open questions (from doc 12)
 
+> **G1–G3 decided in doc 12 §8; G4 (TEE) stays post-1.0.**
+
 - **Q-G1:** Mutable-location semantics — exact overwrite/truncate/secure-erase guarantees at the storage layer (and per backend).
 - **Q-G2:** Hash domain — the log hashes the **ciphertext** (server-verifiable) vs a canonical plaintext digest the client supplies. (Leaning ciphertext, since the local store isn't shared byte-for-byte — §C.)
 - **Q-G3:** Secure-erase on replicas / backups — local delete can't force deletion on copies; document the limit.
@@ -115,7 +117,7 @@ This **resolves Q-B1–B4** and is the heart of P4. With §A and §B settled, th
 
 ---
 
-## Priority / sequencing
+## Priority / sequencing (historical — all settled)
 
 1. **Settle §A (write model)** — it determines whether the linear log survives and shapes all of P4. *Tackle first.*
 2. **§B (sub-forest replication mechanics)** — the region-tail integrity scheme, once the write model is set.

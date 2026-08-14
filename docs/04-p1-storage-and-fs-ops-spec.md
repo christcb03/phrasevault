@@ -17,7 +17,7 @@ On top of the P0 kernel (`pvfs-core`):
 - **`cat`** — stream a file node's bytes, with **read-path integrity verification**.
 - **`hash`** — compute/fill a file node's lazy `content_hash`.
 - **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes (design doc §8.5).
-- **`pvfs serve`** — minimal daemon: filesystem watcher + scheduled reconciliation. No HTTP (that's P3).
+- **`pvfs serve`** — minimal daemon: filesystem watcher + scheduled reconciliation. No HTTP (that's P3). *(Since P5, doc 18: `pvfs serve` is the job supervisor; the P1 watcher lives on as the `watch` job.)*
 - **Managed temp spool** — `<data_dir>/tmp/`, with the startup cleanup sweep (design doc §6.3).
 
 Out of scope (reaffirmed): WASM host (P2), search/serve-HTTP (P3), mount/remote backends/sync (P4).
@@ -114,13 +114,11 @@ For each on-disk file passing the filter:
    node, its metadata, and its links are kept (design doc §8.5) — PVFS does
    not own external bytes.
 
-> **[OPEN-2] What happens when a file's bytes change on disk?** The file node's
-> payload (hash/size) is immutable. Proposal — **same-node metadata refresh is
-> impossible by design, so:** create a **new file node** (fresh payload),
-> `LinkSuperseded` the old home link with a link to the new node (the old node
-> keeps history/orphans for review), and move active locations to the new node
-> (`FileLocationRemoved` old / `FileLocationAdded` new). Alternative: treat
-> changed files as delete+add (simpler, loses the supersede trail).
+> ~~[OPEN-2]~~ **Decided** (§11 item 2) — same-node metadata refresh is
+> impossible by design; changed bytes flag the node **`invalid:
+> changed-on-disk`** and the operator resolves via `pvfs resolve --replace`
+> (successor node + `LinkSuperseded` trail, locations moved) or
+> `--delete [--purge]` (§4.4).
 
 Scan is **transactional per file** (a crash mid-scan leaves a valid partial
 index; the next reconciliation completes it) and **idempotent** (event
@@ -135,19 +133,22 @@ Scan stats are returned and printed: `added / unchanged / changed / removed / sk
 `cat(node)` (engine: `open_bytes(node_id, range)`):
 
 1. Collect active locations; resolution order (federation doc §2.3, P1 subset):
-   local `file://` first; no other schemes in P1.
+   local `file://` first; no other schemes in P1 (P1 subset — doc 17 §7.2/§7.3
+   has the current scheme set: `pvfs-tmp:///`, `pvfs-sync:///`,
+   `pvfs-host://<pin>/` and candidate ordering).
 2. `stat` each candidate until one exists; none ⇒ `Unavailable` error listing
    tried URIs.
 3. Stream bytes. **Integrity check (ADR §6):** if the node has a non-empty
    `content_hash` and the read is **full-file**, hash while streaming and
    compare at EOF; on mismatch the bytes already sent are followed by an error
    (CLI: non-zero exit, partial-output warning on stderr) and the location is
-   **quarantined** (see [OPEN-3]). Range reads skip verification (can't hash a
-   fragment) — documented.
+   **quarantined** (see [OPEN-3]). Range reads over an **attested** file verify
+   per 8 MiB chunk against the recorded manifest (since built: doc 22 §2);
+   unattested files still skip range verification (can't hash a fragment).
 4. Empty `content_hash` (lazy, never hashed) ⇒ serve without verification;
-   `pvfs hash <node>` fills the hash (one streaming pass, emits the updated
-   node? — no: hash lives in the payload… see [OPEN-2]; under the proposed
-   event model `hash` creates the successor node exactly like a changed file).
+   `pvfs hash <node>` fills the hash (one streaming pass; per the §11 item 2
+   decision the hash lives in the payload, so hashing creates a successor node
+   exactly like a changed file).
 
 > **Decided — local quarantine.** A failed check writes to the local
 > `location_quarantine` table (§8) — corruption is an observation about *this*
@@ -168,10 +169,12 @@ Scan stats are returned and printed: `added / unchanged / changed / removed / sk
   every `reconcile_interval` (default 1h), plus the temp-spool sweep at start.
 - Watcher events are debounced (default 2s) and fed through the same ingest
   path as scan steps 1–5.
-- **Single writer:** the daemon takes an advisory lock file
-  (`<data_dir>/serve.lock`). One-shot CLI commands remain usable while the
-  daemon runs (SQLite WAL; writes serialize via busy timeout) — but only one
-  daemon per data dir.
+- **Live-writer discipline** (since built): writer engines hold a shared
+  flock on `<data_dir>/writer.lock`; a CLI open that finds a live writer
+  catches up instead of crash-rebuilding. `serve.lock` is only the watcher's
+  own single-instance lock — one daemon per data dir. One-shot CLI commands
+  remain usable while the daemon runs (SQLite WAL; writes serialize via busy
+  timeout).
 - A manual `pvfs scan` stays available when no daemon is running (design §8.5).
 
 ---
@@ -192,7 +195,7 @@ Scan stats are returned and printed: `added / unchanged / changed / removed / sk
 ## 8. Projection additions (index.db, rebuildable)
 
 ```sql
--- [OPEN-1] if bindings-as-events is accepted:
+-- bindings are events (FolderBound / FolderUnbound) — decided, §11 item 1:
 CREATE TABLE folder_bindings (
   folder_id   TEXT PRIMARY KEY,
   source_uri  TEXT NOT NULL UNIQUE,
@@ -232,7 +235,7 @@ CREATE TABLE scan_state (        -- last seen size/mtime per (binding, uri)
 
 `location_quarantine` and `scan_state` are **local caches**: a full rebuild
 clears them; the next reconciliation/verification repopulates them. New events
-(if [OPEN-1] accepted): `FolderBound`, `FolderUnbound` — signed like all
+(decided, §11 item 1): `FolderBound`, `FolderUnbound` — signed like all
 mutable events, root-or-device authored, replicated.
 
 ---

@@ -70,7 +70,7 @@ The disaster case: everything under `m/43'/20566'/…` is burned. The goals are 
 RootRotated { new_root_pubkey, rotated_at, author, sig }
 ```
 
-Valid iff `author` is the **current root of the lineage** (or the recovery key, C5), and it appends to the **root region** of the canonical log (doc 13 §B — rotation is never valid from a sub-region log). Projection maintains a **root lineage**: `root(t)` = the `new_root_pubkey` of the latest `RootRotated` at-or-before position `t`, else the genesis root. `check_device_cert` and replay validate every device cert against `root(position)` — so history validates forever, and the old root's authority ends at the rotation, atomically.
+Valid iff `author` is the **current root of the lineage** (or the recovery key, C5), and it appends to the **root region** of the canonical log (doc 13 §B — rotation is never valid from a sub-region log). *(Enforced by construction since P7.2: `Engine::route_events` pins `RootRotated` — and every forest-scoped kind — to the top log; `crates/pvfs-core/src/engine.rs`.)* Projection maintains a **root lineage**: `root(t)` = the `new_root_pubkey` of the latest `RootRotated` at-or-before position `t`, else the genesis root. `check_device_cert` and replay validate every device cert against `root(position)` — so history validates forever, and the old root's authority ends at the rotation, atomically.
 
 **C3 — forest identity is unchanged.** `forest_id` stays; URIs (doc 05) stay; node/link ids are content-addressed and never referenced the root key. What *changes* is what federation peers must pin: **not the root pubkey but the genesis + lineage** — each `RootRotated` signed by the then-current root (or recovery key) forms a custody chain any peer can verify (doc 03 gets a short amendment). A peer seeing a lineage extension should surface it like an SSH host-key change: loud, but verifiable.
 
@@ -134,8 +134,10 @@ for a stolen recovery phrase — the C4 first-in-log-wins race still governs a l
    total seed loss, reset-on-rotation + de-register, stranger refused); smoke: register → rotate via
    recovery phrase → old seed rejected, new accepted, `forest_id` survives, retired key can't
    re-rotate, explicit de-register + unknown-key NotFound.
-5. ☐ **Edges** — compaction lineage embedding (doc 11 update); federation lineage pinning (doc 03
-   amendment); optional `forest rotate-root` mass re-admission of old-seed devices; doc 08 item 17 closed.
+5. ◑ **Edges** — federation lineage pinning honored by construction (doc 17 §5: replica replay
+   validates `RootRotated` chains); doc 08 item 17 closed. The compaction lineage embedding waits on
+   compaction itself (deferred by decision, doc 11); optional `forest rotate-root` mass re-admission
+   of old-seed devices remains.
 
 ## 6. Resolved decisions (2026-07-02)
 

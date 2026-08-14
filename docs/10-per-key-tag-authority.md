@@ -1,6 +1,6 @@
 # PVFS — Per-key tag authority (multi-tenant tags) (10)
 
-Status: **Implemented** (`SCHEMA_VERSION` 2; doc 08 P2-G) — proposed 2026-06-20, landed 2026-06-21
+Status: **Implemented** (shipped at `SCHEMA_VERSION` 2 — current schema is 7; doc 08 P2-G) — proposed 2026-06-20, landed 2026-06-21
 Date: 2026-06-20
 Depends on: [02 (P0 spec)](02-p0-core-engine-spec.md), [06 (ACLs & daemon)](06-access-control-and-daemon.md), [09 (tags & live daemon)](09-tags-and-the-live-daemon.md)
 Motivation: PVOS hosts **many apps in one forest**. The current tag model assumes a single administrative domain per forest and breaks under multi-tenancy.
@@ -125,6 +125,9 @@ unrevoked member** — §8 test 4 requires that revoking the authority denies ac
    **signed maintenance sweep** appends the removal events, authored by the forest owner/admin (the
    daemon runs as the owner, so it can perform this). It runs opportunistically when masking finds an
    orphaned tag, and on demand via the forest-wide **rights audit** (doc 08 §4 items 13–14).
+   *(**REJECTED** as built — 2026-06-29, doc 08 item 13: the sweep can't even be expressed cleanly
+   and buys nothing; `pvfs audit` performs **no cleanup writes** — item 14. Masking (1) is the
+   mechanism; physical removal is deferred to compaction — itself deferred, doc 11.)*
 
 **Key rotation:** rotating an app's authority key orphans its existing grants/memberships until
 re-issued under the new key (acceptable v1; revisit if apps need seamless rotation).
@@ -135,4 +138,4 @@ re-issued under the new key (acceptable v1; revisit if apps need seamless rotati
 
 - **Tag-admin delegation** — should an authority be able to authorize *another* key to assign memberships under its tag namespace? (Maps to PVOS capability delegation; defer until needed.)
 - **Display/addressing** of cross-authority tags (ergonomics only).
-- **Federation** — tags travel with their authority key across replicas; confirm the projection rebuild on a replica reproduces `(authority, name)` correctly (it should, since it folds the same signed events). Interacts with sub-forest replication (doc 03 §1.5): a region typically maps to one app authority, so "replicate app A's region" = "replicate the nodes A controls."
+- **Federation** — tags travel with their authority key across replicas; confirm the projection rebuild on a replica reproduces `(authority, name)` correctly (it should, since it folds the same signed events). Interacts with sub-forest replication (doc 03 §1.5): a region typically maps to one app authority, so "replicate app A's region" = "replicate the nodes A controls." **Confirmed:** replicas re-fold the same signed events; fleet-validated across two machines.

@@ -1,7 +1,8 @@
-# 23 — External-ingest sessions & the BitTorrent bridge (P10 candidate)
+# 23 — External-ingest sessions & the BitTorrent bridge (arc P10)
 
-**Status: APPROVED (Chris, 2026-08-13) — the four §8 questions are decided
-and folded into §3/§7 below.** Prerequisite reading:
+**Status: BUILT + FLEET-VALIDATED (P10.0–P10.2, 2026-08-13; unreleased on
+main). The four §8 questions were decided and folded into §3/§7; close-outs
+in §10, §12 and §13.** Prerequisite reading:
 doc 22 (the swarm + attested streaming — the machinery this generalizes),
 doc 21 (attachment kinds), doc 13 (typed log-resident records).
 
@@ -30,7 +31,7 @@ doc 21 (attachment kinds), doc 13 (typed log-resident records).
 Nothing BitTorrent-specific enters `pvfs-core`. The API is a general
 **external-ingest seam**: the BT app is its first consumer, but an HTTP
 download manager, a camera importer, or any bytes-producing app uses the
-same five operations.
+same six operations.
 
 ## 3. The ingest session (the P10 API)
 
@@ -51,7 +52,7 @@ style where they touch the log.
     space (with margin) at the partial destination; `allow_shortfall`
     overrides at the caller's risk.
   - *Authorization:* cataloging needs `w` on the parent. The **early-serve
-    license** (§5) requires the origin record's author to hold `a` on the
+    license** (§4) requires the origin record's author to hold `a` on the
     target subtree — the same bar as doc 22 §2's attestation, for the same
     reason: early bytes are trusted against the origin's hash chain instead
     of the whole-file gate.
@@ -60,14 +61,14 @@ style where they touch the log.
   partial. Out-of-order and duplicate writes are fine; the partial is
   sparse. **Disk-full is a clean pause, never poison** (§8.3): the write
   errors, the session stays resumable from the bitmap. *Same-box fast path
-  (optimization, later):* `IngestBegin` may return the partial's local
-  path to a caller with filesystem access.
+  (built as P10.2, §13):* `IngestBegin`/`IngestList` return each file's
+  `partial_path` — over the Unix socket only.
 - **`IngestVerified`** `{ session, file, ranges }` — the app reports byte
   ranges whose torrent pieces verified against the infohash. `pvfsd` then
   BLAKE3-hashes any 8 MiB PVFS chunks now fully covered by verified ranges
   and marks them in the file's **progress sidecar** (`.{id}.progress`, a
   chunk bitmap beside the partial) — the piece→chunk bridge, incremental
-  and cheap. These chunk marks are what license streaming (§5).
+  and cheap. These chunk marks are what license streaming (§4).
 - **`IngestCommit`** `{ session, file }` — the existing trust gate, reused
   whole: whole-file BLAKE3 over the partial → **hash-fill successor node**
   (the lazy-hash machinery — the pointer node graduates to a hashed one) →
@@ -94,11 +95,10 @@ style where they touch the log.
 Two consumers serve in-flight ingest bytes, both keyed off the progress
 sidecar:
 
-- **The mount** (P9.1 generalized): today the streaming mount tracks its
-  own in-process fetches via `SwarmProgress`; it grows a second source —
-  progress sidecars written by `pvfsd` for ingest sessions. A read waits
-  until its covering chunks are marked, then serves from the partial.
-  First playable bytes arrive as soon as the app has verified the pieces
+- **The mount** (as built in P10.1, §11): reads of an in-flight file
+  proxy as ranged `Cat` to the ingesting daemon, which owns the sidecar,
+  the license check, and the wait — one seam for every reader. First
+  playable bytes arrive as soon as the app has verified the pieces
   covering chunk 0 — for sequentially-prioritized torrent downloads (the
   app's choice), that is seconds into the download.
 - **The fleet swarm** (emergent, free): ranged `Cat` learns to serve marked
@@ -128,17 +128,18 @@ fall through to the central copy.
 ## 6. What PVFS deliberately does not do
 
 No BitTorrent protocol, no queue, no *arr emulation, no seeding policy, no
-UI, no bandwidth shaping. One seam, five-and-a-half operations, all trust
+UI, no bandwidth shaping. One seam, six operations, all trust
 machinery reused from docs 04/22.
 
-## 7. Phases (once approved)
+## 7. Phases
 
 | Phase | Deliverable | Done means |
 |---|---|---|
 | **P10.0** | Ingest sessions end to end: the six wire ops, sessions file, partials + progress sidecars, commit = hash-fill + attest + publish; space preflight + `allow_shortfall`; `pvos.download.closed` on commit and abort | smoke: a scripted fake downloader writes ranges out of order, verifies, commits; the file serves, tiers, exports; kill mid-ingest resumes from the bitmap; an oversized add refuses; abort + commit both leave closed records in the log |
 | **P10.1** | In-flight streaming: the mount consults progress sidecars; ranged `Cat` serves marked chunks of partials; `IngestList` hot ranges (mount demand → app piece priority) | fleet phase K: owner ingests out of order while the edge's mount streams the early chunks and a third box swarm-pulls marked chunks mid-ingest; `IngestList` shows the hot range while the edge's reader waits |
+| **P10.2** | The same-box fast path (§13): `partial_path` on begin/list over the Unix socket, shard dirs pre-created at activation | e2e: direct writes at the returned path verify + commit bit-perfect; PVOS builds against the crates |
 | **App** | The PVOS BT app (separate effort, consumes this API) | out of scope here |
-| **Validate** | pipeline both hosts + fleet, per phase | all green; honest §8 close-out |
+| **Validate** | pipeline both hosts + fleet, per phase | all green; honest close-outs (§10/§12/§13) |
 
 ## 8. Decisions (Chris, 2026-08-13)
 

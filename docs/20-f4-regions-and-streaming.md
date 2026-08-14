@@ -1,8 +1,9 @@
 # 20 — F4: region logs + the streaming mount (P7)
 
-**Status: DESIGN (2026-08-11, authored overnight) — implementation follows the same
-night; every decision here is a PROPOSAL for Chris's morning review, made explicit so
-the build never blocked on an answer. Deviations land in §7 as phases close.**
+**Status: BUILT + FLEET-VALIDATED (P7.0–P7.3, released 1.4.0) — see §7's
+close-outs. Authored as an overnight design 2026-08-11; every decision was a
+proposal for Chris's morning review, and deviations landed in §7 as phases
+closed.**
 Prerequisite reading: doc 13 §B (the *decided* region architecture), doc 17 §8
 (F4's order), doc 11 (compaction — the per-region beneficiary), doc 03 §1.5/§6.
 
@@ -19,8 +20,8 @@ Two capabilities, in doc 17 §8's order:
    consumer browses a pointer-mode library as a real filesystem. The materialized
    export stays the zero-dependency path.
 
-Swarm transfer and standby failover stay design-notes here (§6) — deliberately not
-built this pass.
+Standby failover stays a design note (§6); swarm transfer was built as its own
+arc, P9 (doc 22), and shipped in 1.4.0.
 
 ## 2. Region logs — the shape (doc 13 §B, made concrete)
 
@@ -28,8 +29,9 @@ built this pass.
 
 P7.0 (logical regions) is BUILT. The interim P7.1 was struck (see §7 — its
 sparse-sequence verification mode is machinery physical logs delete), so the arc
-that remains is **P7.2: region replication on physical per-region logs**, built
-directly. Chris confirmed 2026-08-11. The shape:
+that remained was **P7.2: region replication on physical per-region logs**, built
+directly (sub-phases a–d, all landed 2026-08-11/12 — §7). Chris confirmed
+2026-08-11. The shape:
 
 - **Storage.** The existing `log.db` IS the top region's log. A marked region gets
   `​.pvfs/regions/<region-root-id>/log.db` — same schema, its own dense chain.
@@ -56,7 +58,8 @@ directly. Chris confirmed 2026-08-11. The shape:
   in the destination region, same author, each event carrying the other region's
   head hash at authoring time (the causal cross-reference). Replay accepts the
   pair only when both sides exist or the missing side is an unfetched region.
-  Until this lands mid-arc, the P7.0 refusal stays.
+  Until this lands mid-arc, the P7.0 refusal stays. (It landed: P7.2c lifted
+  the refusal — cross-boundary `mv` and orphan adoption work.)
   *Constraints the P7.2c design must answer, discovered building a+b
   (2026-08-11):* (1) **event-shape compat** — landed `LinkRemoved`/
   `LinkCreated` bodies can't grow fields without breaking decode of existing
@@ -86,8 +89,8 @@ sub-phase gates are the safety mechanism.
 - Region = contains-closure under the marked node, minus nested regions (Q-B1 ✓).
 - Marks are signed structural events in the PARENT's scope, admin-authored.
 - Cross-region moves: **refused in P7.0–P7.1** (`mv` across a boundary errors with
-  guidance) — the both-logs authoring question is P7.2's to answer (doc 13 §B
-  deferred it; refusing beats guessing).
+  guidance) — the both-logs authoring question was P7.2's to answer (answered by
+  §2.5's paired protocol; the refusal lifted in P7.2c).
 - ACL/tag grants inside a region travel with it (they're events on its nodes —
   Q-B4 falls out of the filter).
 
@@ -338,15 +341,15 @@ phase validates on presubuntu before its commit, as always.
 
 ## 6. Design notes for the deferred pair
 
-- **Swarm transfer (PROMOTED to a wanted arc — Chris, 2026-08-11, via doc 21 §3):
-  P9, after regions.** Reads pull **from every known holder in parallel,
+- **Swarm transfer (PROMOTED 2026-08-11; since BUILT as P9 — doc 22, shipped
+  1.4.0).** Reads pull **from every known holder in parallel,
   BitTorrent-style**: files get a BLAKE3 chunk manifest (chunked at the sync
   sink); the Fetcher's candidate list — source, registry-pinned holders, and
   doc 21 mirror copies — becomes a seed set, chunks are pulled concurrently from
   all of them, each chunk verified on arrival. Falls out for free: **resumable
   transfers** (the chaos caveat) and **serve-while-fetching** mount reads
-  (punch J) — a read is served the moment its chunks land. Wants regions settled
-  first so manifests can live per-region.
+  (punch J) — a read is served the moment its chunks land. All of it landed as
+  written (doc 22 §6); punch J is retired.
 - **Standby failover (doc 03 §6 Q3):** explicit promotion only — a signed
   `WriterPromoted` event authored with the recovery phrase (never automatic), all
   replicas refuse the old writer's events after fold. Design compatible with
@@ -489,6 +492,8 @@ phase validates on presubuntu before its commit, as always.
   run it after building when the fleet test will be used, or the previous
   binaries serve. **The region arc's remaining sub-phase is P7.2c**
   (cross-region moves — the paired-event protocol), after which the P7.0
-  refusals lift and the release cut can be discussed.
+  refusals lift and the release cut can be discussed. (P7.2c landed the same
+  day; 1.4.0 cut 2026-08-13.)
 - **Morning decisions for Chris:** (1) §7's P7.1→P7.2 merge proposal; (2) doc 19's
   packaging intent — 1.4.0 = P5 + P6 + fixes, with P7.0/P7.3 riding or waiting.
+  (Both since decided: the merge was accepted, and 1.4.0 shipped the full arc.)

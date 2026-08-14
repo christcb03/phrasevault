@@ -1,12 +1,12 @@
 # PVFS — PhraseVault File System
 
-PVFS is a standalone, cross-platform command-line service that provides a **real filesystem abstraction layer** over any accessible storage. Data is organized as a **forest** of **trees** of content-addressed, signed **nodes**. A small core engine handles identity, integrity, and traversal; all domain behavior (encryption, media, configuration, search, …) is added through sandboxed **WASM extension modules**.
+PVFS is a standalone, cross-platform command-line service that provides a **real filesystem abstraction layer** over any accessible storage. Data is organized as a **forest** of **trees** of content-addressed, signed **nodes**. A small core engine handles identity, integrity, and traversal; further domain behavior (media, configuration, search, …) is intended to arrive through sandboxed **WASM extension modules** (future — encryption-at-rest is built into the core today).
 
 This is a ground-up implementation. It is designed to run as a single binary on Windows, Linux, and macOS — no container or language runtime required.
 
 ## Status
 
-**Version `1.2.0` — release candidate (tag `v1.2` pending).** Adds expiring ACL grants, key-identity companion pairing with auto sign-in (PVOS D27/D29), the singleton companion + restart, the https web agent, concurrent daemon metadata reads, `remote` paths/URIs + `add-node`/`payload`, and a completeness pass on `pvfs audit` — see the [CHANGELOG](CHANGELOG.md). Post-1.1 work (federation, compaction) is tracked in [doc 08](docs/08-roadmap-and-status.md).
+**Version `1.4.0` (tag `v1.4`, 2026-08-13; `v1.2`/`v1.3` tagged along the way).** 1.3 shipped the federation & sync line (replicas, write-through, TLS transport, placement + the tiered mover); 1.4 shipped serve jobs, the region arc, the streaming FUSE mount, attachment kinds, and the swarm data plane. Unreleased on main: external-ingest sessions & in-flight streaming (the BT bridge, doc 23). See the [CHANGELOG](CHANGELOG.md); ongoing work is tracked in [doc 08](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11).
 
 | Phase | What | State |
 |-------|------|--------|
@@ -16,7 +16,12 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 | **P2 A–G** | Multi-user access ([docs 06–10](docs/06-access-control-and-daemon.md)) — per-node ACLs (`public`/`any`/`tag`/`key`, inheritance), per-key tag authority, member-signed writes + live admin over the `pvfsd` daemon, challenge-response auth, concurrent raw-bytes `cat`, seamless CLI auto-routing, `pvfs audit`, graceful daemon shutdown | Implemented, tests in `p2_access.rs` + `pvfsd` |
 | **P3** | Encryption-at-rest ([doc 12](docs/12-secure-node-type.md)) — secure node type: mutable encrypted blob + content-free signed hash-state log + companion-gated decryption, incl. over the daemon | Implemented, tests in `p3_secure.rs` |
 | **Companion** | Key vault + tiered signer + "Sign in with PVFS" agent ([doc 14](docs/14-companion-app.md)); key replacement & root rotation ([doc 15](docs/15-key-replacement.md)); joint agent API ([doc 16](docs/16-joint-agent-api.md)) | Implemented through phase 7 (approval context, `user_action`, `api_version`, live-daemon sign-in test) |
-| **P4** | Federation & sub-forest replication, log compaction | Specified ([docs 11](docs/11-compaction-and-verifiable-snapshots.md), [03](docs/03-federation-trust-and-uris.md)); post-1.0 |
+| **P4/F** | Federation & sync ([doc 17](docs/17-federation-and-sync.md)) — replicas, write-through, TLS + pinning, placement, tiered mover | Implemented, released 1.3.0 |
+| **P5–P6** | Serve jobs — the fleet runs itself ([doc 18](docs/18-serve-integration.md)); write-through completeness ([doc 19](docs/19-write-through-completeness.md)) | Implemented, released 1.4.0 |
+| **P7** | Region logs + the streaming FUSE mount ([doc 20](docs/20-f4-regions-and-streaming.md)) | Implemented, released 1.4.0 |
+| **P8–P9** | Attachment kinds ([doc 21](docs/21-attachment-policies.md)); the swarm data plane + serve-while-fetching ([doc 22](docs/22-swarm-data-plane.md)) | Implemented, released 1.4.0 |
+| **P10** | External-ingest sessions & the BT bridge ([doc 23](docs/23-ingest-sessions-and-the-bt-bridge.md)) | Implemented, unreleased on main |
+| **Compaction** | Verifiable snapshots ([doc 11](docs/11-compaction-and-verifiable-snapshots.md)) | Deferred by decision (trigger metric in the doc) |
 
 Build locally with `cargo test --workspace`, or on a remote Linux host — see **[Install guide](docs/INSTALL.md)**.
 
@@ -52,8 +57,14 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [06–10](docs/06-access-control-and-daemon.md) | Access control & daemon, daemon protocol, tags & live daemon, per-key tag authority (P2, implemented) |
 | [**08-roadmap-and-status.md**](docs/08-roadmap-and-status.md) | **What's built, what's next, open concerns** — the honest status index |
 | [**USER-MANUAL.md**](docs/USER-MANUAL.md) | End-user guide: sharing, ACLs, tags, recovery, command reference |
-| [11–13](docs/11-compaction-and-verifiable-snapshots.md) | Compaction (future), secure node type (shipped), PVOS-driven requirements |
+| [11–13](docs/11-compaction-and-verifiable-snapshots.md) | Compaction (deferred by decision), secure node type (shipped), PVOS-driven requirements |
 | [14-companion-app.md](docs/14-companion-app.md) | Companion app — key vault, local signer, "Sign in with PVFS" (implemented, phases 1–7) |
+| [15–16](docs/15-key-replacement.md) | Key replacement & root rotation; the joint agent API |
+| [17-federation-and-sync.md](docs/17-federation-and-sync.md) | Federation & sync — replicas, write-through, placement, the mover (1.3) |
+| [18–19](docs/18-serve-integration.md) | Serve jobs (the fleet runs itself); write-through completeness (1.4) |
+| [20-f4-regions-and-streaming.md](docs/20-f4-regions-and-streaming.md) | Region logs + the streaming FUSE mount (1.4) |
+| [21–22](docs/21-attachment-policies.md) | Attachment kinds; the swarm data plane + serve-while-fetching (1.4) |
+| [23-ingest-sessions-and-the-bt-bridge.md](docs/23-ingest-sessions-and-the-bt-bridge.md) | External-ingest sessions & the BT bridge (unreleased) |
 
 ## Core ideas
 

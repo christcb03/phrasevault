@@ -38,12 +38,12 @@ The **rightmost** component is always the PVFS major version required. Reading r
 
 | Layer | Format | Example |
 |---|---|---|
-| PVFS | `MAJOR.MINOR` | `0.1`, `1.0`, `1.1`, `1.2` |
+| PVFS | `MAJOR.MINOR` | `0.1`, `1.0`, `1.2`, `1.4` |
 | Sync / sharing server | `MAJOR.MINOR.<pvfs>` | `1.0.1` |
 | Media server app | `MAJOR.MINOR.<sync>.<pvfs>` | `1.0.1.1` |
 
 ## Current status
 
-- **PVFS: `1.2.0` — release candidate (tag `v1.2` pending; `v1.1` tagged 2026-07-09).** Builds on `1.0.0` (tagged `v1.0`, 2026-07-03): P0–P2 (core, storage, mounts, multi-user daemon), P3 encryption-at-rest, key replacement/rotation (doc 15), and the companion through phase 7 (joint agent API, doc 16). **1.1** adds PVOS-driven daemon ops (`AddNode`/`Payload`, `stat` parent) plus revoked-key `key:` grant masking and typed `already_exists` — see [CHANGELOG.md](CHANGELOG.md). Build: [docs/INSTALL.md](docs/INSTALL.md).
-- **Next:** apps (notably PVOS) target PVFS major `1`; engine-side post-1.1 work (federation, compaction, polish) is tracked in [docs/08-roadmap-and-status.md](docs/08-roadmap-and-status.md). The sync/file-server layer (Layer 1) remains the next product layer above the engine.
+- **PVFS: `1.4.0` (tag `v1.4`, 2026-08-13; `v1.3` 2026-08-10, `v1.2`/`v1.1`/`v1.0` before).** 1.3 = the federation & sync line (replicas, write-through, TLS + pinning, placement, the tiered mover — doc 17). 1.4 = serve jobs (doc 18), the region arc + streaming FUSE mount (doc 20), attachment kinds (doc 21), and the swarm data plane (doc 22). Unreleased on main: the ingest-session/BT-bridge arc (doc 23). See [CHANGELOG.md](CHANGELOG.md). Build: [docs/INSTALL.md](docs/INSTALL.md).
+- **Next:** apps (notably PVOS) target PVFS major `1`; ongoing engine work is tracked in [docs/08-roadmap-and-status.md](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11). The sync/file-server layer (Layer 1) remains the next product layer above the engine.
 - The previous Python + TypeScript prototype is archived under `v0.0-concept/` and tagged `v0.0-concept`.

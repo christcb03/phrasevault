@@ -1,7 +1,8 @@
 # PVFS — P4 federation & sync: the plan, phased (17)
 
-Status: **Phasing proposal (F1–F4) + F0 built** — drafted 2026-08-08. F0 (`pvfs export`) is
-implemented; F1+ are design-locked by docs 03/13 but not yet built.
+Status: **F0–F3 and F5.0–F5.4 built; F4 built except standby failover** (region logs P7.2, FUSE
+P7.3, swarm P9 — docs 20/22); ingest sessions (P10, [doc 23](23-ingest-sessions-and-the-bt-bridge.md))
+extend the arc. Drafted 2026-08-08 as the phasing proposal.
 Depends on: [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) (data model —
 decided), [13-pvos-driven-requirements.md](13-pvos-driven-requirements.md) §A–§D (write model +
 region design — decided), [04](04-p1-storage-and-fs-ops-spec.md)/[05](05-instance-registry-and-mounts.md)
@@ -37,7 +38,7 @@ presentation layer makes the tree readable by software that has never heard of P
 | **Cross-instance transport & identity** | ❌ — F1 |
 | **Forest replica (verified log shipping)** | ❌ — F2 (doc 03 Mode A) |
 | **Placement policy + sync engine (pointer vs sync)** | ❌ — F3 |
-| Region-granular logs, FUSE streaming, swarm, failover | ❌ — F4 (doc 13 §B / doc 03 §6) |
+| Region-granular logs, FUSE streaming, swarm, failover | ✅ region logs (P7.2), FUSE (P7.3), swarm (P9); ❌ failover only |
 
 ### Why this order
 
@@ -64,7 +65,7 @@ so region granularity isn't on this scenario's critical path.
 | **F5.2** | **Remote read-through**: per-file candidate fetch (registry-pinned holders, then the source), self-healing `cat`, owner-side pulls | ✅ built (§7.3) |
 | **F5.3** | **The mover**: `place <subtree> central --to <dir>`, `pvfs tier` (verified migrate + retire), `pvfs evict` (safe edge reclaim) | ✅ built (§7.4) |
 | **F5.4** | **Tail-subscribe**: `LogWait` long-poll + `pvfs replica follow` — seconds-fresh replicas | ✅ built (§7.5) |
-| **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ☐ later (§8) |
+| **F4** | Region logs (doc 13 §B — the decided target architecture), FUSE read-through mount (pointer-mode streaming), swarm/torrent data plane (doc 03 §2.2 future schemes), standby failover (doc 03 §6 Q3) | ◑ — only failover left (§8) |
 
 ---
 
@@ -83,7 +84,8 @@ Point Plex at `<dest-dir>`; done.
 
 1. **Materialized view, not a mount.** A symlink tree needs no kernel module, no FUSE dependency,
    works on every OS target, and is trivially inspectable. FUSE remains the F4 answer for
-   *pointer-mode streaming* (bytes that aren't local); it is explicitly **not** required for the
+   *pointer-mode streaming* (bytes that aren't local) *(since shipped: the unprivileged
+   `pvfs mount`, P7.3 — doc 20 §3)*; it is explicitly **not** required for the
    sync-mode media case — media you stream repeatedly should be synced local anyway (F3).
 2. **Three modes.**
    - `symlink` (default): zero bytes copied; entries point at the node's first readable location
@@ -210,7 +212,8 @@ The pointer-vs-sync knob, per subtree. As built:
   remains future work: it upgrades a local copy to catalog-visible redundancy.
 - **Deferred from this slice:** `--to <dir>` custom destinations (put the replica's mount on the
   big disk instead), the `serve`-integrated background sync job (F3.1 with F0.1's export
-  freshness), and `local_only` regions (doc 13 §C — arrives with region marks, F4). Secure blobs
+  freshness), and `local_only` regions (doc 13 §C — was to arrive with region marks; the marks
+  landed in P7.2, so `local_only` is no longer blocked but remains unbuilt as of 1.4). Secure blobs
   already ship ciphertext-only through F2's log shipping (their bytes live in the mutable store,
   doc 12; region-scoped replication of those is F4).
 
@@ -286,7 +289,8 @@ Doc 03 §2.3's resolution order, step 3, implemented. As built:
 - **`pvfs cat` self-heals.** A read of a file with no local bytes fetches on demand (blocking,
   verified, into the F3 store) and then serves — the catalog entry alone is enough to reach the
   bytes, before anyone has run a sync pass. Wrong bytes never land; on total failure the original
-  not-found surfaces. True open-and-stream (no full prefetch) remains F4's FUSE mount.
+  not-found surfaces. True open-and-stream (no full prefetch) remains F4's FUSE mount *(since
+  shipped — P7.3, doc 20 §3; extended to in-flight ingest partials in P10.1, doc 23 §11)*.
 - **Owned forests fetch too**: `pvfs sync` on the *owner* pulls edge bytes home through the
   registry — the mover's core primitive, ready for F5.3 to build the policy around.
 - **Freshness note:** write-through's read-your-writes now folds the pulled tail into the
@@ -350,17 +354,24 @@ readable everywhere immediately (F5.2) → migrated to the NAS in the background
 evicted, 3 TB stays free — Plex streaming the whole time. Every step is covered end-to-end by the
 smoke suite.
 
+*Since P10 (doc 23): the blessed downloader path is an **external-ingest session** —
+catalog-at-add, verified partials, gated commit — replacing the hand-rolled `pvfs add` +
+`loc add --here` on the download box.*
+
 ---
 
 ## 8. F4 — later, in this order when needed
 
-1. **Region logs** (doc 13 §B — already the decided architecture): per-region logs + parent
+1. ✅ **Region logs** (doc 13 §B — already the decided architecture): per-region logs + parent
    head-commitments; unlocks per-app replication, per-region compaction, and region-scoped
-   active-active (doc 13 §A's later HA mode).
-2. **FUSE read-through mount**: the pointer-mode streaming answer (open → resolve → stream via the
+   active-active (doc 13 §A's later HA mode). **Built as P7.2a–c (doc 20 §2.3–2.5).**
+2. ✅ **FUSE read-through mount**: the pointer-mode streaming answer (open → resolve → stream via the
    data plane, cache-promote per policy). The materialized export stays the zero-dependency path.
-3. **Swarm data plane**: multi-source fetch-by-hash (doc 03 §2.1's future schemes; P2-F's seam).
-4. **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic dual-writers.
+   **Built as P7.3's unprivileged `pvfs mount` (doc 20 §3).**
+3. ✅ **Swarm data plane**: multi-source fetch-by-hash (doc 03 §2.1's future schemes; P2-F's seam).
+   **Built as P9 (doc 22).**
+4. ☐ **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic
+   dual-writers. **The only remaining F4 item.**
 
 ---
 
@@ -368,17 +379,22 @@ smoke suite.
 
 1. **TLS details (F1):** self-signed cert pinned by instance key vs. raw-key TLS (RFC 7250-style);
    how the companion's localhost-cert experience (doc 14) informs the trust prompt when adding an
-   instance.
+   instance. **DECIDED (F1, §4):** self-signed cert pinned by the BLAKE3 of the cert DER.
 2. **Tail-follow transport (F2):** long-poll over the existing request/response framing vs. a
    subscribe frame; resume tokens are just `(seq, chain_hash)` prefixes either way.
+   **DECIDED (F5.4, §7.5):** long-poll `LogWait` over the existing framing.
 3. **Sync scheduling (F3):** how aggressive the `serve` sync job is (bandwidth caps, schedules,
-   "sync on first read" promotion).
+   "sync on first read" promotion). **Answered by P5 (doc 18)** — sync/export run as fold-nudged
+   serve jobs; backoff tuning is the only leftover.
 4. **Export of folder refs (F0/F4):** revisit once region links exist — a folder ref to a replicated
-   region could export as a real subtree scoped to that region's log.
+   region could export as a real subtree scoped to that region's log. *(Region links exist now —
+   P7.2 — so this is due: revisit, or record as deliberately deferred.)*
 5. **Outbound fetch identity (found by the 2026-08-10 two-machine test) — ✅ DECIDED
-   (2026-08-10, doc 18 §4):** every outbound connection — the owner's own mover and
-   read-through included — authenticates as the box's *client identity*, never the forest
-   device key, and **that stays the model**. The friction (on a private forest even the
-   owner's boxes must be authorize-member'd + granted read) is answered with tooling, not a
-   trust-path change: `pvfs fleet enroll` makes the per-box grant a one-step, logged,
-   revocable operation (doc 18 P5.4). `device.key` never dials.
+   (2026-08-10, option c; extended 2026-08-13, c+ — doc 18 §4 + addendum):** every outbound
+   dial — mover/tier, read-through fetch, replica follow/sync, and the swarm workers —
+   authenticates as the box's *client identity*, never the forest device key, and **that stays
+   the model**. The friction (on a private forest even the owner's boxes must be
+   authorize-member'd + granted read) is answered with tooling, not a trust-path change:
+   `pvfs forest init` self-enrolls the creating box's own client identity with read on the
+   root, and `pvfs fleet enroll` admits other boxes as a one-step, logged, revocable
+   operation (doc 18 P5.4). `device.key` never dials.
