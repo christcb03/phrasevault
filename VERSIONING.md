@@ -2,6 +2,26 @@
 
 PVFS and the application layers built on top of it use a **layered version scheme**. Each layer's version is its own `MAJOR.MINOR`, followed by the **major** version of each layer beneath it (top to bottom), ending with PVFS.
 
+## Wire protocol version (`pvfs_proto::PROTO_VERSION`)
+
+Separate from the release version above: a single monotonic integer sent
+in every connect `Challenge`, so a consumer (e.g. a PVOS app via
+`Client::daemon_proto()`) can require "protocol ≥ N" and a mismatched
+daemon is caught at the launch boundary — not by the connection closing
+mid-op.
+
+**RULE: bump `PROTO_VERSION` in the SAME commit as any additive wire op.**
+The P10 ingest ops shipped without a bump (stayed at 2 while gaining
+`IngestBegin` etc.), so nothing downstream could tell an ingest-capable
+daemon from one without — and a PVOS app built on the ingest seam
+panicked against an older daemon that still reported 2. That is the
+failure this rule prevents (PVOS D63).
+
+| PROTO_VERSION | Added |
+|---|---|
+| 2 | P2-F baseline (2026-06-24) |
+| 3 | P10 external-ingest ops, ranged `Cat`, P10.2 partial paths |
+
 ## Layer 0 — PVFS (the file-system engine, this repo)
 
 ```

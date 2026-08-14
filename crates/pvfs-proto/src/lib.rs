@@ -16,7 +16,14 @@ use pvfs_core::encoding::Enc;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly.
-pub const PROTO_VERSION: u32 = 2;
+/// The wire protocol version, sent in every connect `Challenge`. RULE:
+/// bump this in the SAME commit as any additive wire op, so a consumer can
+/// require "protocol ≥ N" and a mismatched daemon is caught at the launch
+/// boundary instead of closing the connection mid-op (PVOS D63; the ingest
+/// ops shipped at 3 without a bump and it cost a live pass).
+///   2 → 3: the P10 external-ingest ops (IngestBegin/Write/Verified/
+///          Commit/Abort/List), ranged `Cat`, and P10.2 partial paths.
+pub const PROTO_VERSION: u32 = 3;
 /// Hard cap on a single control frame (bulk bytes use the data plane, not frames).
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// Chunk size for binary data-plane frames (1 MiB).

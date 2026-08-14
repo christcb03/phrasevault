@@ -96,11 +96,13 @@ impl From<io::Error> for ClientError {
 
 type Result<T> = std::result::Result<T, ClientError>;
 
-/// The server's parsed challenge: a nonce bound to the forest, with an expiry.
+/// The server's parsed challenge: a nonce bound to the forest, with an
+/// expiry and the daemon's wire-protocol version.
 struct Challenge {
     nonce: Vec<u8>,
     forest_id: String,
     expiry_ms: u64,
+    version: u32,
 }
 
 /// A connected, authenticated session with a forest's daemon.
@@ -108,14 +110,17 @@ pub struct Client {
     stream: Stream,
     /// The principal the daemon resolved us to ("public" or "key:<hex>").
     pub principal: String,
+    /// The daemon's `PROTO_VERSION`, learned from the connect challenge —
+    /// what a consumer checks a minimum against (PVOS D63).
+    daemon_proto: u32,
 }
 
 impl Client {
     /// Connect and authenticate as `public` (no key proven).
     pub fn connect_public(path: &Path) -> Result<Client> {
-        let (mut stream, _challenge) = Self::open(path)?;
+        let (mut stream, ch) = Self::open(path)?;
         write_msg(&mut stream, &ClientMsg::Anonymous)?;
-        Self::finish(stream)
+        Self::finish(stream, ch.version)
     }
 
     /// Connect and prove possession of `pubkey` by signing the challenge digest
@@ -131,9 +136,9 @@ impl Client {
     /// Connect to a `pvfsd --listen` address over TLS, verified against `pin`
     /// (the server's transport pin), and authenticate as `public` (F1).
     pub fn connect_tcp_public(addr: &str, pin: &str) -> Result<Client> {
-        let (mut stream, _challenge) = Self::open_tcp(addr, pin)?;
+        let (mut stream, ch) = Self::open_tcp(addr, pin)?;
         write_msg(&mut stream, &ClientMsg::Anonymous)?;
-        Self::finish(stream)
+        Self::finish(stream, ch.version)
     }
 
     /// [`connect_signed`](Self::connect_signed) over pinned TLS (F1).
@@ -151,6 +156,7 @@ impl Client {
         F: FnOnce(&[u8; 32]) -> Vec<u8>,
     {
         let digest = auth_digest(&ch.nonce, &ch.forest_id, ch.expiry_ms);
+        let proto = ch.version;
         write_msg(
             &mut stream,
             &ClientMsg::Auth {
@@ -158,7 +164,7 @@ impl Client {
                 sig: hex::encode(sign(&digest)),
             },
         )?;
-        Self::finish(stream)
+        Self::finish(stream, proto)
     }
 
     /// Connect the Unix socket and read the server's challenge.
@@ -181,7 +187,7 @@ impl Client {
                 nonce,
                 forest_id,
                 expiry_ms,
-                ..
+                version,
             }) => {
                 let nonce = hex::decode(&nonce)
                     .map_err(|_| ClientError::Protocol("challenge nonce not hex".into()))?;
@@ -189,6 +195,7 @@ impl Client {
                     nonce,
                     forest_id,
                     expiry_ms,
+                    version,
                 })
             }
             Some(other) => Err(unexpected("Challenge", &other)),
@@ -197,13 +204,22 @@ impl Client {
     }
 
     /// Read the `Ready` (or error) that completes the handshake.
-    fn finish(mut stream: Stream) -> Result<Client> {
+    fn finish(mut stream: Stream, daemon_proto: u32) -> Result<Client> {
         match read_msg::<_, ServerMsg>(&mut stream)? {
-            Some(ServerMsg::Ready { principal }) => Ok(Client { stream, principal }),
+            Some(ServerMsg::Ready { principal }) => {
+                Ok(Client { stream, principal, daemon_proto })
+            }
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
             Some(other) => Err(unexpected("Ready", &other)),
             None => Err(ClientError::Protocol("closed during handshake".into())),
         }
+    }
+
+    /// The daemon's wire-protocol version (`PROTO_VERSION`), from the
+    /// connect challenge — a consumer checks its minimum against this
+    /// (PVOS D63). Present before any op is sent.
+    pub fn daemon_proto(&self) -> u32 {
+        self.daemon_proto
     }
 
     fn request(&mut self, req: ClientMsg) -> Result<ServerMsg> {
