@@ -5,11 +5,24 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The identity model, settled and frictionless (doc 18 §4, decided
+  2026-08-13):** every outbound connection authenticates as the box's
+  client identity — never the forest device key — and `pvfs forest init`
+  now **self-enrolls the creating box's own client identity with read**
+  (an explicit, logged, revocable grant), so a private forest's own mover
+  and read-through work from birth. Other boxes enroll via `pvfs fleet
+  enroll`, unchanged. Log compaction (doc 11) was reviewed and
+  deliberately deferred with a written trigger metric.
+- **Streaming-mount fix:** a background fetch that *failed* no longer
+  sticks in the mount — re-opening the file retries instead of serving
+  the cached error until remount.
 - **Same-box fast path (P10.2, doc 23 §13, for the PVOS Torrents app):**
   `IngestBegin`/`IngestList` return each file's partial path over the Unix
   socket (additive `IngestFileWire.partial_path`; TCP callers get none),
   so a same-box downloader writes the partial directly — one home for the
   bytes, no spool — and still marks/commits through the unchanged gates.
+  Session activation pre-creates the shard directories, so the writer's
+  first `open(create)` just works.
 - **In-flight streaming (P10.1, doc 23 §11):** everything an ingest session
   has verified serves **while the download runs**, through one seam —
   ranged `Cat` on the ingesting daemon. Marked chunks stream immediately;

@@ -55,9 +55,8 @@ unchanged.
 - One job runner, serialized per forest (the engine is single-writer locally anyway);
   per-job backoff on failure; last-run/last-error surfaced via `pvfs serve status`
   (reads the daemon over the socket) and the journal.
-- **Open (Chris):** does `pvfsd` on an *owned* mount also get jobs (tier), or do we
-  keep the owner's mover CLI-invoked and daemonize only replica-side jobs first?
-  Proposal: owner tier job included, but P5 phases land replica-side first (§5).
+- **RESOLVED (P5.3):** the owner gets the `tier` job — interval-driven, and
+  since punch H nudged by commits. Replica-side jobs landed first, as proposed.
 
 ## 3. What this deliberately is not
 
@@ -95,6 +94,18 @@ mover least-privilege, and removes the setup surprise — at the cost of one CLI
 zero change to the trust path. (a) was the same posture with worse ergonomics; (b)
 traded the strongest key's isolation for convenience (c) provides more safely.
 
+**Addendum — DECIDED 2026-08-13 (Chris): (c+), the last friction goes.** The one
+surprise (c) left standing was the owner box itself: on a private forest, its own
+mover was a stranger to its own edge boxes until someone remembered the enroll step.
+Now **`pvfs forest init` self-enrolls the box's own client identity with read on the
+root** — an explicit, logged, revocable `DeviceAuthorized` + `AclSet` pair authored by
+the admin device at creation. It grants the box's user nothing they don't already
+hold (the device key and the phrase live beside it); it just makes the outbound-fetch
+identity work from birth. Other boxes still enroll via `pvfs fleet enroll`, and this
+is **the settled model**: every outbound connection — mover, read-through fetch,
+follower, swarm worker — authenticates as a client identity whose grant is in the
+log, and the forest device key never dials.
+
 ## 5. Phases + turnkey checklist
 
 | Phase | Deliverable | Done means |
@@ -108,14 +119,15 @@ traded the strongest key's isolation for convenience (c) provides more safely.
 
 Design-first close-out rule applies: deviations recorded here, honestly, when P5 closes.
 
-## 6. Open questions
+## 6. Open questions — all since resolved
 
-1. §4's identity decision (owner of record: Chris).
-2. §2's owner-jobs question — daemonize tier now or later.
-3. Export-target config shape: per-forest `serve.exports` vs arguments recorded by
-   `pvfs export --keep-fresh`. (Lean: the latter — the export manifest already exists.)
-4. Backoff/jitter numbers and whether *sync* failures should quarantine a candidate
-   instance the way the Fetcher's dead-target set does within one pass.
+1. §4's identity decision — DECIDED 2026-08-10 (option c) and extended 2026-08-13
+   (c+, init self-enrolls); see §4's addendum. Settled.
+2. §2's owner-jobs question — built in P5.3 (owner tier job).
+3. Export-target config shape — DECIDED at build: `serve.exports`, written by
+   `pvfs export --keep-fresh` (§7 deviation 3).
+4. Backoff/jitter numbers and *sync* failure quarantine — as-built defaults have
+   held through the P5–P10 fleet runs; revisit only on observed thrash.
 
 ## 7. Close-out (2026-08-11)
 
@@ -131,7 +143,7 @@ the LAN at ~56 MB/s, and the post-evict stream-back verified bit-perfect at ~59 
 Deviations from the plan, honestly:
 - `pvfs serve` already existed — the P1 **watcher** daemon. The job verbs nested
   under it (bare `pvfs serve` unchanged); unifying the watcher as a `watch` job
-  stays open (§2 note).
+  stayed open here (later resolved by punch E — the watcher IS the `watch` job).
 - `tier` is interval-only (300 s, due immediately on enable/reload) — §2's
   local-commit nudge is deferred to the §6 list.
 - Export config took the `serve.exports` shape (written by `export --keep-fresh`)

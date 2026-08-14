@@ -1,6 +1,16 @@
 # PVFS — Compaction & verifiable snapshots (11)
 
-Status: **Proposed — design note (future)**
+Status: **Deferred by decision (Chris, 2026-08-13) — no build until the trigger trips.**
+The reviewed options: (A) do nothing yet, (B) checkpoint-then-delete compaction (this
+doc's design, generalizing P7.2's sealed generations), (C) archive-only (seal history
+cold, keep tails, delete nothing). **Decision: A now**; when the trigger trips, take
+**C first** and consider B's deletion only if raw storage itself ever hurts.
+**Trigger metric:** a projection rebuild crossing ~one minute, or `replica add`
+crossing a few minutes on LAN. Context at decision time: region logs (doc 20) already
+shard the biggest growth away from the top log; fleet rebuilds run in seconds; and
+B's deletion would break doc 23 §8.4's "no orphaned records, ledger self-contained
+forever" property for compacted spans unless typed records are carried forward.
+
 Date: 2026-06-21
 Depends on: [02 (P0 core / log & chain)](02-p0-core-engine-spec.md), [03 (federation & trust)](03-federation-trust-and-uris.md), [06 (access control)](06-access-control-and-daemon.md)
 Roadmap: [08 §4 item 15](08-roadmap-and-status.md) (Compaction row)
@@ -118,7 +128,7 @@ This resolves doc 03 §6 Q8 (how a replica accepts a checkpoint as a new root).
 
 ---
 
-## 7. Open questions
+## 7. Open questions — if/when built
 
 - **Checkpoint as a kernel event vs. a meta-operation** — is `Checkpoint` a new log event kind (so it
   replays like any other), or an out-of-band re-genesis that rewrites `log.db`? (Leaning: a real
@@ -130,3 +140,15 @@ This resolves doc 03 §6 Q8 (how a replica accepts a checkpoint as a new root).
   growing cold log.
 - **Granularity** — per-region compaction needs the sub-forest accumulator work (doc 03 §6 Q7); start
   with whole-forest compaction.
+
+---
+
+## 8. What deferral costs
+
+Several docs defer **physical cleanup** to compaction: doc 06 §4.3 (expired ACL rows), doc 08
+items 13/14 (inert tag grants/memberships — no signed sweep, no audit writes), doc 10 §9.2
+(orphaned rows under a revoked authority), and doc 15 §6.3 (re-issue key linkage). While this
+deferral stands, those cleanups have **no delivery path**: the inert rows stay in the log and
+projection indefinitely, and **masking remains the only mechanism** keeping them out of effective
+rights. That is a storage/legibility cost, not a correctness one — and it is part of what the §1
+trigger metric watches.

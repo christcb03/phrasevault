@@ -4969,6 +4969,36 @@ fn forest_cmd(
             companion_socket,
             new_phrase,
         } => {
+            /// Q1 A+ (doc 18 §4, decided 2026-08-13): a fresh forest enrolls
+            /// its own box's client identity with read — the identity every
+            /// outbound fetch dials with — so the owner's mover can pull from
+            /// its edge boxes on a private forest without the "why can't my
+            /// own forest read itself" trap. The grant is explicit, logged,
+            /// and revocable like any other; it hands the box's user nothing
+            /// they don't already hold (the device key lives beside it).
+            /// Best-effort: init never fails on it.
+            fn self_enroll_client_identity(engine: &mut Engine) -> Option<String> {
+                let mn = client_identity_mnemonic().ok()?;
+                let key = identity::device_key(&mn, "", 0).ok()?;
+                let pk = crypto::pubkey_bytes(&key);
+                let root = engine.identity.root_node_id.clone();
+                match engine.authorize_member_by_device(&pk) {
+                    Ok(()) | Err(PvfsError::AlreadyExists { .. }) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "note: could not self-enroll this box's client identity ({e}) — \
+                             run `pvfs fleet enroll $(pvfs whoami)` when convenient"
+                        );
+                        return None;
+                    }
+                }
+                if let Err(e) = engine.set_acl(&root, &acl::Principal::Key(pk.clone()), acl::ACL_R)
+                {
+                    eprintln!("note: self-enroll grant failed ({e})");
+                    return None;
+                }
+                Some(hex::encode(pk))
+            }
             if via_companion && new_phrase {
                 return Err(PvfsError::BadInput {
                     field: "forest init".into(),
@@ -5038,13 +5068,14 @@ fn forest_cmd(
             if use_companion {
                 let sock = resolve_companion_socket(companion_socket)?;
                 let root_pub = companion_pubkey(&sock, "root")?;
-                let (engine, report) = mount::init_forest_with_root_signer(
+                let (mut engine, report) = mount::init_forest_with_root_signer(
                     &target,
                     import,
                     policy,
                     &root_pub,
                     |digest| companion_sign(&sock, "root_device_cert", digest),
                 )?;
+                let enrolled = self_enroll_client_identity(&mut engine);
                 let mount = std::fs::canonicalize(&target)
                     .map_err(|e| PvfsError::io("canonicalize mount", e))?;
                 print_forest_created(
@@ -5055,9 +5086,19 @@ fn forest_cmd(
                     None,
                     json,
                 )?;
+                if !json {
+                    if let Some(pk) = &enrolled {
+                        println!(
+                            "self-enrolled this box's client identity ({}…) with read — \
+                             outbound fetches dial as it (doc 18 §4)",
+                            &pk[..12.min(pk.len())]
+                        );
+                    }
+                }
                 engine.close()
             } else {
-                let (engine, mnemonic, report) = mount::init_forest(&target, import, policy)?;
+                let (mut engine, mnemonic, report) = mount::init_forest(&target, import, policy)?;
+                let enrolled = self_enroll_client_identity(&mut engine);
                 let mount = std::fs::canonicalize(&target)
                     .map_err(|e| PvfsError::io("canonicalize mount", e))?;
                 print_forest_created(
@@ -5068,6 +5109,15 @@ fn forest_cmd(
                     Some(mnemonic.to_string()),
                     json,
                 )?;
+                if !json {
+                    if let Some(pk) = &enrolled {
+                        println!(
+                            "self-enrolled this box's client identity ({}…) with read — \
+                             outbound fetches dial as it (doc 18 §4)",
+                            &pk[..12.min(pk.len())]
+                        );
+                    }
+                }
                 engine.close()
             }
         }

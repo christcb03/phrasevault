@@ -305,10 +305,19 @@ DMN="$(jget "$DINIT" mnemonic)"
 CLIENTKEY="$(jget "$($PVFS --json whoami)" pubkey)"
 [ -n "$CLIENTKEY" ] && ok "whoami prints client identity" || fail "whoami prints client identity"
 
+# Q1 A+ (doc 18 §4): init self-enrolls the box's own client identity with
+# read — the outbound-fetch identity works on a private forest from birth.
+$PVFS --json --data-dir "$DMOUNT/.pvfs" acl check "$DROOT" "key:$CLIENTKEY" | qgrep '"effective":"r"' \
+  && ok "init self-enrolled the box's client identity with read (Q1 A+)" \
+  || fail "no self-enrollment at init"
+
 # Owner setup happens BEFORE serving (the daemon opens a snapshot of the log).
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" public r >/dev/null \
   && ok "acl set public r on root" || fail "acl set public r on root"
-$PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --pubkey "$CLIENTKEY" \
+# admin-device authorize (no phrase) — a scratch identity, since the box's
+# own key is enrolled by init now
+AKEY="$(jget "$(XDG_CONFIG_HOME="$DATA/config-authz" $PVFS --json whoami)" pubkey)"
+$PVFS --data-dir "$DMOUNT/.pvfs" device authorize-member --pubkey "$AKEY" \
   >/dev/null && ok "authorize member (admin device, no recovery phrase)" || fail "authorize member (admin device, no recovery phrase)"
 $PVFS --data-dir "$DMOUNT/.pvfs" acl set "$DROOT" "key:$CLIENTKEY" rw >/dev/null \
   && ok "grant member rw on root" || fail "grant member rw on root"
@@ -942,9 +951,8 @@ IGROOT="$(jget "$IGINIT" root_node_id)"
 IGFID="$(jget "$IGINIT" forest_id)"
 IGD="$IGM/.pvfs"
 MEDIA="$($PVFS --data-dir "$IGD" add "$IGROOT" --kind folder --label media)"
-# P10.1: a viewer identity (the client key) reads in-flight bytes remotely
-$PVFS --data-dir "$IGD" device authorize-member --pubkey "$CLIENTKEY" >/dev/null
-$PVFS --data-dir "$IGD" acl set "$MEDIA" "key:$CLIENTKEY" r >/dev/null
+# P10.1 viewer reads ride the Q1 A+ self-enrollment: init already gave the
+# box's client identity read on the root, which media inherits.
 ISOCK="$PVFS_SOCKET_DIR/$IGFID.sock"
 "$PVFSD" --mount "$IGM" >/dev/null 2>"$DATA/pvfsd-ingest.log" &
 IPID=$!
@@ -1228,7 +1236,8 @@ G2FOLDER="$($PVFS --data-dir "$G2/.pvfs" add "$(jget "$G2JSON" root_node_id)" --
 [ ${#G2FOLDER} -eq 64 ] && ok "write works on companion-rooted forest" || fail "add on G2: $G2FOLDER"
 
 # Admit a member with NO phrase typed — the companion root-signs the DeviceAuthorized.
-CMEMBER="$(jget "$($PVFS --json whoami)" pubkey)"
+# a scratch identity — the box's own key is self-enrolled by init (Q1 A+)
+CMEMBER="$(jget "$(XDG_CONFIG_HOME="$DATA/config-cmember" $PVFS --json whoami)" pubkey)"
 $PVFS --data-dir "$CMOUNT/.pvfs" device authorize-member --via-companion --companion-socket "$CSOCK" --pubkey "$CMEMBER" >/dev/null \
   && ok "companion-signed authorize-member (no phrase)" || fail "companion authorize-member"
 # Re-admitting the same key now fails (already a member) — proves the cert landed.
