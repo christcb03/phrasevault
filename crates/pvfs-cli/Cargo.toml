@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-client = { path = "../pvfs-client" }
-pvfs-companion = { path = "../pvfs-companion" }
+pvfs-companion = { path = "../pvfs-companion", default-features = false }
 clap.workspace = true
 hex.workspace = true
 serde_json.workspace = true
@@ -21,3 +21,10 @@ serde_json.workspace = true
 # P7.3 (doc 20 §3): the FUSE streaming mount is Linux-only for now — macOS
 # would need macFUSE; the commands are cfg-gated with it.
 pvfs-fuse = { path = "../pvfs-fuse" }
+
+[features]
+# D69: the OS-keychain backend (keyring -> libdbus) cannot cross-compile
+# to aarch64-musl for the NAS; default stays ON for native builds, the
+# cross-build passes --no-default-features (file-vault custody only).
+default = ["os-keychain"]
+os-keychain = ["pvfs-companion/os-keychain"]
