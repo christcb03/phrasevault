@@ -1,0 +1,9 @@
+# D69 F0.5 (branch d69-nas-arm): static aarch64-musl cross-build for the
+# QNAP TS-x32 (QTS 5.2.10 ships glibc 2.23 — a 2024-era gnu-target build
+# will not load there; musl-static is the only durable shape). Toolchain:
+# musl.cc aarch64-linux-musl-cross, expected on PATH at build time.
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+
+[env]
+CC_aarch64_unknown_linux_musl = "aarch64-linux-musl-gcc"
