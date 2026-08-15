@@ -2417,26 +2417,47 @@ pub fn startup_check(
     data_dir: &std::path::Path,
     others_alive: bool,
 ) -> Result<ForestIdentity> {
-    // Step 1 — structural check.
-    if !quick_check(conn, "log")? {
+    // Step 1 — structural check, now on the CRASH PATH ONLY.
+    //
+    // `PRAGMA quick_check` reads and verifies every page, so it costs time
+    // proportional to the FOREST rather than to the work. Measured on a
+    // 1.7 GB forest: 42s for log.db, 2m04s for index.db — essentially all of
+    // a ~2m45s startup, and pure I/O wait (0.7s of user time in 124s). It ran
+    // on every open, so every title added made every restart slower.
+    //
+    // What stands in for it:
+    //   - **index.db is a pure, rebuildable cache** of the log — the same
+    //     property the schema-version branch below already leans on. Auditing
+    //     a derived cache page-by-page earns little when the recovery is
+    //     "discard and replay", so the cheap probes below stand in and ANY
+    //     failure routes to `full_rebuild`, exactly where the scan pointed.
+    //   - **log.db is hash-chained**, and step 3 verifies the chain at the
+    //     applied point (3b does it per region log). A cryptographic chain is
+    //     a stronger statement than SQLite's structural check, so the scan
+    //     only earns its cost where we already distrust the file: an unclean
+    //     shutdown, where we are about to REPLAY the log and want to know it
+    //     is sound before trusting it.
+    create_schema(conn)?; // tables must exist before the meta reads below
+    let clean = meta_get(conn, "clean_shutdown")?.unwrap_or_else(|| "1".into());
+    let crashed = clean != "1" && !others_alive;
+    if crashed && !quick_check(conn, "log")? {
         return Err(PvfsError::Corruption {
             db: "log.db".into(),
             detail: "PRAGMA quick_check failed".into(),
             seq: None,
         });
     }
-    let index_ok = quick_check(conn, "main")?;
-    if !index_ok {
-        return full_rebuild(conn, data_dir);
-    }
-    create_schema(conn)?; // ensure tables exist on first open of a fresh index
 
-    let identity = decode_genesis(conn)?;
+    // The cheap index probes. A read that fails here means the cache is
+    // unusable — which is a rebuild, never an error to the caller.
+    let Ok(identity) = decode_genesis(conn) else {
+        return full_rebuild(conn, data_dir);
+    };
 
     // Step 2 — positions.
-    let sl = log_store::max_seq(conn)?;
-    let (si, hi) = applied_get(conn, "")?;
-    let clean = meta_get(conn, "clean_shutdown")?.unwrap_or_else(|| "1".into());
+    let (Ok(sl), Ok((si, hi))) = (log_store::max_seq(conn), applied_get(conn, "")) else {
+        return full_rebuild(conn, data_dir);
+    };
 
     let version: u32 = meta_get(conn, "schema_version")?
         .unwrap_or_else(|| SCHEMA_VERSION.to_string())
@@ -2469,7 +2490,7 @@ pub fn startup_check(
 
     // Unclean shutdown forces a full agreement check (spec §9.3 crash flag) —
     // unless the "unclean" flag simply reflects a LIVE writer (see above).
-    if clean != "1" && !others_alive {
+    if crashed {
         return full_rebuild(conn, data_dir);
     }
 

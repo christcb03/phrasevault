@@ -390,9 +390,29 @@ If the process dies before COMMIT, neither side changed (atomic). If it dies aft
 
 Run on **every** `Engine::open`, before serving any request. It is cheap on the happy path and self-healing otherwise. (Yes — this is the log↔index agreement check; it both catches "the index fell behind after a crash" and "something got corrupted or dropped.")
 
-**Step 1 — structural check.** `PRAGMA quick_check` on both files.
-- `index.db` unreadable/corrupt ⇒ discard it and go to **full rebuild** (Step 5). The index is disposable, so this is always safe.
-- `log.db` unreadable/corrupt or chain broken ⇒ **stop** (Step 6). Do not auto-truncate or silently repair the truth log.
+**Step 1 — structural check.** `PRAGMA quick_check`, **on the crash path only**.
+
+The scan reads and verifies every page, so it costs time proportional to the
+FOREST rather than to the work — which broke the "cheap on the happy path"
+promise above as forests grew. Measured on a 1.7 GB forest: 42s for `log.db`
+and 2m04s for `index.db`, essentially all of a ~2m45s startup, and pure I/O
+wait. Every node added made every open slower.
+
+- `index.db` — **not scanned.** It is a pure, rebuildable cache of the log, so
+  a page-by-page audit earns little when the recovery is "discard and replay".
+  Steps 2–3 read it cheaply instead, and **any** failure of those reads (not
+  merely a disagreement) routes to **full rebuild** (Step 5) — the same
+  destination the scan had. A corruption the cheap reads happen to miss
+  surfaces as a failed query later, landing in the same place.
+- `log.db` — scanned **only when `clean_shutdown != 1` and no other writer is
+  live**, i.e. exactly when we are about to REPLAY the log and want to know it
+  is sound before trusting it. Unreadable/corrupt or chain broken ⇒ **stop**
+  (Step 6). Do not auto-truncate or silently repair the truth log.
+
+On the happy path the log's integrity rests on its **hash chain** (§8), which
+Steps 3 and 3b verify at the applied point and per region log. That is a
+cryptographic statement, strictly stronger than SQLite's structural one — the
+scan was insurance on top of it, not the thing establishing it.
 
 **Step 2 — read positions.**
 - From `index.db`: `last_applied_seq` (`Si`), `last_applied_chain_hash` (`Hi`), `clean_shutdown`.
@@ -633,7 +653,7 @@ The kernel is fully testable with no I/O beyond temp dirs. Minimum P0 tests:
 8. **Walk order** — children come back in `order_key` order; insert-between lands in the right place; large-fanout walk uses the index (no full scan); `ref` children are listed but not descended; walk visits each node exactly once.
 9. **Orphans/purge** — orphan detection correct; purge refuses with `NotOrphan` while active inbound links exist; purge of an orphan emits `LinkRemoved` for each active outbound link then `NodePurged`; no active link ever references a missing node afterward; children become orphans (temp children purge immediately).
 10. **Cycle guard** — creating a cycle via `contains` is rejected.
-11. **Startup integrity check (§9.3)** — happy path is a no-op when positions/chains agree; an index lagging the log is caught up by replay; a corrupted/dropped/edited event breaks the chain and triggers full rebuild (or fatal `LogChainBroken` / Step 6 recovery ladder if the log itself is internally inconsistent); an unclean `clean_shutdown` flag forces a full agreement check; a corrupt `index.db` is rebuilt from the log.
+11. **Startup integrity check (§9.3)** — happy path is a no-op when positions/chains agree; an index lagging the log is caught up by replay; a corrupted/dropped/edited event breaks the chain and triggers full rebuild (or fatal `LogChainBroken` / Step 6 recovery ladder if the log itself is internally inconsistent); an unclean `clean_shutdown` flag forces a full agreement check (and is the only path that pays the `PRAGMA quick_check` scan); an unusable `index.db` is rebuilt from the log — detected by the cheap Step 2–3 reads failing, not by scanning it.
 12. **Error contract** — verification reports expected-vs-actual; encoding errors report field + offset; SQLite BUSY retries then surfaces `Busy`; a failed durable write rolls back leaving no half-applied projection; no panic on malformed input/data.
 13. **File locations** — add two URIs to one file node (two events); file node id unchanged; soft-remove one URI; replication scenario = second instance applies same `FileLocationAdded` events.
 14. **Recovery ladder** — corrupt log refuses open with recovery options listed; `--salvage-log` and `--recover-from-filesystem` require explicit confirmation and produce expected outcomes (filesystem rebuild creates fresh tree, history not preserved).
