@@ -480,6 +480,56 @@ member-signed and auditable in the log — the household threat model);
 covers it until the flag earns its place); and any gossip beyond the
 log (the log IS the gossip).
 
+### 7.9 F5.8 — one folder at a time (spec 2026-08-16, the D69 tear's prevention)
+
+**The finding (D69 E2E forensics).** The writer flock on `writer.lock`
+is SHARED by design — it exists so an opener can *probe* for live
+writers (`others_alive`), not to exclude them. Nothing, therefore,
+serializes projection mutation across engines, and three kinds of
+engine mutate it: the serving daemon, its in-process jobs engine, and
+every CLI open. Each mutation is transactional in SQLite, but the two
+*maintenance* paths span MANY transactions, and the write path folds
+under an assumption the maintenance paths break. The proven interleave:
+
+1. Engine A (`full_rebuild`) drops the projection tables and starts
+   replaying the log segment by segment — each segment its own tx.
+2. Engine B appends a write: reads the LOG tip, folds **only its new
+   event**, and sets the applied mark to the new tip — one tx, valid
+   chain, committed between A's segments.
+3. A's next segment re-reads the applied mark under its IMMEDIATE tx,
+   finds it at tip, and concludes the replay is done.
+
+Result: tables near-empty, applied mark at tip, chain hash correct —
+a torn cache that passes every startup probe. This is the exact
+forensic shape of the D69 "author not authorized" brick. The self-heal
+(the 2026-08-16 fix) recovers it; F5.8 prevents it.
+
+**The rule: one folder at a time.** A per-forest `fold.lock` file
+beside `writer.lock`, taken as a **blocking exclusive** flock for the
+duration of every projection-mutating critical section — and there are
+exactly three (replica ingest appends only to the log and defers its
+fold to the next open, so the surface is closed):
+
+- `full_rebuild` — held across the WHOLE drop-and-replay, so no write
+  can land between its segments;
+- `catch_up_tail` — the open-time tail fold;
+- `append_durable_with` — the write path's append+fold tx, taken
+  BEFORE the SQLite tx begins (lock order is always flock → tx, so the
+  two lock systems cannot deadlock).
+
+Waiters print one line ("waiting for another pvfs process folding this
+forest") and block — a CLI write behind a minutes-long rebuild waits,
+which is the correct outcome; the alternative was the tear. Probes and
+reads take nothing: `startup_check`'s decision probes run unlocked, and
+a probe that observes a mid-rebuild state decides at worst on a stale
+picture — every road it can take (rebuild, catch-up, device check)
+either blocks on the lock and re-reads, or lands in the self-heal.
+The heal stays as the safety net for what the lock cannot govern: old
+binaries, and a folder killed mid-rebuild.
+
+Non-goals: no change to `writer.lock` semantics (shared probe stays),
+no new wire ops, no schema change, no CLI surface.
+
 ---
 
 ## 8. F4 — later, in this order when needed

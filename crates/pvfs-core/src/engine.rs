@@ -1055,6 +1055,10 @@ impl Engine {
             }
             projection::attach_log(&self.conn, &self.data_dir, tgt, &file)?;
         }
+        // F5.8 (doc 17 §7.9): the fold lock BEFORE the tx — the append+fold
+        // assumes the projection sits at the log tip, which only holds while
+        // no maintenance replay is mid-flight.
+        let _folds = projection::lock_folds(&self.data_dir)?;
         let result = (|| {
             let tx = self.conn.transaction().map_err(map_db("begin write"))?;
             let t = now_ms();

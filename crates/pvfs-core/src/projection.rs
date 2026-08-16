@@ -263,6 +263,41 @@ const MAIN_OBJECTS: &[&str] = &[
     "projection_meta",
 ];
 
+// ---- the fold lock ----------------------------------------------------------
+
+/// F5.8 (doc 17 §7.9): ONE FOLDER AT A TIME. The writer flock is a shared
+/// PROBE (`others_alive`), so nothing else serializes projection mutation
+/// across engines — and the daemon, its jobs engine, and every CLI open all
+/// fold. The maintenance paths span many transactions; a write landing
+/// between a rebuild's segments moves the applied mark to tip and the
+/// rebuild concludes early — the D69 torn cache. Every projection-mutating
+/// critical section (`full_rebuild`, `catch_up_tail`, the write path's
+/// append+fold tx) therefore holds a blocking EXCLUSIVE flock on
+/// `fold.lock` for its duration. Lock order is always flock → SQLite tx,
+/// so the two lock systems cannot deadlock. RAII: released on drop, and by
+/// the kernel on crash.
+pub(crate) struct FoldLock(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
+
+pub(crate) fn lock_folds(data_dir: &std::path::Path) -> Result<FoldLock> {
+    let path = data_dir.join("fold.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| PvfsError::io("open fold.lock", e))?;
+    match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(l) => Ok(FoldLock(l)),
+        Err((f, _)) => {
+            eprintln!("pvfs: waiting for another pvfs process folding this forest…");
+            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+                .map(FoldLock)
+                .map_err(|(_, e)| {
+                    PvfsError::io("lock fold.lock", std::io::Error::from_raw_os_error(e as i32))
+                })
+        }
+    }
+}
+
 // ---- meta helpers -----------------------------------------------------------
 
 pub fn meta_get(conn: &Connection, k: &str) -> Result<Option<String>> {
@@ -2337,6 +2372,10 @@ fn replay_sealed_child(
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
 /// tree-replay every log from its genesis seed. Temp tables start empty.
 pub fn full_rebuild(conn: &mut Connection, data_dir: &std::path::Path) -> Result<ForestIdentity> {
+    // F5.8: the WHOLE drop-and-replay under the exclusive fold lock — a
+    // write landing between two replay segments moves the applied mark to
+    // tip and this rebuild would conclude early, half-built (the D69 tear).
+    let _folds = lock_folds(data_dir)?;
     // punch C: the post-upgrade/crash rebuild can run minutes on a grown
     // forest — say so instead of looking hung.
     eprintln!(
@@ -2588,6 +2627,10 @@ fn catch_up_tail(
     data_dir: &std::path::Path,
     identity: &ForestIdentity,
 ) -> Result<()> {
+    // F5.8: exclusive with every other folder for the whole multi-segment
+    // walk. The guard drops on return — a failure routed to `full_rebuild`
+    // by the caller re-acquires there, sequentially.
+    let _folds = lock_folds(data_dir)?;
     replay_log(conn, data_dir, identity, "", 0)?;
     check_pending_moves(conn, data_dir)?;
     // Actives whose baseline lives in a sealed generation are unreachable
