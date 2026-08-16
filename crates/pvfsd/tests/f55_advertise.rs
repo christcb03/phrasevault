@@ -236,3 +236,109 @@ fn retract_keeps_bytes_when_theirs_is_the_only_location() {
         .iter()
         .any(|u| u.starts_with(&format!("pvfs-host://{pin}/"))));
 }
+
+#[test]
+fn tier_logs_served_by_attribution_and_never_retires_it() {
+    // The mover with `--served-by`: the store copy is logged twice — the
+    // owner-local file:// row AND the serving instance's pvfs-host:// row
+    // (same aa/<id> layout under its remote prefix) — and the retire step
+    // must NOT treat that attribution row as an edge copy (the bug the
+    // code read-through caught: foreign pin ⇒ retired in the same pass).
+    let cfg = tempfile::tempdir().unwrap();
+    // Scratch instance registry (identity::config_dir honors this); the
+    // sibling tests never read it, so the process-global env is safe here.
+    std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+    let nas_pin = "ef".repeat(32);
+    std::fs::create_dir_all(cfg.path().join("pvfs")).unwrap();
+    std::fs::write(
+        cfg.path().join("pvfs/instances"),
+        format!("nas 127.0.0.1:1 {nas_pin}\n"),
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let bytes_dir = tempfile::tempdir().unwrap();
+    let src = bytes_dir.path().join("movie.mkv");
+    std::fs::File::create(&src).unwrap().write_all(b"store-me").unwrap();
+    let file = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FILE.into(),
+                label: "movie.mkv".into(),
+                payload: FilePayload {
+                    content_hash: blake3::hash(b"store-me").to_hex().to_string(),
+                    size_bytes: 8,
+                    mime_type: "video/x-matroska".into(),
+                    original_name: "movie.mkv".into(),
+                }
+                .encode(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    // The ingest-box shape (what migrates): the ONLY logged location is a
+    // foreign edge pin — owner-local bytes would read as already-central.
+    // The bytes are reachable through the sync store (no network in a
+    // unit test), which deliberately never counts as a central copy.
+    let edge_pin = "aa".repeat(32);
+    engine
+        .add_location(&file, &format!("pvfs-host://{edge_pin}/mnt/local/movie.mkv"))
+        .unwrap();
+    let mut sink = engine.sync_begin(&file).unwrap();
+    sink.write_all(b"store-me").unwrap();
+    engine.sync_commit(sink).unwrap();
+    drop(src);
+
+    let store = tempfile::tempdir().unwrap();
+    pvfs_core::sync::set_central_served(
+        engine.data_dir(),
+        &root,
+        store.path(),
+        false,
+        Some(("nas", std::path::Path::new("/share/CACHEDEV1_DATA/pvfs-store"))),
+    )
+    .unwrap();
+
+    let data_dir = engine.data_dir().to_path_buf();
+    let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
+    let report = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher)
+        .unwrap()
+        .expect("central placement exists");
+    assert_eq!(report.migrated, 1, "failed: {:?}", report.failed);
+
+    let locs = engine.locations(&file).unwrap();
+    let shard = &file[..2];
+    let expect_remote =
+        format!("pvfs-host://{nas_pin}/share/CACHEDEV1_DATA/pvfs-store/{shard}/{file}");
+    assert!(
+        locs.iter().any(|u| u == &expect_remote),
+        "the attribution row is logged: {locs:?}"
+    );
+    assert!(
+        locs.iter().any(|u| u.starts_with("file://") && u.contains(&format!("/{shard}/"))),
+        "the owner-local store row is logged too: {locs:?}"
+    );
+
+    // The retire step ran in the SAME pass: the edge row died, the
+    // attribution row survived (it is the store, not an edge copy) —
+    // the exact bug the code read-through caught.
+    assert!(
+        !locs.iter().any(|u| u.contains(&edge_pin)),
+        "the edge copy was retired: {locs:?}"
+    );
+
+    // A second pass: satisfied, and the attribution row still stands.
+    let report2 = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report2.satisfied, 1);
+    let locs2 = engine.locations(&file).unwrap();
+    assert!(
+        locs2.iter().any(|u| u == &expect_remote),
+        "attribution survives the retire step: {locs2:?}"
+    );
+}

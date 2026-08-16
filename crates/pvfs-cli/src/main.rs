@@ -3492,6 +3492,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             field: "served-by".into(),
                             reason: "expected <instance>:<remote-path>".into(),
                         })?;
+                        if !path.starts_with('/') {
+                            return Err(PvfsError::BadInput {
+                                field: "served-by".into(),
+                                reason: format!(
+                                    "the remote path must be absolute (that box's view of the store): {path}"
+                                ),
+                            });
+                        }
                         let known = pvfs_client::fetch::load_instances()
                             .unwrap_or_default()
                             .iter()

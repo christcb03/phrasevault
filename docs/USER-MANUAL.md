@@ -386,6 +386,20 @@ no local bytes fetches it on demand and then serves it — a catalog entry is en
 per-machine deployment state — two replicas of the same forest can pin different subtrees. Re-run
 `pvfs sync` any time (idempotent); `pvfs place <node> pointer` returns a subtree to catalog-only.
 
+**Become a holder the fleet can dial (F5.5).** Plain `sync` keeps your copies
+private. Add `--advertise` and every verified fetch is also **logged as this
+box's location** — any box that registered you (`pvfs instance add`) then
+fetches those bytes straight from you, even with the source down:
+
+```bash
+pvfs place <library-node> sync --advertise   # needs a transport pin (pvfsd --listen once)
+pvfs sync                                    # fetch + advertise (idempotent, catches up old fetches)
+```
+
+Leaving is honest too: place the subtree back to `pointer` and the next
+`pvfs evict` **retracts each advertisement before deleting its bytes** — and
+never deletes a copy that is the file's only live location.
+
 The full media flow, end to end:
 
 ```bash
@@ -452,6 +466,20 @@ node-id-addressed store, and recorded in the log as a real location. Retirement 
 live central copy — a failed migration never retires anything — so consumers keep streaming
 throughout: before migration they read through to the ingest box, after it to the central copy.
 The store is mover-managed (don't bind or scan it); browse the library through `pvfs export`.
+
+**Let the store's machine serve it (F5.5).** When the store directory lives on
+another box (the NAS, NFS-mounted here), tell the mover so it logs each store
+copy as THAT machine's location — consumers then fetch store bytes straight
+from the NAS instead of hairpinning through you:
+
+```bash
+pvfs place <library-node> central --to /mnt/nas/media-store \
+     --served-by nas:/share/media-store   # the same directory as the NAS sees it
+```
+
+The instance must already be registered (`pvfs instance add nas …`); the two
+paths naming the same directory is your assertion — the command says it back
+so it is a decision, not an accident.
 
 The complete media pipeline, all four machines:
 

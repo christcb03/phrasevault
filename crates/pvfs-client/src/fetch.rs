@@ -540,10 +540,23 @@ pub fn tier_pass(
             // central copy live → retire foreign-instance locations, plus —
             // for a migrate-kind binding — the staging dir's own file:// ones
             for u in engine.locations(&id)? {
-                let foreign = matches!(
-                    pvfs_core::storage::parse_host_uri(&u),
-                    Some((pin, _)) if own_pin.as_deref() != Some(pin)
-                );
+                // F5.5: the serving instance's attribution rows for THIS
+                // subtree's store are ours, not edge copies — retiring
+                // them would undo the row logged moments ago. Precise
+                // exemption: that pin AND a path inside the remote store
+                // prefix; the same instance's other paths retire as ever.
+                let served_row = serve_as.get(&root).is_some_and(|(pin, prefix)| {
+                    matches!(
+                        pvfs_core::storage::parse_host_uri(&u),
+                        Some((p, path)) if p == pin
+                            && std::path::Path::new(path).starts_with(prefix)
+                    )
+                });
+                let foreign = !served_row
+                    && matches!(
+                        pvfs_core::storage::parse_host_uri(&u),
+                        Some((pin, _)) if own_pin.as_deref() != Some(pin)
+                    );
                 let staged = staging_prefix
                     .as_deref()
                     .is_some_and(|p| u.starts_with(p));

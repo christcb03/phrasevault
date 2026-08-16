@@ -406,6 +406,21 @@ a gossip/refresh protocol (advertisements are log rows like any other —
 revocation is `loc rm`, visibility is replica sync); and
 advertisement-driven placement (what to sync stays the operator's call).
 
+**F5.6 (named, not built): attested external ingest.** The D69 fleet's
+mount profiling found the boundary precisely: a file cataloged by hand
+(`pvfs add` + `loc add --here` — the §7.9 ingest-box flow, and the arr
+hook that automates it) carries **no content hash**, so it is an
+unhashed pointer everywhere: the mount PROXIES every read (ranged Cat —
+correct, nothing can verify it; ~1.4 s per 3 MB open on the lab), it
+can never stream-while-fetching, and nothing heals. The fix is not in
+the mount — it is making external ingest ATTEST: the "hash-fill
+successor + attestation" machinery the P10 ingest commit already runs
+(fs.rs) exposed for an already-landed local file, e.g.
+`pvfs loc add --here <path> --attest` (hash + chunk manifest computed
+from the bytes right there, routed like every write-through). Scanned
+files have the same knob already (the bind's hash policy); external
+adds deserve parity.
+
 ---
 
 ## 8. F4 — later, in this order when needed
