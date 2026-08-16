@@ -285,12 +285,19 @@ pub fn placement_path(data_dir: &Path) -> PathBuf {
 #[derive(Debug, Default)]
 pub struct Placement {
     pub sync: Vec<NodeId>,
+    /// F5.5 (doc 17 §7.7): sync + ADVERTISE — fetched copies are logged as
+    /// this box's `pvfs-host://` locations so the fleet can dial them.
+    pub sync_advertise: Vec<NodeId>,
     pub central: Vec<(NodeId, PathBuf)>,
     /// P8 (doc 21): `central-keep` — the mirror mode. The mover lands and
     /// logs the verified central copy but NEVER retires the source, so the
     /// space keeps its bytes and the tree gains a backup replica (and a
     /// future swarm seed, doc 20 §6).
     pub central_keep: Vec<(NodeId, PathBuf)>,
+    /// F5.5: `(subtree, instance name, that instance's path for the store)`
+    /// — the mover logs central copies as the named instance's pvfs-host://
+    /// locations (the NAS serves its own store) alongside the local file://.
+    pub served_by: Vec<(NodeId, String, PathBuf)>,
 }
 
 pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
@@ -305,8 +312,21 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
     }
     let mut out = Placement::default();
     for line in lines.filter(|l| !l.trim().is_empty()) {
-        if let Some(id) = line.strip_prefix("sync ") {
+        if let Some(id) = line.strip_prefix("sync-advertise ") {
+            out.sync_advertise.push(id.to_string());
+        } else if let Some(id) = line.strip_prefix("sync ") {
             out.sync.push(id.to_string());
+        } else if let Some(rest) = line.strip_prefix("served-by ") {
+            // `served-by <id> <instance> <path…>` — the path is the REST so
+            // store paths with spaces survive (instance names cannot have
+            // spaces; the registry enforces that).
+            let mut it = rest.splitn(3, ' ');
+            match (it.next(), it.next(), it.next()) {
+                (Some(id), Some(inst), Some(path)) => {
+                    out.served_by.push((id.to_string(), inst.to_string(), PathBuf::from(path)))
+                }
+                _ => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
         } else if let Some(rest) = line.strip_prefix("central-keep ") {
             match rest.split_once(' ') {
                 Some((id, dir)) => out.central_keep.push((id.to_string(), PathBuf::from(dir))),
@@ -324,9 +344,18 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
     Ok(out)
 }
 
-/// Node ids of subtrees placed `sync` (order preserved, no duplicates).
+/// Node ids of subtrees placed `sync` — advertised or not (both fetch;
+/// F5.5 only adds the advertisement step on top).
 pub fn load_placement(data_dir: &Path) -> Result<Vec<NodeId>> {
-    Ok(load_placement_full(data_dir)?.sync)
+    let p = load_placement_full(data_dir)?;
+    let mut out = p.sync;
+    out.extend(p.sync_advertise);
+    Ok(out)
+}
+
+/// F5.5: just the advertised sync subtrees.
+pub fn load_advertise(data_dir: &Path) -> Result<Vec<NodeId>> {
+    Ok(load_placement_full(data_dir)?.sync_advertise)
 }
 
 /// Subtrees placed `central` with their store directories (owner-side).
@@ -354,6 +383,12 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     for r in &p.sync {
         text.push_str(&format!("sync {r}\n"));
     }
+    for r in &p.sync_advertise {
+        text.push_str(&format!("sync-advertise {r}\n"));
+    }
+    for (r, inst, path) in &p.served_by {
+        text.push_str(&format!("served-by {r} {inst} {}\n", path.display()));
+    }
     for (r, d) in &p.central {
         text.push_str(&format!("central {r} {}\n", d.display()));
     }
@@ -366,11 +401,21 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
 /// Place `id` as `sync` (true) or back to `pointer` (false). Either way any
 /// `central` entry for the subtree is cleared — one mode per subtree.
 pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
+    set_sync_mode(data_dir, id, sync, false)
+}
+
+/// F5.5: the full sync-mode setter — `advertise` logs fetched copies as
+/// this box's locations. One mode per subtree, as ever.
+pub fn set_sync_mode(data_dir: &Path, id: &NodeId, sync: bool, advertise: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
     p.sync.retain(|r| r != id);
+    p.sync_advertise.retain(|r| r != id);
     p.central.retain(|(r, _)| r != id);
     p.central_keep.retain(|(r, _)| r != id);
-    if sync {
+    p.served_by.retain(|(r, _, _)| r != id);
+    if sync && advertise {
+        p.sync_advertise.push(id.clone());
+    } else if sync {
         p.sync.push(id.clone());
     }
     save_placement(data_dir, &p)
@@ -379,14 +424,32 @@ pub fn set_placement(data_dir: &Path, id: &NodeId, sync: bool) -> Result<()> {
 /// Place `id` as `central` with its store directory (owner-side, F5.3).
 /// `keep` = the P8 mirror mode: the mover copies + logs but never retires.
 pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path, keep: bool) -> Result<()> {
+    set_central_served(data_dir, id, dest, keep, None)
+}
+
+/// F5.5: central placement with an optional serving instance — the mover
+/// then logs store copies as `(instance, remote_prefix)`'s pvfs-host://
+/// locations alongside the owner-local file:// row (doc 17 §7.7.2).
+pub fn set_central_served(
+    data_dir: &Path,
+    id: &NodeId,
+    dest: &Path,
+    keep: bool,
+    served_by: Option<(&str, &Path)>,
+) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
     p.sync.retain(|r| r != id);
+    p.sync_advertise.retain(|r| r != id);
     p.central.retain(|(r, _)| r != id);
     p.central_keep.retain(|(r, _)| r != id);
+    p.served_by.retain(|(r, _, _)| r != id);
     if keep {
         p.central_keep.push((id.clone(), dest.to_path_buf()));
     } else {
         p.central.push((id.clone(), dest.to_path_buf()));
+    }
+    if let Some((inst, prefix)) = served_by {
+        p.served_by.push((id.clone(), inst.to_string(), prefix.to_path_buf()));
     }
     save_placement(data_dir, &p)
 }

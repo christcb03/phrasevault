@@ -247,6 +247,15 @@ enum Cmd {
         /// central-store directory (with `central`)
         #[arg(long, required_if_eq_any([("mode", "central"), ("mode", "central-keep")]))]
         to: Option<PathBuf>,
+        /// F5.5 (with `sync`): log fetched copies as THIS box's
+        /// pvfs-host:// locations so the fleet can dial them
+        #[arg(long)]
+        advertise: bool,
+        /// F5.5 (with `central`): `<instance>:<remote-path>` — log store
+        /// copies as that instance's locations (it serves the store dir;
+        /// `<remote-path>` is the store as THAT box sees it)
+        #[arg(long, value_name = "INSTANCE:PATH")]
+        served_by: Option<String>,
     },
     /// Fetch missing bytes from wherever they're reachable — for one
     /// subtree, or every subtree placed `sync`
@@ -3450,24 +3459,78 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Place { target, mode, to } => {
+        Cmd::Place { target, mode, to, advertise, served_by } => {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
+            if advertise && mode != "sync" {
+                return Err(PvfsError::BadInput {
+                    field: "advertise".into(),
+                    reason: "--advertise goes with `sync` (doc 17 §7.7)".into(),
+                });
+            }
+            if served_by.is_some() && mode != "central" && mode != "central-keep" {
+                return Err(PvfsError::BadInput {
+                    field: "served-by".into(),
+                    reason: "--served-by goes with `central`/`central-keep` (doc 17 §7.7)".into(),
+                });
+            }
+            let mut note = String::new();
             if mode == "central" || mode == "central-keep" {
                 let dest = to.expect("clap required_if_eq");
                 std::fs::create_dir_all(&dest)
                     .map_err(|e| PvfsError::io("create central store", e))?;
                 let dest = std::fs::canonicalize(&dest)
                     .map_err(|e| PvfsError::io("resolve central store", e))?;
-                pvfs_core::sync::set_central(&data_dir, &id, &dest, mode == "central-keep")?;
+                // F5.5: attribution needs the instance to exist NOW — its
+                // pin is what the mover will log. The path equivalence
+                // (that <remote-path> on that box IS --to here) is the
+                // operator's assertion; say it back so it's a decision.
+                let served = match &served_by {
+                    Some(sb) => {
+                        let (inst, path) = sb.split_once(':').ok_or_else(|| PvfsError::BadInput {
+                            field: "served-by".into(),
+                            reason: "expected <instance>:<remote-path>".into(),
+                        })?;
+                        let known = pvfs_client::fetch::load_instances()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|(n, _, _)| n == inst);
+                        if !known {
+                            return Err(PvfsError::BadInput {
+                                field: "served-by".into(),
+                                reason: format!(
+                                    "no instance '{inst}' in the registry — `pvfs instance add` it first"
+                                ),
+                            });
+                        }
+                        note = format!(
+                            "; store copies will be logged as {inst}'s (asserting {path} there IS {} here)",
+                            dest.display()
+                        );
+                        Some((inst.to_string(), PathBuf::from(path)))
+                    }
+                    None => None,
+                };
+                pvfs_core::sync::set_central_served(
+                    &data_dir,
+                    &id,
+                    &dest,
+                    mode == "central-keep",
+                    served.as_ref().map(|(i, p)| (i.as_str(), p.as_path())),
+                )?;
             } else {
-                pvfs_core::sync::set_placement(&data_dir, &id, mode == "sync")?;
+                pvfs_core::sync::set_sync_mode(&data_dir, &id, mode == "sync", advertise)?;
+                if advertise {
+                    note = "; fetched copies will be advertised (pvfs sync applies it)".into();
+                }
             }
+            let shown_mode =
+                if advertise { "sync-advertise".to_string() } else { mode.clone() };
             if json {
-                println!("{{\"node\":\"{id}\",\"mode\":\"{mode}\"}}");
+                println!("{{\"node\":\"{id}\",\"mode\":\"{shown_mode}\"}}");
             } else {
-                println!("{id} placed {mode}");
+                println!("{id} placed {shown_mode}{note}");
             }
             Ok(())
         }
@@ -3525,9 +3588,26 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
         Cmd::Evict => {
             // The pass itself is shared with pvfsd's `evict` job (P5.3).
-            let engine = Engine::open(&ctx?)?;
+            let dir = ctx?;
+            // F5.5: advertised copies whose subtree left `sync --advertise`
+            // are retracted (write-through) BEFORE their bytes go — a
+            // dangling advertisement is a lie the fleet would trust.
+            let retract = {
+                let probe = Engine::open(&dir)?;
+                let is_replica = probe.is_replica();
+                probe.close()?;
+                let mut route_pair =
+                    pvfs_client::advertise::replica_route(&dir, is_replica)?;
+                let route = route_pair.as_mut().map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
+                pvfs_client::advertise::retract_pass(&dir, route)?
+            };
+            let engine = Engine::open(&dir)?;
             let report = pvfs_core::sync::evict_pass(&engine)?;
-            let (evicted, freed, skipped) = (report.evicted, report.freed_bytes, report.skipped);
+            let (evicted, freed, skipped) = (
+                report.evicted + retract.retracted,
+                report.freed_bytes + retract.freed_bytes,
+                [report.skipped, retract.skipped].concat(),
+            );
             engine.close()?;
             if json {
                 let skips: Vec<String> = skipped
@@ -3750,7 +3830,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 });
             }
             let (fetched, failed) = sync_pull(&mut engine, &mut fetcher, &roots)?;
+            // F5.5 (doc 17 §7.7): subtrees placed `sync --advertise` log
+            // their fetched copies as this box's locations — catch-up
+            // included, so a re-run advertises files fetched before the
+            // placement flag existed.
+            let is_replica = engine.is_replica();
+            let adv_dir = engine.data_dir().to_path_buf();
             engine.close()?;
+            let ad = {
+                let mut route_pair =
+                    pvfs_client::advertise::replica_route(&adv_dir, is_replica)?;
+                let route = route_pair.as_mut().map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
+                pvfs_client::advertise::advertise_pass(&adv_dir, route)?
+            };
             if json {
                 let fails: Vec<String> = failed
                     .iter()
@@ -3763,11 +3855,18 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     })
                     .collect();
                 println!(
-                    "{{\"fetched\":{fetched},\"failed\":[{}]}}",
+                    "{{\"fetched\":{fetched},\"advertised\":{},\"failed\":[{}]}}",
+                    ad.advertised,
                     fails.join(",")
                 );
             } else {
                 println!("fetched {fetched} files into the sync store");
+                if ad.advertised > 0 {
+                    println!("advertised {} copies to the fleet", ad.advertised);
+                }
+                for (label, e) in &ad.skipped {
+                    eprintln!("advertise skipped: {label} — {e}");
+                }
                 for (label, e) in &failed {
                     eprintln!("failed: {label} — {e}");
                 }

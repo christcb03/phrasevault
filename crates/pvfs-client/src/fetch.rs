@@ -429,6 +429,28 @@ pub fn tier_pass(
         return Ok(None);
     }
     let own_pin = pvfs_core::storage::host_pin(&data_dir);
+    // F5.5 (doc 17 §7.7): central subtrees with a serving instance log the
+    // store copy as THAT instance's pvfs-host:// location too — resolved to
+    // its pin from the registry once, up front (a vanished registry entry
+    // fails the pass loudly rather than logging unattributable rows).
+    let served_by = pvfs_core::sync::load_placement_full(&data_dir)?.served_by;
+    let mut serve_as: std::collections::HashMap<String, (String, std::path::PathBuf)> =
+        std::collections::HashMap::new();
+    if !served_by.is_empty() {
+        let registry = load_instances()?;
+        for (root, inst, prefix) in served_by {
+            let Some((_, _, pin)) = registry.iter().find(|(n, _, _)| n == &inst) else {
+                return Err(PvfsError::BadInput {
+                    field: "tier".into(),
+                    reason: format!(
+                        "placement names serving instance '{inst}' but the registry has no \
+                         such entry — `pvfs instance add` it or re-place without --served-by"
+                    ),
+                });
+            };
+            serve_as.insert(root, (pin.clone(), prefix));
+        }
+    }
     let mut report = TierReport::default();
     for (root, dest, keep) in central {
         // P8 (doc 21): a MIGRATE-kind binding's own staging dir drains too —
@@ -493,7 +515,16 @@ pub fn tier_pass(
                     }
                     std::fs::rename(&tmp, &cpath)
                         .map_err(|e| PvfsError::io("place central copy", e))?;
-                    engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)
+                    engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)?;
+                    // F5.5: the attributed row — the serving instance's view
+                    // of the same store file (same aa/<id> layout under its
+                    // remote prefix), so consumers dial IT for these bytes.
+                    if let Some((pin, prefix)) = serve_as.get(&root) {
+                        let remote = prefix.join(&id[..2]).join(&id);
+                        engine
+                            .add_location(&id, &pvfs_core::storage::host_uri(pin, &remote)?)?;
+                    }
+                    Ok(())
                 })() {
                     report.failed.push((label, e.to_string()));
                     continue;

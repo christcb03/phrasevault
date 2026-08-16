@@ -358,6 +358,54 @@ smoke suite.
 catalog-at-add, verified partials, gated commit — replacing the hand-rolled `pvfs add` +
 `loc add --here` on the download box.*
 
+### 7.7 F5.5 — advertised holders (spec 2026-08-15, the D69 fleet's finding)
+
+The gap, found live on real hardware (PVOS D69 F0.5, a QNAP serving a
+lab fleet): a replica's sync-store copies are **per-machine deployment
+state** — deliberately unlogged (F3) — so a box that syncs a subtree
+holds verified bytes the rest of the fleet cannot discover. The NAS
+held the whole library and nobody could dial it until the copy was
+advertised by hand (`loc add --here <.pvfs/synced path>` — which works
+today and is the semantic F5.5 automates). Two additions, no new wire
+ops (write-through carries everything, so **no PROTO_VERSION bump**):
+
+1. **`pvfs place <target> sync --advertise`** — placement line
+   `sync-advertise <id>`. `pvfs sync` (CLI and the daemon's `sync` job
+   alike — shared pass) then follows every verified fetch under such a
+   subtree with a routed, member-signed `loc add` of
+   `pvfs-host://<own-pin>/<abs sync-store path>` — idempotent (skipped
+   when an own-pin location for the store path is already logged), and
+   catch-up on re-runs (already-fetched files missing their
+   advertisement get one). Needs `rw` at the root (it IS a write) and a
+   transport pin (a box that never ran `--listen` has nothing to
+   advertise — refused with that sentence). **`cat` self-heal never
+   advertises**: casual reads must not grow the log; advertising is the
+   deliberate act of becoming a holder.
+2. **`pvfs place <target> central --to <dir> --served-by
+   <instance>:<remote-prefix>`** — placement line
+   `served-by <id> <instance> <remote-prefix>`. The mover writes
+   through its local `--to` path as today, but logs the central
+   location **as the serving instance's**:
+   `pvfs-host://<that instance's pin>/<remote-prefix>/<store-relative
+   path>` alongside the owner-local `file://` row. The named instance
+   must exist in the registry at place time (its pin is the
+   attribution); the path equivalence — that `<remote-prefix>` on that
+   box IS `--to` here (the NAS export mounted on the owner) — is the
+   operator's assertion and is stated in the place output. Consumers
+   then fetch store bytes straight from the NAS instead of hairpinning
+   through the owner.
+3. **Evict retracts before it deletes.** An advertised copy adds a
+   step to `pvfs evict`'s contract: first retract the own-pin location
+   (routed `loc rm`, write-through), then delete bytes — and only when
+   the catalog still records another live location. Source unreachable
+   → the file is skipped with a reason, never deleted: a dangling
+   advertisement is a lie the fleet would trust.
+
+Deliberately not in F5.5: advertising cat's self-healed copies (above);
+a gossip/refresh protocol (advertisements are log rows like any other —
+revocation is `loc rm`, visibility is replica sync); and
+advertisement-driven placement (what to sync stays the operator's call).
+
 ---
 
 ## 8. F4 — later, in this order when needed

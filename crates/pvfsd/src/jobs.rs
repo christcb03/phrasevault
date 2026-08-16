@@ -269,7 +269,18 @@ fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsErro
     let mut engine = pvfs_core::Engine::open(&data_dir)?;
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
     let r = pvfs_client::fetch::sync_pull(&mut engine, &mut fetcher, &roots);
+    let is_replica = engine.is_replica();
     engine.close()?;
+    // F5.5: advertise fetched copies for `sync --advertise` subtrees — the
+    // same shared pass as the CLI; per-file skips ride the job status, a
+    // pass-level failure (e.g. no pin yet) is the job's error.
+    if r.is_ok() {
+        let mut route_pair = pvfs_client::advertise::replica_route(&data_dir, is_replica)?;
+        let route = route_pair
+            .as_mut()
+            .map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
+        pvfs_client::advertise::advertise_pass(&data_dir, route)?;
+    }
     r
 }
 
@@ -353,6 +364,17 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         "evict" => std::thread::spawn(move || {
             st.set_state("evict", "running");
             let r = (|| -> Result<pvfs_core::sync::EvictReport, PvfsError> {
+                // F5.5: retract de-placed advertised copies before the
+                // classic pass — never delete under a live advertisement.
+                let probe = pvfs_core::Engine::open(st.data_dir())?;
+                let is_replica = probe.is_replica();
+                probe.close()?;
+                let mut route_pair =
+                    pvfs_client::advertise::replica_route(st.data_dir(), is_replica)?;
+                let route = route_pair
+                    .as_mut()
+                    .map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
+                let _ = pvfs_client::advertise::retract_pass(st.data_dir(), route)?;
                 let engine = pvfs_core::Engine::open(st.data_dir())?;
                 let r = pvfs_core::sync::evict_pass(&engine);
                 engine.close()?;

@@ -24,6 +24,7 @@ pub use pvfs_proto::{
     ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
 };
 
+pub mod advertise;
 pub mod fetch;
 pub mod follow;
 pub mod regions;
