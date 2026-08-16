@@ -12,7 +12,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install libdbus (Linux secret-service backend of pvfs-companion)
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to match the PVOS repo's CI and the presubuntu test server
+      # (both 1.96.0). Floating on @stable meant clippy here ran a NEWER
+      # lint set than the box the work is actually gated on, so a change
+      # could pass every local check and still fail this job — which is
+      # exactly what happened with `manual_contains` (a 1.97 lint) on the
+      # D67 C3 write lease. Bump this, the PVOS workflow and presubuntu's
+      # rustup together, or the gap reopens.
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets

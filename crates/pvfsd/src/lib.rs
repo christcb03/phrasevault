@@ -217,7 +217,7 @@ impl Daemon {
         let mut cur = node.to_string();
         // Bounded: a cycle in the link graph must not spin here.
         for _ in 0..64 {
-            if roots.iter().any(|r| *r == cur) {
+            if roots.contains(&cur) {
                 return true;
             }
             match e.parent_of(&cur) {
