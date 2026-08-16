@@ -406,7 +406,22 @@ a gossip/refresh protocol (advertisements are log rows like any other —
 revocation is `loc rm`, visibility is replica sync); and
 advertisement-driven placement (what to sync stays the operator's call).
 
-**F5.6 (named, not built): attested external ingest.** The D69 fleet's
+**F5.6 ✅ BUILT (2026-08-16): attested external ingest — THE MOVER
+ATTESTS.** Built simpler and stronger than first sketched: no
+`--attest` wire op carrying CLAIMED hashes — the mover already fetches
+every migrating file's bytes, so `tier` runs the hash-fill successor +
+attestation right there (`Engine::hash_node`, the lazy-hash design's
+own door), **verified from the real bytes, owner-signed, zero wire
+changes**. The central copy lands under the attested id; consumers
+stream + heal + verify from then on (lab: the same file that proxied at
+~1.4 s/read now streams cold in 1.0 s and reads WARM in 0.00 s — the
+mount's heal works once files are attested). Scope is deliberate:
+`tier` attests only what it MIGRATES — a no-hash scan of a huge
+existing library is never ground through silently; bulk attestation is
+the operator's explicit `pvfs loc hash <file>` (also new, owner-side).
+Original sketch kept below for the record.
+
+*(the original sketch)* The D69 fleet's
 mount profiling found the boundary precisely: a file cataloged by hand
 (`pvfs add` + `loc add --here` — the §7.9 ingest-box flow, and the arr
 hook that automates it) carries **no content hash**, so it is an

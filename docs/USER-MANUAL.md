@@ -467,6 +467,14 @@ live central copy — a failed migration never retires anything — so consumers
 throughout: before migration they read through to the ingest box, after it to the central copy.
 The store is mover-managed (don't bind or scan it); browse the library through `pvfs export`.
 
+**The mover attests (F5.6).** A file cataloged without a hash (an ingest box's
+`pvfs add` + `loc add --here`) is verifiable by nobody — so when `tier`
+migrates it, it fills the hash and attests the chunk manifest from the bytes
+it just fetched, and the central copy lands under the new, attested id. From
+then on every box can stream, heal, and verify it. Files already satisfied in
+place are deliberately left alone — hash a library in bulk only when you ask:
+`pvfs loc hash <file>` (owner-side).
+
 **Let the store's machine serve it (F5.5).** When the store directory lives on
 another box (the NAS, NFS-mounted here), tell the mover so it logs each store
 copy as THAT machine's location — consumers then fetch store bytes straight

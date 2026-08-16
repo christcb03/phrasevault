@@ -487,6 +487,11 @@ enum LocCmd {
     },
     Rm { file: String, uri: String },
     Ls { file: String },
+    /// F5.6: fill a lazy content hash + attestation from the file's
+    /// readable bytes (creates a successor node — prints the NEW id).
+    /// Runs on the owner (log + bytes together); the mover does this
+    /// automatically for migrating files
+    Hash { file: String },
     /// Re-hash locations; lift quarantine where bytes match again
     Verify { file: String },
 }
@@ -2094,6 +2099,25 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{{\"removed\":true}}");
                     } else {
                         println!("removed");
+                    }
+                }
+                LocCmd::Hash { file } => {
+                    if engine.is_replica() {
+                        return Err(PvfsError::BadInput {
+                            field: "hash".into(),
+                            reason: "hash-fill runs on the owner (the log and the bytes \
+                                     together); the mover attests migrating files \
+                                     automatically (doc 17 §7.7)"
+                                .into(),
+                        });
+                    }
+                    let new_id = engine.hash_node(&file)?;
+                    if json {
+                        println!("{{\"node\":\"{new_id}\"}}");
+                    } else if new_id == file {
+                        println!("already hashed — id unchanged");
+                    } else {
+                        println!("attested — successor id: {new_id}");
                     }
                 }
                 LocCmd::Ls { file } => {

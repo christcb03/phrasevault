@@ -491,8 +491,11 @@ pub fn tier_pass(
             if entry.node.node_type != pvfs_core::TYPE_FILE {
                 continue;
             }
-            let id = entry.node.id;
+            let mut id = entry.node.id;
             let label = entry.node.label;
+            let unhashed = pvfs_core::FilePayload::decode(&entry.node.payload)
+                .map(|pl| pl.content_hash.is_empty())
+                .unwrap_or(false);
             // What satisfies this root: for a MIRROR (keep) root the whole
             // point is a copy IN THE STORE — the source's own local location
             // never satisfies it. For migrate/central roots any local copy
@@ -519,6 +522,32 @@ pub fn tier_pass(
                     if let Err(e) = fetcher.fetch(engine, &id) {
                         report.failed.push((label, e));
                         continue; // never retire without a central copy
+                    }
+                }
+                // F5.6 (doc 17 §7.7): the MOVER ATTESTS — but only what it
+                // MIGRATES. An unhashed lazy pointer (the arr hook's
+                // add + loc-here output), bytes in hand, gains its
+                // hash-fill successor first — verified from the real
+                // bytes, owner-signed — so the central copy lands under
+                // the attested id and consumers stream + verify from now
+                // on. Satisfied-in-place unhashed files (a no-hash scan of
+                // a huge library) are deliberately NOT ground through
+                // here: bulk attestation is an explicit operator act
+                // (`pvfs loc hash`), never a silent tier side effect.
+                if unhashed {
+                    match engine.hash_node(&id) {
+                        Ok(new_id) => {
+                            eprintln!(
+                                "tier: attested {label} ({} -> {})",
+                                &id[..12],
+                                &new_id[..12]
+                            );
+                            id = new_id;
+                        }
+                        Err(e) => {
+                            report.failed.push((label, e.to_string()));
+                            continue; // never migrate what we couldn't attest
+                        }
                     }
                 }
                 // …then land a verified copy in the central store
