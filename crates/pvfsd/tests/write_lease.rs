@@ -63,7 +63,7 @@ fn lease_refuses_other_connections_and_dies_with_its_holder() {
             .expect("no lease yet — the write is allowed");
     }
 
-    holder.claim_write_lease(&[control.clone()]).unwrap();
+    holder.claim_write_lease(std::slice::from_ref(&control)).unwrap();
 
     // A second connection under the very same owner key is now refused.
     let mut intruder = connect();
@@ -86,11 +86,11 @@ fn lease_refuses_other_connections_and_dies_with_its_holder() {
 
     // Idempotent for the holder — a daemon reclaiming after a reconnect must
     // not lock itself out.
-    holder.claim_write_lease(&[control.clone()]).unwrap();
+    holder.claim_write_lease(std::slice::from_ref(&control)).unwrap();
 
     // And it cannot be stolen while the holder lives.
     assert!(
-        intruder.claim_write_lease(&[control.clone()]).is_err(),
+        intruder.claim_write_lease(std::slice::from_ref(&control)).is_err(),
         "the lease is exclusive while its holder is alive"
     );
 
