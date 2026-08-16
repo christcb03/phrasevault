@@ -4170,38 +4170,62 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let root = engine.identity.root_node_id.clone();
             let is_replica = engine.is_replica();
             // The directory walk is a read — always local.
-            let find = |parent: &str, label: &str| -> Result<Option<(String, String)>, PvfsError> {
+            let find = |parent: &str, label: &str| -> Result<Option<(String, String, Vec<u8>)>, PvfsError> {
                 Ok(engine.children(&parent.to_string())?.into_iter().find_map(|c| {
-                    (c.node.label == label).then_some((c.node.id, c.link_id))
+                    (c.node.label == label).then_some((c.node.id, c.link_id, c.node.payload))
                 }))
             };
             let fleet = find(&root, pvfs_client::fetch::FLEET_DIR)?;
             let eps = match &fleet {
-                Some((id, _)) => find(id, pvfs_client::fetch::ENDPOINTS_DIR)?,
+                Some((id, _, _)) => find(id, pvfs_client::fetch::ENDPOINTS_DIR)?,
                 None => None,
             };
             let existing = match &eps {
-                Some((id, _)) => find(id, &pin)?,
+                Some((id, _, _)) => find(id, &pin)?,
                 None => None,
             };
+            // Convergence-friendly: an unchanged record is a NO-OP — a
+            // scheduled re-run must not churn the log.
+            if !retract {
+                if let Some((_, _, payload)) = &existing {
+                    if payload.as_slice() == addr.as_bytes() {
+                        engine.close()?;
+                        if json {
+                            println!("{{\"pin\":\"{pin}\",\"addr\":\"{}\",\"unchanged\":true}}", json_escape(&addr));
+                        } else {
+                            println!("already announced at {addr} — nothing to do");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            if retract && existing.is_none() {
+                engine.close()?;
+                if json {
+                    println!("{{\"retracted\":false}}");
+                } else {
+                    println!("no endpoint record — nothing to retract");
+                }
+                return Ok(());
+            }
             if is_replica {
                 // Write-through, member-signed — the F5.0 seam.
                 let data_dir = engine.data_dir().to_path_buf();
                 engine.close()?;
                 let (mut client, sign) = replica_write_client(&data_dir)?;
                 let fleet_id = match fleet {
-                    Some((id, _)) => id,
+                    Some((id, _, _)) => id,
                     None => client
                         .mkdir(&root, pvfs_client::fetch::FLEET_DIR, |d| sign(d))
                         .map_err(remote_err)?,
                 };
                 let eps_id = match eps {
-                    Some((id, _)) => id,
+                    Some((id, _, _)) => id,
                     None => client
                         .mkdir(&fleet_id, pvfs_client::fetch::ENDPOINTS_DIR, |d| sign(d))
                         .map_err(remote_err)?,
                 };
-                if let Some((node_id, _)) = existing {
+                if let Some((node_id, _, _)) = existing {
                     client.rm(&node_id, |d| sign(d)).map_err(remote_err)?;
                 }
                 if !retract {
@@ -4213,7 +4237,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 let mut engine = engine;
                 let fleet_id = match fleet {
-                    Some((id, _)) => id,
+                    Some((id, _, _)) => id,
                     None => engine.add_node(
                         &root,
                         pvfs_core::engine::NodeSpec {
@@ -4226,7 +4250,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     )?,
                 };
                 let eps_id = match eps {
-                    Some((id, _)) => id,
+                    Some((id, _, _)) => id,
                     None => engine.add_node(
                         &fleet_id,
                         pvfs_core::engine::NodeSpec {
@@ -4238,7 +4262,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         },
                     )?,
                 };
-                if let Some((_, link_id)) = existing {
+                if let Some((_, link_id, _)) = existing {
                     engine.remove_link(&link_id)?;
                 }
                 if !retract {
