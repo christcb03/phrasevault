@@ -19,7 +19,13 @@ jobs:
       # exactly what happened with `manual_contains` (a 1.97 lint) on the
       # D67 C3 write lease. Bump this, the PVOS workflow and presubuntu's
       # rustup together, or the gap reopens.
+      # `components: clippy` is required with a PINNED toolchain — @stable
+      # ships clippy, a version pin does not, and the Clippy step below then
+      # fails with "'cargo-clippy' is not installed". Same shape as the PVOS
+      # workflow, which already carries this fix.
       - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets
