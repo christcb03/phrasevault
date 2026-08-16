@@ -15,7 +15,7 @@ use std::io;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -118,6 +118,43 @@ pub struct Daemon {
     data_dir: PathBuf,
     /// P10.0: live ingest sessions (mirror of `ingest.sessions`).
     ingest: Mutex<IngestState>,
+    /// PVOS D67 C3: the write lease, if a connection holds one. `None` = the
+    /// forest has no declared authority and every authenticated write is
+    /// judged on ACLs alone (the pre-lease behaviour, and what a forest with
+    /// no PVOS daemon in front of it keeps).
+    lease: Mutex<Option<WriteLease>>,
+    /// Connection ids, so a lease can name its holder. Monotonic; a reused
+    /// id would let a new connection inherit a dead one's authority.
+    next_conn: AtomicU64,
+}
+
+/// PVOS D67 C3: an exclusive claim on writes under `roots`.
+struct WriteLease {
+    /// The connection that holds it — NOT a key: the serving daemon and an
+    /// owner-run CLI authenticate identically.
+    conn: u64,
+    roots: Vec<String>,
+}
+
+/// Releases the lease when the connection's scope ends — including on error
+/// or panic, which is what makes "a crashed holder never blocks recovery"
+/// true rather than aspirational.
+struct LeaseGuard<'a> {
+    daemon: &'a Daemon,
+    conn: u64,
+}
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        let mut held = match self.daemon.lease.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(), // a poisoned lock must not strand the lease
+        };
+        if held.as_ref().is_some_and(|l| l.conn == self.conn) {
+            *held = None;
+            eprintln!("pvfsd: write lease released (connection {} ended)", self.conn);
+        }
+    }
 }
 
 impl Daemon {
@@ -154,7 +191,41 @@ impl Daemon {
                 committing: HashMap::new(),
                 hot: Vec::new(),
             }),
+            lease: Mutex::new(None),
+            next_conn: AtomicU64::new(1),
         }
+    }
+
+    /// PVOS D67 C3: does a live lease held by SOMEONE ELSE cover `node`?
+    ///
+    /// Walks `node` up its containment links looking for a leased root. The
+    /// leased roots are the forest's control subtrees — shallow and few — and
+    /// a write already pays signature verification and a transaction, so a
+    /// handful of indexed parent lookups is not a new cost class. Answering
+    /// "no lease" is a lock check and nothing more, which is the common case
+    /// for every forest without a PVOS daemon in front of it.
+    fn lease_denies(&self, conn: u64, node: &str) -> bool {
+        let roots = {
+            let held = self.lease.lock().unwrap();
+            match held.as_ref() {
+                // Ours, or nobody's — nothing to deny.
+                Some(l) if l.conn != conn => l.roots.clone(),
+                _ => return false,
+            }
+        };
+        let e = self.engine.lock().unwrap();
+        let mut cur = node.to_string();
+        // Bounded: a cycle in the link graph must not spin here.
+        for _ in 0..64 {
+            if roots.iter().any(|r| *r == cur) {
+                return true;
+            }
+            match e.parent_of(&cur) {
+                Ok(Some(p)) => cur = p,
+                _ => return false, // reached the root, or unknown node
+            }
+        }
+        false
     }
 
     /// Attach the job runner's state so `ServeStatus` answers live (set once,
@@ -300,6 +371,10 @@ pub fn serve_connection<S: io::Read + io::Write>(
     mut stream: S,
     local: bool,
 ) -> io::Result<()> {
+    // D67 C3: this connection's identity for lease purposes, and the guard
+    // that releases the lease however this scope ends.
+    let conn_id = daemon.next_conn.fetch_add(1, Ordering::Relaxed);
+    let _lease_guard = LeaseGuard { daemon, conn: conn_id };
     // 1. challenge (nonce registered single-use, doc 08 §4 item 7)
     let (nonce, expiry_ms) = daemon.issue_nonce();
     write_msg(
@@ -362,7 +437,7 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 continue;
             }
             ClientMsg::SecurePut { node } => {
-                do_secure_put(daemon, &principal, &mut stream, &node)?;
+                do_secure_put(daemon, &principal, &mut stream, &node, conn_id)?;
                 continue;
             }
             ClientMsg::IngestWrite {
@@ -374,7 +449,7 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 continue;
             }
             req => {
-                let resp = handle(daemon, &principal, req, local);
+                let resp = handle(daemon, &principal, req, local, conn_id);
                 write_msg(&mut stream, &resp)?;
             }
         }
@@ -400,7 +475,7 @@ fn resolve_auth(
     Ok(Principal::Key(pk))
 }
 
-fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool) -> ServerMsg {
+fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, conn: u64) -> ServerMsg {
     match req {
         ClientMsg::Info => {
             let e = daemon.reader();
@@ -472,7 +547,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool) -
             timeout_ms,
             region,
         } => do_log_wait(daemon, principal, from_seq, max, timeout_ms, &region),
-        ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op),
+        ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op, conn),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
         ClientMsg::ChunkManifest { node } => {
@@ -525,6 +600,9 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool) -
             keep_catalog,
         } => do_ingest_abort(daemon, principal, &session, keep_catalog),
         ClientMsg::IngestList => do_ingest_list(daemon, principal, local),
+        ClientMsg::ClaimWriteLease { roots } => {
+            do_claim_write_lease(daemon, principal, roots, conn)
+        }
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
@@ -1037,6 +1115,7 @@ fn do_secure_put<S: io::Read + io::Write>(
     principal: &Principal,
     stream: &mut S,
     node: &str,
+    conn: u64,
 ) -> io::Result<()> {
     let author = match principal {
         Principal::Key(pk) => pk.clone(),
@@ -1045,6 +1124,21 @@ fn do_secure_put<S: io::Read + io::Write>(
             return Ok(());
         }
     };
+    // D67 C3: the second write chokepoint. Secure-node CONTENTS bypass
+    // `do_prepare_write` entirely, and the PVOS keychain lives in secure
+    // nodes — so a lease guarding only the structural path would leave every
+    // secret writable from outside it.
+    if daemon.lease_denies(conn, node) {
+        write_msg(
+            stream,
+            &err(
+                "forbidden",
+                "this subtree is under another connection's write lease — \
+                 route the write through the daemon that serves this forest",
+            ),
+        )?;
+        return Ok(());
+    }
     // Read the uploaded ciphertext (frames until a zero-length frame).
     let mut ciphertext = Vec::new();
     loop {
@@ -1751,11 +1845,83 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal, local: bool) -> Server
 }
 
 /// Phase 1: build the signable events for `op` and stash them under a fresh id.
-fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp) -> ServerMsg {
+/// PVOS D67 C3: the node a write op lands on, for the lease check.
+///
+/// `None` means "not a subtree-addressed write": `AuthorizeMember`/`Revoke`
+/// act on the forest's member set and `Unlink`/`Reorder`/`RemoveLocation`
+/// address a link or uri rather than a node. Those are deliberately left to
+/// ACLs — a lease is a claim over a REGION of the tree, and stretching it to
+/// cover forest-wide operations would quietly make it something else.
+fn write_target(op: &WriteOp) -> Option<&str> {
+    match op {
+        WriteOp::Mkdir { parent, .. }
+        | WriteOp::SecureCreate { parent, .. }
+        | WriteOp::AddFile { parent, .. }
+        | WriteOp::AddNode { parent, .. }
+        | WriteOp::Link { parent, .. } => Some(parent),
+        WriteOp::Rm { node }
+        | WriteOp::SetAcl { node, .. }
+        // Re-homing is a write on BOTH ends; the destination is the one that
+        // could smuggle a node INTO a leased subtree.
+        | WriteOp::Mv { node: _, new_parent: node } => Some(node),
+        WriteOp::AddLocation { file, .. } => Some(file),
+        _ => None,
+    }
+}
+
+/// PVOS D67 C3: claim the write lease over `roots`.
+///
+/// Authenticated identity required — the same bar as a write, since holding
+/// the lease is the authority to be the only writer. Idempotent for the
+/// current holder (a daemon re-claiming after a reconnect is not an error);
+/// refused while a DIFFERENT live connection holds it.
+fn do_claim_write_lease(
+    daemon: &Daemon,
+    principal: &Principal,
+    roots: Vec<String>,
+    conn: u64,
+) -> ServerMsg {
+    if !matches!(principal, Principal::Key(_)) {
+        return err("forbidden", "the write lease requires an authenticated identity");
+    }
+    if roots.is_empty() {
+        return err("bad_input", "a write lease needs at least one root");
+    }
+    let mut held = daemon.lease.lock().unwrap();
+    match held.as_ref() {
+        Some(l) if l.conn != conn => err(
+            "forbidden",
+            "another live connection holds this forest's write lease",
+        ),
+        _ => {
+            eprintln!(
+                "pvfsd: write lease held by connection {conn} over {} root(s)",
+                roots.len()
+            );
+            *held = Some(WriteLease { conn, roots });
+            ServerMsg::Ready {
+                principal: principal.display(),
+            }
+        }
+    }
+}
+
+fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u64) -> ServerMsg {
     let author = match principal {
         Principal::Key(pk) => pk.clone(),
         _ => return err("forbidden", "writes require an authenticated identity"),
     };
+    // D67 C3: the lease check sits where the author is established, so no
+    // write path can reach the engine having skipped it.
+    if let Some(node) = write_target(&op) {
+        if daemon.lease_denies(conn, node) {
+            return err(
+                "forbidden",
+                "this subtree is under another connection's write lease — \
+                 route the write through the daemon that serves this forest",
+            );
+        }
+    }
     let prepared = {
         let e = daemon.engine.lock().unwrap();
         match op {

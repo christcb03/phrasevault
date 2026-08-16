@@ -405,6 +405,19 @@ pub enum ClientMsg {
     },
     /// P10.0: the live sessions with per-file progress (active-member gated).
     IngestList,
+    /// Claim the WRITE LEASE over `roots` and everything beneath them
+    /// (PVOS D67 C3). While held, writes under those subtrees are refused
+    /// from every OTHER connection — which is what makes "one authority per
+    /// served forest" an invariant rather than a convention.
+    ///
+    /// Per CONNECTION, not per identity: a daemon serving a forest and a CLI
+    /// run by its owner authenticate with the SAME key, so identity cannot
+    /// separate them. The lease is released when the connection ends — clean
+    /// close or crash — so a dead holder never blocks recovery.
+    ///
+    /// Idempotent for the holder; refused (`forbidden`) when another live
+    /// connection already holds an overlapping root.
+    ClaimWriteLease { roots: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

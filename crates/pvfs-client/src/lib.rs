@@ -636,6 +636,22 @@ impl Client {
         }
     }
 
+    /// Claim the WRITE LEASE over `roots` and everything beneath them (PVOS
+    /// D67 C3): while THIS connection holds it, writes under those subtrees
+    /// are refused from every other connection. Held for the connection's
+    /// life and released when it ends, so a crashed holder blocks nothing.
+    ///
+    /// Idempotent for the holder; `forbidden` while another live connection
+    /// holds an overlapping root.
+    pub fn claim_write_lease(&mut self, roots: &[String]) -> Result<()> {
+        match self.request(ClientMsg::ClaimWriteLease {
+            roots: roots.to_vec(),
+        })? {
+            ServerMsg::Ready { .. } => Ok(()),
+            other => Err(unexpected("Ready", &other)),
+        }
+    }
+
     /// Create a folder named `label` under `parent`. Returns the new node id.
     pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
     where
