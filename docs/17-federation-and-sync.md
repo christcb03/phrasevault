@@ -421,6 +421,50 @@ from the bytes right there, routed like every write-through). Scanned
 files have the same knob already (the bind's hash policy); external
 adds deserve parity.
 
+### 7.8 F5.7 — the self-teaching swarm (spec 2026-08-16, Chris's ask)
+
+Doc 03's open question #1, answered: *how do peers discover
+`instance_id` → network address?* Today every box must `pvfs instance
+add` every holder by hand — the D69 QNAP proof tripped on exactly this
+(the NAS could SEE `pvfs-host://<pin>/…` rows for the ingest box and
+could not dial them). The catalog already teaches every replica WHERE
+copies are; F5.7 makes it teach HOW TO REACH the holders too.
+
+**The endpoint directory** — regular nodes, no new event kinds, no new
+wire ops (and so no PROTO_VERSION change):
+
+```text
+<root>/.fleet/endpoints/<transport-pin>   payload = host:port
+```
+
+- **Publish**: `pvfs fleet announce <host:port>` upserts this box's
+  record (label = own pin, the `--listen` pin) — a plain member-signed
+  write, write-through from replicas like every mutation (F5.0). The
+  dial address cannot be guessed (NAT, names, multi-home): the operator
+  states it. Re-run to change; `pvfs fleet announce --retract` removes.
+- **Learn**: the fetcher's candidate resolution, for a location pin the
+  LOCAL registry doesn't know, consults `.fleet/endpoints/<pin>` from
+  the catalog it already holds. **The local registry always wins** —
+  the operator's word beats the log. One replica-source bootstrap entry
+  is now enough: everything else self-teaches from the synced log.
+- **Trust is unchanged and this is the crux**: the pin in the location
+  row is still the only verification anchor — every connect proves the
+  pin (doc 17 §4), so a wrong or hostile published address can only
+  fail the handshake and cost a fallback to the next candidate, never
+  authority. An endpoint record is a HINT with an audited author (the
+  log row's member signature), not a trust statement.
+- **Staleness**: a dead address behaves exactly like today's stale
+  registry entry — pin-verified connect fails, candidate skipped.
+  Records refresh on `announce` re-runs (the F3 playbooks make it a
+  unit-start step).
+
+Not in v1 (recorded): engine-enforced pin↔author binding on endpoint
+rows (today: last-writer-wins among members with `w`, every write
+member-signed and auditable in the log — the household threat model);
+`pvfsd --announce` as a daemon flag (the CLI + a unit ExecStartPre
+covers it until the flag earns its place); and any gossip beyond the
+log (the log IS the gossip).
+
 ---
 
 ## 8. F4 — later, in this order when needed

@@ -775,6 +775,18 @@ enum FleetCmd {
         #[arg(long)]
         rights: Option<String>,
     },
+    /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
+    /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
+    /// member's fetcher learns how to reach this holder from the catalog
+    /// — no per-box `instance add` needed. The pin still gates every
+    /// connect; the address is a hint only the operator can know.
+    Announce {
+        /// This box's address as the fleet should dial it, `host:port`
+        addr: Option<String>,
+        /// Remove this box's endpoint record instead
+        #[arg(long)]
+        retract: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4105,6 +4117,136 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     engine.close()
                 }
             }
+        }
+        Cmd::Fleet(FleetCmd::Announce { addr, retract }) => {
+            let state_dir = ctx?;
+            let pin = pvfs_core::storage::host_pin(&state_dir).ok_or_else(|| {
+                PvfsError::BadInput {
+                    field: "announce".into(),
+                    reason: "this box has no transport pin yet — run `pvfsd --listen <addr>` \
+                             once; an unreachable box has nothing to announce (doc 17 §7.8)"
+                        .into(),
+                }
+            })?;
+            let addr = match (&addr, retract) {
+                (_, true) => String::new(),
+                (Some(a), false) => a.clone(),
+                (None, false) => prompt_line(
+                    "this box's dial address for the fleet (host:port)",
+                    None,
+                )?,
+            };
+            if !retract && !addr.contains(':') {
+                return Err(PvfsError::BadInput {
+                    field: "announce".into(),
+                    reason: format!("expected host:port, got {addr:?}"),
+                });
+            }
+            let engine = Engine::open(&state_dir)?;
+            let root = engine.identity.root_node_id.clone();
+            let is_replica = engine.is_replica();
+            // The directory walk is a read — always local.
+            let find = |parent: &str, label: &str| -> Result<Option<(String, String)>, PvfsError> {
+                Ok(engine.children(&parent.to_string())?.into_iter().find_map(|c| {
+                    (c.node.label == label).then_some((c.node.id, c.link_id))
+                }))
+            };
+            let fleet = find(&root, pvfs_client::fetch::FLEET_DIR)?;
+            let eps = match &fleet {
+                Some((id, _)) => find(id, pvfs_client::fetch::ENDPOINTS_DIR)?,
+                None => None,
+            };
+            let existing = match &eps {
+                Some((id, _)) => find(id, &pin)?,
+                None => None,
+            };
+            if is_replica {
+                // Write-through, member-signed — the F5.0 seam.
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                let fleet_id = match fleet {
+                    Some((id, _)) => id,
+                    None => client
+                        .mkdir(&root, pvfs_client::fetch::FLEET_DIR, |d| sign(d))
+                        .map_err(remote_err)?,
+                };
+                let eps_id = match eps {
+                    Some((id, _)) => id,
+                    None => client
+                        .mkdir(&fleet_id, pvfs_client::fetch::ENDPOINTS_DIR, |d| sign(d))
+                        .map_err(remote_err)?,
+                };
+                if let Some((node_id, _)) = existing {
+                    client.rm(&node_id, |d| sign(d)).map_err(remote_err)?;
+                }
+                if !retract {
+                    client
+                        .add_node(&eps_id, &pin, "fleet.endpoint", addr.as_bytes(), |d| sign(d))
+                        .map_err(remote_err)?;
+                }
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                let mut engine = engine;
+                let fleet_id = match fleet {
+                    Some((id, _)) => id,
+                    None => engine.add_node(
+                        &root,
+                        pvfs_core::engine::NodeSpec {
+                            node_type: "folder".into(),
+                            label: pvfs_client::fetch::FLEET_DIR.into(),
+                            payload: Vec::new(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?,
+                };
+                let eps_id = match eps {
+                    Some((id, _)) => id,
+                    None => engine.add_node(
+                        &fleet_id,
+                        pvfs_core::engine::NodeSpec {
+                            node_type: "folder".into(),
+                            label: pvfs_client::fetch::ENDPOINTS_DIR.into(),
+                            payload: Vec::new(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?,
+                };
+                if let Some((_, link_id)) = existing {
+                    engine.remove_link(&link_id)?;
+                }
+                if !retract {
+                    engine.add_node(
+                        &eps_id,
+                        pvfs_core::engine::NodeSpec {
+                            node_type: "fleet.endpoint".into(),
+                            label: pin.clone(),
+                            payload: addr.clone().into_bytes(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?;
+                }
+                engine.close()?;
+            }
+            if json {
+                if retract {
+                    println!("{{\"retracted\":true}}");
+                } else {
+                    println!("{{\"pin\":\"{pin}\",\"addr\":\"{}\"}}", json_escape(&addr));
+                }
+            } else if retract {
+                println!("endpoint retracted — the fleet forgets this box's address");
+            } else {
+                println!(
+                    "announced: pin {}… is dialable at {addr} — every member's fetcher \
+                     learns it from the catalog",
+                    &pin[..12]
+                );
+            }
+            Ok(())
         }
         Cmd::Fleet(FleetCmd::Enroll { pubkey, rights }) => {
             let state_dir = ctx?;

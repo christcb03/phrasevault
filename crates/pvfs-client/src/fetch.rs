@@ -54,6 +54,9 @@ pub struct Fetcher {
     dead: HashSet<String>,
     instances: Vec<(String, String, String)>,
     source: Option<ReplicaSource>,
+    /// F5.7: catalog-published endpoints (pin → addr), lazily loaded once
+    /// per pass — the registry always wins; these cover pins it lacks.
+    endpoints: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Fetcher {
@@ -62,6 +65,7 @@ impl Fetcher {
             pool: HashMap::new(),
             dead: HashSet::new(),
             instances: load_instances().unwrap_or_default(),
+            endpoints: None,
             source: ReplicaSource::load(data_dir).ok(),
         }
     }
@@ -73,14 +77,32 @@ impl Fetcher {
     }
 
     /// Where `id`'s bytes might be fetched from, best candidate first.
-    fn candidates(&self, engine: &Engine, id: &str) -> Vec<ReplicaSource> {
+    /// Where a file's bytes can be fetched from, in preference order:
+    /// registry-resolved holders, catalog-taught holders (F5.7), then the
+    /// replica's source. Public because tests and tooling reason about it.
+    pub fn candidates(&mut self, engine: &Engine, id: &str) -> Vec<ReplicaSource> {
         let mut out: Vec<ReplicaSource> = Vec::new();
         for loc in engine.locations(&id.to_string()).unwrap_or_default() {
             if let Some((pin, _path)) = pvfs_core::storage::parse_host_uri(&loc) {
-                if let Some((_, addr, _)) = self.instances.iter().find(|(_, _, p)| p == pin) {
+                // Registry first — the operator's word beats the log; the
+                // catalog's endpoint directory (F5.7) covers unknown pins,
+                // so one bootstrap entry self-teaches the rest. Either
+                // way the connect still proves the pin.
+                let addr = self
+                    .instances
+                    .iter()
+                    .find(|(_, _, p)| p == pin)
+                    .map(|(_, a, _)| a.clone())
+                    .or_else(|| {
+                        self.endpoints
+                            .get_or_insert_with(|| catalog_endpoints(engine))
+                            .get(pin)
+                            .cloned()
+                    });
+                if let Some(addr) = addr {
                     out.push(ReplicaSource {
                         transport: "tcp".into(),
-                        target: addr.clone(),
+                        target: addr,
                         pin: pin.to_string(),
                         region: String::new(),
                     });
@@ -570,6 +592,37 @@ pub fn tier_pass(
         }
     }
     Ok(Some(report))
+}
+
+/// F5.7 (doc 17 §7.8): the well-known endpoint directory —
+/// `<root>/.fleet/endpoints/<pin>` with a `host:port` payload.
+pub const FLEET_DIR: &str = ".fleet";
+pub const ENDPOINTS_DIR: &str = "endpoints";
+
+/// Read the catalog-published endpoint directory: pin → dial address.
+/// Missing directory = empty map (the fleet simply hasn't announced).
+pub fn catalog_endpoints(engine: &Engine) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let step = |parent: &str, label: &str| -> Option<String> {
+        engine
+            .children(&parent.to_string())
+            .ok()?
+            .into_iter()
+            .find(|c| c.node.label == label)
+            .map(|c| c.node.id)
+    };
+    let root = engine.identity.root_node_id.clone();
+    let Some(fleet) = step(&root, FLEET_DIR) else { return out };
+    let Some(eps) = step(&fleet, ENDPOINTS_DIR) else { return out };
+    for c in engine.children(&eps).unwrap_or_default() {
+        if let Ok(addr) = String::from_utf8(c.node.payload) {
+            let addr = addr.trim().to_string();
+            if !addr.is_empty() {
+                out.insert(c.node.label, addr);
+            }
+        }
+    }
+    out
 }
 
 /// Fetch missing bytes under `roots`, streaming each file into the managed
