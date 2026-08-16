@@ -2559,37 +2559,64 @@ pub fn startup_check(
     }
 
     // Step 4 — catch up (tree replay walks every log from its applied mark).
+    // A tail fold that FAILS is the cache lying (a projection torn by a
+    // concurrent folder, a crash between checkpoint writes, …) — the same
+    // class as every probe above, and it routes the same way: discard the
+    // cache and replay the whole log. A genuinely bad LOG still refuses
+    // loudly — full_rebuild replays every event through the identical
+    // verification. Found live by the D69 fleet: a torn membership table
+    // passed the position probes, then refused the forest's own device at
+    // fold-apply ("author not authorized") and bricked the owner, while a
+    // cold rebuild of the very same log was perfect.
     if behind {
-        replay_log(conn, data_dir, &identity, "", 0)?;
-        check_pending_moves(conn, data_dir)?;
-        // Actives whose baseline lives in a sealed generation are unreachable
-        // from the tree walk once the seal is applied (the pause is in the
-        // past) — sweep their tails directly. Order-free: an active region's
-        // tail depends only on its own baseline + log.
-        let actives: Vec<(String, String)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT node_id, log_file FROM regions
-                     WHERE state_root IS NOT NULL AND log_file IS NOT NULL",
-                )
-                .map_err(map_db("list regions"))?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(map_db("list regions"))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(map_db("list regions"))?
-        };
-        for (rid, file) in actives {
-            if !data_dir.join(&file).exists() {
-                continue;
-            }
-            attach_log(conn, data_dir, &rid, &file)?;
-            let res = replay_log(conn, data_dir, &identity, &rid, 1);
-            detach_log(conn, &rid)?;
-            res?;
+        if let Err(e) = catch_up_tail(conn, data_dir, &identity) {
+            eprintln!(
+                "pvfs: incremental fold failed ({e}); discarding the projection \
+                 cache and replaying the full log"
+            );
+            return full_rebuild(conn, data_dir);
         }
     }
     Ok(identity)
+}
+
+/// The Step-4 tail fold, separated so `startup_check` can route ANY of its
+/// failures to `full_rebuild` (the projection is a cache; its fold must
+/// self-heal, never brick).
+fn catch_up_tail(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    identity: &ForestIdentity,
+) -> Result<()> {
+    replay_log(conn, data_dir, identity, "", 0)?;
+    check_pending_moves(conn, data_dir)?;
+    // Actives whose baseline lives in a sealed generation are unreachable
+    // from the tree walk once the seal is applied (the pause is in the
+    // past) — sweep their tails directly. Order-free: an active region's
+    // tail depends only on its own baseline + log.
+    let actives: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, log_file FROM regions
+                 WHERE state_root IS NOT NULL AND log_file IS NOT NULL",
+            )
+            .map_err(map_db("list regions"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(map_db("list regions"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("list regions"))?
+    };
+    for (rid, file) in actives {
+        if !data_dir.join(&file).exists() {
+            continue;
+        }
+        attach_log(conn, data_dir, &rid, &file)?;
+        let res = replay_log(conn, data_dir, identity, &rid, 1);
+        detach_log(conn, &rid)?;
+        res?;
+    }
+    Ok(())
 }
 
 // ---- replay-time author-authorization enforcement (doc 06 §3.3) -------------------

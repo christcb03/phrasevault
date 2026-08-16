@@ -467,7 +467,25 @@ impl Engine {
             replica: false,
             _writer_lock: lock,
         };
-        engine.ensure_device_active()?;
+        if let Err(e) = engine.ensure_device_active() {
+            // A projection torn by concurrent folders can pass every position
+            // probe yet have LOST its device rows (the D69 forensics:
+            // device_keys EMPTY, applied mark at tip) — and this check would
+            // then refuse the forest's own device forever. The projection is
+            // a cache: rebuild it from the log and ask again. A rebuilt
+            // projection that STILL answers inactive is a real revocation —
+            // that refusal stands.
+            if matches!(e, PvfsError::Integrity { .. }) {
+                eprintln!(
+                    "pvfs: device check failed on the cached projection ({e}); \
+                     discarding the cache and replaying the full log"
+                );
+                engine.identity = projection::full_rebuild(&mut engine.conn, &engine.data_dir)?;
+                engine.ensure_device_active()?;
+            } else {
+                return Err(e);
+            }
+        }
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
         engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
         Ok(engine)
