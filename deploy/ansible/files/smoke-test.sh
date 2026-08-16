@@ -650,9 +650,15 @@ $PVFS --data-dir "$DMOUNT/.pvfs" place "$DROOT" central --to "$DATA/central-stor
 TIERJ="$($PVFS --json --data-dir "$DMOUNT/.pvfs" tier)"
 [ "$(jget "$TIERJ" migrated)" -ge 1 ] && ok "mover migrated the edge file" || fail "tier: $TIERJ"
 [ "$(jget "$TIERJ" retired)" -ge 1 ] && ok "mover retired the edge location" || fail "tier retired: $TIERJ"
+# F5.6 (doc 17 §7.7): the mover ATTESTS what it migrates — the unhashed
+# edge file gains a hash-fill successor (NEW node id, same label), and
+# the central copy lands under the attested id. Follow the successor.
+EDGE="$($PVFS --json --data-dir "$DMOUNT/.pvfs" ls "$DROOT" \
+  | python3 -c 'import json,sys; print([c["id"] for c in json.load(sys.stdin) if c["label"]=="edge.bin"][0])')"
+[ -n "$EDGE" ] && ok "attested successor stands in the tree (same label)" || fail "successor missing"
 EDGE2="$(printf '%s' "$EDGE" | cut -c1-2)"
 [ "$(cat "$DATA/central-store/$EDGE2/$EDGE")" = "edge-bytes" ] \
-  && ok "verified copy sits in the central store" || fail "central copy missing"
+  && ok "verified copy sits in the central store (attested id)" || fail "central copy missing"
 $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | qgrep "file://$DATA/central-store" \
   && ok "central location recorded in the log" || fail "central location recorded in the log"
 if $PVFS --data-dir "$DMOUNT/.pvfs" loc ls "$EDGE" | qgrep "pvfs-host://$REPPIN"; then
