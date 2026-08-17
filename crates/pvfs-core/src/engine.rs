@@ -480,7 +480,11 @@ impl Engine {
                     "pvfs: device check failed on the cached projection ({e}); \
                      discarding the cache and replaying the full log"
                 );
-                engine.identity = projection::full_rebuild(&mut engine.conn, &engine.data_dir)?;
+                engine.identity = projection::full_rebuild(
+                    &mut engine.conn,
+                    &engine.data_dir,
+                    "device check failed on the cached projection",
+                )?;
                 engine.ensure_device_active()?;
             } else {
                 return Err(e);

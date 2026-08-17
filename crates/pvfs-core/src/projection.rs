@@ -2385,16 +2385,23 @@ fn replay_sealed_child(
 
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
 /// tree-replay every log from its genesis seed. Temp tables start empty.
-pub fn full_rebuild(conn: &mut Connection, data_dir: &std::path::Path) -> Result<ForestIdentity> {
+pub fn full_rebuild(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    reason: &str,
+) -> Result<ForestIdentity> {
     // F5.8: the WHOLE drop-and-replay under the exclusive fold lock — a
     // write landing between two replay segments moves the applied mark to
     // tip and this rebuild would conclude early, half-built (the D69 tear).
     let _folds = lock_folds(data_dir)?;
     // punch C: the post-upgrade/crash rebuild can run minutes on a grown
     // forest — say so instead of looking hung.
+    // D71: say WHY. A bare "rebuilding" line cost hours of diagnosis when the
+    // lab owner replayed a 59k-event log every ~25s — the message read as the
+    // one-time upgrade path while it was actually recurring.
     eprintln!(
-        "pvfs: rebuilding the index from the signed log (one-time after an \
-         upgrade or unclean shutdown; large forests take a few minutes)"
+        "pvfs: rebuilding the index from the signed log — {reason} \
+         (large forests take a few minutes)"
     );
     let identity = decode_genesis(conn)?;
     for t in MAIN_OBJECTS {
@@ -2504,13 +2511,36 @@ pub fn startup_check(
     // The cheap index probes. A read that fails here means the cache is
     // unusable — which is a rebuild, never an error to the caller.
     let Ok(identity) = decode_genesis(conn) else {
-        return full_rebuild(conn, data_dir);
+        return full_rebuild(conn, data_dir, "genesis unreadable in the cache");
     };
 
-    // Step 2 — positions.
-    let (Ok(sl), Ok((si, hi))) = (log_store::max_seq(conn), applied_get(conn, "")) else {
-        return full_rebuild(conn, data_dir);
+    // Step 2 — positions. Mark first, tail second: the tail is then the
+    // fresher read, so a concurrent append can only make `sl` larger, which is
+    // the harmless direction (step 4 catches up).
+    //
+    // Ordering alone does NOT make the comparison trustworthy, though — see
+    // `racing_writer` below.
+    let (Ok((si, hi)), Ok(sl)) = (applied_get(conn, ""), log_store::max_seq(conn)) else {
+        return full_rebuild(conn, data_dir, "log position unreadable in the cache");
     };
+
+    // A live writer can legitimately show the applied mark AHEAD of the log
+    // tail, and it is not a race we can read our way out of: `log.db` and
+    // `index.db` are separate WAL databases, and **SQLite cannot commit across
+    // databases atomically when any of them is in WAL mode**. A writer that has
+    // just folded event N therefore publishes the mark and the log event in two
+    // separate commits, and another connection opening in between sees the mark
+    // lead the tail.
+    //
+    // Measured on the D69 fleet lab (D71): the mark led by EXACTLY 1, about
+    // four times a minute for as long as a serve job wrote beside the daemon —
+    // and each phantom cost a full replay of a 59,365-event log, forever. The
+    // owner is the box that runs `tier`, so this was the fleet's mover
+    // spending its life rebuilding a cache that was never wrong.
+    //
+    // At rest (no live writer) `si > sl` still means exactly what it always
+    // meant — a truncated or swapped log — and still rebuilds.
+    let racing_writer = others_alive && si > sl;
 
     let version: u32 = meta_get(conn, "schema_version")?
         .unwrap_or_else(|| SCHEMA_VERSION.to_string())
@@ -2522,7 +2552,7 @@ pub fn startup_check(
         // §6 — `full_rebuild` recreates `projection_meta`, so the version is reset to
         // current). A **newer** schema than this binary understands is a hard stop.
         if version < SCHEMA_VERSION {
-            return full_rebuild(conn, data_dir);
+            return full_rebuild(conn, data_dir, "projection schema is older than this binary");
         }
         return Err(PvfsError::SchemaVersion {
             found: version,
@@ -2531,20 +2561,29 @@ pub fn startup_check(
     }
 
     // Step 3 — verify the index agrees with the top log at its applied point.
-    if si > sl {
-        return full_rebuild(conn, data_dir);
+    // Both halves are skipped while a writer is racing us: the event at `si`
+    // is simply not visible on this connection yet, so neither the position
+    // nor its chain hash can be checked, and step 4's tail fold picks it up
+    // once it lands. Skipping a check we cannot perform is right; replaying
+    // the whole projection because we cannot perform it is not.
+    if si > sl && !racing_writer {
+        return full_rebuild(
+            conn,
+            data_dir,
+            &format!("applied mark ({si}) is ahead of the log tail ({sl})"),
+        );
     }
-    if si > 0 {
+    if si > 0 && !racing_writer {
         match log_store::read_event(conn, si)? {
             Some(row) if hex::encode(&row.chain_hash) == hi => {}
-            _ => return full_rebuild(conn, data_dir),
+            _ => return full_rebuild(conn, data_dir, "applied mark disagrees with the log chain"),
         }
     }
 
     // Unclean shutdown forces a full agreement check (spec §9.3 crash flag) —
     // unless the "unclean" flag simply reflects a LIVE writer (see above).
     if crashed {
-        return full_rebuild(conn, data_dir);
+        return full_rebuild(conn, data_dir, "unclean shutdown with no live writer");
     }
 
     // Step 3b (P7.2a) — every active region log agrees with its applied mark:
@@ -2567,14 +2606,14 @@ pub fn startup_check(
             Some(f) => data_dir.join(f),
             None => {
                 if ra > 0 {
-                    return full_rebuild(conn, data_dir);
+                    return full_rebuild(conn, data_dir, "a region has an applied mark but no log file");
                 }
                 continue;
             }
         };
         if !path.exists() {
             if ra > 0 {
-                return full_rebuild(conn, data_dir);
+                return full_rebuild(conn, data_dir, "a region log file is missing");
             }
             continue;
         }
@@ -2590,7 +2629,7 @@ pub fn startup_check(
             .map(|v| v as u64)
             .unwrap_or(0);
         if rtip < ra {
-            return full_rebuild(conn, data_dir);
+            return full_rebuild(conn, data_dir, "a region log is shorter than its applied mark");
         }
         if ra > 0 {
             let chain: Option<Vec<u8>> = rconn
@@ -2603,7 +2642,7 @@ pub fn startup_check(
                 .map_err(map_db("read region chain"))?;
             match chain {
                 Some(c) if hex::encode(&c) == rh => {}
-                _ => return full_rebuild(conn, data_dir),
+                _ => return full_rebuild(conn, data_dir, "a region log disagrees with its applied mark"),
             }
         }
         if rtip > ra {
@@ -2627,7 +2666,7 @@ pub fn startup_check(
                 "pvfs: incremental fold failed ({e}); discarding the projection \
                  cache and replaying the full log"
             );
-            return full_rebuild(conn, data_dir);
+            return full_rebuild(conn, data_dir, "incremental fold failed");
         }
     }
     Ok(identity)
