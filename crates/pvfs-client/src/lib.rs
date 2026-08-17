@@ -22,6 +22,7 @@ use pvfs_proto::{
 
 pub use pvfs_proto::{
     ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
+    PROTO_VERSION,
 };
 
 pub mod advertise;

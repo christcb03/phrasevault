@@ -688,11 +688,56 @@ run `pvfs member replace <file>`).
 
 ---
 
+## 9.5 Upgrading a fleet without stopping it
+
+`pvfs versions` reports what matters before an upgrade:
+
+```bash
+pvfs versions            # bare works; --json for scripts
+```
+```
+pvfs             : 1.4.0
+wire proto       : 3
+projection schema: 8 (this binary)
+this forest      : 7 — will upgrade on next open (per-box cache; …)
+```
+
+Read those three lines like this:
+
+- **projection schema** — the local cache in `index.db`. It is rebuildable from
+  the log and **every box has its own**, so a schema-only change is a *per-box*
+  concern. Upgrade one machine at a time; the others keep serving throughout,
+  and readers simply fall through to them. The fleet never has to stop.
+- **wire proto** — how boxes talk to each other. A change here is **fleet-wide**:
+  mixed versions have to negotiate, so plan it deliberately rather than rolling
+  it machine by machine.
+- **pvfs** — the release.
+
+Within a single machine, everything sharing a data dir (`pvfsd`, the CLI, any
+`pvosd`) must move together: an older binary refuses a newer projection, and a
+read-only view cannot rebuild one. So per box: stop them, install, open the
+forest once while it is quiet, start them again.
+
+Opening on a newer binary does the upgrade. An **additive** change migrates in
+place — sub-second even on a large forest — and says so:
+
+```
+pvfs: projection migrated v7 → v8 (folder_bindings.bound_by from FolderBound) — no replay needed
+```
+
+Anything it cannot migrate safely falls back to replaying the log, which is
+always correct but costs time proportional to the log (~30 s for 80k events),
+and likewise says so. Both messages name their reason; a rebuild that keeps
+*recurring* is a bug worth reporting, not the one-time upgrade path.
+
+---
+
 ## 10. Command reference (summary)
 
 | Command | What it does |
 |---------|--------------|
 | `pvfs forest init [--mount DIR] [--no-import]` | Create a forest (as your user); self-enrolls this box's client identity with read (§7.9). |
+| `pvfs versions [--json]` | Release, wire proto, and projection schema — and, in a forest, the schema the on-disk cache is at (§9.5). |
 | `pvfs forest register <mount> [--alias N]` | Register host-wide (`sudo`). |
 | `pvfs forest unregister <alias\|mount>` | Remove from the registry (keeps `.pvfs/`). |
 | `pvfs forest fix-permissions [--mount DIR]` | Repair `.pvfs/` ownership (`sudo` if root-owned). |

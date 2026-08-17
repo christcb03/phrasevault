@@ -207,6 +207,11 @@ enum Cmd {
     /// List the forest's space enrollments (doc 21): folder, source dir,
     /// kind (in-place|migrate|mirror), store, and options
     Bindings,
+    /// Show this binary's version numbers — and, in a forest, the version the
+    /// on-disk projection is at. What an upgrade needs to decide whether it can
+    /// roll box by box (D71): a `proto` change is fleet-wide and needs the
+    /// version handshake, while a `schema` change is a per-box cache rebuild.
+    Versions,
     /// Node + per-location availability (target: URI / path / node id)
     Stat { target: String },
     /// Stream a file node's bytes (verifies full reads)
@@ -4801,6 +4806,52 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
             engine.close()
+        }
+        Cmd::Versions => {
+            // The on-disk projection version is read RAW, without opening an
+            // engine: opening is what migrates or rebuilds it, and the whole
+            // point here is to report the state an upgrade is about to act on.
+            let on_disk: Option<u32> = ctx
+                .as_ref()
+                .ok()
+                .and_then(|dir| pvfs_core::projection::on_disk_schema_version(dir));
+            if json {
+                println!(
+                    "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{},\"projection_schema\":{}}}",
+                    env!("CARGO_PKG_VERSION"),
+                    pvfs_client::PROTO_VERSION,
+                    pvfs_core::projection::SCHEMA_VERSION,
+                    match on_disk {
+                        Some(v) => v.to_string(),
+                        None => "null".into(),
+                    }
+                );
+            } else {
+                println!("pvfs             : {}", env!("CARGO_PKG_VERSION"));
+                println!("wire proto       : {}", pvfs_client::PROTO_VERSION);
+                println!(
+                    "projection schema: {} (this binary)",
+                    pvfs_core::projection::SCHEMA_VERSION
+                );
+                match on_disk {
+                    Some(v) if v == pvfs_core::projection::SCHEMA_VERSION => {
+                        println!("this forest      : {v} — up to date");
+                    }
+                    Some(v) if v < pvfs_core::projection::SCHEMA_VERSION => {
+                        println!(
+                            "this forest      : {v} — will upgrade on next open (per-box cache; \
+                             the fleet does not need to stop)"
+                        );
+                    }
+                    Some(v) => {
+                        println!(
+                            "this forest      : {v} — NEWER than this binary; it will refuse to open"
+                        );
+                    }
+                    None => println!("this forest      : (no forest here)"),
+                }
+            }
+            Ok(())
         }
         Cmd::Bindings => {
             let engine = Engine::open(&ctx?)?;

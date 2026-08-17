@@ -2385,6 +2385,126 @@ fn replay_sealed_child(
 
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
 /// tree-replay every log from its genesis seed. Temp tables start empty.
+/// The schema version recorded in a forest's projection on disk, without
+/// opening an engine (D71).
+///
+/// Opening is what migrates or rebuilds the cache, so anything that wants to
+/// *report* the state an upgrade is about to act on has to read it raw.
+/// `None` = no forest here, or a projection too damaged to say.
+pub fn on_disk_schema_version(data_dir: &std::path::Path) -> Option<u32> {
+    let conn = Connection::open(data_dir.join("index.db")).ok()?;
+    conn.query_row(
+        "SELECT v FROM projection_meta WHERE k = 'schema_version'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()?
+    .parse()
+    .ok()
+}
+
+// ---- projection migrations (D71) --------------------------------------------
+
+/// Bring the cache forward one schema version at a time WITHOUT dropping it.
+///
+/// Most schema changes are additive: a new column whose value comes from event
+/// kinds already in the log. Dropping all of `MAIN_OBJECTS` and replaying every
+/// event to fill one column costs the entire log — on the D69 fleet owner that
+/// is 59,365 events, and on the production media library it is minutes during
+/// which that box is unavailable. A migration turns the common case into an
+/// `ALTER` plus a targeted pass.
+///
+/// **A migration is only ever an optimisation.** Any failure, and any version
+/// with no registered step, falls back to [`full_rebuild`], which is always
+/// correct. So a migration is free to refuse — and MUST refuse rather than
+/// guess. Returns a description of what it did, or `None` to mean "rebuild".
+fn migrate_projection(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    from: u32,
+) -> Option<String> {
+    // Region logs are attached and detached during replay; a migration reads
+    // only the top log, so a forest with live region logs is refused outright
+    // rather than half-migrated. (The media fleet has none — the fast path is
+    // exactly where it is needed.)
+    let has_regions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM regions WHERE log_file IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if has_regions != 0 {
+        return None;
+    }
+
+    let _folds = lock_folds(data_dir).ok()?;
+    let mut done: Vec<&'static str> = Vec::new();
+    let mut v = from;
+    while v < SCHEMA_VERSION {
+        let step = match v {
+            7 => migrate_v7_to_v8(conn).map(|_| "folder_bindings.bound_by from FolderBound"),
+            _ => return None, // no registered step — rebuild
+        };
+        match step {
+            Ok(what) => done.push(what),
+            Err(_) => return None, // anything unexpected → rebuild, never guess
+        }
+        v += 1;
+    }
+    meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string()).ok()?;
+    Some(done.join("; "))
+}
+
+/// v7 → v8 (D71 W1): `folder_bindings.bound_by`, filled from the author each
+/// `FolderBound` event has always carried.
+fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
+    let have: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('folder_bindings') WHERE name = 'bound_by'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_db("inspect folder_bindings"))?;
+    if have == 0 {
+        conn.execute_batch(
+            "ALTER TABLE folder_bindings ADD COLUMN bound_by BLOB NOT NULL DEFAULT x''",
+        )
+        .map_err(map_db("add bound_by"))?;
+    }
+    let db = attach_name("");
+    let tx = conn.transaction().map_err(map_db("migrate v8"))?;
+    {
+        // Ascending seq, so the newest FolderBound for a folder wins — the same
+        // last-writer-wins the fold's upsert applies.
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT kind, body FROM {db}.events WHERE kind = ?1 ORDER BY seq"
+            ))
+            .map_err(map_db("read folder binds"))?;
+        let rows = stmt
+            .query_map(params![crate::event::K_FOLDER_BOUND], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_db("read folder binds"))?;
+        for row in rows {
+            let (kind, body) = row.map_err(map_db("read folder binds"))?;
+            if let Event::FolderBound {
+                folder_id, author, ..
+            } = Event::decode(&kind, &body)?
+            {
+                tx.execute(
+                    "UPDATE folder_bindings SET bound_by = ?1 WHERE folder_id = ?2",
+                    params![author, folder_id],
+                )
+                .map_err(map_db("fill bound_by"))?;
+            }
+        }
+    }
+    tx.commit().map_err(map_db("migrate v8"))?;
+    Ok(())
+}
+
 pub fn full_rebuild(
     conn: &mut Connection,
     data_dir: &std::path::Path,
@@ -2551,13 +2671,27 @@ pub fn startup_check(
         // self-heals: drop the projection and replay under the current schema (doc 10
         // §6 — `full_rebuild` recreates `projection_meta`, so the version is reset to
         // current). A **newer** schema than this binary understands is a hard stop.
-        if version < SCHEMA_VERSION {
-            return full_rebuild(conn, data_dir, "projection schema is older than this binary");
+        if version > SCHEMA_VERSION {
+            return Err(PvfsError::SchemaVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
         }
-        return Err(PvfsError::SchemaVersion {
-            found: version,
-            supported: SCHEMA_VERSION,
-        });
+        // D71: try the cheap door first. An additive change migrates in place
+        // (an ALTER plus a targeted pass) instead of replaying the whole log,
+        // which is the difference between a blink and minutes of a box being
+        // unavailable. Refusal is always safe — it just means the slow door.
+        match migrate_projection(conn, data_dir, version) {
+            Some(what) => {
+                eprintln!(
+                    "pvfs: projection migrated v{version} → v{SCHEMA_VERSION} ({what}) \
+                     — no replay needed"
+                );
+            }
+            None => {
+                return full_rebuild(conn, data_dir, "projection schema is older than this binary")
+            }
+        }
     }
 
     // Step 3 — verify the index agrees with the top log at its applied point.
