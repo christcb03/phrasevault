@@ -22,13 +22,16 @@ use crate::log_store;
 // tracker) and `purged_nodes` (resurrection tombstones). Same upgrade.
 // v7 (P9.1, doc 22 §2): `chunk_manifests` — owner-attested chunk layouts
 // that license serve-while-fetching. Same upgrade.
+// v9 (D71 W6): `idx_nodes_label` — identity-by-content matches a file by
+// (label, exact size), and without an index that is a full scan of `nodes`
+// per imported file. Migrated in place (CREATE INDEX, no replay).
 // v8 (D71 W1): `folder_bindings.bound_by` — the device that bound the
 // folder, projected from the `FolderBound` event's existing `author`. A
 // binding names a directory on ONE machine, so scanning and watching must
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -243,6 +246,9 @@ CREATE TABLE IF NOT EXISTS projection_meta (
 CREATE INDEX IF NOT EXISTS idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_nodes_type         ON nodes(node_type);
+-- D71 W6: identity-by-content looks a file up by label; without this every
+-- imported file costs a full scan of `nodes`.
+CREATE INDEX IF NOT EXISTS idx_nodes_label        ON nodes(label) WHERE node_type = 'file';
 CREATE INDEX IF NOT EXISTS idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
@@ -2444,6 +2450,7 @@ fn migrate_projection(
     while v < SCHEMA_VERSION {
         let step = match v {
             7 => migrate_v7_to_v8(conn).map(|_| "folder_bindings.bound_by from FolderBound"),
+            8 => migrate_v8_to_v9(conn).map(|_| "idx_nodes_label"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2563,6 +2570,15 @@ fn open_scratch(data_dir: &std::path::Path) -> Result<Connection> {
     conn.execute_batch(crate::log_store::LOG_SCHEMA)
         .map_err(map_db("create log schema"))?;
     Ok(conn)
+}
+
+/// v8 → v9 (D71 W6): the label index identity matching needs. Pure DDL, so the
+/// migration is instant on any size of forest — no replay, nothing to fill.
+fn migrate_v8_to_v9(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label) WHERE node_type = 'file';",
+    )
+    .map_err(map_db("create idx_nodes_label"))
 }
 
 pub fn full_rebuild(

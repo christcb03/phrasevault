@@ -13,6 +13,9 @@ use pvfs_core::{Engine, PvfsError};
 /// How soon a failed pass tries again, and the ceiling it backs off to.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
+/// A file deferred as "still being written" needs a pass AFTER it settles —
+/// the last write is also the last inotify event, so nothing else would.
+const SETTLE_RECHECK: Duration = Duration::from_secs(20);
 
 /// Progress callbacks: stdout lines in the CLI, status rows in pvfsd.
 pub enum WatchEvent {
@@ -134,6 +137,13 @@ pub fn run(
                     Ok(reports) => {
                         retry_at = None;
                         backoff = RETRY_MIN;
+                        // D71 W6: files still being written were deferred, not
+                        // dropped. Nothing will re-trigger us once the copy
+                        // stops (the last inotify event is the last write), so
+                        // schedule the pass that will pick them up.
+                        if reports.iter().any(|r| r.stats.settling > 0) {
+                            retry_at = Some(Instant::now() + SETTLE_RECHECK);
+                        }
                         for r in reports
                             .iter()
                             .filter(|r| r.stats.added + r.stats.changed + r.stats.removed > 0)
@@ -184,7 +194,7 @@ fn scan_pass(
             let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &**sign;
             let mut w =
                 crate::advertise::RoutedScanWriter::new(engine.data_dir(), client, signer);
-            let reports = engine.scan_routed(None, Some(&mut w))?;
+            let reports = engine.scan_routed(None, Some(&mut w), pvfs_core::WATCH_SETTLE_MS)?;
             // Read-your-writes — the same F5.0 precedent `advertise` follows.
             // A routed write lands in the OWNER's log, and this box does not
             // see it until the tail is folded here. Skip this and the next
@@ -199,6 +209,6 @@ fn scan_pass(
             }
             Ok(reports)
         }
-        None => engine.scan(None),
+        None => engine.scan_routed(None, None, pvfs_core::WATCH_SETTLE_MS),
     }
 }

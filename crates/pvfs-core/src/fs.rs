@@ -19,6 +19,17 @@ use crate::storage::{
 
 const SPOOL_DIR: &str = "tmp";
 const TMP_URI_PREFIX: &str = "pvfs-tmp:///";
+/// How long a file must have been untouched before the WATCHER will catalogue
+/// it (D71 W6). Sonarr copies rather than renames, so a file appears under its
+/// final name while still growing.
+///
+/// Deliberately **not** the default for `scan`: a one-shot scan, and
+/// `forest init --import`, are asked to index what is on disk NOW, and a file
+/// copied a minute ago is complete, not mid-write. Making this unconditional
+/// changed the meaning of every scan in the codebase and broke 18 tests, which
+/// was the correct signal. Only the continuous watcher — the one thing that
+/// genuinely races an import — passes a non-zero window.
+pub const WATCH_SETTLE_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashPolicy {
@@ -115,6 +126,12 @@ pub struct ScanStats {
     pub skipped: u64,
     /// Present on disk but the operator can't read it, so it was not imported.
     pub unreadable: u64,
+    /// D71 W6: recognised as a file the catalog already knows, found somewhere
+    /// else in the tree. No new node was made — only a location added.
+    pub relocated: u64,
+    /// D71 W6: still being written when we looked, so deliberately NOT
+    /// catalogued yet. Deferred, never dropped — the next pass takes it.
+    pub settling: u64,
     /// D71 W4: the catalog refused this file for a reason retrying cannot fix
     /// (authorization, bad input). The pass skipped it and carried on — one bad
     /// file must never stop the line — but it needs a human. `quarantined`
@@ -476,7 +493,7 @@ impl Engine {
     /// binding explicitly is a clear error rather than a silent skip: the
     /// caller asked for something this machine cannot do.
     pub fn scan(&mut self, folder: Option<&NodeId>) -> Result<Vec<ScanReport>> {
-        self.scan_routed(folder, None)
+        self.scan_routed(folder, None, 0)
     }
 
     /// `scan`, with the catalog writes sent somewhere other than this engine
@@ -485,6 +502,7 @@ impl Engine {
         &mut self,
         folder: Option<&NodeId>,
         mut writer: Option<&mut dyn ScanWriter>,
+        settle_ms: u64,
     ) -> Result<Vec<ScanReport>> {
         // A replica with no route cannot write a single thing it finds, so say
         // so ONCE, up front, naming the fix — rather than walking the whole
@@ -522,7 +540,7 @@ impl Engine {
         };
         let mut reports = Vec::new();
         for b in bindings {
-            let stats = self.scan_binding(&b, &mut writer)?;
+            let stats = self.scan_binding(&b, &mut writer, settle_ms)?;
             reports.push(ScanReport {
                 folder_id: b.folder_id.clone(),
                 stats,
@@ -535,6 +553,7 @@ impl Engine {
         &mut self,
         b: &Binding,
         writer: &mut Option<&mut dyn ScanWriter>,
+        settle_ms: u64,
     ) -> Result<ScanStats> {
         let root = uri_to_path(&b.source_uri)?;
         let st = LocalBackend.stat(&b.source_uri)?;
@@ -550,7 +569,14 @@ impl Engine {
         // 1. pure-FS walk
         let mut files = Vec::new();
         let mut visited = HashSet::new();
-        walk_disk(&root, Vec::new(), b.recursive, &mut visited, &mut files, &mut stats, b)?;
+        walk_disk(
+            &root,
+            Vec::new(),
+            &mut visited,
+            &mut files,
+            &mut stats,
+            &WalkCtx { binding: b, settle_ms },
+        )?;
 
         // 2. mirror folders + ingest files
         let mut folder_ids: HashMap<String, NodeId> = HashMap::new();
@@ -682,6 +708,56 @@ impl Engine {
         Ok(current)
     }
 
+    /// D71 W6 — identity by content, not by path.
+    ///
+    /// Chris's rule: *files with the same name and exact size are really the
+    /// same file even living in different folders, so it doesn't have to
+    /// re-catalogue, just change the pointer location.* Without this a file
+    /// that moves is a NEW file, which is why a migrated copy would be
+    /// catalogued twice and why reorganising folders would duplicate a library.
+    ///
+    /// **Ambiguity refuses.** Two candidates (two `poster.jpg` of equal size in
+    /// different shows) is not a match — sidecars are exactly where a
+    /// name+size rule would otherwise invent nonsense. One candidate, or none.
+    ///
+    /// Honest about what this is: a heuristic, not a proof. Two files can share
+    /// a name and an exact size and differ in bytes. It never overrides a hash
+    /// that disagrees, and the first hash computed for either side settles it.
+    fn match_by_identity(&self, label: &str, size: u64) -> Result<Option<NodeId>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                // "Live" is not a column on `nodes` — it is having an active
+                // containing link. Joining on that also means a file Sonarr
+                // DELETED is never matched and silently resurrected: a deletion
+                // is a decision, and the same bytes arriving later are new.
+                "SELECT DISTINCT n.id, n.payload FROM nodes n
+                   JOIN links l ON l.child_id = n.id AND l.removed_at IS NULL
+                  WHERE n.label = ?1 AND n.node_type = ?2",
+            )
+            .map_err(map_db("identity match"))?;
+        let rows = stmt
+            .query_map(params![label, node::TYPE_FILE], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_db("identity match"))?;
+        let mut hit: Option<NodeId> = None;
+        for row in rows {
+            let (id, payload) = row.map_err(map_db("identity match"))?;
+            let same = FilePayload::decode(&payload)
+                .map(|p| p.size_bytes == size)
+                .unwrap_or(false);
+            if !same {
+                continue;
+            }
+            if hit.is_some() {
+                return Ok(None); // ambiguous — refuse rather than guess
+            }
+            hit = Some(id);
+        }
+        Ok(hit)
+    }
+
     fn ingest_file(
         &mut self,
         b: &Binding,
@@ -762,6 +838,21 @@ impl Engine {
                 return Ok(());
             }
         }
+        // D71 W6 — before deciding this is new, ask whether the catalog already
+        // knows it under another path. A migrated copy, a moved folder, a
+        // re-import: same file, new place. Record the location, not a new node.
+        if let Some(known) = self.match_by_identity(&f.name, f.size)? {
+            match writer {
+                Some(w) => w.add_location(&known, uri)?,
+                None => {
+                    self.add_location(&known, uri)?;
+                }
+            }
+            self.set_scan_state(uri, f.size, f.mtime_ms, &known)?;
+            stats.relocated += 1;
+            return Ok(());
+        }
+
         // brand-new file ⇒ pointer node + location. P9.1: hashing computes
         // the chunk manifest in the same read and attests it after the node
         // exists (doc 22 §2).
@@ -1690,14 +1781,24 @@ fn row_to_binding(r: &rusqlite::Row<'_>) -> std::result::Result<Result<Binding>,
     }))
 }
 
+/// What a disk walk needs to know about the scan it belongs to. Bundled
+/// because `recursive` and the settle window both come from the same place as
+/// the binding, and passing them individually pushed the walk past clippy's
+/// argument limit — a fair complaint about a growing parameter list.
+struct WalkCtx<'a> {
+    binding: &'a Binding,
+    /// 0 = index whatever is on disk now (a one-shot scan, `--import`);
+    /// non-zero = the watcher's "has it stopped being written" window.
+    settle_ms: u64,
+}
+
 fn walk_disk(
     dir: &std::path::Path,
     rel: Vec<String>,
-    recursive: bool,
     visited: &mut HashSet<PathBuf>,
     files: &mut Vec<DiskFile>,
     stats: &mut ScanStats,
-    b: &Binding,
+    ctx: &WalkCtx<'_>,
 ) -> Result<()> {
     let canon = std::fs::canonicalize(dir).map_err(|e| PvfsError::io("canonicalize", e))?;
     if !visited.insert(canon) {
@@ -1711,7 +1812,7 @@ fn walk_disk(
         }
         let child = dir.join(&entry.name);
         if entry.is_dir {
-            if recursive {
+            if ctx.binding.recursive {
                 // Skip directories the operator can't traverse/read rather than
                 // aborting the whole import — never index what you can't read.
                 if !is_accessible(&child, true) {
@@ -1720,18 +1821,18 @@ fn walk_disk(
                 }
                 let mut sub = rel.clone();
                 sub.push(entry.name.clone());
-                walk_disk(&child, sub, recursive, visited, files, stats, b)?;
+                walk_disk(&child, sub, visited, files, stats, ctx)?;
             }
             continue;
         }
-        if !b.extensions.is_empty() {
+        if !ctx.binding.extensions.is_empty() {
             let ext = entry
                 .name
                 .rsplit('.')
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !b.extensions.iter().any(|e| e == &ext) {
+            if !ctx.binding.extensions.iter().any(|e| e == &ext) {
                 stats.skipped += 1;
                 continue;
             }
@@ -1739,6 +1840,22 @@ fn walk_disk(
         // Never import a file the operator cannot read.
         if !is_accessible(&child, false) {
             stats.unreadable += 1;
+            continue;
+        }
+        // D71 W6 — do not catalogue a file that is still being written.
+        //
+        // Measured on feederbox: Sonarr COPIES into the library (every sampled
+        // file has link count 1, because its source and destination are
+        // different filesystems from its own view), so a 5.8 GB import grows
+        // under its final name for minutes. Identity is by EXACT SIZE, so
+        // cataloguing a half-copied file records a wrong size and then
+        // confidently mis-identifies it later.
+        //
+        // mtime is the cheapest possible "has it stopped moving" test and
+        // needs no stored state: a growing file's mtime keeps advancing.
+        // Deferred, never dropped — counted, and the watcher comes back.
+        if ctx.settle_ms > 0 && entry.mtime_ms.saturating_add(ctx.settle_ms) > now_ms() {
+            stats.settling += 1;
             continue;
         }
         files.push(DiskFile {
