@@ -2459,6 +2459,12 @@ fn migrate_projection(
 /// v7 → v8 (D71 W1): `folder_bindings.bound_by`, filled from the author each
 /// `FolderBound` event has always carried.
 fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
+    // Rebuilt, not ALTERed. `ALTER TABLE ... ADD COLUMN` appends the column at
+    // the END, so a migrated table and a freshly created one would hold the
+    // same values in a DIFFERENT column order — a divergence that is invisible
+    // to every named query and then bites the first thing that copies the table
+    // positionally (it broke the rebuild swap on a live 82k-event forest).
+    // A migrated cache must be structurally identical to a rebuilt one.
     let have: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('folder_bindings') WHERE name = 'bound_by'",
@@ -2467,10 +2473,29 @@ fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
         )
         .map_err(map_db("inspect folder_bindings"))?;
     if have == 0 {
-        conn.execute_batch(
-            "ALTER TABLE folder_bindings ADD COLUMN bound_by BLOB NOT NULL DEFAULT x''",
+        let tx = conn.transaction().map_err(map_db("reshape bindings"))?;
+        tx.execute_batch(
+            "ALTER TABLE folder_bindings RENAME TO folder_bindings_v7;
+             CREATE TABLE folder_bindings (
+               folder_id   TEXT PRIMARY KEY,
+               source_uri  TEXT NOT NULL,
+               recursive   INTEGER NOT NULL,
+               auto_index  INTEGER NOT NULL,
+               extensions  TEXT NOT NULL,
+               hash_policy TEXT NOT NULL,
+               bound_at    INTEGER NOT NULL,
+               bound_by    BLOB NOT NULL DEFAULT x'',
+               unbound_at  INTEGER
+             );
+             INSERT INTO folder_bindings
+               (folder_id, source_uri, recursive, auto_index, extensions,
+                hash_policy, bound_at, unbound_at)
+             SELECT folder_id, source_uri, recursive, auto_index, extensions,
+                    hash_policy, bound_at, unbound_at FROM folder_bindings_v7;
+             DROP TABLE folder_bindings_v7;",
         )
         .map_err(map_db("add bound_by"))?;
+        tx.commit().map_err(map_db("reshape bindings"))?;
     }
     let db = attach_name("");
     let tx = conn.transaction().map_err(map_db("migrate v8"))?;
@@ -2505,6 +2530,41 @@ fn migrate_v7_to_v8(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// The scratch projection a rebuild is built into before it replaces the live
+/// one. Left behind only by a process that died mid-rebuild, and removed by the
+/// next one — the live cache is never the casualty.
+fn rebuild_scratch(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("index.rebuild")
+}
+
+fn clear_scratch(data_dir: &std::path::Path) {
+    let p = rebuild_scratch(data_dir);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+    }
+}
+
+/// A connection whose `main` IS the scratch file, with the forest's log
+/// attached exactly as a real engine has it — so the replay code folds into the
+/// scratch unmodified, with no qualified-name surgery.
+fn open_scratch(data_dir: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(rebuild_scratch(data_dir)).map_err(map_db("open rebuild db"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(map_db("busy timeout"))?;
+    let log_path = data_dir.join("log.db").to_string_lossy().into_owned();
+    conn.execute("ATTACH DATABASE ?1 AS log", params![log_path])
+        .map_err(map_db("attach log.db"))?;
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(
+        Some(rusqlite::DatabaseName::Attached("log")),
+        "journal_mode",
+        "WAL",
+    );
+    conn.execute_batch(crate::log_store::LOG_SCHEMA)
+        .map_err(map_db("create log schema"))?;
+    Ok(conn)
+}
+
 pub fn full_rebuild(
     conn: &mut Connection,
     data_dir: &std::path::Path,
@@ -2524,13 +2584,74 @@ pub fn full_rebuild(
          (large forests take a few minutes)"
     );
     let identity = decode_genesis(conn)?;
-    for t in MAIN_OBJECTS {
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))
-            .map_err(map_db("drop projection table"))?;
+
+    // D71 — BUILD BESIDE, THEN SWAP.
+    //
+    // This used to drop the live tables and replay into them, so for the whole
+    // replay every reader — the daemon's read views included — saw an EMPTY
+    // cache and answered from it. On a large forest that is minutes of a box
+    // confidently returning nothing, and a crash mid-replay left a half-built
+    // cache behind as the real one.
+    //
+    // The replay now happens in a scratch database beside the live one, and the
+    // result lands in a SINGLE transaction. Readers see the old cache for the
+    // whole rebuild and the new one after one commit — never a partial. A
+    // process that dies mid-rebuild leaves only the scratch, which the next
+    // rebuild clears; the live cache was never touched.
+    clear_scratch(data_dir);
+    let built = (|| -> Result<()> {
+        let mut fresh = open_scratch(data_dir)?;
+        create_schema(&fresh)?;
+        replay_log(&mut fresh, data_dir, &identity, "", 0)?;
+        // Verify BEFORE it can become the live cache: a forest that fails this
+        // must not have its old cache replaced by the bad one.
+        check_pending_moves(&fresh, data_dir)?;
+        fresh.close().map_err(|(_, e)| map_db("close rebuild db")(e))
+    })();
+    if let Err(e) = built {
+        clear_scratch(data_dir);
+        return Err(e);
     }
-    create_schema(conn)?;
-    replay_log(conn, data_dir, &identity, "", 0)?;
-    check_pending_moves(conn, data_dir)?;
+
+    // The swap — DDL included, all inside ONE transaction.
+    //
+    // The live tables are dropped and recreated here rather than emptied,
+    // because the shape we are replacing may not be the shape we are building:
+    // a rebuild triggered by a schema bump finds the OLD columns, and a table
+    // that reached v8 through the migration has `bound_by` appended last while
+    // a freshly created one has it before `unbound_at`. Recreating both sides
+    // from the one `INDEX_SCHEMA` makes the copy order-independent by
+    // construction — `SELECT *` across two differently-ordered tables silently
+    // maps the wrong columns onto each other, which is exactly how this was
+    // found (a live 82k-event forest, `NOT NULL constraint failed:
+    // folder_bindings.bound_by`).
+    //
+    // SQLite's DDL is transactional, so readers still see the old cache until
+    // the commit and the new one after it — dropping inside the transaction
+    // costs nothing in visibility.
+    let scratch = rebuild_scratch(data_dir).to_string_lossy().into_owned();
+    conn.execute("ATTACH DATABASE ?1 AS fresh", params![scratch])
+        .map_err(map_db("attach rebuild db"))?;
+    let swapped = (|| -> Result<()> {
+        let tx = conn.transaction().map_err(map_db("swap projection"))?;
+        for t in MAIN_OBJECTS {
+            tx.execute_batch(&format!("DROP TABLE IF EXISTS main.{t};"))
+                .map_err(map_db("swap: drop old table"))?;
+        }
+        tx.execute_batch(INDEX_SCHEMA)
+            .map_err(map_db("swap: recreate schema"))?;
+        for t in MAIN_OBJECTS {
+            tx.execute_batch(&format!(
+                "INSERT INTO main.{t} SELECT * FROM fresh.{t};"
+            ))
+            .map_err(map_db("swap projection table"))?;
+        }
+        tx.commit().map_err(map_db("swap projection"))
+    })();
+    let _ = conn.execute_batch("DETACH DATABASE fresh");
+    clear_scratch(data_dir);
+    swapped?;
+
     meta_set(conn, "clean_shutdown", "0")?;
     Ok(identity)
 }

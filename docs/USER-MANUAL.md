@@ -730,6 +730,12 @@ always correct but costs time proportional to the log (~30 s for 80k events),
 and likewise says so. Both messages name their reason; a rebuild that keeps
 *recurring* is a bug worth reporting, not the one-time upgrade path.
 
+A replay is built **beside** the live cache and swapped in at a single commit,
+so readers keep getting correct answers from the old cache for the whole
+rebuild rather than an empty one — and a rebuild that fails, or a machine that
+loses power halfway through, leaves the old cache intact. It needs room for a
+second copy of the index while it runs.
+
 ---
 
 ## 10. Command reference (summary)
