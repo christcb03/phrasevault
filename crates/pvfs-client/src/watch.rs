@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 use pvfs_core::{Engine, PvfsError};
 
+/// How soon a failed pass tries again, and the ceiling it backs off to.
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Progress callbacks: stdout lines in the CLI, status rows in pvfsd.
 pub enum WatchEvent {
     /// A scan pass ingested changes: (folder_id, added, changed, removed).
@@ -105,6 +109,12 @@ pub fn run(
         let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
         let mut dirty_since: Option<Instant> = None;
         let mut last_reconcile = Instant::now();
+        // A failed pass must come back SOON, not at the next reconcile — that
+        // is an hour on the daemon, which is no kind of autocorrect. A scan is
+        // idempotent, so retrying is free of consequence; back off so a
+        // genuinely stuck forest does not spin.
+        let mut retry_at: Option<Instant> = None;
+        let mut backoff = RETRY_MIN;
 
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(500)) {
@@ -116,11 +126,14 @@ pub fn run(
                 .map(|t| t.elapsed() >= debounce)
                 .unwrap_or(false);
             let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
-            if due_debounce || due_reconcile {
+            let due_retry = retry_at.is_some_and(|t| Instant::now() >= t);
+            if due_debounce || due_reconcile || due_retry {
                 dirty_since = None;
                 last_reconcile = Instant::now();
                 match scan_pass(&mut engine, &mut route) {
                     Ok(reports) => {
+                        retry_at = None;
+                        backoff = RETRY_MIN;
                         for r in reports
                             .iter()
                             .filter(|r| r.stats.added + r.stats.changed + r.stats.removed > 0)
@@ -133,7 +146,13 @@ pub fn run(
                             ));
                         }
                     }
-                    Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
+                    Err(e) => {
+                        // Loud, and self-correcting: say so, then come back
+                        // shortly rather than waiting out the reconcile.
+                        notify_cb(WatchEvent::ScanError(e.to_string()));
+                        retry_at = Some(Instant::now() + backoff);
+                        backoff = (backoff * 2).min(RETRY_MAX);
+                    }
                 }
             }
         }
@@ -163,7 +182,8 @@ fn scan_pass(
     match route {
         Some((client, sign)) => {
             let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &**sign;
-            let mut w = crate::advertise::RoutedScanWriter::new(client, signer);
+            let mut w =
+                crate::advertise::RoutedScanWriter::new(engine.data_dir(), client, signer);
             let reports = engine.scan_routed(None, Some(&mut w))?;
             // Read-your-writes — the same F5.0 precedent `advertise` follows.
             // A routed write lands in the OWNER's log, and this box does not

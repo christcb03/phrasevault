@@ -308,6 +308,34 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Map a remote failure for the SCAN path, preserving whether it is transient.
+///
+/// The wire flattens errors to text, and `remote_err` turns every one of them
+/// into `BadInput` — which `is_transient` correctly reads as "retrying will
+/// never help". For a routed scan that is exactly wrong: a busy database or a
+/// dropped connection is the most ordinary thing that can happen, and it must
+/// come back as retryable or the file is quarantined forever. The D71 lab
+/// showed this precisely — every routed write failing on `SQLite is busy` was
+/// filed as permanent, so the pass never recovered.
+///
+/// Sniffing the text is not elegant; it is what the wire leaves us. Anything
+/// unrecognised stays `BadInput`, so the default is still "ask a human".
+fn scan_remote_err(e: impl std::fmt::Display) -> PvfsError {
+    let msg = e.to_string();
+    let low = msg.to_ascii_lowercase();
+    let transient = [
+        "busy", "locked", "timeout", "timed out", "connection", "broken pipe",
+        "reset", "refused", "unreachable", "eof", "closed",
+    ]
+    .iter()
+    .any(|k| low.contains(k));
+    if transient {
+        PvfsError::Busy { op: "routed scan write".into(), retries: 0 }
+    } else {
+        PvfsError::BadInput { field: "scan".into(), reason: msg }
+    }
+}
+
 /// A [`ScanWriter`] that sends a replica's scan writes to the owner's daemon
 /// (D71 W4).
 ///
@@ -318,11 +346,33 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
 pub struct RoutedScanWriter<'a> {
     client: &'a mut Client,
     sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>,
+    /// This box's transport pin, so the locations it writes say WHOSE disk the
+    /// bytes are on.
+    pin: Option<String>,
 }
 
 impl<'a> RoutedScanWriter<'a> {
-    pub fn new(client: &'a mut Client, sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>) -> Self {
-        Self { client, sign }
+    pub fn new(
+        data_dir: &Path,
+        client: &'a mut Client,
+        sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>,
+    ) -> Self {
+        Self { client, sign, pin: pvfs_core::storage::host_pin(data_dir) }
+    }
+
+    /// A scan finds files by local path, but the row is being written into the
+    /// OWNER's catalog — where `file:///mnt/local/...` names a path that does
+    /// not exist. Qualify it with this box's pin so the fleet knows who holds
+    /// the bytes, exactly as the retired arr hook's `loc add --here` did.
+    ///
+    /// Caught on the lab by reading the row back: the first version wrote a
+    /// bare `file://` and the owner would have tried to `tier` from its own
+    /// non-existent path.
+    fn own(&self, uri: &str) -> String {
+        match (&self.pin, uri.strip_prefix("file://")) {
+            (Some(pin), Some(path)) => format!("pvfs-host://{pin}{path}"),
+            _ => uri.to_string(),
+        }
     }
 }
 
@@ -330,7 +380,7 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
     fn add_folder(&mut self, parent: &str, label: &str) -> pvfs_core::Result<String> {
         self.client
             .mkdir(parent, label, |d| (self.sign)(d))
-            .map_err(remote_err)
+            .map_err(scan_remote_err)
     }
 
     fn add_file(
@@ -342,20 +392,22 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
     ) -> pvfs_core::Result<String> {
         self.client
             .add_file(parent, label, size, mime, |d| (self.sign)(d))
-            .map_err(remote_err)
+            .map_err(scan_remote_err)
     }
 
     fn add_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
+        let uri = self.own(uri);
         self.client
-            .add_location(file, uri, |d| (self.sign)(d))
+            .add_location(file, &uri, |d| (self.sign)(d))
             .map(|_| ())
-            .map_err(remote_err)
+            .map_err(scan_remote_err)
     }
 
     fn remove_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
+        let uri = self.own(uri);
         self.client
-            .remove_location(file, uri, |d| (self.sign)(d))
+            .remove_location(file, &uri, |d| (self.sign)(d))
             .map(|_| ())
-            .map_err(remote_err)
+            .map_err(scan_remote_err)
     }
 }
