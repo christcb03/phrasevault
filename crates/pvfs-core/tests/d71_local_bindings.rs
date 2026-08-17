@@ -88,17 +88,14 @@ fn a_replica_can_bind_its_own_directory() {
     e.close().unwrap();
 }
 
-/// KNOWN GAP, pinned deliberately (D71 §3e): a replica can now *enrol* a
-/// directory, and `scan(None)` correctly reaches that binding and no other —
-/// but the scan's catalog writes still go through the local engine, which a
-/// replica refuses. The remaining work is to route them, exactly as
-/// `advertise` already routes its writes.
+/// A replica's scan must be ROUTED. Asked to scan with no route it says so
+/// once, naming the fix, instead of walking the library and quarantining every
+/// file with the same reason — the cause is the configuration, not the files.
 ///
-/// This test asserts the CURRENT behaviour so the suite stays honest. When
-/// routing lands it will fail, and the fix is to flip it to the success case:
-/// one report, for this folder, with the file catalogued.
+/// The routed path itself is proven end to end against a live daemon on the
+/// fleet, not here: it needs an owner to talk to.
 #[test]
-fn a_replica_cannot_yet_scan_what_it_bound() {
+fn a_replica_scan_without_a_route_says_so_once() {
     let (_owner, rep, folder) = owner_and_replica();
     let src = tempfile::tempdir().unwrap();
     fs::write(src.path().join("ep.mkv"), b"bytes").unwrap();
@@ -109,8 +106,8 @@ fn a_replica_cannot_yet_scan_what_it_bound() {
     e.close().unwrap();
 
     assert!(
-        err.contains("read-only") || err.contains("only writer"),
-        "expected the replica write refusal, got: {err}"
+        err.contains("routed to the owner"),
+        "expected the one clear configuration error, got: {err}"
     );
 }
 

@@ -40,7 +40,7 @@ pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
     BindKind, BindSpec, Binding, BindingRow, HashPolicy, NodeStat, PendingChange, ResolveAction,
-    ScanReport, ScanStats, VerifyOutcome,
+    ScanReport, ScanStats, ScanWriter, VerifyOutcome,
 };
 pub use identity::Mnemonic;
 pub use link::{Link, LinkId, LINK_CONTAINS, LINK_REF};

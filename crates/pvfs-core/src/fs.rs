@@ -115,6 +115,12 @@ pub struct ScanStats {
     pub skipped: u64,
     /// Present on disk but the operator can't read it, so it was not imported.
     pub unreadable: u64,
+    /// D71 W4: the catalog refused this file for a reason retrying cannot fix
+    /// (authorization, bad input). The pass skipped it and carried on — one bad
+    /// file must never stop the line — but it needs a human. `quarantined`
+    /// carries the first few, with reasons, so the report can say WHICH.
+    pub needs_attention: u64,
+    pub quarantined: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -470,6 +476,29 @@ impl Engine {
     /// binding explicitly is a clear error rather than a silent skip: the
     /// caller asked for something this machine cannot do.
     pub fn scan(&mut self, folder: Option<&NodeId>) -> Result<Vec<ScanReport>> {
+        self.scan_routed(folder, None)
+    }
+
+    /// `scan`, with the catalog writes sent somewhere other than this engine
+    /// (D71 W4). `None` = write locally, which is what an owner does.
+    pub fn scan_routed(
+        &mut self,
+        folder: Option<&NodeId>,
+        mut writer: Option<&mut dyn ScanWriter>,
+    ) -> Result<Vec<ScanReport>> {
+        // A replica with no route cannot write a single thing it finds, so say
+        // so ONCE, up front, naming the fix — rather than walking the whole
+        // library and quarantining every file with the same reason. The cause
+        // is the configuration, not the files.
+        if self.replica && writer.is_none() {
+            return Err(PvfsError::Forbidden {
+                action: "scan".into(),
+                reason: "a replica has no local writer, so its scan must be routed to the \
+                         owner — run it from the `watch` serve job, which opens that route, \
+                         rather than as a bare local scan"
+                    .into(),
+            });
+        }
         let bindings = match folder {
             Some(f) => {
                 let b = self.binding_for(f)?.ok_or(PvfsError::NotFound {
@@ -493,7 +522,7 @@ impl Engine {
         };
         let mut reports = Vec::new();
         for b in bindings {
-            let stats = self.scan_binding(&b)?;
+            let stats = self.scan_binding(&b, &mut writer)?;
             reports.push(ScanReport {
                 folder_id: b.folder_id.clone(),
                 stats,
@@ -502,7 +531,11 @@ impl Engine {
         Ok(reports)
     }
 
-    fn scan_binding(&mut self, b: &Binding) -> Result<ScanStats> {
+    fn scan_binding(
+        &mut self,
+        b: &Binding,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> Result<ScanStats> {
         let root = uri_to_path(&b.source_uri)?;
         let st = LocalBackend.stat(&b.source_uri)?;
         if !st.exists || !st.is_dir {
@@ -527,8 +560,18 @@ impl Engine {
         for f in &files {
             let uri = path_to_uri(&f.path)?;
             seen.insert(uri.clone());
-            let parent = self.ensure_subfolders(&mut folder_ids, &b.folder_id, &f.rel_dirs)?;
-            self.ingest_file(b, &parent, f, &uri, &mut stats)?;
+            let parent = self.ensure_subfolders(&mut folder_ids, &b.folder_id, &f.rel_dirs, writer)?;
+            // One file the catalog will never accept must not stop the line —
+            // the hook this replaced quarantined a bad event and carried on.
+            if let Err(e) = self.ingest_file(b, &parent, f, &uri, &mut stats, writer) {
+                if is_transient(&e) {
+                    return Err(e);
+                }
+                stats.needs_attention += 1;
+                if stats.quarantined.len() < 8 {
+                    stats.quarantined.push((uri.clone(), e.to_string()));
+                }
+            }
         }
 
         // 3. deletions: tracked URIs under this binding that vanished from disk
@@ -570,7 +613,10 @@ impl Engine {
                 .optional()
                 .map_err(map_db("scan removals"))?;
             if active.is_some() {
-                self.remove_location(&file_id, &uri)?;
+                match writer {
+                    Some(w) => w.remove_location(&file_id, &uri)?,
+                    None => self.remove_location(&file_id, &uri)?,
+                }
             }
             self.conn
                 .execute("DELETE FROM scan_state WHERE uri = ?1", params![uri])
@@ -591,6 +637,7 @@ impl Engine {
         cache: &mut HashMap<String, NodeId>,
         root: &NodeId,
         rel_dirs: &[String],
+        writer: &mut Option<&mut dyn ScanWriter>,
     ) -> Result<NodeId> {
         let mut current = root.clone();
         let mut key = String::new();
@@ -615,16 +662,19 @@ impl Engine {
                 .map(|c| c.node.id);
             let id = match found {
                 Some(id) => id,
-                None => self.add_node(
-                    &current,
-                    crate::engine::NodeSpec {
-                        node_type: node::TYPE_FOLDER.into(),
-                        label: d.clone(),
-                        payload: node::folder_payload(),
-                        is_temp: false,
-                        creation_nonce: None,
-                    },
-                )?,
+                None => match writer {
+                    Some(w) => w.add_folder(&current, d)?,
+                    None => self.add_node(
+                        &current,
+                        crate::engine::NodeSpec {
+                            node_type: node::TYPE_FOLDER.into(),
+                            label: d.clone(),
+                            payload: node::folder_payload(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?,
+                },
             };
             cache.insert(key.clone(), id.clone());
             current = id;
@@ -639,6 +689,7 @@ impl Engine {
         f: &DiskFile,
         uri: &str,
         stats: &mut ScanStats,
+        writer: &mut Option<&mut dyn ScanWriter>,
     ) -> Result<()> {
         // known via scan_state?
         let ss: Option<(u64, u64, String)> = self
@@ -700,7 +751,12 @@ impl Engine {
             if self.payload_size(&file_id)? == Some(f.size)
                 && fetch_node(&self.conn, &file_id)?.is_some()
             {
-                self.add_location(&file_id, uri)?;
+                match writer {
+                    Some(w) => w.add_location(&file_id, uri)?,
+                    None => {
+                        self.add_location(&file_id, uri)?;
+                    }
+                }
                 self.set_scan_state(uri, f.size, f.mtime_ms, &file_id)?;
                 stats.added += 1;
                 return Ok(());
@@ -722,18 +778,32 @@ impl Engine {
             original_name: f.name.clone(),
         }
         .encode();
-        let id = self.add_node(
-            parent,
-            crate::engine::NodeSpec {
-                node_type: node::TYPE_FILE.into(),
-                label: f.name.clone(),
-                payload,
-                is_temp: false,
-                creation_nonce: None,
-            },
-        )?;
-        self.attest_manifest(&id, &content_hash, &chunks)?;
-        self.add_location(&id, uri)?;
+        let id = match writer {
+            // Write-through has no manifest op, so a routed add is the plain
+            // pointer node the arr hook also produced — `tier` attests it when
+            // it migrates (F5.6), which is where attestation belongs anyway.
+            Some(w) => w.add_file(parent, &f.name, f.size, &guess_mime(&f.name))?,
+            None => {
+                let id = self.add_node(
+                    parent,
+                    crate::engine::NodeSpec {
+                        node_type: node::TYPE_FILE.into(),
+                        label: f.name.clone(),
+                        payload,
+                        is_temp: false,
+                        creation_nonce: None,
+                    },
+                )?;
+                self.attest_manifest(&id, &content_hash, &chunks)?;
+                id
+            }
+        };
+        match writer {
+            Some(w) => w.add_location(&id, uri)?,
+            None => {
+                self.add_location(&id, uri)?;
+            }
+        }
         self.set_scan_state(uri, f.size, f.mtime_ms, &id)?;
         stats.added += 1;
         Ok(())
@@ -1454,6 +1524,40 @@ impl Write for CountingWriter<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Where a scan's catalog writes go (D71 W4).
+///
+/// On the forest owner that is the engine itself. On a **replica** it is the
+/// owner's daemon over the wire — a replica has no local writer, so the box
+/// that must scan its own library could otherwise enrol a directory and then
+/// not write a word about what was in it.
+///
+/// The scan writes exactly these four things, and `pvfs-client`'s `Client`
+/// already speaks all of them: no new wire op, no `PROTO_VERSION` bump.
+pub trait ScanWriter {
+    fn add_folder(&mut self, parent: &str, label: &str) -> Result<NodeId>;
+    fn add_file(&mut self, parent: &str, label: &str, size: u64, mime: &str) -> Result<NodeId>;
+    fn add_location(&mut self, file: &str, uri: &str) -> Result<()>;
+    fn remove_location(&mut self, file: &str, uri: &str) -> Result<()>;
+}
+
+/// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and
+/// only ask for intervention when that isn't possible*.)
+///
+/// A lost owner, a busy database, an I/O blip: the next pass fixes it by
+/// itself, because a scan is idempotent by URI. So the pass fails **loudly**
+/// and the watcher's next tick puts it right with nobody involved.
+///
+/// A refusal (`Forbidden`) or a rejected argument (`BadInput`) will fail the
+/// same way forever. Retrying is not repair, it is a loop — so that ONE file is
+/// quarantined with its reason, the rest of the pass continues, and the report
+/// says a human is needed.
+pub(crate) fn is_transient(e: &PvfsError) -> bool {
+    !matches!(
+        e,
+        PvfsError::Forbidden { .. } | PvfsError::BadInput { .. } | PvfsError::Identity { .. }
+    )
 }
 
 // ---- local bindings (D71 W4, doc 04 §3) -------------------------------------

@@ -152,7 +152,7 @@ pub fn advertise_pass(data_dir: &Path, mut route: Route<'_>) -> Result<Advertise
 /// Pull + fold the source tail after routed writes — the same shape as the
 /// CLI's post-write catch-up: ship rows, sync region generations, and
 /// reopen the engine so the projection folds immediately.
-fn catch_up(data_dir: &Path, client: &mut Client) {
+pub(crate) fn catch_up(data_dir: &Path, client: &mut Client) {
     let _ = (|| -> Result<()> {
         let mut store = pvfs_core::ReplicaStore::open(data_dir)?;
         let mut from = store.tip()? + 1;
@@ -306,4 +306,56 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// A [`ScanWriter`] that sends a replica's scan writes to the owner's daemon
+/// (D71 W4).
+///
+/// The scan writes exactly four things and `Client` already speaks all four,
+/// so this needs no new wire op and no `PROTO_VERSION` bump — which is what
+/// keeps a binding change a per-box, rolling upgrade rather than a fleet-wide
+/// one.
+pub struct RoutedScanWriter<'a> {
+    client: &'a mut Client,
+    sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>,
+}
+
+impl<'a> RoutedScanWriter<'a> {
+    pub fn new(client: &'a mut Client, sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>) -> Self {
+        Self { client, sign }
+    }
+}
+
+impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
+    fn add_folder(&mut self, parent: &str, label: &str) -> pvfs_core::Result<String> {
+        self.client
+            .mkdir(parent, label, |d| (self.sign)(d))
+            .map_err(remote_err)
+    }
+
+    fn add_file(
+        &mut self,
+        parent: &str,
+        label: &str,
+        size: u64,
+        mime: &str,
+    ) -> pvfs_core::Result<String> {
+        self.client
+            .add_file(parent, label, size, mime, |d| (self.sign)(d))
+            .map_err(remote_err)
+    }
+
+    fn add_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
+        self.client
+            .add_location(file, uri, |d| (self.sign)(d))
+            .map(|_| ())
+            .map_err(remote_err)
+    }
+
+    fn remove_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
+        self.client
+            .remove_location(file, uri, |d| (self.sign)(d))
+            .map(|_| ())
+            .map_err(remote_err)
+    }
 }
