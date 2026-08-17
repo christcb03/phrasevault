@@ -175,7 +175,9 @@ impl Engine {
     // ---- bindings (doc 04 §3) --------------------------------------------------
 
     pub fn bind_folder(&mut self, folder: &NodeId, spec: BindSpec) -> Result<()> {
-        self.ensure_device_active()?;
+        if !self.replica {
+            self.ensure_device_active()?;
+        }
         let n = fetch_node(&self.conn, folder)?.ok_or(PvfsError::NotFound {
             kind: "node",
             id: folder.clone(),
@@ -220,6 +222,32 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(",");
         let t = now_ms();
+
+        // A replica has no local writer and `bind` has no write-through wire
+        // op, so this machine records its own enrollment locally (see the
+        // local-bindings note above). Everything the scan then writes — nodes,
+        // locations — DOES route write-through, so the catalog still gets the
+        // content; only the enrollment itself stays here.
+        if self.replica {
+            let mut rows = load_local_bindings(&self.data_dir)?;
+            rows.retain(|b| b.folder_id != *folder);
+            rows.push(Binding {
+                folder_id: folder.clone(),
+                source_uri: spec.source_uri,
+                recursive: spec.recursive,
+                auto_index: spec.auto_index,
+                extensions: if exts.is_empty() {
+                    Vec::new()
+                } else {
+                    exts.split(',').map(|s| s.to_string()).collect()
+                },
+                hash_policy: spec.hash_policy,
+                bound_at: t,
+                bound_by: self.device.pubkey(),
+            });
+            return save_local_bindings(&self.data_dir, &rows);
+        }
+
         let me = self.device.pubkey();
         let sig = crate::crypto::sign_digest(
             &self.device.signing_key,
@@ -248,12 +276,19 @@ impl Engine {
     }
 
     pub fn unbind_folder(&mut self, folder: &NodeId) -> Result<()> {
-        self.ensure_device_active()?;
+        if !self.replica {
+            self.ensure_device_active()?;
+        }
         if self.binding_for(folder)?.is_none() {
             return Err(PvfsError::NotFound {
                 kind: "binding",
                 id: folder.clone(),
             });
+        }
+        if self.replica {
+            let mut rows = load_local_bindings(&self.data_dir)?;
+            rows.retain(|b| b.folder_id != *folder);
+            return save_local_bindings(&self.data_dir, &rows);
         }
         let t = now_ms();
         let me = self.device.pubkey();
@@ -284,6 +319,18 @@ impl Engine {
         for r in rows {
             out.push(r.map_err(map_db("list bindings"))??);
         }
+        // This machine's own enrollments (D71 W4) sit beside the logged ones.
+        // A logged binding for the same folder wins — the log is the shared
+        // truth, and a local row for it would be this box shadowing the fleet.
+        let me = self.device.pubkey();
+        for mut b in load_local_bindings(&self.data_dir)? {
+            if out.iter().any(|l| l.folder_id == b.folder_id) {
+                continue;
+            }
+            b.bound_by = me.clone();
+            out.push(b);
+        }
+        out.sort_by(|a, b| a.folder_id.cmp(&b.folder_id));
         Ok(out)
     }
 
@@ -329,8 +376,18 @@ impl Engine {
             .optional()
             .map_err(map_db("binding lookup"))?;
         match got {
-            None => Ok(None),
             Some(r) => Ok(Some(r?)),
+            // Fall through to this machine's own enrollments (D71 W4).
+            None => {
+                let me = self.device.pubkey();
+                Ok(load_local_bindings(&self.data_dir)?
+                    .into_iter()
+                    .find(|b| b.folder_id == *folder)
+                    .map(|mut b| {
+                        b.bound_by = me;
+                        b
+                    }))
+            }
         }
     }
 
@@ -1397,6 +1454,108 @@ impl Write for CountingWriter<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+// ---- local bindings (D71 W4, doc 04 §3) -------------------------------------
+//
+// A binding names a directory that exists on ONE machine. On the forest owner
+// that fact is logged (`FolderBound`) and replicates. A **replica** cannot
+// append to the log at all, and `bind` — unlike `add`/`loc add`/`unlink` — has
+// no write-through wire op, so an ingest box could never enroll its own
+// library: the box that must scan the directory was the one box that could not
+// say it had one.
+//
+// It is recorded here instead, as per-machine deployment state beside
+// `placement`. That is not a workaround but the rule this codebase already
+// states for exactly this class of fact — "placement is per-instance
+// deployment state, never catalog truth" (§`binding_listing`) — and `sync.rs`
+// describes that file as being "like bindings and the replica marker".
+//
+// Consequence, deliberately accepted: the owner sees an ingest box's *effects*
+// (the nodes and locations its scans write, which do route write-through) but
+// not its enrollment. Making enrollment fleet-visible needs a wire op and a
+// PROTO bump — a fleet-wide upgrade, which is the one thing the rolling
+// upgrade play refuses to do.
+
+const LOCAL_BINDINGS_FILE: &str = "bindings.local";
+const LOCAL_BINDINGS_HEADER: &str = "pvfs-local-bindings 1";
+
+fn local_bindings_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(LOCAL_BINDINGS_FILE)
+}
+
+/// Read this machine's own bindings. Absent file = none, never an error.
+pub(crate) fn load_local_bindings(data_dir: &std::path::Path) -> Result<Vec<Binding>> {
+    let text = match std::fs::read_to_string(local_bindings_path(data_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(PvfsError::io("read local bindings", e)),
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(LOCAL_BINDINGS_HEADER) {
+        return Err(bad("bindings.local", "unrecognized local bindings file"));
+    }
+    let mut out = Vec::new();
+    for line in lines.filter(|l| !l.trim().is_empty()) {
+        // bind <folder> <recursive> <auto_index> <hash_policy> <bound_at> <exts> <uri…>
+        // `exts` is comma-joined (never contains a space); the URI is the REST,
+        // so a directory with spaces in its name survives the round trip.
+        let Some(rest) = line.strip_prefix("bind ") else {
+            continue;
+        };
+        let mut f = rest.splitn(7, ' ');
+        let (Some(folder), Some(rec), Some(auto), Some(policy), Some(at), Some(exts), Some(uri)) = (
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+        ) else {
+            return Err(bad("bindings.local", "malformed bind line"));
+        };
+        out.push(Binding {
+            folder_id: folder.to_string(),
+            source_uri: uri.to_string(),
+            recursive: rec == "1",
+            auto_index: auto == "1",
+            extensions: if exts == "-" {
+                Vec::new()
+            } else {
+                exts.split(',').map(|s| s.to_string()).collect()
+            },
+            hash_policy: HashPolicy::parse(policy)?,
+            bound_at: at.parse().unwrap_or(0),
+            // Filled by the caller, which knows this device's key.
+            bound_by: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+fn save_local_bindings(data_dir: &std::path::Path, rows: &[Binding]) -> Result<()> {
+    let mut text = String::from(LOCAL_BINDINGS_HEADER);
+    text.push('\n');
+    for b in rows {
+        let exts = if b.extensions.is_empty() {
+            "-".to_string()
+        } else {
+            b.extensions.join(",")
+        };
+        text.push_str(&format!(
+            "bind {} {} {} {} {} {} {}\n",
+            b.folder_id,
+            if b.recursive { 1 } else { 0 },
+            if b.auto_index { 1 } else { 0 },
+            b.hash_policy.as_str(),
+            b.bound_at,
+            exts,
+            b.source_uri,
+        ));
+    }
+    std::fs::write(local_bindings_path(data_dir), text)
+        .map_err(|e| PvfsError::io("write local bindings", e))
 }
 
 /// A device key, short enough to name a machine in an error message.
