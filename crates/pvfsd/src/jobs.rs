@@ -238,7 +238,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                         }
                     }
                     WatchEvent::ScanError(e) => cb.mark_retry("watch", &e),
-                    WatchEvent::Watching(_) => cb.set_state("watch", "running"),
+                    WatchEvent::Watching(..) => cb.set_state("watch", "running"),
                 });
                 match r {
                     Ok(()) => st.set_state(

@@ -736,7 +736,7 @@ enum ReplicaCmd {
 
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// Enable a job in `serve.jobs` (follow|sync|export|tier|evict). The
+    /// Enable a job in `serve.jobs` (follow|watch|sync|export|tier|evict). The
     /// daemon picks it up on SIGHUP or restart.
     Enable { job: String },
     /// Disable a job in `serve.jobs`
@@ -3788,9 +3788,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             pvfs_client::watch::WatchEvent::ScanError(e) => {
                                 eprintln!("scan error: {e}")
                             }
-                            pvfs_client::watch::WatchEvent::Watching(n) => {
+                            pvfs_client::watch::WatchEvent::Watching(n, elsewhere) => {
                                 if !json {
-                                    println!("watching {n} bound folder(s); Ctrl-C to stop");
+                                    // Name the skipped ones: on a replica most
+                                    // of the forest's bindings belong to other
+                                    // boxes, and a bare "watching 0" reads as a
+                                    // fault rather than as correct (D71 W1).
+                                    let others = match elsewhere {
+                                        0 => String::new(),
+                                        n => format!(
+                                            " ({n} bound on other machines, not this box's to watch)"
+                                        ),
+                                    };
+                                    println!(
+                                        "watching {n} bound folder(s){others}; Ctrl-C to stop"
+                                    );
                                 }
                             }
                         },
@@ -4800,7 +4812,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         format!(
                             "{{\"folder_id\":\"{}\",\"folder_path\":{},\"source_uri\":\"{}\",\
                              \"kind\":\"{}\",\"store\":{},\"recursive\":{},\"auto_index\":{},\
-                             \"extensions\":\"{}\",\"hash_policy\":\"{}\",\"bound_at\":{}}}",
+                             \"extensions\":\"{}\",\"hash_policy\":\"{}\",\"bound_at\":{},\
+                             \"bound_by\":\"{}\",\"is_local\":{}}}",
                             json_escape(&r.binding.folder_id),
                             match &r.folder_path {
                                 Some(p) => format!("\"{}\"", json_escape(p)),
@@ -4817,6 +4830,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             json_escape(&r.binding.extensions.join(",")),
                             r.binding.hash_policy.as_str(),
                             r.binding.bound_at,
+                            hex::encode(&r.binding.bound_by),
+                            r.is_local,
                         )
                     })
                     .collect();
@@ -4837,16 +4852,27 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         },
                         r.binding.hash_policy.as_str(),
                     );
+                    // A binding names a directory on ONE machine (D71 W1). The
+                    // listing shows the whole forest — an operator wants the
+                    // fleet view — so mark the ones this box does not scan.
+                    let whose = if r.is_local {
+                        String::new()
+                    } else {
+                        format!(
+                            "  [bound on another machine: {}…]",
+                            hex::encode(&r.binding.bound_by).chars().take(12).collect::<String>(),
+                        )
+                    };
                     match &r.store {
                         Some(s) => println!(
-                            "{place} <- {} [{}; store {}] ({opts}) {}",
+                            "{place} <- {} [{}; store {}] ({opts}) {}{whose}",
                             r.binding.source_uri,
                             r.kind.as_str(),
                             s.display(),
                             r.binding.folder_id,
                         ),
                         None => println!(
-                            "{place} <- {} [{}] ({opts}) {}",
+                            "{place} <- {} [{}] ({opts}) {}{whose}",
                             r.binding.source_uri,
                             r.kind.as_str(),
                             r.binding.folder_id,

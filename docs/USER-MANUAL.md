@@ -150,6 +150,19 @@ pvfs bind <folder> /mnt/photos  --kind mirror  --to /tank/backup # backup: a ver
 The kind is placement state under the hood (`pvfs place … central|central-keep`
 work too); the store may not live inside the bound space.
 
+**A binding belongs to the machine that made it.** The catalog is shared, but
+`/mnt/library` is a path on one box and nowhere else — so `pvfs scan` (with no
+folder) and the `watch` job only ever touch the bindings **this** machine bound.
+`pvfs bindings` still lists the whole forest and marks the rest
+`[bound on another machine: …]`; naming a foreign one explicitly
+(`pvfs scan <folder>`) says so rather than pretending. Bind a directory on the
+box that actually has it.
+
+One thing this deliberately does *not* do: skip a binding merely because its
+directory is missing. If a directory **this** machine bound has vanished — an
+unmounted NAS — the scan still fails loudly, because silently treating it as
+empty would soft-remove every location under it.
+
 ### 6.2 The live mount (`pvfs mount`, Linux)
 
 Where an export materializes a snapshot, `pvfs mount <node> <dir>` presents the tree as a **live

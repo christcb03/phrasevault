@@ -55,6 +55,11 @@ pub struct Binding {
     pub extensions: Vec<String>,
     pub hash_policy: HashPolicy,
     pub bound_at: u64,
+    /// The device that ran the bind (D71 W1) — folded from the `FolderBound`
+    /// event's author. `source_uri` is a path on THAT machine and nowhere
+    /// else, so anything that touches the directory (scan, watch) must filter
+    /// on this. See [`Engine::local_bindings`].
+    pub bound_by: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +98,11 @@ pub struct BindingRow {
     pub folder_path: Option<String>,
     pub kind: BindKind,
     pub store: Option<PathBuf>,
+    /// This machine bound it, so its directory exists here and this box
+    /// scans/watches it (D71 W1). The listing deliberately shows the whole
+    /// forest's enrollments — an operator wants to see the fleet — and marks
+    /// which ones are local rather than hiding the rest.
+    pub is_local: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -263,7 +273,7 @@ impl Engine {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at
+                "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, bound_by
                  FROM folder_bindings WHERE unbound_at IS NULL ORDER BY folder_id",
             )
             .map_err(map_db("list bindings"))?;
@@ -277,11 +287,41 @@ impl Engine {
         Ok(out)
     }
 
+    /// The bindings THIS machine owns — the only ones whose `source_uri`
+    /// names a directory that exists here (D71 W1).
+    ///
+    /// A binding is a forest-wide catalog record describing a machine-local
+    /// fact, so every caller that touches the directory behind it must filter
+    /// on the device. Before this existed, `scan(None)` and the watcher walked
+    /// every binding in the forest and died on the first one belonging to
+    /// another box — which made the `watch` job unusable on any replica
+    /// (proven on the D69 lab: an ingest box aborted on the owner's four
+    /// binds).
+    ///
+    /// Note this is deliberately NOT "skip bindings whose directory is
+    /// missing". A binding that IS this machine's and whose directory has
+    /// vanished must still raise — that is the unmounted-NAS guard in
+    /// [`Engine::scan_binding`], and quietly skipping it would let a scan
+    /// soft-remove every location under it.
+    pub fn local_bindings(&self) -> Result<Vec<Binding>> {
+        let me = self.device.pubkey();
+        Ok(self
+            .bindings()?
+            .into_iter()
+            .filter(|b| b.bound_by == me)
+            .collect())
+    }
+
+    /// Whether `binding` was bound by this machine.
+    pub fn is_local_binding(&self, binding: &Binding) -> bool {
+        binding.bound_by == self.device.pubkey()
+    }
+
     pub fn binding_for(&self, folder: &NodeId) -> Result<Option<Binding>> {
         let got = self
             .conn
             .query_row(
-                "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at
+                "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, bound_by
                  FROM folder_bindings WHERE folder_id = ?1 AND unbound_at IS NULL",
                 params![folder],
                 row_to_binding,
@@ -311,11 +351,13 @@ impl Engine {
                 None => (BindKind::InPlace, None),
             };
             let folder_path = self.folder_tree_path(&binding.folder_id)?;
+            let is_local = self.is_local_binding(&binding);
             out.push(BindingRow {
                 binding,
                 folder_path,
                 kind,
                 store,
+                is_local,
             });
         }
         Ok(out)
@@ -364,6 +406,12 @@ impl Engine {
     // ---- scan & reconcile (doc 04 §4) --------------------------------------------
 
     /// Scan one bound folder (or all of them) against its directory.
+    ///
+    /// "All of them" means **this machine's** (D71 W1) — a binding made on
+    /// another box names a directory that does not exist here, and walking it
+    /// is at best an error and at worst a mass soft-removal. Naming a foreign
+    /// binding explicitly is a clear error rather than a silent skip: the
+    /// caller asked for something this machine cannot do.
     pub fn scan(&mut self, folder: Option<&NodeId>) -> Result<Vec<ScanReport>> {
         let bindings = match folder {
             Some(f) => {
@@ -371,9 +419,20 @@ impl Engine {
                     kind: "binding",
                     id: f.clone(),
                 })?;
+                if !self.is_local_binding(&b) {
+                    return Err(bad(
+                        "folder",
+                        &format!(
+                            "{} is bound on another machine ({}) — scan it there; \
+                             this box only scans directories it bound itself",
+                            b.source_uri,
+                            short_key(&b.bound_by),
+                        ),
+                    ));
+                }
                 vec![b]
             }
-            None => self.bindings()?,
+            None => self.local_bindings()?,
         };
         let mut reports = Vec::new();
         for b in bindings {
@@ -1340,6 +1399,15 @@ impl Write for CountingWriter<'_> {
     }
 }
 
+/// A device key, short enough to name a machine in an error message.
+fn short_key(key: &[u8]) -> String {
+    let full = hex::encode(key);
+    if full.is_empty() {
+        return "unattributed".into();
+    }
+    full.chars().take(12).collect::<String>() + "…"
+}
+
 fn row_to_binding(r: &rusqlite::Row<'_>) -> std::result::Result<Result<Binding>, rusqlite::Error> {
     let policy: String = r.get(5)?;
     let exts: String = r.get(4)?;
@@ -1355,6 +1423,7 @@ fn row_to_binding(r: &rusqlite::Row<'_>) -> std::result::Result<Result<Binding>,
         },
         hash_policy,
         bound_at: r.get::<_, i64>(6).unwrap_or(0) as u64,
+        bound_by: r.get(7).unwrap_or_default(),
     }))
 }
 

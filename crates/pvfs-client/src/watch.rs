@@ -16,8 +16,11 @@ pub enum WatchEvent {
     Ingested(String, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
-    /// Watching started: how many bound folders have live watches.
-    Watching(usize),
+    /// Watching started: (folders watched here, bindings skipped as another
+    /// machine's). The second number matters — on a replica it is normal for
+    /// most of the forest's bindings to belong elsewhere, and "watching 0"
+    /// with no explanation reads like a broken watcher (D71 W1).
+    Watching(usize, usize),
 }
 
 /// Run the watcher until `stop` is set. Holds `serve.lock` in the data dir —
@@ -64,7 +67,12 @@ pub fn run(
             reason: e.to_string(),
         })?;
         let mut watching = 0usize;
-        for b in engine.bindings()? {
+        // THIS machine's bindings only (D71 W1). A binding made on another box
+        // names a directory that does not exist here, so registering a watch on
+        // it fails — which used to abort the whole watcher on any replica.
+        let local = engine.local_bindings()?;
+        let elsewhere = engine.bindings()?.len() - local.len();
+        for b in local {
             if !b.auto_index {
                 continue;
             }
@@ -84,7 +92,7 @@ pub fn run(
             })?;
             watching += 1;
         }
-        notify_cb(WatchEvent::Watching(watching));
+        notify_cb(WatchEvent::Watching(watching, elsewhere));
 
         let debounce = Duration::from_millis(debounce_ms);
         let reconcile_every = Duration::from_secs(reconcile_secs.max(1));

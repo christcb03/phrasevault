@@ -74,6 +74,28 @@ Constraints (either way): one active binding per folder; one binding per
 `source_uri` per forest (two folders bound to the same directory would fight);
 binding a folder requires the directory to exist and be readable.
 
+> **Decided (D71 W1) — a binding is scoped to the machine that made it.**
+> `source_uri` names a path on exactly one box, so the binding's **author** (the
+> device key `FolderBound` has always carried, never before folded) is projected
+> as `folder_bindings.bound_by`, and everything that touches the directory
+> filters on it: `scan(None)` and the watcher process **only this device's**
+> bindings, and naming a foreign one explicitly is a clear error rather than a
+> silent skip. `bindings()` still returns forest-wide truth — the listing shows
+> the whole fleet and marks what belongs elsewhere.
+>
+> This is attribution, **not** absence-tolerance. A binding that *is* this
+> machine's and whose directory has vanished still raises (§4's unmounted-source
+> guard); weakening that into "skip anything missing" would let one unmounted
+> NAS soft-remove every location beneath it.
+>
+> No new event, no wire change — the attribution was always in the signed log.
+> Schema v8's drop-and-replay back-fills it.
+>
+> *Why it was needed:* on the D69 media fleet the `watch` job could not run on
+> any replica at all — the watcher walked every binding in the forest and died
+> registering a watch on the owner's directories, which do not exist on the
+> ingest box.
+
 ---
 
 ## 4. Scan & reconciliation

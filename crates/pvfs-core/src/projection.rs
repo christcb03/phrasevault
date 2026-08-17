@@ -22,7 +22,13 @@ use crate::log_store;
 // tracker) and `purged_nodes` (resurrection tombstones). Same upgrade.
 // v7 (P9.1, doc 22 §2): `chunk_manifests` — owner-attested chunk layouts
 // that license serve-while-fetching. Same upgrade.
-pub const SCHEMA_VERSION: u32 = 7;
+// v8 (D71 W1): `folder_bindings.bound_by` — the device that bound the
+// folder, projected from the `FolderBound` event's existing `author`. A
+// binding names a directory on ONE machine, so scanning and watching must
+// only ever touch this device's own. No new event, no wire change: the
+// attribution was always in the signed log, just never folded. Same
+// drop-and-replay upgrade, which back-fills it for free.
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -197,6 +203,7 @@ CREATE TABLE IF NOT EXISTS folder_bindings (
   extensions  TEXT NOT NULL,
   hash_policy TEXT NOT NULL,
   bound_at    INTEGER NOT NULL,
+  bound_by    BLOB NOT NULL DEFAULT x'',
   unbound_at  INTEGER
 );
 
@@ -1263,12 +1270,17 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             extensions,
             hash_policy,
             bound_at,
+            author,
             ..
         } => {
+            // `author` is the device that ran the bind — the one machine where
+            // `source_uri` actually exists (D71 W1). Re-binding a folder from a
+            // different box legitimately re-attributes it, so the upsert takes
+            // the newest event's author, exactly like every other field.
             tx.execute(
                 "INSERT INTO folder_bindings
-                 (folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, unbound_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                 (folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, bound_by, unbound_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
                  ON CONFLICT(folder_id) DO UPDATE SET
                    source_uri = excluded.source_uri,
                    recursive = excluded.recursive,
@@ -1276,6 +1288,7 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                    extensions = excluded.extensions,
                    hash_policy = excluded.hash_policy,
                    bound_at = excluded.bound_at,
+                   bound_by = excluded.bound_by,
                    unbound_at = NULL",
                 params![
                     folder_id,
@@ -1284,7 +1297,8 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                     *auto_index as i64,
                     extensions,
                     hash_policy,
-                    *bound_at as i64
+                    *bound_at as i64,
+                    author
                 ],
             )
             .map_err(&m)?;
