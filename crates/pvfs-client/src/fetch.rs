@@ -536,14 +536,42 @@ pub fn tier_pass(
                 "{}/",
                 pvfs_core::storage::path_to_uri(&dest)?.trim_end_matches('/')
             );
-            let has_central = engine.locations(&id)?.iter().any(|u| {
-                if keep {
-                    u.starts_with(&dest_prefix)
-                } else {
-                    logged_local_location(u, &own_pin)
-                        && !staging_prefix.as_deref().is_some_and(|p| u.starts_with(p))
+
+            // D71 — under TREE layout, "already placed" means at the RIGHT
+            // path, not merely somewhere under the root.
+            //
+            // A node-addressed store derives its path from the id, which never
+            // changes, so "is there a copy under the root" was a sound test.
+            // A tree path changes whenever the file — or ANY ancestor folder —
+            // is renamed. The lab caught it: renaming a show left three
+            // episodes sitting at their old paths while the catalog said
+            // otherwise, and the mover reported success because a copy did
+            // exist under the root.
+            let tree_dest: Option<std::path::PathBuf> = if tree_roots.contains(&root) {
+                match engine.tree_path_under(&id, &root)? {
+                    Some(segs) if !segs.is_empty() => {
+                        Some(segs.iter().fold(dest.clone(), |acc, s| acc.join(s)))
+                    }
+                    _ => None,
                 }
-            });
+            } else {
+                None
+            };
+
+            let has_central = match &tree_dest {
+                Some(want) => {
+                    let want_uri = pvfs_core::storage::path_to_uri(want)?;
+                    engine.locations(&id)?.iter().any(|u| u == &want_uri)
+                }
+                None => engine.locations(&id)?.iter().any(|u| {
+                    if keep {
+                        u.starts_with(&dest_prefix)
+                    } else {
+                        logged_local_location(u, &own_pin)
+                            && !staging_prefix.as_deref().is_some_and(|p| u.starts_with(p))
+                    }
+                }),
+            };
             if has_central {
                 report.satisfied += 1;
             } else {
@@ -587,13 +615,11 @@ pub fn tier_pass(
                 // normal media library rather than a node-addressed store, and
                 // PVFS is not required to read it.
                 let cpath = if tree_roots.contains(&root) {
-                    match engine.tree_path_under(&id, &root)? {
-                        Some(segs) if !segs.is_empty() => {
-                            segs.iter().fold(dest.clone(), |acc, seg| acc.join(seg))
-                        }
+                    match &tree_dest {
+                        Some(p) => p.clone(),
                         // Not under this root, or the root itself: never guess
                         // a path on a 130T NAS.
-                        _ => {
+                        None => {
                             report.failed.push((
                                 label,
                                 "no tree path under the placement root — refusing to \
@@ -656,6 +682,55 @@ pub fn tier_pass(
                     if let Some(dir) = cpath.parent() {
                         std::fs::create_dir_all(dir)
                             .map_err(|e| PvfsError::io("create central dir", e))?;
+                    }
+
+                    // D71 — MOVE, don't re-copy, when the bytes are already on
+                    // this filesystem under a different name.
+                    //
+                    // A rename changes a file's tree path, and under tree
+                    // layout that means its destination changes too. Streaming
+                    // it through `cat` costs minutes for a 40 GB episode; a
+                    // same-filesystem `rename` costs milliseconds. Renaming a
+                    // SEASON folder moves every episode beneath it, so without
+                    // this a folder rename is unusable.
+                    //
+                    // Only for `central` (migrate). A mirror keeps its source
+                    // by definition, so moving it would be exactly wrong.
+                    if !keep {
+                        let here: Option<std::path::PathBuf> = engine
+                            .locations(&id)?
+                            .iter()
+                            .filter_map(|u| pvfs_core::storage::uri_to_path(u).ok())
+                            .find(|p| p != &cpath && p.is_file());
+                        if let Some(old) = here {
+                            if std::fs::rename(&old, &cpath).is_ok() {
+                                engine
+                                    .add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)?;
+                                let old_uri = pvfs_core::storage::path_to_uri(&old)?;
+                                engine.remove_location(&id, &old_uri)?;
+                                // Tidy the directories the move emptied. A
+                                // renamed show otherwise leaves `Rename Show/
+                                // Season 02/` standing beside
+                                // `Rename Show (2019)/Season 02/`, and Plex
+                                // shows an empty series. `remove_dir` only
+                                // succeeds on an EMPTY directory, so this can
+                                // never take anything with it — and it stops at
+                                // the placement root.
+                                let mut dir = old.parent().map(|p| p.to_path_buf());
+                                while let Some(d) = dir {
+                                    if d == dest || !d.starts_with(&dest) {
+                                        break;
+                                    }
+                                    if std::fs::remove_dir(&d).is_err() {
+                                        break; // not empty — leave it alone
+                                    }
+                                    dir = d.parent().map(|p| p.to_path_buf());
+                                }
+                                return Ok(());
+                            }
+                            // Different filesystem (EXDEV) or otherwise
+                            // refused: fall through to the honest copy.
+                        }
                     }
                     // Publish atomically: a 40 GB copy written under its final name would
                     // be visible to Plex half-transferred, and a failed transfer would

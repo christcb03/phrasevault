@@ -572,10 +572,8 @@ impl PvfsFs {
             .into_iter()
             .find(|c| c.node.label == name)
             .ok_or(libc::ENOENT)?;
-        if entry.node.node_type != pvfs_core::TYPE_FILE {
-            // Renaming a folder would have to re-parent everything beneath it.
-            // Refuse rather than half-do it.
-            return Err(libc::EXDEV);
+        if entry.node.node_type == pvfs_core::TYPE_FOLDER {
+            return self.rename_folder(&entry, to, newname);
         }
         let payload = pvfs_core::FilePayload::decode(&entry.node.payload)
             .map_err(|_| libc::EIO)?;
@@ -627,7 +625,108 @@ impl PvfsFs {
                 }
             }
         })();
-        res.map_err(|_| libc::EIO)
+        res.map_err(|e| {
+            eprintln!("pvfs mount: rename failed: {e}");
+            libc::EIO
+        })
+    }
+
+    /// D71 — renaming a FOLDER, which Chris needs to propagate too.
+    ///
+    /// Same successor shape as a file, one level deeper: a folder's label is in
+    /// its id, so the rename mints a new folder node and **re-links every child
+    /// under it**. Children keep their own ids and their own subtrees, so a
+    /// season folder full of episodes — or a show folder full of seasons —
+    /// moves by re-linking, not by touching a single byte.
+    ///
+    /// What follows is the expensive part, and why this needed the mover's
+    /// same-filesystem move first: every descendant file's TREE PATH just
+    /// changed, so under tree layout the mover relocates each of them. With a
+    /// `rename` on the holder that is milliseconds per episode; streaming them
+    /// through `cat` would make renaming a show unusable.
+    fn rename_folder(
+        &mut self,
+        entry: &pvfs_core::ChildEntry,
+        to: &NodeId,
+        newname: &str,
+    ) -> Result<(), i32> {
+        let children = self
+            .engine
+            .children(&entry.node.id)
+            .map_err(|_| libc::EIO)?;
+
+        let res = (|| -> Result<(), PvfsError> {
+            match &mut self.route {
+                Some((client, sign)) => {
+                    let new_id = client
+                        .mkdir(to, newname, |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    // MOVE, not link: a node has exactly ONE containing
+                    // parent, so linking a child under a second one is refused
+                    // (`AlreadyContained`). The lab said so — a folder rename
+                    // half-completed, leaving an empty new folder beside an
+                    // intact original.
+                    for c in &children {
+                        client
+                            .mv(&c.node.id, &new_id, |d| sign(d))
+                            .map_err(|e| PvfsError::BadInput {
+                                field: "rename".into(),
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    // Old folder last: a crash before this leaves the subtree
+                    // reachable from BOTH names, which is untidy but complete.
+                    // The other order can orphan every child.
+                    client
+                        .unlink(&entry.link_id, |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    pvfs_client::advertise::catch_up(&self.data_dir, client);
+                    Ok(())
+                }
+                None => {
+                    let new_id = self.engine.add_node(
+                        to,
+                        pvfs_core::NodeSpec {
+                            node_type: pvfs_core::TYPE_FOLDER.into(),
+                            label: newname.to_string(),
+                            payload: entry.node.payload.clone(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?;
+                    // Locally there is no single move primitive, and a node
+                    // may have only ONE containing parent — so it must be
+                    // unlink-then-link, not the safer link-first order. The
+                    // window between them leaves the child an orphan rather
+                    // than duplicated; orphans are recoverable (`pvfs orphans`)
+                    // and duplication is refused outright, so this is the only
+                    // order available.
+                    for c in &children {
+                        self.engine.remove_link(&c.link_id)?;
+                        self.engine.link(
+                            &new_id,
+                            &c.node.id,
+                            pvfs_core::LINK_CONTAINS,
+                            None,
+                            0,
+                        )?;
+                    }
+                    self.engine.remove_link(&entry.link_id)
+                }
+            }
+        })();
+        // Say WHY. A mount that answers EIO with no explanation is exactly
+        // what turned a one-line bug into a lab round.
+        res.map_err(|e| {
+            eprintln!("pvfs mount: folder rename failed: {e}");
+            libc::EIO
+        })
     }
 
     /// D71 W2 — retire a link, routing on a replica.
