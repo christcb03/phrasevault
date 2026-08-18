@@ -251,9 +251,13 @@ enum Cmd {
         #[arg(value_parser = ["pointer", "sync", "central", "central-keep"])]
         mode: String,
         /// central-store directory (with `central`)
-        /// D71 W5: land migrated files at their TREE PATH under --to, rather
-        /// than as `<shard>/<node-id>` blobs — the destination stays a normal
-        /// media library that Plex reads directly, with no export and no mount.
+        /// D71 W5: land files at their TREE PATH under --to, rather than as
+        /// `<shard>/<node-id>` blobs — the destination stays a normal media
+        /// library that Plex reads directly, with no export and no mount.
+        ///
+        /// Good with `central-keep` too: a mirror's destination is a DIFFERENT
+        /// box (backup, redundancy, somewhere faster to serve from), so the
+        /// same tree path under a different root is the point, not a clash.
         #[arg(long)]
         tree: bool,
         #[arg(long, required_if_eq_any([("mode", "central"), ("mode", "central-keep")]))]
@@ -3567,15 +3571,6 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     None => None,
                 };
-                if tree && mode == "central-keep" {
-                    return Err(PvfsError::BadInput {
-                        field: "tree".into(),
-                        reason: "--tree is for `central` (the mover MOVES files to their \
-                                 tree path); a mirror keeps the source, so a second copy \
-                                 at the same tree path would collide with it"
-                            .into(),
-                    });
-                }
                 pvfs_core::sync::set_central_served(
                     &data_dir,
                     &id,

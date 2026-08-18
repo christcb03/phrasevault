@@ -29,7 +29,8 @@ type Result<T> = std::result::Result<T, PvfsError>;
 pub type Route<'a> = Option<(&'a mut Client, &'a dyn Fn(&[u8; 32]) -> Vec<u8>)>;
 
 /// An owned signing closure (the boxed flavor `replica_route` returns).
-pub type BoxedSign = Box<dyn Fn(&[u8; 32]) -> Vec<u8>>;
+// `Send` because the FUSE mount carries a route across threads (D71 W2).
+pub type BoxedSign = Box<dyn Fn(&[u8; 32]) -> Vec<u8> + Send>;
 
 #[derive(Debug, Default)]
 pub struct AdvertiseReport {
@@ -152,7 +153,7 @@ pub fn advertise_pass(data_dir: &Path, mut route: Route<'_>) -> Result<Advertise
 /// Pull + fold the source tail after routed writes — the same shape as the
 /// CLI's post-write catch-up: ship rows, sync region generations, and
 /// reopen the engine so the projection folds immediately.
-pub(crate) fn catch_up(data_dir: &Path, client: &mut Client) {
+pub fn catch_up(data_dir: &Path, client: &mut Client) {
     let _ = (|| -> Result<()> {
         let mut store = pvfs_core::ReplicaStore::open(data_dir)?;
         let mut from = store.tip()? + 1;

@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use fuser::{
+use fuser::{ReplyEmpty, 
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEntry, ReplyOpen, Request,
 };
@@ -43,6 +43,9 @@ pub struct PvfsFs {
     proxy: HashMap<u64, ProxyRead>,
     data_dir: std::path::PathBuf,
     next_fh: u64,
+    /// D71 W2: on a replica the catalog has no local writer, so namespace
+    /// changes route to the owner's daemon — the same seam the scan uses.
+    route: Option<(pvfs_client::Client, pvfs_client::advertise::BoxedSign)>,
 }
 
 /// One in-flight proxy handle: the connection is reused across reads.
@@ -55,6 +58,7 @@ struct ProxyRead {
 impl PvfsFs {
     pub fn new(data_dir: &Path, target: &NodeId) -> Result<PvfsFs, PvfsError> {
         let engine = Engine::open(data_dir)?;
+        let engine_is_replica = engine.is_replica();
         let fetcher = Fetcher::new(data_dir);
         let mut fs = PvfsFs {
             engine,
@@ -70,6 +74,10 @@ impl PvfsFs {
             proxy: HashMap::new(),
             data_dir: data_dir.to_path_buf(),
             next_fh: 1,
+            route: {
+                let is_replica = engine_is_replica;
+                pvfs_client::advertise::replica_route(data_dir, is_replica).unwrap_or(None)
+            },
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
@@ -398,6 +406,22 @@ impl Filesystem for PvfsFs {
         }
     }
 
+    /// D71 W2: Sonarr deleting a drained file must work. Byte writes stay
+    /// refused — only the namespace is write-through.
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.retire(parent, name, false) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.retire(parent, name, true) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
     fn release(
         &mut self,
         _req: &Request<'_>,
@@ -430,6 +454,62 @@ pub fn mount(data_dir: &Path, target: &NodeId, mountpoint: &Path) -> Result<(), 
             fuser::mount2(fs, mountpoint, &opts(false)).map_err(|e| PvfsError::io("fuse mount", e))
         }
         Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+impl PvfsFs {
+    /// D71 W2 — retire a link, routing on a replica.
+    ///
+    /// This is the gap that made the design a REGRESSION against the rclone
+    /// mounts it replaces: those are read-write, so Sonarr deleting a drained
+    /// file works today, and against a read-only PVFS branch it got EROFS.
+    /// Upgrades hit this constantly.
+    ///
+    /// The catalog op happens here; the BYTES are not touched from this box.
+    /// A holder reclaims its own files (`pvfs reclaim`), which is what keeps
+    /// the owner from reaching across NFS to delete, and what routes every
+    /// automated deletion through the trash.
+    fn retire(&mut self, parent: u64, name: &OsStr, want_dir: bool) -> Result<(), i32> {
+        let parent_node = self
+            .ino_to_node
+            .get(&parent)
+            .cloned()
+            .ok_or(libc::ENOENT)?;
+        let name = name.to_str().ok_or(libc::ENOENT)?;
+        let children = self.engine.children(&parent_node).map_err(|_| libc::EIO)?;
+        let entry = children
+            .into_iter()
+            .find(|c| c.node.label == name)
+            .ok_or(libc::ENOENT)?;
+        let is_dir = entry.node.node_type == pvfs_core::TYPE_FOLDER;
+        if want_dir && !is_dir {
+            return Err(libc::ENOTDIR);
+        }
+        if !want_dir && is_dir {
+            return Err(libc::EISDIR);
+        }
+        if is_dir
+            && !self
+                .engine
+                .children(&entry.node.id)
+                .map_err(|_| libc::EIO)?
+                .is_empty()
+        {
+            return Err(libc::ENOTEMPTY);
+        }
+        match &mut self.route {
+            Some((client, sign)) => {
+                client
+                    .unlink(&entry.link_id, |d| sign(d))
+                    .map_err(|_| libc::EIO)?;
+                pvfs_client::advertise::catch_up(&self.data_dir, client);
+            }
+            None => self
+                .engine
+                .remove_link(&entry.link_id)
+                .map_err(|_| libc::EIO)?,
+        }
+        Ok(())
     }
 }
 

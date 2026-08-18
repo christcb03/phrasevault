@@ -1673,6 +1673,23 @@ impl Engine {
     /// (F5.3, doc 17 §7.4): `(file_id, uri, local_path)` rows whose bytes
     /// this host may now delete, once it confirms another live location.
     /// Empty when this instance has no transport pin.
+    /// Does any live link still contain this node? (D71 W2.)
+    ///
+    /// The difference between "moved" and "deleted": a node that still hangs
+    /// somewhere in the tree has not been deleted, whatever happened to one of
+    /// its locations, and its bytes must not be reclaimed.
+    pub fn node_is_linked(&self, node: &NodeId) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE child_id = ?1 AND removed_at IS NULL",
+                params![node],
+                |r| r.get(0),
+            )
+            .map_err(map_db("node linked"))?;
+        Ok(n > 0)
+    }
+
     pub fn retired_own_host_locations(&self) -> Result<Vec<(NodeId, String, PathBuf)>> {
         // Two shapes of "this box's bytes were retired by the mover":
         // pvfs-host:// under our own pin (the F5.3 edge flow), and — P8

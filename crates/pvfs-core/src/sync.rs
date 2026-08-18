@@ -272,6 +272,57 @@ pub fn swarm_part_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dest.with_file_name(format!(".{id}.swarmpart")))
 }
 
+/// D71 W2/W3 — reclaim the bytes of files that are no longer in the catalog.
+///
+/// This is what makes a delete **mirror** to the holder: the mount retires the
+/// link (routed, on whatever box the user is on), and the box that actually
+/// owns the bytes tidies its own filesystem. The owner never reaches across
+/// NFS to delete something on the NAS — a holder reclaims its own.
+///
+/// Conservative by construction:
+///
+/// * only locations under a **tree-layout** root, so a node-addressed store is
+///   left to `evict`'s existing rules;
+/// * only when the node has **no live link anywhere** — a file that merely
+///   moved is not a file that was deleted;
+/// * and the bytes go to the **trash**, not to `unlink`. After `evict` has
+///   reclaimed the ingest copy this is the only copy, and an automated
+///   deletion that turns out to be wrong is otherwise unrecoverable.
+pub fn reclaim_pass(engine: &Engine, data_dir: &Path) -> Result<TrashPurge> {
+    let mut report = TrashPurge::default();
+    let placement = load_placement_full(data_dir)?;
+    if placement.central_tree.is_empty() {
+        return Ok(report);
+    }
+    let roots: Vec<PathBuf> = placement
+        .central
+        .iter()
+        .chain(placement.central_keep.iter())
+        .filter(|(id, _)| placement.central_tree.contains(id))
+        .map(|(_, dir)| dir.clone())
+        .collect();
+    if roots.is_empty() {
+        return Ok(report);
+    }
+    for (id, _uri, path) in engine.retired_own_host_locations()? {
+        // A node still linked somewhere is alive: it moved, it was not deleted.
+        if engine.node_is_linked(&id)? {
+            continue;
+        }
+        let Some(root) = roots.iter().find(|r| path.starts_with(r)) else {
+            continue; // not in a tree-layout root — evict's territory
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        move_to_trash(root, &path)?;
+        report.removed += 1;
+        report.freed_bytes += size;
+    }
+    Ok(report)
+}
+
 // ---- the trash (D71 W5, Chris: "build in the safety") -----------------------
 //
 // Once `evict` has reclaimed the ingest box's copy, the NAS holds the ONLY

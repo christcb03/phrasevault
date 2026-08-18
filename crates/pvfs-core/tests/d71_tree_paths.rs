@@ -117,3 +117,31 @@ fn location_ownership_answers_who_holds_a_path() {
     assert_eq!(engine.location_owner(uri).unwrap(), None);
     engine.close().unwrap();
 }
+
+/// Tree layout belongs with `central-keep` (mirror) as much as with `central`:
+/// a mirror's destination is a DIFFERENT box, so the same tree path under a
+/// different root is the whole point — an identical, browsable second library.
+/// (An earlier version of this work wrongly refused the combination.)
+#[test]
+fn tree_layout_is_valid_for_a_mirror_to_another_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let media = child(&mut engine, &root, "Media", TYPE_FOLDER);
+    let show = child(&mut engine, &media, "Show", TYPE_FOLDER);
+    let ep = child(&mut engine, &show, "ep.mkv", TYPE_FILE);
+    let segs = engine.tree_path_under(&ep, &media).unwrap().unwrap();
+
+    // The same relative path resolves under two independent roots without any
+    // possibility of collision — which is exactly what a backup mirror wants.
+    let primary = std::path::Path::new("/mnt/nas/Media");
+    let backup = std::path::Path::new("/mnt/backup-nas/Media");
+    let under = |base: &std::path::Path| segs.iter().fold(base.to_path_buf(), |a, s| a.join(s));
+    assert_eq!(under(primary), std::path::Path::new("/mnt/nas/Media/Show/ep.mkv"));
+    assert_eq!(
+        under(backup),
+        std::path::Path::new("/mnt/backup-nas/Media/Show/ep.mkv")
+    );
+    assert_ne!(under(primary), under(backup));
+    engine.close().unwrap();
+}
