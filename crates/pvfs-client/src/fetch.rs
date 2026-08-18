@@ -478,6 +478,28 @@ pub fn tier_pass(
         }
     }
     let mut report = TierReport::default();
+    // D71 W5 — the MOST SPECIFIC placement wins.
+    //
+    // Placements nest: a store placement on `Media` and a tree placement on
+    // `Media/from-feeder` both cover the same files, and without an order the
+    // outer one silently claims them. The lab caught exactly that — a file
+    // configured for a human path landed as a hex blob in the store because
+    // the broader root was processed first. Deepest root first, and a file
+    // handled by an inner placement is not revisited by an outer one.
+    let forest_root = engine.identity.root_node_id.clone();
+    let mut central: Vec<_> = central;
+    central.sort_by_key(|(root, _, _)| {
+        std::cmp::Reverse(
+            engine
+                .tree_path_under(root, &forest_root)
+                .ok()
+                .flatten()
+                .map(|segs| segs.len())
+                .unwrap_or(0),
+        )
+    });
+    let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for (root, dest, keep) in central {
         // P8 (doc 21): a MIGRATE-kind binding's own staging dir drains too —
         // its file:// locations retire once the central copy is live, and the
@@ -496,6 +518,10 @@ pub fn tier_pass(
                 continue;
             }
             let mut id = entry.node.id;
+            // Claimed by a deeper (more specific) placement already.
+            if !handled.insert(id.clone()) {
+                continue;
+            }
             let label = entry.node.label;
             let unhashed = pvfs_core::FilePayload::decode(&entry.node.payload)
                 .map(|pl| pl.content_hash.is_empty())

@@ -993,6 +993,14 @@ impl Engine {
         Ok(())
     }
 
+    /// The size the catalog records for a file (D71). Public because `evict`
+    /// must check that the bytes it is about to reclaim are still the ones its
+    /// retired location row described — an upgrade writes its replacement at
+    /// the very same path.
+    pub fn payload_size_of(&self, file_id: &str) -> Result<Option<u64>> {
+        self.payload_size(file_id)
+    }
+
     fn payload_size(&self, file_id: &str) -> Result<Option<u64>> {
         match fetch_node(&self.conn, file_id)? {
             Some(n) if n.node_type == node::TYPE_FILE => {

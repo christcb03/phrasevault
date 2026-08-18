@@ -702,6 +702,29 @@ pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
         match std::fs::symlink_metadata(&path) {
             Ok(md) if md.file_type().is_file() => {
                 let size = md.len();
+                // D71 — the file at this path must still BE the file the
+                // retired row described.
+                //
+                // A retired location says "the copy that WAS here has been
+                // migrated". It does not say the path is now free. Sonarr's
+                // upgrade writes the replacement at exactly the same path, so
+                // between that write and the next scan the retired row points
+                // at NEW bytes — and evicting them destroys an upgrade before
+                // it is ever catalogued.
+                //
+                // Found on the lab: a 1080p replacement was deleted this way,
+                // silently, with the 720p copy still on the NAS. Size is the
+                // cheapest honest check and it is the same signal W6 uses for
+                // identity.
+                if engine.payload_size_of(&id)?.is_some_and(|recorded| recorded != size) {
+                    report.skipped.push((
+                        uri,
+                        "file on disk no longer matches the migrated copy — \
+                         looks like a replacement, not the evicted bytes"
+                            .into(),
+                    ));
+                    continue;
+                }
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         report.evicted += 1;
