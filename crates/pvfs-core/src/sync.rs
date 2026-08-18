@@ -294,6 +294,11 @@ pub struct Placement {
     /// space keeps its bytes and the tree gains a backup replica (and a
     /// future swarm seed, doc 20 §6).
     pub central_keep: Vec<(NodeId, PathBuf)>,
+    /// D71 W5: central roots whose destination is the file's TREE PATH rather
+    /// than `<store>/<shard>/<node-id>` — the NAS keeps a normal media layout
+    /// that Plex reads directly, so PVFS is not required to read it. Local
+    /// deployment state like the rest of this file: no event, no wire change.
+    pub central_tree: Vec<NodeId>,
     /// F5.5: `(subtree, instance name, that instance's path for the store)`
     /// — the mover logs central copies as the named instance's pvfs-host://
     /// locations (the NAS serves its own store) alongside the local file://.
@@ -327,6 +332,8 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
                 }
                 _ => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
             }
+        } else if let Some(id) = line.strip_prefix("central-tree ") {
+            out.central_tree.push(id.to_string());
         } else if let Some(rest) = line.strip_prefix("central-keep ") {
             match rest.split_once(' ') {
                 Some((id, dir)) => out.central_keep.push((id.to_string(), PathBuf::from(dir))),
@@ -389,6 +396,9 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     for (r, inst, path) in &p.served_by {
         text.push_str(&format!("served-by {r} {inst} {}\n", path.display()));
     }
+    for r in &p.central_tree {
+        text.push_str(&format!("central-tree {r}\n"));
+    }
     for (r, d) in &p.central {
         text.push_str(&format!("central {r} {}\n", d.display()));
     }
@@ -423,6 +433,17 @@ pub fn set_sync_mode(data_dir: &Path, id: &NodeId, sync: bool, advertise: bool) 
 
 /// Place `id` as `central` with its store directory (owner-side, F5.3).
 /// `keep` = the P8 mirror mode: the mover copies + logs but never retires.
+/// D71 W5: mark (or unmark) a central root as tree-layout — migrated files
+/// land at their own path under the store root instead of `<shard>/<node-id>`.
+pub fn set_central_tree(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.central_tree.retain(|r| r != id);
+    if on {
+        p.central_tree.push(id.clone());
+    }
+    save_placement(data_dir, &p)
+}
+
 pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path, keep: bool) -> Result<()> {
     set_central_served(data_dir, id, dest, keep, None)
 }

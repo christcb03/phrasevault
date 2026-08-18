@@ -455,7 +455,11 @@ pub fn tier_pass(
     // store copy as THAT instance's pvfs-host:// location too — resolved to
     // its pin from the registry once, up front (a vanished registry entry
     // fails the pass loudly rather than logging unattributable rows).
-    let served_by = pvfs_core::sync::load_placement_full(&data_dir)?.served_by;
+    let placement = pvfs_core::sync::load_placement_full(&data_dir)?;
+    let served_by = placement.served_by;
+    // D71 W5: roots whose destination is the file's TREE PATH, not a hex blob.
+    let tree_roots: std::collections::HashSet<String> =
+        placement.central_tree.iter().cloned().collect();
     let mut serve_as: std::collections::HashMap<String, (String, std::path::PathBuf)> =
         std::collections::HashMap::new();
     if !served_by.is_empty() {
@@ -550,13 +554,77 @@ pub fn tier_pass(
                         }
                     }
                 }
-                // …then land a verified copy in the central store
-                let cpath = dest.join(&id[..2]).join(&id);
+                // …then land a verified copy at its destination.
+                //
+                // D71 W5: for a tree-layout root that is the file's own path —
+                // `…/Media/TV/Show/Season 03/ep.mkv` — so the NAS stays a
+                // normal media library rather than a node-addressed store, and
+                // PVFS is not required to read it.
+                let cpath = if tree_roots.contains(&root) {
+                    match engine.tree_path_under(&id, &root)? {
+                        Some(segs) if !segs.is_empty() => {
+                            segs.iter().fold(dest.clone(), |acc, seg| acc.join(seg))
+                        }
+                        // Not under this root, or the root itself: never guess
+                        // a path on a 130T NAS.
+                        _ => {
+                            report.failed.push((
+                                label,
+                                "no tree path under the placement root — refusing to \
+                                 guess a destination"
+                                    .into(),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    dest.join(&id[..2]).join(&id)
+                };
+
+                // An occupied destination is decided by the LIVE CATALOG, never
+                // by overwriting on faith (D71 W5). Replacing IS the normal
+                // upgrade — quality is not in the filename, so a 720p file and
+                // its 1080p replacement share a name — but only when the bytes
+                // there are not some OTHER live node's, and not a file the
+                // catalog has never seen.
+                if tree_roots.contains(&root) && cpath.exists() {
+                    let occupant_uri = pvfs_core::storage::path_to_uri(&cpath)?;
+                    match engine.location_owner(&occupant_uri)? {
+                        // our own older copy — this is the upgrade
+                        Some(owner) if owner == id => {}
+                        Some(_) => {
+                            report.failed.push((
+                                label,
+                                format!(
+                                    "{} is another live file's bytes — refusing to \
+                                     overwrite; the old entry must be deleted first",
+                                    cpath.display()
+                                ),
+                            ));
+                            continue;
+                        }
+                        None => {
+                            report.failed.push((
+                                label,
+                                format!(
+                                    "{} exists but the catalog has never seen it — \
+                                     refusing to overwrite an unknown file",
+                                    cpath.display()
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 if let Err(e) = (|| -> Result<(), PvfsError> {
                     if let Some(dir) = cpath.parent() {
                         std::fs::create_dir_all(dir)
                             .map_err(|e| PvfsError::io("create central dir", e))?;
                     }
+                    // Publish atomically: a 40 GB copy written under its final name would
+                    // be visible to Plex half-transferred, and a failed transfer would
+                    // leave a broken file under the real name. Same directory, so the
+                    // rename is instant and the upgrade swap has no visible window.
                     let tmp = cpath.with_file_name(format!(".{id}.tmp"));
                     let mut f = std::fs::File::create(&tmp)
                         .map_err(|e| PvfsError::io("create central copy", e))?;

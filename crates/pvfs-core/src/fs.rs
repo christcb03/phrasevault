@@ -447,6 +447,70 @@ impl Engine {
     /// contains-links upward. `None` when the node is detached from the
     /// root (or the walk exceeds any sane depth) — an absent path is
     /// honest; an invented one is not.
+    /// Which live node claims this location URI, if any (D71 W5).
+    ///
+    /// The mover asks before writing over anything: the answer decides whether
+    /// an occupied destination is this file's own older copy (an upgrade —
+    /// replace it), another live file's bytes (refuse), or something the
+    /// catalog has never seen (refuse, because on a 130T NAS silently
+    /// clobbering an unrecognised file is the worst thing this can do).
+    pub fn location_owner(&self, uri: &str) -> Result<Option<NodeId>> {
+        self.conn
+            .query_row(
+                "SELECT file_id FROM file_locations
+                  WHERE uri = ?1 AND removed_at IS NULL LIMIT 1",
+                params![uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("location owner"))
+    }
+
+    /// The path of `node` relative to `ancestor`, as tree segments (D71 W5).
+    ///
+    /// This is what lets a migrated file land at
+    /// `…/Media/TV/Show/Season 03/ep.mkv` on the NAS instead of a hex blob in
+    /// a node-addressed store — so the NAS stays a normal media library that
+    /// Plex reads directly, and PVFS stops being *required* to read it.
+    ///
+    /// `None` when `node` is not under `ancestor` at all, which the caller must
+    /// treat as "do not place this here" rather than guessing a path.
+    pub fn tree_path_under(
+        &self,
+        node: &NodeId,
+        ancestor: &NodeId,
+    ) -> Result<Option<Vec<String>>> {
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = node.clone();
+        for _ in 0..256 {
+            if current == *ancestor {
+                segments.reverse();
+                return Ok(Some(segments));
+            }
+            let Some(n) = fetch_node(&self.conn, &current)? else {
+                return Ok(None);
+            };
+            segments.push(n.label);
+            let parent: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM links
+                     WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL
+                       AND parent_id IS NOT NULL
+                     ORDER BY id LIMIT 1",
+                    params![current, LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("tree path"))?;
+            match parent {
+                Some(p) => current = p,
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     fn folder_tree_path(&self, folder: &NodeId) -> Result<Option<String>> {
         let root = &self.identity.root_node_id;
         if folder == root {

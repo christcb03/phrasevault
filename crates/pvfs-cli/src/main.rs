@@ -251,6 +251,11 @@ enum Cmd {
         #[arg(value_parser = ["pointer", "sync", "central", "central-keep"])]
         mode: String,
         /// central-store directory (with `central`)
+        /// D71 W5: land migrated files at their TREE PATH under --to, rather
+        /// than as `<shard>/<node-id>` blobs — the destination stays a normal
+        /// media library that Plex reads directly, with no export and no mount.
+        #[arg(long)]
+        tree: bool,
         #[arg(long, required_if_eq_any([("mode", "central"), ("mode", "central-keep")]))]
         to: Option<PathBuf>,
         /// F5.5 (with `sync`): log fetched copies as THIS box's
@@ -3501,7 +3506,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Place { target, mode, to, advertise, served_by } => {
+        Cmd::Place { target, mode, to, advertise, served_by, tree } => {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
@@ -3562,6 +3567,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     None => None,
                 };
+                if tree && mode == "central-keep" {
+                    return Err(PvfsError::BadInput {
+                        field: "tree".into(),
+                        reason: "--tree is for `central` (the mover MOVES files to their \
+                                 tree path); a mirror keeps the source, so a second copy \
+                                 at the same tree path would collide with it"
+                            .into(),
+                    });
+                }
                 pvfs_core::sync::set_central_served(
                     &data_dir,
                     &id,
@@ -3569,6 +3583,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     mode == "central-keep",
                     served.as_ref().map(|(i, p)| (i.as_str(), p.as_path())),
                 )?;
+                pvfs_core::sync::set_central_tree(&data_dir, &id, tree)?;
             } else {
                 pvfs_core::sync::set_sync_mode(&data_dir, &id, mode == "sync", advertise)?;
                 if advertise {
