@@ -272,6 +272,138 @@ pub fn swarm_part_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dest.with_file_name(format!(".{id}.swarmpart")))
 }
 
+// ---- the trash (D71 W5, Chris: "build in the safety") -----------------------
+//
+// Once `evict` has reclaimed the ingest box's copy, the NAS holds the ONLY
+// copy — and PVFS now has AUTOMATED paths that destroy files: the mover
+// replacing an upgraded file, and (W2) the live mirror following a delete. A
+// bug in either loses data with nothing behind it.
+//
+// So an automated deletion MOVES THE FILE ASIDE. Same filesystem, so it is an
+// instant rename costing no extra space; dot-prefixed, so the watcher's
+// dotfile rule ignores it for free; and recoverable by moving it back.
+//
+// Deliberately NOT applied to a person's own `pvfs rm` — a deliberate action
+// is not the thing this guards against.
+
+const TRASH_DIR: &str = ".pvfs-trash";
+
+/// Days since the epoch — a sortable bucket without pulling in a date library.
+/// Purging works on this number, and an operator reading `.pvfs-trash/20321`
+/// only needs to know that bigger is newer.
+fn epoch_day(now_ms: u64) -> u64 {
+    now_ms / 86_400_000
+}
+
+pub fn trash_root(root: &Path) -> PathBuf {
+    root.join(TRASH_DIR)
+}
+
+/// Move `file` (which must be under `root`) into the trash, preserving its
+/// relative path so a restore is obvious. Returns where it went.
+pub fn move_to_trash(root: &Path, file: &Path) -> Result<PathBuf> {
+    let rel = file.strip_prefix(root).map_err(|_| {
+        bad(
+            "trash",
+            &format!("{} is not under {}", file.display(), root.display()),
+        )
+    })?;
+    let dest = trash_root(root)
+        .join(epoch_day(crate::engine::now_ms()).to_string())
+        .join(rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create trash dir", e))?;
+    }
+    // Same filesystem ⇒ instant. If it is not (a store on another mount), fall
+    // back to copy+remove rather than silently leaving the file in place.
+    match std::fs::rename(file, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            std::fs::copy(file, &dest).map_err(|e| PvfsError::io("copy to trash", e))?;
+            std::fs::remove_file(file).map_err(|e| PvfsError::io("remove after trash copy", e))?;
+            Ok(dest)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TrashPurge {
+    pub removed: u64,
+    pub freed_bytes: u64,
+}
+
+/// Purge trash buckets older than `keep_days`, and — when `min_free_bytes` is
+/// not met — keep purging oldest-first until it is.
+///
+/// Age alone is not enough here: `Data` is 88% full with 9.4 T free, so a
+/// fortnight of deleted 40 GB episodes could matter. Oldest first, and the
+/// caller reports what went.
+pub fn purge_trash(root: &Path, keep_days: u64, min_free_bytes: u64) -> Result<TrashPurge> {
+    let mut report = TrashPurge::default();
+    let base = trash_root(root);
+    if !base.exists() {
+        return Ok(report);
+    }
+    let mut buckets: Vec<(u64, PathBuf)> = std::fs::read_dir(&base)
+        .map_err(|e| PvfsError::io("read trash", e))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let day: u64 = e.file_name().to_str()?.parse().ok()?;
+            Some((day, e.path()))
+        })
+        .collect();
+    buckets.sort_by_key(|(day, _)| *day);
+
+    let today = epoch_day(crate::engine::now_ms());
+    for (day, path) in buckets {
+        let too_old = today.saturating_sub(day) >= keep_days;
+        let need_space = min_free_bytes > 0 && free_bytes(root) < min_free_bytes;
+        if !too_old && !need_space {
+            continue;
+        }
+        let freed = dir_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                report.removed += 1;
+                report.freed_bytes += freed;
+            }
+            Err(e) => return Err(PvfsError::io("purge trash bucket", e)),
+        }
+    }
+    Ok(report)
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            match e.metadata() {
+                Ok(md) if md.is_dir() => total += dir_bytes(&e.path()),
+                Ok(md) => total += md.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Free space on the filesystem holding `path`, or 0 if it cannot be read
+/// (which makes the space rule inert rather than making it purge blindly).
+fn free_bytes(path: &Path) -> u64 {
+    use std::process::Command;
+    Command::new("df")
+        .args(["-kP", &path.to_string_lossy()])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            let line = text.lines().nth(1)?.to_string();
+            line.split_whitespace().nth(3)?.parse::<u64>().ok()
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
 // ---- placement policy (deployment file) -------------------------------------
 
 pub fn placement_path(data_dir: &Path) -> PathBuf {

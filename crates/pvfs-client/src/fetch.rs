@@ -590,8 +590,18 @@ pub fn tier_pass(
                 if tree_roots.contains(&root) && cpath.exists() {
                     let occupant_uri = pvfs_core::storage::path_to_uri(&cpath)?;
                     match engine.location_owner(&occupant_uri)? {
-                        // our own older copy — this is the upgrade
-                        Some(owner) if owner == id => {}
+                        // Our own older copy: this is the upgrade. The old
+                        // bytes still go to the trash rather than under the
+                        // rename — once evict has reclaimed the ingest copy
+                        // this is the ONLY copy, and an automated overwrite
+                        // that turns out to be wrong is unrecoverable
+                        // (D71 W5, Chris: build in the safety).
+                        Some(owner) if owner == id => {
+                            if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
+                                report.failed.push((label, e.to_string()));
+                                continue;
+                            }
+                        }
                         Some(_) => {
                             report.failed.push((
                                 label,
