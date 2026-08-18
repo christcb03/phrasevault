@@ -596,7 +596,17 @@ impl PvfsFs {
 }
 
 fn opts(auto_unmount: bool) -> Vec<MountOption> {
-    let mut o = vec![MountOption::RO, MountOption::FSName("pvfs".into())];
+    // D71 W2: NOT `MountOption::RO`. The kernel enforces that flag before any
+    // handler runs, so `unlink`/`rmdir`/`rename` never saw the call — the lab
+    // proved it, with `rm` returning EROFS against a mount whose handlers were
+    // already implemented.
+    //
+    // The data path stays read-only regardless: `write`, `create` and
+    // `truncate` are simply not implemented, so the kernel answers ENOSYS and
+    // mergerfs keeps routing creates to /mnt/local. What is now permitted is
+    // exactly the NAMESPACE — which is the whole point of W2, and the one
+    // place this design was behind the read-write rclone mounts it replaces.
+    let mut o = vec![MountOption::FSName("pvfs".into())];
     if auto_unmount {
         o.push(MountOption::AutoUnmount);
     }

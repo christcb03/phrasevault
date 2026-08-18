@@ -1673,6 +1673,39 @@ impl Engine {
     /// (F5.3, doc 17 §7.4): `(file_id, uri, local_path)` rows whose bytes
     /// this host may now delete, once it confirms another live location.
     /// Empty when this instance has no transport pin.
+    /// Live `file://` locations whose node no longer hangs anywhere in the
+    /// tree — bytes on THIS box belonging to something that was deleted.
+    ///
+    /// Note this is the opposite shape to `retired_own_host_locations`, and
+    /// getting that wrong cost a lab round: unlinking a node does NOT retire
+    /// its locations. The rows stay live; what changes is that nothing links
+    /// the node any more. So the deleted-file sweep looks for LIVE locations
+    /// under DEAD nodes, not the reverse.
+    pub fn orphaned_local_locations(&self) -> Result<Vec<(NodeId, PathBuf)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT l.file_id, l.uri FROM file_locations l
+                  WHERE l.removed_at IS NULL
+                    AND l.uri LIKE 'file://%'
+                    AND NOT EXISTS (SELECT 1 FROM links k
+                                    WHERE k.child_id = l.file_id
+                                      AND k.removed_at IS NULL)",
+            )
+            .map_err(map_db("orphaned locations"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_db("orphaned locations"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, uri) = row.map_err(map_db("orphaned locations"))?;
+            if let Ok(p) = crate::storage::uri_to_path(&uri) {
+                out.push((id, p));
+            }
+        }
+        Ok(out)
+    }
+
     /// Does any live link still contain this node? (D71 W2.)
     ///
     /// The difference between "moved" and "deleted": a node that still hangs

@@ -304,11 +304,7 @@ pub fn reclaim_pass(engine: &Engine, data_dir: &Path) -> Result<TrashPurge> {
     if roots.is_empty() {
         return Ok(report);
     }
-    for (id, _uri, path) in engine.retired_own_host_locations()? {
-        // A node still linked somewhere is alive: it moved, it was not deleted.
-        if engine.node_is_linked(&id)? {
-            continue;
-        }
+    for (_id, path) in engine.orphaned_local_locations()? {
         let Some(root) = roots.iter().find(|r| path.starts_with(r)) else {
             continue; // not in a tree-layout root — evict's territory
         };

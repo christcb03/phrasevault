@@ -750,7 +750,8 @@ enum ReplicaCmd {
 
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// Enable a job in `serve.jobs` (follow|watch|sync|export|tier|evict). The
+    /// Enable a job in `serve.jobs` (follow|watch|sync|export|tier|evict|reclaim).
+    /// The
     /// daemon picks it up on SIGHUP or restart.
     Enable { job: String },
     /// Disable a job in `serve.jobs`
@@ -4099,7 +4100,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()?;
             std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create mountpoint", e))?;
             eprintln!(
-                "mounting {id} at {} (read-only; `pvfs umount {}` to stop)",
+                "mounting {id} at {} (data read-only; delete/rename write through; \
+                 `pvfs umount {}` to stop)",
                 dir.display(),
                 dir.display()
             );

@@ -54,10 +54,12 @@ pub fn run(
     let result = (|| {
         let mut engine = Engine::open(data_dir)?;
         // D71 W4: on a replica the catalog writes go to the owner's daemon —
-        // this box has no local writer. The route is opened once and reused
-        // for every pass; if the owner is unreachable the watcher starts
-        // anyway and each pass reports the failure, because a scan is
-        // idempotent and the NEXT pass repairs it with nobody involved.
+        // this box has no local writer. If the owner is unreachable the
+        // watcher starts anyway and each pass reports the failure, because a
+        // scan is idempotent and the NEXT pass repairs it with nobody
+        // involved. A failed pass DROPS the route so the following one
+        // reconnects (see the Err arm) — an owner restart would otherwise
+        // wedge this box permanently.
         let is_replica = engine.is_replica();
         let mut route = crate::advertise::replica_route(data_dir, is_replica).unwrap_or(None);
         // initial reconciliation
@@ -160,6 +162,22 @@ pub fn run(
                         // Loud, and self-correcting: say so, then come back
                         // shortly rather than waiting out the reconcile.
                         notify_cb(WatchEvent::ScanError(e.to_string()));
+                        // DROP THE ROUTE so the next pass reconnects.
+                        //
+                        // The connection was opened once at startup, and an
+                        // owner restart kills it — which happens on every
+                        // upgrade. Retrying against a dead socket cannot
+                        // succeed no matter how patient we are, and because
+                        // the failure text says "closed" it is classified
+                        // transient and retried forever. The lab wedged
+                        // exactly this way: the owner restarted twice, and the
+                        // ingest box never catalogued another file until its
+                        // OWN daemon was restarted.
+                        //
+                        // Reconnecting is cheap and idempotent, so pay it on
+                        // any failure rather than trying to tell "the owner is
+                        // busy" from "the socket is gone" through a string.
+                        route = None;
                         retry_at = Some(Instant::now() + backoff);
                         backoff = (backoff * 2).min(RETRY_MAX);
                     }
@@ -189,6 +207,12 @@ fn scan_pass(
     engine: &mut Engine,
     route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
 ) -> Result<Vec<pvfs_core::ScanReport>, PvfsError> {
+    // Reconnect if a previous pass dropped the route (see the Err arm above).
+    // A replica with no route cannot write anything it finds, so failing to
+    // reconnect must surface as the pass failing — not as a silent local scan.
+    if route.is_none() && engine.is_replica() {
+        *route = crate::advertise::replica_route(engine.data_dir(), true)?;
+    }
     match route {
         Some((client, sign)) => {
             let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &**sign;

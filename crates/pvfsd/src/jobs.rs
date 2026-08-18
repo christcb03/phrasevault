@@ -29,7 +29,7 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
-const PERIODIC: [&str; 4] = ["sync", "export", "tier", "evict"];
+const PERIODIC: [&str; 5] = ["sync", "export", "tier", "evict", "reclaim"];
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
 const TIER_INTERVAL: Duration = Duration::from_secs(300);
@@ -361,6 +361,23 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("tier", Some(e.to_string())),
             }
         }),
+        // D71 W2/W3: the holder tidies its own filesystem after a delete. The
+        // mount retires the link from whatever box the user is on; the box
+        // that owns the BYTES moves them to the trash. The owner never reaches
+        // across NFS to delete something on the NAS.
+        "reclaim" => std::thread::spawn(move || {
+            st.set_state("reclaim", "running");
+            let r = (|| -> Result<pvfs_core::sync::TrashPurge, PvfsError> {
+                let engine = pvfs_core::Engine::open(st.data_dir())?;
+                let r = pvfs_core::sync::reclaim_pass(&engine, st.data_dir());
+                engine.close()?;
+                r
+            })();
+            match r {
+                Ok(_) => st.mark_pass("reclaim", None),
+                Err(e) => st.mark_pass("reclaim", Some(e.to_string())),
+            }
+        }),
         "evict" => std::thread::spawn(move || {
             st.set_state("evict", "running");
             let r = (|| -> Result<pvfs_core::sync::EvictReport, PvfsError> {
@@ -395,6 +412,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
 fn interval(name: &str) -> Duration {
     match name {
         "sync" => SYNC_INTERVAL,
+        "reclaim" => EVICT_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
         _ => EVICT_INTERVAL,
