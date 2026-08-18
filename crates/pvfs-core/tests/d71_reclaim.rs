@@ -102,3 +102,42 @@ fn reclaimed_bytes_go_to_the_trash_not_to_unlink() {
     fs::rename(&moved, &episode).unwrap();
     assert_eq!(fs::read(&episode).unwrap(), b"the only copy");
 }
+
+/// A path still claimed by a LIVE node is never reclaimed, even when a dead
+/// node also references it.
+///
+/// This is the rename shape: the successor inherits the old node's locations
+/// and the old node is retired, so for a moment one file is referenced by both
+/// a dead node and a live one. Without this guard the sweep would trash the
+/// bytes the surviving node depends on — turning a rename into data loss.
+#[test]
+fn a_path_a_live_node_still_claims_is_never_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let old = file_node(&mut engine, &root, "before.mkv", 10);
+    let new = file_node(&mut engine, &root, "after.mkv", 10);
+    let uri = "file:///nas/Media/Show/before.mkv";
+    engine.add_location(&old, uri).unwrap();
+    engine.add_location(&new, uri).unwrap(); // the successor inherits it
+
+    // Retire the old node, exactly as a rename does.
+    let link = engine
+        .children(&root)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == old)
+        .unwrap()
+        .link_id;
+    engine.remove_link(&link).unwrap();
+    assert!(!engine.node_is_linked(&old).unwrap());
+    assert!(engine.node_is_linked(&new).unwrap());
+
+    let orphans = engine.orphaned_local_locations().unwrap();
+    assert!(
+        !orphans.iter().any(|(_, p)| p.to_string_lossy().contains("before.mkv")),
+        "the surviving node still needs those bytes — never reclaim them"
+    );
+    engine.close().unwrap();
+}

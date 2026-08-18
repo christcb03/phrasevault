@@ -1690,7 +1690,18 @@ impl Engine {
                     AND l.uri LIKE 'file://%'
                     AND NOT EXISTS (SELECT 1 FROM links k
                                     WHERE k.child_id = l.file_id
-                                      AND k.removed_at IS NULL)",
+                                      AND k.removed_at IS NULL)
+                    -- ...and NO OTHER LIVE NODE claims the same bytes.
+                    -- A rename carries the old node's locations onto its
+                    -- successor and retires the old node, so for a moment one
+                    -- path is referenced by a dead node AND a live one.
+                    -- Without this the sweep would trash the file the
+                    -- SURVIVING node depends on.
+                    AND NOT EXISTS (SELECT 1 FROM file_locations o
+                                    JOIN links lk ON lk.child_id = o.file_id
+                                                 AND lk.removed_at IS NULL
+                                    WHERE o.uri = l.uri
+                                      AND o.removed_at IS NULL)",
             )
             .map_err(map_db("orphaned locations"))?;
         let rows = stmt

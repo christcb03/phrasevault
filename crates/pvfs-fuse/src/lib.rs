@@ -457,8 +457,10 @@ impl Filesystem for PvfsFs {
             return reply.error(libc::ENOENT);
         };
         if name != newname {
-            // A name change is a new node, not a rename. See above.
-            return reply.error(libc::EXDEV);
+            return match self.rename_to_new_name(&from, name, &to, newname) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            };
         }
         if from == to {
             return reply.ok(); // nothing to do
@@ -540,6 +542,94 @@ pub fn mount(data_dir: &Path, target: &NodeId, mountpoint: &Path) -> Result<(), 
 }
 
 impl PvfsFs {
+    /// D71 W2 — a name change, as a SUCCESSOR.
+    ///
+    /// The node id is a hash that includes the label (`node.rs`
+    /// `compute_id_digest`), so a new name is unavoidably a new node. What
+    /// makes it a rename rather than a re-import is that the successor
+    /// **inherits the old node's locations**: the bytes are already accounted
+    /// for, nothing is copied here, and the old node is retired.
+    ///
+    /// Two consequences worth knowing:
+    ///
+    /// * for a moment one file is referenced by both a dead node and a live
+    ///   one — `orphaned_local_locations` refuses to reclaim a path any live
+    ///   node still claims, which is what stops this becoming data loss;
+    /// * under tree-layout placement the successor's path differs, so the
+    ///   mover will relocate the bytes on its next pass. Today that is a copy;
+    ///   a same-filesystem `rename` on the holder is the obvious optimisation
+    ///   and is NOT done yet — for a 40 GB episode that difference is minutes
+    ///   against milliseconds.
+    fn rename_to_new_name(
+        &mut self,
+        from: &NodeId,
+        name: &str,
+        to: &NodeId,
+        newname: &str,
+    ) -> Result<(), i32> {
+        let children = self.engine.children(from).map_err(|_| libc::EIO)?;
+        let entry = children
+            .into_iter()
+            .find(|c| c.node.label == name)
+            .ok_or(libc::ENOENT)?;
+        if entry.node.node_type != pvfs_core::TYPE_FILE {
+            // Renaming a folder would have to re-parent everything beneath it.
+            // Refuse rather than half-do it.
+            return Err(libc::EXDEV);
+        }
+        let payload = pvfs_core::FilePayload::decode(&entry.node.payload)
+            .map_err(|_| libc::EIO)?;
+        let locations = self.engine.locations(&entry.node.id).map_err(|_| libc::EIO)?;
+
+        let res = (|| -> Result<(), PvfsError> {
+            match &mut self.route {
+                Some((client, sign)) => {
+                    let new_id = client
+                        .add_file(to, newname, payload.size_bytes, &payload.mime_type, |d| {
+                            sign(d)
+                        })
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    for uri in &locations {
+                        client
+                            .add_location(&new_id, uri, |d| sign(d))
+                            .map_err(|e| PvfsError::BadInput {
+                                field: "rename".into(),
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    client
+                        .unlink(&entry.link_id, |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    pvfs_client::advertise::catch_up(&self.data_dir, client);
+                    Ok(())
+                }
+                None => {
+                    let new_id = self.engine.add_node(
+                        to,
+                        pvfs_core::NodeSpec {
+                            node_type: pvfs_core::TYPE_FILE.into(),
+                            label: newname.to_string(),
+                            payload: entry.node.payload.clone(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?;
+                    for uri in &locations {
+                        self.engine.add_location(&new_id, uri)?;
+                    }
+                    self.engine.remove_link(&entry.link_id)
+                }
+            }
+        })();
+        res.map_err(|_| libc::EIO)
+    }
+
     /// D71 W2 — retire a link, routing on a replica.
     ///
     /// This is the gap that made the design a REGRESSION against the rclone
