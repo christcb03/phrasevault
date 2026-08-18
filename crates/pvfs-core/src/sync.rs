@@ -716,7 +716,12 @@ pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
                 // silently, with the 720p copy still on the NAS. Size is the
                 // cheapest honest check and it is the same signal W6 uses for
                 // identity.
-                if engine.payload_size_of(&id)?.is_some_and(|recorded| recorded != size) {
+                // FAIL CLOSED. `is_some_and` here would delete whenever the
+                // recorded size is UNKNOWN — and one of the retired rows for a
+                // migrated file is a pvfs-sync node with no payload size at
+                // all, so the guard let the replacement through and deleted it
+                // anyway. Reclaim only when we positively know the bytes match.
+                if engine.payload_size_of(&id)? != Some(size) {
                     report.skipped.push((
                         uri,
                         "file on disk no longer matches the migrated copy — \
