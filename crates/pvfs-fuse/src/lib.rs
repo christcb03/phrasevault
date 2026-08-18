@@ -422,6 +422,88 @@ impl Filesystem for PvfsFs {
         }
     }
 
+    /// D71 W2 — `rename`.
+    ///
+    /// Two genuinely different operations wear one syscall here, because **the
+    /// node id is a hash that includes the label** (`node.rs` `compute_id_digest`):
+    ///
+    /// * **Moving** a file between folders keeps its name, so it keeps its
+    ///   identity: unlink from the old parent, link under the new one. Cheap,
+    ///   exact, and the file's locations are untouched.
+    /// * **Changing the name** cannot be a relabel — a different label is a
+    ///   different node. Doing it silently would mint a new id, orphan the old
+    ///   node's locations, and quietly break W6's identity for the file. That
+    ///   deserves a deliberate design (carry the locations across, retire the
+    ///   old node, move the bytes on every holder), not a side effect of a
+    ///   `mv`. Refused with EXDEV until it has one — the same answer a rename
+    ///   across filesystems gets, which callers already handle by copy+delete.
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(from), Some(to)) = (
+            self.ino_to_node.get(&parent).cloned(),
+            self.ino_to_node.get(&newparent).cloned(),
+        ) else {
+            return reply.error(libc::ENOENT);
+        };
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(libc::ENOENT);
+        };
+        if name != newname {
+            // A name change is a new node, not a rename. See above.
+            return reply.error(libc::EXDEV);
+        }
+        if from == to {
+            return reply.ok(); // nothing to do
+        }
+        let children = match self.engine.children(&from) {
+            Ok(c) => c,
+            Err(e) => return reply.error(enoent(e)),
+        };
+        let Some(entry) = children.into_iter().find(|c| c.node.label == name) else {
+            return reply.error(libc::ENOENT);
+        };
+        // Link first, then unlink: a crash between the two leaves the file
+        // reachable from both parents, which a later pass can tidy. The other
+        // order can lose it entirely.
+        let res = (|| -> Result<(), PvfsError> {
+            match &mut self.route {
+                Some((client, sign)) => {
+                    client
+                        .link(&to, &entry.node.id, pvfs_core::LINK_CONTAINS, "", |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    client
+                        .unlink(&entry.link_id, |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    pvfs_client::advertise::catch_up(&self.data_dir, client);
+                    Ok(())
+                }
+                None => {
+                    self.engine
+                        .link(&to, &entry.node.id, pvfs_core::LINK_CONTAINS, None, 0)?;
+                    self.engine.remove_link(&entry.link_id)
+                }
+            }
+        })();
+        match res {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
     fn release(
         &mut self,
         _req: &Request<'_>,
