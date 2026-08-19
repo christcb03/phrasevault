@@ -422,25 +422,33 @@ impl Filesystem for PvfsFs {
         }
     }
 
-    /// D71 W2 — `rename`.
+    /// `rename` — D71 W2, rewritten by D72.
     ///
-    /// Two genuinely different operations wear one syscall here, because **the
-    /// node id is a hash that includes the label** (`node.rs` `compute_id_digest`):
+    /// It used to be two genuinely different operations wearing one syscall,
+    /// because **the node id was a hash that included the label**: moving kept
+    /// the name and so kept the identity (unlink, link), while RENAMING could
+    /// not be a relabel at all — it had to mint a successor node, copy every
+    /// location onto it, retire the old one, and leave the mover to relocate
+    /// the bytes. For a folder it was worse: a new folder node, every child
+    /// re-linked, and every descendant's tree path changed with it.
     ///
-    /// * **Moving** a file between folders keeps its name, so it keeps its
-    ///   identity: unlink from the old parent, link under the new one. Cheap,
-    ///   exact, and the file's locations are untouched.
-    /// * **Changing the name IN PLACE** is now one event. D72 moved labels onto
-    ///   links, so a rename that keeps the same parent is a `LinkRelabeled` on
-    ///   the existing edge: the node keeps its id, its locations, its content
-    ///   hash and its bytes, and nothing moves on any holder. This is the case
-    ///   that matters — an arr renaming an episode in place — and it went from
-    ///   "mint a successor and relocate the file" to a single signed event.
-    /// * **Changing the name AND the parent** still takes the successor path
-    ///   below. It is rarer, and doing it properly means a move plus a relabel;
-    ///   splitting that is deliberate future work, not a silent half-measure.
-    /// * On a REPLICA the relabel wire op does not exist yet (D72 Part C), so
-    ///   the successor path is used there too — correct, just not cheap.
+    /// D72 moved labels onto LINKS, so a name is an attribute of the edge and a
+    /// node's identity no longer depends on it. Locally that collapses all four
+    /// cases into the same three primitives — nothing is minted, nothing is
+    /// copied, and locations and content hashes are untouched throughout:
+    ///
+    /// | | same name | new name |
+    /// |---|---|---|
+    /// | **same parent** | nothing | relabel |
+    /// | **new parent** | link + unlink | link + relabel + unlink |
+    ///
+    /// Renaming a show is now ONE event at the top of its subtree, whatever is
+    /// beneath it.
+    ///
+    /// A **replica** still takes the old successor path for a name change: the
+    /// relabel wire op does not exist, and adding one is a wire change rather
+    /// than a log change, which Part A's tolerance does not cover. That is the
+    /// gap D73 is for.
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -460,36 +468,6 @@ impl Filesystem for PvfsFs {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
             return reply.error(libc::ENOENT);
         };
-        if name != newname {
-            // D72 FAST PATH: same parent ⇒ the name lives on the edge, so this
-            // is one event. No new node, no re-linking a folder's children, no
-            // byte movement — the thing that made renames expensive was that a
-            // label was part of a node's identity, and it no longer is.
-            if from == to && self.route.is_none() {
-                let found = self
-                    .engine
-                    .children(&from)
-                    .ok()
-                    .and_then(|kids| kids.into_iter().find(|c| c.label == name));
-                if let Some(entry) = found {
-                    return match self.engine.relabel_link(&entry.link_id, newname) {
-                        Ok(()) => reply.ok(),
-                        Err(e) => {
-                            eprintln!("pvfs mount: relabel failed: {e}");
-                            reply.error(libc::EIO)
-                        }
-                    };
-                }
-                return reply.error(libc::ENOENT);
-            }
-            return match self.rename_to_new_name(&from, name, &to, newname) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
-            };
-        }
-        if from == to {
-            return reply.ok(); // nothing to do
-        }
         let children = match self.engine.children(&from) {
             Ok(c) => c,
             Err(e) => return reply.error(enoent(e)),
@@ -497,33 +475,88 @@ impl Filesystem for PvfsFs {
         let Some(entry) = children.into_iter().find(|c| c.label == name) else {
             return reply.error(libc::ENOENT);
         };
-        // Link first, then unlink: a crash between the two leaves the file
-        // reachable from both parents, which a later pass can tidy. The other
-        // order can lose it entirely.
-        let res = (|| -> Result<(), PvfsError> {
-            match &mut self.route {
-                Some((client, sign)) => {
-                    client
-                        .link(&to, &entry.node.id, pvfs_core::LINK_CONTAINS, "", |d| sign(d))
-                        .map_err(|e| PvfsError::BadInput {
-                            field: "rename".into(),
-                            reason: e.to_string(),
-                        })?;
-                    client
-                        .unlink(&entry.link_id, |d| sign(d))
-                        .map_err(|e| PvfsError::BadInput {
-                            field: "rename".into(),
-                            reason: e.to_string(),
-                        })?;
-                    pvfs_client::advertise::catch_up(&self.data_dir, client);
-                    Ok(())
-                }
-                None => {
-                    self.engine
-                        .link(&to, &entry.node.id, pvfs_core::LINK_CONTAINS, None, 0)?;
-                    self.engine.remove_link(&entry.link_id)
-                }
+
+        // D72: locally, ALL FOUR cases are the same three primitives, because a
+        // name is an attribute of the edge and a node's identity never depends
+        // on it. Nothing is minted, nothing is copied, and the file's locations
+        // and content hash are untouched in every case.
+        //
+        //   same parent, same name  → nothing
+        //   same parent, new name   → relabel
+        //   new parent,  same name  → link + unlink
+        //   new parent,  new name   → link + relabel + unlink
+        //
+        // This replaced a "successor node" path that minted a new node, copied
+        // every location onto it, retired the old one, and left the mover to
+        // relocate the bytes — and, for a folder, re-linked every child so that
+        // every descendant's tree path changed too.
+        if self.route.is_none() {
+            if from == to && name == newname {
+                return reply.ok();
             }
+            let res = (|| -> Result<(), PvfsError> {
+                if from == to {
+                    return self.engine.relabel_link(&entry.link_id, newname);
+                }
+                // ONE move, not link+unlink: the one-home rule means a node has
+                // exactly one containing parent, so linking under the new one
+                // first fails with `AlreadyContained`. `move_node` retires the
+                // old edge and creates the new one in a single commit, with the
+                // cycle and both-parents write checks that live there.
+                self.engine.move_node(&entry.node.id, &to)?;
+                if name != newname {
+                    let moved = self
+                        .engine
+                        .children(&to)?
+                        .into_iter()
+                        .find(|c| c.node.id == entry.node.id)
+                        .ok_or_else(|| PvfsError::NotFound {
+                            kind: "moved node",
+                            id: entry.node.id.clone(),
+                        })?;
+                    self.engine.relabel_link(&moved.link_id, newname)?;
+                }
+                Ok(())
+            })();
+            return match res {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    eprintln!("pvfs mount: rename failed: {e}");
+                    reply.error(libc::EIO)
+                }
+            };
+        }
+
+        // A REPLICA has no relabel wire op yet, so a name change still takes
+        // the successor path there. Correct, just not cheap — and it is the
+        // reason the wire needs Part A's treatment of its own (see D73).
+        if name != newname {
+            return match self.rename_to_new_name(&from, name, &to, newname) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            };
+        }
+        if from == to {
+            return reply.ok();
+        }
+        let res = (|| -> Result<(), PvfsError> {
+            let Some((client, sign)) = &mut self.route else {
+                unreachable!("route checked above")
+            };
+            client
+                .link(&to, &entry.node.id, pvfs_core::LINK_CONTAINS, "", |d| sign(d))
+                .map_err(|e| PvfsError::BadInput {
+                    field: "rename".into(),
+                    reason: e.to_string(),
+                })?;
+            client
+                .unlink(&entry.link_id, |d| sign(d))
+                .map_err(|e| PvfsError::BadInput {
+                    field: "rename".into(),
+                    reason: e.to_string(),
+                })?;
+            pvfs_client::advertise::catch_up(&self.data_dir, client);
+            Ok(())
         })();
         match res {
             Ok(()) => reply.ok(),

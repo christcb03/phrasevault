@@ -1547,6 +1547,34 @@ impl Engine {
         })
     }
 
+    /// Move a node to a new containing parent, locally.
+    ///
+    /// This primitive was MISSING. The wire path had `prepare_move_node` (used
+    /// by `WriteOp::Mv`), but locally FUSE open-coded a move as `link` then
+    /// `remove_link` — and that cannot work: the one-home rule means a node has
+    /// exactly ONE containing parent, so linking under the new one while the
+    /// old link is still live fails with `AlreadyContained`. Every local
+    /// cross-folder move therefore returned EIO. Nothing tested it, and the
+    /// comment above it described an ordering the engine refuses.
+    ///
+    /// Reusing `prepare_move_node` rather than open-coding it again is the
+    /// point: it is where the cycle check, the write check on BOTH parents,
+    /// and the cross-region paired-event protocol live. A second
+    /// implementation would be a second place for those to be forgotten.
+    pub fn move_node(&mut self, node: &NodeId, new_parent: &NodeId) -> Result<()> {
+        self.ensure_device_active()?;
+        let me = self.device.pubkey();
+        let prepared = self.prepare_move_node(&me, node, new_parent)?;
+        let mut events = Vec::with_capacity(prepared.events.len());
+        for pe in prepared.events {
+            let sig = crypto::sign_digest(&self.device.signing_key, &pe.digest)?;
+            let mut ev = pe.event;
+            ev.set_author_sig(sig);
+            events.push(ev);
+        }
+        self.commit_member_write(events)
+    }
+
     /// Set a link's display label — the name a parent uses for this child.
     ///
     /// Mirrors [`reorder_link`]: a signed event changing a MUTABLE attribute of

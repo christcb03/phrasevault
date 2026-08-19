@@ -237,3 +237,66 @@ fn renaming_a_folder_moves_everything_under_it() {
     );
     engine.close().unwrap();
 }
+
+/// Moving AND renaming in one step — the case that used to fall back to
+/// minting a successor node even after in-place renames got cheap.
+///
+/// These are the exact three primitives FUSE `rename` now uses locally:
+/// link under the new parent, relabel that new edge, unlink the old one. The
+/// node is never touched, so its id, its locations and its content hash all
+/// survive a move-and-rename that previously replaced it.
+#[test]
+fn a_file_moved_and_renamed_at_once_keeps_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let media = child(&mut engine, &root, "Media", TYPE_FOLDER);
+    let tv = child(&mut engine, &media, "TV", TYPE_FOLDER);
+    let show = child(&mut engine, &tv, "Show Name (2020)", TYPE_FOLDER);
+    let s1 = child(&mut engine, &show, "Season 01", TYPE_FOLDER);
+    let s2 = child(&mut engine, &show, "Season 02", TYPE_FOLDER);
+    let ep = child(&mut engine, &s1, "wrongly-filed.mkv", TYPE_FILE);
+
+    // move → relabel, the two primitives FUSE now uses.
+    //
+    // NOT link-then-unlink: the one-home rule means a node has exactly ONE
+    // containing parent, so linking under the new parent while the old edge is
+    // still live fails with `AlreadyContained`. That is what the open-coded
+    // version in FUSE did, which is why every local cross-folder move returned
+    // EIO until this test went looking.
+    engine.move_node(&ep, &s2).unwrap();
+    let new_link = engine
+        .children(&s2)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == ep)
+        .expect("moved")
+        .link_id;
+    engine
+        .relabel_link(&new_link, "Show Name - s02e05.mkv")
+        .unwrap();
+
+    // Gone from the old season, present in the new one — as the SAME node.
+    assert!(
+        engine.children(&s1).unwrap().is_empty(),
+        "the old parent must not still claim it"
+    );
+    let moved = engine.children(&s2).unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].node.id, ep, "same node — nothing was re-catalogued");
+    assert_eq!(moved[0].label, "Show Name - s02e05.mkv");
+
+    // And the destination on the NAS reflects BOTH the move and the rename.
+    let segs = engine.tree_path_under(&ep, &media).unwrap().unwrap();
+    assert_eq!(
+        segs,
+        vec![
+            "TV",
+            "Show Name (2020)",
+            "Season 02",
+            "Show Name - s02e05.mkv"
+        ]
+    );
+    engine.close().unwrap();
+}
