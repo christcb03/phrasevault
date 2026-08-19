@@ -579,6 +579,16 @@ pub fn msg_secure_blob_updated(
 
 // ---- encode / decode --------------------------------------------------------
 
+/// Does THIS binary understand `kind`?
+///
+/// The migration path needs this: a box that folded an event as `Unknown` and
+/// later gained the code to read it cannot cheaply migrate — its projection is
+/// missing whatever that event carried, and only a replay can recover it.
+/// Kept next to `decode` so the two lists cannot drift apart.
+pub fn is_known_kind(kind: &str) -> bool {
+    !matches!(Event::decode(kind, &[]), Ok(Event::Unknown { .. }))
+}
+
 impl Event {
     pub fn kind(&self) -> &str {
         match self {

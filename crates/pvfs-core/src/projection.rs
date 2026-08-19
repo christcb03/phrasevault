@@ -2464,6 +2464,28 @@ fn replay_sealed_child(
 ///
 /// Surfaced by `pvfs versions` so "this box is behind" is a fact an operator
 /// can read, not something they infer when the library looks wrong.
+/// Same as [`unknown_events`], on a connection already open (the migration path
+/// runs inside one).
+fn unknown_events_conn(conn: &Connection) -> Option<(u64, String)> {
+    let n: u64 = conn
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'unknown_events'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()?
+        .parse()
+        .ok()?;
+    let kinds: String = conn
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'unknown_event_kinds'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    Some((n, kinds))
+}
+
 pub fn unknown_events(data_dir: &std::path::Path) -> Option<(u64, String)> {
     let conn = Connection::open(data_dir.join("index.db")).ok()?;
     let n: u64 = conn
@@ -2536,6 +2558,27 @@ fn migrate_projection(
         .unwrap_or(1);
     if has_regions != 0 {
         return None;
+    }
+
+    // A box that folded an event as `Unknown` and has SINCE gained the code to
+    // read it cannot take the cheap door. Its projection is missing whatever
+    // that event carried, and an ALTER adding an empty column does not recover
+    // it — only a replay does.
+    //
+    // This is not a corner case. In a rolling upgrade every box except the
+    // first is behind for a while, so every box except the first may have
+    // ignored events it can now read. Migrating those in place would leave
+    // them permanently, silently wrong.
+    if let Some((n, kinds)) = unknown_events_conn(conn) {
+        if n > 0
+            && kinds
+                .split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .any(crate::event::is_known_kind)
+        {
+            return None; // slow door: replay, and learn what we ignored
+        }
     }
 
     let _folds = lock_folds(data_dir).ok()?;

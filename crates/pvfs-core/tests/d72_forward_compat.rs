@@ -211,3 +211,68 @@ fn a_relabel_round_trips() {
         other => panic!("expected LinkRelabeled, got {:?}", other.kind()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The gap the mixed-version lab test exposed BEFORE it was ever run.
+// ---------------------------------------------------------------------------
+
+/// `is_known_kind` must answer for the kinds this binary actually decodes —
+/// it is the migration's only way to ask "did I ignore something I can now
+/// read?", and a wrong answer costs correctness in both directions.
+#[test]
+fn a_binary_knows_which_kinds_it_knows() {
+    use pvfs_core::event::{is_known_kind, K_LINK_CREATED, K_LINK_RELABELED};
+
+    assert!(is_known_kind(K_LINK_CREATED), "a long-standing kind");
+    assert!(is_known_kind(K_LINK_RELABELED), "the kind Part B adds");
+    assert!(
+        !is_known_kind("SomethingFromTheFuture"),
+        "a kind no binary has ever emitted"
+    );
+}
+
+/// THE ROLLING-UPGRADE TRAP, pinned.
+///
+/// Part A lets an older box fold an event it cannot read as `Unknown` and keep
+/// going. That box's projection is then MISSING whatever the event carried.
+/// If it later gains the code to read that kind, the cheap in-place migration
+/// (an `ALTER` adding an empty column) does NOT recover it — the labels are in
+/// the log, not in the column, and nothing re-reads the log.
+///
+/// This is not a corner case. In a rolling upgrade every box except the first
+/// is behind for a while, so nearly every box may have ignored events it can
+/// now read. Migrating those in place leaves them permanently, silently wrong
+/// — the exact failure Part A's "tolerance must never become silence" rule
+/// exists to prevent.
+///
+/// So: recorded unknown events whose kinds are NOW known must force the slow
+/// door (replay). Unknown events still genuinely unknown must not — a replay
+/// would not teach the box anything it does not already lack.
+#[test]
+fn a_box_that_ignored_an_event_it_can_now_read_must_replay_not_migrate() {
+    use pvfs_core::event::is_known_kind;
+
+    // The decision the migration makes, stated exactly as the code states it.
+    let should_replay = |kinds: &str| {
+        kinds
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .any(is_known_kind)
+    };
+
+    assert!(
+        should_replay("LinkRelabeled"),
+        "ignored a relabel, then learned to read one ⇒ the column is empty \
+         but the log has the names ⇒ MUST replay"
+    );
+    assert!(
+        should_replay("SomethingFromTheFuture,LinkRelabeled"),
+        "one now-known kind among unknowns is enough to require a replay"
+    );
+    assert!(
+        !should_replay("SomethingFromTheFuture"),
+        "still unreadable ⇒ a replay teaches nothing ⇒ take the cheap door"
+    );
+    assert!(!should_replay(""), "nothing ignored ⇒ nothing to recover");
+}
