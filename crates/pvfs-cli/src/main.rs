@@ -84,6 +84,13 @@ enum Cmd {
     },
     /// Soft-remove a link (triggers temp purge check)
     Unlink { link_id: String },
+    /// Move a node to a new containing parent (its name is unchanged; use
+    /// `relabel` to rename). Prompts for anything omitted.
+    Mv {
+        node: Option<String>,
+        #[arg(long = "to")]
+        new_parent: Option<String>,
+    },
     /// Set a link's display label (the name its parent uses for this child)
     Relabel {
         link_id: String,
@@ -1902,6 +1909,29 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 println!("removed {link_id}");
             }
+            Ok(())
+        }
+        Cmd::Mv { node, new_parent } => {
+            let mut engine = Engine::open(&ctx?)?;
+            let node = match node {
+                Some(n) => n,
+                None => prompt_line("node to move", None)?,
+            };
+            let new_parent = match new_parent {
+                Some(p) => p,
+                None => prompt_line("new parent", None)?,
+            };
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client.mv(&node, &new_parent, |d| sign(d)).map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.move_node(&node, &new_parent)?;
+                engine.close()?;
+            }
+            println!("moved {node} -> {new_parent}");
             Ok(())
         }
         Cmd::Relabel { link_id, label } => {
