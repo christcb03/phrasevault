@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS temp_links (
   link_type     TEXT NOT NULL,
   link_nonce    INTEGER NOT NULL,
   order_key     TEXT NOT NULL,
+  label         TEXT NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
   author        BLOB NOT NULL,
   sig           BLOB NOT NULL,
@@ -2734,6 +2735,21 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
     if have == 0 {
         conn.execute_batch("ALTER TABLE links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add links.label"))?;
+    }
+    // temp_links carries the same attribute for the same reason; a temp link's
+    // label never becomes an event (it is not durable), so this column is the
+    // only place it can live. Guarded like `links` above: a migration must be
+    // safe to meet a projection that already has the column.
+    let have_temp: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('temp_links') WHERE name = 'label'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_db("inspect temp_links"))?;
+    if have_temp == 0 {
+        conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
+            .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
 }

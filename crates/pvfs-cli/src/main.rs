@@ -84,6 +84,12 @@ enum Cmd {
     },
     /// Soft-remove a link (triggers temp purge check)
     Unlink { link_id: String },
+    /// Set a link's display label (the name its parent uses for this child)
+    Relabel {
+        link_id: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// Change a link's sibling order key
     Reorder {
         link_id: String,
@@ -1896,6 +1902,27 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 println!("removed {link_id}");
             }
+            Ok(())
+        }
+        Cmd::Relabel { link_id, label } => {
+            let mut engine = Engine::open(&ctx?)?;
+            if engine.is_replica() {
+                // The relabel wire op does not exist yet (D72 Part C). Say so
+                // plainly rather than failing somewhere less obvious.
+                return Err(PvfsError::Forbidden {
+                    action: "relabel".into(),
+                    reason: "not yet supported from a replica (no wire op — D72 Part C); \
+                             run it on the forest owner"
+                        .into(),
+                });
+            }
+            let label = match label {
+                Some(l) => l,
+                None => prompt_line("new label", None)?,
+            };
+            engine.relabel_link(&link_id, &label)?;
+            engine.close()?;
+            println!("relabeled {link_id} -> {label}");
             Ok(())
         }
         Cmd::Reorder { link_id, key } => {

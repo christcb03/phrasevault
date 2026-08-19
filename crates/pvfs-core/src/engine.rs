@@ -1536,6 +1536,48 @@ impl Engine {
         })
     }
 
+    /// Set a link's display label — the name a parent uses for this child.
+    ///
+    /// Mirrors [`reorder_link`]: a signed event changing a MUTABLE attribute of
+    /// an edge, without touching the edge's identity. `order_key` and `label`
+    /// both sit outside the link id preimage by design (doc 01 §5), which is
+    /// exactly what lets a rename avoid re-creating anything.
+    ///
+    /// A temp link keeps its label in the temp table — no event, same as
+    /// reordering one.
+    pub fn relabel_link(&mut self, link_id: &LinkId, label: &str) -> Result<()> {
+        self.ensure_device_active()?;
+        if let Some(_l) = fetch_link(&self.conn, link_id)? {
+            let me = self.device.pubkey();
+            let sig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_link_relabeled(link_id, label, &me),
+            )?;
+            return self.append_durable(vec![Event::LinkRelabeled {
+                link_id: link_id.clone(),
+                label: label.to_string(),
+                author: me,
+                sig,
+            }]);
+        }
+        if fetch_temp_link(&self.conn, link_id)?.is_some() {
+            let lbl = label.to_string();
+            let lid = link_id.clone();
+            return self.temp_write(|tx| {
+                tx.execute(
+                    "UPDATE temp_links SET label = ?1 WHERE id = ?2",
+                    params![lbl, lid],
+                )
+                .map_err(map_db("relabel temp link"))?;
+                Ok(())
+            });
+        }
+        Err(PvfsError::NotFound {
+            kind: "link",
+            id: link_id.clone(),
+        })
+    }
+
     // ---- file locations (spec §4.3 / §6) ----------------------------------------
 
     pub fn add_location(&mut self, file: &NodeId, uri: &str) -> Result<()> {
