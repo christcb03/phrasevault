@@ -102,3 +102,81 @@ fn a_known_event_tolerates_a_field_it_does_not_know_about() {
     }
     assert!(!f.is_empty());
 }
+
+/// THE proof: a forest containing an event this binary cannot parse still
+/// opens, still verifies, still serves — and SAYS it did not understand.
+///
+/// This is what makes a rolling upgrade possible. A newer box writes a kind an
+/// older box has never heard of; the older box must keep working rather than
+/// refusing the whole log. The event is appended through the real chain-hash
+/// path, so this exercises replay and verification, not just decoding.
+#[test]
+fn a_forest_with_a_future_event_still_opens_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = pvfs_core::Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    engine
+        .add_node(
+            &root,
+            pvfs_core::NodeSpec {
+                node_type: pvfs_core::TYPE_FOLDER.into(),
+                label: "library".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    engine.close().unwrap();
+
+    // A newer binary appends a kind we have never heard of, chained correctly.
+    {
+        // The append writes to the attached `log` alias, exactly as an engine
+        // connection has it.
+        let mut conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS log",
+            [dir.path().join("log.db").to_str().unwrap()],
+        )
+        .unwrap();
+        let (seq, prev): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT seq, chain_hash FROM log.events ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let mut prev32 = [0u8; 32];
+        prev32.copy_from_slice(&prev);
+        let future = Event::Unknown {
+            kind: "MediaTitleAssigned".into(), // something a later version might add
+            body: b"imdb=tt0111161".to_vec(),
+        };
+        let tx = conn.transaction().unwrap();
+        pvfs_core::log_store::append_event(&tx, &prev32, seq as u64 + 1, &future, 1)
+            .expect("appending a future event must chain like any other");
+        tx.commit().unwrap();
+    }
+
+    // Force a full replay so the unknown event goes through the fold.
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let engine = pvfs_core::Engine::open(dir.path())
+        .expect("a forest newer than this binary must still OPEN");
+
+    // It still works: the parts it understood are intact.
+    let kids = engine.children(&root).unwrap();
+    assert!(
+        kids.iter().any(|c| c.node.label == "library"),
+        "everything this binary DID understand must still be there"
+    );
+    engine.close().unwrap();
+
+    // And it is honest about the part it did not.
+    let (n, kinds) = pvfs_core::projection::unknown_events(dir.path())
+        .expect("the count must be recorded");
+    assert_eq!(n, 1, "the skipped event is counted, not silently dropped");
+    assert!(
+        kinds.contains("MediaTitleAssigned"),
+        "and named, so an operator knows WHAT it is behind on: {kinds}"
+    );
+}

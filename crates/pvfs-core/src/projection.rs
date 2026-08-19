@@ -1425,7 +1425,20 @@ fn replay_one(
         });
     }
     let ev = Event::decode(&row.kind, &row.body)?;
-    ev.verify_sig()?;
+    // D72 Part A — an event we cannot parse cannot have its signature checked,
+    // because we do not know which bytes were signed. `verify_sig` says so
+    // honestly, and replay must not treat that honesty as a verification
+    // FAILURE — doing so would refuse the whole forest, which is precisely the
+    // behaviour this work exists to remove.
+    //
+    // Authorization is DEFERRED, not waived. The chain hash already binds the
+    // event's bytes into the log's order, and the first binary that
+    // understands the kind will verify it properly and reject it if it was
+    // never authorized. Until then it changes nothing and is reported as
+    // not understood.
+    if !matches!(ev, Event::Unknown { .. }) {
+        ev.verify_sig()?;
+    }
     if !log_id.is_empty() {
         if let Event::ForestCreated { .. }
         | Event::DeviceAuthorized { .. }
@@ -1477,6 +1490,18 @@ fn replay_one(
             }
         }
         Event::ForestCreated { .. } => {} // genesis (seq 1), root-authored
+        // D72 Part A — we cannot authorize an author we cannot parse, and
+        // `author()` correctly reports none. Refusing here would reject the
+        // whole forest, which is the behaviour this work removes.
+        //
+        // DEFERRED, NOT WAIVED, and the deferral is bounded: the event alters
+        // nothing (the fold ignores it), it is counted and named in
+        // `pvfs versions`, and the first binary that understands the kind
+        // performs the full signature and authorization check — rejecting it
+        // then if it was never authorized. An unauthorized event can therefore
+        // sit in a log unnoticed by boxes too old to read it, but it can never
+        // take EFFECT on one.
+        Event::Unknown { .. } => {}
         // Every other event is device-authored: enforce the same author + ACL
         // rules used by live member writes, so a tampered or synced log can't
         // carry an event its author had no right to (doc 06 §4.3, doc 07 §5).
