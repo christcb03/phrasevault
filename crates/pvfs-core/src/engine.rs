@@ -938,6 +938,16 @@ impl Engine {
         let mut routes = Vec::with_capacity(events.len());
         for ev in events {
             let route = match ev {
+                // D72: we never AUTHOR an unknown kind — this path is for
+                // events this binary is writing. Reaching here means a caller
+                // handed us something it decoded but cannot describe, which is
+                // a bug rather than a routing decision.
+                Event::Unknown { kind, .. } => {
+                    return Err(bad(
+                        "event",
+                        &format!("refusing to author an unparsed event kind {kind:?}"),
+                    ))
+                }
                 // Forest-scoped kinds always author in the top log.
                 Event::ForestCreated { .. }
                 | Event::DeviceAuthorized { .. }

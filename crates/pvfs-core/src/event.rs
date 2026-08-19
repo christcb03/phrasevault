@@ -271,6 +271,19 @@ pub enum Event {
         author: Vec<u8>,
         sig: Vec<u8>,
     },
+    /// D72 Part A — an event kind this binary does not know.
+    ///
+    /// Kept rather than rejected, so a newer box can write a kind an older box
+    /// has never heard of and the older box still replays the log. That is
+    /// cryptographically safe: the chain hash covers `(seq, kind, body,
+    /// written_at)` — the RAW bytes — so integrity is verifiable without
+    /// understanding meaning.
+    ///
+    /// It is NOT semantically safe to pretend it applied. Every fold that
+    /// meets one records it, and the box reports itself as not fully
+    /// understanding its own forest (§5.A.3). Tolerating an unknown event must
+    /// never look like having applied it.
+    Unknown { kind: String, body: Vec<u8> },
 }
 
 // ---- signed-message digests (spec §6 table) --------------------------------
@@ -546,7 +559,7 @@ pub fn msg_secure_blob_updated(
 // ---- encode / decode --------------------------------------------------------
 
 impl Event {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
         match self {
             Event::ForestCreated { .. } => K_FOREST_CREATED,
             Event::DeviceAuthorized { .. } => K_DEVICE_AUTHORIZED,
@@ -576,6 +589,7 @@ impl Event {
             Event::AclSet { .. } => K_ACL_SET,
             Event::MemberTagged { .. } => K_MEMBER_TAGGED,
             Event::SecureBlobUpdated { .. } => K_SECURE_BLOB_UPDATED,
+            Event::Unknown { kind, .. } => kind.as_str(),
         }
     }
 
@@ -613,6 +627,10 @@ impl Event {
             Event::LinkRemoved { removed_by, .. } | Event::FileLocationRemoved { removed_by, .. } => {
                 removed_by
             }
+            // D72: we cannot name the author of a kind we cannot parse. An
+            // empty author authorizes nothing, which is the right answer —
+            // the replay must not grant it authority it cannot verify.
+            Event::Unknown { .. } => &[],
         }
     }
 
@@ -651,8 +669,16 @@ impl Event {
     }
 
     pub fn encode_body(&self) -> Vec<u8> {
+        // D72: an unknown event round-trips its ORIGINAL bytes exactly. Any
+        // re-encoding would change the chain hash and break the log for
+        // everyone who does understand it.
+        if let Event::Unknown { body, .. } = self {
+            return body.clone();
+        }
         let mut e = Enc::new();
         match self {
+            // handled by the byte-exact early return above
+            Event::Unknown { .. } => unreachable!("Unknown re-encodes its original bytes"),
             Event::ForestCreated {
                 instance_id,
                 forest_id,
@@ -1238,21 +1264,53 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
+            // D72 Part A — forward compatibility. A kind this binary does not
+            // know is KEPT, not rejected: a newer box must be able to write
+            // one and have an older box still replay the log. The chain hash
+            // covers the raw bytes, so integrity survives ignorance.
             other => {
-                return Err(PvfsError::Encoding {
-                    what: "event kind".into(),
-                    offset: 0,
-                    detail: format!("unknown event kind {other:?}"),
+                return Ok(Event::Unknown {
+                    kind: other.to_string(),
+                    body: body.to_vec(),
                 })
             }
         };
-        d.finish()?;
+        // Trailing bytes are TOLERATED (D72 Part A), where they used to be a
+        // hard error. That is what lets a future version append an optional
+        // field to an existing event without breaking every older reader —
+        // the single change that turns a fleet-wide upgrade into a rolling
+        // one.
+        //
+        // What is given up: canonical encoding, i.e. exactly one byte string
+        // per event. The signature still authenticates the DECODED fields, so
+        // padding cannot forge meaning; and the chain hash covers the raw
+        // bytes, so padding cannot hide either. It only means an authorized
+        // writer could emit a non-minimal encoding of an event it was already
+        // entitled to write.
+        let _trailing = d.remaining();
         Ok(ev)
     }
 
     /// Verify the event's own signature(s) — used on replay/sync (spec §6).
     pub fn verify_sig(&self) -> Result<()> {
+        // D72: an event we cannot parse cannot have its signature checked —
+        // we do not know which bytes were signed. Report that honestly
+        // instead of returning Ok, which would be a silent "verified".
+        // Callers decide what to do with a forest they only partly understand
+        // (§5.A.3); they must not be told it verified.
+        if let Event::Unknown { kind, .. } = self {
+            return Err(PvfsError::Encoding {
+                what: "event signature".into(),
+                offset: 0,
+                detail: format!(
+                    "cannot verify {kind:?}: this binary does not know the kind, so it \
+                     cannot know what was signed — upgrade this box to fold it"
+                ),
+            });
+        }
         match self {
+            // handled by the honest refusal above
+            Event::Unknown { .. } => unreachable!("Unknown refuses verification above"),
             Event::ForestCreated {
                 instance_id,
                 forest_id,

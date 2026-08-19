@@ -4862,6 +4862,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     None => println!("this forest      : (no forest here)"),
                 }
+                // D72: say when this box could not fold part of its own forest.
+                if let Some((n, kinds)) = ctx
+                    .as_ref()
+                    .ok()
+                    .and_then(|d| pvfs_core::projection::unknown_events(d))
+                {
+                    if n > 0 {
+                        println!(
+                            "NOT UNDERSTOOD   : {n} event(s) of kind(s) {kinds} — this box is \
+                             older than its forest; upgrade it to fold them"
+                        );
+                    }
+                }
             }
             Ok(())
         }

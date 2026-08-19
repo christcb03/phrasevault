@@ -588,6 +588,32 @@ pub fn canonical_state_root(conn: &Connection, root: &str) -> Result<[u8; 32]> {
 pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Result<()> {
     let m = map_db("fold event");
     match event {
+        // D72 Part A — an event kind this binary does not know.
+        //
+        // It changes nothing in the projection, because we have no idea what
+        // it means. What we MUST NOT do is pass over it silently: a box that
+        // skipped an event has a projection that is missing whatever that
+        // event said, and reporting itself healthy would be a lie of exactly
+        // the kind this project keeps getting bitten by.
+        //
+        // So it is counted, and the count is surfaced (`pvfs versions`). The
+        // box can still serve — the log verifies, most of it folded — but it
+        // knows, and says, that it does not fully understand its own forest.
+        Event::Unknown { kind, .. } => {
+            tx.execute(
+                "INSERT INTO projection_meta (k, v) VALUES ('unknown_events', '1')
+                 ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)",
+                [],
+            )
+            .map_err(&m)?;
+            tx.execute(
+                "INSERT INTO projection_meta (k, v) VALUES ('unknown_event_kinds', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v =
+                   CASE WHEN instr(v, ?1) > 0 THEN v ELSE v || ',' || ?1 END",
+                params![kind],
+            )
+            .map_err(&m)?;
+        }
         Event::ForestCreated {
             instance_id,
             forest_id,
@@ -2391,6 +2417,32 @@ fn replay_sealed_child(
 
 /// Full rebuild (spec §9.3 step 5): drop and recreate the index schema, then
 /// tree-replay every log from its genesis seed. Temp tables start empty.
+/// What this box could NOT understand in its own forest (D72 Part A):
+/// `(count, kinds)`. Zero means it folded everything.
+///
+/// Surfaced by `pvfs versions` so "this box is behind" is a fact an operator
+/// can read, not something they infer when the library looks wrong.
+pub fn unknown_events(data_dir: &std::path::Path) -> Option<(u64, String)> {
+    let conn = Connection::open(data_dir.join("index.db")).ok()?;
+    let n: u64 = conn
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'unknown_events'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()?
+        .parse()
+        .ok()?;
+    let kinds: String = conn
+        .query_row(
+            "SELECT v FROM projection_meta WHERE k = 'unknown_event_kinds'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    Some((n, kinds))
+}
+
 /// The schema version recorded in a forest's projection on disk, without
 /// opening an engine (D71).
 ///
