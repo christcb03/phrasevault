@@ -180,3 +180,34 @@ fn a_forest_with_a_future_event_still_opens_and_says_so() {
         "and named, so an operator knows WHAT it is behind on: {kinds}"
     );
 }
+
+/// D72 Part B — `LinkRelabeled` round-trips, and the ROLLING claim is named
+/// honestly rather than faked.
+///
+/// What a unit test can show: the event encodes and decodes correctly, and
+/// (above) that an unrecognised kind is tolerated, counted and named.
+///
+/// What it CANNOT show: that an OLDER box tolerates this specific event. This
+/// binary knows the kind, so asking it to decode "LinkRelabeled" gives the
+/// real variant — any "old box" simulation here would be a costume, not a
+/// test. That claim needs two binaries and belongs on the lab (D72 §6 step 3),
+/// where PVFS has never yet knowingly run a mixed-version fleet.
+#[test]
+fn a_relabel_round_trips() {
+    let ev = Event::LinkRelabeled {
+        link_id: "abc123".into(),
+        label: "Show Name (2019)".into(),
+        author: vec![1, 2, 3],
+        sig: vec![4, 5, 6],
+    };
+    let body = ev.encode_body();
+    assert_eq!(ev.kind(), pvfs_core::event::K_LINK_RELABELED);
+
+    match Event::decode(pvfs_core::event::K_LINK_RELABELED, &body).unwrap() {
+        Event::LinkRelabeled { link_id, label, .. } => {
+            assert_eq!(link_id, "abc123");
+            assert_eq!(label, "Show Name (2019)");
+        }
+        other => panic!("expected LinkRelabeled, got {:?}", other.kind()),
+    }
+}

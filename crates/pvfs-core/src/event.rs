@@ -22,6 +22,11 @@ pub const K_FILE_LOCATION_REMOVED: &str = "FileLocationRemoved";
 pub const K_NODE_PURGED: &str = "NodePurged";
 pub const K_FOLDER_BOUND: &str = "FolderBound";
 pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
+/// D72 Part B — a link's label. Mirrors `LinkReordered`: a signed event that
+/// changes a MUTABLE attribute of an edge, leaving the edge's identity alone.
+/// Old binaries (post-Part-A) see this as `Event::Unknown`, ignore it, and go
+/// on using node labels — which is what makes labels-on-links ROLL.
+pub const K_LINK_RELABELED: &str = "LinkRelabeled";
 pub const K_ACL_SET: &str = "AclSet";
 pub const K_MEMBER_TAGGED: &str = "MemberTagged";
 pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
@@ -97,6 +102,13 @@ pub enum Event {
     LinkReordered {
         link_id: String,
         new_order_key: String,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// D72 Part B — the name this edge gives its child.
+    LinkRelabeled {
+        link_id: String,
+        label: String,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -358,6 +370,15 @@ pub fn msg_link_reordered(link_id: &str, new_order_key: &str, author: &[u8]) -> 
     crypto::domain_digest("pvfs:linkreordered:v1:", &e.finish())
 }
 
+/// D72 Part B. The label IS signed — it is content someone asserted, not
+/// incidental state — but it is NOT part of the link's id preimage, so
+/// renaming never changes the edge (doc 01 §5, the `order_key` precedent).
+pub fn msg_link_relabeled(link_id: &str, label: &str, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(link_id).string(label).bytes(author);
+    crypto::domain_digest("pvfs:linkrelabeled:v1:", &e.finish())
+}
+
 pub fn msg_link_superseded(old_link_id: &str, new_link_id: &str, author: &[u8]) -> [u8; 32] {
     let mut e = Enc::new();
     e.string(old_link_id).string(new_link_id).bytes(author);
@@ -571,6 +592,7 @@ impl Event {
             Event::LinkCreated(_) => K_LINK_CREATED,
             Event::LinkRemoved { .. } => K_LINK_REMOVED,
             Event::LinkReordered { .. } => K_LINK_REORDERED,
+            Event::LinkRelabeled { .. } => K_LINK_RELABELED,
             Event::LinkSuperseded { .. } => K_LINK_SUPERSEDED,
             Event::LinkSuspended { .. } => K_LINK_SUSPENDED,
             Event::LinkUnsuspended { .. } => K_LINK_UNSUSPENDED,
@@ -605,6 +627,7 @@ impl Event {
             | Event::RecoveryKeyRegistered { author, .. }
             | Event::RecoveryKeyRevoked { author, .. }
             | Event::LinkReordered { author, .. }
+            | Event::LinkRelabeled { author, .. }
             | Event::LinkSuperseded { author, .. }
             | Event::LinkSuspended { author, .. }
             | Event::LinkUnsuspended { author, .. }
@@ -777,6 +800,14 @@ impl Event {
                 sig,
             } => {
                 e.string(link_id).string(new_order_key).bytes(author).bytes(sig);
+            }
+            Event::LinkRelabeled {
+                link_id,
+                label,
+                author,
+                sig,
+            } => {
+                e.string(link_id).string(label).bytes(author).bytes(sig);
             }
             Event::LinkSuperseded {
                 old_link_id,
@@ -1085,6 +1116,12 @@ impl Event {
                 removed_at: d.u64()?,
                 removed_by: d.bytes()?,
                 removal_sig: d.bytes()?,
+            },
+            K_LINK_RELABELED => Event::LinkRelabeled {
+                link_id: d.string()?,
+                label: d.string()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
             },
             K_LINK_REORDERED => Event::LinkReordered {
                 link_id: d.string()?,
@@ -1417,6 +1454,12 @@ impl Event {
                 &msg_link_reordered(link_id, new_order_key, author),
                 sig,
             ),
+            Event::LinkRelabeled {
+                link_id,
+                label,
+                author,
+                sig,
+            } => crypto::verify_digest(author, &msg_link_relabeled(link_id, label, author), sig),
             Event::LinkSuperseded {
                 old_link_id,
                 new_link_id,

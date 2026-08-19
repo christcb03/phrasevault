@@ -974,6 +974,7 @@ impl Engine {
                 },
                 Event::LinkRemoved { link_id, .. }
                 | Event::LinkReordered { link_id, .. }
+                | Event::LinkRelabeled { link_id, .. }
                 | Event::LinkSuspended { link_id, .. }
                 | Event::LinkUnsuspended { link_id, .. } => self.route_by_link(link_id, &batch_homes)?,
                 Event::LinkSuperseded { old_link_id, .. } => {

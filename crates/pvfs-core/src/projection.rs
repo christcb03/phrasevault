@@ -22,6 +22,10 @@ use crate::log_store;
 // tracker) and `purged_nodes` (resurrection tombstones). Same upgrade.
 // v7 (P9.1, doc 22 §2): `chunk_manifests` — owner-attested chunk layouts
 // that license serve-while-fetching. Same upgrade.
+// v10 (D72 Part B): `links.label` — the name an EDGE gives its child, so a
+// rename changes a link instead of minting a new node. Empty means "no link
+// label yet", and readers fall back to the node's label, which is what lets
+// the change roll while boxes are mixed.
 // v9 (D71 W6): `idx_nodes_label` — identity-by-content matches a file by
 // (label, exact size), and without an index that is a full scan of `nodes`
 // per imported file. Migrated in place (CREATE INDEX, no replay).
@@ -31,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -54,6 +58,10 @@ CREATE TABLE IF NOT EXISTS links (
   link_type     TEXT NOT NULL,
   link_nonce    INTEGER NOT NULL,
   order_key     TEXT NOT NULL,
+  -- D72 Part B: the name this EDGE gives its child. Empty = none yet, and
+  -- readers fall back to the child node's label. Outside the link's id
+  -- preimage, exactly like order_key, so renaming never changes the edge.
+  label         TEXT NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
   author        BLOB NOT NULL,
   sig           BLOB NOT NULL,
@@ -243,6 +251,7 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   v TEXT NOT NULL
 );
 
+-- D72 Part B: empty = fall back to the child node's label.
 CREATE INDEX IF NOT EXISTS idx_links_parent_order ON links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_links_child        ON links(child_id)             WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_nodes_type         ON nodes(node_type);
@@ -931,6 +940,14 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             tx.execute(
                 "UPDATE links SET removed_at = ?1 WHERE id = ?2",
                 params![*removed_at as i64, link_id],
+            )
+            .map_err(&m)?;
+        }
+        // D72 Part B — the label is the edge's, not the node's.
+        Event::LinkRelabeled { link_id, label, .. } => {
+            tx.execute(
+                "UPDATE links SET label = ?1 WHERE id = ?2",
+                params![label, link_id],
             )
             .map_err(&m)?;
         }
@@ -2528,6 +2545,7 @@ fn migrate_projection(
         let step = match v {
             7 => migrate_v7_to_v8(conn).map(|_| "folder_bindings.bound_by from FolderBound"),
             8 => migrate_v8_to_v9(conn).map(|_| "idx_nodes_label"),
+            9 => migrate_v9_to_v10(conn).map(|_| "links.label"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2656,6 +2674,25 @@ fn migrate_v8_to_v9(conn: &mut Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label) WHERE node_type = 'file';",
     )
     .map_err(map_db("create idx_nodes_label"))
+}
+
+/// v9 → v10 (D72 Part B): links carry a label. Added EMPTY, deliberately — an
+/// empty link label means "fall back to the node", which is exactly the
+/// behaviour a forest had before this column existed. Nothing to back-fill,
+/// so the migration is instant on any size of forest.
+fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
+    let have: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('links') WHERE name = 'label'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_db("inspect links"))?;
+    if have == 0 {
+        conn.execute_batch("ALTER TABLE links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
+            .map_err(map_db("add links.label"))?;
+    }
+    Ok(())
 }
 
 pub fn full_rebuild(
