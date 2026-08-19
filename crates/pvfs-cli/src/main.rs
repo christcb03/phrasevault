@@ -2003,7 +2003,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         format!(
                             "{{\"id\":\"{}\",\"label\":\"{}\",\"type\":\"{}\",\"link_type\":\"{}\",\"temp\":{},\"link_id\":\"{}\"}}",
                             k.node.id,
-                            json_escape(&k.node.label),
+                            json_escape(&k.label),
                             json_escape(&k.node.node_type),
                             json_escape(&k.link_type),
                             k.node.is_temp,
@@ -2019,7 +2019,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         k.node.id,
                         k.node.node_type,
                         k.link_type,
-                        k.node.label,
+                        k.label,
                         if k.node.is_temp { "  [temp]" } else { "" }
                     );
                 }
@@ -2036,7 +2036,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         format!(
                             "{{\"id\":\"{}\",\"label\":\"{}\",\"depth\":{},\"link_type\":\"{}\"}}",
                             e.node.id,
-                            json_escape(&e.node.label),
+                            json_escape(&e.label),
                             e.depth,
                             json_escape(&e.link_type),
                         )
@@ -2048,7 +2048,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     println!(
                         "{}{} {}{}",
                         "  ".repeat(e.depth),
-                        e.node.label,
+                        e.label,
                         if e.link_type == "ref" { "→ " } else { "" },
                         if e.node.is_temp { "[temp]" } else { "" }
                     );
@@ -4242,7 +4242,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // The directory walk is a read — always local.
             let find = |parent: &str, label: &str| -> Result<Option<(String, String, Vec<u8>)>, PvfsError> {
                 Ok(engine.children(&parent.to_string())?.into_iter().find_map(|c| {
-                    (c.node.label == label).then_some((c.node.id, c.link_id, c.node.payload))
+                    (c.label == label).then_some((c.node.id, c.link_id, c.node.payload))
                 }))
             };
             let fleet = find(&root, pvfs_client::fetch::FLEET_DIR)?;
@@ -4854,16 +4854,43 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 .as_ref()
                 .ok()
                 .and_then(|dir| pvfs_core::projection::on_disk_schema_version(dir));
+            // D72 Part C: what this box could not fold. `behind` is the whole
+            // contract the fleet automation reads — one boolean meaning "this
+            // box is older than its own forest's CONTENT and a roll would
+            // teach it something". Deliberately NOT true for a stale
+            // projection schema, which self-heals on the next open without
+            // anyone rolling anything.
+            let (unknown_n, unknown_kinds) = ctx
+                .as_ref()
+                .ok()
+                .and_then(|d| pvfs_core::projection::unknown_events(d))
+                .unwrap_or((0, String::new()));
+            let behind = unknown_n > 0;
+
             if json {
                 println!(
-                    "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{},\"projection_schema\":{}}}",
+                    "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{},\"projection_schema\":{},\
+                     \"unknown_events\":{},\"unknown_kinds\":{},\"behind\":{}}}",
                     env!("CARGO_PKG_VERSION"),
                     pvfs_client::PROTO_VERSION,
                     pvfs_core::projection::SCHEMA_VERSION,
                     match on_disk {
                         Some(v) => v.to_string(),
                         None => "null".into(),
-                    }
+                    },
+                    unknown_n,
+                    if unknown_kinds.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        let items: Vec<String> = unknown_kinds
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|k| !k.is_empty())
+                            .map(|k| format!("\"{k}\""))
+                            .collect();
+                        format!("[{}]", items.join(","))
+                    },
+                    behind
                 );
             } else {
                 println!("pvfs             : {}", env!("CARGO_PKG_VERSION"));
@@ -4890,17 +4917,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     None => println!("this forest      : (no forest here)"),
                 }
                 // D72: say when this box could not fold part of its own forest.
-                if let Some((n, kinds)) = ctx
-                    .as_ref()
-                    .ok()
-                    .and_then(|d| pvfs_core::projection::unknown_events(d))
-                {
-                    if n > 0 {
-                        println!(
-                            "NOT UNDERSTOOD   : {n} event(s) of kind(s) {kinds} — this box is \
-                             older than its forest; upgrade it to fold them"
-                        );
-                    }
+                if behind {
+                    println!(
+                        "NOT UNDERSTOOD   : {unknown_n} event(s) of kind(s) {unknown_kinds} — \
+                         this box is older than its forest; upgrade it to fold them"
+                    );
                 }
             }
             Ok(())

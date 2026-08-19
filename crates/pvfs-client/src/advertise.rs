@@ -113,7 +113,7 @@ pub fn advertise_pass(data_dir: &Path, mut route: Route<'_>) -> Result<Advertise
             let Some(store_path) = psync::sync_store_lookup(data_dir, &id)? else {
                 continue;
             };
-            let label = if entry.node.label.is_empty() { id.clone() } else { entry.node.label.clone() };
+            let label = if entry.label.is_empty() { id.clone() } else { entry.label.clone() };
             let abs = match std::fs::canonicalize(&store_path) {
                 Ok(a) => a,
                 Err(e) => {

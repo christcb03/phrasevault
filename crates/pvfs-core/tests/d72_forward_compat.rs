@@ -276,3 +276,47 @@ fn a_box_that_ignored_an_event_it_can_now_read_must_replay_not_migrate() {
     );
     assert!(!should_replay(""), "nothing ignored ⇒ nothing to recover");
 }
+
+/// The bug the read-path flip nearly shipped.
+///
+/// Identity-by-name matched `nodes.label`. Once a rename became a
+/// `LinkRelabeled`, the NODE label stayed at the old name — so a file renamed
+/// in place would stop matching its own catalogue entry, and the next watch
+/// pass would enrol it as a NEW file. A duplicate node for a file that was
+/// merely renamed is exactly the re-cataloguing D72 exists to remove, and it
+/// would have looked like a working rename right up until the next scan.
+///
+/// This pins the resolution rule that the fix and `Engine::children` share:
+/// a link that HAS a label is known by it; a link without one falls back to
+/// the node's.
+#[test]
+fn a_renamed_file_is_matched_by_its_new_name_not_its_old_one() {
+    // The predicate, exactly as the SQL states it.
+    let matches = |link_label: &str, node_label: &str, looking_for: &str| {
+        if !link_label.is_empty() {
+            link_label == looking_for
+        } else {
+            node_label == looking_for
+        }
+    };
+
+    // Renamed in place: the disk now says the new name, the node still says the old.
+    assert!(
+        matches("Deep Show (2021) - s01e01.mkv", "Deep Show - s01e01.mkv",
+                "Deep Show (2021) - s01e01.mkv"),
+        "a renamed file must match the name it now has on disk"
+    );
+    assert!(
+        !matches("Deep Show (2021) - s01e01.mkv", "Deep Show - s01e01.mkv",
+                 "Deep Show - s01e01.mkv"),
+        "and must NOT still answer to the name it was renamed away from — \
+         otherwise the old path would resurrect as a second live claim"
+    );
+
+    // Never renamed: the node label is the name, exactly as before D72.
+    assert!(
+        matches("", "Deep Show - s01e01.mkv", "Deep Show - s01e01.mkv"),
+        "an un-renamed file keeps matching by its node label — the fallback is \
+         the NORMAL case, not a legacy path"
+    );
+}

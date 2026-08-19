@@ -201,7 +201,7 @@ impl Filesystem for PvfsFs {
             Ok(c) => c,
             Err(e) => return reply.error(enoent(e)),
         };
-        match children.into_iter().find(|c| c.node.label == name) {
+        match children.into_iter().find(|c| c.label == name) {
             Some(c) => match self.attr_for(&c.node.id.clone()) {
                 Ok(attr) => reply.entry(&TTL, &attr, 0),
                 Err(e) => reply.error(enoent(e)),
@@ -246,7 +246,7 @@ impl Filesystem for PvfsFs {
                 FileType::Directory
             };
             let child_ino = self.ino_of(&c.node.id);
-            entries.push((child_ino, kind, c.node.label));
+            entries.push((child_ino, kind, c.label));
         }
         for (i, (child_ino, kind, name)) in
             entries.into_iter().enumerate().skip(offset as usize)
@@ -430,13 +430,17 @@ impl Filesystem for PvfsFs {
     /// * **Moving** a file between folders keeps its name, so it keeps its
     ///   identity: unlink from the old parent, link under the new one. Cheap,
     ///   exact, and the file's locations are untouched.
-    /// * **Changing the name** cannot be a relabel — a different label is a
-    ///   different node. Doing it silently would mint a new id, orphan the old
-    ///   node's locations, and quietly break W6's identity for the file. That
-    ///   deserves a deliberate design (carry the locations across, retire the
-    ///   old node, move the bytes on every holder), not a side effect of a
-    ///   `mv`. Refused with EXDEV until it has one — the same answer a rename
-    ///   across filesystems gets, which callers already handle by copy+delete.
+    /// * **Changing the name IN PLACE** is now one event. D72 moved labels onto
+    ///   links, so a rename that keeps the same parent is a `LinkRelabeled` on
+    ///   the existing edge: the node keeps its id, its locations, its content
+    ///   hash and its bytes, and nothing moves on any holder. This is the case
+    ///   that matters — an arr renaming an episode in place — and it went from
+    ///   "mint a successor and relocate the file" to a single signed event.
+    /// * **Changing the name AND the parent** still takes the successor path
+    ///   below. It is rarer, and doing it properly means a move plus a relabel;
+    ///   splitting that is deliberate future work, not a silent half-measure.
+    /// * On a REPLICA the relabel wire op does not exist yet (D72 Part C), so
+    ///   the successor path is used there too — correct, just not cheap.
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -457,6 +461,27 @@ impl Filesystem for PvfsFs {
             return reply.error(libc::ENOENT);
         };
         if name != newname {
+            // D72 FAST PATH: same parent ⇒ the name lives on the edge, so this
+            // is one event. No new node, no re-linking a folder's children, no
+            // byte movement — the thing that made renames expensive was that a
+            // label was part of a node's identity, and it no longer is.
+            if from == to && self.route.is_none() {
+                let found = self
+                    .engine
+                    .children(&from)
+                    .ok()
+                    .and_then(|kids| kids.into_iter().find(|c| c.label == name));
+                if let Some(entry) = found {
+                    return match self.engine.relabel_link(&entry.link_id, newname) {
+                        Ok(()) => reply.ok(),
+                        Err(e) => {
+                            eprintln!("pvfs mount: relabel failed: {e}");
+                            reply.error(libc::EIO)
+                        }
+                    };
+                }
+                return reply.error(libc::ENOENT);
+            }
             return match self.rename_to_new_name(&from, name, &to, newname) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
@@ -469,7 +494,7 @@ impl Filesystem for PvfsFs {
             Ok(c) => c,
             Err(e) => return reply.error(enoent(e)),
         };
-        let Some(entry) = children.into_iter().find(|c| c.node.label == name) else {
+        let Some(entry) = children.into_iter().find(|c| c.label == name) else {
             return reply.error(libc::ENOENT);
         };
         // Link first, then unlink: a crash between the two leaves the file
@@ -570,7 +595,7 @@ impl PvfsFs {
         let children = self.engine.children(from).map_err(|_| libc::EIO)?;
         let entry = children
             .into_iter()
-            .find(|c| c.node.label == name)
+            .find(|c| c.label == name)
             .ok_or(libc::ENOENT)?;
         if entry.node.node_type == pvfs_core::TYPE_FOLDER {
             return self.rename_folder(&entry, to, newname);
@@ -750,7 +775,7 @@ impl PvfsFs {
         let children = self.engine.children(&parent_node).map_err(|_| libc::EIO)?;
         let entry = children
             .into_iter()
-            .find(|c| c.node.label == name)
+            .find(|c| c.label == name)
             .ok_or(libc::ENOENT)?;
         let is_dir = entry.node.node_type == pvfs_core::TYPE_FOLDER;
         if want_dir && !is_dir {

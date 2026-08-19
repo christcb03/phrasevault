@@ -43,6 +43,17 @@ pub struct ChildEntry {
     pub link_id: LinkId,
     pub link_type: String,
     pub order_key: String,
+    /// The name this parent uses for this child (D72).
+    ///
+    /// Resolved ONCE, here, so every reader agrees: the link's label if it has
+    /// one, otherwise the node's. An empty link label means "no one has
+    /// renamed this edge", which is how every forest behaved before labels
+    /// moved onto links — so the fallback is not a legacy path, it is the
+    /// normal case for a child that was never renamed.
+    ///
+    /// Read this, NOT `node.label`. A rename changes the edge, and a node may
+    /// be reached by more than one.
+    pub label: String,
 }
 
 /// A split region's generation state (P7.2a, doc 20 §2.3).
@@ -1836,11 +1847,11 @@ impl Engine {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT child_id, id, link_type, order_key FROM (
-                   SELECT child_id, id, link_type, order_key FROM links
+                "SELECT child_id, id, link_type, order_key, label FROM (
+                   SELECT child_id, id, link_type, order_key, label FROM links
                     WHERE parent_id = ?1 AND removed_at IS NULL AND suspended_at IS NULL
                    UNION ALL
-                   SELECT child_id, id, link_type, order_key FROM temp_links
+                   SELECT child_id, id, link_type, order_key, label FROM temp_links
                     WHERE parent_id = ?1 AND removed_at IS NULL AND suspended_at IS NULL
                  ) ORDER BY order_key, child_id",
             )
@@ -1852,18 +1863,27 @@ impl Engine {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4).unwrap_or_default(),
                 ))
             })
             .map_err(map_db("children"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (child_id, link_id, link_type, order_key) = row.map_err(map_db("children"))?;
+            let (child_id, link_id, link_type, order_key, link_label) =
+                row.map_err(map_db("children"))?;
             if let Some(n) = fetch_node(&self.conn, &child_id)? {
+                // The link wins when it has a name; otherwise the node's.
+                let label = if link_label.is_empty() {
+                    n.label.clone()
+                } else {
+                    link_label
+                };
                 out.push(ChildEntry {
                     node: n,
                     link_id,
                     link_type,
                     order_key,
+                    label,
                 });
             }
         }
@@ -1880,6 +1900,8 @@ impl Engine {
             id: root.clone(),
         })?;
         let mut entries = vec![WalkEntry {
+            // The root is reached by no link, so its own label is the name.
+            label: root_node.label.clone(),
             node: root_node,
             depth: 0,
             link_type: LINK_CONTAINS.into(),
@@ -1896,6 +1918,7 @@ impl Engine {
                 node: k.node,
                 depth,
                 link_type: k.link_type,
+                label: k.label,
             });
             if descend {
                 self.preorder_into(&id, depth + 1, out)?;

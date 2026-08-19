@@ -522,7 +522,7 @@ pub fn tier_pass(
             if !handled.insert(id.clone()) {
                 continue;
             }
-            let label = entry.node.label;
+            let label = entry.label;
             let unhashed = pvfs_core::FilePayload::decode(&entry.node.payload)
                 .map(|pl| pl.content_hash.is_empty())
                 .unwrap_or(false);
@@ -816,7 +816,7 @@ pub fn catalog_endpoints(engine: &Engine) -> std::collections::HashMap<String, S
             .children(&parent.to_string())
             .ok()?
             .into_iter()
-            .find(|c| c.node.label == label)
+            .find(|c| c.label == label)
             .map(|c| c.node.id)
     };
     let root = engine.identity.root_node_id.clone();
@@ -826,7 +826,7 @@ pub fn catalog_endpoints(engine: &Engine) -> std::collections::HashMap<String, S
         if let Ok(addr) = String::from_utf8(c.node.payload) {
             let addr = addr.trim().to_string();
             if !addr.is_empty() {
-                out.insert(c.node.label, addr);
+                out.insert(c.label, addr);
             }
         }
     }

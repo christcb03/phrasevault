@@ -2250,7 +2250,7 @@ fn do_ls(daemon: &Daemon, principal: &Principal, node: &str) -> Result<Vec<Child
         .into_iter()
         .map(|c| ChildInfo {
             id: c.node.id,
-            label: c.node.label,
+            label: c.label,
             node_type: c.node.node_type,
         })
         .collect())

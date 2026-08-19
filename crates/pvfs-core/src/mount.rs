@@ -583,8 +583,8 @@ pub fn node_at_path(engine: &Engine, segments: &[String]) -> Result<NodeId> {
         let kids = engine.children(&current)?;
         let hit = kids
             .iter()
-            .find(|c| c.link_type == LINK_CONTAINS && c.node.label == *seg)
-            .or_else(|| kids.iter().find(|c| c.node.label == *seg));
+            .find(|c| c.link_type == LINK_CONTAINS && c.label == *seg)
+            .or_else(|| kids.iter().find(|c| c.label == *seg));
         match hit {
             Some(c) => current = c.node.id.clone(),
             None => {

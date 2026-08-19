@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -259,6 +259,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type         ON nodes(node_type);
 -- D71 W6: identity-by-content looks a file up by label; without this every
 -- imported file costs a full scan of `nodes`.
 CREATE INDEX IF NOT EXISTS idx_nodes_label        ON nodes(label) WHERE node_type = 'file';
+-- v11 (D72): identity-by-name resolves the LINK label first, so that branch
+-- needs its own index or every scanned file costs a table scan.
+CREATE INDEX IF NOT EXISTS idx_links_label        ON links(label) WHERE label <> '';
 CREATE INDEX IF NOT EXISTS idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
@@ -2590,6 +2593,7 @@ fn migrate_projection(
             7 => migrate_v7_to_v8(conn).map(|_| "folder_bindings.bound_by from FolderBound"),
             8 => migrate_v8_to_v9(conn).map(|_| "idx_nodes_label"),
             9 => migrate_v9_to_v10(conn).map(|_| "links.label"),
+            10 => migrate_v10_to_v11(conn).map(|_| "idx_links_label"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2752,6 +2756,13 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
             .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
+}
+
+fn migrate_v10_to_v11(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_links_label ON links(label) WHERE label <> '';",
+    )
+    .map_err(map_db("create idx_links_label"))
 }
 
 pub fn full_rebuild(

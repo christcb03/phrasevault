@@ -490,21 +490,32 @@ impl Engine {
             let Some(n) = fetch_node(&self.conn, &current)? else {
                 return Ok(None);
             };
-            segments.push(n.label);
-            let parent: Option<String> = self
+            // D72: the segment is the name the CONTAINING LINK gives this
+            // child, not the node's own. Reading `n.label` here would make the
+            // tree path — and therefore the file's path on the NAS — keep the
+            // name a file was renamed AWAY from, so a rename would never reach
+            // the disk that matters.
+            let parent: Option<(String, String)> = self
                 .conn
                 .query_row(
-                    "SELECT parent_id FROM links
+                    "SELECT parent_id, label FROM links
                      WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL
                        AND parent_id IS NOT NULL
                      ORDER BY id LIMIT 1",
                     params![current, LINK_CONTAINS],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get::<_, String>(1).unwrap_or_default())),
                 )
                 .optional()
                 .map_err(map_db("tree path"))?;
             match parent {
-                Some(p) => current = p,
+                Some((p, link_label)) => {
+                    segments.push(if link_label.is_empty() {
+                        n.label
+                    } else {
+                        link_label
+                    });
+                    current = p;
+                }
                 None => return Ok(None),
             }
         }
@@ -522,26 +533,34 @@ impl Engine {
             let Some(node) = fetch_node(&self.conn, &current)? else {
                 return Ok(None);
             };
-            segments.push(node.label);
-            let parent: Option<String> = self
+            // D72: same rule as `tree_path_under` — the containing link names
+            // the child. A folder rename must move the binding path with it.
+            let parent: Option<(String, String)> = self
                 .conn
                 .query_row(
-                    "SELECT parent_id FROM links
+                    "SELECT parent_id, label FROM links
                      WHERE child_id = ?1 AND link_type = ?2 AND removed_at IS NULL
                        AND parent_id IS NOT NULL
                      ORDER BY id LIMIT 1",
                     params![current, LINK_CONTAINS],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get::<_, String>(1).unwrap_or_default())),
                 )
                 .optional()
                 .map_err(map_db("binding path walk"))?;
             match parent {
                 None => return Ok(None),
-                Some(p) if &p == root => {
-                    segments.reverse();
-                    return Ok(Some(format!("/{}", segments.join("/"))));
+                Some((p, link_label)) => {
+                    segments.push(if link_label.is_empty() {
+                        node.label
+                    } else {
+                        link_label
+                    });
+                    if &p == root {
+                        segments.reverse();
+                        return Ok(Some(format!("/{}", segments.join("/"))));
+                    }
+                    current = p;
                 }
-                Some(p) => current = p,
             }
         }
         Ok(None)
@@ -747,7 +766,7 @@ impl Engine {
                 .find(|c| {
                     c.link_type == LINK_CONTAINS
                         && c.node.node_type == node::TYPE_FOLDER
-                        && c.node.label == *d
+                        && c.label == *d
                 })
                 .map(|c| c.node.id);
             let id = match found {
@@ -795,9 +814,25 @@ impl Engine {
                 // containing link. Joining on that also means a file Sonarr
                 // DELETED is never matched and silently resurrected: a deletion
                 // is a decision, and the same bytes arriving later are new.
+                // D72: match the EFFECTIVE name, resolved exactly as
+                // `Engine::children` resolves it — the link's label when it has
+                // one, the node's otherwise.
+                //
+                // Matching `n.label` alone was a real bug once labels moved onto
+                // links: renaming a file in place leaves the NODE label stale,
+                // so the file on disk would stop matching its own catalogue
+                // entry and the next watch pass would enrol it as a NEW file.
+                // A duplicate node for a file that was merely renamed is exactly
+                // the re-cataloguing this milestone exists to remove.
+                //
+                // Written as two indexed branches rather than a COALESCE so
+                // both sides can still use an index (`idx_links_label`,
+                // `idx_nodes_label`); COALESCE would force a scan.
                 "SELECT DISTINCT n.id, n.payload FROM nodes n
                    JOIN links l ON l.child_id = n.id AND l.removed_at IS NULL
-                  WHERE n.label = ?1 AND n.node_type = ?2",
+                  WHERE n.node_type = ?2
+                    AND ( (l.label <> '' AND l.label = ?1)
+                       OR (l.label =  '' AND n.label = ?1) )",
             )
             .map_err(map_db("identity match"))?;
         let rows = stmt

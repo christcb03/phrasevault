@@ -10,6 +10,12 @@ pub struct WalkEntry {
     pub node: Node,
     pub depth: usize,
     pub link_type: String,
+    /// The name this entry's PARENT uses for it (D72) — resolved the same way
+    /// as [`crate::engine::ChildEntry::label`]. The root has no parent link,
+    /// so it falls back to its node label.
+    ///
+    /// Read this, NOT `node.label`.
+    pub label: String,
 }
 
 /// An eagerly materialized pre-order traversal (P0: trees are local and the

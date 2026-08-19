@@ -145,3 +145,95 @@ fn tree_layout_is_valid_for_a_mirror_to_another_root() {
     assert_ne!(under(primary), under(backup));
     engine.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// D72 — a rename must reach the NAS, not just the catalogue.
+// ---------------------------------------------------------------------------
+
+/// The bug this pins was found by tracing, NOT by a failing test: the whole
+/// suite stayed green while `tree_path_under` still read the NODE label.
+///
+/// Once a rename became a `LinkRelabeled`, the node label stayed at the OLD
+/// name. The catalogue looked right — `ls` showed the new name — but the tree
+/// path, and therefore the file's destination on the NAS, kept the name the
+/// file had been renamed AWAY from. A rename that never reaches the disk the
+/// media actually lives on is not a rename.
+#[test]
+fn a_renamed_file_moves_on_the_nas_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let media = child(&mut engine, &root, "Media", TYPE_FOLDER);
+    let tv = child(&mut engine, &media, "TV", TYPE_FOLDER);
+    let show = child(&mut engine, &tv, "Show Name (2020)", TYPE_FOLDER);
+    let season = child(&mut engine, &show, "Season 03", TYPE_FOLDER);
+    let ep = child(&mut engine, &season, "Show Name - s03e01.mkv", TYPE_FILE);
+
+    // Rename the episode in place — one event, no new node.
+    let link = engine
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.label == "Show Name - s03e01.mkv")
+        .expect("the episode")
+        .link_id;
+    engine
+        .relabel_link(&link, "Show Name - s03e01 - Pilot.mkv")
+        .unwrap();
+
+    // The node kept its identity — this is the whole point of D72.
+    let kids = engine.children(&season).unwrap();
+    assert_eq!(kids.len(), 1, "a rename must not mint a second child");
+    assert_eq!(kids[0].node.id, ep, "same node id — nothing was re-catalogued");
+    assert_eq!(kids[0].label, "Show Name - s03e01 - Pilot.mkv");
+
+    // ...and the destination on the NAS followed it.
+    let segs = engine.tree_path_under(&ep, &media).unwrap().unwrap();
+    assert_eq!(
+        segs,
+        vec![
+            "TV",
+            "Show Name (2020)",
+            "Season 03",
+            "Show Name - s03e01 - Pilot.mkv"
+        ],
+        "the mover's destination must use the NEW name, or the rename never \
+         reaches the disk the media lives on"
+    );
+    engine.close().unwrap();
+}
+
+/// A FOLDER rename must carry every descendant's path with it — the case that
+/// used to mean re-linking every child and relocating every file beneath it.
+#[test]
+fn renaming_a_folder_moves_everything_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let media = child(&mut engine, &root, "Media", TYPE_FOLDER);
+    let tv = child(&mut engine, &media, "TV", TYPE_FOLDER);
+    let show = child(&mut engine, &tv, "Show Name", TYPE_FOLDER);
+    let season = child(&mut engine, &show, "Season 03", TYPE_FOLDER);
+    let ep = child(&mut engine, &season, "ep.mkv", TYPE_FILE);
+
+    // Rename the SHOW — one event, at the top of a subtree.
+    let link = engine
+        .children(&tv)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.label == "Show Name")
+        .expect("the show")
+        .link_id;
+    engine.relabel_link(&link, "Show Name (2020)").unwrap();
+
+    let segs = engine.tree_path_under(&ep, &media).unwrap().unwrap();
+    assert_eq!(
+        segs,
+        vec!["TV", "Show Name (2020)", "Season 03", "ep.mkv"],
+        "one relabel at the top must move every descendant's destination — \
+         no child was touched, and none needed to be"
+    );
+    engine.close().unwrap();
+}

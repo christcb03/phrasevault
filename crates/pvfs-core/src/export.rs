@@ -248,7 +248,7 @@ impl Engine {
                 .last_mut()
                 .expect("walk order keeps the parent level on the stack");
             let id = entry.node.id.clone();
-            let name = claim_name(&safe_name(&entry.node.label, &id), &id, &mut parent.used);
+            let name = claim_name(&safe_name(&entry.label, &id), &id, &mut parent.used);
             let rel = parent.rel.join(&name);
             let rel_str = rel.to_string_lossy().into_owned();
             let full = dest.join(&rel);

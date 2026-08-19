@@ -1025,7 +1025,7 @@ impl Engine {
                 continue;
             }
             if self.readable_path(&entry.node.id)?.is_none() {
-                out.push((entry.node.id, entry.node.label));
+                out.push((entry.node.id, entry.label));
             }
         }
         Ok(out)
