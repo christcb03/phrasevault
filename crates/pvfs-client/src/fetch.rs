@@ -439,12 +439,27 @@ pub fn tier_pass(
     engine: &mut Engine,
     fetcher: &mut Fetcher,
 ) -> Result<Option<TierReport>, PvfsError> {
-    if engine.is_replica() {
-        return Err(PvfsError::BadInput {
-            field: "tier".into(),
-            reason: "the mover runs on the owner — edges reclaim space with `pvfs evict`".into(),
-        });
-    }
+    // D75 — a REPLICA may pull-and-place, but never retire.
+    //
+    // The mover does two separable things: it PLACES bytes at their tree path
+    // in a central store, and it RETIRES other boxes' locations once that copy
+    // exists. Placing is a local act — fetch from the swarm, write the file,
+    // log where it went. Retiring is an authority decision about someone
+    // else's copy, and belongs to the owner.
+    //
+    // Refusing a replica outright conflated the two, and forced the central
+    // store to be a path the OWNER can write — which meant NFS, and an owner
+    // sitting in the byte path for bytes it does not keep. A holder that pulls
+    // for itself and advertises what it now has is the shape the fleet wants:
+    // the holder does the I/O, the controller decides when the edge may
+    // reclaim.
+    let pull_only = engine.is_replica();
+    // Opened once: a replica's catalog writes all go through the owner.
+    let mut route = if pull_only {
+        crate::advertise::replica_route(engine.data_dir(), true)?
+    } else {
+        None
+    };
     let data_dir = engine.data_dir().to_path_buf();
     let central = pvfs_core::sync::load_central_all(&data_dir)?;
     if central.is_empty() {
@@ -613,7 +628,13 @@ pub fn tier_pass(
                 // a huge library) are deliberately NOT ground through
                 // here: bulk attestation is an explicit operator act
                 // (`pvfs loc hash`), never a silent tier side effect.
-                if unhashed {
+                // D75: attestation mints a SUCCESSOR NODE, which is a catalog
+                // write and therefore the owner's. A replica places the bytes
+                // and records where they are; the owner attests on its own
+                // pass (or an operator does, with `pvfs loc hash`). Trying it
+                // here fails the whole file for a reason that has nothing to
+                // do with the copy having been made.
+                if unhashed && !pull_only {
                     match engine.hash_node(&id) {
                         Ok(new_id) => {
                             eprintln!(
@@ -766,7 +787,33 @@ pub fn tier_pass(
                     }
                     std::fs::rename(&tmp, &cpath)
                         .map_err(|e| PvfsError::io("place central copy", e))?;
-                    engine.add_location(&id, &pvfs_core::storage::path_to_uri(&cpath)?)?;
+                    // D75: on a REPLICA the catalog is the owner's to write, so
+                    // the row is ROUTED there — and pin-qualified, because a
+                    // bare file:// path is host-implicit and this copy lives on
+                    // a specific box. That is what makes the fleet able to dial
+                    // the holder for these bytes, and what lets the controller
+                    // see the copy exists before telling the edge to reclaim.
+                    let cpath_uri = pvfs_core::storage::path_to_uri(&cpath)?;
+                    if pull_only {
+                        let (client, sign) = route.as_mut().ok_or_else(|| PvfsError::BadInput {
+                            field: "tier".into(),
+                            reason: "a replica must route its writes to the owner, but no \
+                                     route is available — check the owner is reachable"
+                                .into(),
+                        })?;
+                        let qualified = match &own_pin {
+                            Some(pin) => format!("pvfs-host://{pin}{}", cpath.display()),
+                            None => cpath_uri.clone(),
+                        };
+                        client
+                            .add_location(&id, &qualified, |d| sign(d))
+                            .map_err(|e| PvfsError::BadInput {
+                                field: "tier".into(),
+                                reason: e.to_string(),
+                            })?;
+                    } else {
+                        engine.add_location(&id, &cpath_uri)?;
+                    }
                     // F5.5: the attributed row — the serving instance's view
                     // of the same store file (same aa/<id> layout under its
                     // remote prefix), so consumers dial IT for these bytes.
@@ -785,7 +832,9 @@ pub fn tier_pass(
             // MIRROR kind (central-keep, P8): the copy is the whole point —
             // nothing is ever retired, the source keeps serving, and the
             // logged store location doubles as a future swarm seed.
-            if keep {
+            // A replica places and advertises; retiring another box's location
+            // is the owner's call, so it stops here.
+            if keep || pull_only {
                 continue;
             }
             // central copy live → retire foreign-instance locations, plus —
