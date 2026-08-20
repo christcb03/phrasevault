@@ -275,6 +275,19 @@ enum Cmd {
         tree: bool,
         #[arg(long, required_if_eq_any([("mode", "central"), ("mode", "central-keep")]))]
         to: Option<PathBuf>,
+        /// Do NOT index a central store that already holds files.
+        ///
+        /// By default, placing `central` on a NON-EMPTY directory indexes what
+        /// is already there — because pointing PVFS at an existing library is
+        /// the normal case, not an edge case, and a catalog that does not know
+        /// its own store is worse than useless: every later collision is
+        /// refused as "the catalog has never seen it", which is exactly how a
+        /// routine UPGRADE looks (same name, different bytes).
+        ///
+        /// Skipping it leaves the store's existing files unknown. Use this only
+        /// when you mean to adopt them later, or not at all.
+        #[arg(long)]
+        no_adopt: bool,
         /// F5.5 (with `sync`): log fetched copies as THIS box's
         /// pvfs-host:// locations so the fleet can dial them
         #[arg(long)]
@@ -1064,6 +1077,67 @@ fn enroll_hint(msg: &str) -> String {
     } else {
         msg.to_string()
     }
+}
+
+/// Does this central store already hold files PVFS did not put there?
+///
+/// The marker is ignored — it is ours, and a store containing only the marker
+/// is empty for this purpose.
+fn store_has_content(dir: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten()
+        .any(|e| e.file_name() != std::ffi::OsStr::new(pvfs_core::sync::CENTRAL_MARKER))
+}
+
+/// Index a central store's existing contents into the catalog.
+///
+/// Exactly what a user would otherwise have to know to do by hand: bind the
+/// store on THIS box and scan it. Bindings are machine-scoped (D71 W1), so the
+/// owner binding the store to its own path does not disturb an ingest box that
+/// has the same folder bound somewhere else entirely.
+///
+/// Metadata only — no bytes move. Afterwards `tier` reports those files as
+/// "already central", which is the point: the store and the catalog agree.
+fn adopt_central_store(
+    data_dir: &std::path::Path,
+    node: &str,
+    dir: &std::path::Path,
+) -> Result<Option<String>, PvfsError> {
+    let mut engine = Engine::open(data_dir)?;
+    if engine.is_replica() {
+        // A replica cannot write the catalog locally, and routing a whole
+        // library scan through the owner is not something to start behind
+        // someone's back. Say so instead.
+        engine.close()?;
+        return Ok(Some(
+            "store already holds files, but this box is a replica — run \
+             `pvfs place` on the owner to index them"
+                .into(),
+        ));
+    }
+    engine.bind_folder(
+        &node.to_string(),
+        pvfs_core::BindSpec {
+            source_uri: format!("file://{}", dir.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            // Lazy: hashing a whole existing library up front would turn a
+            // placement command into hours of reading. Identity by (name, exact
+            // size) is enough to recognise these files, and the first hash that
+            // is ever needed settles it (D71 W6).
+            hash_policy: pvfs_core::HashPolicy::Lazy,
+        },
+    )?;
+    let reports = engine.scan_routed(Some(&node.to_string()), None, 0)?;
+    engine.close()?;
+    let added: usize = reports.iter().map(|r| r.stats.added as usize).sum();
+    let unchanged: usize = reports.iter().map(|r| r.stats.unchanged as usize).sum();
+    Ok(Some(format!(
+        "indexed the store's existing contents: {added} added, {unchanged} already known"
+    )))
 }
 
 fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
@@ -3586,7 +3660,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Place { target, mode, to, advertise, served_by, tree } => {
+        Cmd::Place { target, mode, to, advertise, served_by, tree, no_adopt } => {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
@@ -3603,6 +3677,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 });
             }
             let mut note = String::new();
+            let mut adopted: Option<String> = None;
             if mode == "central" || mode == "central-keep" {
                 let dest = to.expect("clap required_if_eq");
                 std::fs::create_dir_all(&dest)
@@ -3655,6 +3730,25 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     served.as_ref().map(|(i, p)| (i.as_str(), p.as_path())),
                 )?;
                 pvfs_core::sync::set_central_tree(&data_dir, &id, tree)?;
+
+                // ADOPT what is already in the store, by default.
+                //
+                // Pointing PVFS at an EXISTING library is the normal case — a
+                // media library that predates the catalog is why anyone reaches
+                // for a central store in the first place. Leaving those files
+                // unknown makes every later collision fail as "the catalog has
+                // never seen it", which is precisely what a routine upgrade
+                // looks like: same name, different bytes, because quality is not
+                // in the filename. That turned a working system into one that
+                // silently refused every upgrade until someone knew to run
+                // `bind` + `scan` by hand.
+                //
+                // So: bind the store on THIS box (bindings are machine-scoped,
+                // D71 W1) and index it. Metadata only — nothing is moved, and
+                // `tier` then reports those files as "already central".
+                if !no_adopt && store_has_content(&dest) {
+                    adopted = adopt_central_store(&data_dir, &id, &dest)?;
+                }
             } else {
                 pvfs_core::sync::set_sync_mode(&data_dir, &id, mode == "sync", advertise)?;
                 if advertise {
@@ -3664,9 +3758,18 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let shown_mode =
                 if advertise { "sync-advertise".to_string() } else { mode.clone() };
             if json {
-                println!("{{\"node\":\"{id}\",\"mode\":\"{shown_mode}\"}}");
+                println!(
+                    "{{\"node\":\"{id}\",\"mode\":\"{shown_mode}\",\"adopted\":{}}}",
+                    match &adopted {
+                        Some(a) => format!("\"{}\"", json_escape(a)),
+                        None => "null".into(),
+                    }
+                );
             } else {
                 println!("{id} placed {shown_mode}{note}");
+                if let Some(a) = &adopted {
+                    println!("  {a}");
+                }
             }
             Ok(())
         }
