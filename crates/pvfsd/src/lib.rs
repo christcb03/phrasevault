@@ -2111,7 +2111,29 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
         events.push(ev);
     }
     let mut e = daemon.engine.lock().unwrap();
-    match e.commit_member_write(events) {
+    // A member write must not fail merely because the projection was busy for a
+    // moment. The owner's serve jobs (tier, evict, reclaim) take the write lock
+    // on a timer, and a replica's write landing in that window used to come back
+    // as `SQLite is busy/locked during fold event` — surfaced to the caller as a
+    // hard error, with the write simply lost.
+    //
+    // That is the ingest path: an arr writing through feederbox hits exactly
+    // this. Retrying is safe because the commit is one transaction — a BUSY
+    // means nothing was applied, so there is no half-write to reconcile.
+    //
+    // Bounded, because a lock held for seconds is a real problem and should be
+    // reported rather than waited out forever.
+    let mut attempt = 0;
+    let outcome = loop {
+        match e.commit_member_write(events.clone()) {
+            Err(PvfsError::Busy { .. }) if attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+            }
+            other => break other,
+        }
+    };
+    match outcome {
         Ok(()) => {
             // Punch H: a committed write is new content on the owner — wake
             // the mover instead of waiting out its interval.

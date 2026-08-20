@@ -806,6 +806,13 @@ pub fn tier_pass(
 /// `<root>/.fleet/endpoints/<pin>` with a `host:port` payload.
 pub const FLEET_DIR: &str = ".fleet";
 pub const ENDPOINTS_DIR: &str = "endpoints";
+/// `<root>/.fleet/versions/<pin>` — what each box RUNS, announced by that box.
+///
+/// D72 Part C: the fleet has to be able to answer "is every box on the same
+/// format?" from the forest itself, not from a control host with SSH. A box
+/// that can read the catalog can read the fleet's spread, which is what makes
+/// a format flip safe to decide anywhere.
+pub const VERSIONS_DIR: &str = "versions";
 
 /// Read the catalog-published endpoint directory: pin → dial address.
 /// Missing directory = empty map (the fleet simply hasn't announced).

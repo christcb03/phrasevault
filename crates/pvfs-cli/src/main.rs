@@ -809,6 +809,10 @@ enum FleetCmd {
         #[arg(long)]
         rights: Option<String>,
     },
+    /// D72 Part C: what every box in the fleet RUNS, read from the catalog —
+    /// no SSH, no control host. Answers the question a format flip depends on:
+    /// is the fleet uniform yet?
+    Versions,
     /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
     /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
     /// member's fetcher learns how to reach this holder from the catalog
@@ -4242,6 +4246,110 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
         }
+        Cmd::Fleet(FleetCmd::Versions) => {
+            let engine = Engine::open(&ctx?)?;
+            let root = engine.identity.root_node_id.clone();
+            let me = pvfs_core::storage::host_pin(engine.data_dir());
+            let find = |parent: &str, label: &str| -> Result<Option<String>, PvfsError> {
+                Ok(engine
+                    .children(&parent.to_string())?
+                    .into_iter()
+                    .find_map(|c| (c.label == label).then_some(c.node.id)))
+            };
+            let mut rows: Vec<(String, String, bool)> = Vec::new();
+            let mut silent: Vec<String> = Vec::new();
+            if let Some(fleet) = find(&root, pvfs_client::fetch::FLEET_DIR)? {
+                if let Some(vers) = find(&fleet, pvfs_client::fetch::VERSIONS_DIR)? {
+                    for c in engine.children(&vers)? {
+                        let is_me = me.as_deref() == Some(c.label.as_str());
+                        rows.push((
+                            c.label.clone(),
+                            String::from_utf8_lossy(&c.node.payload).to_string(),
+                            is_me,
+                        ));
+                    }
+                }
+                // Which boxes are we NOT hearing from? A box that announced an
+                // endpoint is a box the fleet knows about, so one with no
+                // version record is SILENT, not absent.
+                //
+                // Without this, a fleet where exactly one box has reported
+                // reads "UNIFORM" — every version seen agrees, because only one
+                // was seen. That is absence of evidence dressed up as evidence,
+                // and it is the reading a format flip must never be gated on.
+                if let Some(eps) = find(&fleet, pvfs_client::fetch::ENDPOINTS_DIR)? {
+                    for c in engine.children(&eps)? {
+                        if !rows.iter().any(|(pin, _, _)| *pin == c.label) {
+                            silent.push(c.label.clone());
+                        }
+                    }
+                }
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            silent.sort();
+            let distinct: std::collections::BTreeSet<&str> =
+                rows.iter().map(|(_, v, _)| v.as_str()).collect();
+            // Uniform means "every box the fleet knows about reports the same
+            // build" — so a silent box makes the answer NO, not "probably".
+            let uniform = distinct.len() <= 1 && silent.is_empty() && !rows.is_empty();
+            engine.close()?;
+
+            if json {
+                let items: Vec<String> = rows
+                    .iter()
+                    .map(|(pin, v, is_me)| {
+                        format!(
+                            "{{\"pin\":\"{}\",\"self\":{is_me},\"reported\":{v}}}",
+                            json_escape(pin)
+                        )
+                    })
+                    .collect();
+                let sil: Vec<String> = silent
+                    .iter()
+                    .map(|p| format!("\"{}\"", json_escape(p)))
+                    .collect();
+                println!(
+                    "{{\"uniform\":{uniform},\"boxes\":[{}],\"silent\":[{}]}}",
+                    items.join(","),
+                    sil.join(",")
+                );
+            } else if rows.is_empty() {
+                println!(
+                    "no box has announced a version yet — run `pvfs fleet announce` on each \
+                     (an upgrade should re-announce; see fleet/tasks/roll-one.yml)"
+                );
+            } else {
+                for (pin, v, is_me) in &rows {
+                    println!(
+                        "{}{}  {v}",
+                        &pin[..12.min(pin.len())],
+                        if *is_me { " (this box)" } else { "           " }
+                    );
+                }
+                for pin in &silent {
+                    println!(
+                        "{}  (announced an endpoint but NO version — silent)",
+                        &pin[..12.min(pin.len())]
+                    );
+                }
+                if uniform {
+                    println!("\nthe fleet is UNIFORM — every box reports the same build");
+                } else if !silent.is_empty() {
+                    println!(
+                        "\nthe fleet is UNKNOWN — {} box(es) have not reported. Not the same \
+                         as uniform: a format flip must not be gated on boxes we cannot hear.",
+                        silent.len()
+                    );
+                } else {
+                    println!(
+                        "\nthe fleet is MIXED — {} different builds. A format flip is only \
+                         safe once this reads uniform.",
+                        distinct.len()
+                    );
+                }
+            }
+            Ok(())
+        }
         Cmd::Fleet(FleetCmd::Announce { addr, retract }) => {
             let state_dir = ctx?;
             let pin = pvfs_core::storage::host_pin(&state_dir).ok_or_else(|| {
@@ -4284,11 +4392,36 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Some((id, _, _)) => find(id, &pin)?,
                 None => None,
             };
+            // D72 Part C: a box announces WHAT IT RUNS at the same moment it
+            // announces where it is. One command, one moment — a separate verb
+            // would be a separate thing to forget after an upgrade, and a stale
+            // version record is worse than none.
+            let vers = match &fleet {
+                Some((id, _, _)) => find(id, pvfs_client::fetch::VERSIONS_DIR)?,
+                None => None,
+            };
+            let existing_ver = match &vers {
+                Some((id, _, _)) => find(id, &pin)?,
+                None => None,
+            };
+            let ver_json = format!(
+                "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{}}}",
+                env!("CARGO_PKG_VERSION"),
+                pvfs_client::PROTO_VERSION,
+                pvfs_core::projection::SCHEMA_VERSION
+            );
+            let ver_unchanged = existing_ver
+                .as_ref()
+                .is_some_and(|(_, _, p)| p.as_slice() == ver_json.as_bytes());
             // Convergence-friendly: an unchanged record is a NO-OP — a
             // scheduled re-run must not churn the log.
             if !retract {
+                // Both halves, or neither. After an upgrade the ADDRESS is
+                // unchanged and the VERSION is not — returning early on the
+                // address alone would leave the catalog claiming this box still
+                // runs what it ran before the roll.
                 if let Some((_, _, payload)) = &existing {
-                    if payload.as_slice() == addr.as_bytes() {
+                    if payload.as_slice() == addr.as_bytes() && ver_unchanged {
                         engine.close()?;
                         if json {
                             println!("{{\"pin\":\"{pin}\",\"addr\":\"{}\",\"unchanged\":true}}", json_escape(&addr));
@@ -4333,6 +4466,23 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         .add_node(&eps_id, &pin, "fleet.endpoint", addr.as_bytes(), |d| sign(d))
                         .map_err(remote_err)?;
                 }
+                // ...and the version record, in the same breath.
+                let vers_id = match vers {
+                    Some((id, _, _)) => id,
+                    None => client
+                        .mkdir(&fleet_id, pvfs_client::fetch::VERSIONS_DIR, |d| sign(d))
+                        .map_err(remote_err)?,
+                };
+                if let Some((node_id, _, _)) = existing_ver {
+                    client.rm(&node_id, |d| sign(d)).map_err(remote_err)?;
+                }
+                if !retract {
+                    client
+                        .add_node(&vers_id, &pin, "fleet.version", ver_json.as_bytes(), |d| {
+                            sign(d)
+                        })
+                        .map_err(remote_err)?;
+                }
                 replica_catch_up(&data_dir, &mut client);
             } else {
                 let mut engine = engine;
@@ -4372,6 +4522,35 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             node_type: "fleet.endpoint".into(),
                             label: pin.clone(),
                             payload: addr.clone().into_bytes(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?;
+                }
+                // ...and the version record, in the same breath.
+                let vers_id = match vers {
+                    Some((id, _, _)) => id,
+                    None => engine.add_node(
+                        &fleet_id,
+                        pvfs_core::engine::NodeSpec {
+                            node_type: "folder".into(),
+                            label: pvfs_client::fetch::VERSIONS_DIR.into(),
+                            payload: Vec::new(),
+                            is_temp: false,
+                            creation_nonce: None,
+                        },
+                    )?,
+                };
+                if let Some((_, link_id, _)) = existing_ver {
+                    engine.remove_link(&link_id)?;
+                }
+                if !retract {
+                    engine.add_node(
+                        &vers_id,
+                        pvfs_core::engine::NodeSpec {
+                            node_type: "fleet.version".into(),
+                            label: pin.clone(),
+                            payload: ver_json.clone().into_bytes(),
                             is_temp: false,
                             creation_nonce: None,
                         },
