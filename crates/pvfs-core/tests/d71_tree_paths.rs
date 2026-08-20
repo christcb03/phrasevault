@@ -300,3 +300,45 @@ fn a_file_moved_and_renamed_at_once_keeps_its_identity() {
     );
     engine.close().unwrap();
 }
+
+/// The mover must never retire the location that makes a file central.
+///
+/// D74, found on production: adopting an existing library binds the store and
+/// places it central — so the binding's source and the central destination are
+/// the SAME directory. The drain logic retires anything under the staging
+/// prefix, which then matched every adopted file's own central location.
+///
+/// One pass retired 27,562 locations and left 26,729 files catalogued with no
+/// live location, while every byte sat untouched on disk. Nothing was lost, but
+/// the catalog stopped knowing where its own library was — and a `tier` that
+/// had just reported "26,728 already central" reported 0 the next run.
+///
+/// Staging drains because it is somewhere ELSE: bytes staged locally are
+/// redundant once copied to a separate store. When source == store there is
+/// nowhere to drain to, and the correct number of retirements is zero.
+#[test]
+fn the_drain_never_retires_the_central_store_itself() {
+    let staging = "file:///mnt/nas/Media/";
+    let dest = "file:///mnt/nas/Media/";
+
+    // The predicate as the mover states it.
+    let staged = |u: &str| u.starts_with(staging) && !u.starts_with(dest);
+
+    assert!(
+        !staged("file:///mnt/nas/Media/TV/Show/ep.mkv"),
+        "source == store: the file's own central location must NOT be drained"
+    );
+
+    // And the case the drain exists for: staging somewhere else entirely.
+    let staging2 = "file:///srv/incoming/";
+    let dest2 = "file:///mnt/nas/Media/";
+    let staged2 = |u: &str| u.starts_with(staging2) && !u.starts_with(dest2);
+    assert!(
+        staged2("file:///srv/incoming/ep.mkv"),
+        "a genuinely staged copy still drains once the central copy exists"
+    );
+    assert!(
+        !staged2("file:///mnt/nas/Media/TV/Show/ep.mkv"),
+        "the central copy is never drained"
+    );
+}

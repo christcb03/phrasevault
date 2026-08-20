@@ -808,9 +808,25 @@ pub fn tier_pass(
                         pvfs_core::storage::parse_host_uri(&u),
                         Some((pin, _)) if own_pin.as_deref() != Some(pin)
                     );
+                // A location that IS the central store is never "staged".
+                //
+                // Staging drains because a migrate binding stages bytes
+                // LOCALLY and the mover then copies them to a SEPARATE central
+                // store — once the central copy exists the staged one is
+                // redundant. When the binding's source and the store are the
+                // SAME directory, there is nowhere to drain to, and this
+                // retired the very locations that made those files central:
+                // the mover ate its own tail. 27,562 locations went in one
+                // pass, leaving 26,729 files catalogued with no live location
+                // while every byte sat untouched on disk.
+                //
+                // Adopting an existing store (D74) makes source == store the
+                // NORMAL case, so this is a guard the drain logic always
+                // needed and never had.
                 let staged = staging_prefix
                     .as_deref()
-                    .is_some_and(|p| u.starts_with(p));
+                    .is_some_and(|p| u.starts_with(p))
+                    && !u.starts_with(&dest_prefix);
                 if foreign || staged {
                     match engine.remove_location(&id, &u) {
                         Ok(()) => report.retired += 1,

@@ -884,6 +884,40 @@ impl Engine {
             .map_err(map_db("scan state"))?;
         if let Some((size, mtime, file_id)) = ss {
             if size == f.size && mtime == f.mtime_ms {
+                // D74 — unchanged ON DISK is not the same as recorded IN THE
+                // CATALOG, and this short-circuit used to conflate them.
+                //
+                // `scan_state` remembers that this uri was scanned, so a
+                // matching size+mtime returned "unchanged" without ever asking
+                // whether the location is still live. When a pass had retired
+                // those locations, a re-scan of 27,562 files reported every one
+                // of them unchanged and repaired nothing — the catalog could
+                // not find bytes that were sitting right there, and rescanning
+                // (the obvious remedy) was a no-op.
+                //
+                // The reactivation path below already knew how to fix this; it
+                // was simply unreachable. So: confirm the location before
+                // believing our own memory of it.
+                let live: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM file_locations
+                          WHERE uri = ?1 AND file_id = ?2 AND removed_at IS NULL",
+                        params![uri, file_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_db("scan location check"))?;
+                if live.is_none() && fetch_node(&self.conn, &file_id)?.is_some() {
+                    match writer {
+                        Some(w) => w.add_location(&file_id, uri)?,
+                        None => {
+                            self.add_location(&file_id, uri)?;
+                        }
+                    }
+                    stats.added += 1;
+                    return Ok(());
+                }
                 stats.unchanged += 1;
             } else {
                 self.flag_change(&file_id, uri, size, mtime, f)?;
