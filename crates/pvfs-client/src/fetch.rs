@@ -450,6 +450,27 @@ pub fn tier_pass(
     if central.is_empty() {
         return Ok(None);
     }
+    // D74 — the central store must PROVE it is the central store.
+    //
+    // A central directory is very often a mount (NFS/SMB to a NAS). When that
+    // mount is not there, the mountpoint is still a perfectly good local
+    // directory — so the mover writes to it, reports "migrated into the central
+    // store", and the catalog records bytes as safely central that are actually
+    // on the owner's own small disk. Demonstrated on the lab: 16MB written to a
+    // VM's root filesystem while every message said success. With `evict`
+    // downstream, that is a path to losing the only real copy.
+    //
+    // The marker costs one file and turns a silent wrong-disk write into a
+    // refusal that names the mount. It is written when placement is set.
+    for (_root, dir, _keep) in &central {
+        pvfs_core::sync::verify_central_marker(dir).map_err(|e| PvfsError::BadInput {
+            field: "tier".into(),
+            reason: format!(
+                "{} does not look like the central store: {e}. If this is a mount, it is                  probably not mounted — writing here would put the bytes on this box's own                  disk while the catalog recorded them as central.",
+                dir.display()
+            ),
+        })?;
+    }
     let own_pin = pvfs_core::storage::host_pin(&data_dir);
     // F5.5 (doc 17 §7.7): central subtrees with a serving instance log the
     // store copy as THAT instance's pvfs-host:// location too — resolved to

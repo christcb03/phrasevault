@@ -623,7 +623,83 @@ pub fn set_central_tree(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
     save_placement(data_dir, &p)
 }
 
+/// The file that proves a directory really is the central store.
+pub const CENTRAL_MARKER: &str = ".pvfs-central";
+
+/// Write the marker into a central store as placement is set.
+///
+/// D74: a central directory is usually a MOUNT. When the mount is absent the
+/// mountpoint is still a writable local directory, so without this the mover
+/// happily fills the owner's own disk while reporting files as central.
+pub fn write_central_marker(dir: &Path, forest_id: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create central dir", e))?;
+    let p = dir.join(CENTRAL_MARKER);
+    if let Ok(existing) = std::fs::read_to_string(&p) {
+        if existing.trim() == forest_id {
+            return Ok(());
+        }
+    }
+    std::fs::write(&p, format!("{forest_id}\n")).map_err(|e| PvfsError::io("write marker", e))
+}
+
+/// Refuse a central store that cannot show its marker.
+///
+/// Deliberately NOT self-healing: writing the marker here would defeat the
+/// point, because an unmounted mountpoint would simply be re-marked and the
+/// mover would carry on writing to the wrong disk. The marker is placed once,
+/// when placement is set, and after that its absence is a fact worth stopping
+/// for.
+pub fn verify_central_marker(dir: &Path) -> Result<()> {
+    let p = dir.join(CENTRAL_MARKER);
+    match std::fs::read_to_string(&p) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // ADOPTION, for stores that predate the marker.
+            //
+            // A central store set up before D74 has no marker, and refusing it
+            // would break every existing forest on upgrade. But "no marker" is
+            // also exactly what an unmounted mountpoint looks like, so this
+            // cannot simply pass.
+            //
+            // The discriminator is CONTENT: an absent mount is an empty
+            // directory, while a real store already holds the library. So a
+            // non-empty unmarked directory is adopted (and marked, once), and
+            // an EMPTY unmarked one is refused — which is the dangerous case
+            // and the only one worth stopping.
+            let non_empty = std::fs::read_dir(dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if non_empty {
+                // Best-effort: a read-only store is still a valid store.
+                let _ = std::fs::write(&p, "adopted\n");
+                return Ok(());
+            }
+            Err(PvfsError::BadInput {
+                field: "central".into(),
+                reason: format!("no {CENTRAL_MARKER} marker, and the directory is empty"),
+            })
+        }
+        Err(e) => Err(PvfsError::io("read central marker", e)),
+    }
+}
+
+/// Mark a store as placement is set, best-effort.
+///
+/// Best-effort because placement may legitimately be configured before the
+/// destination is reachable (an unmounted NAS at setup time). The mover's
+/// check is the one that must hold; this just gets the marker there whenever
+/// the directory is writable.
+fn mark_central_best_effort(data_dir: &Path, dest: &Path) {
+    // The marker's job is "this directory IS the central store". Its CONTENT
+    // is informational — the owning forest's data dir, so a store shared by two
+    // forests by mistake is legible to a human reading the file. Verification
+    // checks presence only, which keeps this off the projection and avoids
+    // re-entering the engine from inside a placement write.
+    let _ = write_central_marker(dest, &data_dir.display().to_string());
+}
+
 pub fn set_central(data_dir: &Path, id: &NodeId, dest: &Path, keep: bool) -> Result<()> {
+    mark_central_best_effort(data_dir, dest);
     set_central_served(data_dir, id, dest, keep, None)
 }
 
@@ -637,6 +713,7 @@ pub fn set_central_served(
     keep: bool,
     served_by: Option<(&str, &Path)>,
 ) -> Result<()> {
+    mark_central_best_effort(data_dir, dest);
     let mut p = load_placement_full(data_dir)?;
     p.sync.retain(|r| r != id);
     p.sync_advertise.retain(|r| r != id);
