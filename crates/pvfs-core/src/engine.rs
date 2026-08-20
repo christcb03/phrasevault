@@ -1144,7 +1144,29 @@ impl Engine {
     }
 
     pub(crate) fn append_durable(&mut self, events: Vec<Event>) -> Result<()> {
-        self.append_durable_with(events, |_| Ok(()))
+        // D74: a local write must not die because the projection was busy for a
+        // moment. A daemon serving this same forest takes the write lock on a
+        // timer (its serve jobs), and a CLI write landing in that window came
+        // back as `SQLite is busy/locked during fold event`.
+        //
+        // That is survivable for one `pvfs add`. It is NOT survivable for a
+        // long scan: adopting a 28,000-file library died five minutes in,
+        // having catalogued 1,221 files, because one fold met one lock.
+        //
+        // Safe to retry because the append is one transaction — BUSY means
+        // nothing was applied. Bounded, because a lock held for seconds is a
+        // real problem to report rather than wait out forever. Mirrors the same
+        // fix on the daemon's member-write path.
+        let mut attempt = 0;
+        loop {
+            match self.append_durable_with(events.clone(), |_| Ok(())) {
+                Err(PvfsError::Busy { .. }) if attempt < 5 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Run only temp-table work in one transaction (no events, no log touch).
