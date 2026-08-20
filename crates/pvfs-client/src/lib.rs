@@ -22,7 +22,7 @@ use pvfs_proto::{
 
 pub use pvfs_proto::{
     ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
-    PROTO_VERSION,
+    PROTO_COMPATIBLE_WITH, PROTO_VERSION,
 };
 
 pub mod advertise;
@@ -806,6 +806,30 @@ impl Client {
             WriteOp::Reorder {
                 link_id: link_id.into(),
                 key: key.into(),
+            },
+            sign,
+        )
+    }
+
+    /// Can this daemon do `Relabel`? (D73 — proto 4.)
+    ///
+    /// Ask BEFORE sending, and take the older path when the answer is no. The
+    /// daemon will refuse legibly either way, but a caller that checks can pick
+    /// a path that works instead of discovering the refusal mid-operation.
+    pub fn supports_relabel(&self) -> bool {
+        self.daemon_proto >= 4
+    }
+
+    /// D73 — set a link's display label. Gated: check [`supports_relabel`]
+    /// first, and fall back to the successor-node path against an older daemon.
+    pub fn relabel<F>(&mut self, link_id: &str, label: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::Relabel {
+                link_id: link_id.into(),
+                label: label.into(),
             },
             sign,
         )

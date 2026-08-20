@@ -527,9 +527,35 @@ impl Filesystem for PvfsFs {
             };
         }
 
-        // A REPLICA has no relabel wire op yet, so a name change still takes
-        // the successor path there. Correct, just not cheap — and it is the
-        // reason the wire needs Part A's treatment of its own (see D73).
+        // D73: a REPLICA can take the cheap path too, when the owner is new
+        // enough to understand it. Gated rather than assumed — the owner may be
+        // older than this binary, and degrading to the successor path is
+        // correct there, just expensive.
+        if name != newname && from == to {
+            let supported = matches!(&self.route, Some((c, _)) if c.supports_relabel());
+            if supported {
+                let res = (|| -> Result<(), PvfsError> {
+                    let Some((client, sign)) = &mut self.route else {
+                        unreachable!("route checked above")
+                    };
+                    client
+                        .relabel(&entry.link_id, newname, |d| sign(d))
+                        .map_err(|e| PvfsError::BadInput {
+                            field: "rename".into(),
+                            reason: e.to_string(),
+                        })?;
+                    pvfs_client::advertise::catch_up(&self.data_dir, client);
+                    Ok(())
+                })();
+                return match res {
+                    Ok(()) => reply.ok(),
+                    Err(e) => {
+                        eprintln!("pvfs mount: relabel failed: {e}");
+                        reply.error(libc::EIO)
+                    }
+                };
+            }
+        }
         if name != newname {
             return match self.rename_to_new_name(&from, name, &to, newname) {
                 Ok(()) => reply.ok(),

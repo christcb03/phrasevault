@@ -1940,22 +1940,36 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
         Cmd::Relabel { link_id, label } => {
             let mut engine = Engine::open(&ctx?)?;
-            if engine.is_replica() {
-                // The relabel wire op does not exist yet (D72 Part C). Say so
-                // plainly rather than failing somewhere less obvious.
-                return Err(PvfsError::Forbidden {
-                    action: "relabel".into(),
-                    reason: "not yet supported from a replica (no wire op — D72 Part C); \
-                             run it on the forest owner"
-                        .into(),
-                });
-            }
             let label = match label {
                 Some(l) => l,
                 None => prompt_line("new label", None)?,
             };
-            engine.relabel_link(&link_id, &label)?;
-            engine.close()?;
+            if engine.is_replica() {
+                // D73: gated. The owner may be older than this binary, and an
+                // op it has never heard of is its to refuse, not ours to
+                // assume — so ask before sending.
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                if !client.supports_relabel() {
+                    return Err(PvfsError::Forbidden {
+                        action: "relabel".into(),
+                        reason: format!(
+                            "the forest owner speaks proto {} and relabel needs 4 — roll the \
+                             owner first (the owner always rolls first: forward compatibility \
+                             covers the log, and the wire only degrades)",
+                            client.daemon_proto()
+                        ),
+                    });
+                }
+                client
+                    .relabel(&link_id, &label, |d| sign(d))
+                    .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.relabel_link(&link_id, &label)?;
+                engine.close()?;
+            }
             println!("relabeled {link_id} -> {label}");
             Ok(())
         }
@@ -5078,10 +5092,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
 
             if json {
                 println!(
-                    "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{},\"projection_schema\":{},\
+                    "{{\"pvfs\":\"{}\",\"proto\":{},\"proto_compatible_with\":{},\
+                     \"schema\":{},\"projection_schema\":{},\
                      \"unknown_events\":{},\"unknown_kinds\":{},\"behind\":{}}}",
                     env!("CARGO_PKG_VERSION"),
                     pvfs_client::PROTO_VERSION,
+                    pvfs_client::PROTO_COMPATIBLE_WITH,
                     pvfs_core::projection::SCHEMA_VERSION,
                     match on_disk {
                         Some(v) => v.to_string(),
@@ -5103,7 +5119,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 );
             } else {
                 println!("pvfs             : {}", env!("CARGO_PKG_VERSION"));
-                println!("wire proto       : {}", pvfs_client::PROTO_VERSION);
+                println!(
+                    "wire proto       : {} (talks back to {})",
+                    pvfs_client::PROTO_VERSION,
+                    pvfs_client::PROTO_COMPATIBLE_WITH
+                );
                 println!(
                     "projection schema: {} (this binary)",
                     pvfs_core::projection::SCHEMA_VERSION

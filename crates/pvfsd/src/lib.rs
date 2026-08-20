@@ -25,7 +25,8 @@ use pvfs_core::{
     crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
 };
 use pvfs_proto::{
-    auth_digest, read_data_frame, read_msg, write_data_frame, write_msg, ChildInfo, ClientMsg,
+    auth_digest, read_data_frame, read_frame, read_msg, write_data_frame, write_msg, ChildInfo,
+    ClientMsg,
     IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, WriteOp,
     DATA_CHUNK, PROTO_VERSION,
 };
@@ -118,6 +119,13 @@ pub struct Daemon {
     data_dir: PathBuf,
     /// P10.0: live ingest sessions (mirror of `ingest.sessions`).
     ingest: Mutex<IngestState>,
+    /// D73: ops a peer asked for that this daemon does not know.
+    ///
+    /// Tolerating an unknown request must never become silence — the same rule
+    /// Part A set for unknown log events. A daemon quietly refusing ops it is
+    /// too old to perform looks healthy while a newer peer degrades around it,
+    /// so it says which ops those were.
+    unknown_ops: Mutex<std::collections::BTreeSet<String>>,
     /// PVOS D67 C3: the write lease, if a connection holds one. `None` = the
     /// forest has no declared authority and every authenticated write is
     /// judged on ACLs alone (the pre-lease behaviour, and what a forest with
@@ -192,6 +200,7 @@ impl Daemon {
                 hot: Vec::new(),
             }),
             lease: Mutex::new(None),
+            unknown_ops: Mutex::new(std::collections::BTreeSet::new()),
             next_conn: AtomicU64::new(1),
         }
     }
@@ -424,7 +433,35 @@ pub fn serve_connection<S: io::Read + io::Write>(
     )?;
 
     // 3. request loop
-    while let Some(req) = read_msg::<_, ClientMsg>(&mut stream)? {
+    //
+    // D73: a request this daemon cannot read is REFUSED, not fatal. It used to
+    // propagate out of `read_msg` with `?` and drop the connection, which is
+    // why no additive wire change could ever roll — a newer peer sending an op
+    // an older daemon had never heard of simply lost its connection, with
+    // nothing to distinguish that from a network fault.
+    //
+    // Refusing is safe because the framing is length-prefixed: the unknown
+    // frame was consumed exactly, so the stream is still aligned.
+    while let Some(frame) = read_frame::<_, ClientMsg>(&mut stream)? {
+        let req = match frame {
+            pvfs_proto::Frame::Msg(m) => m,
+            pvfs_proto::Frame::Unknown { tag } => {
+                // Named, so the caller can fall back on THIS op rather than
+                // guessing which of its requests was too new.
+                daemon.unknown_ops.lock().unwrap().insert(tag.clone());
+                write_msg(
+                    &mut stream,
+                    &ServerMsg::Error {
+                        code: "unknown_op".into(),
+                        message: format!(
+                            "this daemon (proto {}) does not know the op {tag:?} — it is older                              than the client",
+                            pvfs_proto::PROTO_VERSION
+                        ),
+                    },
+                )?;
+                continue;
+            }
+        };
         // Cat uses the data plane: it writes multiple frames to the stream
         // directly rather than returning a single ServerMsg.
         match req {
@@ -2029,6 +2066,9 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u
             }
             WriteOp::Unlink { link_id } => e.prepare_remove_link(&author, &link_id),
             WriteOp::Reorder { link_id, key } => e.prepare_reorder_link(&author, &link_id, &key),
+            WriteOp::Relabel { link_id, label } => {
+                e.prepare_relabel_link(&author, &link_id, &label)
+            }
             WriteOp::Mv { node, new_parent } => e.prepare_move_node(&author, &node, &new_parent),
             WriteOp::SetAcl {
                 node,

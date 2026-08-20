@@ -23,7 +23,22 @@ use serde::{Deserialize, Serialize};
 /// ops shipped at 3 without a bump and it cost a live pass).
 ///   2 → 3: the P10 external-ingest ops (IngestBegin/Write/Verified/
 ///          Commit/Abort/List), ranged `Cat`, and P10.2 partial paths.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
+
+/// The oldest proto this binary can still talk to (D73).
+///
+/// PROTO_VERSION says what we speak; this says how far back we degrade. Every
+/// change between the two has been additive and gated, so a peer anywhere in
+/// `[PROTO_COMPATIBLE_WITH, PROTO_VERSION]` is safe to roll against — which is
+/// what lets `upgrade.yml` allow a proto bump instead of refusing every one.
+///
+/// Moving THIS number is the fleet-wide event that a bare `PROTO_VERSION` bump
+/// used to be.
+pub const PROTO_COMPATIBLE_WITH: u32 = 3;
+
+/// A binary cannot degrade to a proto newer than it speaks. Enforced at COMPILE
+/// time so the pair can never ship inconsistent.
+const _: () = assert!(PROTO_COMPATIBLE_WITH <= PROTO_VERSION);
 /// Hard cap on a single control frame (bulk bytes use the data plane, not frames).
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// Chunk size for binary data-plane frames (1 MiB).
@@ -243,6 +258,15 @@ pub enum WriteOp {
     Unlink { link_id: String },
     /// Change a link's sibling order (P6.0). Write on the link's parent.
     Reorder { link_id: String, key: String },
+    /// D73/proto 4 — set a link's display label (D72). Write on the link's
+    /// parent, exactly like `Reorder`: both change a MUTABLE attribute of an
+    /// edge without touching the edge's identity.
+    ///
+    /// Additive and GATED: a client sends this only when the daemon reports
+    /// proto >= 4, and falls back to the pre-D72 successor-node path otherwise.
+    /// That is what makes it rollable — an older daemon never has to know it
+    /// exists, and now refuses it legibly rather than dropping the connection.
+    Relabel { link_id: String, label: String },
     /// Re-home `node` under `new_parent`.
     Mv { node: String, new_parent: String },
     /// Set a principal's rights on a node. `principal` = `public`|`any`|`tag:<name>`|
@@ -462,6 +486,79 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
 }
 
 /// Read one length-prefixed JSON control frame; `Ok(None)` on a clean EOF.
+/// One frame off the wire: either a message this binary understands, or
+/// well-formed JSON it does not.
+///
+/// D73: the distinction exists because the framing makes it SAFE. Frames are
+/// length-prefixed, so a frame we cannot interpret has still been consumed
+/// exactly — the stream stays aligned and the next frame is readable. That is
+/// what lets an unknown request be REFUSED instead of killing the connection,
+/// which is what used to happen and is why no additive wire change could roll.
+///
+/// Note the asymmetry with the log's `Event::Unknown`, and keep it: an unknown
+/// EVENT is *retained*, because the log is a durable shared record and those
+/// bytes must survive for boxes that do understand them. An unknown REQUEST is
+/// *refused* — there is nothing to preserve, and acting on what you cannot
+/// parse is the one thing that must never happen. Tolerance means "do not
+/// die", never "proceed anyway".
+#[derive(Debug, Clone)]
+pub enum Frame<T> {
+    Msg(T),
+    /// Valid JSON, unknown shape. `tag` is the discriminant if one was present
+    /// (`t` for a message, `op` for a write) — so the refusal can name what it
+    /// could not do rather than saying only "no".
+    Unknown { tag: String },
+}
+
+/// Read one frame, tolerating a message this binary does not know.
+///
+/// Prefer this over [`read_msg`] on any long-lived connection: it is the
+/// difference between "this daemon cannot do that" and the peer's connection
+/// dropping.
+pub fn read_frame<R: Read, T: serde::de::DeserializeOwned>(
+    r: &mut R,
+) -> io::Result<Option<Frame<T>>> {
+    let Some(body) = read_frame_bytes(r)? else {
+        return Ok(None);
+    };
+    match serde_json::from_slice::<T>(&body) {
+        Ok(v) => Ok(Some(Frame::Msg(v))),
+        Err(e) => {
+            // Only a well-formed JSON object is refusable. Anything else means
+            // the peer is not speaking this protocol, and continuing to read
+            // would be guessing.
+            match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(serde_json::Value::Object(map)) => {
+                    let tag = map
+                        .get("op")
+                        .or_else(|| map.get("t"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(untagged)")
+                        .to_string();
+                    Ok(Some(Frame::Unknown { tag }))
+                }
+                _ => Err(invalid(e)),
+            }
+        }
+    }
+}
+
+fn read_frame_bytes<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match r.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_FRAME {
+        return Err(invalid("frame exceeds cap"));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
 pub fn read_msg<R: Read, T: serde::de::DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {

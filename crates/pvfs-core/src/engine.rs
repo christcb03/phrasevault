@@ -3179,6 +3179,32 @@ impl Engine {
     }
 
     /// Phase 1 of a member `reorder` (P6.0, doc 19 §2).
+    /// D73 — the member-write half of `relabel_link`, mirroring
+    /// `prepare_reorder_link`. Same authority: a label is a mutable attribute
+    /// of an edge, so editing it is a write on the link, judged exactly as a
+    /// reorder is.
+    pub fn prepare_relabel_link(
+        &self,
+        author_pub: &[u8],
+        link_id: &LinkId,
+        label: &str,
+    ) -> Result<PreparedWrite> {
+        let _ = self.link_for_member_edit(author_pub, link_id, "relabel")?;
+        let digest = event::msg_link_relabeled(link_id, label, author_pub);
+        Ok(PreparedWrite {
+            result_id: link_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::LinkRelabeled {
+                    link_id: link_id.clone(),
+                    label: label.to_string(),
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
     pub fn prepare_reorder_link(
         &self,
         author_pub: &[u8],
