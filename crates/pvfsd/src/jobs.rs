@@ -129,18 +129,10 @@ impl JobsState {
             .iter()
             .cloned()
             .map(|mut r| {
-                if r.state == "running" {
-                    let since = r.last_ok_ms.unwrap_or(self.started_ms);
-                    let limit = interval(&r.name).as_millis() as u64 * STALL_FACTOR;
-                    if now.saturating_sub(since) > limit {
-                        let mins = now.saturating_sub(since) / 60_000;
-                        r.state = "stalled".into();
-                        r.last_error = Some(format!(
-                            "no pass has completed in {mins} min (interval is {}s) — the pass \
-                             is stuck, not working",
-                            interval(&r.name).as_secs()
-                        ));
-                    }
+                let since = r.last_ok_ms.unwrap_or(self.started_ms);
+                if let Some(why) = stalled_reason(&r.state, since, now, interval(&r.name)) {
+                    r.state = "stalled".into();
+                    r.last_error = Some(why);
                 }
                 r
             })
@@ -450,6 +442,35 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         other => unreachable!("no pass body for job {other}"),
     };
     Managed { stop, handle }
+}
+
+/// Is a job that claims to be `running` actually stuck?
+///
+/// Pure so it can be tested: the bug this exists to catch is a job reporting
+/// `running` forever, and a stall detector that is itself never exercised is
+/// the same failure one level up.
+///
+/// `since` is the last COMPLETED pass, or the runner's start for a job that has
+/// never finished one — which is exactly the shape a first-run hang produces.
+pub fn stalled_reason(
+    state: &str,
+    since_ms: u64,
+    now_ms: u64,
+    every: Duration,
+) -> Option<String> {
+    if state != "running" {
+        return None;
+    }
+    let limit = every.as_millis() as u64 * STALL_FACTOR;
+    let waited = now_ms.saturating_sub(since_ms);
+    if waited <= limit {
+        return None;
+    }
+    Some(format!(
+        "no pass has completed in {} min (interval is {}s) — the pass is stuck, not working",
+        waited / 60_000,
+        every.as_secs()
+    ))
 }
 
 fn interval(name: &str) -> Duration {
