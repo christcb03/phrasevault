@@ -20,6 +20,13 @@ use pvfs_proto::{
     IngestFileSpecWire, ServerMsg, WriteOp,
 };
 
+/// How long a connection may deliver NOTHING before we stop waiting.
+///
+/// Generous on purpose: a busy owner folding a large batch can legitimately be
+/// quiet for a while, and a false timeout mid-migration is its own problem. But
+/// it is finite, which is the whole point.
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 pub use pvfs_proto::{
     ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
     PROTO_COMPATIBLE_WITH, PROTO_VERSION,
@@ -1043,5 +1050,18 @@ fn tls_connect(
     let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|e| ClientError::Protocol(format!("tls: {e}")))?;
     let tcp = TcpStream::connect(addr)?;
+    // D78 — a read that can never end is worse than a read that fails.
+    //
+    // Without this, a request whose reply never comes blocks the calling
+    // thread FOREVER, and the serve job it belongs to sits in state "running"
+    // reporting no error. Seen twice: production feederbox stuck 6.4 hours, a
+    // lab ingest stuck 40+ minutes — both with the connection ESTABLISHED,
+    // zero bytes queued either way, and both peers idle. Nobody was coming.
+    //
+    // This is a NO-PROGRESS timeout, not a total-time one: the clock is per
+    // read call, so a 40 GB `cat` that is still delivering bytes resets it on
+    // every chunk and is unaffected. Only genuine silence trips it.
+    let _ = tcp.set_read_timeout(Some(IDLE_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(IDLE_TIMEOUT));
     Ok(rustls::StreamOwned::new(conn, tcp))
 }

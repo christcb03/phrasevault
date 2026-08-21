@@ -30,6 +30,11 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
 const PERIODIC: [&str; 5] = ["sync", "export", "tier", "evict", "reclaim"];
+/// How many intervals a pass may overrun before it is called stalled. Three is
+/// slack enough for a genuinely long pass (a big tier run) without letting a
+/// hang hide for hours.
+const STALL_FACTOR: u64 = 3;
+
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
 const TIER_INTERVAL: Duration = Duration::from_secs(300);
@@ -47,6 +52,9 @@ fn now_ms() -> u64 {
 pub struct JobsState {
     data_dir: PathBuf,
     rows: Mutex<Vec<ServeJobWire>>,
+    /// When the runner started — the baseline for a job that has NEVER
+    /// completed a pass, which is exactly the case a first-run hang produces.
+    started_ms: u64,
     /// Content changed (a follow fold): the consuming passes should run soon.
     nudge_sync: AtomicBool,
     nudge_export: AtomicBool,
@@ -64,6 +72,7 @@ impl JobsState {
         let s = JobsState {
             data_dir,
             rows: Mutex::new(Vec::new()),
+            started_ms: now_ms(),
             nudge_sync: AtomicBool::new(false),
             nudge_export: AtomicBool::new(false),
             nudge_evict: AtomicBool::new(false),
@@ -101,7 +110,41 @@ impl JobsState {
     }
 
     pub fn snapshot(&self) -> Vec<ServeJobWire> {
-        self.rows.lock().unwrap().clone()
+        // D78 — a job that has been "running" for far longer than its own
+        // interval is STALLED, and must say so.
+        //
+        // `running` with a healthy-looking row is how this hid: production
+        // feederbox sat 6.4 hours past its last completed pass, and a lab box
+        // 40+ minutes, both reporting `running` with no error while doing
+        // nothing at all. The underlying cause was a socket read that could
+        // never end (fixed separately), but the REPORTING is the part that let
+        // it go unnoticed — and the next cause will be different.
+        //
+        // Derived at read time rather than tracked, so nothing has to remember
+        // to set it.
+        let now = now_ms();
+        self.rows
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if r.state == "running" {
+                    let since = r.last_ok_ms.unwrap_or(self.started_ms);
+                    let limit = interval(&r.name).as_millis() as u64 * STALL_FACTOR;
+                    if now.saturating_sub(since) > limit {
+                        let mins = now.saturating_sub(since) / 60_000;
+                        r.state = "stalled".into();
+                        r.last_error = Some(format!(
+                            "no pass has completed in {mins} min (interval is {}s) — the pass \
+                             is stuck, not working",
+                            interval(&r.name).as_secs()
+                        ));
+                    }
+                }
+                r
+            })
+            .collect()
     }
 
     fn with_row(&self, name: &str, f: impl FnOnce(&mut ServeJobWire)) {
