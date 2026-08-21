@@ -23,6 +23,7 @@ pub mod fs;
 pub mod identity;
 pub mod ingest;
 pub mod link;
+pub mod arr;
 pub mod media;
 pub mod log_store;
 pub mod mount;

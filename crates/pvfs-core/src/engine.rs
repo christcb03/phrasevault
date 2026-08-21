@@ -1602,6 +1602,66 @@ impl Engine {
         self.commit_member_write(events)
     }
 
+    /// Record what a media file IS — resolution, HDR, bit depth, duration —
+    /// and WHERE that measurement came from (D76).
+    ///
+    /// Provenance is not decoration. The *arrs measured these files at import
+    /// and their figure is a real probe result, but it goes stale and it is
+    /// gone the moment they replace the file. A probe of ours is current. The
+    /// re-encoder's analysis is authoritative because it decoded the thing.
+    /// The newest measurement wins, and `source` is how that ordering stays
+    /// auditable rather than implicit.
+    ///
+    /// Captured at CATALOG time, not looked up at decision time: by the time a
+    /// collision is resolved, the arr has already forgotten the loser.
+    pub fn set_media_quality(
+        &mut self,
+        node: &NodeId,
+        quality: &crate::media::MediaQuality,
+        source: &str,
+    ) -> Result<()> {
+        self.ensure_device_active()?;
+        if fetch_node(&self.conn, node)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: node.clone(),
+            });
+        }
+        let encoded = quality.encode();
+        let me = self.device.pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_media_quality(node, &encoded, source, &me),
+        )?;
+        self.append_durable(vec![Event::MediaQuality {
+            node_id: node.clone(),
+            quality: encoded,
+            source: source.to_string(),
+            author: me,
+            sig,
+        }])
+    }
+
+    /// What we know about a file, and who said so. `None` = never measured.
+    pub fn media_quality(
+        &self,
+        node: &NodeId,
+    ) -> Result<Option<(crate::media::MediaQuality, String)>> {
+        let got: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT quality, source FROM media_quality WHERE node_id = ?1",
+                params![node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("read media quality"))?;
+        match got {
+            Some((q, src)) => Ok(Some((crate::media::MediaQuality::decode(&q)?, src))),
+            None => Ok(None),
+        }
+    }
+
     /// Set a link's display label — the name a parent uses for this child.
     ///
     /// Mirrors [`reorder_link`]: a signed event changing a MUTABLE attribute of

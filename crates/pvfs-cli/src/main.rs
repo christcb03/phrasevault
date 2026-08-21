@@ -84,6 +84,27 @@ enum Cmd {
     },
     /// Soft-remove a link (triggers temp purge check)
     Unlink { link_id: String },
+    /// What a media file IS — record it, or read it back (D76).
+    ///
+    /// Quality must be captured while the source still knows: once an arr
+    /// replaces a file it forgets the old one's detail for good, so a
+    /// measurement taken at catalog time is the only one that will exist when a
+    /// collision needs deciding.
+    #[command(subcommand)]
+    Quality(QualityCmd),
+    /// Which of two copies would survive, and why — WITHOUT touching either.
+    ///
+    /// The first thing to reach for when a decision looks wrong. Nobody should
+    /// have to read the source to find out why their file was replaced.
+    Explain {
+        /// The incoming copy
+        a: String,
+        /// The copy already in place
+        b: String,
+        /// Percent larger that counts as "significantly" (Chris's ~10%)
+        #[arg(long, default_value_t = 10)]
+        size_margin: u32,
+    },
     /// Move a node to a new containing parent (its name is unchanged; use
     /// `relabel` to rename). Prompts for anything omitted.
     Mv {
@@ -452,6 +473,57 @@ enum IngestCmd {
     },
     /// List live sessions with per-file progress
     List,
+}
+
+#[derive(Subcommand)]
+enum QualityCmd {
+    /// Show what is known about a file, and where the measurement came from.
+    Show { node: String },
+    /// Record a measurement by hand (mostly for testing and repair; the normal
+    /// source is `import`).
+    Set {
+        node: String,
+        /// e.g. 1920x1080
+        #[arg(long)]
+        resolution: Option<String>,
+        #[arg(long)]
+        bit_depth: Option<u8>,
+        /// HDR flavour; empty = SDR
+        #[arg(long, default_value = "")]
+        hdr: String,
+        /// Seconds, or mm:ss / h:mm:ss
+        #[arg(long)]
+        duration: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        bitrate: u64,
+        #[arg(long, default_value = "")]
+        codec: String,
+        /// Where this came from: arr | probe | derived | manual
+        #[arg(long, default_value = "manual")]
+        source: String,
+    },
+    /// Backfill quality from a Sonarr/Radarr export (D76).
+    ///
+    /// Takes the JSON an arr's `/api/v3/episodefile` or `/api/v3/moviefile`
+    /// returns — piped in, or from a file — and records what it knows about
+    /// every file it can match to this catalog.
+    ///
+    /// THIS HAS A DEADLINE. The arrs hold full `mediaInfo` for the CURRENT file
+    /// only; every upgrade destroys one file's detail permanently, and history
+    /// keeps just the coarse label and the size.
+    Import {
+        /// Path to the JSON, or `-` for stdin
+        file: String,
+        /// The library folder segment that arr paths and tree paths share
+        #[arg(long, default_value = "Media")]
+        library: String,
+        /// The folder node the tree paths are relative to
+        #[arg(long)]
+        under: String,
+        /// Report what WOULD be recorded and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1147,6 +1219,58 @@ fn adopt_central_store(
     Ok(Some(format!(
         "indexed the store's existing contents: {added} added, {unchanged} already known"
     )))
+}
+
+/// Pull the fields the ladder needs out of a Sonarr/Radarr export.
+///
+/// Deliberately tolerant: an arr release may add fields, and half the records
+/// carry no `mediaInfo` at all. A file we cannot read is skipped, never
+/// guessed at — and the count of those is reported, because "94% matched" and
+/// "94% had data" are different facts.
+fn parse_arr_export(raw: &str) -> Result<Vec<pvfs_core::arr::ArrFile>, PvfsError> {
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| PvfsError::BadInput {
+        field: "export".into(),
+        reason: format!("not JSON: {e}"),
+    })?;
+    let rows = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+    let mut out = Vec::new();
+    for r in rows {
+        let mi = r.get("mediaInfo");
+        out.push(pvfs_core::arr::ArrFile {
+            path: r.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            size_bytes: r.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+            resolution: mi
+                .and_then(|m| m.get("resolution"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            bit_depth: mi
+                .and_then(|m| m.get("videoBitDepth"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u8,
+            dynamic_range: mi
+                .and_then(|m| m.get("videoDynamicRangeType"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            bitrate: mi
+                .and_then(|m| m.get("videoBitrate"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+            codec: mi
+                .and_then(|m| m.get("videoCodec"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            run_time: mi
+                .and_then(|m| m.get("runTime"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            file_id: r.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
+        });
+    }
+    Ok(out)
 }
 
 fn remote_err(e: pvfs_client::ClientError) -> PvfsError {
@@ -1996,6 +2120,232 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 println!("removed {link_id}");
             }
+            Ok(())
+        }
+        Cmd::Explain { a, b, size_margin } => {
+            let engine = Engine::open(&ctx?)?;
+            let rules = pvfs_core::media::Rules {
+                size_margin_pct: size_margin,
+                ..Default::default()
+            };
+            let load = |id: &String| -> Result<pvfs_core::media::Candidate, PvfsError> {
+                let n = engine.node(id)?.ok_or(PvfsError::NotFound {
+                    kind: "node",
+                    id: id.clone(),
+                })?;
+                let payload = pvfs_core::FilePayload::decode(&n.payload)?;
+                let (quality, src) = engine
+                    .media_quality(id)?
+                    .unwrap_or_else(|| (Default::default(), "never measured".into()));
+                println!(
+                    "  {:<14} {}  [{}]",
+                    &id[..12.min(id.len())],
+                    n.label,
+                    src
+                );
+                println!(
+                    "  {:<14} {}x{}  depth {}  hdr {:?}  {}s  {} bytes",
+                    "",
+                    quality.width,
+                    quality.height,
+                    quality.bit_depth,
+                    quality.hdr,
+                    quality.duration_s,
+                    payload.size_bytes
+                );
+                Ok(pvfs_core::media::Candidate {
+                    label: n.label.clone(),
+                    quality,
+                    size_bytes: payload.size_bytes,
+                    mtime_ms: n.created_at,
+                    integrity_ok: true,
+                })
+            };
+            println!("comparing:");
+            let ca = load(&a)?;
+            let cb = load(&b)?;
+            let is_media = pvfs_core::media::is_media_file(&ca.label, "")
+                || pvfs_core::media::is_media_file(&cb.label, "");
+            let (a_wins, verdict) = if is_media {
+                pvfs_core::media::choose(&ca, &cb, &rules)
+            } else {
+                pvfs_core::media::choose_non_media(&ca, &cb)
+            };
+            engine.close()?;
+            println!();
+            if verdict.decided() {
+                // Name the NODE, not just the label. Two copies of one episode
+                // have the same label by definition — that is what makes them
+                // a collision — so "WINNER: <label>" identifies nothing.
+                let (win_id, win, lose_id, lose) = if a_wins {
+                    (&a, &ca, &b, &cb)
+                } else {
+                    (&b, &cb, &a, &ca)
+                };
+                println!(
+                    "WINNER: {}  {}\n  {}x{}, {} bytes",
+                    &win_id[..12.min(win_id.len())],
+                    win.label,
+                    win.quality.width,
+                    win.quality.height,
+                    win.size_bytes
+                );
+                println!(
+                    "LOSER:  {}  {}\n  {}x{}, {} bytes  → would be moved to TRASH, not deleted",
+                    &lose_id[..12.min(lose_id.len())],
+                    lose.label,
+                    lose.quality.width,
+                    lose.quality.height,
+                    lose.size_bytes
+                );
+                println!("\n  because: {}", verdict.reason());
+            } else {
+                // Refusing IS the answer, and must read like a decision rather
+                // than a failure.
+                println!("NO DECISION — both copies stay.\n  because: {}", verdict.reason());
+            }
+            Ok(())
+        }
+        Cmd::Quality(QualityCmd::Show { node }) => {
+            let engine = Engine::open(&ctx?)?;
+            let got = engine.media_quality(&node)?;
+            engine.close()?;
+            match got {
+                Some((q, src)) => {
+                    if json {
+                        println!(
+                            "{{\"source\":\"{}\",\"quality\":{}}}",
+                            json_escape(&src),
+                            q.encode()
+                        );
+                    } else {
+                        println!("source     : {src}");
+                        println!("resolution : {}x{} ({} px)", q.width, q.height, q.pixels());
+                        println!("bit depth  : {}", q.bit_depth);
+                        println!("hdr        : {}", if q.hdr.is_empty() { "SDR" } else { &q.hdr });
+                        println!("bitrate    : {} bps", q.bitrate);
+                        println!("duration   : {}s", q.duration_s);
+                        println!(
+                            "decoded    : {}",
+                            match q.decoded_ok {
+                                Some(true) => "ok",
+                                Some(false) => "FAILED",
+                                None => "never checked",
+                            }
+                        );
+                    }
+                }
+                None => println!("never measured"),
+            }
+            Ok(())
+        }
+        Cmd::Quality(QualityCmd::Import {
+            file,
+            library,
+            under,
+            dry_run,
+        }) => {
+            let raw = if file == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                    PvfsError::io("read stdin", e)
+                })?;
+                buf
+            } else {
+                std::fs::read_to_string(&file).map_err(|e| PvfsError::io("read export", e))?
+            };
+            let files = parse_arr_export(&raw)?;
+            let mut engine = Engine::open(&ctx?)?;
+
+            // Index the subtree ONCE by tree path — the alternative is a walk
+            // per file, which on a 27,000-file library is the difference
+            // between seconds and an afternoon.
+            let root = under.clone();
+            let mut by_path: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for entry in engine.walk(&root)?.entries {
+                if entry.node.node_type != pvfs_core::TYPE_FILE {
+                    continue;
+                }
+                if let Some(segs) = engine.tree_path_under(&entry.node.id, &root)? {
+                    by_path.insert(segs.join("/"), entry.node.id.clone());
+                }
+            }
+
+            let (mut matched, mut recorded, mut unmatched, mut nothing_to_say) = (0, 0, 0, 0);
+            for f in &files {
+                let Some(rel) = pvfs_core::arr::tree_path_of(&f.path, &library) else {
+                    unmatched += 1;
+                    continue;
+                };
+                let Some(node) = by_path.get(&rel) else {
+                    unmatched += 1;
+                    continue;
+                };
+                matched += 1;
+                let q = f.to_quality()?;
+                if q.is_empty() {
+                    // The arr had no mediaInfo for this one — about 6% of
+                    // Sonarr's library. Recording an empty measurement would
+                    // be worse than none: it looks like an answer.
+                    nothing_to_say += 1;
+                    continue;
+                }
+                if !dry_run {
+                    engine.set_media_quality(node, &q, "arr")?;
+                }
+                recorded += 1;
+            }
+            engine.close()?;
+            if dry_run {
+                println!("DRY RUN — nothing was recorded.");
+            }
+            println!(
+                "{} file(s) in the export; {matched} matched this catalog, \
+                 {recorded} {} quality, {nothing_to_say} had no mediaInfo, \
+                 {unmatched} matched no node",
+                files.len(),
+                if dry_run { "would gain" } else { "gained" }
+            );
+            Ok(())
+        }
+        Cmd::Quality(QualityCmd::Set {
+            node,
+            resolution,
+            bit_depth,
+            hdr,
+            duration,
+            bitrate,
+            codec,
+            source,
+        }) => {
+            let mut engine = Engine::open(&ctx?)?;
+            let mut q = engine
+                .media_quality(&node)?
+                .map(|(q, _)| q)
+                .unwrap_or_default();
+            if let Some(r) = &resolution {
+                q.set_resolution(r)?;
+            }
+            if let Some(d) = bit_depth {
+                q.bit_depth = d;
+            }
+            if !hdr.is_empty() {
+                q.hdr = hdr;
+            }
+            if let Some(d) = &duration {
+                q.duration_s = pvfs_core::arr::parse_runtime(d).max(d.parse().unwrap_or(0));
+            }
+            if bitrate > 0 {
+                q.bitrate = bitrate;
+            }
+            if !codec.is_empty() {
+                q.video_codec = codec;
+            }
+            engine.set_media_quality(&node, &q, &source)?;
+            engine.close()?;
+            println!("recorded [{source}] {}x{}", q.width, q.height);
             Ok(())
         }
         Cmd::Mv { node, new_parent } => {

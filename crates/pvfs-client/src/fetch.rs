@@ -443,6 +443,52 @@ pub struct TierReport {
 /// else fetched (locally or by read-through) and streamed into the store —
 /// then retire foreign-instance locations. `Ok(None)` = nothing placed
 /// central (a clean no-op for the job; the CLI turns it into guidance).
+/// Decide which of two live copies of one tree path survives (D76).
+///
+/// `None` = do not act. That is returned when the rules are OFF, when either
+/// side has never been measured, or when the ladder cannot separate them — and
+/// in every one of those cases the caller keeps the existing refusal. The rules
+/// exist to replace "I will not guess" with "here is why", never to
+/// manufacture a decision out of missing information.
+///
+/// `Some((true, _))` = the INCOMING copy wins and the occupant is trashed.
+fn decide_collision(
+    engine: &Engine,
+    incoming: &str,
+    occupant: &str,
+    rules: Option<pvfs_core::media::Rules>,
+) -> Option<(bool, pvfs_core::media::Verdict)> {
+    let rules = rules?;
+    let cand = |id: &str| -> Option<pvfs_core::media::Candidate> {
+        let node = engine.node(&id.to_string()).ok()??;
+        let payload = pvfs_core::FilePayload::decode(&node.payload).ok()?;
+        // Never measured ⇒ no opinion. Falling back to size alone here would
+        // quietly decide upgrades on a signal Chris explicitly ranked LAST.
+        let (quality, _src) = engine.media_quality(&id.to_string()).ok()??;
+        Some(pvfs_core::media::Candidate {
+            label: node.label.clone(),
+            quality,
+            size_bytes: payload.size_bytes,
+            mtime_ms: node.created_at,
+            // A recorded hash that disagrees is caught by the fetch itself;
+            // what this flag carries is whether anything has DECODED the file.
+            integrity_ok: true,
+        })
+    };
+    let (a, b) = (cand(incoming)?, cand(occupant)?);
+    // From the FILE TYPE, not from whether a measurement happens to exist —
+    // an unmeasured episode is still an episode, and must climb the ladder
+    // (and so reach SIZE) rather than being decided on date alone.
+    let is_media = pvfs_core::media::is_media_file(&a.label, "")
+        || pvfs_core::media::is_media_file(&b.label, "");
+    let (a_wins, verdict) = if is_media {
+        pvfs_core::media::choose(&a, &b, &rules)
+    } else {
+        pvfs_core::media::choose_non_media(&a, &b)
+    };
+    verdict.decided().then_some((a_wins, verdict))
+}
+
 pub fn tier_pass(
     engine: &mut Engine,
     fetcher: &mut Fetcher,
@@ -450,11 +496,31 @@ pub fn tier_pass(
     tier_pass_opts(engine, fetcher, false)
 }
 
+/// The mover with copy-selection rules enabled (D76). Rules are OPT-IN: with
+/// `None` a collision is refused exactly as before.
+pub fn tier_pass_ruled(
+    engine: &mut Engine,
+    fetcher: &mut Fetcher,
+    dry_run: bool,
+    rules: Option<pvfs_core::media::Rules>,
+) -> Result<Option<TierReport>, PvfsError> {
+    tier_pass_inner(engine, fetcher, dry_run, rules)
+}
+
 /// The mover, with `dry_run` — plan every action, take none of them.
 pub fn tier_pass_opts(
     engine: &mut Engine,
     fetcher: &mut Fetcher,
     dry_run: bool,
+) -> Result<Option<TierReport>, PvfsError> {
+    tier_pass_inner(engine, fetcher, dry_run, None)
+}
+
+fn tier_pass_inner(
+    engine: &mut Engine,
+    fetcher: &mut Fetcher,
+    dry_run: bool,
+    rules: Option<pvfs_core::media::Rules>,
 ) -> Result<Option<TierReport>, PvfsError> {
     // D75 — a REPLICA may pull-and-place, but never retire.
     //
@@ -742,16 +808,68 @@ pub fn tier_pass_opts(
                                 continue;
                             }
                         }
-                        Some(_) => {
-                            report.failed.push((
-                                label,
-                                format!(
-                                    "{} is another live file's bytes — refusing to \
-                                     overwrite; the old entry must be deleted first",
-                                    cpath.display()
-                                ),
-                            ));
-                            continue;
+                        Some(occupant) => {
+                            // D76 — TWO LIVE COPIES CLAIM ONE PATH. This is the
+                            // upgrade case: same name, different bytes, because
+                            // quality is not in the filename.
+                            //
+                            // Refusing is still the DEFAULT and still the right
+                            // answer when nothing can separate them. The rules
+                            // only ever replace "I will not guess" with "here is
+                            // why", and the loser goes to TRASH, never to
+                            // unlink.
+                            match decide_collision(engine, &id, &occupant, rules) {
+                                Some((incoming_wins, verdict)) if incoming_wins => {
+                                    if dry_run {
+                                        report.planned.push(format!(
+                                            "WOULD REPLACE {label}  ({})",
+                                            verdict.reason()
+                                        ));
+                                        report.planned.push(format!(
+                                            "WOULD TRASH  {} (lost: {})",
+                                            cpath.display(),
+                                            verdict.reason()
+                                        ));
+                                        continue;
+                                    }
+                                    eprintln!("tier: {label} replaces the copy in place — {}", verdict.reason());
+                                    if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
+                                        report.failed.push((label, e.to_string()));
+                                        continue;
+                                    }
+                                }
+                                Some((_, verdict)) => {
+                                    // The copy already there wins. Not a
+                                    // failure — a decision, and it must read
+                                    // like one.
+                                    report.failed.push((
+                                        label,
+                                        format!(
+                                            "the copy already at {} wins — {}",
+                                            cpath.display(),
+                                            verdict.reason()
+                                        ),
+                                    ));
+                                    continue;
+                                }
+                                None => {
+                                    report.failed.push((
+                                        label,
+                                        format!(
+                                            "{} is another live file's bytes — refusing to \
+                                             overwrite; {}",
+                                            cpath.display(),
+                                            match rules {
+                                                Some(_) => "the rules could not separate them",
+                                                None => "copy-selection rules are off \
+                                                         (`--rules`), so the old entry must be \
+                                                         deleted first",
+                                            }
+                                        ),
+                                    ));
+                                    continue;
+                                }
+                            }
                         }
                         None => {
                             report.failed.push((

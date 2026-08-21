@@ -379,6 +379,26 @@ pub fn choose(a: &Candidate, b: &Candidate, rules: &Rules) -> (bool, Verdict) {
     )
 }
 
+/// Is this a media file — judged by what it IS, not by what we happened to
+/// measure.
+///
+/// Deciding this from "did we record a resolution?" was wrong and it showed
+/// immediately: two unmeasured copies of one episode were treated as non-media
+/// and decided on DATE, skipping size entirely — the exact opposite of the
+/// order Chris asked for. An unmeasured film is still a film.
+pub fn is_media_file(label: &str, mime: &str) -> bool {
+    if mime.starts_with("video/") || mime.starts_with("audio/") {
+        return true;
+    }
+    let lower = label.to_lowercase();
+    [
+        ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts", ".webm",
+        ".flac", ".mp3", ".m4a",
+    ]
+    .iter()
+    .any(|e| lower.ends_with(e))
+}
+
 /// A non-media file has no quality ladder to climb: newest wins, per Chris's
 /// rule 3. Kept separate so the caller must decide which it is looking at
 /// rather than a quality of zero silently meaning "not media".
