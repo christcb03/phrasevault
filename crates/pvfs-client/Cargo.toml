@@ -15,3 +15,6 @@ hex.workspace = true
 # F1 network transport (doc 17 §4): TLS connect pinned to the instance's
 # certificate hash — no CA, no roots.
 rustls.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

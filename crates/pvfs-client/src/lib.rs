@@ -25,7 +25,22 @@ use pvfs_proto::{
 /// Generous on purpose: a busy owner folding a large batch can legitimately be
 /// quiet for a while, and a false timeout mid-migration is its own problem. But
 /// it is finite, which is the whole point.
-pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+pub const IDLE_TIMEOUT_DEFAULT_SECS: u64 = 180;
+
+/// How long a connection may deliver NOTHING before we stop waiting.
+///
+/// Overridable with `PVFS_IDLE_TIMEOUT_SECS` — tests need seconds, not
+/// minutes, and an operator on a genuinely slow link may want more. Zero or
+/// unparseable falls back to the default rather than disabling the timeout,
+/// because "no timeout" is the bug this exists to prevent.
+pub fn idle_timeout() -> std::time::Duration {
+    let secs = std::env::var("PVFS_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(IDLE_TIMEOUT_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 pub use pvfs_proto::{
     ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, ServeJobWire,
@@ -1061,7 +1076,7 @@ fn tls_connect(
     // This is a NO-PROGRESS timeout, not a total-time one: the clock is per
     // read call, so a 40 GB `cat` that is still delivering bytes resets it on
     // every chunk and is unaffected. Only genuine silence trips it.
-    let _ = tcp.set_read_timeout(Some(IDLE_TIMEOUT));
-    let _ = tcp.set_write_timeout(Some(IDLE_TIMEOUT));
+    let _ = tcp.set_read_timeout(Some(idle_timeout()));
+    let _ = tcp.set_write_timeout(Some(idle_timeout()));
     Ok(rustls::StreamOwned::new(conn, tcp))
 }

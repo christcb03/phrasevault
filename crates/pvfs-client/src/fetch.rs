@@ -768,6 +768,20 @@ pub fn tier_pass_opts(
                 }
                 let mut planned_place: Option<String> = None;
                 if let Err(e) = (|| -> Result<(), PvfsError> {
+                    // DRY RUN STOPS HERE — first statement in the closure, on
+                    // purpose.
+                    //
+                    // It used to sit further down, just before the atomic
+                    // publish, which looked like "before anything is written".
+                    // It was not: D71's same-filesystem MOVE optimisation runs
+                    // above that point, so a dry run RENAMED the file into the
+                    // store. Caught by the test that diffs the store rather
+                    // than trusting the report — the plan said "would place"
+                    // while the file had already moved.
+                    if dry_run {
+                        planned_place = Some(cpath.display().to_string());
+                        return Ok(());
+                    }
                     if let Some(dir) = cpath.parent() {
                         std::fs::create_dir_all(dir)
                             .map_err(|e| PvfsError::io("create central dir", e))?;
@@ -825,12 +839,6 @@ pub fn tier_pass_opts(
                     // be visible to Plex half-transferred, and a failed transfer would
                     // leave a broken file under the real name. Same directory, so the
                     // rename is instant and the upgrade swap has no visible window.
-                    if dry_run {
-                        // Inside the placement closure — return, do not
-                        // `continue`; the caller records the plan below.
-                        planned_place = Some(cpath.display().to_string());
-                        return Ok(());
-                    }
                     let tmp = cpath.with_file_name(format!(".{id}.tmp"));
                     let mut f = std::fs::File::create(&tmp)
                         .map_err(|e| PvfsError::io("create central copy", e))?;
