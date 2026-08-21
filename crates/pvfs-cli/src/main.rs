@@ -310,7 +310,16 @@ enum Cmd {
     },
     /// Owner-side mover (doc 17 §7.4): ensure central copies for
     /// `central`-placed subtrees, then retire edge locations
-    Tier,
+    Tier {
+        /// Plan every action and take NONE of them.
+        ///
+        /// Prints exactly what the pass would place, fetch, retire and trash,
+        /// in order, and touches nothing. Worth running first on anything
+        /// irreplaceable: two separate bugs in this milestone were only
+        /// visible in what the mover had already DONE.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Edge-side space reclaim (doc 17 §7.4): delete local bytes whose
     /// catalog location was retired by the mover — only ever with another
     /// live location recorded
@@ -3773,12 +3782,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Tier => {
+        Cmd::Tier { dry_run } => {
             // The pass itself is shared with pvfsd's `tier` job (P5.3).
             let mut engine = Engine::open(&ctx?)?;
             let data_dir = engine.data_dir().to_path_buf();
             let mut fetcher = Fetcher::new(&data_dir);
-            let report = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher)?;
+            let report =
+                pvfs_client::fetch::tier_pass_opts(&mut engine, &mut fetcher, dry_run)?;
             let Some(report) = report else {
                 return Err(PvfsError::BadInput {
                     field: "tier".into(),
@@ -3786,11 +3796,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         .into(),
                 });
             };
-            let (migrated, satisfied, retired, failed) = (
+            let (migrated, satisfied, retired, failed, planned) = (
                 report.migrated,
                 report.satisfied,
                 report.retired,
                 report.failed,
+                report.planned,
             );
             engine.close()?;
             if json {
@@ -3804,10 +3815,33 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         )
                     })
                     .collect();
+                let plan: Vec<String> =
+                    planned.iter().map(|p| format!("\"{}\"", json_escape(p))).collect();
                 println!(
-                    "{{\"migrated\":{migrated},\"satisfied\":{satisfied},\"retired\":{retired},\"failed\":[{}]}}",
-                    fails.join(",")
+                    "{{\"dry_run\":{dry_run},\"migrated\":{migrated},\"satisfied\":{satisfied},\
+                     \"retired\":{retired},\"failed\":[{}],\"planned\":[{}]}}",
+                    fails.join(","),
+                    plan.join(",")
                 );
+            } else if dry_run {
+                // Say DRY RUN first and last. A plan that reads like a result
+                // is worse than no plan: the whole point is that nobody
+                // mistakes one for the other.
+                println!("DRY RUN — nothing was changed.\n");
+                for line in &planned {
+                    println!("  {line}");
+                }
+                if planned.is_empty() {
+                    println!("  (nothing to do)");
+                }
+                println!(
+                    "\nwould place/fetch {migrated}, leave {satisfied} already central, \
+                     retire {retired} edge location(s)"
+                );
+                for (label, e) in &failed {
+                    println!("  WOULD FAIL   {label} — {e}");
+                }
+                println!("\nDRY RUN — nothing was changed. Re-run without --dry-run to apply.");
             } else {
                 println!(
                     "migrated {migrated} into the central store ({satisfied} already central, {retired} edge locations retired)"
@@ -3816,7 +3850,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     eprintln!("failed: {label} — {e}");
                 }
             }
-            if failed.is_empty() {
+            // A dry run REPORTS failures; it does not fail. Exiting non-zero
+            // for a problem it only predicted would make "plan first" hurt.
+            if failed.is_empty() || dry_run {
                 Ok(())
             } else {
                 Err(PvfsError::BadInput {

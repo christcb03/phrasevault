@@ -427,6 +427,14 @@ pub struct TierReport {
     pub satisfied: u64,
     pub retired: u64,
     pub failed: Vec<(String, String)>,
+    /// D76 — what a DRY RUN would have done, in order, one line per action.
+    ///
+    /// Empty on a real pass. This exists because two separate bugs in this
+    /// milestone were only visible in what the mover DID afterwards — locations
+    /// retired that should not have been, bytes written to a disk that was not
+    /// the NAS. Being able to read the plan before it runs is the cheapest
+    /// possible defence against the next one.
+    pub planned: Vec<String>,
 }
 
 /// One mover pass, owner-side (F5.3, shared by `pvfs tier` and the daemon's
@@ -438,6 +446,15 @@ pub struct TierReport {
 pub fn tier_pass(
     engine: &mut Engine,
     fetcher: &mut Fetcher,
+) -> Result<Option<TierReport>, PvfsError> {
+    tier_pass_opts(engine, fetcher, false)
+}
+
+/// The mover, with `dry_run` — plan every action, take none of them.
+pub fn tier_pass_opts(
+    engine: &mut Engine,
+    fetcher: &mut Fetcher,
+    dry_run: bool,
 ) -> Result<Option<TierReport>, PvfsError> {
     // D75 — a REPLICA may pull-and-place, but never retire.
     //
@@ -597,7 +614,20 @@ pub fn tier_pass(
             let has_central = match &tree_dest {
                 Some(want) => {
                     let want_uri = pvfs_core::storage::path_to_uri(want)?;
-                    engine.locations(&id)?.iter().any(|u| u == &want_uri)
+                    // D75: a REPLICA logs its store copy PIN-QUALIFIED, because a
+                    // bare file:// path is host-implicit and that copy lives on a
+                    // specific box. So the satisfied check must recognise both
+                    // forms — otherwise the holder does not recognise the file it
+                    // placed itself, re-places it every pass, and the occupied-path
+                    // guard reports it as "the catalog has never seen it".
+                    //
+                    // (Found by the dry run, before it had written anything.)
+                    let want_host = own_pin
+                        .as_deref()
+                        .map(|pin| format!("pvfs-host://{pin}{}", want.display()));
+                    engine.locations(&id)?.iter().any(|u| {
+                        u == &want_uri || want_host.as_deref().is_some_and(|w| u == w)
+                    })
                 }
                 None => engine.locations(&id)?.iter().any(|u| {
                     if keep {
@@ -613,6 +643,13 @@ pub fn tier_pass(
             } else {
                 // reach the bytes (locally or via read-through)…
                 if engine.readable_path(&id)?.is_none() {
+                    if dry_run {
+                        report.planned.push(format!(
+                            "WOULD FETCH  {label}  (no local copy — would pull from the swarm)"
+                        ));
+                        report.migrated += 1;
+                        continue;
+                    }
                     if let Err(e) = fetcher.fetch(engine, &id) {
                         report.failed.push((label, e));
                         continue; // never retire without a central copy
@@ -634,7 +671,11 @@ pub fn tier_pass(
                 // pass (or an operator does, with `pvfs loc hash`). Trying it
                 // here fails the whole file for a reason that has nothing to
                 // do with the copy having been made.
-                if unhashed && !pull_only {
+                if unhashed && !pull_only && dry_run {
+                    report
+                        .planned
+                        .push(format!("WOULD ATTEST {label} (hash + successor node)"));
+                } else if unhashed && !pull_only {
                     match engine.hash_node(&id) {
                         Ok(new_id) => {
                             eprintln!(
@@ -691,7 +732,12 @@ pub fn tier_pass(
                         // that turns out to be wrong is unrecoverable
                         // (D71 W5, Chris: build in the safety).
                         Some(owner) if owner == id => {
-                            if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
+                            if dry_run {
+                                report.planned.push(format!(
+                                    "WOULD TRASH  {} (replaced in place)",
+                                    cpath.display()
+                                ));
+                            } else if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
                                 report.failed.push((label, e.to_string()));
                                 continue;
                             }
@@ -720,6 +766,7 @@ pub fn tier_pass(
                         }
                     }
                 }
+                let mut planned_place: Option<String> = None;
                 if let Err(e) = (|| -> Result<(), PvfsError> {
                     if let Some(dir) = cpath.parent() {
                         std::fs::create_dir_all(dir)
@@ -778,6 +825,12 @@ pub fn tier_pass(
                     // be visible to Plex half-transferred, and a failed transfer would
                     // leave a broken file under the real name. Same directory, so the
                     // rename is instant and the upgrade swap has no visible window.
+                    if dry_run {
+                        // Inside the placement closure — return, do not
+                        // `continue`; the caller records the plan below.
+                        planned_place = Some(cpath.display().to_string());
+                        return Ok(());
+                    }
                     let tmp = cpath.with_file_name(format!(".{id}.tmp"));
                     let mut f = std::fs::File::create(&tmp)
                         .map_err(|e| PvfsError::io("create central copy", e))?;
@@ -828,6 +881,13 @@ pub fn tier_pass(
                     continue;
                 }
                 report.migrated += 1;
+                if let Some(dest_shown) = planned_place {
+                    report
+                        .planned
+                        .push(format!("WOULD PLACE  {label}  ->  {dest_shown}"));
+                    // Nothing was written, so nothing downstream applies.
+                    continue;
+                }
             }
             // MIRROR kind (central-keep, P8): the copy is the whole point —
             // nothing is ever retired, the source keeps serving, and the
@@ -877,6 +937,13 @@ pub fn tier_pass(
                     .is_some_and(|p| u.starts_with(p))
                     && !u.starts_with(&dest_prefix);
                 if foreign || staged {
+                    if dry_run {
+                        report
+                            .planned
+                            .push(format!("WOULD RETIRE {label}  ->  {u}"));
+                        report.retired += 1;
+                        continue;
+                    }
                     match engine.remove_location(&id, &u) {
                         Ok(()) => report.retired += 1,
                         Err(e) => report.failed.push((id.clone(), e.to_string())),

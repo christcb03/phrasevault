@@ -973,6 +973,11 @@ impl Engine {
                 | Event::RegionBaseline { node_id, .. }
                 | Event::SubRegionHead { node_id, .. } => self.enclosing_log(node_id)?,
                 Event::NodeCreated(n) => self.resolve_region(&n.id, &batch_homes)?,
+                // A quality measurement is a fact about a NODE, so it routes
+                // with that node, exactly as its creation did.
+                Event::MediaQuality { node_id, .. } => {
+                    self.resolve_region(node_id, &batch_homes)?
+                }
                 Event::LinkCreated(l) => match &l.parent_id {
                     Some(p) => self.resolve_region(p, &batch_homes)?,
                     None => String::new(),

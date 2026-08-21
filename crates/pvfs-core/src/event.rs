@@ -27,6 +27,12 @@ pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
 /// Old binaries (post-Part-A) see this as `Event::Unknown`, ignore it, and go
 /// on using node labels — which is what makes labels-on-links ROLL.
 pub const K_LINK_RELABELED: &str = "LinkRelabeled";
+/// D76 — what a media file IS, measured: resolution, bit depth, HDR, bitrate.
+///
+/// A separate EVENT rather than a payload field, because the payload is inside
+/// the node's id preimage — adding to it would change every node's identity.
+/// Same reasoning that put labels on links (D72).
+pub const K_MEDIA_QUALITY: &str = "MediaQuality";
 pub const K_ACL_SET: &str = "AclSet";
 pub const K_MEMBER_TAGGED: &str = "MemberTagged";
 pub const K_SECURE_BLOB_UPDATED: &str = "SecureBlobUpdated";
@@ -109,6 +115,20 @@ pub enum Event {
     LinkRelabeled {
         link_id: String,
         label: String,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// D76 — a measurement of a file's media quality, and WHERE it came from.
+    ///
+    /// `source` is provenance, not decoration: `arr` (the *arrs' own probe,
+    /// captured at ingest), `probe` (ours), `derived` (computed from size and
+    /// duration). A later, better measurement supersedes an earlier one, and
+    /// knowing which is which is how that ordering stays honest.
+    MediaQuality {
+        node_id: String,
+        /// Canonical JSON — see `MediaQuality` in `media.rs`.
+        quality: String,
+        source: String,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -379,6 +399,13 @@ pub fn msg_link_relabeled(link_id: &str, label: &str, author: &[u8]) -> [u8; 32]
     crypto::domain_digest("pvfs:linkrelabeled:v1:", &e.finish())
 }
 
+/// D76 — the signed preimage for a quality measurement.
+pub fn msg_media_quality(node_id: &str, quality: &str, source: &str, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).string(quality).string(source).bytes(author);
+    crypto::domain_digest("pvfs:mediaquality:v1:", &e.finish())
+}
+
 pub fn msg_link_superseded(old_link_id: &str, new_link_id: &str, author: &[u8]) -> [u8; 32] {
     let mut e = Enc::new();
     e.string(old_link_id).string(new_link_id).bytes(author);
@@ -603,6 +630,7 @@ impl Event {
             Event::LinkRemoved { .. } => K_LINK_REMOVED,
             Event::LinkReordered { .. } => K_LINK_REORDERED,
             Event::LinkRelabeled { .. } => K_LINK_RELABELED,
+            Event::MediaQuality { .. } => K_MEDIA_QUALITY,
             Event::LinkSuperseded { .. } => K_LINK_SUPERSEDED,
             Event::LinkSuspended { .. } => K_LINK_SUSPENDED,
             Event::LinkUnsuspended { .. } => K_LINK_UNSUSPENDED,
@@ -638,6 +666,7 @@ impl Event {
             | Event::RecoveryKeyRevoked { author, .. }
             | Event::LinkReordered { author, .. }
             | Event::LinkRelabeled { author, .. }
+            | Event::MediaQuality { author, .. }
             | Event::LinkSuperseded { author, .. }
             | Event::LinkSuspended { author, .. }
             | Event::LinkUnsuspended { author, .. }
@@ -818,6 +847,19 @@ impl Event {
                 sig,
             } => {
                 e.string(link_id).string(label).bytes(author).bytes(sig);
+            }
+            Event::MediaQuality {
+                node_id,
+                quality,
+                source,
+                author,
+                sig,
+            } => {
+                e.string(node_id)
+                    .string(quality)
+                    .string(source)
+                    .bytes(author)
+                    .bytes(sig);
             }
             Event::LinkSuperseded {
                 old_link_id,
@@ -1130,6 +1172,13 @@ impl Event {
             K_LINK_RELABELED => Event::LinkRelabeled {
                 link_id: d.string()?,
                 label: d.string()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_MEDIA_QUALITY => Event::MediaQuality {
+                node_id: d.string()?,
+                quality: d.string()?,
+                source: d.string()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
@@ -1470,6 +1519,17 @@ impl Event {
                 author,
                 sig,
             } => crypto::verify_digest(author, &msg_link_relabeled(link_id, label, author), sig),
+            Event::MediaQuality {
+                node_id,
+                quality,
+                source,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_media_quality(node_id, quality, source, author),
+                sig,
+            ),
             Event::LinkSuperseded {
                 old_link_id,
                 new_link_id,

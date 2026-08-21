@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -262,6 +262,15 @@ CREATE INDEX IF NOT EXISTS idx_nodes_label        ON nodes(label) WHERE node_typ
 -- v11 (D72): identity-by-name resolves the LINK label first, so that branch
 -- needs its own index or every scanned file costs a table scan.
 CREATE INDEX IF NOT EXISTS idx_links_label        ON links(label) WHERE label <> '';
+-- v12 (D76): what a media file IS, measured. Keyed by node because a distinct
+-- file is a distinct node; `seq` keeps the newest measurement winning on
+-- replay regardless of the order rows arrive in.
+CREATE TABLE IF NOT EXISTS media_quality (
+  node_id  TEXT PRIMARY KEY,
+  quality  TEXT NOT NULL,
+  source   TEXT NOT NULL,
+  seq      INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
@@ -952,6 +961,28 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             tx.execute(
                 "UPDATE links SET label = ?1 WHERE id = ?2",
                 params![label, link_id],
+            )
+            .map_err(&m)?;
+        }
+        // D76 — the LATEST measurement wins, and its provenance rides with it.
+        // A probe supersedes an *arr's import-time figure; the re-encoder's
+        // analysis supersedes both. Storing the source is what makes that
+        // ordering auditable instead of implicit.
+        Event::MediaQuality {
+            node_id,
+            quality,
+            source,
+            ..
+        } => {
+            tx.execute(
+                "INSERT INTO media_quality (node_id, quality, source, seq)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                   quality = excluded.quality,
+                   source  = excluded.source,
+                   seq     = excluded.seq
+                 WHERE excluded.seq >= media_quality.seq",
+                params![node_id, quality, source, seq as i64],
             )
             .map_err(&m)?;
         }
@@ -2594,6 +2625,7 @@ fn migrate_projection(
             8 => migrate_v8_to_v9(conn).map(|_| "idx_nodes_label"),
             9 => migrate_v9_to_v10(conn).map(|_| "links.label"),
             10 => migrate_v10_to_v11(conn).map(|_| "idx_links_label"),
+            11 => migrate_v11_to_v12(conn).map(|_| "media_quality"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2756,6 +2788,15 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
             .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
+}
+
+fn migrate_v11_to_v12(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS media_quality (
+           node_id TEXT PRIMARY KEY, quality TEXT NOT NULL,
+           source TEXT NOT NULL, seq INTEGER NOT NULL);",
+    )
+    .map_err(map_db("create media_quality"))
 }
 
 fn migrate_v10_to_v11(conn: &mut Connection) -> Result<()> {
