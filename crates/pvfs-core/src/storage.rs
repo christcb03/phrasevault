@@ -112,6 +112,33 @@ pub fn parse_host_uri(uri: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// The local path a location URI denotes **on this host**, if any.
+///
+/// D81. A location is recorded host-implicit (`file:///path`) when the box
+/// holding the bytes writes its own log, and PIN-QUALIFIED
+/// (`pvfs-host://<pin>/path`, D75) when a replica writes through to the owner —
+/// because a bare `file://` path is host-implicit and a replica's copy lives on
+/// a specific box. Both name the same bytes on the same disk when the pin is
+/// ours.
+///
+/// Every caller that asks "is this location mine, and where" needs that
+/// equivalence, and three of them derived it separately: `has_central` learned
+/// it only because a dry run caught the mover re-placing files it had just
+/// placed, and the scan's deletion pass never learned it at all — so a replica
+/// silently retired nothing, for every move and every delete, while reporting
+/// success. One implementation, so the next caller inherits it.
+pub fn local_path_of(uri: &str, own_pin: Option<&str>) -> Option<PathBuf> {
+    if let Ok(p) = uri_to_path(uri) {
+        return Some(p);
+    }
+    match (parse_host_uri(uri), own_pin) {
+        (Some((pin, path)), Some(mine)) if pin.eq_ignore_ascii_case(mine) => {
+            Some(PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
+
 /// This data dir's own transport pin, if it has ever served a network
 /// listener (`pvfsd --listen` mints it). `None` until then — a host nobody
 /// can dial has no meaningful location to offer.

@@ -4391,6 +4391,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                     println!("ingested {f}: +{a} !{c} -{r}");
                                 }
                             }
+                            // A quiet pass is progress for the daemon's stall
+                            // detector, not news for a human watching a terminal.
+                            pvfs_client::watch::WatchEvent::Quiet => {}
                             pvfs_client::watch::WatchEvent::ScanError(e) => {
                                 eprintln!("scan error: {e}")
                             }

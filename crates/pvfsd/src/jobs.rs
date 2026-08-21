@@ -38,6 +38,10 @@ const STALL_FACTOR: u64 = 3;
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
 const TIER_INTERVAL: Duration = Duration::from_secs(300);
+/// The watcher's own safety-net reconcile — the cadence a quiet `watch` keeps.
+/// Passed to `watch::run` AND used as its stall baseline, so the two cannot
+/// drift apart again.
+pub const WATCH_RECONCILE: Duration = Duration::from_secs(3600);
 const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 
 fn now_ms() -> u64 {
@@ -262,7 +266,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 st.set_state("watch", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
-                let r = watch::run(&data_dir, 3600, 2000, &flag, |ev| match ev {
+                let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| match ev {
                     WatchEvent::Ingested(_, a, c, rm) => {
                         cb.mark_ok("watch");
                         if a + c + rm > 0 {
@@ -272,6 +276,8 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                             cb.nudge_tier();
                         }
                     }
+                    // D81 — a clean pass with nothing to do is progress.
+                    WatchEvent::Quiet => cb.mark_ok("watch"),
                     WatchEvent::ScanError(e) => cb.mark_retry("watch", &e),
                     WatchEvent::Watching(..) => cb.set_state("watch", "running"),
                 });
@@ -479,6 +485,12 @@ fn interval(name: &str) -> Duration {
         "reclaim" => EVICT_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
+        // D81 — `watch` is CONTINUOUS: inotify-driven, with a reconcile as the
+        // safety net. It had no arm here, so it fell through to 300s and the
+        // detector policed a 15-minute deadline against an HOURLY cadence.
+        // A job's stall threshold has to be derived from what that job actually
+        // does, or the detector measures a number nobody chose.
+        "watch" => WATCH_RECONCILE,
         _ => EVICT_INTERVAL,
     }
 }

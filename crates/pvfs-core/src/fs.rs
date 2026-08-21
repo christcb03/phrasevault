@@ -723,19 +723,40 @@ impl Engine {
         }
 
         // 3. deletions: tracked URIs under this binding that vanished from disk
+        //
+        // D81 — TWO prefixes, not one. This box's own locations are recorded
+        // host-implicit (`file:///path`) when it owns the log, and
+        // PIN-QUALIFIED (`pvfs-host://<pin>/path`) when it is a REPLICA writing
+        // through to the owner (D75). Matching only the bare `file://` prefix
+        // meant a replica's `file_locations` half matched NOTHING: the removal
+        // was skipped by the `active.is_some()` guard below, the `scan_state`
+        // row was deleted anyway so the next pass could not see it either, and
+        // the stale location survived forever while the scan reported it gone.
+        //
+        // Production is not exposed today only because the NAS library is
+        // catalogued by the OWNER over NFS in bare `file://` form. D80's
+        // migration converts all 27,565 to pin-qualified on a replica, which is
+        // the moment this would have started losing every move and delete.
         let prefix = format!("{}/", b.source_uri.trim_end_matches('/'));
+        let host_prefix = crate::storage::host_pin(&self.data_dir).and_then(|pin| {
+            crate::storage::host_uri(&pin, &root)
+                .ok()
+                .map(|u| format!("{}/", u.trim_end_matches('/')))
+        });
         let tracked: Vec<(String, String)> = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT uri, file_id FROM scan_state WHERE uri LIKE ?1 || '%'
+                    "SELECT uri, file_id FROM scan_state
+                      WHERE uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%')
                      UNION
                      SELECT uri, file_id FROM file_locations
-                      WHERE uri LIKE ?1 || '%' AND removed_at IS NULL",
+                      WHERE (uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%'))
+                        AND removed_at IS NULL",
                 )
                 .map_err(map_db("scan removals"))?;
             let rows = stmt
-                .query_map(params![prefix], |r| {
+                .query_map(params![prefix, host_prefix], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })
                 .map_err(map_db("scan removals"))?;
@@ -746,8 +767,19 @@ impl Engine {
             if seen.contains(&uri) {
                 continue;
             }
-            let still_there = LocalBackend.stat(&uri).map(|s| s.exists).unwrap_or(false);
-            if still_there {
+            // D81 — resolve BEFORE statting. `LocalBackend.stat` takes a
+            // `file://` URI; handed a pin-qualified one it errors, which
+            // `unwrap_or(false)` turned into "the bytes are gone" — the most
+            // dangerous possible default for a function that decides what to
+            // retire. A location whose path cannot be resolved on this host is
+            // not ours to judge, so it is left alone.
+            let Some(path) = crate::storage::local_path_of(
+                &uri,
+                crate::storage::host_pin(&self.data_dir).as_deref(),
+            ) else {
+                continue;
+            };
+            if path.exists() {
                 continue; // filtered out, not deleted — leave it alone
             }
             // soft-remove the location if still active
@@ -760,11 +792,18 @@ impl Engine {
                 )
                 .optional()
                 .map_err(map_db("scan removals"))?;
+            // D81 — count what actually happened. `stats.removed` used to be
+            // incremented unconditionally, below, outside this guard: when the
+            // location did not match (the pin-qualified case) the scan reported
+            // a removal it had just skipped. A counter that lies about the one
+            // operation that destroys information is worse than no counter.
+            let mut removed_here = false;
             if active.is_some() {
                 match writer {
                     Some(w) => w.remove_location(&file_id, &uri)?,
                     None => self.remove_location(&file_id, &uri)?,
                 }
+                removed_here = true;
             }
             self.conn
                 .execute("DELETE FROM scan_state WHERE uri = ?1", params![uri])
@@ -775,7 +814,9 @@ impl Engine {
                     params![file_id, uri],
                 )
                 .map_err(map_db("scan removals"))?;
-            stats.removed += 1;
+            if removed_here {
+                stats.removed += 1;
+            }
         }
         Ok(stats)
     }
@@ -959,8 +1000,30 @@ impl Engine {
                 }
                 stats.unchanged += 1;
             } else {
+                // D81 — count a change ONCE, when it is first detected.
+                //
+                // `scan_state` is deliberately NOT advanced here: the change is
+                // unresolved, and pending changes wait for an operator
+                // (doc 04 §4.4). But that means the very same file is
+                // re-detected on every later pass, and counting it again each
+                // time made `stats.changed` permanently non-zero — which fires
+                // the watcher's progress signal forever and SILENCES the stall
+                // detector on any box with one unresolved change. A wedged job
+                // reporting `running` is the exact failure D78 was built to
+                // prevent, reintroduced through the detector's own input.
+                let already: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM pending_changes WHERE file_id = ?1 AND uri = ?2",
+                        params![file_id, uri],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(map_db("pending change"))?;
                 self.flag_change(&file_id, uri, size, mtime, f)?;
-                stats.changed += 1;
+                if already.is_none() {
+                    stats.changed += 1;
+                }
             }
             return Ok(());
         }

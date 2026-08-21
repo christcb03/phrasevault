@@ -23,6 +23,13 @@ pub enum WatchEvent {
     Ingested(String, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
+    /// A scan pass completed and found nothing to do.
+    ///
+    /// D81 — a pass that finds nothing IS a completed pass, and used to say so
+    /// to no one: `Ingested` was the only progress signal and it is filtered to
+    /// passes that changed something. So an idle watcher marked no progress for
+    /// up to a whole reconcile interval and the stall detector called it stuck.
+    Quiet,
     /// Watching started: (folders watched here, bindings skipped as another
     /// machine's). The second number matters — on a replica it is normal for
     /// most of the forest's bindings to belong elsewhere, and "watching 0"
@@ -146,16 +153,23 @@ pub fn run(
                         if reports.iter().any(|r| r.stats.settling > 0) {
                             retry_at = Some(Instant::now() + SETTLE_RECHECK);
                         }
+                        let mut said_something = false;
                         for r in reports
                             .iter()
                             .filter(|r| r.stats.added + r.stats.changed + r.stats.removed > 0)
                         {
+                            said_something = true;
                             notify_cb(WatchEvent::Ingested(
                                 r.folder_id.clone(),
                                 r.stats.added,
                                 r.stats.changed,
                                 r.stats.removed,
                             ));
+                        }
+                        // The pass ran cleanly either way — say so, so progress
+                        // does not depend on the library happening to change.
+                        if !said_something {
+                            notify_cb(WatchEvent::Quiet);
                         }
                     }
                     Err(e) => {
