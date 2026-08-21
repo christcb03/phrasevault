@@ -632,6 +632,45 @@ impl Engine {
         Ok(reports)
     }
 
+    /// Index a directory into `folder` WITHOUT taking the folder's binding.
+    ///
+    /// D74/D78 — the bug this exists to avoid: bindings are keyed
+    /// `folder_id PRIMARY KEY`, fleet-wide, and a LOGGED binding beats a
+    /// machine's local one ("a local row for it would be this box shadowing
+    /// the fleet"). So adopting a central store by binding it on the owner
+    /// silently shadowed the ingest box's binding, and its watcher — still
+    /// reporting `running`, with no error — scanned nothing at all.
+    ///
+    /// Adoption is a ONE-SHOT index, not an ongoing enrollment. It has no
+    /// business claiming the folder's binding, and now does not: the spec is
+    /// built in memory, used for one pass, and never persisted.
+    pub fn scan_unbound(
+        &mut self,
+        folder: &NodeId,
+        source_uri: &str,
+        spec: &BindSpec,
+        writer: &mut Option<&mut dyn ScanWriter>,
+        settle_ms: u64,
+    ) -> Result<ScanStats> {
+        let transient = Binding {
+            folder_id: folder.clone(),
+            source_uri: source_uri.to_string(),
+            recursive: spec.recursive,
+            auto_index: spec.auto_index,
+            extensions: spec
+                .extensions
+                .split(',')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.trim().to_lowercase())
+                .collect(),
+            hash_policy: spec.hash_policy,
+            bound_at: now_ms(),
+            // This machine's — the directory is a path here and nowhere else.
+            bound_by: self.device.pubkey(),
+        };
+        self.scan_binding(&transient, writer, settle_ms)
+    }
+
     fn scan_binding(
         &mut self,
         b: &Binding,

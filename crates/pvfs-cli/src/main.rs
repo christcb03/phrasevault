@@ -1126,24 +1126,24 @@ fn adopt_central_store(
                 .into(),
         ));
     }
-    engine.bind_folder(
-        &node.to_string(),
-        pvfs_core::BindSpec {
-            source_uri: format!("file://{}", dir.display()),
-            recursive: true,
-            auto_index: true,
-            extensions: String::new(),
-            // Lazy: hashing a whole existing library up front would turn a
-            // placement command into hours of reading. Identity by (name, exact
-            // size) is enough to recognise these files, and the first hash that
-            // is ever needed settles it (D71 W6).
-            hash_policy: pvfs_core::HashPolicy::Lazy,
-        },
-    )?;
-    let reports = engine.scan_routed(Some(&node.to_string()), None, 0)?;
+    // NOT `bind_folder`: a logged binding shadows every replica's local one
+    // for the same folder, which silently stopped the ingest box's watcher the
+    // first time this ran. Index the store for one pass and claim nothing.
+    let spec = pvfs_core::BindSpec {
+        source_uri: format!("file://{}", dir.display()),
+        recursive: true,
+        auto_index: true,
+        extensions: String::new(),
+        // Lazy: hashing a whole existing library up front would turn a
+        // placement command into hours of reading. Identity by (name, exact
+        // size) is enough to recognise these files, and the first hash that is
+        // ever needed settles it (D71 W6).
+        hash_policy: pvfs_core::HashPolicy::Lazy,
+    };
+    let uri = spec.source_uri.clone();
+    let stats = engine.scan_unbound(&node.to_string(), &uri, &spec, &mut None, 0)?;
     engine.close()?;
-    let added: usize = reports.iter().map(|r| r.stats.added as usize).sum();
-    let unchanged: usize = reports.iter().map(|r| r.stats.unchanged as usize).sum();
+    let (added, unchanged) = (stats.added as usize, stats.unchanged as usize);
     Ok(Some(format!(
         "indexed the store's existing contents: {added} added, {unchanged} already known"
     )))
