@@ -340,6 +340,20 @@ enum Cmd {
         /// visible in what the mover had already DONE.
         #[arg(long)]
         dry_run: bool,
+        /// Let the copy-selection rules resolve a collision (D76).
+        ///
+        /// OFF by default: without it, two live copies of one path are refused
+        /// exactly as before, and a human decides. With it, the ladder decides
+        /// — resolution, then HDR, then bit depth, then completeness, then
+        /// size, then date — and the LOSER IS MOVED TO TRASH, never deleted.
+        ///
+        /// Pair it with --dry-run first. `pvfs explain <a> <b>` shows the same
+        /// decision for one pair without running a pass at all.
+        #[arg(long)]
+        rules: bool,
+        /// Percent larger that counts as "significantly" for rule 2.
+        #[arg(long, default_value_t = 10)]
+        size_margin: u32,
     },
     /// Edge-side space reclaim (doc 17 §7.4): delete local bytes whose
     /// catalog location was retired by the mover — only ever with another
@@ -4132,13 +4146,25 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
-        Cmd::Tier { dry_run } => {
+        Cmd::Tier {
+            dry_run,
+            rules,
+            size_margin,
+        } => {
             // The pass itself is shared with pvfsd's `tier` job (P5.3).
             let mut engine = Engine::open(&ctx?)?;
             let data_dir = engine.data_dir().to_path_buf();
             let mut fetcher = Fetcher::new(&data_dir);
-            let report =
-                pvfs_client::fetch::tier_pass_opts(&mut engine, &mut fetcher, dry_run)?;
+            let ruleset = rules.then(|| pvfs_core::media::Rules {
+                size_margin_pct: size_margin,
+                ..Default::default()
+            });
+            let report = pvfs_client::fetch::tier_pass_ruled(
+                &mut engine,
+                &mut fetcher,
+                dry_run,
+                ruleset,
+            )?;
             let Some(report) = report else {
                 return Err(PvfsError::BadInput {
                     field: "tier".into(),
