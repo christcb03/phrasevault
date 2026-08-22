@@ -110,6 +110,20 @@ pub struct Engine {
     /// release — clean close or crash — is what makes writer liveness
     /// observable to other opens (P7.2c close-out finding).
     _writer_lock: Option<nix::fcntl::Flock<std::fs::File>>,
+    /// This box's transport pin, read once. D81 — the scan asks "is this
+    /// location mine" per FILE, and `host_pin` reads a file off disk to answer;
+    /// doing that thousands of times per pass is a cost nobody chose.
+    own_pin: std::sync::OnceLock<Option<String>>,
+}
+
+impl Engine {
+    /// This box's transport pin, if it has ever served a listener. Cached —
+    /// it cannot change while the engine is open.
+    pub(crate) fn own_pin(&self) -> Option<&str> {
+        self.own_pin
+            .get_or_init(|| crate::storage::host_pin(&self.data_dir))
+            .as_deref()
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -444,6 +458,7 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             device,
             _writer_lock: take_writer_lock(data_dir),
+            own_pin: std::sync::OnceLock::new(),
             identity: ForestIdentity {
                 instance_id,
                 forest_id,
@@ -477,6 +492,7 @@ impl Engine {
             closed: false,
             replica: false,
             _writer_lock: lock,
+            own_pin: std::sync::OnceLock::new(),
         };
         if let Err(e) = engine.ensure_device_active() {
             // A projection torn by concurrent folders can pass every position
@@ -586,6 +602,7 @@ impl Engine {
             closed: true,
             replica: false,
             _writer_lock: None,
+            own_pin: std::sync::OnceLock::new(),
         })
     }
 
@@ -610,6 +627,7 @@ impl Engine {
             closed: false,
             replica: true,
             _writer_lock: lock,
+            own_pin: std::sync::OnceLock::new(),
         })
     }
 
@@ -741,6 +759,7 @@ impl Engine {
             closed: false,
             replica: false,
             _writer_lock: _writer_lock_held,
+            own_pin: std::sync::OnceLock::new(),
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();

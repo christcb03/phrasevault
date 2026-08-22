@@ -738,8 +738,9 @@ impl Engine {
         // migration converts all 27,565 to pin-qualified on a replica, which is
         // the moment this would have started losing every move and delete.
         let prefix = format!("{}/", b.source_uri.trim_end_matches('/'));
-        let host_prefix = crate::storage::host_pin(&self.data_dir).and_then(|pin| {
-            crate::storage::host_uri(&pin, &root)
+        let own_pin = self.own_pin().map(str::to_string);
+        let host_prefix = own_pin.as_deref().and_then(|pin| {
+            crate::storage::host_uri(pin, &root)
                 .ok()
                 .map(|u| format!("{}/", u.trim_end_matches('/')))
         });
@@ -773,10 +774,7 @@ impl Engine {
             // dangerous possible default for a function that decides what to
             // retire. A location whose path cannot be resolved on this host is
             // not ours to judge, so it is left alone.
-            let Some(path) = crate::storage::local_path_of(
-                &uri,
-                crate::storage::host_pin(&self.data_dir).as_deref(),
-            ) else {
+            let Some(path) = crate::storage::local_path_of(&uri, own_pin.as_deref()) else {
                 continue;
             };
             if path.exists() {
@@ -978,12 +976,26 @@ impl Engine {
                 // The reactivation path below already knew how to fix this; it
                 // was simply unreachable. So: confirm the location before
                 // believing our own memory of it.
+                // D81 — the SAME equivalence the deletion pass needed, on the
+                // add side. A replica records this location pin-qualified
+                // (D75); comparing only the bare `file://` form meant the check
+                // never matched, so every pass "discovered" every file again
+                // and re-added a location that was already there. Measured on
+                // the lab holder: 1,998 pointless routed writes per pass, each
+                // one a round trip to the owner — which is why a pass over
+                // 2,000 files could not finish inside the stall threshold.
+                let qualified = self.own_pin().and_then(|pin| {
+                    crate::storage::uri_to_path(uri)
+                        .ok()
+                        .and_then(|p| crate::storage::host_uri(pin, &p).ok())
+                });
                 let live: Option<i64> = self
                     .conn
                     .query_row(
                         "SELECT 1 FROM file_locations
-                          WHERE uri = ?1 AND file_id = ?2 AND removed_at IS NULL",
-                        params![uri, file_id],
+                          WHERE file_id = ?2 AND removed_at IS NULL
+                            AND (uri = ?1 OR (?3 IS NOT NULL AND uri = ?3))",
+                        params![uri, file_id, qualified],
                         |r| r.get(0),
                     )
                     .optional()

@@ -226,3 +226,52 @@ fn an_unresolved_change_is_counted_once_not_every_pass() {
     assert_eq!(third[0].stats.changed, 0, "nor a third");
     engine.close().unwrap();
 }
+
+/// The add-side twin: a pin-qualified location already there is NOT missing.
+///
+/// Found on the lab holder, not in a test: every watch pass wrote **1,998
+/// FileLocationAdded events** for files whose locations were already recorded —
+/// because the "is this location live?" check compared only the bare `file://`
+/// form, and a replica records pin-qualified. Each one is a round trip to the
+/// owner, which is why a pass over 2,000 files never finished, which is why the
+/// job looked stalled, which is what sent me looking in the first place.
+///
+/// The same missing equivalence as the retire bug, on the opposite path, doing
+/// the opposite damage: one silently dropped work it should have done, the
+/// other endlessly repeated work already done.
+#[test]
+fn a_pin_qualified_location_is_not_rediscovered_every_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, media, lib) = media_forest(dir.path());
+
+    let file = engine
+        .walk(&media)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.node.node_type == pvfs_core::TYPE_FILE)
+        .unwrap()
+        .node
+        .id;
+
+    // Record it the way a replica does, and drop the host-implicit form.
+    let path = lib.join("TV/Show/ep.mkv");
+    let qualified = host_uri(PIN_A, &path).unwrap();
+    engine.add_location(&file, &qualified).unwrap();
+    engine
+        .remove_location(&file, &format!("file://{}", path.display()))
+        .unwrap();
+
+    let again = engine.scan(Some(&media)).unwrap();
+    assert_eq!(
+        again[0].stats.added, 0,
+        "the bytes are already recorded as living here — a differently spelled \
+         URI for the same path on the same disk is not a discovery"
+    );
+    assert_eq!(again[0].stats.unchanged, 1);
+    assert_eq!(
+        engine.locations(&file).unwrap(),
+        vec![qualified],
+        "and nothing was added alongside it"
+    );
+    engine.close().unwrap();
+}
