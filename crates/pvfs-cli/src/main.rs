@@ -636,6 +636,32 @@ enum LocCmd {
     Hash { file: String },
     /// Re-hash locations; lift quarantine where bytes match again
     Verify { file: String },
+    /// D81 — move a file's BYTES to another root of its library.
+    ///
+    /// Distinct from `pvfs mv`, which moves a NODE to a different parent in the
+    /// tree. This moves the bytes between physical roots — Data to Data_ext, or
+    /// one box to another — and is the supported form of what is otherwise done
+    /// by hand behind the catalog's back.
+    ///
+    /// Doing it THROUGH PVFS removes the ambiguity a scan can never resolve:
+    /// the catalog is told what happened rather than inferring it from a
+    /// filesystem diff that cannot tell "moved" from "deleted".
+    ///
+    /// Ordering is D80's migration in the small, and the only safe one:
+    /// PLACE at the target, VERIFY it arrived, and only THEN retire the source.
+    /// Reversed, it is the drain that stranded 26,729 files.
+    Move {
+        /// File or FOLDER node — a whole title moves as one thing, because
+        /// that is the unit anyone actually moves
+        target: String,
+        /// Destination root (a bound directory of this file's folder).
+        /// Prompted for when omitted.
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Plan every move and make none of them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2708,6 +2734,83 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 actual: format!("{bad} location(s) mismatched"),
                             },
                         });
+                    }
+                }
+                LocCmd::Move { target, to, dry_run } => {
+                    let node = target.clone();
+                    // The roots this node's library actually has, so the
+                    // destination can be OFFERED rather than typed from memory.
+                    // Walk up until a bound ancestor is found: a title's roots
+                    // are its library's, recorded on some folder above it.
+                    let mut folder = engine.parent_of(&node)?.unwrap_or_else(|| node.clone());
+                    let mut roots = engine.bindings_for(&folder)?;
+                    while roots.is_empty() {
+                        match engine.parent_of(&folder)? {
+                            Some(up) => {
+                                folder = up;
+                                roots = engine.bindings_for(&folder)?;
+                            }
+                            None => break,
+                        }
+                    }
+                    let dest: PathBuf = match to {
+                        Some(d) => d,
+                        None => {
+                            if roots.is_empty() {
+                                engine.close()?;
+                                return Err(PvfsError::BadInput {
+                                    field: "to".into(),
+                                    reason: "this file's folder has no bound roots to move                                              between"
+                                        .into(),
+                                });
+                            }
+                            println!("roots of this library:");
+                            for (i, b) in roots.iter().enumerate() {
+                                println!("  {}. {}", i + 1, b.source_uri);
+                            }
+                            let pick = prompt_line("move the bytes to which root", None)?;
+                            let chosen = pick
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|n| roots.get(n.wrapping_sub(1)))
+                                .map(|b| b.source_uri.clone())
+                                .unwrap_or_else(|| pick.trim().to_string());
+                            pvfs_core::storage::uri_to_path(&chosen)
+                                .unwrap_or_else(|_| PathBuf::from(chosen))
+                        }
+                    };
+                    let report = pvfs_client::relocate::move_to_root(
+                        &mut engine,
+                        &node,
+                        &dest,
+                        dry_run,
+                    )?;
+                    if json {
+                        println!(
+                            "{{\"moved\":{},\"skipped\":{},\"failed\":{},\"dry_run\":{}}}",
+                            report.moved,
+                            report.skipped,
+                            report.failed.len(),
+                            dry_run
+                        );
+                    } else {
+                        for line in &report.planned {
+                            println!("  {line}");
+                        }
+                        for (what, why) in &report.failed {
+                            println!("  FAILED  {what}: {why}");
+                        }
+                        println!(
+                            "{} {} file(s), {} already there, {} failed",
+                            if dry_run { "would move" } else { "moved" },
+                            report.moved,
+                            report.skipped,
+                            report.failed.len()
+                        );
+                        if dry_run && report.moved > 0 {
+                            println!("DRY RUN — nothing was changed.");
+                        }
                     }
                 }
             }

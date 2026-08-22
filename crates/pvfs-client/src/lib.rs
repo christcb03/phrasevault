@@ -51,6 +51,7 @@ pub mod advertise;
 pub mod fetch;
 pub mod follow;
 pub mod regions;
+pub mod relocate;
 pub mod watch;
 
 /// The client's transport: both arms speak identical frames.
