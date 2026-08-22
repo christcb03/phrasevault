@@ -701,6 +701,19 @@ fn tier_pass_inner(
                 None
             };
 
+            // D81 — this file's tree path under every LIBRARY root. Used twice:
+            // to decide it is already in the library (4b), and to find a copy
+            // of it on another volume (4c).
+            let tree_segs = engine.tree_path_under(&id, &root)?.unwrap_or_default();
+            let at_a_root: Vec<std::path::PathBuf> = if tree_segs.is_empty() {
+                Vec::new()
+            } else {
+                library_dirs
+                    .iter()
+                    .map(|d| tree_segs.iter().fold(d.clone(), |acc, s| acc.join(s)))
+                    .collect()
+            };
+
             let has_central = match &tree_dest {
                 Some(want) => {
                     let want_uri = pvfs_core::storage::path_to_uri(want)?;
@@ -717,11 +730,7 @@ fn tier_pass_inner(
                     // put (Chris: "writing needs to be a single place"). Being
                     // already somewhere in the library is a different question,
                     // and this is it.
-                    let segs = engine.tree_path_under(&id, &root)?.unwrap_or_default();
-                    let at_a_root: Vec<std::path::PathBuf> = library_dirs
-                        .iter()
-                        .map(|d| segs.iter().fold(d.clone(), |acc, s| acc.join(s)))
-                        .collect();
+
                     // D75: a REPLICA logs its store copy PIN-QUALIFIED, because a
                     // bare file:// path is host-implicit and that copy lives on a
                     // specific box. So the satisfied check must recognise both
@@ -739,7 +748,7 @@ fn tier_pass_inner(
                         }
                         // Held by ANY box, at its tree path under ANY root.
                         pvfs_core::storage::any_path_of(u)
-                            .is_some_and(|p| !segs.is_empty() && at_a_root.contains(&p))
+                            .is_some_and(|p| at_a_root.contains(&p))
                     })
                 }
                 None => engine.locations(&id)?.iter().any(|u| {
@@ -828,6 +837,85 @@ fn tier_pass_inner(
                 } else {
                     dest.join(&id[..2]).join(&id)
                 };
+
+                // D81 4c — THE OCCUPANT MAY BE ON ANOTHER VOLUME.
+                //
+                // Chris: "if something gets upgraded from data_ext it would get
+                // written to Data, but then the system has to remove the extra
+                // copy from data_ext. I'm not sure how to manage that just yet."
+                //
+                // Collision detection asked only whether the DESTINATION PATH
+                // was occupied. Upgrade a title that lives on the cold volume
+                // and the destination on the warm one is empty, so nothing was
+                // detected: the new copy landed and the old one stayed, two
+                // live copies of one tree path on two volumes, with nothing to
+                // reconcile them. The fix is to ask the catalog rather than the
+                // destination directory — same tree path, whichever root holds
+                // it — which turns this from a special case into the ordinary
+                // one the D76 ladder already decides.
+                //
+                // The loser is trashed ON ITS OWN VOLUME. `move_to_trash`
+                // refuses a file outside the root it is given, which is what
+                // stops a 20GB cold title being copied across filesystems to
+                // reach the warm volume's trash.
+                let mut superseded_elsewhere = false;
+                if tree_roots.contains(&root) {
+                    for (cand, cand_root) in at_a_root.iter().zip(library_dirs.iter()) {
+                        if cand == &cpath || !cand.exists() {
+                            continue;
+                        }
+                        let cand_uri = pvfs_core::storage::path_to_uri(cand)?;
+                        let Some(occupant) = engine.location_owner(&cand_uri)? else {
+                            continue;
+                        };
+                        if occupant == id {
+                            continue;
+                        }
+                        match decide_collision(engine, &id, &occupant, rules) {
+                            Some((incoming_wins, verdict)) if incoming_wins => {
+                                if dry_run {
+                                    report.planned.push(format!(
+                                        "WOULD TRASH  {} (on another root; lost: {})",
+                                        cand.display(),
+                                        verdict.reason()
+                                    ));
+                                } else if let Err(e) =
+                                    pvfs_core::sync::move_to_trash(cand_root, cand)
+                                {
+                                    report.failed.push((label.clone(), e.to_string()));
+                                    superseded_elsewhere = true;
+                                    break;
+                                }
+                            }
+                            Some((_, verdict)) => {
+                                report.failed.push((
+                                    label.clone(),
+                                    format!(
+                                        "the copy already at {} wins — {}",
+                                        cand.display(),
+                                        verdict.reason()
+                                    ),
+                                ));
+                                superseded_elsewhere = true;
+                                break;
+                            }
+                            None => {
+                                report.failed.push((
+                                    label.clone(),
+                                    format!(
+                                        "{} holds another live copy of this same tree path;                                          copy-selection rules are off (`--rules`), so a human                                          decides which survives",
+                                        cand.display()
+                                    ),
+                                ));
+                                superseded_elsewhere = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if superseded_elsewhere {
+                    continue;
+                }
 
                 // An occupied destination is decided by the LIVE CATALOG, never
                 // by overwriting on faith (D71 W5). Replacing IS the normal
