@@ -66,6 +66,13 @@ pub struct JobsState {
     nudge_evict: AtomicBool,
     /// Punch H: the daemon's own commits (write-through ingest) wake the mover.
     nudge_tier: AtomicBool,
+    /// D81 — when each job's CURRENT pass began; absent means none in flight.
+    /// Local to the daemon: `ServeJobWire` is on the wire and this is not worth
+    /// a proto bump, since it only ever feeds `state` and `last_error`.
+    pass_started: Mutex<std::collections::HashMap<String, u64>>,
+    /// How long each job's last completed pass took — the baseline a stall is
+    /// judged against.
+    pass_dur: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl JobsState {
@@ -81,6 +88,8 @@ impl JobsState {
             nudge_export: AtomicBool::new(false),
             nudge_evict: AtomicBool::new(false),
             nudge_tier: AtomicBool::new(false),
+            pass_started: Mutex::new(std::collections::HashMap::new()),
+            pass_dur: Mutex::new(std::collections::HashMap::new()),
         };
         s.reload()?;
         Ok(s)
@@ -134,6 +143,23 @@ impl JobsState {
             .cloned()
             .map(|mut r| {
                 let since = r.last_ok_ms.unwrap_or(self.started_ms);
+                // D81 — a pass IN FLIGHT far past this job's own typical
+                // duration is the sharp signal; time since the last completed
+                // pass is the blunt one, and for a continuous watcher it is
+                // mostly a measure of how quiet the library has been.
+                let in_flight = self.pass_started.lock().unwrap().get(&r.name).copied();
+                let typical = self.pass_dur.lock().unwrap().get(&r.name).copied();
+                if r.state == "running" {
+                    if let Some(started) = in_flight {
+                        if let Some(why) =
+                            pass_stalled_reason(started, now, typical, PASS_STALL_FLOOR)
+                        {
+                            r.state = "stalled".into();
+                            r.last_error = Some(why);
+                            return r;
+                        }
+                    }
+                }
                 if let Some(why) = stalled_reason(&r.state, since, now, interval(&r.name)) {
                     r.state = "stalled".into();
                     r.last_error = Some(why);
@@ -152,6 +178,25 @@ impl JobsState {
 
     fn set_state(&self, name: &str, state: &str) {
         self.with_row(name, |r| r.state = state.to_string());
+    }
+
+    /// A pass has begun (D81). What makes "wedged" distinguishable from
+    /// "quiet": a watcher waiting for its next reconcile has no pass in flight.
+    fn mark_pass_start(&self, name: &str) {
+        self.pass_started
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), now_ms());
+    }
+
+    /// A pass has ended; remember how long this job's passes take.
+    fn mark_pass_end(&self, name: &str) {
+        if let Some(start) = self.pass_started.lock().unwrap().remove(name) {
+            self.pass_dur
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), now_ms().saturating_sub(start));
+        }
     }
 
     /// A successful pass: running, stamped, error cleared.
@@ -267,7 +312,9 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
                 let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| match ev {
+                    WatchEvent::PassStarted => cb.mark_pass_start("watch"),
                     WatchEvent::Ingested(_, a, c, rm) => {
+                        cb.mark_pass_end("watch");
                         cb.mark_ok("watch");
                         if a + c + rm > 0 {
                             // local ingest = new content: views, placed
@@ -277,8 +324,14 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                         }
                     }
                     // D81 — a clean pass with nothing to do is progress.
-                    WatchEvent::Quiet => cb.mark_ok("watch"),
-                    WatchEvent::ScanError(e) => cb.mark_retry("watch", &e),
+                    WatchEvent::Quiet => {
+                        cb.mark_pass_end("watch");
+                        cb.mark_ok("watch");
+                    }
+                    WatchEvent::ScanError(e) => {
+                        cb.mark_pass_end("watch");
+                        cb.mark_retry("watch", &e);
+                    }
                     WatchEvent::Watching(..) => cb.set_state("watch", "running"),
                 });
                 match r {
@@ -458,6 +511,52 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
 ///
 /// `since` is the last COMPLETED pass, or the runner's start for a job that has
 /// never finished one — which is exactly the shape a first-run hang produces.
+/// A pass that is RUNNING RIGHT NOW and has taken far longer than this job's
+/// passes normally take (D81).
+///
+/// `stalled_reason` measures time since the last COMPLETED pass, which is the
+/// right question for an interval job and the wrong one for a continuous
+/// watcher: an idle watcher legitimately completes nothing for a whole
+/// reconcile. Keying its threshold off the reconcile interval instead — as I
+/// first did — pushed the alarm out to three HOURS, so the wedge I had just
+/// been debugging would have gone unreported for an afternoon.
+///
+/// What actually distinguishes "wedged" from "quiet" is whether a pass is in
+/// flight. A watcher waiting for the next reconcile has none; a watcher stuck
+/// on a socket that never returns has one, and it is old. The threshold comes
+/// from the job's own observed pass duration, so a fleet with a 27,000-file
+/// library and one with 2,000 are each judged against themselves.
+pub fn pass_stalled_reason(
+    started_ms: u64,
+    now_ms: u64,
+    typical_ms: Option<u64>,
+    floor: Duration,
+) -> Option<String> {
+    let running_for = now_ms.saturating_sub(started_ms);
+    let limit = typical_ms
+        .map(|t| t.saturating_mul(STALL_FACTOR))
+        .unwrap_or(0)
+        .max(floor.as_millis() as u64);
+    if running_for <= limit {
+        return None;
+    }
+    Some(match typical_ms {
+        Some(t) => format!(
+            "a pass has been running {}s; this job's passes normally take {}s — it is stuck, not working",
+            running_for / 1000,
+            t / 1000
+        ),
+        None => format!(
+            "the first pass has been running {}s and has never completed",
+            running_for / 1000
+        ),
+    })
+}
+
+/// The floor under `pass_stalled_reason`, so a job whose passes are quick is
+/// not flagged for a momentary hiccup.
+pub const PASS_STALL_FLOOR: Duration = Duration::from_secs(300);
+
 pub fn stalled_reason(
     state: &str,
     since_ms: u64,

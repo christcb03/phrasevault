@@ -23,6 +23,9 @@ pub enum WatchEvent {
     Ingested(String, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
+    /// A scan pass has BEGUN (D81) — what lets the daemon tell a wedged
+    /// watcher from a quiet one.
+    PassStarted,
     /// A scan pass completed and found nothing to do.
     ///
     /// D81 — a pass that finds nothing IS a completed pass, and used to say so
@@ -70,6 +73,7 @@ pub fn run(
         let is_replica = engine.is_replica();
         let mut route = crate::advertise::replica_route(data_dir, is_replica).unwrap_or(None);
         // initial reconciliation
+        notify_cb(WatchEvent::PassStarted);
         match scan_pass(&mut engine, &mut route) {
             Ok(reports) => {
                 for r in &reports {
@@ -142,6 +146,7 @@ pub fn run(
             if due_debounce || due_reconcile || due_retry {
                 dirty_since = None;
                 last_reconcile = Instant::now();
+                notify_cb(WatchEvent::PassStarted);
                 match scan_pass(&mut engine, &mut route) {
                     Ok(reports) => {
                         retry_at = None;
