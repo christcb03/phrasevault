@@ -516,10 +516,23 @@ impl Engine {
         let centrals = crate::sync::load_central_all(&self.data_dir)?;
         let mut out = Vec::new();
         for binding in self.bindings()? {
+            // D81 — which roots DRAIN is per root, so the kind must be too.
+            // The listing used to read the folder's placement and label every
+            // root of it `migrate`, which in a three-root library said that all
+            // three drained when only one did. An operator reading that before
+            // deciding where to put a title would be reading a lie.
+            let staging = crate::sync::staging_roots_of(&self.data_dir, &binding.folder_id)?;
+            let opted_in = !staging.is_empty();
+            let drains = staging.iter().any(|u| u == &binding.source_uri);
             let (kind, store) = match centrals.iter().find(|(id, _, _)| id == &binding.folder_id)
             {
                 Some((_, dir, true)) => (BindKind::Mirror, Some(dir.clone())),
-                Some((_, dir, false)) => (BindKind::Migrate, Some(dir.clone())),
+                Some((_, dir, false)) if !opted_in || drains => {
+                    (BindKind::Migrate, Some(dir.clone()))
+                }
+                // Marked roots exist and this is not one of them: it KEEPS what
+                // it holds, and the store is still where new content goes.
+                Some((_, dir, false)) => (BindKind::InPlace, Some(dir.clone())),
                 None => (BindKind::InPlace, None),
             };
             let folder_path = self.folder_tree_path(&binding.folder_id)?;
@@ -1575,8 +1588,23 @@ impl Engine {
                 sig: add_sig,
             });
         }
+        // D81 — a MEASUREMENT follows its file. Attestation mints a successor
+        // node, and quality is keyed by node id, so without this every file the
+        // mover attests silently loses what the probe or the arrs measured
+        // about it — the whole backfill undone one migration at a time. Found
+        // in the lab: the winner of a cross-root upgrade arrived at the store
+        // with no quality at all, while its measurement sat stranded on the
+        // superseded node.
+        //
+        // Re-signed as a fresh event for the NEW id rather than moved: the log
+        // is append-only, and the successor is a different file node that
+        // happens to describe the same bytes.
+        let carried = self.media_quality(&old.id)?;
         let new_id = new_node.id.clone();
         self.append_durable(events)?;
+        if let Some((quality, source)) = carried {
+            self.set_media_quality(&new_id, &quality, &source)?;
+        }
         // local notes follow the node
         self.conn
             .execute(

@@ -923,6 +923,17 @@ fn tier_pass_inner(
                                     report.failed.push((label.clone(), e.to_string()));
                                     superseded_elsewhere = true;
                                     break;
+                                } else {
+                                    // D81 — RETIRE THE LOSER'S LOCATION. The
+                                    // bytes moved to trash; leaving the catalog
+                                    // pointing at where they used to be is the
+                                    // same stale-claim bug this milestone spent
+                                    // a day removing from the scan, reintroduced
+                                    // by the code that resolves the collision.
+                                    // Found in the lab, not by a test.
+                                    if let Err(e) = engine.remove_location(&occupant, &cand_uri) {
+                                        report.failed.push((label.clone(), e.to_string()));
+                                    }
                                 }
                             }
                             Some((_, verdict)) => {
@@ -941,8 +952,12 @@ fn tier_pass_inner(
                                 report.failed.push((
                                     label.clone(),
                                     format!(
-                                        "{} holds another live copy of this same tree path;                                          copy-selection rules are off (`--rules`), so a human                                          decides which survives",
-                                        cand.display()
+                                        "{} holds another live copy of this same tree path; {}",
+                                        cand.display(),
+                                        match rules {
+                                            Some(_) => "the rules could not separate them, so a human decides which survives",
+                                            None => "copy-selection rules are off (`--rules`), so a human decides which survives",
+                                        }
                                     ),
                                 ));
                                 superseded_elsewhere = true;

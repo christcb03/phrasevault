@@ -2303,6 +2303,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 .map(|e| (e.node.id, e.label))
                 .collect();
             let (mut done, mut skipped, mut failed, mut unreadable) = (0u64, 0u64, 0u64, 0u64);
+            let mut not_media = 0u64;
             for (id, label) in files {
                 if !force && engine.media_quality(&id)?.is_some() {
                     skipped += 1;
@@ -2314,6 +2315,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 };
                 match pvfs_core::probe::probe_headers(&path) {
                     Ok(mut q) => {
+                        // A library holds subtitles, artwork and NFOs as well
+                        // as video. ffprobe exits happily on those and reports
+                        // no video stream, which would otherwise be recorded as
+                        // a MEASUREMENT of 0x0 — marking the file "known" and
+                        // pinning a zero onto rungs the ladder should skip.
+                        // Nothing learned, nothing recorded.
+                        if q.width == 0 && q.height == 0 && q.video_codec.is_empty() {
+                            not_media += 1;
+                            continue;
+                        }
                         if deep {
                             q.decoded_ok =
                                 Some(pvfs_core::probe::decode_check(&path).unwrap_or(false));
@@ -2343,11 +2354,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             if json {
                 println!(
-                    "{{\"measured\":{done},\"already_known\":{skipped},\"unreadable\":{unreadable},\"failed\":{failed},\"dry_run\":{dry_run}}}"
+                    "{{\"measured\":{done},\"already_known\":{skipped},\"not_media\":{not_media},\"unreadable\":{unreadable},\"failed\":{failed},\"dry_run\":{dry_run}}}"
                 );
             } else {
                 println!(
-                    "{} {done} file(s); {skipped} already known, {unreadable} with no readable copy here, {failed} failed",
+                    "{} {done} file(s); {skipped} already known, {not_media} not video, {unreadable} with no readable copy here, {failed} failed",
                     if dry_run { "would measure" } else { "measured" }
                 );
                 if unreadable > 0 {
