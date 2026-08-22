@@ -674,6 +674,69 @@ pub fn set_central_tree(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
 }
 
 /// The file that proves a directory really is the central store.
+/// D81 — the same proof, for a BOUND ROOT.
+///
+/// Chris: "can we have a file that the system looks for to verify the mount
+/// itself is healthy… as long as that file is readable we can assume the mount
+/// is there for the purposes of a scan, if that file isn't readable just report
+/// a possible mount issue and don't change any files."
+///
+/// `scan_binding` already refuses a root whose PATH is missing. That catches an
+/// unmounted volume only when the mountpoint disappears with it; a volume that
+/// mounts EMPTY, or whose mountpoint directory survives unmounting, sails
+/// through — and then every tracked location under it stats as gone and the
+/// deletion pass retires the lot. That is the D74 drain incident's shape, on a
+/// path the D74 marker was never applied to.
+pub const ROOT_MARKER: &str = ".pvfs-root";
+
+/// Write a bound root's marker, as the bind is recorded.
+pub fn write_root_marker(dir: &Path, forest_id: &str) -> Result<()> {
+    let p = dir.join(ROOT_MARKER);
+    if let Ok(existing) = std::fs::read_to_string(&p) {
+        if existing.trim() == forest_id {
+            return Ok(());
+        }
+    }
+    // Best-effort: a read-only library is still a perfectly good root to scan,
+    // and refusing to bind one because we cannot leave a note in it would be
+    // the tail wagging the dog. `verify_root_marker` handles the absence.
+    let _ = std::fs::write(&p, format!("{forest_id}\n"));
+    Ok(())
+}
+
+/// Refuse a bound root that cannot show its marker AND has nothing in it.
+///
+/// Same discriminator as the central store's, for the same reason: an absent
+/// mount is an EMPTY directory, a real library is not. Not self-healing on the
+/// empty case — re-marking an unmounted mountpoint would defeat the entire
+/// point.
+pub fn verify_root_marker(dir: &Path) -> Result<()> {
+    let p = dir.join(ROOT_MARKER);
+    match std::fs::read_to_string(&p) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let non_empty = std::fs::read_dir(dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if non_empty {
+                let _ = std::fs::write(&p, "adopted\n");
+                return Ok(());
+            }
+            Err(bad(
+                "binding",
+                &format!(
+                    "{} is empty and carries no {ROOT_MARKER} — this is what an \
+                     UNMOUNTED volume looks like, and scanning it would retire every \
+                     location under it. Mount it, or bind it again once it holds the \
+                     library.",
+                    dir.display()
+                ),
+            ))
+        }
+        Err(e) => Err(PvfsError::io("read root marker", e)),
+    }
+}
+
 pub const CENTRAL_MARKER: &str = ".pvfs-central";
 
 /// Write the marker into a central store as placement is set.

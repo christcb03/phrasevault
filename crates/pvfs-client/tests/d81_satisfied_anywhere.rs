@@ -29,7 +29,10 @@ fn count_files(dir: &std::path::Path) -> usize {
                 let p = e.path();
                 if p.is_dir() {
                     walk(&p, n);
-                } else if p.file_name().and_then(|s| s.to_str()) != Some(".pvfs-central") {
+                } else if !matches!(
+                    p.file_name().and_then(|s| s.to_str()),
+                    Some(".pvfs-central") | Some(".pvfs-root")
+                ) {
                     *n += 1;
                 }
             }

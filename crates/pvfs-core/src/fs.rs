@@ -218,6 +218,12 @@ impl Engine {
                 &format!("{} is not an existing directory", spec.source_uri),
             ));
         }
+        // D81 4d — mark it now, while we can see it. From here on, its absence
+        // means the volume is not mounted, and the scan stops rather than
+        // retiring everything under it.
+        if let Ok(dir) = uri_to_path(&spec.source_uri) {
+            crate::sync::write_root_marker(&dir, &self.identity.forest_id)?;
+        }
         // D81 — a folder may have MANY roots. What is refused is a duplicate
         // (folder, directory) pair, and a directory already claimed by a
         // DIFFERENT folder; binding the same tree to a second directory is the
@@ -784,6 +790,13 @@ impl Engine {
                 id: b.source_uri.clone(),
             });
         }
+        // D81 4d — the path existing is not the volume being THERE. A volume
+        // that mounts empty, or whose mountpoint survives an unmount, passes
+        // the check above and then every tracked location under it stats as
+        // gone. The marker is what tells the difference (Chris's suggestion,
+        // and the same discriminator D74 gave central stores after the mover
+        // wrote 16MB to a VM's root filesystem believing it was the NAS).
+        crate::sync::verify_root_marker(&root)?;
         let mut stats = ScanStats::default();
 
         // 1. pure-FS walk
@@ -2160,7 +2173,13 @@ fn walk_disk(
     let uri = path_to_uri(dir)?;
     for entry in LocalBackend.list(&uri)? {
         if entry.name.starts_with('.') {
-            stats.skipped += 1;
+            // D81 — our OWN bookkeeping is not something the operator chose not
+            // to index, and counting it as `skipped` would put a permanent +1
+            // on every scan report of every root. Dotfiles they put there are
+            // still counted, because that is a fact about their directory.
+            if entry.name != crate::sync::ROOT_MARKER {
+                stats.skipped += 1;
+            }
             continue;
         }
         let child = dir.join(&entry.name);
