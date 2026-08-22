@@ -624,14 +624,38 @@ fn tier_pass_inner(
         // its file:// locations retire once the central copy is live, and the
         // evict pass then reclaims the staged bytes. Resolved per root from
         // the binding, so in-place binds elsewhere are never touched.
-        let staging_prefix: Option<String> = if keep {
-            None
+        // D81 4a — every root, not just the first. With one binding per folder
+        // this could be a single prefix; with several, taking only one means
+        // the others' staged copies are never recognised as staged.
+        let staging_prefixes: Vec<String> = if keep {
+            Vec::new()
         } else {
             // trailing slash: "file:///a/b" must not match "file:///a/bXX/…"
             engine
-                .binding_for(&root)?
+                .bindings_for(&root)?
+                .iter()
                 .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
+                .collect()
         };
+        // D81 4b — the library's roots, as directories. A file sitting at its
+        // tree path under ANY of them is in the library; only the write target
+        // is where new content is PUT.
+        //
+        // STAGING ROOTS ARE EXCLUDED, and the first draft of this got it wrong
+        // by including them: an incoming file sits in staging, staging is a
+        // bound root, so the file counted as "already in the library" and was
+        // never placed at all. Ingest would have silently stopped. That is
+        // exactly the line 4a-i draws — a file whose only live location is a
+        // staging root is placement work, not a file that has arrived.
+        let library_dirs: Vec<std::path::PathBuf> = engine
+            .bindings_for(&root)?
+            .iter()
+            .filter(|b| {
+                let pfx = format!("{}/", b.source_uri.trim_end_matches('/'));
+                !staging_prefixes.contains(&pfx)
+            })
+            .filter_map(|b| pvfs_core::storage::uri_to_path(&b.source_uri).ok())
+            .collect();
         for entry in engine.walk(&root)?.entries {
             if entry.node.node_type != pvfs_core::TYPE_FILE {
                 continue;
@@ -680,6 +704,24 @@ fn tier_pass_inner(
             let has_central = match &tree_dest {
                 Some(want) => {
                     let want_uri = pvfs_core::storage::path_to_uri(want)?;
+                    // D81 4b — SATISFIED AT ANY LIBRARY ROOT.
+                    //
+                    // This used to ask only "is there a copy at the write
+                    // target". So a title Chris hand-moved from Data to
+                    // Data_ext was recorded correctly by the scan and then
+                    // FETCHED BACK by the very next mover pass, because it was
+                    // no longer at the destination. The catalog knew where the
+                    // file was; the mover simply was not asking.
+                    //
+                    // The write target is still the ONE place new content is
+                    // put (Chris: "writing needs to be a single place"). Being
+                    // already somewhere in the library is a different question,
+                    // and this is it.
+                    let segs = engine.tree_path_under(&id, &root)?.unwrap_or_default();
+                    let at_a_root: Vec<std::path::PathBuf> = library_dirs
+                        .iter()
+                        .map(|d| segs.iter().fold(d.clone(), |acc, s| acc.join(s)))
+                        .collect();
                     // D75: a REPLICA logs its store copy PIN-QUALIFIED, because a
                     // bare file:// path is host-implicit and that copy lives on a
                     // specific box. So the satisfied check must recognise both
@@ -692,7 +734,12 @@ fn tier_pass_inner(
                         .as_deref()
                         .map(|pin| format!("pvfs-host://{pin}{}", want.display()));
                     engine.locations(&id)?.iter().any(|u| {
-                        u == &want_uri || want_host.as_deref().is_some_and(|w| u == w)
+                        if u == &want_uri || want_host.as_deref().is_some_and(|w| u == w) {
+                            return true;
+                        }
+                        // Held by ANY box, at its tree path under ANY root.
+                        pvfs_core::storage::any_path_of(u)
+                            .is_some_and(|p| !segs.is_empty() && at_a_root.contains(&p))
                     })
                 }
                 None => engine.locations(&id)?.iter().any(|u| {
@@ -700,7 +747,7 @@ fn tier_pass_inner(
                         u.starts_with(&dest_prefix)
                     } else {
                         logged_local_location(u, &own_pin)
-                            && !staging_prefix.as_deref().is_some_and(|p| u.starts_with(p))
+                            && !staging_prefixes.iter().any(|p| u.starts_with(p))
                     }
                 }),
             };
@@ -1058,9 +1105,7 @@ fn tier_pass_inner(
                 // Adopting an existing store (D74) makes source == store the
                 // NORMAL case, so this is a guard the drain logic always
                 // needed and never had.
-                let staged = staging_prefix
-                    .as_deref()
-                    .is_some_and(|p| u.starts_with(p))
+                let staged = staging_prefixes.iter().any(|p| u.starts_with(p))
                     && !u.starts_with(&dest_prefix);
                 if foreign || staged {
                     if dry_run {

@@ -139,6 +139,21 @@ pub fn local_path_of(uri: &str, own_pin: Option<&str>) -> Option<PathBuf> {
     }
 }
 
+/// The path a location URI denotes, on WHICHEVER host holds it.
+///
+/// D81 4b. `local_path_of` answers "is this mine, and where"; this answers the
+/// weaker question "what path does this name", which is what deciding whether a
+/// file already sits at a library root requires — a copy held by ANOTHER box at
+/// one of the library's roots satisfies the library just as well as our own.
+/// Returns `None` for anything that is not a filesystem path (`pvfs-sync:///…`
+/// blobs, say), which is the honest answer: those have no tree path to compare.
+pub fn any_path_of(uri: &str) -> Option<PathBuf> {
+    if let Ok(p) = uri_to_path(uri) {
+        return Some(p);
+    }
+    parse_host_uri(uri).map(|(_, path)| PathBuf::from(path))
+}
+
 /// This data dir's own transport pin, if it has ever served a network
 /// listener (`pvfsd --listen` mints it). `None` until then — a host nobody
 /// can dial has no meaningful location to offer.
