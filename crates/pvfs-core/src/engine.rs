@@ -2077,7 +2077,54 @@ impl Engine {
 
     /// Durable nodes with zero active inbound links (counted across BOTH
     /// links and temp_links — design doc §6.1).
-    pub fn list_orphans(&self) -> Result<Vec<Node>> {
+/// Files the catalog still claims, that NOBODY holds (D81).
+    ///
+    /// The third kind of orphan, and the one with no reporting until now:
+    /// `list_orphans` finds nodes with no live LINK, `orphaned_local_locations`
+    /// finds bytes with no live NODE. This finds a node that is still in the
+    /// tree, still shown to anyone browsing, whose every location has been
+    /// retired — the residue of a file deleted outside PVFS.
+    ///
+    /// Deliberately a REPORT and not an action. A scan cannot distinguish
+    /// "deleted on purpose" from "deleted by accident" from "the volume is
+    /// unavailable" — that is D81 4a-ii's whole case matrix — so unlinking
+    /// these automatically would be inferring intent from a filesystem diff,
+    /// which is the mistake this milestone exists to stop making.
+    ///
+    /// What DID change is how much the report is worth. Before 4d, an
+    /// unmounted volume retired every location under it, so this list would
+    /// have been mostly noise. Now a root must prove it is mounted before a
+    /// scan may prune it, so a file reaching this list was gone while its
+    /// volume was verifiably there.
+    pub fn files_held_by_nobody(&self) -> Result<Vec<(NodeId, String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.id, n.label, COALESCE(MAX(l.removed_at), 0)
+                   FROM nodes n
+                   JOIN links k ON k.child_id = n.id AND k.removed_at IS NULL
+                   LEFT JOIN file_locations l ON l.file_id = n.id
+                  WHERE n.node_type = 'file'
+                    AND NOT EXISTS (SELECT 1 FROM file_locations a
+                                     WHERE a.file_id = n.id AND a.removed_at IS NULL)
+                  GROUP BY n.id, n.label
+                  ORDER BY 3 DESC",
+            )
+            .map_err(map_db("held by nobody"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(map_db("held by nobody"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("held by nobody"))
+    }
+
+        pub fn list_orphans(&self) -> Result<Vec<Node>> {
         let mut stmt = self
             .conn
             .prepare(

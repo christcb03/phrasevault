@@ -141,6 +141,19 @@ enum Cmd {
     Audit,
     /// List orphaned durable nodes
     Orphans,
+    /// Files the catalog claims that NOBODY holds — the residue of deletions
+    /// made outside PVFS (D81).
+    ///
+    /// A REPORT, not a sweep. A scan cannot tell a deliberate deletion from an
+    /// accident from an unavailable volume, so what to do about these is the
+    /// operator's call — `--forget` makes it, per file or for all of them.
+    Missing {
+        /// Unlink them from the tree. Prompts unless --yes.
+        #[arg(long)]
+        forget: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Hard-delete orphaned nodes (explicit)
     Purge { ids: Vec<String> },
     /// Device certificate operations
@@ -2948,6 +2961,83 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         );
                     }
                 }
+            }
+            engine.close()
+        }
+        Cmd::Missing { forget, yes } => {
+            let mut engine = Engine::open(&ctx?)?;
+            let rows = engine.files_held_by_nobody()?;
+            if json {
+                let items: Vec<String> = rows
+                    .iter()
+                    .map(|(id, label, since)| {
+                        format!(
+                            "{{\"id\":\"{}\",\"label\":\"{}\",\"last_seen_ms\":{}}}",
+                            id,
+                            json_escape(label),
+                            since
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+            } else if rows.is_empty() {
+                println!("every file the catalog knows is held by somebody");
+            } else {
+                for (id, label, _) in &rows {
+                    println!("  {}  {label}", &id[..12]);
+                }
+                println!(
+                    "{} file(s) the catalog claims that nobody holds",
+                    rows.len()
+                );
+                if !forget {
+                    println!(
+                        "these are REPORTED, not swept: a scan cannot tell a deliberate \n\
+                         deletion from an accident from an unavailable volume. \n\
+                         `pvfs missing --forget` unlinks them once you have decided."
+                    );
+                }
+            }
+            if forget && !rows.is_empty() {
+                if !yes {
+                    let a = prompt_line(
+                        &format!("unlink {} file(s) from the tree? [y/N]", rows.len()),
+                        Some("N"),
+                    )?;
+                    if !a.trim().eq_ignore_ascii_case("y") {
+                        println!("nothing was changed");
+                        return engine.close();
+                    }
+                }
+                let mut done = 0u64;
+                for (id, label, _) in &rows {
+                    // Every live link into this node, so a file that is
+                    // referenced twice does not survive half-forgotten.
+                    let links: Vec<String> = match engine.parent_of(id)? {
+                        Some(parent) => engine
+                            .children(&parent)?
+                            .into_iter()
+                            .filter(|c| &c.node.id == id)
+                            .map(|c| c.link_id)
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if links.is_empty() {
+                        println!("  FAILED  {label}: no live link to remove");
+                        continue;
+                    }
+                    let mut ok = true;
+                    for l in links {
+                        if let Err(e) = engine.remove_link(&l) {
+                            println!("  FAILED  {label}: {e}");
+                            ok = false;
+                        }
+                    }
+                    if ok {
+                        done += 1;
+                    }
+                }
+                println!("unlinked {done} file(s); `pvfs purge` hard-deletes them if you want that too");
             }
             engine.close()
         }
