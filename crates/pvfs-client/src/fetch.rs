@@ -452,6 +452,46 @@ pub struct TierReport {
 /// manufacture a decision out of missing information.
 ///
 /// `Some((true, _))` = the INCOMING copy wins and the occupant is trashed.
+/// Retire the loser of a collision: its location, and its place in the tree.
+///
+/// D81, and Chris's call on the shape. When the ladder decides, the loser's
+/// bytes go to trash — but leaving its NODE linked showed a phantom duplicate
+/// of every upgraded title in a Plex-facing library, and leaving its LOCATION
+/// pointing at a path that now holds the winner's bytes was worse than a
+/// phantom: it was a lie the catalog would act on.
+///
+/// The trash is the recovery mechanism, not the node. Restoring from it is a
+/// deliberate act either way.
+fn retire_loser(
+    engine: &mut pvfs_core::Engine,
+    loser: &str,
+    at: &std::path::Path,
+) -> Result<(), PvfsError> {
+    // The location that named the trashed bytes, in whichever form it was
+    // recorded (a replica writes them pin-qualified — D81).
+    let doomed: Vec<String> = engine
+        .locations(&loser.to_string())?
+        .into_iter()
+        .filter(|u| pvfs_core::storage::any_path_of(u).is_some_and(|p| p == at))
+        .collect();
+    for u in doomed {
+        let _ = engine.remove_location(&loser.to_string(), &u);
+    }
+    // …and out of the tree, so nobody browsing sees a title that is in trash.
+    if let Some(parent) = engine.parent_of(&loser.to_string())? {
+        let links: Vec<String> = engine
+            .children(&parent)?
+            .into_iter()
+            .filter(|c| c.node.id == loser)
+            .map(|c| c.link_id)
+            .collect();
+        for l in links {
+            let _ = engine.remove_link(&l);
+        }
+    }
+    Ok(())
+}
+
 fn decide_collision(
     engine: &Engine,
     incoming: &str,
@@ -923,17 +963,8 @@ fn tier_pass_inner(
                                     report.failed.push((label.clone(), e.to_string()));
                                     superseded_elsewhere = true;
                                     break;
-                                } else {
-                                    // D81 — RETIRE THE LOSER'S LOCATION. The
-                                    // bytes moved to trash; leaving the catalog
-                                    // pointing at where they used to be is the
-                                    // same stale-claim bug this milestone spent
-                                    // a day removing from the scan, reintroduced
-                                    // by the code that resolves the collision.
-                                    // Found in the lab, not by a test.
-                                    if let Err(e) = engine.remove_location(&occupant, &cand_uri) {
-                                        report.failed.push((label.clone(), e.to_string()));
-                                    }
+                                } else if let Err(e) = retire_loser(engine, &occupant, cand) {
+                                    report.failed.push((label.clone(), e.to_string()));
                                 }
                             }
                             Some((_, verdict)) => {
@@ -1022,6 +1053,15 @@ fn tier_pass_inner(
                                     }
                                     eprintln!("tier: {label} replaces the copy in place — {}", verdict.reason());
                                     if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
+                                        report.failed.push((label, e.to_string()));
+                                        continue;
+                                    }
+                                    // Without this the loser kept a location
+                                    // naming `cpath` — which the winner is
+                                    // about to be written to. Two nodes, one
+                                    // path, and the stale one pointing at the
+                                    // other's bytes.
+                                    if let Err(e) = retire_loser(engine, &occupant, &cpath) {
                                         report.failed.push((label, e.to_string()));
                                         continue;
                                     }

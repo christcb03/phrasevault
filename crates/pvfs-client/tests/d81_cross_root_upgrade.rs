@@ -24,6 +24,7 @@ struct Rig {
     data_dir: std::path::PathBuf,
     warm: std::path::PathBuf,
     cold: std::path::PathBuf,
+    media: String,
 }
 
 /// A cold title on `Data_ext`, and its upgrade waiting in staging.
@@ -69,7 +70,7 @@ fn rig(cold_bytes: usize, new_bytes: usize) -> Rig {
         true,
     )
     .unwrap();
-    Rig { _tmp: tmp, engine, data_dir, warm, cold }
+    Rig { _tmp: tmp, engine, data_dir, warm, cold, media }
 }
 
 fn cold_copy(r: &Rig) -> std::path::PathBuf {
@@ -208,3 +209,62 @@ fn walk_find(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     hit
 }
 
+
+/// The loser leaves the tree, not just the disk (Chris's call).
+///
+/// The ladder trashing the bytes while leaving the node linked showed a phantom
+/// duplicate of every upgraded title to anything browsing the library — and the
+/// loser's LOCATION still named a path that, in the same-root case, the winner
+/// was about to be written to. A stale claim pointing at someone else's bytes
+/// is worse than a phantom.
+#[test]
+fn the_loser_leaves_the_tree_and_takes_its_location_with_it() {
+    let mut r = rig(3000, 9000);
+    let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
+    pvfs_client::fetch::tier_pass_ruled(
+        &mut r.engine,
+        &mut fetcher,
+        false,
+        Some(Rules::default()),
+    )
+    .unwrap()
+    .expect("a central placement exists");
+
+    // One live file at this tree path, not two.
+    let live: Vec<String> = r
+        .engine
+        .walk(&r.media)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.node.node_type == pvfs_core::TYPE_FILE && e.label == "cold.mkv")
+        .map(|e| e.node.id)
+        .collect();
+    assert_eq!(
+        live.len(),
+        1,
+        "the trashed loser must not still be shown in the tree: {live:?}"
+    );
+
+    // And nothing anywhere claims a path that does not hold its bytes.
+    let mut stale = 0;
+    for e in r.engine.walk(&r.media).unwrap() {
+        if e.node.node_type != pvfs_core::TYPE_FILE {
+            continue;
+        }
+        for u in r.engine.locations(&e.node.id).unwrap() {
+            if let Some(p) = pvfs_core::storage::any_path_of(&u) {
+                if !p.exists() {
+                    stale += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(stale, 0, "no location may name a path its bytes have left");
+
+    // The bytes are still recoverable — trashed, never deleted.
+    assert!(
+        walk_find(&r.cold, "cold.mkv").is_some(),
+        "the loser's bytes must still be in the trash"
+    );
+    r.engine.close().unwrap();
+}
