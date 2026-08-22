@@ -704,6 +704,27 @@ pub fn write_root_marker(dir: &Path, forest_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Does this tree contain any regular file at all?
+///
+/// The discriminator between "a library that predates the marker" and "the
+/// skeleton of a volume that is not mounted". Directories are not evidence:
+/// an unmounted mountpoint keeps whatever directory structure was created on
+/// it, and that is the case this exists to catch.
+fn holds_a_file(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut dirs = Vec::new();
+    for e in rd.flatten() {
+        match e.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(e.path()),
+            Ok(_) => return true, // a file — this is a real library
+            Err(_) => {}
+        }
+    }
+    dirs.iter().any(|d| holds_a_file(d))
+}
+
 /// Refuse a bound root that cannot show its marker AND has nothing in it.
 ///
 /// Same discriminator as the central store's, for the same reason: an absent
@@ -715,10 +736,18 @@ pub fn verify_root_marker(dir: &Path) -> Result<()> {
     match std::fs::read_to_string(&p) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let non_empty = std::fs::read_dir(dir)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-            if non_empty {
+            // "Non-empty" must mean HOLDS FILES, not merely has entries.
+            //
+            // Found on the NAS: a root whose files had all moved away still had
+            // its empty `Movies/` tree, so `read_dir().next().is_some()` called
+            // it a real library and adopted it. That is precisely what a stale
+            // mountpoint looks like — the directory skeleton of a volume that
+            // is no longer there — and adopting it would let the very next scan
+            // retire every location beneath it.
+            //
+            // Short-circuits on the first file, so a real library costs one
+            // readdir and an empty skeleton costs a walk of nothing.
+            if holds_a_file(dir) {
                 let _ = std::fs::write(&p, "adopted\n");
                 return Ok(());
             }

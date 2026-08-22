@@ -137,6 +137,21 @@ pub fn move_to_root(
             }
         }
 
+        // 1b. FLUSH IT TO DISK before believing it arrived.
+        //
+        // `std::fs::copy` returns once the bytes are in the page cache, so the
+        // size check below would happily read them back from RAM, the source
+        // would be deleted, and a power loss in the seconds that follow would
+        // take the only copy with it. Measured on the NAS: a 2GB move returned
+        // in 13s with the flush still in flight behind it.
+        //
+        // This is the one place in the milestone where the ordering rule —
+        // place, VERIFY, then retire — depends on "arrived" meaning committed
+        // rather than merely accepted.
+        if let Ok(f) = std::fs::File::open(&want) {
+            let _ = f.sync_all();
+        }
+
         // 2. VERIFY it actually arrived, at the right size, before anything is
         //    retired. This is the step whose absence turned D74's drain into
         //    26,729 stranded files.

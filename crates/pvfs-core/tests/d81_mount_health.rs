@@ -117,3 +117,46 @@ fn a_vanished_volume_stops_the_scan_instead_of_emptying_the_catalog() {
     );
     engine.close().unwrap();
 }
+
+/// A directory SKELETON is not a library.
+///
+/// Found on the NAS, not in a test: a root whose files had all moved away still
+/// had its empty `Movies/` tree, and `read_dir().next().is_some()` called that
+/// a real library and adopted it. An unmounted mountpoint keeps whatever
+/// directory structure was created on it, so directories are not evidence of
+/// anything — and adopting one lets the next scan retire every location under
+/// it, which is the whole failure this guard exists to prevent.
+#[test]
+fn an_empty_directory_tree_is_not_evidence_of_a_library() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Movies/Some Title (2001)")).unwrap();
+    std::fs::create_dir_all(dir.path().join("TV/A Show/Season 01")).unwrap();
+
+    let err = verify_root_marker(dir.path()).unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("unmounted"),
+        "a skeleton with no files in it is exactly what an absent mount looks \
+         like: {err}"
+    );
+    assert!(
+        !dir.path().join(ROOT_MARKER).exists(),
+        "and it must NOT be adopted and marked — that would bless the skeleton \
+         permanently"
+    );
+}
+
+/// One file anywhere beneath it, however deep, is enough.
+#[test]
+fn a_single_file_deep_in_the_tree_is_enough_to_adopt() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("TV/A Show/Season 01");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("ep.mkv"), b"x").unwrap();
+
+    assert!(
+        verify_root_marker(dir.path()).is_ok(),
+        "a real library that predates the marker must still be adopted, and its \
+         files may be several levels down"
+    );
+    assert!(dir.path().join(ROOT_MARKER).exists());
+}
