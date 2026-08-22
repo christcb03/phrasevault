@@ -468,6 +468,24 @@ pub struct Placement {
     /// this box's `pvfs-host://` locations so the fleet can dial them.
     pub sync_advertise: Vec<NodeId>,
     pub central: Vec<(NodeId, PathBuf)>,
+    /// D81 — which ROOTS of a folder drain. `(folder_id, source_uri)`.
+    ///
+    /// `BindKind` is derived per FOLDER, so "this volume stages, that one keeps"
+    /// was inexpressible: under `migrate` every bound root counted as staging,
+    /// so a title hand-moved to a cold volume was fetched straight back; under
+    /// `mirror` nothing drained and nothing was ever placed. Chris's library
+    /// needs both at once — feederbox drains, `Data` is the write target,
+    /// `Data_ext` keeps.
+    ///
+    /// **A root is a LIBRARY root unless it is listed here** (Chris: default to
+    /// keeps; currently only feederbox's `/mnt/local/Media` should drain). The
+    /// safe default matters: mis-marking a library root as staging retires real
+    /// locations, mis-marking a staging root as library only leaves bytes
+    /// where they are.
+    ///
+    /// Deployment state, like everything else in this file — doc 17 §6 — so no
+    /// schema and no event.
+    pub staging_roots: Vec<(NodeId, String)>,
     /// P8 (doc 21): `central-keep` — the mirror mode. The mover lands and
     /// logs the verified central copy but NEVER retires the source, so the
     /// space keeps its bytes and the tree gains a backup replica (and a
@@ -510,6 +528,13 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
                     out.served_by.push((id.to_string(), inst.to_string(), PathBuf::from(path)))
                 }
                 _ => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
+        } else if let Some(rest) = line.strip_prefix("staging-root ") {
+            // `staging-root <folder-id> <source-uri>` — the URI is the REST, so
+            // a directory with spaces survives a round trip.
+            match rest.split_once(' ') {
+                Some((id, uri)) => out.staging_roots.push((id.to_string(), uri.to_string())),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
             }
         } else if let Some(id) = line.strip_prefix("central-tree ") {
             out.central_tree.push(id.to_string());
@@ -581,6 +606,9 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     for (r, d) in &p.central {
         text.push_str(&format!("central {r} {}\n", d.display()));
     }
+    for (r, u) in &p.staging_roots {
+        text.push_str(&format!("staging-root {r} {u}\n"));
+    }
     for (r, d) in &p.central_keep {
         text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
@@ -614,6 +642,28 @@ pub fn set_sync_mode(data_dir: &Path, id: &NodeId, sync: bool, advertise: bool) 
 /// `keep` = the P8 mirror mode: the mover copies + logs but never retires.
 /// D71 W5: mark (or unmark) a central root as tree-layout — migrated files
 /// land at their own path under the store root instead of `<shard>/<node-id>`.
+/// Mark one ROOT of a folder as staging (drains), or clear the mark (D81).
+pub fn set_staging_root(data_dir: &Path, id: &NodeId, source_uri: &str, on: bool) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.staging_roots
+        .retain(|(r, u)| !(r == id && u == source_uri));
+    if on {
+        p.staging_roots.push((id.clone(), source_uri.to_string()));
+    }
+    save_placement(data_dir, &p)
+}
+
+/// The staging roots of one folder — the roots that DRAIN. Everything else
+/// bound to that folder is a library root.
+pub fn staging_roots_of(data_dir: &Path, id: &NodeId) -> Result<Vec<String>> {
+    Ok(load_placement_full(data_dir)?
+        .staging_roots
+        .into_iter()
+        .filter(|(r, _)| r == id)
+        .map(|(_, u)| u)
+        .collect())
+}
+
 pub fn set_central_tree(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
     p.central_tree.retain(|r| r != id);

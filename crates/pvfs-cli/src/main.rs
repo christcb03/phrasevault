@@ -5526,6 +5526,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             if let Some(dest) = &store {
                 pvfs_core::sync::set_central(&data_dir, &folder, dest, kind == "mirror")?;
             }
+            // D81 — `migrate` is a property of THIS ROOT, not of the folder.
+            // A folder can now hold a staging root and library roots at once,
+            // which is Chris's actual topology: feederbox drains, Data is the
+            // write target, Data_ext keeps. Unmarked roots are LIBRARY roots —
+            // the safe default, since mis-marking a library root as staging
+            // retires real locations while the reverse only leaves bytes where
+            // they already are.
+            pvfs_core::sync::set_staging_root(
+                &data_dir,
+                &folder,
+                &source_uri,
+                kind == "migrate",
+            )?;
             if json {
                 println!(
                     "{{\"bound\":true,\"kind\":\"{}\",\"source_uri\":\"{}\"}}",

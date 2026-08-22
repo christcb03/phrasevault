@@ -462,9 +462,25 @@ fn decide_collision(
     let cand = |id: &str| -> Option<pvfs_core::media::Candidate> {
         let node = engine.node(&id.to_string()).ok()??;
         let payload = pvfs_core::FilePayload::decode(&node.payload).ok()?;
-        // Never measured ⇒ no opinion. Falling back to size alone here would
-        // quietly decide upgrades on a signal Chris explicitly ranked LAST.
-        let (quality, _src) = engine.media_quality(&id.to_string()).ok()??;
+        // NEVER MEASURED IS NOT NO OPINION — it is an empty rung, and the
+        // ladder is built to fall through empty rungs to the next one.
+        //
+        // This used to bail here, which made the mover REFUSE every unmeasured
+        // pair while `pvfs explain` — same ladder, same two files — decided
+        // them on size and said so. Chris, on exactly that case: "I wanted the
+        // size comparison for that exact case, I want the larger one to win."
+        // His rule was that size ranks LAST, not that it never applies.
+        //
+        // It matters at production scale rather than in the abstract: all three
+        // collisions pending on the real library are TV, and TV is the 5,868
+        // files Sonarr never analysed. Bailing here refused precisely the cases
+        // `--rules` exists to settle, while the comment below promised they
+        // would reach size.
+        let (quality, _src) = engine
+            .media_quality(&id.to_string())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| (Default::default(), "never measured".into()));
         Some(pvfs_core::media::Candidate {
             label: node.label.clone(),
             quality,
@@ -624,16 +640,38 @@ fn tier_pass_inner(
         // its file:// locations retire once the central copy is live, and the
         // evict pass then reclaims the staged bytes. Resolved per root from
         // the binding, so in-place binds elsewhere are never touched.
-        // D81 4a — every root, not just the first. With one binding per folder
-        // this could be a single prefix; with several, taking only one means
-        // the others' staged copies are never recognised as staged.
+        // D81 — WHICH ROOTS DRAIN IS PER ROOT, not per folder.
+        //
+        // This used to be "every bound root, when the placement is migrate",
+        // which made Chris's topology inexpressible: feederbox must drain while
+        // Data_ext must not, and they are roots of the same folder. Under
+        // migrate every root staged (so a hand-moved title was fetched back);
+        // under mirror none did (so nothing was ever placed).
+        //
+        // A root is a LIBRARY root unless explicitly marked staging. That
+        // default is the safe one: mis-marking a library root as staging
+        // retires real locations, while the reverse merely leaves bytes where
+        // they already are.
+        // BACKWARD COMPATIBILITY, and it is not optional. A folder that has
+        // never been marked keeps the OLD meaning — under `migrate`, every
+        // bound root stages. Without this, upgrading a running fleet would make
+        // every staging root look like a library root, so every pending file
+        // would read as "already in the library" and the mover would quietly
+        // stop placing anything. Silent, and exactly the failure mode this
+        // milestone keeps finding.
+        //
+        // Marking ANY root of a folder opts that folder into the per-root
+        // model, where unmarked means LIBRARY (Chris: default to keeps).
+        let marked = pvfs_core::sync::staging_roots_of(&data_dir, &root)?;
+        let opted_in = !marked.is_empty();
+        // trailing slash: "file:///a/b" must not match "file:///a/bXX/…"
         let staging_prefixes: Vec<String> = if keep {
             Vec::new()
         } else {
-            // trailing slash: "file:///a/b" must not match "file:///a/bXX/…"
             engine
                 .bindings_for(&root)?
                 .iter()
+                .filter(|b| !opted_in || marked.iter().any(|u| u == &b.source_uri))
                 .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
                 .collect()
         };
