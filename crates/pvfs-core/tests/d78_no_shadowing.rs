@@ -70,11 +70,20 @@ fn adopting_a_store_leaves_no_binding_behind() {
     engine.close().unwrap();
 }
 
-/// The property that made the bug possible, pinned so it cannot surprise
-/// anyone again: one folder has ONE binding, and the second bind replaces the
-/// first rather than sitting alongside it.
+/// SUPERSEDED BEHAVIOUR, KEPT AS A TEST OF THE PROPERTY THAT MATTERED.
+///
+/// D78 pinned "one folder has ONE binding", because a second bind silently
+/// REPLACING the first is what switched off feederbox's watcher. The refusal
+/// was the fix available at the time; it was never the point.
+///
+/// D81 removes the one-binding limit — Chris needs `Data` and `Data_ext` as
+/// roots of one library — and in doing so makes the original bug impossible by
+/// construction rather than by refusal: a second bind now sits ALONGSIDE the
+/// first, so there is nothing left to be shadowed. This test therefore asserts
+/// the property D78 cared about (the first root survives a second bind) rather
+/// than the mechanism it used to get it (refusal).
 #[test]
-fn a_folder_has_exactly_one_binding_fleet_wide() {
+fn a_second_bind_never_displaces_the_first() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
     let b = dir.path().join("b");
@@ -99,19 +108,21 @@ fn a_folder_has_exactly_one_binding_fleet_wide() {
     engine.bind_folder(&media, spec(&a)).unwrap();
     assert_eq!(engine.bindings().unwrap().len(), 1);
 
-    // A second bind of the SAME folder is refused rather than silently
-    // replacing the first — which is what makes `scan_unbound` necessary.
-    let second = engine.bind_folder(&media, spec(&b));
-    assert!(
-        second.is_err(),
-        "binding an already-bound folder must be refused, not silently taken over"
-    );
+    // A second bind of the SAME folder now ADDS a root (D81). What must never
+    // happen — then or now — is the first one quietly ceasing to be scanned.
+    engine
+        .bind_folder(&media, spec(&b))
+        .expect("a second root is a supported topology, not an error");
     let rows = engine.bindings().unwrap();
-    assert_eq!(rows.len(), 1, "still exactly one");
+    assert_eq!(rows.len(), 2, "both roots, not one replacing the other");
     assert!(
-        rows[0].source_uri.ends_with("/a"),
-        "and it is still the FIRST one: {}",
-        rows[0].source_uri
+        rows.iter().any(|r| r.source_uri.ends_with("/a")),
+        "THE ORIGINAL BUG: the first root must still be there — its
+         disappearance is what silently stopped feederbox indexing: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.source_uri.ends_with("/b")),
+        "{rows:?}"
     );
     engine.close().unwrap();
 }

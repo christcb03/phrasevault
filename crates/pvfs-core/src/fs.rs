@@ -218,14 +218,27 @@ impl Engine {
                 &format!("{} is not an existing directory", spec.source_uri),
             ));
         }
-        if self.binding_for(folder)?.is_some() {
-            return Err(bad("folder", "already bound; unbind first"));
+        // D81 — a folder may have MANY roots. What is refused is a duplicate
+        // (folder, directory) pair, and a directory already claimed by a
+        // DIFFERENT folder; binding the same tree to a second directory is the
+        // whole point. Before this, the second bind was refused outright — and
+        // on a replica it did something worse, silently REPLACING the first.
+        if self
+            .bindings_for(folder)?
+            .iter()
+            .any(|b| b.source_uri == spec.source_uri)
+        {
+            return Err(bad(
+                "source_uri",
+                &format!("{} is already a root of this folder", spec.source_uri),
+            ));
         }
         let dup: Option<String> = self
             .conn
             .query_row(
-                "SELECT folder_id FROM folder_bindings WHERE source_uri = ?1 AND unbound_at IS NULL",
-                params![spec.source_uri],
+                "SELECT folder_id FROM folder_bindings
+                  WHERE source_uri = ?1 AND folder_id != ?2 AND unbound_at IS NULL",
+                params![spec.source_uri, folder],
                 |r| r.get(0),
             )
             .optional()
@@ -253,7 +266,8 @@ impl Engine {
         // content; only the enrollment itself stays here.
         if self.replica {
             let mut rows = load_local_bindings(&self.data_dir)?;
-            rows.retain(|b| b.folder_id != *folder);
+            // D81 — drop only THIS root's row, not every root of the folder.
+            rows.retain(|b| !(b.folder_id == *folder && b.source_uri == spec.source_uri));
             rows.push(Binding {
                 folder_id: folder.clone(),
                 source_uri: spec.source_uri,
@@ -298,29 +312,71 @@ impl Engine {
         }])
     }
 
-    pub fn unbind_folder(&mut self, folder: &NodeId) -> Result<()> {
+    /// Remove one root, or the only root.
+    ///
+    /// D81 — with many roots per folder, "unbind this folder" is ambiguous and
+    /// the ambiguous answer is destructive: unbinding every root of a
+    /// two-volume library because the caller named no root would be a very
+    /// quiet way to lose half a catalog's reach. So it is refused, and the
+    /// roots are listed.
+    pub fn unbind_folder(&mut self, folder: &NodeId, root: Option<&str>) -> Result<()> {
         if !self.replica {
             self.ensure_device_active()?;
         }
-        if self.binding_for(folder)?.is_none() {
+        let roots = self.bindings_for(folder)?;
+        if roots.is_empty() {
             return Err(PvfsError::NotFound {
                 kind: "binding",
                 id: folder.clone(),
             });
         }
+        let target: String = match root {
+            Some(r) => {
+                if !roots.iter().any(|b| b.source_uri == r) {
+                    return Err(bad(
+                        "root",
+                        &format!(
+                            "{r} is not a root of this folder; it has: {}",
+                            roots
+                                .iter()
+                                .map(|b| b.source_uri.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                }
+                r.to_string()
+            }
+            None if roots.len() == 1 => roots[0].source_uri.clone(),
+            None => {
+                return Err(bad(
+                    "root",
+                    &format!(
+                        "this folder has {} roots — name the one to remove: {}",
+                        roots.len(),
+                        roots
+                            .iter()
+                            .map(|b| b.source_uri.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ))
+            }
+        };
         if self.replica {
             let mut rows = load_local_bindings(&self.data_dir)?;
-            rows.retain(|b| b.folder_id != *folder);
+            rows.retain(|b| !(b.folder_id == *folder && b.source_uri == target));
             return save_local_bindings(&self.data_dir, &rows);
         }
         let t = now_ms();
         let me = self.device.pubkey();
         let sig = crate::crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_folder_unbound(folder, t, &me),
+            &event::msg_folder_unbound_root(folder, &target, t, &me),
         )?;
-        self.append_durable(vec![Event::FolderUnbound {
+        self.append_durable(vec![Event::FolderUnboundRoot {
             folder_id: folder.clone(),
+            source_uri: target,
             unbound_at: t,
             author: me,
             sig,
@@ -385,6 +441,36 @@ impl Engine {
     /// Whether `binding` was bound by this machine.
     pub fn is_local_binding(&self, binding: &Binding) -> bool {
         binding.bound_by == self.device.pubkey()
+    }
+
+    /// EVERY root of this folder — logged and this machine's own (D81).
+    ///
+    /// `binding_for` returns at most one, which was the only possible answer
+    /// while `folder_id` was a primary key. It still exists for callers that
+    /// genuinely want a single root, but any caller deciding what to SCAN must
+    /// use this: a folder with two roots scanned through the singular form
+    /// silently ignores one of them.
+    pub fn bindings_for(&self, folder: &NodeId) -> Result<Vec<Binding>> {
+        let mut out: Vec<Binding> = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, bound_by
+                 FROM folder_bindings WHERE folder_id = ?1 AND unbound_at IS NULL",
+            )
+            .map_err(map_db("binding lookup"))?;
+        let rows = stmt
+            .query_map(params![folder], row_to_binding)
+            .map_err(map_db("binding lookup"))?;
+        for r in rows {
+            out.push(r.map_err(map_db("binding lookup"))??);
+        }
+        for b in load_local_bindings(&self.data_dir)? {
+            if b.folder_id == *folder && !out.iter().any(|x| x.source_uri == b.source_uri) {
+                out.push(b);
+            }
+        }
+        Ok(out)
     }
 
     pub fn binding_for(&self, folder: &NodeId) -> Result<Option<Binding>> {
@@ -602,11 +688,23 @@ impl Engine {
         }
         let bindings = match folder {
             Some(f) => {
-                let b = self.binding_for(f)?.ok_or(PvfsError::NotFound {
-                    kind: "binding",
-                    id: f.clone(),
-                })?;
-                if !self.is_local_binding(&b) {
+                // D81 — every root of this folder, not just the first. Scanning
+                // one root of a two-root folder is how "the library is on two
+                // volumes" turns into "half the library vanished".
+                let all = self.bindings_for(f)?;
+                if all.is_empty() {
+                    return Err(PvfsError::NotFound {
+                        kind: "binding",
+                        id: f.clone(),
+                    });
+                }
+                let mine: Vec<Binding> = all
+                    .iter()
+                    .filter(|b| self.is_local_binding(b))
+                    .cloned()
+                    .collect();
+                if mine.is_empty() {
+                    let b = all[0].clone();
                     return Err(bad(
                         "folder",
                         &format!(
@@ -617,7 +715,7 @@ impl Engine {
                         ),
                     ));
                 }
-                vec![b]
+                mine
             }
             None => self.local_bindings()?,
         };

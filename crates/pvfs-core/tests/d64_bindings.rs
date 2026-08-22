@@ -82,7 +82,7 @@ fn listing_joins_placement_into_kinds() {
     assert_eq!(r.folder_path.as_deref(), Some("/photos"));
 
     // Unbind ends the enrollment; its placement row alone must not revive it.
-    engine.unbind_folder(&staging).unwrap();
+    engine.unbind_folder(&staging, None).unwrap();
     let rows = engine.binding_listing().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.binding.folder_id != staging));

@@ -427,7 +427,7 @@ fn binding_rules() {
         Err(PvfsError::BadInput { .. })
     ));
     // unbind then rebind elsewhere works
-    engine.unbind_folder(&folder).unwrap();
+    engine.unbind_folder(&folder, None).unwrap();
     engine
         .bind_folder(&other, bind_spec(fixture.path(), HashPolicy::Lazy))
         .unwrap();

@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -207,8 +207,12 @@ CREATE TABLE IF NOT EXISTS temp_file_locations (
   PRIMARY KEY (file_id, uri)
 );
 
+-- D81: one folder, MANY roots. The primary key was folder_id alone, which made
+-- the same library on two volumes inexpressible -- and, worse, made a second
+-- bind silently REPLACE the first. Data and Data_ext (and feederbox, and any
+-- future holder) are roots of one tree.
 CREATE TABLE IF NOT EXISTS folder_bindings (
-  folder_id   TEXT PRIMARY KEY,
+  folder_id   TEXT NOT NULL,
   source_uri  TEXT NOT NULL,
   recursive   INTEGER NOT NULL,
   auto_index  INTEGER NOT NULL,
@@ -216,7 +220,8 @@ CREATE TABLE IF NOT EXISTS folder_bindings (
   hash_policy TEXT NOT NULL,
   bound_at    INTEGER NOT NULL,
   bound_by    BLOB NOT NULL DEFAULT x'',
-  unbound_at  INTEGER
+  unbound_at  INTEGER,
+  PRIMARY KEY (folder_id, source_uri)
 );
 
 -- Local observations (P1 spec §8): never folded from events; cleared by a
@@ -1365,8 +1370,7 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                 "INSERT INTO folder_bindings
                  (folder_id, source_uri, recursive, auto_index, extensions, hash_policy, bound_at, bound_by, unbound_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
-                 ON CONFLICT(folder_id) DO UPDATE SET
-                   source_uri = excluded.source_uri,
+                 ON CONFLICT(folder_id, source_uri) DO UPDATE SET
                    recursive = excluded.recursive,
                    auto_index = excluded.auto_index,
                    extensions = excluded.extensions,
@@ -1392,9 +1396,24 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             unbound_at,
             ..
         } => {
+            // Still means EVERY root — the meaning it has always had, and the
+            // meaning every already-deployed box folds it with (D81).
             tx.execute(
                 "UPDATE folder_bindings SET unbound_at = ?1 WHERE folder_id = ?2",
                 params![*unbound_at as i64, folder_id],
+            )
+            .map_err(&m)?;
+        }
+        Event::FolderUnboundRoot {
+            folder_id,
+            source_uri,
+            unbound_at,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE folder_bindings SET unbound_at = ?1
+                  WHERE folder_id = ?2 AND source_uri = ?3",
+                params![*unbound_at as i64, folder_id, source_uri],
             )
             .map_err(&m)?;
         }
@@ -2626,6 +2645,7 @@ fn migrate_projection(
             9 => migrate_v9_to_v10(conn).map(|_| "links.label"),
             10 => migrate_v10_to_v11(conn).map(|_| "idx_links_label"),
             11 => migrate_v11_to_v12(conn).map(|_| "media_quality"),
+            12 => migrate_v12_to_v13(conn).map(|_| "folder_bindings keyed (folder_id, source_uri)"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2787,6 +2807,36 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add temp_links.label"))?;
     }
+    Ok(())
+}
+
+fn migrate_v12_to_v13(conn: &mut Connection) -> Result<()> {
+    // D81 — widen the key so one folder can have many roots. Rebuilt rather
+    // than ALTERed: SQLite cannot change a primary key in place, and every
+    // existing row is already valid under the wider key, so nothing is lost.
+    let tx = conn.transaction().map_err(map_db("migrate v12→v13"))?;
+    tx.execute_batch(
+        "CREATE TABLE folder_bindings_new (
+           folder_id   TEXT NOT NULL,
+           source_uri  TEXT NOT NULL,
+           recursive   INTEGER NOT NULL,
+           auto_index  INTEGER NOT NULL,
+           extensions  TEXT NOT NULL,
+           hash_policy TEXT NOT NULL,
+           bound_at    INTEGER NOT NULL,
+           bound_by    BLOB NOT NULL DEFAULT x'',
+           unbound_at  INTEGER,
+           PRIMARY KEY (folder_id, source_uri)
+         );
+         INSERT INTO folder_bindings_new
+           SELECT folder_id, source_uri, recursive, auto_index, extensions,
+                  hash_policy, bound_at, bound_by, unbound_at
+             FROM folder_bindings;
+         DROP TABLE folder_bindings;
+         ALTER TABLE folder_bindings_new RENAME TO folder_bindings;",
+    )
+    .map_err(map_db("migrate v12→v13"))?;
+    tx.commit().map_err(map_db("migrate v12→v13"))?;
     Ok(())
 }
 

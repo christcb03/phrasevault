@@ -22,6 +22,12 @@ pub const K_FILE_LOCATION_REMOVED: &str = "FileLocationRemoved";
 pub const K_NODE_PURGED: &str = "NodePurged";
 pub const K_FOLDER_BOUND: &str = "FolderBound";
 pub const K_FOLDER_UNBOUND: &str = "FolderUnbound";
+/// D81 — unbind ONE root of a folder that has several. A NEW kind rather than a
+/// field on `FolderUnbound`, because that event means "this folder is bound
+/// nowhere" to every box already running, and quietly narrowing it would make an
+/// old box and a new one disagree about the same log. An old box sees this as
+/// `Event::Unknown`, retains it, and reports itself behind (D72 Part A).
+pub const K_FOLDER_UNBOUND_ROOT: &str = "FolderUnboundRoot";
 /// D72 Part B — a link's label. Mirrors `LinkReordered`: a signed event that
 /// changes a MUTABLE attribute of an edge, leaving the edge's identity alone.
 /// Old binaries (post-Part-A) see this as `Event::Unknown`, ignore it, and go
@@ -264,6 +270,14 @@ pub enum Event {
     },
     FolderUnbound {
         folder_id: String,
+        unbound_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// One root removed from a multi-root folder (D81).
+    FolderUnboundRoot {
+        folder_id: String,
+        source_uri: String,
         unbound_at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
@@ -548,6 +562,20 @@ pub fn msg_folder_unbound(folder_id: &str, unbound_at: u64, author: &[u8]) -> [u
 /// `expires_at == 0` (no expiry) keeps the v1 domain and message bytes, so every
 /// pre-1.1 signature still verifies; an expiring grant signs under a fresh v2
 /// domain that covers the expiry, so the two can never be confused.
+pub fn msg_folder_unbound_root(
+    folder_id: &str,
+    source_uri: &str,
+    unbound_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(folder_id)
+        .string(source_uri)
+        .u64(unbound_at)
+        .bytes(author);
+    crypto::domain_digest("pvfs:folderunboundroot:v1:", &e.finish())
+}
+
 pub fn msg_acl_set(
     node_id: &str,
     principal_kind: u64,
@@ -646,6 +674,7 @@ impl Event {
             Event::NodePurged { .. } => K_NODE_PURGED,
             Event::FolderBound { .. } => K_FOLDER_BOUND,
             Event::FolderUnbound { .. } => K_FOLDER_UNBOUND,
+            Event::FolderUnboundRoot { .. } => K_FOLDER_UNBOUND_ROOT,
             Event::AclSet { .. } => K_ACL_SET,
             Event::MemberTagged { .. } => K_MEMBER_TAGGED,
             Event::SecureBlobUpdated { .. } => K_SECURE_BLOB_UPDATED,
@@ -680,6 +709,7 @@ impl Event {
             | Event::NodePurged { author, .. }
             | Event::FolderBound { author, .. }
             | Event::FolderUnbound { author, .. }
+            | Event::FolderUnboundRoot { author, .. }
             | Event::AclSet { author, .. }
             | Event::MemberTagged { author, .. }
             | Event::SecureBlobUpdated { author, .. } => author,
@@ -1038,6 +1068,19 @@ impl Event {
             } => {
                 e.string(folder_id).u64(*unbound_at).bytes(author).bytes(sig);
             }
+            Event::FolderUnboundRoot {
+                folder_id,
+                source_uri,
+                unbound_at,
+                author,
+                sig,
+            } => {
+                e.string(folder_id)
+                    .string(source_uri)
+                    .u64(*unbound_at)
+                    .bytes(author)
+                    .bytes(sig);
+            }
             Event::AclSet {
                 node_id,
                 principal_kind,
@@ -1305,6 +1348,13 @@ impl Event {
             },
             K_FOLDER_UNBOUND => Event::FolderUnbound {
                 folder_id: d.string()?,
+                unbound_at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_FOLDER_UNBOUND_ROOT => Event::FolderUnboundRoot {
+                folder_id: d.string()?,
+                source_uri: d.string()?,
                 unbound_at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
@@ -1678,6 +1728,17 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_folder_unbound(folder_id, *unbound_at, author),
+                sig,
+            ),
+            Event::FolderUnboundRoot {
+                folder_id,
+                source_uri,
+                unbound_at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_folder_unbound_root(folder_id, source_uri, *unbound_at, author),
                 sig,
             ),
             Event::AclSet {

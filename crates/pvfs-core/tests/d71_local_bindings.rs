@@ -118,7 +118,7 @@ fn unbinding_a_local_binding_removes_it() {
 
     let mut e = Engine::open(rep.path()).unwrap();
     e.bind_folder(&folder, spec(src.path())).unwrap();
-    e.unbind_folder(&folder).unwrap();
+    e.unbind_folder(&folder, None).unwrap();
     assert!(e.binding_for(&folder).unwrap().is_none());
     assert!(e.local_bindings().unwrap().is_empty());
     e.close().unwrap();

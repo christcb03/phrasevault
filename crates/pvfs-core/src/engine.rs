@@ -1022,6 +1022,7 @@ impl Engine {
                 Event::NodePurged { node_id, .. }
                 | Event::FolderBound { folder_id: node_id, .. }
                 | Event::FolderUnbound { folder_id: node_id, .. }
+                | Event::FolderUnboundRoot { folder_id: node_id, .. }
                 | Event::AclSet { node_id, .. } => self.resolve_region(node_id, &batch_homes)?,
                 Event::SecureBlobUpdated { blob_id, .. } => {
                     self.resolve_region(blob_id, &batch_homes)?

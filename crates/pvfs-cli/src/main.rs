@@ -235,7 +235,13 @@ enum Cmd {
         to: Option<PathBuf>,
     },
     /// Remove a folder's directory binding
-    Unbind { folder: String },
+    Unbind {
+        folder: String,
+        /// Which root to remove. A folder may have several (D81); omitted, you
+        /// are asked, and a folder with exactly one root needs no answer.
+        #[arg(long)]
+        root: Option<String>,
+    },
     /// Scan bound folders against their directories
     Scan { folder: Option<String> },
     /// List the forest's space enrollments (doc 21): folder, source dir,
@@ -5533,13 +5539,41 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Unbind { folder } => {
+        Cmd::Unbind { folder, root } => {
             let mut engine = Engine::open(&ctx?)?;
-            engine.unbind_folder(&folder)?;
+            // D81 — a folder can have many roots, and "unbind the folder" would
+            // then mean "detach the library from every volume it lives on".
+            // Ask rather than guess; guessing here is unrecoverable by hand.
+            let chosen = match root {
+                Some(r) => Some(r),
+                None => {
+                    let roots = engine.bindings_for(&folder)?;
+                    if roots.len() > 1 {
+                        println!("{folder} has {} roots:", roots.len());
+                        for (i, b) in roots.iter().enumerate() {
+                            println!("  {}. {}", i + 1, b.source_uri);
+                        }
+                        let pick = prompt_line("which root to remove (number or URI)", None)?;
+                        let by_index = pick
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| roots.get(n.wrapping_sub(1)))
+                            .map(|b| b.source_uri.clone());
+                        Some(by_index.unwrap_or_else(|| pick.trim().to_string()))
+                    } else {
+                        None
+                    }
+                }
+            };
+            engine.unbind_folder(&folder, chosen.as_deref())?;
             if json {
                 println!("{{\"unbound\":true}}");
             } else {
-                println!("unbound {folder}");
+                match &chosen {
+                    Some(r) => println!("unbound {folder} <- {r}"),
+                    None => println!("unbound {folder}"),
+                }
             }
             engine.close()
         }
