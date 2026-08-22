@@ -25,6 +25,7 @@ pub mod ingest;
 pub mod link;
 pub mod arr;
 pub mod media;
+pub mod probe;
 pub mod log_store;
 pub mod mount;
 pub mod node;

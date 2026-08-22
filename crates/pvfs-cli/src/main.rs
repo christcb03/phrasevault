@@ -512,6 +512,26 @@ enum IngestCmd {
 enum QualityCmd {
     /// Show what is known about a file, and where the measurement came from.
     Show { node: String },
+    /// Measure files by READING them, for the ones no index knows about (D81).
+    ///
+    /// Run it where the bytes are. The arrs live at Hetzner while the library
+    /// is on the NAS at home, so letting them analyse would drag every file
+    /// across the VPN — measuring locally is faster now and the only thing that
+    /// stays correct once the NFS mount goes away.
+    Probe {
+        /// File or folder — a show or a whole library subtree is the usual unit
+        target: String,
+        /// Also DECODE every frame, not just read headers. Catches a file that
+        /// hashes fine and will not play — and reads the whole file to do it.
+        #[arg(long)]
+        deep: bool,
+        /// Re-measure files that already have a recorded quality
+        #[arg(long)]
+        force: bool,
+        /// Report what would be measured and record nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Record a measurement by hand (mostly for testing and repair; the normal
     /// source is `import`).
     Set {
@@ -2264,6 +2284,77 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!("NO DECISION — both copies stay.\n  because: {}", verdict.reason());
             }
             Ok(())
+        }
+        Cmd::Quality(QualityCmd::Probe { target, deep, force, dry_run }) => {
+            let mut engine = Engine::open(&ctx?)?;
+            if !pvfs_core::probe::prober_available() {
+                engine.close()?;
+                return Err(PvfsError::BadInput {
+                    field: "probe".into(),
+                    reason: "no ffprobe on this box — install it where the BYTES are, not \
+                             where the catalog is (apt install ffmpeg)"
+                        .into(),
+                });
+            }
+            let files: Vec<(String, String)> = engine
+                .walk(&target)?
+                .into_iter()
+                .filter(|e| e.node.node_type == pvfs_core::TYPE_FILE)
+                .map(|e| (e.node.id, e.label))
+                .collect();
+            let (mut done, mut skipped, mut failed, mut unreadable) = (0u64, 0u64, 0u64, 0u64);
+            for (id, label) in files {
+                if !force && engine.media_quality(&id)?.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(path) = engine.readable_path(&id)? else {
+                    unreadable += 1;
+                    continue;
+                };
+                match pvfs_core::probe::probe_headers(&path) {
+                    Ok(mut q) => {
+                        if deep {
+                            q.decoded_ok =
+                                Some(pvfs_core::probe::decode_check(&path).unwrap_or(false));
+                            if q.decoded_ok == Some(false) {
+                                println!("  DECODE FAILED  {label}");
+                            }
+                        }
+                        if dry_run {
+                            println!(
+                                "  WOULD RECORD  {}x{} {} {label}",
+                                q.width, q.height, q.video_codec
+                            );
+                        } else {
+                            engine.set_media_quality(
+                                &id,
+                                &q,
+                                if deep { "probe-deep" } else { "probe" },
+                            )?;
+                        }
+                        done += 1;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        println!("  FAILED  {label}: {e}");
+                    }
+                }
+            }
+            if json {
+                println!(
+                    "{{\"measured\":{done},\"already_known\":{skipped},\"unreadable\":{unreadable},\"failed\":{failed},\"dry_run\":{dry_run}}}"
+                );
+            } else {
+                println!(
+                    "{} {done} file(s); {skipped} already known, {unreadable} with no readable copy here, {failed} failed",
+                    if dry_run { "would measure" } else { "measured" }
+                );
+                if unreadable > 0 {
+                    println!("  ({unreadable} have no copy THIS box can read — run the probe where those bytes live)");
+                }
+            }
+            engine.close()
         }
         Cmd::Quality(QualityCmd::Show { node }) => {
             let engine = Engine::open(&ctx?)?;
