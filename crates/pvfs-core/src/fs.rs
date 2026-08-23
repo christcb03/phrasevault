@@ -536,7 +536,13 @@ impl Engine {
             // three drained when only one did. An operator reading that before
             // deciding where to put a title would be reading a lie.
             let staging = crate::sync::staging_roots_of(&self.data_dir, &binding.folder_id)?;
-            let opted_in = !staging.is_empty();
+            let declared = crate::sync::library_roots_of(&self.data_dir, &binding.folder_id)?;
+            // D81 — a folder is opted into the per-root model by EITHER kind of
+            // declaration. Checking only staging meant a root declared LIBRARY
+            // still listed as `migrate`, telling the operator it drains when it
+            // keeps — the exact reverse of the truth, on the one screen they
+            // would check before trusting it.
+            let opted_in = !staging.is_empty() || !declared.is_empty();
             let drains = staging.iter().any(|u| u == &binding.source_uri);
             let (kind, store) = match centrals.iter().find(|(id, _, _)| id == &binding.folder_id)
             {

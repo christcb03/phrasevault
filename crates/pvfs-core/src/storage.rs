@@ -154,6 +154,32 @@ pub fn any_path_of(uri: &str) -> Option<PathBuf> {
     parse_host_uri(uri).map(|(_, path)| PathBuf::from(path))
 }
 
+/// Do any of these locations put the bytes on a DIFFERENT host?
+///
+/// D82. The FUSE mount treats "unhashed with no local bytes" as an in-flight
+/// ingest and proxies reads to the local daemon (P10.1). That test is too
+/// loose: a file whose bytes live on another holder is not being ingested here,
+/// it is simply elsewhere — and taking the proxy path for it dials a daemon
+/// that has nothing, fails, and returns EIO without ever reaching the resolve
+/// that would have fetched it.
+///
+/// Found staging the presentation layer: every file held only by the NAS was
+/// unreadable through the mount while `pvfs cat` on the same node succeeded.
+/// Under a mount serving Plex, that is the entire library returning I/O errors.
+pub fn held_on_another_host(locations: &[String], own_pin: Option<&str>) -> bool {
+    locations.iter().any(|u| {
+        parse_host_uri(u)
+            .map(|(pin, _)| match own_pin {
+                // A pin that is not ours is another box, definitively.
+                Some(mine) => !pin.eq_ignore_ascii_case(mine),
+                // No pin of our own: any pin-qualified location is someone
+                // else's, because we could not have written one.
+                None => true,
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// This data dir's own transport pin, if it has ever served a network
 /// listener (`pvfsd --listen` mints it). `None` until then — a host nobody
 /// can dial has no meaningful location to offer.

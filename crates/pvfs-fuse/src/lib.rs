@@ -37,6 +37,9 @@ pub struct PvfsFs {
     streaming: HashMap<u64, Arc<SwarmProgress>>,
     /// One background fetch per node, shared across its open handles.
     active: HashMap<NodeId, Arc<SwarmProgress>>,
+    /// This box's transport pin, read once — used to tell OUR pin-qualified
+    /// locations from another holder's (D82).
+    own_pin: Option<String>,
     /// P10.1 (doc 23 §11): handles proxying an IN-FLIGHT ingest file — each
     /// read forwards as a ranged `Cat` to the serving daemon, which waits
     /// for chunk coverage and registers our demand as a hot range.
@@ -71,6 +74,7 @@ impl PvfsFs {
             handles: HashMap::new(),
             streaming: HashMap::new(),
             active: HashMap::new(),
+            own_pin: pvfs_core::storage::host_pin(data_dir),
             proxy: HashMap::new(),
             data_dir: data_dir.to_path_buf(),
             next_fh: 1,
@@ -308,7 +312,23 @@ impl Filesystem for PvfsFs {
         // is an in-flight ingest — proxy reads through the serving daemon's
         // ranged Cat (it enforces the early-serve license, waits for chunk
         // coverage, and registers our demand as a hot range).
-        if local.is_none() {
+        // D82 — the proxy is for an IN-FLIGHT INGEST on this box, and "unhashed
+        // with no local bytes" is too loose a test for that. A file whose bytes
+        // live on ANOTHER host is not being ingested here; it is simply
+        // elsewhere, and taking the proxy path for it dials the local daemon,
+        // fails, and returns EIO — never reaching the resolve below, which
+        // would have fetched it.
+        //
+        // Found staging the presentation layer: every file held only by the NAS
+        // was unreadable through the mount, while `pvfs cat` on the same node
+        // succeeded. Under a mount that has to serve Plex, that is the whole
+        // library returning I/O errors.
+        let held_elsewhere = self
+            .engine
+            .locations(&node)
+            .map(|ls| pvfs_core::storage::held_on_another_host(&ls, self.own_pin.as_deref()))
+            .unwrap_or(false);
+        if local.is_none() && !held_elsewhere {
             if let Some((declared, client)) = self.ingest_proxy(&node) {
                 eprintln!("mount: ingest-stream {node} — reads proxy ranged Cat (doc 23 §11)");
                 let fh = self.next_fh;
