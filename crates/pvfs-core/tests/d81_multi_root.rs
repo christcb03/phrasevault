@@ -177,3 +177,59 @@ fn unbinding_without_naming_a_root_is_refused_when_there_are_several() {
     assert!(engine.bindings_for(&m).unwrap().is_empty());
     engine.close().unwrap();
 }
+
+
+/// A REPLICA's roots are all LOCAL, and all of them must be listed and scanned.
+///
+/// Found by the distributed lab run, invisible to every single-box test before
+/// it. An owner's bindings are LOGGED and come from the projection; a replica's
+/// live in `.pvfs/bindings.local`. The merge that folds local rows in compared
+/// FOLDER only, so the first local root shadowed every later one: a two-root
+/// replica listed one, and `local_bindings` — which the scan walks — returned
+/// one. Chris's NAS would have scanned `Data` and silently ignored `Data_ext`.
+///
+/// This writes `bindings.local` DIRECTLY, because that is the only way to
+/// exercise the path: `bind_folder` on an owner takes the logged route and
+/// never touches the merge at all. My first attempt at this test used an owner
+/// and passed with the fix reverted — it was testing the wrong half.
+#[test]
+fn every_local_root_of_a_folder_is_listed_and_scannable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (warm, cold) = two_volumes(dir.path());
+    let forest = dir.path().join("forest");
+    let (mut engine, _mn) = Engine::init(forest.as_path()).unwrap();
+    let m = media(&mut engine);
+    let data_dir = engine.data_dir().to_path_buf();
+    engine.close().unwrap();
+
+    // Two LOCAL roots for one folder, as a replica records them.
+    std::fs::write(
+        data_dir.join("bindings.local"),
+        format!(
+            "pvfs-local-bindings 1\n\
+             bind {m} 1 1 lazy 1000 - file://{}\n\
+             bind {m} 1 1 lazy 1001 - file://{}\n",
+            warm.display(),
+            cold.display()
+        ),
+    )
+    .unwrap();
+
+    let engine = Engine::open(&data_dir).unwrap();
+    assert_eq!(
+        engine.bindings().unwrap().len(),
+        2,
+        "both local roots must be listed, not just the first"
+    );
+    assert_eq!(
+        engine.local_bindings().unwrap().len(),
+        2,
+        "the scan walks `local_bindings`; dropping one here loses half a library"
+    );
+    assert_eq!(
+        engine.bindings_for(&m).unwrap().len(),
+        2,
+        "and the mover's view must agree with the operator's"
+    );
+    engine.close().unwrap();
+}

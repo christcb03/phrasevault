@@ -405,11 +405,25 @@ impl Engine {
             out.push(r.map_err(map_db("list bindings"))??);
         }
         // This machine's own enrollments (D71 W4) sit beside the logged ones.
-        // A logged binding for the same folder wins — the log is the shared
+        // A logged binding for the same ROOT wins — the log is the shared
         // truth, and a local row for it would be this box shadowing the fleet.
+        //
+        // D81 — the comparison is on (folder, ROOT), not folder alone. Matching
+        // on the folder meant that once the first local root was pushed, every
+        // later root of that folder matched it and was dropped: a replica with
+        // two roots listed one, and `local_bindings` — which the SCAN uses —
+        // returned one, so the watcher only ever scanned half the library.
+        //
+        // Exactly Chris's NAS with `Data` and `Data_ext`. Invisible to
+        // single-box testing, because an owner's bindings are LOGGED and come
+        // from the query above; only a replica's are local, and only a replica
+        // can have several.
         let me = self.device.pubkey();
         for mut b in load_local_bindings(&self.data_dir)? {
-            if out.iter().any(|l| l.folder_id == b.folder_id) {
+            if out
+                .iter()
+                .any(|l| l.folder_id == b.folder_id && l.source_uri == b.source_uri)
+            {
                 continue;
             }
             b.bound_by = me.clone();
