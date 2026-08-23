@@ -139,6 +139,25 @@ enum Cmd {
     /// Authorization health check: list grants/memberships whose tag authority
     /// has been revoked (inert — masked live, cleaned up by compaction)
     Audit,
+    /// Declare which directories are roots of a folder's library, and which
+    /// of them DRAIN (D81).
+    ///
+    /// The mover runs on the owner and a replica's binding is machine-local, so
+    /// the owner cannot discover feederbox's root or the NAS's. Declaring them
+    /// is how it learns the topology.
+    Roots {
+        folder: String,
+        /// Declare this directory a root. Repeatable via successive calls.
+        #[arg(long)]
+        add: Option<String>,
+        /// Undeclare it.
+        #[arg(long)]
+        rm: Option<String>,
+        /// With --add: this root DRAINS (its copies retire once central).
+        /// Without it, the root KEEPS what it holds.
+        #[arg(long)]
+        staging: bool,
+    },
     /// List orphaned durable nodes
     Orphans,
     /// Files the catalog claims that NOBODY holds — the residue of deletions
@@ -3142,6 +3161,56 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!("unlinked {done} file(s); `pvfs purge` hard-deletes them if you want that too");
             }
             engine.close()
+        }
+        Cmd::Roots { folder, add, rm, staging } => {
+            let engine = Engine::open(&ctx?)?;
+            let data_dir = engine.data_dir().to_path_buf();
+            engine.close()?;
+            if let Some(uri) = rm {
+                let u = if uri.contains("://") {
+                    uri
+                } else {
+                    pvfs_core::storage::path_to_uri(std::path::Path::new(&uri))?
+                };
+                pvfs_core::sync::set_library_root(&data_dir, &folder, &u, false)?;
+                pvfs_core::sync::set_staging_root(&data_dir, &folder, &u, false)?;
+                println!("undeclared {u}");
+            }
+            if let Some(uri) = add {
+                let u = if uri.contains("://") {
+                    uri
+                } else {
+                    pvfs_core::storage::path_to_uri(std::path::Path::new(&uri))?
+                };
+                if staging {
+                    pvfs_core::sync::set_staging_root(&data_dir, &folder, &u, true)?;
+                    pvfs_core::sync::set_library_root(&data_dir, &folder, &u, false)?;
+                    println!("declared {u} — STAGING (drains once a central copy exists)");
+                } else {
+                    pvfs_core::sync::set_library_root(&data_dir, &folder, &u, true)?;
+                    pvfs_core::sync::set_staging_root(&data_dir, &folder, &u, false)?;
+                    println!("declared {u} — LIBRARY (keeps what it holds)");
+                }
+            }
+            let lib = pvfs_core::sync::library_roots_of(&data_dir, &folder)?;
+            let stg = pvfs_core::sync::staging_roots_of(&data_dir, &folder)?;
+            if json {
+                println!(
+                    "{{\"library\":[{}],\"staging\":[{}]}}",
+                    lib.iter().map(|u| format!("\"{}\"", json_escape(u))).collect::<Vec<_>>().join(","),
+                    stg.iter().map(|u| format!("\"{}\"", json_escape(u))).collect::<Vec<_>>().join(",")
+                );
+            } else if lib.is_empty() && stg.is_empty() {
+                println!("no roots declared for this folder — the mover will fall back to whatever bindings THIS box can see");
+            } else {
+                for u in &lib {
+                    println!("  LIBRARY  {u}");
+                }
+                for u in &stg {
+                    println!("  STAGING  {u}");
+                }
+            }
+            Ok(())
         }
         Cmd::Orphans => {
             let engine = Engine::open(&ctx?)?;

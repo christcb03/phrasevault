@@ -703,17 +703,28 @@ fn tier_pass_inner(
         // Marking ANY root of a folder opts that folder into the per-root
         // model, where unmarked means LIBRARY (Chris: default to keeps).
         let marked = pvfs_core::sync::staging_roots_of(&data_dir, &root)?;
-        let opted_in = !marked.is_empty();
+        let declared = pvfs_core::sync::library_roots_of(&data_dir, &root)?;
+        let opted_in = !marked.is_empty() || !declared.is_empty();
         // trailing slash: "file:///a/b" must not match "file:///a/bXX/…"
+        //
+        // DECLARED roots win over discovered ones, because the mover often
+        // cannot discover them at all: it runs on the owner, and a replica's
+        // binding is machine-local (D71 W1). On Chris's fleet the owner sees
+        // `no bound spaces`, so deriving the topology from bindings alone gave
+        // an empty set — quietly making everything below a no-op on the one
+        // box it runs on.
+        let visible: Vec<String> = engine
+            .bindings_for(&root)?
+            .iter()
+            .map(|b| b.source_uri.clone())
+            .collect();
+        let as_prefix = |u: &str| format!("{}/", u.trim_end_matches('/'));
         let staging_prefixes: Vec<String> = if keep {
             Vec::new()
+        } else if opted_in {
+            marked.iter().map(|u| as_prefix(u)).collect()
         } else {
-            engine
-                .bindings_for(&root)?
-                .iter()
-                .filter(|b| !opted_in || marked.iter().any(|u| u == &b.source_uri))
-                .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
-                .collect()
+            visible.iter().map(|u| as_prefix(u)).collect()
         };
         // D81 4b — the library's roots, as directories. A file sitting at its
         // tree path under ANY of them is in the library; only the write target
@@ -725,14 +736,14 @@ fn tier_pass_inner(
         // never placed at all. Ingest would have silently stopped. That is
         // exactly the line 4a-i draws — a file whose only live location is a
         // staging root is placement work, not a file that has arrived.
-        let library_dirs: Vec<std::path::PathBuf> = engine
-            .bindings_for(&root)?
+        let library_dirs: Vec<std::path::PathBuf> = declared
             .iter()
-            .filter(|b| {
-                let pfx = format!("{}/", b.source_uri.trim_end_matches('/'));
-                !staging_prefixes.contains(&pfx)
-            })
-            .filter_map(|b| pvfs_core::storage::uri_to_path(&b.source_uri).ok())
+            .cloned()
+            .chain(visible.iter().cloned())
+            .filter(|u| !staging_prefixes.contains(&as_prefix(u)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .iter()
+            .filter_map(|u| pvfs_core::storage::uri_to_path(u).ok())
             .collect();
         for entry in engine.walk(&root)?.entries {
             if entry.node.node_type != pvfs_core::TYPE_FILE {

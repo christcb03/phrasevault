@@ -468,6 +468,21 @@ pub struct Placement {
     /// this box's `pvfs-host://` locations so the fleet can dial them.
     pub sync_advertise: Vec<NodeId>,
     pub central: Vec<(NodeId, PathBuf)>,
+    /// D81 — roots of a folder that this box should treat as part of the
+    /// library, DECLARED rather than discovered. `(folder_id, source_uri)`.
+    ///
+    /// The mover derives the topology from `bindings_for`, and a replica's
+    /// binding is machine-local by design (D71 W1) — so the owner, which is
+    /// where the mover runs, cannot see feederbox's root or the NAS's. In
+    /// Chris's fleet the owner reports `no bound spaces` and would have had an
+    /// EMPTY set of library roots, silently making "satisfied at any root" a
+    /// no-op in the only place it matters.
+    ///
+    /// Declaring them here keeps the fix on the side the existing design
+    /// already put deployment state — doc 17 §6, "placement is per-instance
+    /// deployment state, never catalog truth" — instead of making replica
+    /// bindings into logged events, which D71 deliberately avoided.
+    pub library_roots: Vec<(NodeId, String)>,
     /// D81 — which ROOTS of a folder drain. `(folder_id, source_uri)`.
     ///
     /// `BindKind` is derived per FOLDER, so "this volume stages, that one keeps"
@@ -528,6 +543,11 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
                     out.served_by.push((id.to_string(), inst.to_string(), PathBuf::from(path)))
                 }
                 _ => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
+        } else if let Some(rest) = line.strip_prefix("library-root ") {
+            match rest.split_once(' ') {
+                Some((id, uri)) => out.library_roots.push((id.to_string(), uri.to_string())),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
             }
         } else if let Some(rest) = line.strip_prefix("staging-root ") {
             // `staging-root <folder-id> <source-uri>` — the URI is the REST, so
@@ -609,6 +629,9 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     for (r, u) in &p.staging_roots {
         text.push_str(&format!("staging-root {r} {u}\n"));
     }
+    for (r, u) in &p.library_roots {
+        text.push_str(&format!("library-root {r} {u}\n"));
+    }
     for (r, d) in &p.central_keep {
         text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
@@ -642,6 +665,27 @@ pub fn set_sync_mode(data_dir: &Path, id: &NodeId, sync: bool, advertise: bool) 
 /// `keep` = the P8 mirror mode: the mover copies + logs but never retires.
 /// D71 W5: mark (or unmark) a central root as tree-layout — migrated files
 /// land at their own path under the store root instead of `<shard>/<node-id>`.
+/// Declare one root of a folder as part of the library, or undeclare it (D81).
+pub fn set_library_root(data_dir: &Path, id: &NodeId, source_uri: &str, on: bool) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.library_roots
+        .retain(|(r, u)| !(r == id && u == source_uri));
+    if on {
+        p.library_roots.push((id.clone(), source_uri.to_string()));
+    }
+    save_placement(data_dir, &p)
+}
+
+/// The declared library roots of one folder.
+pub fn library_roots_of(data_dir: &Path, id: &NodeId) -> Result<Vec<String>> {
+    Ok(load_placement_full(data_dir)?
+        .library_roots
+        .into_iter()
+        .filter(|(r, _)| r == id)
+        .map(|(_, u)| u)
+        .collect())
+}
+
 /// Mark one ROOT of a folder as staging (drains), or clear the mark (D81).
 pub fn set_staging_root(data_dir: &Path, id: &NodeId, source_uri: &str, on: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;
