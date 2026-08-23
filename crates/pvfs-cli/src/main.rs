@@ -714,6 +714,23 @@ enum LocCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// D80 — retire MANY locations at once: every location under a URI prefix
+    /// whose file is also held somewhere else.
+    ///
+    /// This is the NAS migration's last step, and the one that is dangerous
+    /// done naively — removing a location that is a file's only one strands
+    /// it, which is exactly how 26,729 files were stranded before. So
+    /// eligibility is decided per file: anything held nowhere else is REFUSED
+    /// and listed, never removed. Run `--dry-run` first; it prints the same
+    /// counts and touches nothing.
+    Retire {
+        /// URI prefix to retire, e.g. file:///mnt/nas-media/
+        /// Prompted for when omitted.
+        prefix: Option<String>,
+        /// Count what would go, and remove none of it
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2784,6 +2801,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         }
                         return Ok(());
                     }
+                    LocCmd::Retire { .. } => {
+                        engine.close()?;
+                        return Err(PvfsError::Forbidden {
+                            action: "loc retire".into(),
+                            reason: "a bulk retire reads the whole catalog and batches its \
+                                     appends, so it runs on the OWNER, where the log is — \
+                                     not through a replica's write-through client"
+                                .into(),
+                        });
+                    }
                     _ => {} // reads run locally
                 }
             }
@@ -2943,6 +2970,43 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             report.failed.len()
                         );
                         if dry_run && report.moved > 0 {
+                            println!("DRY RUN — nothing was changed.");
+                        }
+                    }
+                }
+                LocCmd::Retire { prefix, dry_run } => {
+                    let prefix = match prefix {
+                        Some(p) => p,
+                        None => prompt_line(
+                            "retire locations under which URI prefix",
+                            Some("file:///mnt/nas-media/"),
+                        )?,
+                    };
+                    let report = engine.retire_locations_under(&prefix, dry_run, 500)?;
+                    if json {
+                        println!(
+                            "{{\"eligible\":{},\"removed\":{},\"refused\":{},\"dry_run\":{}}}",
+                            report.eligible,
+                            report.removed,
+                            report.refused.len(),
+                            dry_run
+                        );
+                    } else {
+                        // The refused list is the part worth reading: each one
+                        // is a file this prefix is the LAST record of.
+                        for (file, uri) in report.refused.iter().take(20) {
+                            println!("  REFUSED  {} — held nowhere else ({uri})", &file[..16.min(file.len())]);
+                        }
+                        if report.refused.len() > 20 {
+                            println!("  … and {} more refused", report.refused.len() - 20);
+                        }
+                        println!(
+                            "{} {} location(s), {} refused",
+                            if dry_run { "would retire" } else { "retired" },
+                            if dry_run { report.eligible } else { report.removed },
+                            report.refused.len()
+                        );
+                        if dry_run && report.eligible > 0 {
                             println!("DRY RUN — nothing was changed.");
                         }
                     }

@@ -57,6 +57,18 @@ pub struct ChildEntry {
 }
 
 /// A split region's generation state (P7.2a, doc 20 §2.3).
+/// What a bulk retire did, and what it deliberately would not do (D80 §8).
+#[derive(Debug, Clone)]
+pub struct RetireReport {
+    /// Locations under the prefix whose file is held somewhere else too.
+    pub eligible: usize,
+    /// How many were actually removed — `eligible` on a completed run, 0 on a dry run.
+    pub removed: usize,
+    /// Locations left alone: removing them would leave the file held by nobody.
+    pub refused: Vec<(NodeId, String)>,
+}
+
+
 #[derive(Debug, Clone)]
 pub struct RegionInfo {
     pub marked_at: u64,
@@ -1839,6 +1851,107 @@ impl Engine {
             removed_by: me,
             removal_sig: sig,
         }])
+    }
+
+    /// D80 §8 — retire every location under `prefix` whose file is still held
+    /// somewhere else, and REFUSE the rest.
+    ///
+    /// The migration's last step, and the one the drain got wrong. Eligibility
+    /// is the whole safety story: a location goes only while the same file
+    /// keeps another live one, so an interrupted or partial run leaves files
+    /// with MORE locations than they need, never fewer. Nothing can strand.
+    ///
+    /// Per file through the CLI this is a process spawn and an fsync each —
+    /// 3.2/s, which is what made D80 an overnight job. The events are
+    /// identical; only the batching changes.
+    ///
+    /// `batch` trades fsyncs against how much one transaction spans: a batch
+    /// crossing many SPLIT regions attaches one database per region, so on a
+    /// heavily split forest it wants to be smaller. The media forest has none,
+    /// and every event routes to the top region.
+    pub fn retire_locations_under(
+        &mut self,
+        prefix: &str,
+        dry_run: bool,
+        batch: usize,
+    ) -> Result<RetireReport> {
+        self.ensure_device_active()?;
+        let mut eligible: Vec<(NodeId, String)> = self
+            .conn
+            .prepare(
+                "SELECT l.file_id, l.uri FROM file_locations l
+                 WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
+                   AND EXISTS (SELECT 1 FROM file_locations o
+                               WHERE o.file_id = l.file_id AND o.removed_at IS NULL
+                                 AND o.uri NOT LIKE ?1 || '%')
+                 ORDER BY l.file_id",
+            )
+            .map_err(map_db("retire scan"))?
+            .query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(map_db("retire scan"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("retire scan"))?;
+
+        // Held nowhere else BY RECORD — but the managed sync store counts by
+        // existence, not record (see `locations`), so these get a second look
+        // before they are refused. Only this set pays for the lookup, and the
+        // check can only ever move a location OUT of refusal.
+        let maybe_refused: Vec<(NodeId, String)> = self
+            .conn
+            .prepare(
+                "SELECT l.file_id, l.uri FROM file_locations l
+                 WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM file_locations o
+                                   WHERE o.file_id = l.file_id AND o.removed_at IS NULL
+                                     AND o.uri NOT LIKE ?1 || '%')
+                 ORDER BY l.file_id",
+            )
+            .map_err(map_db("retire scan"))?
+            .query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(map_db("retire scan"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("retire scan"))?;
+
+        let mut refused: Vec<(NodeId, String)> = Vec::new();
+        for (file, uri) in maybe_refused {
+            if crate::sync::sync_store_lookup(&self.data_dir, &file)?.is_some() {
+                eligible.push((file, uri));
+            } else {
+                refused.push((file, uri));
+            }
+        }
+
+        let mut report = RetireReport {
+            eligible: eligible.len(),
+            removed: 0,
+            refused,
+        };
+        if dry_run {
+            return Ok(report);
+        }
+
+        let me = self.device.pubkey();
+        let batch = batch.max(1);
+        for chunk in eligible.chunks(batch) {
+            let t = now_ms();
+            let mut events = Vec::with_capacity(chunk.len());
+            for (file, uri) in chunk {
+                let sig = crypto::sign_digest(
+                    &self.device.signing_key,
+                    &event::msg_file_location_removed(file, uri, t, &me),
+                )?;
+                events.push(Event::FileLocationRemoved {
+                    file_id: file.clone(),
+                    uri: uri.clone(),
+                    removed_at: t,
+                    removed_by: me.clone(),
+                    removal_sig: sig,
+                });
+            }
+            self.append_durable(events)?;
+            report.removed += chunk.len();
+        }
+        Ok(report)
     }
 
     /// Active URIs for a file node. The managed sync store (F3) is included
