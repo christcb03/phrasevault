@@ -281,7 +281,22 @@ CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, orde
 CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
 ";
 
-const MAIN_OBJECTS: &[&str] = &[
+/// Every table a rebuild must carry from the scratch replay into the live cache.
+///
+/// D81 — HAND-MAINTAINED, AND THREE HAD BEEN FORGOTTEN. A rebuild drops the live
+/// tables and copies these back; anything folded from events but absent here is
+/// silently emptied by every replay. `media_quality` (schema 12, mine),
+/// `recovery_keys` and `secure_blobs` were all missing — so a rebuild discarded
+/// quality, recovery-phrase custody and the encrypted-content ledger, and said
+/// nothing.
+///
+/// Found in production: feederbox replayed 24,586 `MediaQuality` events, ended
+/// with `unknown_events: 0` — it had decoded every one — and a `media_quality`
+/// table with ZERO rows.
+///
+/// `rebuild_copies_every_table` pins the list against the schema, so the next
+/// table cannot be forgotten the way these three were.
+pub const MAIN_OBJECTS: &[&str] = &[
     "nodes",
     "links",
     "file_locations",
@@ -301,6 +316,9 @@ const MAIN_OBJECTS: &[&str] = &[
     "location_quarantine",
     "scan_state",
     "projection_meta",
+    "media_quality",
+    "recovery_keys",
+    "secure_blobs",
 ];
 
 // ---- the fold lock ----------------------------------------------------------
