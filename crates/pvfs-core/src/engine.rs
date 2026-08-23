@@ -56,7 +56,6 @@ pub struct ChildEntry {
     pub label: String,
 }
 
-/// A split region's generation state (P7.2a, doc 20 §2.3).
 /// What a bulk retire did, and what it deliberately would not do (D80 §8).
 #[derive(Debug, Clone)]
 pub struct RetireReport {
@@ -68,7 +67,7 @@ pub struct RetireReport {
     pub refused: Vec<(NodeId, String)>,
 }
 
-
+/// A split region's generation state (P7.2a, doc 20 §2.3).
 #[derive(Debug, Clone)]
 pub struct RegionInfo {
     pub marked_at: u64,
@@ -1952,6 +1951,40 @@ impl Engine {
             report.removed += chunk.len();
         }
         Ok(report)
+    }
+
+    /// D82 — what the tree holds: total bytes across file nodes, and how many.
+    ///
+    /// Sizes live in each file node's PAYLOAD rather than a column, so this
+    /// decodes every one. `statfs` is what needs it, and the mount caches the
+    /// answer rather than paying this per call.
+    ///
+    /// Counts LIVE files only — a node with no live link is not part of any
+    /// tree a reader can see, so counting it would put things in `df` that are
+    /// not in the filesystem. That matters here: 97 episodes lost to a drive
+    /// failure are exactly such nodes, deliberately kept as a record.
+    pub fn total_file_bytes(&self) -> Result<(u64, u64)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.payload FROM nodes n
+                  WHERE n.node_type = ?1
+                    AND EXISTS (SELECT 1 FROM links k
+                                WHERE k.child_id = n.id AND k.removed_at IS NULL)",
+            )
+            .map_err(map_db("capacity"))?;
+        let rows = stmt
+            .query_map(params![node::TYPE_FILE], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(map_db("capacity"))?;
+        let (mut bytes, mut files) = (0u64, 0u64);
+        for p in rows {
+            let p = p.map_err(map_db("capacity"))?;
+            files += 1;
+            if let Ok(fp) = node::FilePayload::decode(&p) {
+                bytes = bytes.saturating_add(fp.size_bytes);
+            }
+        }
+        Ok((bytes, files))
     }
 
     /// Active URIs for a file node. The managed sync store (F3) is included

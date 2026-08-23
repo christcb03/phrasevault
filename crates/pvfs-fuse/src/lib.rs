@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{ReplyEmpty, 
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, ReplyOpen, Request,
+    ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 use pvfs_client::fetch::{Fetcher, SwarmProgress};
 use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, TYPE_FILE};
@@ -49,6 +49,10 @@ pub struct PvfsFs {
     /// D71 W2: on a replica the catalog has no local writer, so namespace
     /// changes route to the owner's daemon — the same seam the scan uses.
     route: Option<(pvfs_client::Client, pvfs_client::advertise::BoxedSign)>,
+    /// D82 — `statfs`'s answer, and when it was computed. The byte total needs
+    /// every file payload decoded, and a library scan can call `statfs` in a
+    /// loop, so it is worth not recomputing per call.
+    capacity: Option<((u64, u64), std::time::Instant)>,
 }
 
 /// One in-flight proxy handle: the connection is reused across reads.
@@ -82,10 +86,30 @@ impl PvfsFs {
                 let is_replica = engine_is_replica;
                 pvfs_client::advertise::replica_route(data_dir, is_replica).unwrap_or(None)
             },
+            capacity: None,
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
         Ok(fs)
+    }
+
+    /// D82 — what this filesystem HOLDS: total bytes, and how many files.
+    ///
+    /// Sizes live in each file node's payload, not a column, so this decodes
+    /// every one. That is milliseconds at library scale and `statfs` is rare,
+    /// but an arr walking the tree can still call it repeatedly, so the answer
+    /// is cached for a minute. A stale byte total is harmless; the numbers that
+    /// have to be exact are the zeroes below, and those are constants.
+    fn capacity(&mut self) -> (u64, u64) {
+        const TTL: Duration = Duration::from_secs(60);
+        if let Some((v, at)) = self.capacity {
+            if at.elapsed() < TTL {
+                return v;
+            }
+        }
+        let v = self.engine.total_file_bytes().unwrap_or((0, 0));
+        self.capacity = Some((v, std::time::Instant::now()));
+        v
     }
 
     fn ino_of(&mut self, node: &NodeId) -> u64 {
@@ -428,6 +452,34 @@ impl Filesystem for PvfsFs {
 
     /// D71 W2: Sonarr deleting a drained file must work. Byte writes stay
     /// refused — only the namespace is write-through.
+    /// D82 — answer `statfs`, so anything asking about capacity gets the truth
+    /// instead of the zeroes a default impl returns.
+    ///
+    /// The honest shape of this filesystem: it presents N files totalling X
+    /// bytes, and NOTHING can be created in it — there is no `create`, `mknod`
+    /// or `write` here, because the bytes live on holders and arrive by the
+    /// mover. So free and available are 0, and that is a statement rather than
+    /// a placeholder: in a mergerfs union it is what stops a create policy from
+    /// ever choosing this branch, which is exactly right when the writable
+    /// staging disk is the branch beside it.
+    ///
+    /// `unlink`/`rmdir`/`rename` still work — they retire catalog entries, and
+    /// none of them needs free space.
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        const BSIZE: u32 = 512;
+        let (bytes, files) = self.capacity();
+        reply.statfs(
+            bytes.div_ceil(BSIZE as u64), // blocks: what the tree holds
+            0,                            // bfree
+            0,                            // bavail — nothing can be written here
+            files,                        // inodes in use
+            0,                            // ffree
+            BSIZE,
+            255, // NAME_MAX, matching the label cap the catalog enforces
+            BSIZE,
+        );
+    }
+
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.retire(parent, name, false) {
             Ok(()) => reply.ok(),
