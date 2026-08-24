@@ -38,9 +38,25 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Set by the SIGTERM/SIGINT handler; polled by the accept loop so the daemon can
-/// stop accepting, checkpoint the WAL, and exit cleanly (doc 08 §4 item 4).
+/// Set by the SIGTERM/SIGINT handler. It tells the JOB RUNNER to stop; it no
+/// longer stops the accept loops directly (see `STOP_SERVING`).
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// D83 — set only once the jobs have finished, and the one flag the accept
+/// loops watch.
+///
+/// The order used to be the other way round: a signalled daemon closed both
+/// listeners immediately and THEN waited for its jobs. That is exactly
+/// backwards. On 2026-08-24 it left the NAS holding the library and answering
+/// nothing for the better part of an hour while it finished a 14.7GB
+/// background fetch — every file held only by that box unreadable for the
+/// duration, with `available location not found` as the only symptom.
+///
+/// Chris: *"having the daemon serving files and allowing reads to the library
+/// is the #1 top priority... This needs to be as on and available to serve
+/// files as the NAS itself."* So serving is the LAST thing to stop, and
+/// background work is cancelled rather than waited on.
+static STOP_SERVING: AtomicBool = AtomicBool::new(false);
 
 /// Set by the SIGHUP handler; the job runner re-reads `serve.jobs` (doc 18 §2).
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -168,7 +184,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let d = Arc::clone(&daemon);
         let cfg = Arc::clone(&tls.config);
         tls_thread = Some(std::thread::spawn(move || {
-            let _ = pvfsd::serve_tls_until(tcp, cfg, d, &SHUTDOWN);
+            let _ = pvfsd::serve_tls_until(tcp, cfg, d, &STOP_SERVING);
         }));
     }
 
@@ -183,7 +199,23 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // but not yet serving" is exactly the window that crash-looped pvosd
     // three times (PVOS D49/D55/M4b close-outs).
     notify_systemd_ready();
-    serve_until(listener, Arc::clone(&daemon), &SHUTDOWN)?;
+
+    // D83 — the drain coordinator. SIGTERM tells the jobs to stop; only when
+    // they have actually stopped do the listeners close. Keeping this off the
+    // main thread is what lets `serve_until` go on answering reads while a
+    // cancelled transfer unwinds.
+    let drain = std::thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The runner sees SHUTDOWN, flags its passes, and joins them. The
+        // mover honours that flag between chunks now, so this is quick — but
+        // however long it takes, the listeners above are still up.
+        let _ = jobs_thread.join();
+        STOP_SERVING.store(true, Ordering::SeqCst);
+    });
+
+    serve_until(listener, Arc::clone(&daemon), &STOP_SERVING)?;
 
     // Graceful stop: flush the WAL and record a clean shutdown so the next start is
     // fast. In-flight connection threads are best-effort; the socket is removed by
@@ -192,7 +224,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(t) = tls_thread {
         let _ = t.join();
     }
-    let _ = jobs_thread.join();
+    let _ = drain.join();
     eprintln!("pvfsd: shutting down (checkpointing)");
     daemon.shutdown_checkpoint()?;
     Ok(())

@@ -407,7 +407,13 @@ fn export_pass(state: &JobsState) -> Result<u64, PvfsError> {
 }
 
 fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
-    let stop = Arc::new(AtomicBool::new(false)); // passes are short; uniform bookkeeping
+    // This flag used to be bookkeeping only — "passes are short" — and no pass
+    // ever received it. That held for sync/evict/reclaim and was badly wrong
+    // for `tier`, which moves hundreds of GB across a WAN. On 2026-08-24 a
+    // signalled daemon closed both listeners and then sat for the better part
+    // of an hour finishing a 14.7GB fetch, serving nothing the whole time.
+    // The mover now gets the flag and honours it (D83).
+    let stop = Arc::new(AtomicBool::new(false));
     let st = Arc::clone(state);
     let handle = match name {
         "sync" => std::thread::spawn(move || {
@@ -433,11 +439,14 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("export", Some(e.to_string())),
             }
         }),
-        "tier" => std::thread::spawn(move || {
+        "tier" => {
+            let cancel = Arc::clone(&stop);
+            std::thread::spawn(move || {
             st.set_state("tier", "running");
             let r = (|| -> Result<Option<pvfs_client::fetch::TierReport>, PvfsError> {
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
                 let mut fetcher = pvfs_client::fetch::Fetcher::new(st.data_dir());
+                fetcher.set_cancel(cancel);
                 let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
                 engine.close()?;
                 r
@@ -454,7 +463,8 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 }
                 Err(e) => st.mark_pass("tier", Some(e.to_string())),
             }
-        }),
+            })
+        }
         // D71 W2/W3: the holder tidies its own filesystem after a delete. The
         // mount retires the link from whatever box the user is on; the box
         // that owns the BYTES moves them to the trash. The owner never reaches

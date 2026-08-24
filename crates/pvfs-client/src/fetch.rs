@@ -57,6 +57,15 @@ pub struct Fetcher {
     /// F5.7: catalog-published endpoints (pin → addr), lazily loaded once
     /// per pass — the registry always wins; these cover pins it lacks.
     endpoints: Option<std::collections::HashMap<String, String>>,
+    /// D83 — set to abandon this pass. Checked between files AND between
+    /// chunks, because a pass that can only stop between files still takes
+    /// half an hour to notice when the file is a 20GB remux.
+    ///
+    /// Chris, 2026-08-24: *"having the daemon serving files and allowing reads
+    /// to the library is the #1 top priority. Killing background transfers
+    /// isn't a very big issue."* A half-pulled temp file costs one re-fetch;
+    /// a daemon that will not answer costs the library.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Fetcher {
@@ -67,7 +76,21 @@ impl Fetcher {
             instances: load_instances().unwrap_or_default(),
             endpoints: None,
             source: ReplicaSource::load(data_dir).ok(),
+            cancel: None,
         }
+    }
+
+    /// D83 — give this fetcher a cancellation flag. The daemon hands it the
+    /// job's stop flag so a shutdown can abandon a transfer in progress.
+    pub fn set_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(flag);
+    }
+
+    /// Has this pass been told to stop?
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Whether ANY source could serve fetches: a recorded replica source or
@@ -334,6 +357,19 @@ impl Fetcher {
         let counts_ref = &counts;
         let part_ref = &part;
         let progress_ref = &progress;
+        // D83 — cloned out of `self` before the scope so every worker can see
+        // it. Cancellation is checked BETWEEN CHUNKS, not just between files:
+        // a 20GB remux is half an hour of a daemon that has been told to stop.
+        // Abandoning costs one re-fetch and not even that in practice — the
+        // partial `.tmp` is resumed chunk-by-chunk on the next attempt (see
+        // "resumed N/M chunks" above).
+        // Owned once, then shared by REFERENCE like every other ref above:
+        // `Option<Arc<_>>` is not Copy, so handing the value itself to a
+        // `move` closure moves it on the first iteration and the second worker
+        // will not compile. `&Option<Arc<_>>` is Copy, which is why
+        // queue/counts/progress are all borrowed rather than cloned.
+        let cancel_owned = self.cancel.clone();
+        let cancel_ref = &cancel_owned;
 
         std::thread::scope(|scope| {
             for (key, mut client) in holders.drain(..) {
@@ -345,6 +381,12 @@ impl Fetcher {
                     let mut pulled = 0u64;
                     let mut strikes = 0u32;
                     loop {
+                        if cancel_ref
+                            .as_ref()
+                            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                        {
+                            break;
+                        }
                         let idx = match queue_ref.lock().unwrap().pop() {
                             Some(i) => i,
                             None => break,
@@ -746,6 +788,14 @@ fn tier_pass_inner(
             .filter_map(|u| pvfs_core::storage::uri_to_path(u).ok())
             .collect();
         for entry in engine.walk(&root)?.entries {
+            // D83 — stop between files as well as between chunks. The pass
+            // returns what it has done so far rather than erroring: a mover
+            // that was told to stop has not failed, and reporting it as a
+            // failure would put a permanent `last_error` on the job every
+            // time the daemon restarts.
+            if fetcher.cancelled() {
+                break;
+            }
             if entry.node.node_type != pvfs_core::TYPE_FILE {
                 continue;
             }
