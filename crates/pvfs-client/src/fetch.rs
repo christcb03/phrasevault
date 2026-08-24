@@ -187,9 +187,24 @@ impl Fetcher {
             match client.cat(id, &mut sink) {
                 Ok(_) => match engine.sync_commit(sink) {
                     Ok(_) => return Ok(()),
-                    Err(e) => last_err = e.to_string(),
+                    Err(e) => {
+                        // D83 — the bytes arrived and the COMMIT refused. A
+                        // different failure entirely from a broken stream, and
+                        // indistinguishable in `last_err` alone.
+                        eprintln!("fetch: {id} streamed but commit failed from {key}: {e}");
+                        last_err = e.to_string();
+                    }
                 },
                 Err(e) => {
+                    // D83 — say it HERE, not only if every candidate fails.
+                    //
+                    // This is the path production actually takes: the swarm
+                    // needs two or more holders, and with one holder it is
+                    // skipped entirely. So the swarm's diagnostics never fire,
+                    // and a stream that dies mid-file left no trace at all —
+                    // fetches were abandoned at multiple GB for hours with an
+                    // empty log and nothing to read.
+                    eprintln!("fetch: {id} stream failed from {key}: {e}");
                     // a failed stream may leave the connection out of step
                     last_err = e.to_string();
                     self.pool.remove(&key);
