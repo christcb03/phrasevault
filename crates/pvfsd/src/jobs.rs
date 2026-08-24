@@ -454,7 +454,13 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             match r {
                 // None = nothing placed central — a clean idle pass
                 Ok(report) => {
+                    // D83 — a CANCELLED pass reports no verdict. Its `failed`
+                    // list is mostly its own abandoned fetches, and recording
+                    // those makes an orderly stop look like a broken mover.
                     let issue = report.and_then(|t| {
+                        if t.cancelled {
+                            return None;
+                        }
                         t.failed.first().map(|(label, e)| {
                             format!("{} migrations failed (first: {label} — {e})", t.failed.len())
                         })

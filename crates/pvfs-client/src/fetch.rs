@@ -428,8 +428,25 @@ impl Fetcher {
 
         let leftover = queue.lock().unwrap().len();
         if leftover > 0 {
+            // D83 — say WHICH it was. "every holder failed" was the only
+            // message either case produced, so hours of abandoned fetches gave
+            // no way to tell a cancelled pass from a failing link, and the
+            // failure was invisible until the pass ended — which, for a pass
+            // that never ends, is never.
+            let why = if cancel_owned
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                "cancelled mid-fetch"
+            } else {
+                "every holder failed"
+            };
+            eprintln!(
+                "swarm: giving up on {id} — {leftover}/{} chunk(s) unfetched ({why})",
+                manifest.len()
+            );
             return Err(format!(
-                "{leftover} chunk(s) unfetched — every holder failed; partial kept for resume"
+                "{leftover} chunk(s) unfetched — {why}; partial kept for resume"
             ));
         }
         let stats = counts.into_inner().unwrap();
@@ -469,6 +486,16 @@ pub struct TierReport {
     pub satisfied: u64,
     pub retired: u64,
     pub failed: Vec<(String, String)>,
+    /// D83 — the pass was told to stop rather than reaching the end.
+    ///
+    /// This matters because cancelling mid-pass produces a burst of entries in
+    /// `failed`: every in-flight fetch abandons, and each abandoned migration
+    /// looks exactly like a migration that failed on its own merits. Reported
+    /// as failures they are worse than noise — they become the job's
+    /// `last_error`, so a clean shutdown leaves the mover looking broken.
+    /// Observed for real: disabling `tier` produced "215 migrations failed"
+    /// when the true count of real problems was 34.
+    pub cancelled: bool,
     /// D76 — what a DRY RUN would have done, in order, one line per action.
     ///
     /// Empty on a real pass. This exists because two separate bugs in this
@@ -794,6 +821,7 @@ fn tier_pass_inner(
             // failure would put a permanent `last_error` on the job every
             // time the daemon restarts.
             if fetcher.cancelled() {
+                report.cancelled = true;
                 break;
             }
             if entry.node.node_type != pvfs_core::TYPE_FILE {

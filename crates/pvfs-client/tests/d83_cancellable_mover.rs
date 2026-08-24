@@ -111,6 +111,17 @@ fn a_cancelled_pass_stops_and_is_not_an_error() {
             report.migrated, 0,
             "cancelled before the first file, so nothing should have moved"
         );
+        // The return value being Ok was never enough. Cancelling mid-pass
+        // abandons every in-flight fetch, and each abandoned migration lands
+        // in `failed` looking exactly like a real one — which the daemon then
+        // stamps as the job's last_error. In production that turned an orderly
+        // stop into "215 migrations failed" when 34 were real. The pass has to
+        // SAY it was cancelled so the daemon can withhold the verdict.
+        assert!(
+            report.cancelled,
+            "a cancelled pass must mark itself cancelled, or its abandoned \
+             work is reported as failure"
+        );
     }
     engine.close().unwrap();
 }
