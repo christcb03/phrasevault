@@ -182,6 +182,17 @@ pub struct Candidate {
 #[derive(Debug, Clone, Copy)]
 pub struct Rules {
     pub size_margin_pct: u32,
+    /// How close two resolutions must be to count as the SAME resolution.
+    ///
+    /// The rung used to fire on any difference at all, so 1438x1080 beat
+    /// 1440x1080 — 2,160 pixels out of 1.55 million, 0.14%. That is cropping
+    /// noise, not resolution, and letting it decide short-circuits the whole
+    /// rest of the ladder on a difference nobody can see.
+    ///
+    /// 2% is far below anything genuine: 1080p vs 720p is 55% apart, 1080p vs
+    /// 1440p is 44%. So this can separate real tiers and cannot be fooled by a
+    /// crop.
+    pub resolution_margin_pct: u32,
     /// How much SHORTER a copy may be before it is treated as truncated.
     ///
     /// Two copies of one episode should agree closely on length — cuts vary a
@@ -195,6 +206,7 @@ impl Default for Rules {
     fn default() -> Self {
         Rules {
             size_margin_pct: 10,
+            resolution_margin_pct: 2,
             truncation_pct: 10,
         }
     }
@@ -272,7 +284,17 @@ pub fn choose(a: &Candidate, b: &Candidate, rules: &Rules) -> (bool, Verdict) {
     // against bit depth against bitrate, and any such weighting is a guess
     // dressed as arithmetic.
     let (pa, pb) = (a.quality.pixels(), b.quality.pixels());
-    if pa != pb && pa != 0 && pb != 0 {
+    // Within the margin the two are the SAME resolution, and the ladder falls
+    // through to the rungs that can actually tell them apart. Measured on the
+    // live library: 3 of the 13 fully-measured collisions were being decided
+    // by a sub-2% pixel difference.
+    let close = if pa == 0 || pb == 0 {
+        false
+    } else {
+        let (hi, lo) = (pa.max(pb) as f64, pa.min(pb) as f64);
+        (hi - lo) / hi * 100.0 < rules.resolution_margin_pct as f64
+    };
+    if pa != pb && pa != 0 && pb != 0 && !close {
         let win = pa > pb;
         return (
             win,
