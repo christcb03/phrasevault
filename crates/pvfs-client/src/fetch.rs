@@ -1635,3 +1635,172 @@ mod tests {
         assert!(q.failed(), "an error finish is");
     }
 }
+
+/// D84 — one file, one node.
+///
+/// Two live nodes at one TREE PATH are the same episode. That is the identity
+/// this library actually has: the arrs write `Show - s16e10 - Title.mkv` with
+/// no quality tag, so an upgrade lands at the SAME path — which is exactly why
+/// it replaces in place. Content identity answers *"are these the same
+/// bytes?"*; the question here is *"are these the same episode?"*, and the path
+/// answers it without hashing 67 TB of library.
+///
+/// Chris, 2026-08-25: *"we don't need to use hash to tell what the file is when
+/// we have the path... that is the identifier for that episode."*
+#[derive(Debug, Default)]
+pub struct CollideReport {
+    /// Tree paths found carrying more than one live file node.
+    pub examined: usize,
+    /// Collisions decided and acted on.
+    pub resolved: usize,
+    /// Left exactly as they were, and why. A refusal costs a duplicate; a wrong
+    /// call costs a file, so this list is the safe outcome, not the failure one.
+    pub refused: Vec<(String, String)>,
+    /// One line per action a dry run did NOT take.
+    pub planned: Vec<String>,
+}
+
+/// Resolve path collisions under `root`. `dry_run` reports and changes nothing.
+///
+/// **This pass moves no bytes and deletes nothing.** It unlinks the loser from
+/// the tree and leaves its location alone; the box that HOLDS those bytes
+/// trashes them on its own `reclaim` pass, which is precisely what
+/// `orphaned_local_locations` — a live location whose node has no live link —
+/// already means. Keeping it catalog-only is what lets it run on the owner,
+/// which holds no media and can therefore never be the box that deletes.
+pub fn collide_pass(
+    engine: &mut Engine,
+    root: &str,
+    rules: Option<pvfs_core::media::Rules>,
+    dry_run: bool,
+) -> Result<CollideReport, PvfsError> {
+    let mut report = CollideReport::default();
+
+    // Tree path -> the live file nodes sitting at it. Pre-order gives depth, so
+    // a stack rebuilds the path without a second query per node.
+    let mut at_path: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    for e in engine.walk(&root.to_string())?.entries {
+        stack.truncate(e.depth);
+        stack.push(e.label.clone());
+        if e.node.node_type == pvfs_core::TYPE_FILE {
+            at_path
+                .entry(stack.join("/"))
+                .or_default()
+                .push(e.node.id.clone());
+        }
+    }
+
+    for (path, nodes) in at_path {
+        if nodes.len() < 2 {
+            continue;
+        }
+        report.examined += 1;
+
+        // Who actually holds bytes. A "location" that is only the managed sync
+        // store is still bytes, so `locations()` is the right question.
+        let mut with_bytes: Vec<String> = Vec::new();
+        let mut ghosts: Vec<String> = Vec::new();
+        for n in &nodes {
+            match engine.locations(&n.to_string()) {
+                Ok(l) if !l.is_empty() => with_bytes.push(n.clone()),
+                Ok(_) => ghosts.push(n.clone()),
+                Err(e) => {
+                    report.refused.push((path.clone(), format!("cannot read locations: {e}")));
+                    with_bytes.clear();
+                    ghosts.clear();
+                    break;
+                }
+            }
+        }
+        if with_bytes.is_empty() && ghosts.is_empty() {
+            continue; // errored above, already reported
+        }
+
+        // EVERY node here holds nothing. Leave them: this is the deliberate
+        // record of what a drive failure took (D80 §10), and Chris asked for it
+        // to be kept. Retiring them would erase the only trace those episodes
+        // ever existed.
+        if with_bytes.is_empty() {
+            report.refused.push((
+                path.clone(),
+                format!("{} nodes, none holding bytes — kept as the record of a loss", nodes.len()),
+            ));
+            continue;
+        }
+
+        // Ghosts lose to anything, and no ladder is needed to say so: a node
+        // with no bytes anywhere cannot be the better copy, and unlinking it
+        // destroys nothing. 91 of the production 184 are exactly this.
+        for g in &ghosts {
+            if dry_run {
+                report.planned.push(format!("WOULD UNLINK ghost {} at {path}", &g[..12.min(g.len())]));
+            } else {
+                unlink_from_tree(engine, g)?;
+            }
+        }
+
+        match with_bytes.len() {
+            1 => {
+                if !ghosts.is_empty() {
+                    report.resolved += 1;
+                }
+            }
+            2 => {
+                let (a, b) = (with_bytes[0].clone(), with_bytes[1].clone());
+                match decide_collision(engine, &a, &b, rules) {
+                    Some((a_wins, verdict)) if verdict.decided() => {
+                        let loser = if a_wins { &b } else { &a };
+                        if dry_run {
+                            report.planned.push(format!(
+                                "WOULD RETIRE {} at {path} — {}",
+                                &loser[..12.min(loser.len())],
+                                verdict.reason()
+                            ));
+                        } else {
+                            unlink_from_tree(engine, loser)?;
+                        }
+                        report.resolved += 1;
+                    }
+                    Some((_, verdict)) => {
+                        report.refused.push((path.clone(), verdict.reason().to_string()));
+                    }
+                    // No rules supplied — the ladder is OPT-IN, exactly as the
+                    // mover treats it. Without them a human decides.
+                    None => report
+                        .refused
+                        .push((path.clone(), "two copies; --rules not enabled".into())),
+                }
+            }
+            n => {
+                report.refused.push((
+                    path.clone(),
+                    format!("{n} copies hold bytes — the ladder compares two, so a human decides"),
+                ));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Take a node out of the tree, leaving its locations alone.
+///
+/// The bytes are the holder's business: a live location whose node has no live
+/// link is what `reclaim` already looks for, and it moves such a file to trash
+/// rather than deleting it (D71 W5). So this never destroys anything, and it
+/// works from a box that holds no media.
+fn unlink_from_tree(engine: &mut Engine, node: &str) -> Result<(), PvfsError> {
+    if let Some(parent) = engine.parent_of(&node.to_string())? {
+        let links: Vec<String> = engine
+            .children(&parent)?
+            .into_iter()
+            .filter(|c| c.node.id == node)
+            .map(|c| c.link_id)
+            .collect();
+        for l in links {
+            engine.remove_link(&l)?;
+        }
+    }
+    Ok(())
+}

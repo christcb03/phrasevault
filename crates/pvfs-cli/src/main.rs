@@ -393,6 +393,36 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         size_margin: u32,
     },
+    /// D84 — resolve path collisions: two live nodes at one tree path.
+    ///
+    /// The tree path IS the identity of an episode. The arrs write
+    /// `Show - s16e10 - Title.mkv` with no quality tag, so an upgrade lands at
+    /// the SAME path — which is why it replaces in place. Two nodes there are
+    /// two encodes of one episode, and the D76 ladder already knows how to
+    /// choose between them; it has simply never been reached, because nothing
+    /// told the catalog there were two.
+    ///
+    /// MOVES NO BYTES AND DELETES NOTHING. The loser is unlinked from the tree;
+    /// the box that holds those bytes trashes them on its own `reclaim` pass.
+    /// So this is safe to run from the owner, which holds no media at all.
+    ///
+    /// A node holding no bytes anywhere loses to one that does, with no ladder
+    /// needed. But where NO node at a path holds bytes, all are kept — that is
+    /// the deliberate record of what a drive failure took, not a duplicate.
+    Collide {
+        /// Folder to sweep (defaults to the forest root).
+        target: Option<String>,
+        /// Report every decision and take NONE of them. Run this first.
+        #[arg(long)]
+        dry_run: bool,
+        /// Let the D76 ladder decide between two real copies. OFF by default:
+        /// without it a genuine two-copy collision is reported for a human.
+        #[arg(long)]
+        rules: bool,
+        /// Percent larger that counts as "significantly".
+        #[arg(long, default_value_t = 10)]
+        size_margin: u32,
+    },
     /// Edge-side space reclaim (doc 17 §7.4): delete local bytes whose
     /// catalog location was retired by the mover — only ever with another
     /// live location recorded
@@ -4579,6 +4609,61 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
             Ok(())
+        }
+        Cmd::Collide {
+            target,
+            dry_run,
+            rules,
+            size_margin,
+        } => {
+            // Same target grammar as `walk`/`node`: a URI, a path under a
+            // mount, or a node id. Defaults to the whole forest.
+            let (mut engine, root) = match &target {
+                Some(t) => engine_and_node(ctx, t)?,
+                None => {
+                    let e = Engine::open(&ctx?)?;
+                    let r = e.identity.root_node_id.clone();
+                    (e, r)
+                }
+            };
+            let ruleset = rules.then(|| pvfs_core::media::Rules {
+                size_margin_pct: size_margin,
+                ..Default::default()
+            });
+            let report =
+                pvfs_client::fetch::collide_pass(&mut engine, &root, ruleset, dry_run)?;
+            if json {
+                println!(
+                    "{{\"examined\":{},\"resolved\":{},\"refused\":{}}}",
+                    report.examined,
+                    report.resolved,
+                    report.refused.len()
+                );
+            } else {
+                for line in &report.planned {
+                    println!("  {line}");
+                }
+                // The refusals are the part worth reading: each is a pair the
+                // ladder would not separate, and leaving one costs a duplicate
+                // while deciding wrong costs a file.
+                for (path, why) in report.refused.iter().take(25) {
+                    println!("  REFUSED  {path} — {why}");
+                }
+                if report.refused.len() > 25 {
+                    println!("  … and {} more refused", report.refused.len() - 25);
+                }
+                println!(
+                    "{} {} of {} colliding path(s), {} refused",
+                    if dry_run { "would resolve" } else { "resolved" },
+                    report.resolved,
+                    report.examined,
+                    report.refused.len()
+                );
+                if dry_run && report.resolved > 0 {
+                    println!("DRY RUN — nothing was changed.");
+                }
+            }
+            engine.close()
         }
         Cmd::Tier {
             dry_run,
