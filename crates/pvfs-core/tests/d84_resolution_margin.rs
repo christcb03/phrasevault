@@ -11,9 +11,11 @@
 use pvfs_core::media::{choose, Candidate, MediaQuality, Rules};
 
 fn cand(label: &str, w: u32, h: u32, size: u64) -> Candidate {
-    let mut q = MediaQuality::default();
-    q.width = w;
-    q.height = h;
+    let q = MediaQuality {
+        width: w,
+        height: h,
+        ..Default::default()
+    };
     Candidate {
         label: label.into(),
         quality: q,
