@@ -150,7 +150,21 @@ impl Fetcher {
                         instance with `pvfs instance add`)"
                 .into());
         }
-        if candidates.len() >= 2 {
+        // D84 — ALWAYS try the swarm. It used to be gated on `candidates.len()
+        // >= 2`, which skipped it by ARITY rather than capability: the whole
+        // production fleet has one holder for ingest bytes, so every real fetch
+        // took the single-stream path below — a whole-file `cat` with no
+        // resume, no per-chunk verification, and (until D83) no logging. Multi-
+        // GB fetches were abandoned for hours against an empty log.
+        //
+        // A swarm of one is still chunked, resumable and hash-verified per
+        // chunk; it is strictly better than the fallback, and most so on a
+        // single WAN link where a dropped stream is likeliest.
+        //
+        // Chris: "the whole point of this file system was the swarm was the
+        // ability to serve data from any node anywhere in the swarm... that
+        // should be the method to pull files always."
+        {
             match self.swarm_fetch(engine, id, &candidates) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {} // not swarm-eligible — single-stream below
@@ -221,7 +235,8 @@ impl Fetcher {
     }
 
     /// The all-holder parallel pull (P9, doc 22 §3). `Ok(true)` = published;
-    /// `Ok(false)` = not swarm-eligible (small/unhashed/one live holder) —
+    /// `Ok(false)` = not swarm-eligible (unhashed, or NO live holder answered;
+    /// D84 removed "one live holder" — one holder is a swarm of one) —
     /// caller takes the single-stream path; `Err` leaves any partial in place
     /// for a later resume.
     fn swarm_fetch(
@@ -230,7 +245,10 @@ impl Fetcher {
         id: &str,
         candidates: &[ReplicaSource],
     ) -> Result<bool, String> {
-        self.swarm_fetch_opts(engine, id, candidates, 2, None)
+        // min_holders = 1: the only thing that should stop a swarm is having
+        // NO live holder. `holders.len() < min_holders` then means exactly
+        // "nobody answered", which is the honest reason to fall through.
+        self.swarm_fetch_opts(engine, id, candidates, 1, None)
     }
 
     fn swarm_fetch_opts(
