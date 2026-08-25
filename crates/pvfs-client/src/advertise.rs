@@ -390,9 +390,10 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
         label: &str,
         size: u64,
         mime: &str,
+        content_hash: &str,
     ) -> pvfs_core::Result<String> {
         self.client
-            .add_file(parent, label, size, mime, |d| (self.sign)(d))
+            .add_file(parent, label, size, mime, content_hash, |d| (self.sign)(d))
             .map_err(scan_remote_err)
     }
 

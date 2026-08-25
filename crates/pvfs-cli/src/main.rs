@@ -2153,7 +2153,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 engine.close()?;
                 let (mut client, sign) = replica_write_client(&data_dir)?;
                 let id = if kind == "file" {
-                    client.add_file(&parent, &label, size, &mime, |d| sign(d))
+                    client.add_file(&parent, &label, size, &mime, "", |d| sign(d))
                 } else {
                     client.mkdir(&parent, &label, |d| sign(d))
                 }
@@ -5825,7 +5825,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let parent = remote_node(&mut client, &parent)?;
                     let key = identity_key.as_ref().ok_or_else(needs_identity)?;
                     let id = client
-                        .add_file(&parent, &label, size, &mime, |d| {
+                        .add_file(&parent, &label, size, &mime, "", |d| {
                             crypto::sign_digest(key, d).unwrap_or_default()
                         })
                         .map_err(remote_err)?;

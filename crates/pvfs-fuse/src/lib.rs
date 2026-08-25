@@ -739,7 +739,7 @@ impl PvfsFs {
             match &mut self.route {
                 Some((client, sign)) => {
                     let new_id = client
-                        .add_file(to, newname, payload.size_bytes, &payload.mime_type, |d| {
+                        .add_file(to, newname, payload.size_bytes, &payload.mime_type, &payload.content_hash, |d| {
                             sign(d)
                         })
                         .map_err(|e| PvfsError::BadInput {

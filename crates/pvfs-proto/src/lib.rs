@@ -227,6 +227,19 @@ pub enum WriteOp {
         label: String,
         size: u64,
         mime: String,
+        /// D84 — the content hash, computed BY THE BOX THAT HOLDS THE BYTES.
+        ///
+        /// Hashing has to happen where the bytes are, and on this fleet that is
+        /// never the owner: it holds the log and no media. Without this field a
+        /// replica computed the hash during `on_add` ingest and then threw it
+        /// away, because the write-through op had nowhere to put it — so 99.9%
+        /// of the library is unhashed and the swarm, which needs a content hash
+        /// as its trust anchor, cannot run.
+        ///
+        /// `default` keeps this additive: an older client omits it and gets the
+        /// previous behaviour, an unhashed pointer node.
+        #[serde(default)]
+        content_hash: String,
     },
     /// Create a typed node with an inline **payload** (hex; capped small). The
     /// payload lives in the signed event log itself — for small, auditable,

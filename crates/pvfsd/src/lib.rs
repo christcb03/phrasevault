@@ -1989,9 +1989,10 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u
                 label,
                 size,
                 mime,
+                content_hash,
             } => {
                 let payload = FilePayload {
-                    content_hash: String::new(),
+                    content_hash,
                     size_bytes: size,
                     mime_type: mime,
                     original_name: label.clone(),

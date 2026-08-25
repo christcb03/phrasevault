@@ -692,12 +692,16 @@ impl Client {
     }
 
     /// Create a file node named `label` under `parent` (metadata). Returns its id.
+    /// `content_hash` is empty for an unhashed pointer node, or the hash the
+    /// CALLER computed from bytes it holds locally (D84). The owner cannot
+    /// compute it — it has the log and none of the media.
     pub fn add_file<F>(
         &mut self,
         parent: &str,
         label: &str,
         size: u64,
         mime: &str,
+        content_hash: &str,
         sign: F,
     ) -> Result<String>
     where
@@ -709,6 +713,7 @@ impl Client {
                 label: label.into(),
                 size,
                 mime: mime.into(),
+                content_hash: content_hash.into(),
             },
             sign,
         )

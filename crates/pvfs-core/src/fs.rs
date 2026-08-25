@@ -1261,10 +1261,14 @@ impl Engine {
         }
         .encode();
         let id = match writer {
-            // Write-through has no manifest op, so a routed add is the plain
-            // pointer node the arr hook also produced — `tier` attests it when
-            // it migrates (F5.6), which is where attestation belongs anyway.
-            Some(w) => w.add_file(parent, &f.name, f.size, &guess_mime(&f.name))?,
+            // D84 — the hash computed just above now TRAVELS. It used to be
+            // discarded here: a replica under `on_add` hashed the file and then
+            // sent a plain pointer node, because the write-through op had no
+            // field for it. The comment that stood here said `tier` would
+            // attest on migration instead; measured 2026-08-25, it does not —
+            // 0 of the 12 most recently migrated files were hashed. So the
+            // hash has to survive this call, and now does.
+            Some(w) => w.add_file(parent, &f.name, f.size, &guess_mime(&f.name), &content_hash)?,
             None => {
                 let id = self.add_node(
                     parent,
@@ -2042,7 +2046,16 @@ impl Write for CountingWriter<'_> {
 /// already speaks all of them: no new wire op, no `PROTO_VERSION` bump.
 pub trait ScanWriter {
     fn add_folder(&mut self, parent: &str, label: &str) -> Result<NodeId>;
-    fn add_file(&mut self, parent: &str, label: &str, size: u64, mime: &str) -> Result<NodeId>;
+    /// D84 — `content_hash` is computed by the caller from bytes it holds.
+    /// Empty means an unhashed pointer node (the old behaviour).
+    fn add_file(
+        &mut self,
+        parent: &str,
+        label: &str,
+        size: u64,
+        mime: &str,
+        content_hash: &str,
+    ) -> Result<NodeId>;
     fn add_location(&mut self, file: &str, uri: &str) -> Result<()>;
     fn remove_location(&mut self, file: &str, uri: &str) -> Result<()>;
 }

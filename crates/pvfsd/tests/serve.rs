@@ -198,12 +198,40 @@ fn daemon_member_add_file_and_rm() {
     .unwrap();
 
     let file_id = m
-        .add_file(&dropbox, "clip.mkv", 1234, "video/x-matroska", |d| {
+        .add_file(&dropbox, "clip.mkv", 1234, "video/x-matroska", "", |d| {
             crypto::sign_digest(&member_key, d).unwrap()
         })
         .unwrap();
     assert_eq!(m.stat(&file_id).unwrap().node_type, "file");
     assert!(labels(&m.ls(&dropbox).unwrap()).contains(&"clip.mkv".to_string()));
+
+    // D84 — a hash computed by the CALLER must survive the write-through.
+    //
+    // Hashing has to happen where the bytes are, and on this fleet that is
+    // never the owner. Before this field existed a replica under `on_add`
+    // hashed the file and then sent a plain pointer node, because the op had
+    // nowhere to carry it — which is why 99.9% of the production library is
+    // unhashed and the swarm, which needs a content hash as its trust anchor,
+    // could not run at all.
+    let want = blake3::hash(b"pretend these are the bytes").to_hex().to_string();
+    let hashed_id = m
+        .add_file(&dropbox, "hashed.mkv", 4321, "video/x-matroska", &want, |d| {
+            crypto::sign_digest(&member_key, d).unwrap()
+        })
+        .unwrap();
+    let payload = pvfs_core::FilePayload::decode(&m.payload(&hashed_id).unwrap()).unwrap();
+    assert_eq!(
+        payload.content_hash, want,
+        "the caller's hash must reach the catalog, not be replaced by an empty one"
+    );
+    assert_eq!(payload.size_bytes, 4321);
+
+    // ...and omitting it still yields an unhashed pointer node, unchanged.
+    let plain = pvfs_core::FilePayload::decode(&m.payload(&file_id).unwrap()).unwrap();
+    assert!(
+        plain.content_hash.is_empty(),
+        "an empty hash still means an unhashed pointer node"
+    );
 
     m.rm(&file_id, |d| crypto::sign_digest(&member_key, d).unwrap())
         .unwrap();
