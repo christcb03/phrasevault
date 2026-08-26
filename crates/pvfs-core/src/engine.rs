@@ -2032,7 +2032,15 @@ impl Engine {
             .prepare(
                 "SELECT DISTINCT l.file_id, l.uri FROM file_locations l
                   WHERE l.removed_at IS NULL
-                    AND l.uri LIKE 'file://%'
+                    -- D84 — host-implicit `file://` OR THIS BOX'S OWN PIN.
+                    --
+                    -- A replica records its locations pin-qualified (D75/D81),
+                    -- so a `file://`-only test made reclaim blind on the one
+                    -- box that actually holds the bytes: the holder swept 0 of
+                    -- 34 orphans because every one of them was written
+                    -- `pvfs-host://<own pin>/…`. The owner, which this test was
+                    -- written for, holds no media at all.
+                    AND (l.uri LIKE 'file://%' OR (?1 IS NOT NULL AND l.uri LIKE ?1 || '%'))
                     AND NOT EXISTS (SELECT 1 FROM links k
                                     WHERE k.child_id = l.file_id
                                       AND k.removed_at IS NULL)
@@ -2049,13 +2057,23 @@ impl Engine {
                                       AND o.removed_at IS NULL)",
             )
             .map_err(map_db("orphaned locations"))?;
+        let own = self.own_pin().map(str::to_string);
+        let prefix = own.as_deref().and_then(|pin| {
+            crate::storage::host_uri(pin, std::path::Path::new("/"))
+                .ok()
+                .map(|u| u.trim_end_matches('/').to_string())
+        });
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map(params![prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(map_db("orphaned locations"))?;
         let mut out = Vec::new();
         for row in rows {
             let (id, uri) = row.map_err(map_db("orphaned locations"))?;
-            if let Ok(p) = crate::storage::uri_to_path(&uri) {
+            // Resolves BOTH forms to a path on this box, and refuses another
+            // holder's pin — the unification D81 added for exactly this.
+            if let Some(p) = crate::storage::local_path_of(&uri, own.as_deref()) {
                 out.push((id, p));
             }
         }
