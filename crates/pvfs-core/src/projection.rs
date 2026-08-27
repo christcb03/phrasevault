@@ -1776,6 +1776,19 @@ pub fn check_member_event_batched(
             let target = resolve(l.parent_id.as_deref().unwrap());
             require_right(conn, ev.author(), &target, acl::ACL_W, "create link", as_of_ms)
         }
+        // D85 — a location placed on a node BORN IN THIS BATCH.
+        //
+        // The hash-fill successor mints a node and moves every location onto it
+        // in one write. Without this arm the location add resolved rights from
+        // the new node's tree position — which does not exist yet at check time
+        // — and the whole fill was refused with "author lacks the required
+        // right", naming a node id that had never been written. Same shape as
+        // the LinkCreated arm above, and it existed for the same reason.
+        Event::FileLocationAdded { file_id, .. } if born.contains_key(file_id) => {
+            require_active_author(conn, ev, as_of_ms)?;
+            let target = resolve(file_id);
+            require_right(conn, ev.author(), &target, acl::ACL_W, "add location", as_of_ms)
+        }
         Event::ChunkManifestRecorded { file_id, .. } if born.contains_key(file_id) => {
             require_active_author(conn, ev, as_of_ms)?;
             let target = resolve(file_id);
