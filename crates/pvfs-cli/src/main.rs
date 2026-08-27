@@ -2863,16 +2863,44 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
                 LocCmd::Hash { file } => {
-                    if engine.is_replica() {
-                        return Err(PvfsError::BadInput {
-                            field: "hash".into(),
-                            reason: "hash-fill runs on the owner (the log and the bytes \
-                                     together); the mover attests migrating files \
-                                     automatically (doc 17 §7.7)"
-                                .into(),
-                        });
-                    }
-                    let new_id = engine.hash_node(&file)?;
+                    // D85 — a replica hashes WHERE THE BYTES ARE and routes the
+                    // write through the owner.
+                    //
+                    // This used to refuse outright, on the grounds that hash
+                    // fill "runs on the owner (the log and the bytes together)"
+                    // and that the mover attests migrating files anyway.
+                    // Neither held in this fleet: the owner holds no media at
+                    // all, and the mover's attestation is skipped on a replica
+                    // by design. So the only box that could read the bytes was
+                    // the one being refused, and 97.8% of the library stayed
+                    // unhashed — which is what made every mount read block on a
+                    // whole-file fetch instead of streaming.
+                    let new_id = if engine.is_replica() {
+                        let path = engine.readable_path(&file)?.ok_or(PvfsError::NotFound {
+                            kind: "readable bytes",
+                            id: file.clone(),
+                        })?;
+                        let (content_hash, _chunks) =
+                            pvfs_core::sync::hash_with_manifest(&path)?;
+                        let size = std::fs::metadata(&path)
+                            .map_err(|e| PvfsError::io("stat for hash fill", e))?
+                            .len();
+                        let data_dir = engine.data_dir().to_path_buf();
+                        engine.close()?;
+                        let (mut client, sign) = replica_write_client(&data_dir)?;
+                        let id = client
+                            .set_content_hash(&file, &content_hash, size, |d| sign(d))
+                            .map_err(remote_err)?;
+                        replica_catch_up(&data_dir, &mut client);
+                        if json {
+                            println!("{{\"node\":\"{id}\"}}");
+                        } else {
+                            println!("attested — successor id: {id}");
+                        }
+                        return Ok(());
+                    } else {
+                        engine.hash_node(&file)?
+                    };
                     if json {
                         println!("{{\"node\":\"{new_id}\"}}");
                     } else if new_id == file {

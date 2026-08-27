@@ -241,6 +241,16 @@ pub enum WriteOp {
         #[serde(default)]
         content_hash: String,
     },
+    /// D85 — fill a lazy content hash, computed BY THE BOX THAT HOLDS THE
+    /// BYTES. Mints the successor node the hash implies and carries the home
+    /// link and every location across, as one write.
+    ///
+    /// The owner cannot do this itself: it holds the log and none of the media.
+    SetContentHash {
+        node: String,
+        content_hash: String,
+        size_bytes: u64,
+    },
     /// Create a typed node with an inline **payload** (hex; capped small). The
     /// payload lives in the signed event log itself — for small, auditable,
     /// replayable records (e.g. PVOS grant events, doc 13). Not for file bytes

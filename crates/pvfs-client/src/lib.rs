@@ -743,6 +743,28 @@ impl Client {
         )
     }
 
+    /// D85 — fill a lazy content hash the CALLER computed from bytes it holds.
+    /// Returns the successor node's id.
+    pub fn set_content_hash<F>(
+        &mut self,
+        node: &str,
+        content_hash: &str,
+        size_bytes: u64,
+        sign: F,
+    ) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::SetContentHash {
+                node: node.into(),
+                content_hash: content_hash.into(),
+                size_bytes,
+            },
+            sign,
+        )
+    }
+
     /// Read a node's inline payload (read-ACL-gated).
     pub fn payload(&mut self, node: &str) -> Result<Vec<u8>> {
         match self.request(ClientMsg::Payload { node: node.into() })? {

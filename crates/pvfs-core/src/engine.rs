@@ -3067,6 +3067,177 @@ impl Engine {
         })
     }
 
+    /// D85 — phase 1 of a HASH FILL: the successor transaction, unsigned.
+    ///
+    /// Hashing must happen where the bytes are, and on this fleet that is never
+    /// the owner — it holds the log and no media. `pvfs loc hash` refused on a
+    /// replica for a reason the code stated plainly ("hash-fill runs on the
+    /// owner, the log and the bytes together"), and the two routes it named
+    /// were both unavailable here: the owner never runs a `tier` pass, and the
+    /// only box holding the bytes was the one being refused.
+    ///
+    /// So the replica reads and hashes, and the OWNER records — the same seam
+    /// the watcher already uses. Every event is authored by the CALLER, which
+    /// is what keeps this a member write rather than the daemon signing on
+    /// someone's behalf.
+    ///
+    /// This mirrors `successor_node`: a new node carrying the hash, the home
+    /// link swapped to it, and every location moved across. It is one write, so
+    /// a half-applied hash fill is not reachable.
+    pub fn prepare_set_content_hash(
+        &self,
+        author_pub: &[u8],
+        node_id: &NodeId,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<PreparedWrite> {
+        if content_hash.is_empty() {
+            return Err(bad("content_hash", "empty — nothing to fill"));
+        }
+        let old = fetch_node(&self.conn, node_id)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: node_id.clone(),
+        })?;
+        if old.node_type != node::TYPE_FILE {
+            return Err(bad("node", "hash fill works on file nodes"));
+        }
+        let payload = node::FilePayload::decode(&old.payload)?;
+        if !payload.content_hash.is_empty() {
+            return Err(bad("node", "already hashed"));
+        }
+
+        let home = active_home(&self.conn, node_id)?;
+        // Rights come from the PARENT, as every other member write does. A node
+        // with no home cannot be checked and is therefore refused rather than
+        // written blind.
+        let parent = home
+            .as_ref()
+            .and_then(|(_, p)| p.clone())
+            .ok_or_else(|| PvfsError::Forbidden {
+                action: "hash fill".into(),
+                reason: "node has no home link to inherit rights from".into(),
+            })?;
+        let author = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &author, &parent)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "hash fill".into(),
+                reason: format!("you lack write (w) on {parent}"),
+            });
+        }
+
+        let t = now_ms();
+        let creation_nonce = {
+            let mut b = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut b);
+            u64::from_le_bytes(b)
+        };
+        let mut new_node = Node {
+            id: String::new(),
+            node_type: old.node_type.clone(),
+            label: old.label.clone(),
+            visibility: VISIBILITY_PUBLIC.into(),
+            payload: node::FilePayload {
+                content_hash: content_hash.into(),
+                size_bytes,
+                mime_type: payload.mime_type.clone(),
+                original_name: payload.original_name.clone(),
+            }
+            .encode(),
+            is_temp: false,
+            creation_nonce,
+            created_at: t,
+            author: author_pub.to_vec(),
+            sig: Vec::new(),
+        };
+        let node_digest = new_node.id_digest();
+        new_node.id = hex::encode(node_digest);
+        let new_id = new_node.id.clone();
+
+        let mut events = vec![PreparedEvent {
+            event: Event::NodeCreated(new_node.clone()),
+            digest: node_digest,
+        }];
+
+        if let Some((old_link_id, _)) = home {
+            let order_key = fetch_link(&self.conn, &old_link_id)?
+                .map(|l| l.order_key)
+                .unwrap_or_else(|| OrderKey::middle().as_str().to_string());
+            let mut new_link = Link {
+                id: String::new(),
+                parent_id: Some(parent.clone()),
+                child_id: new_id.clone(),
+                link_type: LINK_CONTAINS.into(),
+                link_nonce: 0,
+                order_key,
+                created_at: t,
+                author: author_pub.to_vec(),
+                sig: Vec::new(),
+                removed_at: None,
+                superseded_by: None,
+                suspended_at: None,
+            };
+            let link_digest = new_link.id_digest();
+            new_link.id = hex::encode(link_digest);
+            let new_link_id = new_link.id.clone();
+            events.push(PreparedEvent {
+                event: Event::LinkCreated(new_link),
+                digest: link_digest,
+            });
+            events.push(PreparedEvent {
+                digest: event::msg_link_superseded(&old_link_id, &new_link_id, author_pub),
+                event: Event::LinkSuperseded {
+                    old_link_id: old_link_id.clone(),
+                    new_link_id,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            });
+            events.push(PreparedEvent {
+                digest: event::msg_link_removed(&old_link_id, t, author_pub),
+                event: Event::LinkRemoved {
+                    link_id: old_link_id,
+                    removed_at: t,
+                    removed_by: author_pub.to_vec(),
+                    removal_sig: Vec::new(),
+                },
+            });
+        }
+
+        // Every location follows the node. The sync store is synthesized by
+        // existence rather than recorded, so it is not moved — it re-derives
+        // under the new id on its own.
+        for uri in self.locations(node_id)? {
+            if uri.starts_with(&crate::sync::sync_uri(node_id)) {
+                continue;
+            }
+            events.push(PreparedEvent {
+                digest: event::msg_file_location_removed(node_id, &uri, t, author_pub),
+                event: Event::FileLocationRemoved {
+                    file_id: node_id.clone(),
+                    uri: uri.clone(),
+                    removed_at: t,
+                    removed_by: author_pub.to_vec(),
+                    removal_sig: Vec::new(),
+                },
+            });
+            events.push(PreparedEvent {
+                digest: event::msg_file_location_added(&new_id, &uri, t, author_pub),
+                event: Event::FileLocationAdded {
+                    file_id: new_id.clone(),
+                    uri,
+                    added_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            });
+        }
+
+        Ok(PreparedWrite {
+            events,
+            result_id: new_id,
+        })
+    }
+
     /// Phase 1 of a member location-add: build the unsigned `FileLocationAdded`
     /// recording where a file node's bytes live. The author must hold write on
     /// the file (re-checked at commit and replay).

@@ -1897,6 +1897,7 @@ fn write_target(op: &WriteOp) -> Option<&str> {
         | WriteOp::AddNode { parent, .. }
         | WriteOp::Link { parent, .. } => Some(parent),
         WriteOp::Rm { node }
+        | WriteOp::SetContentHash { node, .. }
         | WriteOp::SetAcl { node, .. }
         // Re-homing is a write on BOTH ends; the destination is the one that
         // could smuggle a node INTO a leased subtree.
@@ -2047,6 +2048,11 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u
                     }
                 }
             }
+            WriteOp::SetContentHash {
+                node,
+                content_hash,
+                size_bytes,
+            } => e.prepare_set_content_hash(&author, &node, &content_hash, size_bytes),
             WriteOp::Rm { node } => e.prepare_remove_node(&author, &node),
             WriteOp::AddLocation { file, uri } => e.prepare_add_location(&author, &file, &uri),
             WriteOp::RemoveLocation { file, uri } => {
