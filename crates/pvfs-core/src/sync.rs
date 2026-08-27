@@ -932,7 +932,25 @@ pub struct EvictReport {
 /// Delete local bytes whose catalog location was retired by the mover —
 /// only ever when the catalog records another **live** location (synthesized
 /// sync-store entries never count: they aren't catalog truth).
-pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
+/// D85 — free space on the ingest box, in ONE step and in the safe order.
+///
+/// Chris, 2026-08-26: *"remember the timing issue where removing the location
+/// first means it doesn't know where to remove the file from, so they have to
+/// be done in the same step. Have the daemon delete the file and then remove
+/// the location from the node."*
+///
+/// That is now the whole shape of this pass. It used to act only on locations
+/// SOMEONE ELSE had already retired, which split the job across two boxes and
+/// two passes — and in this fleet the second box never ran: the holder's
+/// `tier` is `pull_only` and never retires, and the owner does not run `tier`
+/// at all. So evict idled while feederbox grew to 558 GB.
+///
+/// The order is load-bearing. **Delete, then retire.** The location is the only
+/// record of WHERE the bytes are, so retiring first throws away the address of
+/// the thing being deleted. And if the delete succeeds but the retire fails,
+/// the result is a stale location a scan repairs; reversed, it is an orphaned
+/// file nothing knows about.
+pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
     let mut report = EvictReport::default();
     // P8 (doc 21): retired plain file:// locations are evictable ONLY under a
     // migrate-kind binding's source dir — that binding consented to draining
@@ -944,14 +962,34 @@ pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
         .filter_map(|(root, _, _)| engine.binding_for(&root).ok().flatten())
         .map(|b| format!("{}/", b.source_uri.trim_end_matches('/')))
         .collect();
-    for (id, uri, path) in engine.retired_own_host_locations()? {
-        if uri.starts_with("file://") && !staging_prefixes.iter().any(|p| uri.starts_with(p)) {
-            continue; // not a migrate-kind staging location — never touch it
+    // D85 — a root must have SAID it drains. `staging-root` (D81) is that
+    // statement, and it is per-box deployment state: only feederbox declares
+    // `/mnt/local/Media`, so only feederbox's copies are disposable. A box that
+    // has never said so keeps everything, which is the safe default for a
+    // pass whose job is deleting.
+    let declared: Vec<String> = load_placement_full(engine.data_dir())?
+        .staging_roots
+        .into_iter()
+        .map(|(_, u)| format!("{}/", u.trim_end_matches('/')))
+        .collect();
+
+    for (id, uri, path) in engine.live_own_host_locations()? {
+        // Under a declared draining root, or a migrate-kind binding's source.
+        let drains = declared.iter().any(|d| {
+            crate::storage::any_path_of(&uri).is_some_and(|p| p.starts_with(
+                std::path::Path::new(d.trim_start_matches("file://").trim_end_matches('/'))
+            ))
+        }) || staging_prefixes.iter().any(|p| uri.starts_with(p));
+        if !drains {
+            continue; // this root never consented to draining
         }
+        // Held somewhere that is NOT us and NOT the sync store. Our own
+        // location is now live (it is what we are about to retire), so it must
+        // be excluded or every file would look safe to delete.
         let live_elsewhere = engine
             .locations(&id)?
             .iter()
-            .any(|u| !u.starts_with(SYNC_URI_PREFIX));
+            .any(|u| u != &uri && !u.starts_with(SYNC_URI_PREFIX));
         if !live_elsewhere {
             report
                 .skipped
@@ -989,10 +1027,21 @@ pub fn evict_pass(engine: &Engine) -> Result<EvictReport> {
                     ));
                     continue;
                 }
+                // DELETE FIRST — while the location still tells us where the
+                // bytes are — and only then retire it.
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         report.evicted += 1;
                         report.freed_bytes += size;
+                        // A failure here leaves a location pointing at bytes
+                        // that are gone: stale, and a scan repairs it. That is
+                        // strictly better than the reverse, which leaves a file
+                        // nothing in the catalog knows about.
+                        if let Err(e) = engine.remove_location(&id, &uri) {
+                            report
+                                .skipped
+                                .push((uri, format!("evicted, but the location remains: {e}")));
+                        }
                     }
                     Err(e) => report.skipped.push((uri, e.to_string())),
                 }

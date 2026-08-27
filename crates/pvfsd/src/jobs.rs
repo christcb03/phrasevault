@@ -502,8 +502,8 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     .as_mut()
                     .map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
                 let _ = pvfs_client::advertise::retract_pass(st.data_dir(), route)?;
-                let engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = pvfs_core::sync::evict_pass(&engine);
+                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
+                let r = pvfs_core::sync::evict_pass(&mut engine);
                 engine.close()?;
                 r
             })();

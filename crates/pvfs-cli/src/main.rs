@@ -4771,8 +4771,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let route = route_pair.as_mut().map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
                 pvfs_client::advertise::retract_pass(&dir, route)?
             };
-            let engine = Engine::open(&dir)?;
-            let report = pvfs_core::sync::evict_pass(&engine)?;
+            let mut engine = Engine::open(&dir)?;
+            let report = pvfs_core::sync::evict_pass(&mut engine)?;
             let (evicted, freed, skipped) = (
                 report.evicted + retract.retracted,
                 report.freed_bytes + retract.freed_bytes,

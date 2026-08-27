@@ -2097,6 +2097,42 @@ impl Engine {
         Ok(n > 0)
     }
 
+    /// D85 — LIVE locations naming bytes on this box.
+    ///
+    /// The mirror of `retired_own_host_locations`, and what lets a box decide
+    /// for itself that a copy is disposable. Evict used to work only on
+    /// ALREADY-RETIRED rows, which meant something else had to retire them
+    /// first — the owner, on a `tier` pass it does not run in this topology.
+    /// So evict sat idle forever while the ingest box filled up.
+    pub fn live_own_host_locations(&self) -> Result<Vec<(NodeId, String, PathBuf)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT file_id, uri FROM file_locations
+                 WHERE (uri LIKE ?1 || '%' OR uri LIKE 'file://%')
+                   AND removed_at IS NULL",
+            )
+            .map_err(map_db("live own locations"))?;
+        let own_prefix = crate::storage::host_pin(&self.data_dir)
+            .map(|pin| format!("{}{pin}/", crate::storage::HOST_URI_PREFIX))
+            .unwrap_or_else(|| "\u{0}".into());
+        let rows = stmt
+            .query_map(params![own_prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_db("live own locations"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (file_id, uri) = row.map_err(map_db("live own locations"))?;
+            if let Some((_, path)) = crate::storage::parse_host_uri(&uri) {
+                out.push((file_id, uri.clone(), PathBuf::from(path)));
+            } else if let Ok(path) = crate::storage::uri_to_path(&uri) {
+                out.push((file_id, uri.clone(), path));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn retired_own_host_locations(&self) -> Result<Vec<(NodeId, String, PathBuf)>> {
         // Two shapes of "this box's bytes were retired by the mover":
         // pvfs-host:// under our own pin (the F5.3 edge flow), and — P8
