@@ -6187,14 +6187,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{},\"unreadable\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
                             r.stats.changed,
                             r.stats.removed,
                             r.stats.skipped,
-                            r.stats.unreadable
+                            r.stats.unreadable,
+                            r.stats.empty_dirs
                         )
                     })
                     .collect();
@@ -6202,14 +6203,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 for r in &reports {
                     println!(
-                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped, {} unreadable",
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped, {} unreadable, {} empty folders",
                         r.folder_id,
                         r.stats.added,
                         r.stats.unchanged,
                         r.stats.changed,
                         r.stats.removed,
                         r.stats.skipped,
-                        r.stats.unreadable
+                        r.stats.unreadable,
+                        r.stats.empty_dirs
                     );
                 }
                 let changed: u64 = reports.iter().map(|r| r.stats.changed).sum();

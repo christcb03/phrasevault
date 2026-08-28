@@ -132,6 +132,10 @@ pub struct ScanStats {
     /// D71 W6: still being written when we looked, so deliberately NOT
     /// catalogued yet. Deferred, never dropped — the next pass takes it.
     pub settling: u64,
+    /// Directories mirrored that hold no indexed file DIRECTLY (they may still
+    /// hold subdirectories). A folder is part of the shape of a tree, not merely
+    /// a place files happen to be, so an empty one is content in its own right.
+    pub empty_dirs: u64,
     /// D71 W4: the catalog refused this file for a reason retrying cannot fix
     /// (authorization, bad input). The pass skipped it and carried on — one bad
     /// file must never stop the line — but it needs a human. `quarantined`
@@ -834,12 +838,14 @@ impl Engine {
 
         // 1. pure-FS walk
         let mut files = Vec::new();
+        let mut dirs = Vec::new();
         let mut visited = HashSet::new();
         walk_disk(
             &root,
             Vec::new(),
             &mut visited,
             &mut files,
+            &mut dirs,
             &mut stats,
             &WalkCtx { binding: b, settle_ms },
         )?;
@@ -848,6 +854,22 @@ impl Engine {
         let mut folder_ids: HashMap<String, NodeId> = HashMap::new();
         folder_ids.insert(String::new(), b.folder_id.clone());
         let mut seen: HashSet<String> = HashSet::new();
+
+        // Directories FIRST, so the shape of the tree does not depend on which
+        // directories happened to contain a file. `ensure_subfolders` is
+        // idempotent and shares `folder_ids` with the ingest below, so a
+        // directory that does hold files costs a cache hit here, not a lookup.
+        for d in &dirs {
+            self.ensure_subfolders(&mut folder_ids, &b.folder_id, d, writer)?;
+        }
+        // Report only the ones holding no file of their own; the rest are about
+        // to be counted as the files they hold.
+        let dirs_with_files: HashSet<&[String]> =
+            files.iter().map(|f| f.rel_dirs.as_slice()).collect();
+        stats.empty_dirs = dirs
+            .iter()
+            .filter(|d| !dirs_with_files.contains(d.as_slice()))
+            .count() as u64;
 
         for f in &files {
             let uri = path_to_uri(&f.path)?;
@@ -1028,6 +1050,22 @@ impl Engine {
     /// Honest about what this is: a heuristic, not a proof. Two files can share
     /// a name and an exact size and differ in bytes. It never overrides a hash
     /// that disagrees, and the first hash computed for either side settles it.
+    /// Is this node still IN the tree? "Live" is having an active containing
+    /// link — the same rule `match_by_identity` joins on.
+    ///
+    /// D84 — the collision pass unlinks a losing duplicate but leaves its
+    /// locations active, so a file on disk kept resolving to a node that was no
+    /// longer anywhere. Nothing can be written about such a node (rights are
+    /// inherited from the parent it no longer has), which is why the hash fill
+    /// refused it. Treating it as a MISS instead sends the file down the
+    /// identity path, which matches only linked nodes and therefore re-homes
+    /// the location onto the duplicate that won.
+    fn is_homed(&self, id: &NodeId) -> Result<bool> {
+        Ok(crate::engine::active_home(&self.conn, id)?
+            .and_then(|(_, parent)| parent)
+            .is_some())
+    }
+
     fn match_by_identity(&self, label: &str, size: u64) -> Result<Option<NodeId>> {
         let mut stmt = self
             .conn
@@ -1104,6 +1142,13 @@ impl Engine {
             )
             .optional()
             .map_err(map_db("scan state"))?;
+        // An unlinked node is not an identity (see `is_homed`). Falling through
+        // costs one resolution; trusting it cost a 606 MB re-read per pass, on
+        // every pass, for a write that could never land.
+        let ss = match ss {
+            Some((_, _, ref id)) if !self.is_homed(id)? => None,
+            other => other,
+        };
         if let Some((size, mtime, file_id)) = ss {
             if size == f.size && mtime == f.mtime_ms {
                 // D74 — unchanged ON DISK is not the same as recorded IN THE
@@ -1205,6 +1250,10 @@ impl Engine {
             )
             .optional()
             .map_err(map_db("scan match"))?;
+        let active = match active {
+            Some(ref id) if !self.is_homed(id)? => None,
+            other => other,
+        };
         if let Some(file_id) = active {
             let recorded = self.payload_size(&file_id)?;
             if recorded == Some(f.size) {
@@ -1229,6 +1278,7 @@ impl Engine {
         if let Some(file_id) = prior {
             if self.payload_size(&file_id)? == Some(f.size)
                 && fetch_node(&self.conn, &file_id)?.is_some()
+                && self.is_homed(&file_id)?
             {
                 match writer {
                     Some(w) => w.add_location(&file_id, uri)?,
@@ -1766,6 +1816,24 @@ impl Engine {
         if !self.needs_hash(id).unwrap_or(false) {
             return id.clone();
         }
+        // Check BEFORE reading the file, not after. `set_content_hash` inherits
+        // its rights from the node's parent, so an unlinked node is refused —
+        // and the refusal used to arrive having already hashed the whole file.
+        match self.is_homed(id) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "scan: not hashing {uri} — its node is not linked into the tree \
+                     (a duplicate that lost a collision); the location belongs on the \
+                     node that won"
+                );
+                return id.clone();
+            }
+            Err(e) => {
+                eprintln!("scan: cannot tell whether {uri} is linked: {e}");
+                return id.clone();
+            }
+        }
         // D85 — every reason to skip is now SAYABLE. These branches returned
         // silently, so a fill that never ran and a fill that ran and failed
         // looked identical from outside: on the live holder the pass reported
@@ -1785,15 +1853,38 @@ impl Engine {
                 return id.clone();
             }
         };
-        let filled = match writer.as_deref_mut() {
-            Some(w) => w.set_content_hash(id, &content_hash, size),
-            None => self.fill_content_hash(id, &content_hash, size, &chunks),
-        };
-        match filled {
-            Ok(new_id) => new_id,
-            Err(e) => {
-                eprintln!("scan: hash fill failed for {}: {e}", path.display());
-                id.clone()
+        // The bytes are read and hashed — that is the whole cost of this
+        // function. A TRANSIENT failure to record it must not throw that away.
+        //
+        // Measured on the NAS holder: 230 of 551 fills came back `SQLite is
+        // busy/locked during routed scan write (retried 0x)`. Every one had just
+        // read a whole film, and every one would read it again on the next pass,
+        // which is a large part of why that box ran hot for days. The write is
+        // the cheap half; retry THAT.
+        let mut attempt = 0u32;
+        loop {
+            let filled = match writer.as_deref_mut() {
+                Some(w) => w.set_content_hash(id, &content_hash, size),
+                None => self.fill_content_hash(id, &content_hash, size, &chunks),
+            };
+            match filled {
+                Ok(new_id) => return new_id,
+                Err(e) if is_transient(&e) && attempt < HASH_WRITE_RETRIES => {
+                    attempt += 1;
+                    // 200ms, 400ms, 800ms, 1.6s, 3.2s — ~6s of patience against
+                    // re-reading gigabytes, and it backs off rather than adding
+                    // to the contention it just met.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        100u64 << attempt,
+                    ));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "scan: hash fill failed for {} after {attempt} retries: {e}",
+                        path.display()
+                    );
+                    return id.clone();
+                }
             }
         }
     }
@@ -2199,6 +2290,11 @@ pub trait ScanWriter {
 /// same way forever. Retrying is not repair, it is a loop — so that ONE file is
 /// quarantined with its reason, the rest of the pass continues, and the report
 /// says a human is needed.
+/// How many times a hash WRITE is retried before the hash is discarded. The
+/// read that produced it is orders of magnitude more expensive than the write,
+/// so patience here is cheap and impatience is what re-reads the library.
+const HASH_WRITE_RETRIES: u32 = 5;
+
 pub(crate) fn is_transient(e: &PvfsError) -> bool {
     !matches!(
         e,
@@ -2352,6 +2448,7 @@ fn walk_disk(
     rel: Vec<String>,
     visited: &mut HashSet<PathBuf>,
     files: &mut Vec<DiskFile>,
+    dirs: &mut Vec<Vec<String>>,
     stats: &mut ScanStats,
     ctx: &WalkCtx<'_>,
 ) -> Result<()> {
@@ -2382,7 +2479,13 @@ fn walk_disk(
                 }
                 let mut sub = rel.clone();
                 sub.push(entry.name.clone());
-                walk_disk(&child, sub, visited, files, stats, ctx)?;
+                // Every directory we descend into, not just the ones holding
+                // files: a directory IS content. An empty one is a fact about
+                // the tree — the place a season is filed before the episodes
+                // land — and a filesystem that cannot show it is not mirroring
+                // the disk, it is summarising it.
+                dirs.push(sub.clone());
+                walk_disk(&child, sub, visited, files, dirs, stats, ctx)?;
             }
             continue;
         }
