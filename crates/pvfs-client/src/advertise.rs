@@ -397,6 +397,17 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
             .map_err(scan_remote_err)
     }
 
+    fn set_content_hash(
+        &mut self,
+        file: &str,
+        content_hash: &str,
+        size: u64,
+    ) -> pvfs_core::Result<String> {
+        self.client
+            .set_content_hash(file, content_hash, size, |d| (self.sign)(d))
+            .map_err(scan_remote_err)
+    }
+
     fn add_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
         self.client

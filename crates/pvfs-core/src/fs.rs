@@ -1154,6 +1154,18 @@ impl Engine {
                     stats.added += 1;
                     return Ok(());
                 }
+                // D85 — an unchanged file may still be UNHASHED. This is the
+                // path the backlog actually arrives on.
+                let filled = self.fill_hash_if_needed(
+                    &file_id,
+                    uri,
+                    f.size,
+                    b.hash_policy,
+                    writer,
+                );
+                if filled != file_id {
+                    self.set_scan_state(uri, f.size, f.mtime_ms, &filled)?;
+                }
                 stats.unchanged += 1;
             } else {
                 // D81 — count a change ONCE, when it is first detected.
@@ -1233,6 +1245,24 @@ impl Engine {
         // knows it under another path. A migrated copy, a moved folder, a
         // re-import: same file, new place. Record the location, not a new node.
         if let Some(known) = self.match_by_identity(&f.name, f.size)? {
+            // D85 — SELF-HEALING HASH FILL.
+            //
+            // Chris: "It seems [lazy hashing] isn't very useful since it can't
+            // serve the files properly in a swarm which is the whole point of
+            // the file system... It should also hash any newly found or known
+            // but unhashed files on each scan."
+            //
+            // A lazily-hashed file has no chunk manifest, so the swarm refuses
+            // it and a mount cannot stream it — measured through FUSE, 115.8s
+            // to read 1MB of an unhashed file against 0.10s for a hashed one.
+            // The library's default state was its least useful one.
+            //
+            // So a scan fills what it finds empty. It converges: each file is
+            // hashed once and skipped thereafter, and a scan interrupted
+            // halfway simply resumes on the next pass. That is why this needs
+            // no bulk backfill tool — the ordinary cycle drains the backlog.
+            let known =
+                self.fill_hash_if_needed(&known, uri, f.size, b.hash_policy, writer);
             match writer {
                 Some(w) => w.add_location(&known, uri)?,
                 None => {
@@ -1712,6 +1742,92 @@ impl Engine {
     /// check — callers must check ACL before calling). `None` if no readable
     /// location exists. Used by the daemon data plane to resolve a path before
     /// releasing the engine lock for concurrent streaming (doc 07 §6).
+    /// D85 — fill this node's hash if it is empty, returning the id to use.
+    ///
+    /// Called from BOTH scan paths — the file the scan re-discovers and the one
+    /// it considers unchanged. The unchanged path is the one that matters for a
+    /// grown library: 27,049 files whose size and mtime have not moved in
+    /// months are exactly the backlog, and a fill that only ran on newly-seen
+    /// files would never reach them.
+    ///
+    /// Never fails a scan. A file that cannot be hashed right now is recorded
+    /// as it was and retried next pass.
+    fn fill_hash_if_needed(
+        &mut self,
+        id: &NodeId,
+        uri: &str,
+        size: u64,
+        policy: HashPolicy,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> NodeId {
+        if matches!(policy, HashPolicy::Never) {
+            return id.clone();
+        }
+        if !self.needs_hash(id).unwrap_or(false) {
+            return id.clone();
+        }
+        let Ok(path) = crate::storage::uri_to_path(uri) else {
+            return id.clone();
+        };
+        let (content_hash, chunks) = match crate::sync::hash_with_manifest(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("scan: could not hash {}: {e}", path.display());
+                return id.clone();
+            }
+        };
+        let filled = match writer.as_deref_mut() {
+            Some(w) => w.set_content_hash(id, &content_hash, size),
+            None => self.fill_content_hash(id, &content_hash, size, &chunks),
+        };
+        match filled {
+            Ok(new_id) => new_id,
+            Err(e) => {
+                eprintln!("scan: hash fill failed for {}: {e}", path.display());
+                id.clone()
+            }
+        }
+    }
+
+    /// D85 — is this file node still carrying an empty content hash?
+    pub fn needs_hash(&self, id: &NodeId) -> Result<bool> {
+        let Some(n) = crate::engine::fetch_node(&self.conn, id)? else {
+            return Ok(false);
+        };
+        if n.node_type != node::TYPE_FILE {
+            return Ok(false);
+        }
+        Ok(FilePayload::decode(&n.payload)
+            .map(|p| p.content_hash.is_empty())
+            .unwrap_or(false))
+    }
+
+    /// D85 — owner-side hash fill: the successor node plus its attestation.
+    /// The replica equivalent routes through `ScanWriter::set_content_hash`.
+    pub fn fill_content_hash(
+        &mut self,
+        id: &NodeId,
+        content_hash: &str,
+        size_bytes: u64,
+        chunks: &[[u8; 32]],
+    ) -> Result<NodeId> {
+        let n = crate::engine::fetch_node(&self.conn, id)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: id.clone(),
+        })?;
+        let old = FilePayload::decode(&n.payload)?;
+        let payload = FilePayload {
+            content_hash: content_hash.into(),
+            size_bytes,
+            mime_type: old.mime_type,
+            original_name: old.original_name,
+        };
+        let all = self.locations(id)?;
+        let new_id = self.successor_node(&n, payload.encode(), &all)?;
+        self.attest_manifest(&new_id, content_hash, chunks)?;
+        Ok(new_id)
+    }
+
     pub fn readable_path(&self, id: &NodeId) -> Result<Option<std::path::PathBuf>> {
         let uri = match self.first_readable_location(id)? {
             Some(u) => u,
@@ -2058,6 +2174,9 @@ pub trait ScanWriter {
     ) -> Result<NodeId>;
     fn add_location(&mut self, file: &str, uri: &str) -> Result<()>;
     fn remove_location(&mut self, file: &str, uri: &str) -> Result<()>;
+    /// D85 — fill a lazy hash on an EXISTING node, returning the successor id.
+    /// The caller computed it from bytes it holds; the owner records it.
+    fn set_content_hash(&mut self, file: &str, content_hash: &str, size: u64) -> Result<NodeId>;
 }
 
 /// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and

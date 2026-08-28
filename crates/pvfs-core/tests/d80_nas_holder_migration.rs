@@ -111,7 +111,19 @@ fn the_holders_scan_relocates_it_does_not_duplicate() {
 
     let after = files_under(&engine, &media);
     assert_eq!(after.len(), 6, "node count unchanged");
-    assert_eq!(before, after, "and they are the SAME nodes, not replacements");
+    // D85 — the ids MAY advance, and that is not duplication.
+    //
+    // This used to assert `before == after`, which held only while a relocate
+    // was a pure no-op. A scan now fills any empty content hash it meets, and
+    // filling one mints a SUCCESSOR — a different id describing the same bytes.
+    // What must never change is the COUNT: 6 files before, 6 after. Anything
+    // above that is the catalog doubling, which is what this test exists for.
+    for id in &after {
+        assert!(
+            !engine.needs_hash(id).unwrap(),
+            "the holder's scan should have filled every hash it found empty"
+        );
+    }
     engine.close().unwrap();
 }
 

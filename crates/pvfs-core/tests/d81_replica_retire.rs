@@ -268,8 +268,22 @@ fn a_pin_qualified_location_is_not_rediscovered_every_pass() {
          URI for the same path on the same disk is not a discovery"
     );
     assert_eq!(again[0].stats.unchanged, 1);
+    // D85 — follow the successor. A scan now fills any empty content hash it
+    // meets, and filling one mints a new node that the location moves onto. The
+    // property this test guards is unchanged and still asserted above: `added`
+    // is 0 and the pass counts the file `unchanged`, so a differently spelled
+    // URI for the same path is still not a discovery. What must also hold is
+    // that exactly ONE location survives the move — not two.
+    let now = engine
+        .walk(&media)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.node.node_type == pvfs_core::TYPE_FILE)
+        .unwrap()
+        .node
+        .id;
     assert_eq!(
-        engine.locations(&file).unwrap(),
+        engine.locations(&now).unwrap(),
         vec![qualified],
         "and nothing was added alongside it"
     );

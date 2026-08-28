@@ -253,7 +253,17 @@ enum Cmd {
         no_auto_index: bool,
         #[arg(long, default_value = "")]
         extensions: String,
-        #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
+        /// D85 — defaults to `on_add`: hash the whole directory as it is bound.
+        ///
+        /// It used to default to `lazy`, on the reasoning that hashing a large
+        /// library up front is expensive. It is — but an unhashed file has no
+        /// chunk manifest, so the swarm refuses it and a mount cannot stream
+        /// it, which is the whole point of the filesystem. Chris: "It seems
+        /// that isn't very useful since it can't serve the files properly in a
+        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// scan now fills any empty hash it meets, so choosing it only defers
+        /// the cost rather than avoiding it.
+        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
         hash_policy: String,
         /// P8 (doc 21): how this space is enrolled — in-place (bytes stay,
         /// today's bind), migrate (staging: the mover drains it to a central
@@ -646,7 +656,17 @@ enum ForestCmd {
         /// Suggested alias for a later `pvfs forest register --alias` (does not register)
         #[arg(long)]
         alias: Option<String>,
-        #[arg(long, default_value = "lazy", value_parser = ["lazy", "on_add", "never"])]
+        /// D85 — defaults to `on_add`: hash the whole directory as it is bound.
+        ///
+        /// It used to default to `lazy`, on the reasoning that hashing a large
+        /// library up front is expensive. It is — but an unhashed file has no
+        /// chunk manifest, so the swarm refuses it and a mount cannot stream
+        /// it, which is the whole point of the filesystem. Chris: "It seems
+        /// that isn't very useful since it can't serve the files properly in a
+        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// scan now fills any empty hash it meets, so choosing it only defers
+        /// the cost rather than avoiding it.
+        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
         hash_policy: String,
         /// Root-sign genesis with a running companion (existing seed; no new phrase)
         #[arg(long)]
