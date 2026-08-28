@@ -1766,9 +1766,18 @@ impl Engine {
         if !self.needs_hash(id).unwrap_or(false) {
             return id.clone();
         }
-        let Ok(path) = crate::storage::uri_to_path(uri) else {
-            return id.clone();
+        // D85 — every reason to skip is now SAYABLE. These branches returned
+        // silently, so a fill that never ran and a fill that ran and failed
+        // looked identical from outside: on the live holder the pass reported
+        // success and 27,049 files stayed unhashed with nothing in the log.
+        let path = match crate::storage::uri_to_path(uri) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("scan: cannot resolve {uri} to a path for hashing: {e}");
+                return id.clone();
+            }
         };
+        eprintln!("scan: hashing {} ({size} bytes)", path.display());
         let (content_hash, chunks) = match crate::sync::hash_with_manifest(&path) {
             Ok(v) => v,
             Err(e) => {

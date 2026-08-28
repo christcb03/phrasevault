@@ -277,6 +277,17 @@ CREATE TABLE IF NOT EXISTS media_quality (
   seq      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_file_locations_file ON file_locations(file_id) WHERE removed_at IS NULL;
+-- D85 — locations are also looked up BY URI, and that had no index.
+--
+-- `orphaned_local_locations` asks whether any OTHER live node claims these
+-- same bytes, which is a match on `o.uri = l.uri`. Unindexed that is a full scan
+-- of every location per candidate row. On the live holder — 28k locations — it
+-- pinned a core and read the catalog at 143 MB/s while producing nothing,
+-- starving the hash backfill sharing the same database. Correctness had been
+-- checked; cost had not.
+--
+-- Prefix matches on uri use it too.
+CREATE INDEX IF NOT EXISTS idx_file_locations_uri  ON file_locations(uri)     WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_parent_order ON temp_links(parent_id, order_key) WHERE removed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)             WHERE removed_at IS NULL;
 ";

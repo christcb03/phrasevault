@@ -152,7 +152,7 @@ impl JobsState {
                 if r.state == "running" {
                     if let Some(started) = in_flight {
                         if let Some(why) =
-                            pass_stalled_reason(started, now, typical, PASS_STALL_FLOOR)
+                            pass_stalled_reason(started, now, typical, stall_floor(&r.name))
                         {
                             r.state = "stalled".into();
                             r.last_error = Some(why);
@@ -572,6 +572,32 @@ pub fn pass_stalled_reason(
 /// The floor under `pass_stalled_reason`, so a job whose passes are quick is
 /// not flagged for a momentary hiccup.
 pub const PASS_STALL_FLOOR: Duration = Duration::from_secs(300);
+
+/// D85 — how long THIS job may legitimately run before silence is suspicious.
+///
+/// The floor only bites when a job has never completed a pass, because
+/// `typical` is learned from completions. For most jobs that is fine: they
+/// finish in seconds, so a first pass over five minutes really is stuck.
+///
+/// For two jobs it was badly wrong, and they are the two that matter most:
+///
+/// * `tier` moves hundreds of GB across a WAN. A real pass is hours.
+/// * `watch` now hashes what it finds unhashed (D85), so a first pass over a
+///   grown library is bounded by reading the whole library — measured at
+///   roughly 110 files/hour against ~67 TB, which is DAYS.
+///
+/// Both therefore reported `stalled` permanently while working perfectly, and
+/// a detector that cries wolf on healthy work is worse than none — it is
+/// exactly the false alarm that would make D83's monitoring untrustworthy the
+/// day it ships. The comment on `interval()` already said it: a job's stall
+/// threshold has to be derived from what that job actually does.
+pub fn stall_floor(name: &str) -> Duration {
+    match name {
+        "tier" => Duration::from_secs(6 * 3600),
+        "watch" => Duration::from_secs(36 * 3600),
+        _ => PASS_STALL_FLOOR,
+    }
+}
 
 pub fn stalled_reason(
     state: &str,

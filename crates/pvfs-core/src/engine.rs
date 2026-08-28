@@ -2097,6 +2097,20 @@ impl Engine {
         Ok(n > 0)
     }
 
+    /// Index names on the projection — for tests that pin schema decisions
+    /// whose only symptom is cost.
+    pub fn debug_index_names(&self) -> Result<Vec<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL")
+            .map_err(map_db("index names"))?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_db("index names"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("index names"))
+    }
+
     /// D85 — LIVE locations naming bytes on this box.
     ///
     /// The mirror of `retired_own_host_locations`, and what lets a box decide
