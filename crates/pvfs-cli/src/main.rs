@@ -731,10 +731,17 @@ enum LocCmd {
     },
     Rm { file: String, uri: String },
     Ls { file: String },
-    /// F5.6: fill a lazy content hash + attestation from the file's
-    /// readable bytes (creates a successor node — prints the NEW id).
-    /// Runs on the owner (log + bytes together); the mover does this
-    /// automatically for migrating files
+    /// F5.6: fill a lazy content hash + attestation from the file's readable
+    /// bytes (creates a successor node — prints the NEW id).
+    ///
+    /// Runs wherever the BYTES are, including a replica: it hashes locally and
+    /// routes the write through the owner (D85). It used to say "runs on the
+    /// owner (log + bytes together); the mover does this automatically for
+    /// migrating files" — both false here. The owner holds no media, and the
+    /// mover skips attestation on a replica by design, so the only box that
+    /// could read the bytes was the one being refused.
+    ///
+    /// You rarely need this by hand: a SCAN now fills any empty hash it meets.
     Hash { file: String },
     /// Re-hash locations; lift quarantine where bytes match again
     Verify { file: String },
