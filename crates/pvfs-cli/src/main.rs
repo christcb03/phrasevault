@@ -229,7 +229,15 @@ enum Cmd {
     /// directories from the catalog, file reads resolve live — local bytes,
     /// the sync store, else verified read-through. Blocks until unmounted.
     #[cfg(target_os = "linux")]
-    Mount { target: String, dir: PathBuf },
+    Mount {
+        target: String,
+        dir: PathBuf,
+        /// Let other users read the mount (root, mergerfs, containers).
+        /// Off by default: a mount is private to whoever made it. Needs
+        /// `user_allow_other` in /etc/fuse.conf.
+        #[arg(long)]
+        allow_other: bool,
+    },
     /// Unmount a pvfs mount (fusermount -u)
     #[cfg(target_os = "linux")]
     Umount { dir: PathBuf },
@@ -5262,7 +5270,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
         },
         #[cfg(target_os = "linux")]
-        Cmd::Mount { target, dir } => {
+        Cmd::Mount {
+            target,
+            dir,
+            allow_other,
+        } => {
             let (engine, id) = engine_and_node(ctx, &target)?;
             let data_dir = engine.data_dir().to_path_buf();
             engine.close()?;
@@ -5273,12 +5285,20 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 dir.display(),
                 dir.display()
             );
+            eprintln!(
+                "  readable by: {}",
+                if allow_other {
+                    "every user on this host (--allow-other) — mergerfs and containers included"
+                } else {
+                    "this user only — pass --allow-other if root or a container must read it"
+                }
+            );
             // Long-running: re-ignore SIGPIPE for the mount's lifetime
             // (same contract as `serve watch` — see main()).
             unsafe {
                 let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
             }
-            pvfs_fuse::mount(&data_dir, &id, &dir)?;
+            pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
             Ok(())
         }
         #[cfg(target_os = "linux")]

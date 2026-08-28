@@ -682,18 +682,52 @@ impl Filesystem for PvfsFs {
 /// Mount `target` (a node in the forest at `data_dir`) read-only at
 /// `mountpoint`, blocking until unmounted (`fusermount3 -u`, or the process
 /// ends with auto-unmount).
-pub fn mount(data_dir: &Path, target: &NodeId, mountpoint: &Path) -> Result<(), PvfsError> {
+pub fn mount(
+    data_dir: &Path,
+    target: &NodeId,
+    mountpoint: &Path,
+    allow_other: bool,
+) -> Result<(), PvfsError> {
     // AutoUnmount implies allow_other on fusermount, which stock
     // /etc/fuse.conf forbids for users — try the convenient shape first,
     // fall back to the universally-permitted one.
+    //
+    // `allow_other` asked for BY NAME is a different matter, and is never
+    // quietly dropped. Inheriting it from AutoUnmount is what hid D82's
+    // failure: fusermount3 refused the pair, the fallback mounted privately,
+    // and a mount that looked healthy — right options in /proc/mounts, right
+    // listing for the mounting user — was unreadable to root, so mergerfs saw
+    // nothing. A mount no other user can read is useless to the union, and it
+    // must say so at mount time rather than at read time.
     let fs = PvfsFs::new(data_dir, target)?;
-    match fuser::mount2(fs, mountpoint, &opts(true)) {
+    match fuser::mount2(fs, mountpoint, &opts(true, allow_other)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let fs = PvfsFs::new(data_dir, target)?;
-            fuser::mount2(fs, mountpoint, &opts(false)).map_err(|e| PvfsError::io("fuse mount", e))
+            if allow_other {
+                // Drop only AutoUnmount: this separates a fusermount3 that
+                // dislikes auto-unmount from one that forbids allow_other.
+                return fuser::mount2(fs, mountpoint, &opts(false, true)).map_err(allow_other_denied);
+            }
+            fuser::mount2(fs, mountpoint, &opts(false, false))
+                .map_err(|e| PvfsError::io("fuse mount", e))
         }
         Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+/// The one remedy worth naming: `allow_other` is gated by `/etc/fuse.conf`,
+/// not by anything PVFS controls.
+fn allow_other_denied(e: std::io::Error) -> PvfsError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        PvfsError::io(
+            "fuse mount with allow_other — add `user_allow_other` to /etc/fuse.conf \
+             (needed so root and other users, e.g. mergerfs, can read this mount), \
+             or mount without --allow-other to keep it private to this user",
+            e,
+        )
+    } else {
+        PvfsError::io("fuse mount", e)
     }
 }
 
@@ -940,7 +974,7 @@ impl PvfsFs {
     }
 }
 
-fn opts(auto_unmount: bool) -> Vec<MountOption> {
+fn opts(auto_unmount: bool, allow_other: bool) -> Vec<MountOption> {
     // D71 W2: NOT `MountOption::RO`. The kernel enforces that flag before any
     // handler runs, so `unlink`/`rmdir`/`rename` never saw the call — the lab
     // proved it, with `rm` returning EROFS against a mount whose handlers were
@@ -952,6 +986,9 @@ fn opts(auto_unmount: bool) -> Vec<MountOption> {
     // exactly the NAMESPACE — which is the whole point of W2, and the one
     // place this design was behind the read-write rclone mounts it replaces.
     let mut o = vec![MountOption::FSName("pvfs".into())];
+    if allow_other {
+        o.push(MountOption::AllowOther);
+    }
     if auto_unmount {
         o.push(MountOption::AutoUnmount);
     }
@@ -966,13 +1003,35 @@ pub fn spawn_mount(
     mountpoint: &Path,
 ) -> Result<fuser::BackgroundSession, PvfsError> {
     let fs = PvfsFs::new(data_dir, target)?;
-    match fuser::spawn_mount2(fs, mountpoint, &opts(true)) {
+    match fuser::spawn_mount2(fs, mountpoint, &opts(true, false)) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let fs = PvfsFs::new(data_dir, target)?;
-            fuser::spawn_mount2(fs, mountpoint, &opts(false))
+            fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }
         Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D82: `allow_other` used to arrive only as a side effect of AutoUnmount,
+    /// so the moment fusermount3 refused that pair the mount came up private —
+    /// readable by the mounting user, invisible to root, and therefore empty as
+    /// far as mergerfs was concerned. It is an option in its own right now.
+    #[test]
+    fn allow_other_is_requested_by_name_not_inherited() {
+        assert!(opts(false, true).contains(&MountOption::AllowOther));
+        assert!(opts(true, true).contains(&MountOption::AllowOther));
+    }
+
+    /// And it is opt-in: a mount stays private unless someone asks otherwise.
+    #[test]
+    fn a_mount_is_private_by_default() {
+        assert!(!opts(true, false).contains(&MountOption::AllowOther));
+        assert!(!opts(false, false).contains(&MountOption::AllowOther));
     }
 }
