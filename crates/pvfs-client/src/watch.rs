@@ -49,15 +49,32 @@ pub fn run(
     stop: &std::sync::Arc<AtomicBool>,
     mut notify_cb: impl FnMut(WatchEvent),
 ) -> Result<(), PvfsError> {
+    // D86 — liveness, not existence.
+    //
+    // This used to be `create_new`, so the LOCK WAS THE FILE: any watcher that
+    // died without unlinking it — a crash, an OOM kill, the `kill -9` it takes
+    // to roll a daemon that will not stand down — left the next one refusing to
+    // start, forever, with "delete the file if stale". The box then looks
+    // rolled and healthy while doing NO scanning at all, which is exactly what
+    // the NAS holder did after its swap: `watch error`, a lock file dated two
+    // days earlier, and nothing hashing.
+    //
+    // An flock is released by the KERNEL when the holder dies, so a stale lock
+    // cannot exist — the same reason `writer.lock` is one. The file is now just
+    // somewhere to hang the lock; whether it already exists means nothing.
     let lock_path = data_dir.join("serve.lock");
-    let _lock = std::fs::OpenOptions::new()
+    let lock_file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(&lock_path)
-        .map_err(|e| PvfsError::BadInput {
+        .map_err(|e| PvfsError::io("open serve.lock", e))?;
+    let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, e)| PvfsError::BadInput {
             field: "watch".into(),
             reason: format!(
-                "another watcher may be running ({}): {e} — delete the file if stale",
+                "another watcher IS running and holds {} ({e}) — this is liveness, \
+                 not a leftover file, so deleting it will not help",
                 lock_path.display()
             ),
         })?;
@@ -211,6 +228,10 @@ pub fn run(
         }
         engine.close()
     })();
+    // Drop the flock first, then tidy the file away. Order matters: unlinking
+    // while still holding it would let a second watcher create a NEW file and
+    // take a lock on it, and two watchers would scan the same forest.
+    drop(_lock);
     let _ = std::fs::remove_file(&lock_path);
     result
 }

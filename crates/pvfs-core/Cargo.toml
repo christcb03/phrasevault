@@ -21,3 +21,6 @@ nix = { workspace = true, features = ["user", "fs"] }
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true
+# D86: the fold-lock tests hold the lock from a second thread the way another
+# process would, so they need flock directly.
+nix = { workspace = true, features = ["fs"] }

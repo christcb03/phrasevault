@@ -347,22 +347,81 @@ pub const MAIN_OBJECTS: &[&str] = &[
 /// the kernel on crash.
 pub(crate) struct FoldLock(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
 
+/// How long to wait for another process's fold before giving up.
+///
+/// D86 — this wait used to be UNBOUNDED: one non-blocking attempt, a message,
+/// then `LockExclusive`, which blocks until the holder releases. Forever, if it
+/// never does.
+///
+/// That is survivable in a CLI and fatal in a FUSE mount. The mount's session is
+/// single-threaded, so a handler parked on this lock stops answering everything
+/// — `getattr`, `readdir`, the lot — and the filesystem is dead while its
+/// process looks perfectly healthy: alive, sleeping, small. That is exactly how
+/// the library mount came up after a reboot, with the daemon beside it busy
+/// folding a backlog: unit `active`, `mountpoint -q` timing out, readers stuck
+/// in uninterruptible sleep where not even `timeout` could kill them.
+///
+/// Bounded, it becomes a `Busy` — which every caller already treats as
+/// transient and retries. A slow fold now costs a retry instead of a mount.
+///
+/// The budget is SMALL on purpose, and the arithmetic is the reason. The write
+/// path retries `Busy` five times, so this bound multiplies: at 30s the lab
+/// measured a single `rm` through the mount taking 148s, with the message
+/// printed three times — bounded, but 148 seconds of a frozen filesystem is not
+/// meaningfully better than forever to anything waiting on it.
+///
+/// The lock is held for the length of a fold, which is milliseconds in the
+/// ordinary case. Five seconds is already far outside normal; patience beyond
+/// that belongs to the caller's retry ladder, which can afford it because it is
+/// not holding a FUSE session hostage while it waits.
+const FOLD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const FOLD_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub(crate) fn lock_folds(data_dir: &std::path::Path) -> Result<FoldLock> {
+    lock_folds_within(data_dir, FOLD_LOCK_WAIT)
+}
+
+/// Test-only view of the bounded wait: can the fold lock be taken within
+/// `budget`? Takes it and lets it go again, so the "it gives up rather than
+/// hanging" property can be asserted without reaching into crate internals.
+#[doc(hidden)]
+pub fn try_fold_lock_for_test(
+    data_dir: &std::path::Path,
+    budget: std::time::Duration,
+) -> Result<()> {
+    lock_folds_within(data_dir, budget).map(|_| ())
+}
+
+pub(crate) fn lock_folds_within(
+    data_dir: &std::path::Path,
+    budget: std::time::Duration,
+) -> Result<FoldLock> {
     let path = data_dir.join("fold.lock");
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| PvfsError::io("open fold.lock", e))?;
-    match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(l) => Ok(FoldLock(l)),
-        Err((f, _)) => {
-            eprintln!("pvfs: waiting for another pvfs process folding this forest…");
-            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-                .map(FoldLock)
-                .map_err(|(_, e)| {
-                    PvfsError::io("lock fold.lock", std::io::Error::from_raw_os_error(e as i32))
-                })
+    let deadline = std::time::Instant::now() + budget;
+    let mut said = false;
+    let mut waits = 0u32;
+    loop {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| PvfsError::io("open fold.lock", e))?;
+        match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(l) => return Ok(FoldLock(l)),
+            Err((_f, _)) => {
+                if !said {
+                    eprintln!("pvfs: waiting for another pvfs process folding this forest…");
+                    said = true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(PvfsError::Busy {
+                        op: "fold lock (another pvfs process is folding this forest)".into(),
+                        retries: waits,
+                    });
+                }
+                waits += 1;
+                std::thread::sleep(FOLD_LOCK_POLL);
+            }
         }
     }
 }

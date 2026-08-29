@@ -15,6 +15,9 @@ hex.workspace = true
 # F1 network transport (doc 17 §4): TLS connect pinned to the instance's
 # certificate hash — no CA, no roots.
 rustls.workspace = true
+# D86: flock for `serve.lock` — a watcher's liveness, released by the kernel
+# when it dies, so a crash cannot leave a lock that blocks every later start.
+nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
