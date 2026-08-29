@@ -275,6 +275,33 @@ fn manifest_sidecar_roundtrips_and_caches() {
     assert_eq!(m2.len(), 2, "recomputed for the new size");
 }
 
+// The cache must never lay a sidecar down FOR a sidecar — that is the recursion.
+// A forest that already adopted `.manifest` nodes still serves them; it just
+// recomputes each time instead of growing the chain another level.
+#[test]
+fn no_sidecar_for_a_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("blob.bin");
+    std::fs::write(&f, b"some bytes").unwrap();
+
+    let m = sync::manifest_for(&f).unwrap();
+    let side = sync::manifest_sidecar_path(&f);
+    assert!(side.exists(), "sidecar cached for real content");
+
+    let m_side = sync::manifest_for(&side).unwrap();
+    assert_eq!(m_side.len(), 1, "still answers for the sidecar's own bytes");
+    assert!(
+        !sync::manifest_sidecar_path(&side).exists(),
+        "no .manifest.manifest written"
+    );
+    assert_eq!(sync::manifest_for(&f).unwrap(), m, "real file unaffected");
+
+    assert!(sync::is_sidecar_name("a.mkv.manifest"));
+    assert!(!sync::is_sidecar_name("a.mkv"));
+    assert!(sync::is_sidecar_path(&side));
+    assert!(!sync::is_sidecar_path(&f));
+}
+
 #[test]
 fn swarm_commit_keeps_the_whole_file_gate() {
     let (dir, mut engine) = new_forest();
