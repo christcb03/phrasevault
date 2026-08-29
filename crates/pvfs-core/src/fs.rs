@@ -132,6 +132,9 @@ pub struct ScanStats {
     /// D71 W6: still being written when we looked, so deliberately NOT
     /// catalogued yet. Deferred, never dropped — the next pass takes it.
     pub settling: u64,
+    /// The pass stopped early because a stop was asked for (D86). Everything
+    /// counted here really happened; what is missing was never attempted.
+    pub cancelled: bool,
     /// Directories mirrored that hold no indexed file DIRECTLY (they may still
     /// hold subdirectories). A folder is part of the shape of a tree, not merely
     /// a place files happen to be, so an empty one is content in its own right.
@@ -765,10 +768,16 @@ impl Engine {
         let mut reports = Vec::new();
         for b in bindings {
             let stats = self.scan_binding(&b, &mut writer, settle_ms)?;
+            let stopped = stats.cancelled;
             reports.push(ScanReport {
                 folder_id: b.folder_id.clone(),
                 stats,
             });
+            // A folder with several roots (D81) must not carry on to the next
+            // one after being told to stop.
+            if stopped {
+                break;
+            }
         }
         Ok(reports)
     }
@@ -860,6 +869,10 @@ impl Engine {
         // idempotent and shares `folder_ids` with the ingest below, so a
         // directory that does hold files costs a cache hit here, not a lookup.
         for d in &dirs {
+            if self.cancelled() {
+                stats.cancelled = true;
+                return Ok(stats);
+            }
             self.ensure_subfolders(&mut folder_ids, &b.folder_id, d, writer)?;
         }
         // Report only the ones holding no file of their own; the rest are about
@@ -872,6 +885,12 @@ impl Engine {
             .count() as u64;
 
         for f in &files {
+            // Between files, as well as inside the hash. A pass abandoned here
+            // has recorded every file before this one; the next pass resumes.
+            if self.cancelled() {
+                stats.cancelled = true;
+                return Ok(stats);
+            }
             let uri = path_to_uri(&f.path)?;
             seen.insert(uri.clone());
             let parent = self.ensure_subfolders(&mut folder_ids, &b.folder_id, &f.rel_dirs, writer)?;
@@ -1846,13 +1865,17 @@ impl Engine {
             }
         };
         eprintln!("scan: hashing {} ({size} bytes)", path.display());
-        let (content_hash, chunks) = match crate::sync::hash_with_manifest(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("scan: could not hash {}: {e}", path.display());
-                return id.clone();
-            }
-        };
+        let (content_hash, chunks) =
+            match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
+                Ok(Some(v)) => v,
+                // Asked to stop mid-file. Not a failure: nothing is recorded, and
+                // the next pass hashes it from the start.
+                Ok(None) => return id.clone(),
+                Err(e) => {
+                    eprintln!("scan: could not hash {}: {e}", path.display());
+                    return id.clone();
+                }
+            };
         // The bytes are read and hashed — that is the whole cost of this
         // function. A TRANSIENT failure to record it must not throw that away.
         //
@@ -1871,12 +1894,16 @@ impl Engine {
                 Ok(new_id) => return new_id,
                 Err(e) if is_transient(&e) && attempt < HASH_WRITE_RETRIES => {
                     attempt += 1;
-                    // 200ms, 400ms, 800ms, 1.6s, 3.2s — ~6s of patience against
-                    // re-reading gigabytes, and it backs off rather than adding
-                    // to the contention it just met.
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        100u64 << attempt,
-                    ));
+                    // Backs off rather than adding to the contention it just
+                    // met, and caps the single wait so a stop is still prompt.
+                    let ms = (100u64 << attempt).min(HASH_WRITE_BACKOFF_MAX_MS);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    // Asked to stop while waiting out a busy owner: drop it
+                    // rather than spending another half minute on a write
+                    // nobody is waiting for.
+                    if self.cancelled() {
+                        return id.clone();
+                    }
                 }
                 Err(e) => {
                     eprintln!(
@@ -2290,10 +2317,20 @@ pub trait ScanWriter {
 /// same way forever. Retrying is not repair, it is a loop — so that ONE file is
 /// quarantined with its reason, the rest of the pass continues, and the report
 /// says a human is needed.
-/// How many times a hash WRITE is retried before the hash is discarded. The
-/// read that produced it is orders of magnitude more expensive than the write,
-/// so patience here is cheap and impatience is what re-reads the library.
-const HASH_WRITE_RETRIES: u32 = 5;
+/// How many times a hash WRITE is retried before the hash is discarded, and the
+/// longest single wait between tries.
+///
+/// The budget is set by the ASYMMETRY, not by taste. Behind this write sits a
+/// whole-file read — 7.7 GB for one of the films on the holder, minutes of disk
+/// — and behind the failure sits doing it all again next pass. Waiting a minute
+/// for a lock is nothing against that, so the retry is deliberately patient:
+/// ~29s of sleeping across 8 tries, on top of each attempt's own 5s SQLite
+/// busy_timeout.
+///
+/// It is still bounded. A lock held longer than that is a real fault and should
+/// be reported rather than waited out forever.
+const HASH_WRITE_RETRIES: u32 = 8;
+const HASH_WRITE_BACKOFF_MAX_MS: u64 = 8_000;
 
 pub(crate) fn is_transient(e: &PvfsError) -> bool {
     !matches!(

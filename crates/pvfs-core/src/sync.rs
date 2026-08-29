@@ -188,6 +188,22 @@ pub fn manifest_root(hashes: &[[u8; 32]]) -> [u8; 32] {
 /// One read, both answers: the whole-file hash (hex) and the chunk manifest —
 /// what the hashing paths use so attestation costs no second read (P9.1).
 pub fn hash_with_manifest(path: &Path) -> Result<(String, Vec<[u8; 32]>)> {
+    Ok(hash_with_manifest_until(path, None)?.expect("no cancel flag, so never cancelled"))
+}
+
+/// As `hash_with_manifest`, but abandons the read when `cancel` is set, returning
+/// `Ok(None)`.
+///
+/// D86 — the granularity matters. A scan pass hashes a whole library, and one
+/// film can be 7.7 GB, so checking a stop flag only between FILES still leaves
+/// minutes of unstoppable work. On the NAS holder that was the difference
+/// between a daemon that could be rolled and one that ignored SIGTERM for hours.
+/// Checked once per 1 MiB read: cheap enough not to matter, fine enough that a
+/// stop lands promptly.
+pub fn hash_with_manifest_until(
+    path: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<(String, Vec<[u8; 32]>)>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for hash", e))?;
     let mut whole = blake3::Hasher::new();
@@ -196,6 +212,9 @@ pub fn hash_with_manifest(path: &Path) -> Result<(String, Vec<[u8; 32]>)> {
     let mut hasher = blake3::Hasher::new();
     let mut in_chunk: u64 = 0;
     loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Ok(None);
+        }
         let n = f.read(&mut buf).map_err(|e| PvfsError::io("read for hash", e))?;
         if n == 0 {
             break;
@@ -217,7 +236,7 @@ pub fn hash_with_manifest(path: &Path) -> Result<(String, Vec<[u8; 32]>)> {
     if in_chunk > 0 {
         hashes.push(*hasher.finalize().as_bytes());
     }
-    Ok((whole.finalize().to_hex().to_string(), hashes))
+    Ok(Some((whole.finalize().to_hex().to_string(), hashes)))
 }
 
 pub(crate) fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {

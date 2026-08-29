@@ -46,7 +46,7 @@ pub fn run(
     data_dir: &Path,
     reconcile_secs: u64,
     debounce_ms: u64,
-    stop: &AtomicBool,
+    stop: &std::sync::Arc<AtomicBool>,
     mut notify_cb: impl FnMut(WatchEvent),
 ) -> Result<(), PvfsError> {
     let lock_path = data_dir.join("serve.lock");
@@ -63,6 +63,12 @@ pub fn run(
         })?;
     let result = (|| {
         let mut engine = Engine::open(data_dir)?;
+        // D86 — the same flag the loop below checks, handed to the engine so a
+        // pass ALREADY RUNNING can be abandoned. Without this the loop condition
+        // is only consulted between passes, and a pass is a whole library: the
+        // NAS holder ignored SIGTERM for hours, which is why it could not be
+        // rolled.
+        engine.set_cancel(std::sync::Arc::clone(stop));
         // D71 W4: on a replica the catalog writes go to the owner's daemon —
         // this box has no local writer. If the owner is unreachable the
         // watcher starts anyway and each pass reports the failure, because a

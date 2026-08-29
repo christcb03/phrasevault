@@ -125,9 +125,37 @@ pub struct Engine {
     /// location mine" per FILE, and `host_pin` reads a file off disk to answer;
     /// doing that thousands of times per pass is a cost nobody chose.
     own_pin: std::sync::OnceLock<Option<String>>,
+    /// Set to abandon a long pass early (D86). A scan walks a whole library and
+    /// hashes every unhashed file it meets, so "between passes" is the wrong
+    /// granularity for a stop: on the NAS holder that meant SIGTERM was ignored
+    /// for hours and the box could not be rolled at all.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Engine {
+    /// Give this engine a flag that asks a long pass to stop early.
+    ///
+    /// The scan is resumable by construction — `scan_state` records progress
+    /// per file — so abandoning a pass costs at most the file in flight, and
+    /// the next pass picks up where this one left off. That is what makes it
+    /// safe to honour a stop in the middle rather than only between passes.
+    pub fn set_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(flag);
+    }
+
+    /// Has a stop been asked for?
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The flag itself, for handing to code that reads it in a tight loop
+    /// (the hasher) without borrowing the engine.
+    pub(crate) fn cancel_flag(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        self.cancel.as_deref()
+    }
+
     /// This box's transport pin, if it has ever served a listener. Cached —
     /// it cannot change while the engine is open.
     pub(crate) fn own_pin(&self) -> Option<&str> {
@@ -470,6 +498,7 @@ impl Engine {
             device,
             _writer_lock: take_writer_lock(data_dir),
             own_pin: std::sync::OnceLock::new(),
+            cancel: None,
             identity: ForestIdentity {
                 instance_id,
                 forest_id,
@@ -504,6 +533,7 @@ impl Engine {
             replica: false,
             _writer_lock: lock,
             own_pin: std::sync::OnceLock::new(),
+            cancel: None,
         };
         if let Err(e) = engine.ensure_device_active() {
             // A projection torn by concurrent folders can pass every position
@@ -614,6 +644,7 @@ impl Engine {
             replica: false,
             _writer_lock: None,
             own_pin: std::sync::OnceLock::new(),
+            cancel: None,
         })
     }
 
@@ -639,6 +670,7 @@ impl Engine {
             replica: true,
             _writer_lock: lock,
             own_pin: std::sync::OnceLock::new(),
+            cancel: None,
         })
     }
 
@@ -771,6 +803,7 @@ impl Engine {
             replica: false,
             _writer_lock: _writer_lock_held,
             own_pin: std::sync::OnceLock::new(),
+            cancel: None,
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();

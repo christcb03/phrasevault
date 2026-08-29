@@ -4961,7 +4961,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     unsafe {
                         let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
                     }
-                    let never = std::sync::atomic::AtomicBool::new(false);
+                    let never = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     pvfs_client::watch::run(
                         &data_dir,
                         reconcile_secs,
