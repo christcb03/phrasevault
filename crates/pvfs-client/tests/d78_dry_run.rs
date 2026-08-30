@@ -71,7 +71,7 @@ fn a_dry_run_plans_the_work_and_writes_nothing() {
                 recursive: true,
                 auto_index: true,
                 extensions: String::new(),
-                hash_policy: HashPolicy::Lazy,
+                hash_policy: HashPolicy::OnAdd,
             },
         )
         .unwrap();

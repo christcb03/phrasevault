@@ -21,7 +21,7 @@ fn spec(dir: &std::path::Path) -> BindSpec {
         recursive: true,
         auto_index: true,
         extensions: String::new(),
-        hash_policy: HashPolicy::Lazy,
+        hash_policy: HashPolicy::OnAdd,
     }
 }
 

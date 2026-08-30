@@ -70,7 +70,7 @@ fn find_by_label(engine: &Engine, parent: &str, label: &str) -> Option<String> {
 // §10.2/§10.3 — scan indexes a tree of pointers; rescan is a no-op
 #[test]
 fn scan_mirrors_directory_and_is_idempotent() {
-    let (_data, _fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    let (_data, _fixture, mut engine, folder) = bound_fixture(HashPolicy::OnAdd);
     let reports = engine.scan(Some(&folder)).unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].stats.added, 3);
@@ -111,7 +111,7 @@ fn extension_filter() {
             },
         )
         .unwrap();
-    let mut spec = bind_spec(fixture.path(), HashPolicy::Lazy);
+    let mut spec = bind_spec(fixture.path(), HashPolicy::OnAdd);
     spec.extensions = "mkv".into();
     engine.bind_folder(&folder, spec).unwrap();
     let r = engine.scan(Some(&folder)).unwrap();
@@ -149,7 +149,7 @@ fn scan_never_adopts_manifest_sidecars() {
         .unwrap();
     // the production shape: no extension filter at all
     engine
-        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::Lazy))
+        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::OnAdd))
         .unwrap();
 
     let r = engine.scan(Some(&folder)).unwrap();
@@ -193,7 +193,7 @@ fn unreadable_file_is_not_imported() {
         )
         .unwrap();
     engine
-        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::Lazy))
+        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::OnAdd))
         .unwrap();
 
     let r = engine.scan(Some(&folder)).unwrap();
@@ -213,7 +213,7 @@ fn unreadable_file_is_not_imported() {
 // §10.4 — disk deletion soft-removes; restore re-attaches the same node
 #[test]
 fn disk_delete_and_restore() {
-    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::OnAdd);
     engine.scan(Some(&folder)).unwrap();
     let notes = find_by_label(&engine, &folder, "notes.txt").unwrap();
 
@@ -287,7 +287,7 @@ fn changed_file_flag_and_resolve() {
 
 #[test]
 fn changed_file_resolve_delete_purge() {
-    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::OnAdd);
     engine.scan(Some(&folder)).unwrap();
     let beta = {
         let movies = find_by_label(&engine, &folder, "movies").unwrap();
@@ -353,7 +353,9 @@ fn integrity_quarantine_and_repair() {
 // §10.7 — lazy hashing: fill via successor node
 #[test]
 fn lazy_hash_fill() {
-    let (_data, _fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    // D94 — `Never` is now how you get an UNHASHED node on purpose. This test
+    // is about filling a hash that is absent, which `on_add` no longer leaves.
+    let (_data, _fixture, mut engine, folder) = bound_fixture(HashPolicy::Never);
     engine.scan(Some(&folder)).unwrap();
     let notes = find_by_label(&engine, &folder, "notes.txt").unwrap();
 
@@ -425,7 +427,7 @@ fn temp_spool_sweep() {
 // §10.x — bindings survive rebuild (they are log events)
 #[test]
 fn bindings_survive_rebuild() {
-    let (data, fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    let (data, fixture, mut engine, folder) = bound_fixture(HashPolicy::OnAdd);
     engine.scan(Some(&folder)).unwrap();
     engine.close().unwrap();
     fs::remove_file(data.path().join("index.db")).unwrap();
@@ -444,10 +446,10 @@ fn bindings_survive_rebuild() {
 // binding validation rules
 #[test]
 fn binding_rules() {
-    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::Lazy);
+    let (_data, fixture, mut engine, folder) = bound_fixture(HashPolicy::OnAdd);
     // double-bind refused
     assert!(matches!(
-        engine.bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::Lazy)),
+        engine.bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::OnAdd)),
         Err(PvfsError::BadInput { .. })
     ));
     // same dir on another folder refused
@@ -465,13 +467,13 @@ fn binding_rules() {
         )
         .unwrap();
     assert!(matches!(
-        engine.bind_folder(&other, bind_spec(fixture.path(), HashPolicy::Lazy)),
+        engine.bind_folder(&other, bind_spec(fixture.path(), HashPolicy::OnAdd)),
         Err(PvfsError::BadInput { .. })
     ));
     // unbind then rebind elsewhere works
     engine.unbind_folder(&folder, None).unwrap();
     engine
-        .bind_folder(&other, bind_spec(fixture.path(), HashPolicy::Lazy))
+        .bind_folder(&other, bind_spec(fixture.path(), HashPolicy::OnAdd))
         .unwrap();
 }
 

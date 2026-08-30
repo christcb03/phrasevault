@@ -1403,7 +1403,7 @@ fn adopt_central_store(
         // placement command into hours of reading. Identity by (name, exact
         // size) is enough to recognise these files, and the first hash that is
         // ever needed settles it (D71 W6).
-        hash_policy: pvfs_core::HashPolicy::Lazy,
+        hash_policy: pvfs_core::HashPolicy::OnAdd,
     };
     let uri = spec.source_uri.clone();
     let stats = engine.scan_unbound(&node.to_string(), &uri, &spec, &mut None, 0)?;

@@ -236,21 +236,34 @@ HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
 [ "$HASHED" = "$LAZY" ] && ok "hash on an on_add node is an idempotent no-op" \
   || fail "hash on on_add node re-identified: $LAZY -> $HASHED"
 [ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified" || fail "hashed cat"
-# A genuinely lazy binding: scan skips hashing, so the fill happens at `pvfs
-# hash` time — the hash lives in the immutable payload, hence a successor node.
+# D94 — `lazy` is gone as a POLICY but still accepted as a WORD, because
+# bindings in the field say it on disk and must not break. It now means
+# `on_add`. This asserts that migration, then uses `never` for the successor
+# case below, which is what `lazy` used to be the lazy way of reaching.
+BINDLIB="$DATA/oldword"
+mkdir -p "$BINDLIB"; printf 'x' > "$BINDLIB/f.bin"
+BFOLDER="$($PVFS add "$ROOT" --kind folder --label oldword)"
+$PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy lazy >/dev/null \
+  && ok "the word 'lazy' still binds (reads as on_add)" || fail "lazy word rejected"
+$PVFS bindings | qgrep "hash on_add" \
+  && ok "and is recorded as on_add" || fail "lazy did not migrate to on_add"
+
+# The fill happens at `pvfs hash` time — the hash lives in the immutable
+# payload, hence a successor node. `never` is how you ask for an unhashed node
+# on purpose now that `on_add` is the default.
 LAZYLIB="$DATA/lazylib"
 mkdir -p "$LAZYLIB"
 printf 'truly-lazy' > "$LAZYLIB/slow.bin"
 ZFOLDER="$($PVFS add "$ROOT" --kind folder --label lazylib)"
-$PVFS bind "$ZFOLDER" "$LAZYLIB" --hash-policy lazy >/dev/null && ok "bind (lazy policy)" || fail "lazy bind"
+$PVFS bind "$ZFOLDER" "$LAZYLIB" --hash-policy never >/dev/null && ok "bind (never policy)" || fail "never bind"
 $PVFS scan "$ZFOLDER" >/dev/null
 SLOW="$($PVFS --json ls "$ZFOLDER" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "slow.bin": print(e["id"])')"
 FILLED="$($PVFS hash "$SLOW" 2>/dev/null)"
-[ ${#FILLED} -eq 64 ] && [ "$FILLED" != "$SLOW" ] && ok "hash created successor node (lazy policy)" \
-  || fail "lazy hash fill: $SLOW -> $FILLED"
+[ ${#FILLED} -eq 64 ] && [ "$FILLED" != "$SLOW" ] && ok "hash created successor node (never policy)" \
+  || fail "unhashed hash fill: $SLOW -> $FILLED"
 [ "$($PVFS cat "$FILLED")" = "truly-lazy" ] && ok "successor serves verified bytes" || fail "successor cat"
 
 say "P4 F0: export (native tree view, doc 17)"

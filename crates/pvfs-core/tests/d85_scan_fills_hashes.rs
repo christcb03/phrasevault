@@ -45,10 +45,17 @@ fn unhashed_count(e: &Engine, folder: &str) -> usize {
         .count()
 }
 
-/// A library bound LAZY leaves every file unhashed — the state 97.8% of the
-/// production library was in. A later scan must fill them all.
+/// A library that was left unhashed must be filled by a later scan — the state
+/// 97.8% of the production library was in, and still the state of the 27,050
+/// files the holder is working through.
+///
+/// D94 — this used to reach that state via `lazy`, which is now gone precisely
+/// because it was the default and left libraries like this. `Never` is how you
+/// ask for an unhashed node on purpose, and re-binding `on_add` is the
+/// migration the real fleet is doing: bind a library that was never hashed, and
+/// the next pass fills it.
 #[test]
-fn a_later_scan_fills_hashes_a_lazy_bind_left_empty() {
+fn a_later_scan_fills_hashes_an_unhashed_bind_left_empty() {
     let dir = tempfile::tempdir().unwrap();
     let media = library(&dir.path().join("lib"), 5);
     let (mut e, _mn) = Engine::init(&dir.path().join("forest")).unwrap();
@@ -66,14 +73,14 @@ fn a_later_scan_fills_hashes_a_lazy_bind_left_empty() {
         )
         .unwrap();
 
-    // bound LAZY: nothing is hashed
-    let lazy = spec(&media, HashPolicy::Lazy);
-    let uri = lazy.source_uri.clone();
-    e.scan_unbound(&folder, &uri, &lazy, &mut None, 0).unwrap();
-    assert_eq!(unhashed_count(&e, &folder), 5, "a lazy bind hashes nothing");
+    // bound NEVER: nothing is hashed, which is the state the library starts in
+    let bare = spec(&media, HashPolicy::Never);
+    let uri = bare.source_uri.clone();
+    e.scan_unbound(&folder, &uri, &bare, &mut None, 0).unwrap();
+    assert_eq!(unhashed_count(&e, &folder), 5, "a `never` bind hashes nothing");
 
-    // scan again — the pass fills what it finds empty
-    let again = spec(&media, HashPolicy::Lazy);
+    // scan again as on_add — the pass fills what it finds empty
+    let again = spec(&media, HashPolicy::OnAdd);
     e.scan_unbound(&folder, &uri, &again, &mut None, 0).unwrap();
     assert_eq!(
         unhashed_count(&e, &folder),

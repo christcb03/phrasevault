@@ -71,7 +71,7 @@ fn find_by_label(engine: &Engine, parent: &str, label: &str) -> Option<pvfs_core
 // doc 17 §3 — symlink export materializes the tree; entries read through
 #[test]
 fn symlink_export_materializes_tree() {
-    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::Lazy);
+    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::OnAdd);
     let dest_root = tempfile::tempdir().unwrap();
     let dest = dest_root.path().join("plex");
     let spec = ExportSpec {
@@ -101,7 +101,7 @@ fn symlink_export_materializes_tree() {
 // removals leave stale entries; --prune clears them
 #[test]
 fn reexport_reports_then_prunes_stale_entries() {
-    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::Lazy);
+    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::OnAdd);
     let dest_root = tempfile::tempdir().unwrap();
     let dest = dest_root.path().join("view");
     let spec = ExportSpec {
@@ -222,7 +222,7 @@ fn label_collisions_disambiguate() {
 // never adopt a directory the export didn't create
 #[test]
 fn refuses_foreign_nonempty_dest() {
-    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::Lazy);
+    let (_data, _fixture, mut engine, folder) = scanned_library(HashPolicy::OnAdd);
     let dest_root = tempfile::tempdir().unwrap();
     let dest = dest_root.path().join("occupied");
     write_file(&dest.join("precious.txt"), b"user data");

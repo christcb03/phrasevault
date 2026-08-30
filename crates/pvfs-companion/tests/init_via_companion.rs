@@ -29,7 +29,7 @@ fn forest_init_with_companion_root_no_new_phrase() {
     let (engine, report) = mount::init_forest_with_root_signer(
         mount.path(),
         false,
-        HashPolicy::Lazy,
+        HashPolicy::OnAdd,
         &root_pub,
         |digest| {
             Ok(signer

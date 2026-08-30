@@ -33,7 +33,6 @@ pub const WATCH_SETTLE_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashPolicy {
-    Lazy,
     OnAdd,
     Never,
 }
@@ -41,15 +40,26 @@ pub enum HashPolicy {
 impl HashPolicy {
     pub fn parse(s: &str) -> Result<HashPolicy> {
         match s {
-            "lazy" => Ok(HashPolicy::Lazy),
-            "on_add" => Ok(HashPolicy::OnAdd),
+            // D94 — `lazy` is GONE, and existing bindings that still say it on
+            // disk are read as `on_add` rather than broken.
+            //
+            // It did not defer the hashing, it skipped it: 91.5% of the media
+            // forest was unhashed, and an unhashed file has no chunk manifest,
+            // so a mount cannot stream it and blocks on a whole-file fetch —
+            // 115.8s to read 1MB against 0.10s for a hashed one.
+            //
+            // Worse, it was the ORPHAN FACTORY. `on_add` gives a node its hash
+            // at birth; `lazy` creates it bare and lets the fill mint a
+            // SUCCESSOR, orphaning the original. That is 1298 orphaned unhashed
+            // nodes on the ingest box and one more for every file still to be
+            // filled — and an orphan could not even be retired until D90.
+            "lazy" | "on_add" => Ok(HashPolicy::OnAdd),
             "never" => Ok(HashPolicy::Never),
             other => Err(bad("hash_policy", &format!("unknown policy {other:?}"))),
         }
     }
     pub fn as_str(&self) -> &'static str {
         match self {
-            HashPolicy::Lazy => "lazy",
             HashPolicy::OnAdd => "on_add",
             HashPolicy::Never => "never",
         }
@@ -1616,7 +1626,9 @@ impl Engine {
             .map_err(map_db("policy lookup"))?;
         match got {
             Some(s) => HashPolicy::parse(&s),
-            None => Ok(HashPolicy::Lazy),
+            // D94 — binding a library now hashes it. The old default was
+            // `lazy`, which is why so little of the fleet was ever hashed.
+            None => Ok(HashPolicy::OnAdd),
         }
     }
 
