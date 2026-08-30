@@ -116,6 +116,27 @@ pub struct BindingRow {
     pub is_local: bool,
 }
 
+/// What `backfill_sidecars` did (D93).
+#[derive(Debug, Default, Clone)]
+pub struct BackfillReport {
+    /// Hashes rescued out of the catalog and written beside the bytes.
+    pub written: u64,
+    /// Of those, ones with no chunk hashes to carry — the whole hash only.
+    pub whole_hash_only: u64,
+    /// Pre-D91 sidecars removed after their content was rewritten at the
+    /// dotfile name.
+    pub legacy_retired: u64,
+    /// Already had a usable v2 sidecar; nothing to do.
+    pub already_durable: u64,
+    /// The catalog has no hash for these yet — the fill has not reached them.
+    pub unhashed: u64,
+    /// No readable copy on this box, so nowhere to leave the note.
+    pub no_local_copy: u64,
+    /// On-disk size disagrees with the catalog: a replacement at the same path,
+    /// not the file that was hashed. Never stamped with the old hash.
+    pub size_mismatch: u64,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     pub added: u64,
@@ -1904,6 +1925,19 @@ impl Engine {
                 eprintln!("scan: hash from sidecar {} ({size} bytes)", path.display());
                 known
             }
+            // A sidecar carrying only the whole hash still saves the whole read,
+            // which is the entire cost here. `sidecar backfill` writes these when
+            // it rescues a hash that existed only in a previous forest's catalog.
+            // Chunks stay unrecorded rather than guessed — `manifest_for`
+            // computes them the first time the file is actually served.
+            None if crate::sync::sidecar_whole_hash(&path, size).is_some() => {
+                let w = crate::sync::sidecar_whole_hash(&path, size).unwrap();
+                eprintln!(
+                    "scan: hash from sidecar (no chunks) {} ({size} bytes)",
+                    path.display()
+                );
+                (w, Vec::new())
+            }
             None => {
                 eprintln!("scan: hashing {} ({size} bytes)", path.display());
                 match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
@@ -1923,7 +1957,11 @@ impl Engine {
         // forest's catalog and died with it — 2918 hashed nodes against 90
         // sidecars on disk. Best-effort: a read-only store still fills, it just
         // cannot leave the note.
-        let _ = crate::sync::write_manifest_sidecar(&path, Some(&content_hash), &chunks);
+        // Do not overwrite a good sidecar with a chunkless one: if we got here
+        // FROM a chunkless sidecar there is nothing new to record.
+        if !chunks.is_empty() {
+            let _ = crate::sync::write_manifest_sidecar(&path, Some(&content_hash), &chunks);
+        }
         // The bytes are read and hashed — that is the whole cost of this
         // function. A TRANSIENT failure to record it must not throw that away.
         //
@@ -1999,8 +2037,88 @@ impl Engine {
         };
         let all = self.locations(id)?;
         let new_id = self.successor_node(&n, payload.encode(), &all)?;
-        self.attest_manifest(&new_id, content_hash, chunks)?;
+        // Attest ONLY what we actually computed. `manifest_root(&[])` is the
+        // root of an empty manifest, so attesting with no chunks would sign a
+        // statement that this file HAS no chunks — false for every non-empty
+        // file, and signed. A hash recovered from a sidecar that carries no
+        // chunk hashes is still worth recording; the manifest is simply built
+        // the first time the file is served.
+        if !chunks.is_empty() {
+            self.attest_manifest(&new_id, content_hash, chunks)?;
+        }
         Ok(new_id)
+    }
+
+    /// D93 — rescue hashes that exist ONLY in this forest's catalog, and retire
+    /// the pre-D91 sidecar name while we are there.
+    ///
+    /// The fill recorded a content hash in the node payload and wrote nothing to
+    /// disk, so tens of hours of holder time were pinned to one forest and would
+    /// die with it: 3005 hashed nodes against 90 sidecars. This walks what the
+    /// catalog knows and leaves it beside the bytes, where a re-import can find
+    /// it. It reads no file content — only `stat` — so it costs nothing next to
+    /// the hashing it preserves.
+    ///
+    /// Chunk hashes are carried forward when a v1 sidecar happens to hold them,
+    /// and otherwise left unrecorded rather than invented. The whole hash is the
+    /// half that cost a full read and the half that gives a node its identity.
+    pub fn backfill_sidecars(&self, dry_run: bool) -> Result<BackfillReport> {
+        let mut report = BackfillReport::default();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, payload FROM nodes WHERE node_type = 'file'")
+            .map_err(map_db("backfill scan"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .map_err(map_db("backfill scan"))?;
+        for row in rows {
+            let (id, payload) = row.map_err(map_db("backfill scan"))?;
+            let Ok(p) = FilePayload::decode(&payload) else {
+                continue;
+            };
+            if p.content_hash.is_empty() {
+                report.unhashed += 1;
+                continue;
+            }
+            let Some(path) = self.readable_path(&id)? else {
+                report.no_local_copy += 1;
+                continue;
+            };
+            let Ok(md) = std::fs::metadata(&path) else {
+                report.no_local_copy += 1;
+                continue;
+            };
+            // The same exact-size rule the read path uses: a file whose size
+            // disagrees with the catalog is a replacement written at the same
+            // path, and stamping the OLD hash beside it would be a lie that
+            // outlives this forest.
+            if md.len() != p.size_bytes {
+                report.size_mismatch += 1;
+                continue;
+            }
+            if crate::sync::sidecar_whole_hash(&path, p.size_bytes).is_some() {
+                report.already_durable += 1;
+                continue;
+            }
+            // A v1 sidecar lying here still holds real chunk work — carry it.
+            let chunks = crate::sync::sidecar_chunks(&path);
+            let legacy = crate::sync::legacy_manifest_sidecar_path(&path);
+            let had_legacy = legacy.exists();
+            if !dry_run {
+                crate::sync::write_manifest_sidecar(&path, Some(&p.content_hash), &chunks)?;
+                if had_legacy {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+            }
+            report.written += 1;
+            if had_legacy {
+                report.legacy_retired += 1;
+            }
+            if chunks.is_empty() {
+                report.whole_hash_only += 1;
+            }
+        }
+        Ok(report)
     }
 
     pub fn readable_path(&self, id: &NodeId) -> Result<Option<std::path::PathBuf>> {

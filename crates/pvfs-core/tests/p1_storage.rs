@@ -474,3 +474,70 @@ fn binding_rules() {
         .bind_folder(&other, bind_spec(fixture.path(), HashPolicy::Lazy))
         .unwrap();
 }
+
+// D93 — the backfill rescues hashes that exist only in the catalog.
+//
+// Before D91 the fill wrote the hash into the node and NOTHING to disk, so tens
+// of hours of holder time were pinned to one forest: 3005 hashed nodes against
+// 90 sidecars. This is the job that gets that work out where a re-import can
+// use it, and it must never stamp an old hash beside bytes that have changed.
+#[test]
+fn backfill_rescues_catalog_only_hashes() {
+    let (_data, mut engine, _m) = new_forest();
+    let fixture = tempfile::tempdir().unwrap();
+    write_file(&fixture.path().join("alpha.mkv"), b"alpha-bytes");
+    write_file(&fixture.path().join("beta.mkv"), b"beta-bytes!");
+    let root = engine.identity.root_node_id.clone();
+    let folder = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FOLDER.into(),
+                label: "library".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    engine
+        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::OnAdd))
+        .unwrap();
+    engine.scan(Some(&folder)).unwrap();
+
+    // The pre-D91 world, reconstructed: the catalog knows the hash, disk does not.
+    let alpha = fixture.path().join("alpha.mkv");
+    let beta = fixture.path().join("beta.mkv");
+    for f in [&alpha, &beta] {
+        let _ = std::fs::remove_file(pvfs_core::sync::manifest_sidecar_path(f));
+    }
+    assert!(pvfs_core::sync::sidecar_whole_hash(&alpha, 11).is_none());
+
+    let dry = engine.backfill_sidecars(true).unwrap();
+    assert_eq!(dry.written, 2, "dry run counts both");
+    assert!(
+        pvfs_core::sync::sidecar_whole_hash(&alpha, 11).is_none(),
+        "a dry run must write nothing"
+    );
+
+    let r = engine.backfill_sidecars(false).unwrap();
+    assert_eq!(r.written, 2);
+    let rescued = pvfs_core::sync::sidecar_whole_hash(&alpha, 11).expect("hash now on disk");
+    assert_eq!(rescued, blake3::hash(b"alpha-bytes").to_hex().to_string());
+
+    // idempotent — a second pass has nothing left to do
+    let again = engine.backfill_sidecars(false).unwrap();
+    assert_eq!(again.written, 0);
+    assert_eq!(again.already_durable, 2);
+
+    // THE SAFETY CASE: bytes replaced at the same path. This job writes hashes
+    // it did not compute, so asserting one for bytes that have since changed is
+    // the single way it can do real damage — and the lie would be carried into
+    // the fresh forest as truth.
+    let _ = std::fs::remove_file(pvfs_core::sync::manifest_sidecar_path(&beta));
+    write_file(&beta, b"a completely different encode");
+    let after = engine.backfill_sidecars(false).unwrap();
+    assert_eq!(after.written, 0, "must not stamp a stale hash on new bytes");
+    assert_eq!(after.size_mismatch, 1);
+    assert!(pvfs_core::sync::sidecar_whole_hash(&beta, 29).is_none());
+}

@@ -369,6 +369,33 @@ fn read_manifest_sidecar(file: &Path) -> Option<Sidecar> {
 /// with the forest it was computed for. A size check is the honest limit of
 /// what a sidecar can promise — same size and a recorded hash means "almost
 /// certainly the file we hashed"; a changed size means recompute.
+/// The whole-file hash recorded beside `file`, ignoring whether chunk hashes
+/// were recorded with it.
+///
+/// The whole hash is the expensive half — it costs a full read of the file —
+/// and it is what gives a node its identity. Chunk hashes come free with that
+/// same read but are only a swarm optimisation, and `manifest_for` already
+/// computes them on demand. So a sidecar carrying the whole hash and NO chunks
+/// is a perfectly good record: it is what `sidecar backfill` writes when it
+/// rescues a hash that exists only in the catalog, where 3005 whole hashes sat
+/// against 22 chunk manifests.
+/// Chunk hashes recorded beside `file`, from either sidecar generation, or an
+/// empty vec if there are none. Used by the backfill to carry real chunk work
+/// forward from a v1 sidecar instead of discarding it.
+pub fn sidecar_chunks(file: &Path) -> Vec<[u8; 32]> {
+    read_manifest_sidecar(file)
+        .map(|sc| sc.chunks)
+        .unwrap_or_default()
+}
+
+pub fn sidecar_whole_hash(file: &Path, size: u64) -> Option<String> {
+    let sc = read_manifest_sidecar(file)?;
+    if sc.recorded_size? != size {
+        return None;
+    }
+    sc.whole
+}
+
 pub fn sidecar_hashes(file: &Path, size: u64) -> Option<(String, Vec<[u8; 32]>)> {
     let sc = read_manifest_sidecar(file)?;
     // EXACT size, or nothing. A chunk-count check passes for any size within
