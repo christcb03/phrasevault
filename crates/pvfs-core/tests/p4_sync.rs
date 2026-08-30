@@ -278,6 +278,39 @@ fn manifest_sidecar_roundtrips_and_caches() {
 // The cache must never lay a sidecar down FOR a sidecar — that is the recursion.
 // A forest that already adopted `.manifest` nodes still serves them; it just
 // recomputes each time instead of growing the chain another level.
+// D88 — hashing now runs across all cores (`update_rayon`) and reads a whole
+// swarm chunk per pass instead of 1 MiB. Both are invisible by contract: BLAKE3
+// is defined by its input, not by how many threads or how many `update` calls
+// carried it. This pins that, because a hash that changed silently would
+// invalidate every id in the forest.
+#[test]
+fn parallel_hash_matches_the_serial_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("multi.bin");
+    // 2.5 chunks, so the read buffer, the chunk boundary and EOF all disagree
+    let data: Vec<u8> = (0..(sync::SWARM_CHUNK * 5 / 2) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&f, &data).unwrap();
+
+    let (whole, chunks) = sync::hash_with_manifest(&f).unwrap();
+    assert_eq!(
+        whole,
+        blake3::hash(&data).to_hex().to_string(),
+        "whole-file hash must equal a plain one-shot BLAKE3 of the same bytes"
+    );
+    assert_eq!(chunks.len(), 3, "ceil(2.5) chunks");
+    for (i, h) in chunks.iter().enumerate() {
+        let off = i * sync::SWARM_CHUNK as usize;
+        let end = (off + sync::SWARM_CHUNK as usize).min(data.len());
+        assert_eq!(blake3::hash(&data[off..end]).as_bytes(), h, "chunk {i}");
+    }
+    // and the cancellable path agrees with the plain one
+    let again = sync::hash_with_manifest_until(&f, None).unwrap().unwrap();
+    assert_eq!(again.0, whole);
+    assert_eq!(again.1, chunks);
+}
+
 #[test]
 fn no_sidecar_for_a_sidecar() {
     let dir = tempfile::tempdir().unwrap();

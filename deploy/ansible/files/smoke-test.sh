@@ -274,7 +274,15 @@ $PVFS serve watch --debounce-ms 300 >/dev/null 2>&1 &
 SERVE_PID=$!
 sleep 2
 printf 'watched-file' > "$LIB/movies/watched.mkv"
-sleep 3
+# Wait for the ingest rather than assuming a duration. D86 made a directory
+# content in its own right, so the first pass walks more than it used to and a
+# flat 3s stopped being enough on a loaded runner — the watcher was working and
+# the budget was not. Polling exits as soon as it lands, so the common case is
+# faster than the old sleep, and a real failure still fails inside 20s.
+for _ in $(seq 1 40); do
+  $PVFS ls "$MOVIES" | qgrep watched.mkv && break
+  sleep 0.5
+done
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
 $PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"

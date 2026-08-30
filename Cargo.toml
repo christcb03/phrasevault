@@ -16,7 +16,9 @@ edition = "2021"
 rust-version = "1.75"
 
 [workspace.dependencies]
-blake3 = "1.5"
+# `rayon`: BLAKE3 across all cores. The holder was hashing a 23TB library on
+# ONE of its four (D88) — the box was not too weak, we were using a quarter of it.
+blake3 = { version = "1.5", features = ["rayon"] }
 sha2 = "0.10"
 k256 = { version = "0.13", features = ["ecdh"] }
 bip39 = { version = "2.1", features = ["rand"] }

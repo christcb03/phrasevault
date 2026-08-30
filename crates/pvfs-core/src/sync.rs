@@ -167,7 +167,7 @@ pub fn compute_manifest(path: &Path) -> Result<Vec<[u8; 32]>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for manifest", e))?;
     let mut hashes = Vec::new();
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; SWARM_CHUNK as usize];
     let mut hasher = blake3::Hasher::new();
     let mut in_chunk: u64 = 0;
     loop {
@@ -179,7 +179,7 @@ pub fn compute_manifest(path: &Path) -> Result<Vec<[u8; 32]>> {
         while off < n {
             let room = (SWARM_CHUNK - in_chunk) as usize;
             let take = room.min(n - off);
-            hasher.update(&buf[off..off + take]);
+            hasher.update_rayon(&buf[off..off + take]);
             in_chunk += take as u64;
             off += take;
             if in_chunk == SWARM_CHUNK {
@@ -228,7 +228,12 @@ pub fn hash_with_manifest_until(
     let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for hash", e))?;
     let mut whole = blake3::Hasher::new();
     let mut hashes = Vec::new();
-    let mut buf = vec![0u8; 1 << 20];
+    // One swarm chunk per read. BLAKE3 only parallelises WITHIN an update call,
+    // so a 1 MiB buffer left three of the holder's four cores idle no matter
+    // what: the size of this buffer is the width of the hash (D88). Cancellation
+    // stays responsive because a parallel 8 MiB pass is quicker in wall time
+    // than the 1 MiB serial one it replaces (D86).
+    let mut buf = vec![0u8; SWARM_CHUNK as usize];
     let mut hasher = blake3::Hasher::new();
     let mut in_chunk: u64 = 0;
     loop {
@@ -239,11 +244,11 @@ pub fn hash_with_manifest_until(
         if n == 0 {
             break;
         }
-        whole.update(&buf[..n]);
+        whole.update_rayon(&buf[..n]);
         let mut off = 0usize;
         while off < n {
             let take = ((SWARM_CHUNK - in_chunk) as usize).min(n - off);
-            hasher.update(&buf[off..off + take]);
+            hasher.update_rayon(&buf[off..off + take]);
             in_chunk += take as u64;
             off += take;
             if in_chunk == SWARM_CHUNK {
