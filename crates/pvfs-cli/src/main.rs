@@ -3389,7 +3389,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!(
                     "{{\"written\":{},\"whole_hash_only\":{},\"legacy_retired\":{},\
                       \"already_durable\":{},\"unhashed\":{},\"no_local_copy\":{},\
-                      \"size_mismatch\":{},\"dry_run\":{}}}",
+                      \"size_mismatch\":{},\"own_bookkeeping\":{},\"dry_run\":{}}}",
                     r.written,
                     r.whole_hash_only,
                     r.legacy_retired,
@@ -3397,6 +3397,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     r.unhashed,
                     r.no_local_copy,
                     r.size_mismatch,
+                    r.own_bookkeeping,
                     dry_run
                 );
             } else {
@@ -3410,6 +3411,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!("not hashed yet                  : {}", r.unhashed);
                 println!("no readable copy here           : {}", r.no_local_copy);
                 println!("size disagrees with the catalog : {}", r.size_mismatch);
+                println!("our own sidecars, skipped       : {}", r.own_bookkeeping);
                 if r.size_mismatch > 0 {
                     eprintln!(
                         "note: {} file(s) on disk no longer match the size the catalog \

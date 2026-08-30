@@ -157,6 +157,9 @@ pub struct BackfillReport {
     /// On-disk size disagrees with the catalog: a replacement at the same path,
     /// not the file that was hashed. Never stamped with the old hash.
     pub size_mismatch: u64,
+    /// Nodes the catalog adopted that are actually PVFS's own sidecars. Skipped
+    /// outright: a hash-rescue pass has no business touching our bookkeeping.
+    pub own_bookkeeping: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2108,6 +2111,20 @@ impl Engine {
                 report.no_local_copy += 1;
                 continue;
             };
+            // D95 — never treat our OWN bookkeeping as content, even when the
+            // catalog has adopted it as a node (which it did, ~1667 times,
+            // before D87). `write_manifest_sidecar` already refuses these, so
+            // nothing was written — but they were still COUNTED as rescued,
+            // and worse: for a node at `x.mkv.manifest` the "legacy" path
+            // resolves to `x.mkv.manifest.manifest`, so the real run would have
+            // deleted the next level of the chain as a side effect of a rule
+            // written for something else entirely. Cleaning that junk is a
+            // separate, deliberate act — not something a hash-rescue pass does
+            // by accident.
+            if crate::sync::is_sidecar_path(&path) {
+                report.own_bookkeeping += 1;
+                continue;
+            }
             let Ok(md) = std::fs::metadata(&path) else {
                 report.no_local_copy += 1;
                 continue;
