@@ -2505,6 +2505,14 @@ fn walk_disk(
             }
             continue;
         }
+        // Our chunk-manifest sidecar, which is bookkeeping and not content.
+        // Unconditional, and BEFORE the extension filter: an empty `extensions`
+        // list means "every file the operator has", not "also the files we
+        // ourselves write next to them". Not counted as `skipped`, for the same
+        // reason the dotfile arm above does not count ours (D81).
+        if !entry.is_dir && crate::sync::is_sidecar_name(&entry.name) {
+            continue;
+        }
         let child = dir.join(&entry.name);
         if entry.is_dir {
             if ctx.binding.recursive {

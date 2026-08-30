@@ -300,7 +300,7 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
             .flatten()
         {
             let name = f.file_name().to_string_lossy().to_string();
-            if name.ends_with(".manifest") || !f.path().is_file() {
+            if psync::is_sidecar_name(&name) || !f.path().is_file() {
                 continue;
             }
             out.push(name);

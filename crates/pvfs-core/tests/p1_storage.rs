@@ -120,6 +120,48 @@ fn extension_filter() {
     assert!(find_by_label(&engine, &folder, "b.txt").is_none());
 }
 
+// Our own sidecars are never content. An empty extension list means "every file
+// the operator has" — adopting a `.manifest` makes the next pass write a sidecar
+// for the sidecar, one level deeper each time (23 deep in the field, 2026-08-29).
+// Not counted as `skipped`: ours is not something the operator declined to index.
+#[test]
+fn scan_never_adopts_manifest_sidecars() {
+    let (_data, mut engine, _m) = new_forest();
+    let fixture = tempfile::tempdir().unwrap();
+    write_file(&fixture.path().join("alpha.mkv"), b"alpha-bytes");
+    write_file(&fixture.path().join("alpha.mkv.manifest"), b"pvfs-manifest 1\n");
+    write_file(
+        &fixture.path().join("alpha.mkv.manifest.manifest"),
+        b"pvfs-manifest 1\n",
+    );
+    let root = engine.identity.root_node_id.clone();
+    let folder = engine
+        .add_node(
+            &root,
+            NodeSpec {
+                node_type: TYPE_FOLDER.into(),
+                label: "library".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    // the production shape: no extension filter at all
+    engine
+        .bind_folder(&folder, bind_spec(fixture.path(), HashPolicy::Lazy))
+        .unwrap();
+
+    let r = engine.scan(Some(&folder)).unwrap();
+    assert_eq!(r[0].stats.skipped, 0, "our bookkeeping is not a skip");
+    assert!(find_by_label(&engine, &folder, "alpha.mkv").is_some());
+    assert!(
+        find_by_label(&engine, &folder, "alpha.mkv.manifest").is_none(),
+        "sidecar must never become content"
+    );
+    assert!(find_by_label(&engine, &folder, "alpha.mkv.manifest.manifest").is_none());
+}
+
 // import never references a file the operator cannot read (doc 05 §5.1)
 #[cfg(unix)]
 #[test]

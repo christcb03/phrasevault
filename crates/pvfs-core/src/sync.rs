@@ -142,6 +142,26 @@ pub fn manifest_sidecar_path(file: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Whether `name` is PVFS's own bookkeeping rather than the operator's content.
+///
+/// `.pvfs-root` and `.{id}.swarmpart` are dotfiles, so every walker already
+/// steps over them. The chunk-manifest sidecar is the one piece of our
+/// bookkeeping that is NOT — it is written next to the file it describes, in a
+/// directory a scan walks, under a name the operator could plausibly own. That
+/// asymmetry is what let a scan adopt a sidecar as content, whose own sidecar
+/// the next pass then adopted, one level deeper per pass. Until the name itself
+/// becomes a dotfile, every walker asks here.
+pub fn is_sidecar_name(name: &str) -> bool {
+    name.ends_with(".manifest")
+}
+
+/// Whether `path`'s own file name is a sidecar.
+pub fn is_sidecar_path(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| is_sidecar_name(&n.to_string_lossy()))
+        .unwrap_or(false)
+}
+
 /// Compute a file's chunk manifest by reading it.
 pub fn compute_manifest(path: &Path) -> Result<Vec<[u8; 32]>> {
     use std::io::Read;
@@ -240,6 +260,12 @@ pub fn hash_with_manifest_until(
 }
 
 pub(crate) fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
+    // Never write a sidecar for a sidecar. The cache is best-effort, so a
+    // forest that already adopted `.manifest` nodes still serves them — it
+    // recomputes instead of laying down another level.
+    if is_sidecar_path(file) {
+        return Ok(());
+    }
     let mut text = format!("{MANIFEST_HEADER}\n{SWARM_CHUNK}\n");
     for h in hashes {
         text.push_str(&hex::encode(h));
