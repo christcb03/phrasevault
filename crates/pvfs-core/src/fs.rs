@@ -982,11 +982,40 @@ impl Engine {
             // operation that destroys information is worse than no counter.
             let mut removed_here = false;
             if active.is_some() {
-                match writer {
-                    Some(w) => w.remove_location(&file_id, &uri)?,
-                    None => self.remove_location(&file_id, &uri)?,
+                let attempt = match writer {
+                    Some(w) => w.remove_location(&file_id, &uri),
+                    None => self.remove_location(&file_id, &uri),
+                };
+                // D89 — the same rule the ingest arm above already follows: one
+                // file the catalog will never accept must not stop the line.
+                // Retiring is where it was missing, and the cost was total: a
+                // single refusal propagated and abandoned the WHOLE pass, so
+                // every later file went unreconciled and the next pass met the
+                // same node and died in the same place. Seen in the field as
+                // `watch` stuck in backoff for hours while the tree drifted.
+                //
+                // The refusal is real and not ours to override: an ORPHANED node
+                // has no live `contains` parent, `effective_rights` resolves
+                // authority by walking exactly that chain, and the grants live
+                // at the root — so a node you authored, holding your own bytes,
+                // becomes unwritable the moment it is unlinked. Quarantine says
+                // so out loud instead of hiding it in a dead pass.
+                //
+                // scan_state is deliberately NOT cleared here: the location is
+                // still live, so a later pass (or a repaired grant) must be able
+                // to try again. Deleting it would forget the only record that
+                // this needs fixing.
+                match attempt {
+                    Ok(()) => removed_here = true,
+                    Err(e) if is_transient(&e) => return Err(e),
+                    Err(e) => {
+                        stats.needs_attention += 1;
+                        if stats.quarantined.len() < 8 {
+                            stats.quarantined.push((uri.clone(), e.to_string()));
+                        }
+                        continue;
+                    }
                 }
-                removed_here = true;
             }
             self.conn
                 .execute("DELETE FROM scan_state WHERE uri = ?1", params![uri])

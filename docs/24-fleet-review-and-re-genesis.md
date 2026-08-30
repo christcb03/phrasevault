@@ -1,6 +1,6 @@
 # 24 — Fleet review + library re-genesis (D87)
 
-**Status: REVIEW COMPLETE, BUILD NOT STARTED.** Written 2026-08-29 after the
+**Status: REVIEW COMPLETE; D87 + D88 BUILT, DEPLOYED AND VERIFIED (2026-08-30); D89 BUILT.** Written 2026-08-29 after the
 `.manifest` recursion incident. Scope asked for by Chris: a full review of what
 PVFS does, every issue and change since the media forest was created, whether
 replica write-routing and the identity model are right, and whether fixes we
@@ -243,24 +243,140 @@ mostly wrong.
 
 ---
 
-## 5. Open questions — not answered by this review
+## 5. The scan refusal — SOLVED (D89)
 
-Recorded honestly rather than papered over.
+Recorded in full, including the wrong turns, because three plausible
+explanations were tested and disproved before the right one, and the wrong ones
+are cheap to repeat.
 
-1. **Why the scan's location removal was refused.** The observed error was
-   `forbidden: forbidden: remove location — you lack write (w) on cc50859a…`.
-   Three hypotheses were tested and **all three failed**: (a) the owner refusing
-   — the commit-side check has no arm for that kind, so it cannot be the
-   refuser; (b) a batched-authority gap mirroring D85 — the removal targets a
-   pre-existing node, so the `born` map would not fire; (c) the node being
-   orphaned and therefore grant-unreachable — **0 of the 17 candidate nodes are
-   orphans**. The error is also stale: the node it names is not in the current
-   candidate set (17 vanished Dragon Ball Z S03 files). **Reproduce it under the
-   fixed binary before theorising again.**
-2. Whether `purge` and `quality` are routable from a replica, or local-only by
+### The chain, proven end to end
+
+1. `effective_rights_at` resolves authority by walking **`contains` parents**
+   toward a grant (`projection.rs`), and `contains_parent` matches only
+   `removed_at IS NULL` — a **live** link.
+2. Every grant in this forest is at the **root**: three `key:` rows, `rwa`,
+   nothing anywhere else.
+3. So an **orphan** — a node whose last live `contains` link is gone — reaches
+   no grant. The walk ends at the node itself, `rights = 0`, and default-deny
+   refuses. **A node you authored, holding bytes you hold, becomes unwritable
+   the moment it is unlinked.**
+4. The scan's removal loop matches BOTH prefixes (D81: bare `file://` and
+   pin-qualified `pvfs-host://<pin>/`), so it does reach these nodes.
+5. `remove_location(...)?` propagated that refusal and **abandoned the entire
+   pass** — so no later file reconciled, and the next pass met the same node and
+   died in the same place. In the field: `watch` in backoff for hours while the
+   tree drifted.
+
+Live proof, 2026-08-30, under the fixed binary: node
+`b91682ae…` — `Big Brother (US) - s28e20 - Episode 20.mkv`, authored by
+feederbox's own key, holding a live `pvfs-host://` location on feederbox's own
+pin — is an orphan, absent from the `/Media` walk, and refused. **95 orphans on
+feederbox still hold live locations.** The same episode label has **two other
+live nodes** under the same parent, which is D84 in the flesh: duplicate
+resolution orphans a node, and orphaned nodes can never be cleaned up by the box
+that owns them. 40 paths still carry duplicate live file nodes.
+
+### What was wrong before, and why
+
+- *"The owner refuses it."* No — `check_member_event` has no arm for
+  `FileLocationRemoved`, so the commit side cannot be the refuser. The refusal
+  is the **prepare**-side check.
+- *"A batched-authority gap mirroring D85."* No — the removal targets a
+  pre-existing node, so the `born` map never fires.
+- *"The node is orphaned."* Right idea, **tested against the wrong sample**: 0 of
+  the 17 vanished Dragon Ball Z nodes were orphans, so it was discarded. Those 17
+  were never the failing set — the error naming `cc50859a…` was **stale**, left
+  over from a job that had been in backoff for hours. A stale error read as a
+  live one cost the most time of anything in this review.
+
+### The fix, and the half deliberately not taken
+
+**Taken:** the removal arm now quarantines and carries on, exactly as the ingest
+arm ten lines above it already did — *"one file the catalog will never accept
+must not stop the line"* (D71 W4). The rule existed and had simply never been
+applied to retiring. `scan_state` is deliberately not cleared on refusal: the
+location is still live, so a later pass or a repaired grant must be able to
+retry. `needs_attention`/`quarantined` now say WHICH node and why, instead of
+the whole pass dying silently.
+
+**Not taken:** making orphans writable. That is a real design question, not a
+bug to patch quietly, and the options differ in what they give up —
+(a) fall back to the root grant when the walk finds nothing, which weakens
+default-deny for every node; (b) let a node's author always retain `w` on their
+own orphan, which is narrower but makes authority depend on authorship; or
+(c) keep orphans immutable and make `purge` the only path, which means
+something must actively reap them. **Decision needed (§8).**
+
+### Still open
+
+1. Whether `purge` and `quality` are routable from a replica, or local-only by
    design like bind/unbind.
-3. Whether the D84 duplicate folders and the 79 `/mnt/nas-media` strays are one
-   cause or two.
+2. The 40 duplicate live nodes and the 95 orphans holding live locations. The
+   quarantine stops them wedging the scan; it does not clean them up.
+
+---
+
+## 5b. The holder's CPU — SOLVED (D88)
+
+Reported as "the NAS hits CPU high enough to stall playback, but 90% of the time
+it is fine". Both halves of that were true and the second was the clue.
+
+**Measured, not assumed.** pvfsd held **93% of one core** with io at only 2.2% —
+CPU-bound on BLAKE3, not disk-bound. And the library is not occasionally large,
+it is *mostly* large: **1,161 movies, median 19 GB, p90 31 GB, max 70 GB, 833 at
+or above 10 GB** — roughly 23 TB. TV episodes at 1–2 GB pass in seconds, which is
+the 90% that felt fine; a 19 GB movie holds a core for a long stretch, which is
+the 10% that stalled playback.
+
+**The real cause was that we were using a quarter of the box.** `hasher.update`
+is single-threaded and blake3 was pulled in without `rayon`. Worse, the read
+buffer was 1 MiB — and BLAKE3 only parallelises WITHIN an `update` call, so
+enabling rayon alone would have changed nothing. The buffer size *is* the width
+of the hash. It is now a full swarm chunk, which is the boundary the manifest
+already needed, so the read size and the hash width finally agree.
+
+**Result on the holder, measured after deploy:** four rayon workers active, and
+the job moved from **CPU-bound (0.93 cores, 2.2% io)** to **I/O-bound
+(1.11 cores, 13–16% io)** at **153 MB/s**, with ~40% CPU idle. That is ~20% more
+CPU, *not* 3–4×, because the disk now sets the pace — which is the outcome
+wanted: hashing is off the critical path and the cores are free for playback.
+
+**Priority.** busybox on QTS has **no `nice` applet, only `renice`**, so the
+launcher sets it after start, and finds the pid the way the existing guard does
+because `setsid` may fork. The whole daemon is reniced rather than only the hash:
+serving is I/O-bound so it loses little, and the trade is the one wanted — fleet
+transfers yield to whatever someone is watching.
+
+**Consequence for §6.** This is the concrete price of dropping lazy hashing:
+~23 TB read once, at 153 MB/s ≈ 42 hours of holder time. That is affordable
+*only* because it is niced and one-time — which is exactly why the hash must be
+recorded somewhere portable (`pvfs-manifest 2`) rather than paid again per
+forest.
+
+---
+
+## 5c. Deployment record — 2026-08-30
+
+Rolled owner → feederbox → holder (the D72 §9e order), each step verified by
+**binary content**, not by a green recap.
+
+| Box | Was | Now |
+|---|---|---|
+| owner `pvfs-owner` | pre-D86 | d88, `pvfsd-media` active |
+| ingest `feederbox` | pre-D86 | d88, `pvfsd-replica` active, `watch` back on |
+| holder `qnap` | D86 (ahead of the others) | d88, reniced 19, `watch` back on |
+
+No schema migration: every box was already at projection schema 13.
+
+**Verified after:** feederbox's local manifests fell 1499 → 1 (the rest drained
+to the NAS via cloudplow) with **zero new recursive sidecars** once `watch`
+resumed — the D87 guard holds under live load.
+
+**Operational traps worth keeping.** `/tmp/pvfs` on these boxes is the SOCKET
+directory: `scp`ing a file named `pvfs` there fails with a bare "dest open
+failure". Stage to `~/d88`. The holder keeps `bin/{pvfs,pvfsd}.pre-d88` as the
+rollback, and its ARM binary was test-run on the box *before* the swap, because
+a wrong-arch binary there means a dead daemon and no systemd to notice.
 
 ---
 
@@ -320,20 +436,24 @@ cheap.
 Ordered so each step is verifiable before the next.
 
 ### A — process (do first, blocks everything)
-- [ ] A1. Fast-forward PVFS `main` to `d71-scoped-bindings`. **Verified safe
+- [x] A1. **DONE 2026-08-30.** Fast-forward PVFS `main` to `d71-scoped-bindings`. **Verified safe
       2026-08-29:** `main` is 0 ahead and fully contained, so this is a
       fast-forward with no conflicts possible. The 80 commits span 2026-08-17
       to 2026-08-29 and cover **D71–D86**, the migration work included.
       A full ref audit found nothing orphaned: every dangling object is either
       pre-rebase residue whose subject is present in the branch, an old stash
       (2026-04-18, 2026-08-10), or a superseded clippy fix that clippy now
-      passes without. Then merge `d87-sidecar-and-review` on top.
-- [ ] A1b. **PVOS has the same drift, and it is NOT a fast-forward.**
+      passes without. Then merge `d87-sidecar-and-review` on top. Landed as `e533b14`; branches
+      deleted, both repos down to `main` and in sync with origin.
+- [x] A1b. **DONE 2026-08-30** (`c635beb`). **PVOS has the same drift, and it is NOT a fast-forward.**
       `d71-watch-ingest` is 90 ahead of `main` while `main` is 12 ahead of it —
       they diverged when `main` took the D70 merge on 2026-08-16 and the branch
       did not. A `merge-tree` dry run reports exactly **one** conflicting file:
       `deploy/ansible/fleet/fleet-lab.ini`. Note the irony: one of `main`'s 12
       commits is "sync by content, not mtime", which is the fix A4 below needs.
+      Resolved by taking the branch's file (it comments out the row pointing at
+      the PRODUCTION QNAP) but keeping main's `fleet_artifacts` — the branch
+      default `phrasevault-arm/target` has NO builds in it, checked on the host.
 - [ ] A2. Version strings must distinguish builds — `git describe` into
       `--version`, so `1.4.0` cannot mean two different binaries.
 - [ ] A3. Fix the pipeline summary: it reads the last `test result:` line, which
@@ -353,13 +473,16 @@ Ordered so each step is verifiable before the next.
 ### B — the incident (fix in hand)
 - [x] B1. Sidecar guard on the correct base — shared predicate, `walk_disk`
       guard before the extension filter, `write_manifest_sidecar` refusal.
-- [ ] B2. Regression tests ported to this base.
-- [ ] B3. Pipeline green on `d71-scoped-bindings` + clippy `-D warnings`.
-- [ ] B4. Deploy to feederbox, re-enable `watch`, confirm no regrowth.
-- [ ] B5. Delete the ~3,000 junk files (`-name "*.manifest.manifest"`, all
+- [x] B2. Regression tests ported to this base.
+- [x] B3. Pipeline green + clippy `-D warnings` clean.
+- [x] B4. **DONE** — rolled owner → feederbox → holder, `watch` back on, and
+      confirmed: local manifests 1499 → 1, **zero** new recursive sidecars (§5c).
+- [ ] B5. Delete the junk files (`-name "*.manifest.manifest"`, all
       exactly 89 bytes; keep the level-1 sidecars).
-- [ ] B6. Decide the 1,667 junk nodes: unlink+purge (3,334 events, 1,667 interim
-      orphans) or leave for compaction to drop for free. **Recommend: leave.**
+- [ ] B6. **Chris decided 2026-08-30: LEAVE them** for re-genesis to drop.
+      Which makes E/F below load-bearing rather than optional.
+      (was: decide the 1,667 junk nodes: unlink+purge (3,334 events, 1,667 interim
+      orphans) or leave for compaction to drop for free.)
 
 ### C — the real fix
 - [ ] C1. Make the sidecar a dotfile. Migration: accept both names on read,
@@ -368,7 +491,16 @@ Ordered so each step is verifiable before the next.
       seed `content_hash`.
 - [ ] C3. Stop `manifest_for` writing on read; make caching an explicit call.
 
-### D — authority (from §3)
+### D — authority (from §3 and §5)
+- [x] D0. **Scan no longer dies on one refusal** (D89). The removal arm
+      quarantines and carries on, the way the ingest arm always has.
+      `needs_attention`/`quarantined` name the node and the reason;
+      `scan_state` is kept so a repaired grant can retry. Test:
+      `an_orphan_can_reach_no_grant`.
+- [ ] D0b. **Decide what an orphan may do** (§5, "the half not taken"):
+      root-grant fallback, author-retains-`w`, or orphans stay immutable and
+      something reaps them. Blocks cleaning the 95 orphans holding live
+      locations and the 40 duplicate live nodes.
 - [ ] D1. Mirror the prepare-side right into `check_member_event` for every kind
       now hitting `_ => {}` — `FileLocationRemoved` first.
 - [ ] D2. Make the catch-all **deny** for mutating kinds, so a new event kind
@@ -392,11 +524,33 @@ Ordered so each step is verifiable before the next.
 
 ---
 
-## 8. Decisions needed from Chris
+## 8. Decisions
 
-1. **A1 — which branch is trunk?** Everything else waits on this.
-2. **B6 — unlink the junk nodes, or leave them for compaction?**
-3. **C1 — dotfile rename now, or after re-genesis?** Doing it first means one
-   migration instead of two.
-4. **F1 — measure the compaction trigger now**, or build re-genesis on the
-   correctness argument regardless of the numbers?
+### Settled 2026-08-30
+
+1. **A1 — trunk.** `main`, both repos. Merged, branches deleted, origin in sync.
+2. **B6 — leave the junk nodes.** Re-genesis drops them for free; unlinking
+   would cost ~3,334 permanent log events and bury 924 real orphans under 1,667
+   junk ones. This makes E/F load-bearing rather than optional.
+3. **F1 — do not measure the compaction trigger.** Chris: a rebuild into a fresh
+   forest is wanted regardless, and it is the better instrument — it exercises
+   the same machinery and surfaces duplicates and orphans as failures instead of
+   carrying them. Doc 11's trigger (a rebuild crossing ~1 min, `replica add`
+   crossing a few minutes on LAN) stands unmeasured, by choice.
+4. **Lazy hashing goes.** Confirmed by the numbers: 91.5% of the library was
+   unhashed, so swarm serving and verified read-through did not apply to it.
+   D85 began this; removing the `Lazy` variant finishes it.
+
+### Still open
+
+1. **D0b — what may an orphan do?** (§5, "the half not taken"). Root-grant
+   fallback weakens default-deny everywhere; author-retains-`w` is narrower but
+   ties authority to authorship; orphans-stay-immutable needs something to reap
+   them. Blocks cleaning 95 orphans with live locations and 40 duplicate nodes.
+2. **C1 — dotfile rename now or after re-genesis?** Doing it first means one
+   migration instead of two, and it is the real fix for §1 rather than the guard.
+3. **The evict pair in the smoke suite** (§3): change the test to the new truth,
+   change its setup so tier does not pre-retire, or widen evict to reclaim
+   retired own-host locations. Option three changes production eviction.
+4. **A2–A4 — the pipeline can lie.** It reports "0 passed" on a green run and
+   can test stale binaries at exit 0. Both bit this review.
