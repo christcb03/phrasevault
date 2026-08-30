@@ -96,6 +96,17 @@ The **owner** (identity root, and devices it marks admin) always has full rights
 
 - A node with **no explicit ACL inherits** its nearest ancestor's effective ACL (POSIX default-ACL style). The forest root has a default ACL set at init: **owner = full, everyone else = none** (requirement 3).
 - Effective rights for principal *P* on node *N* = union of grants on *N* and the nearest ancestor that names *P* (most-specific wins for deny; v1 is **grant-only**, no explicit deny — absence = no access, which keeps evaluation simple and matches the "private by default" rule).
+- **An ORPHAN resumes at the root (D90, 2026-08-30).** Inheritance walks live
+  `contains` links, so a node with no live parent used to reach no grant at all
+  and was denied by default — including to the key that authored it. That is not
+  "private by default", it is unreachable: the watcher could see a file was gone
+  and could not retire its location, and 95 such nodes accumulated on the ingest
+  box. When the walk runs out of links, that means either *N* IS the root (a real
+  end) or *N* is an orphan (a cut chain); the two are now distinguished, and an
+  orphan continues at the forest root exactly once. An orphan is still in the
+  forest and is governed by the forest's grants — no more, no less. Concretely:
+  a principal granted only on a subfolder still has nothing on an orphan, because
+  the resume goes to the ROOT, not to "allow".
 - Read of a node requires `r` on that node; listing a folder returns only children the caller may `r`; writing requires `w` on the parent; re-sharing requires `a`.
 
 ### 4.3 Storage: ACLs are signed events

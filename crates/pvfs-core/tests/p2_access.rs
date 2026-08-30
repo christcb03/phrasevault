@@ -160,14 +160,20 @@ fn can_and_readable_children() {
 }
 
 // doc 07 §5 — two-phase member write: prepare (daemon) → member signs → commit
-// D89 — authority is resolved by walking `contains` parents to a grant, so an
-// ORPHAN can reach none. A node the member authored, holding bytes the member
-// holds, becomes unwritable the moment its last live link goes: the grants sit
-// at the root and an orphan has no path there. Found in the field as a `watch`
-// job wedged for hours — the scan tried to retire an orphan's location, was
-// refused, and the refusal killed the whole pass.
+// D90 — an orphan resumes the authority walk at the forest ROOT.
+//
+// Authority is resolved by walking `contains` parents to a grant, and the grants
+// sit at the root, so an orphan used to reach none: a node its author had
+// created, holding bytes that author held, became unwritable the moment its last
+// live link went. In the field that was a `watch` job wedged for hours — it could
+// see the file was gone and could not say so.
+//
+// A tree must be able to retire what no longer exists, so the walk now resumes
+// at the root once. The widening is BOUNDED to the root's own grants, which the
+// second half of this test is what actually pins: a member granted only on a
+// subfolder still gets nothing on an orphan.
 #[test]
-fn an_orphan_can_reach_no_grant() {
+fn an_orphan_resumes_at_the_root() {
     let dir = tempfile::tempdir().unwrap();
     let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
     let root = engine.identity.root_node_id.clone();
@@ -222,14 +228,35 @@ fn an_orphan_can_reach_no_grant() {
         .link_id;
     engine.remove_link(&link_id).unwrap();
 
-    // same member, same key, same grant — now refused, because the walk from an
-    // orphan reaches no grant at all
+    // ORPHANED, and still writable: the walk resumes at the root, so the same
+    // grant that covered it in the tree covers it out of the tree. This is what
+    // lets the watcher retire a location for a file that is genuinely gone.
+    assert!(
+        engine
+            .prepare_remove_location(&member_pub, &file_id, uri)
+            .is_ok(),
+        "an orphan must resume at the root, or nothing can ever retire it"
+    );
+
+    // …and the widening stops there. A member granted only on a SUBFOLDER has
+    // nothing at the root, so an orphan gives them nothing either — resuming at
+    // the root is not the same as allowing everything.
+    let sub_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let sub_pub = crypto::pubkey_bytes(&sub_key);
+    engine.authorize_member(&owner_mn, &sub_pub).unwrap();
+    engine
+        .set_acl(
+            &folder_id,
+            &acl::Principal::Key(sub_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
     assert!(
         matches!(
-            engine.prepare_remove_location(&member_pub, &file_id, uri),
+            engine.prepare_remove_location(&sub_pub, &file_id, uri),
             Err(PvfsError::Forbidden { .. })
         ),
-        "an orphan reaches no grant, so default-deny refuses its own author"
+        "a subfolder grant must not reach an orphan — it is not under that folder any more"
     );
     engine.close().unwrap();
 }

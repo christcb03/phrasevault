@@ -299,13 +299,24 @@ location is still live, so a later pass or a repaired grant must be able to
 retry. `needs_attention`/`quarantined` now say WHICH node and why, instead of
 the whole pass dying silently.
 
-**Not taken:** making orphans writable. That is a real design question, not a
-bug to patch quietly, and the options differ in what they give up —
-(a) fall back to the root grant when the walk finds nothing, which weakens
-default-deny for every node; (b) let a node's author always retain `w` on their
-own orphan, which is narrower but makes authority depend on authorship; or
-(c) keep orphans immutable and make `purge` the only path, which means
-something must actively reap them. **Decision needed (§8).**
+**Then taken, on Chris's call (D90):** *"any tree needs to be able to remove
+nodes for files that no longer exist — when the job watching for file changes
+sees a change it must be able to make that update."* That settles it, and it
+rules out the alternatives: author-retains-`w` ties authority to authorship
+rather than to the forest, and keep-orphans-immutable needs a reaper that does
+not exist and leaves the watcher unable to state a fact it can plainly see.
+
+So **the walk resumes at the forest root exactly once** when it runs out of
+links. Running out means one of two very different things — `n` IS the root
+(a real end) or `n` is an orphan (a cut chain) — and treating them alike was the
+bug. An orphan is still in the forest; it should not fall off a cliff.
+
+This is a widening and is documented as one: anyone holding `w` at the root can
+now act on any orphan. That is the same authority which already covers every
+linked node, and an orphan has no claim to be better protected than the tree it
+fell out of. The bound is real and tested — a member granted only on a
+**subfolder** still gets nothing on an orphan, because the resume goes to the
+root, not to "allow". Test: `an_orphan_resumes_at_the_root`.
 
 ### Still open
 
@@ -543,10 +554,9 @@ Ordered so each step is verifiable before the next.
 
 ### Still open
 
-1. **D0b — what may an orphan do?** (§5, "the half not taken"). Root-grant
-   fallback weakens default-deny everywhere; author-retains-`w` is narrower but
-   ties authority to authorship; orphans-stay-immutable needs something to reap
-   them. Blocks cleaning 95 orphans with live locations and 40 duplicate nodes.
+1. ~~**D0b — what may an orphan do?**~~ **SETTLED (D90): resume at the root.**
+   A tree must be able to retire what no longer exists. The 95 orphans holding
+   live locations can now be retired by the watcher itself.
 2. **C1 — dotfile rename now or after re-genesis?** Doing it first means one
    migration instead of two, and it is the real fix for §1 rather than the guard.
 3. **The evict pair in the smoke suite** (§3): change the test to the new truth,
