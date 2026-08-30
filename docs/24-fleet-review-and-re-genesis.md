@@ -320,8 +320,20 @@ cheap.
 Ordered so each step is verifiable before the next.
 
 ### A — process (do first, blocks everything)
-- [ ] A1. Decide the trunk. Fast-forward `main` to `d71-scoped-bindings`, or
-      declare the branch authoritative and retire `main`.
+- [ ] A1. Fast-forward PVFS `main` to `d71-scoped-bindings`. **Verified safe
+      2026-08-29:** `main` is 0 ahead and fully contained, so this is a
+      fast-forward with no conflicts possible. The 80 commits span 2026-08-17
+      to 2026-08-29 and cover **D71–D86**, the migration work included.
+      A full ref audit found nothing orphaned: every dangling object is either
+      pre-rebase residue whose subject is present in the branch, an old stash
+      (2026-04-18, 2026-08-10), or a superseded clippy fix that clippy now
+      passes without. Then merge `d87-sidecar-and-review` on top.
+- [ ] A1b. **PVOS has the same drift, and it is NOT a fast-forward.**
+      `d71-watch-ingest` is 90 ahead of `main` while `main` is 12 ahead of it —
+      they diverged when `main` took the D70 merge on 2026-08-16 and the branch
+      did not. A `merge-tree` dry run reports exactly **one** conflicting file:
+      `deploy/ansible/fleet/fleet-lab.ini`. Note the irony: one of `main`'s 12
+      commits is "sync by content, not mtime", which is the fix A4 below needs.
 - [ ] A2. Version strings must distinguish builds — `git describe` into
       `--version`, so `1.4.0` cannot mean two different binaries.
 - [ ] A3. Fix the pipeline summary: it reads the last `test result:` line, which
