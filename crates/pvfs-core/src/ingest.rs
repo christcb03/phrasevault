@@ -795,7 +795,7 @@ impl Engine {
         }
         std::fs::rename(part, &dest).map_err(|e| PvfsError::io("publish ingest partial", e))?;
         // Sidecar is a cache — best-effort, like swarm_commit's.
-        let _ = crate::sync::write_manifest_sidecar(&dest, manifest);
+        let _ = crate::sync::write_manifest_sidecar(&dest, Some(&payload.content_hash), manifest);
         self.conn
             .execute(
                 "DELETE FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",

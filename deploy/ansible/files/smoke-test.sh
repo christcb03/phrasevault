@@ -690,6 +690,12 @@ fi
 # the edge box syncs the tail, then reclaims its space — never before the
 # catalog shows another live location
 $PVFS --json replica sync "$REPMOUNT" >/dev/null
+# D92 — evict will not delete from a root that never SAID it drains: silence is
+# not consent for a pass whose job is deleting (D85). The live fleet declares
+# feederbox's library exactly this way; the test omitted it and then expected
+# the reclaim to happen anyway, which is why this pair failed. Declaring it is
+# what makes the scenario the one the fleet actually runs.
+$PVFS --data-dir "$REPMOUNT/.pvfs" roots "$DROOT" --add "$DATA" --staging >/dev/null
 EVICTJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" evict)"
 [ "$(jget "$EVICTJ" evicted)" -ge 1 ] && ok "edge box evicted the migrated bytes" || fail "evict: $EVICTJ"
 [ ! -f "$DATA/edge.bin" ] && ok "edge bytes deleted — space reclaimed" || fail "edge bytes remain"
@@ -1091,7 +1097,10 @@ NEW_A="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_A")"
 $PVFS --data-dir "$IGD" cat "$NEW_A" > "$DATA/ig-got-a" 2>/dev/null
 cmp -s "$DATA/ig-got-a" "$DATA/ig-src-a" \
   && ok "published bytes round-trip bit-perfect" || fail "roundtrip mismatch"
-[ -f "$IGD/synced/${NEW_A:0:2}/$NEW_A.manifest" ] \
+# D91 — the sidecar is a DOTFILE now, so this path gained a leading dot. That
+# rename is the actual fix for the recursion (every walker already skips
+# dotfiles); the guards in the walkers are only the belt.
+[ -f "$IGD/synced/${NEW_A:0:2}/.$NEW_A.manifest" ] \
   && ok "manifest sidecar cached at publish" || fail "no manifest sidecar"
 ATT=$(ig_count "SELECT COUNT(*) FROM chunk_manifests WHERE file_id='$NEW_A'")
 [ "$ATT" -eq 1 ] && ok "attestation folded (the early-serve license)" || fail "no attestation row"

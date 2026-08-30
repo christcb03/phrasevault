@@ -1893,18 +1893,37 @@ impl Engine {
                 return id.clone();
             }
         };
-        eprintln!("scan: hashing {} ({size} bytes)", path.display());
-        let (content_hash, chunks) =
-            match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
-                Ok(Some(v)) => v,
-                // Asked to stop mid-file. Not a failure: nothing is recorded, and
-                // the next pass hashes it from the start.
-                Ok(None) => return id.clone(),
-                Err(e) => {
-                    eprintln!("scan: could not hash {}: {e}", path.display());
-                    return id.clone();
+        // D91 — a sidecar beside the file may already hold this hash, written by
+        // an earlier pass or by a PREVIOUS FOREST. Reading 20 GB to recompute
+        // what is sitting next to it is exactly the cost the record exists to
+        // avoid: it is what lets the library be re-imported into a fresh forest
+        // without paying for the hashing again. The size check inside is the
+        // honest limit of what a sidecar can promise.
+        let (content_hash, chunks) = match crate::sync::sidecar_hashes(&path, size) {
+            Some(known) => {
+                eprintln!("scan: hash from sidecar {} ({size} bytes)", path.display());
+                known
+            }
+            None => {
+                eprintln!("scan: hashing {} ({size} bytes)", path.display());
+                match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
+                    Ok(Some(v)) => v,
+                    // Asked to stop mid-file. Not a failure: nothing is recorded,
+                    // and the next pass hashes it from the start.
+                    Ok(None) => return id.clone(),
+                    Err(e) => {
+                        eprintln!("scan: could not hash {}: {e}", path.display());
+                        return id.clone();
+                    }
                 }
-            };
+            }
+        };
+        // Persist it beside the file. The fill used to record the hash ONLY in
+        // the node payload, so tens of hours of holder time lived in one
+        // forest's catalog and died with it — 2918 hashed nodes against 90
+        // sidecars on disk. Best-effort: a read-only store still fills, it just
+        // cannot leave the note.
+        let _ = crate::sync::write_manifest_sidecar(&path, Some(&content_hash), &chunks);
         // The bytes are read and hashed — that is the whole cost of this
         // function. A TRANSIENT failure to record it must not throw that away.
         //

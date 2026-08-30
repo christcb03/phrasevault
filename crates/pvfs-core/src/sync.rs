@@ -133,10 +133,33 @@ pub fn parse_sync_uri(uri: &str) -> Option<&str> {
 
 /// Swarm chunk size (doc 22 §3).
 pub const SWARM_CHUNK: u64 = 8 * 1024 * 1024;
-const MANIFEST_HEADER: &str = "pvfs-manifest 1";
+const MANIFEST_HEADER_V1: &str = "pvfs-manifest 1";
+const MANIFEST_HEADER: &str = "pvfs-manifest 2";
+/// Written in the whole-hash slot when the writer did not know it (v2 always
+/// has the slot, so the format stays fixed-position and trivial to parse).
+const NO_WHOLE_HASH: &str = "-";
 
-/// The sidecar next to a stored/served file.
+/// The sidecar beside a stored/served file — a DOTFILE (D91).
+///
+/// v1 wrote `<file>.manifest`, the only bookkeeping we put in the operator's
+/// tree that was not hidden: `.pvfs-root` and `.{id}.swarmpart` always were.
+/// That asymmetry is what let a scan adopt a sidecar as content and then adopt
+/// the sidecar's sidecar, 23 levels deep across ~3000 files. Every walker
+/// already steps over dotfiles, so the NAME is the fix and the guards are only
+/// the belt.
 pub fn manifest_sidecar_path(file: &Path) -> PathBuf {
+    match file.file_name() {
+        Some(name) => file.with_file_name(format!(".{}.manifest", name.to_string_lossy())),
+        // A path with no file name cannot have a sidecar beside it; keep the
+        // old shape rather than inventing one.
+        None => legacy_manifest_sidecar_path(file),
+    }
+}
+
+/// Where v1 put it. Read-only: still honoured so an existing library keeps its
+/// hashes, never written again. A sweep can retire these once the fleet is on
+/// v2 everywhere.
+pub fn legacy_manifest_sidecar_path(file: &Path) -> PathBuf {
     let mut os = file.as_os_str().to_os_string();
     os.push(".manifest");
     PathBuf::from(os)
@@ -144,13 +167,10 @@ pub fn manifest_sidecar_path(file: &Path) -> PathBuf {
 
 /// Whether `name` is PVFS's own bookkeeping rather than the operator's content.
 ///
-/// `.pvfs-root` and `.{id}.swarmpart` are dotfiles, so every walker already
-/// steps over them. The chunk-manifest sidecar is the one piece of our
-/// bookkeeping that is NOT — it is written next to the file it describes, in a
-/// directory a scan walks, under a name the operator could plausibly own. That
-/// asymmetry is what let a scan adopt a sidecar as content, whose own sidecar
-/// the next pass then adopted, one level deeper per pass. Until the name itself
-/// becomes a dotfile, every walker asks here.
+/// Since D91 the sidecar is a dotfile, so the walkers' existing dotfile skip
+/// covers new ones by construction. This stays for the V1 name, which is still
+/// lying in every library that predates the rename and would otherwise be
+/// adopted as media on the next scan — the exact failure it was written for.
 pub fn is_sidecar_name(name: &str) -> bool {
     name.ends_with(".manifest")
 }
@@ -264,14 +284,27 @@ pub fn hash_with_manifest_until(
     Ok(Some((whole.finalize().to_hex().to_string(), hashes)))
 }
 
-pub(crate) fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result<()> {
+pub(crate) fn write_manifest_sidecar(
+    file: &Path,
+    whole: Option<&str>,
+    hashes: &[[u8; 32]],
+) -> Result<()> {
     // Never write a sidecar for a sidecar. The cache is best-effort, so a
     // forest that already adopted `.manifest` nodes still serves them — it
     // recomputes instead of laying down another level.
     if is_sidecar_path(file) {
         return Ok(());
     }
-    let mut text = format!("{MANIFEST_HEADER}\n{SWARM_CHUNK}\n");
+    // The EXACT byte size, not just enough to infer the chunk count. Chunk
+    // count only changes at an 8 MiB boundary, so it cannot tell a file apart
+    // from a replacement a few MB different — which is exactly what an arr
+    // writes when it upgrades an encode at the same path. Trusting a stale hash
+    // is silently wrong in the catalog; re-hashing is merely slow.
+    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let mut text = format!(
+        "{MANIFEST_HEADER}\n{SWARM_CHUNK}\n{}\n{size}\n",
+        whole.unwrap_or(NO_WHOLE_HASH)
+    );
     for h in hashes {
         text.push_str(&hex::encode(h));
         text.push('\n');
@@ -279,21 +312,77 @@ pub(crate) fn write_manifest_sidecar(file: &Path, hashes: &[[u8; 32]]) -> Result
     crate::storage::atomic_overwrite(&manifest_sidecar_path(file), text.as_bytes())
 }
 
-fn read_manifest_sidecar(file: &Path) -> Option<Vec<[u8; 32]>> {
-    let text = std::fs::read_to_string(manifest_sidecar_path(file)).ok()?;
+/// A parsed sidecar: the whole-file hash when the writer knew it (v2 only), and
+/// the per-chunk hashes.
+struct Sidecar {
+    whole: Option<String>,
+    /// The file size the writer saw. v2 only; `None` for a v1 sidecar, which is
+    /// why v1 can never seed a re-import.
+    recorded_size: Option<u64>,
+    chunks: Vec<[u8; 32]>,
+}
+
+/// Read the sidecar, preferring the D91 dotfile and falling back to the v1
+/// name so a library written before the rename keeps its hashes.
+fn read_manifest_sidecar(file: &Path) -> Option<Sidecar> {
+    let text = std::fs::read_to_string(manifest_sidecar_path(file))
+        .or_else(|_| std::fs::read_to_string(legacy_manifest_sidecar_path(file)))
+        .ok()?;
     let mut lines = text.lines();
-    if lines.next() != Some(MANIFEST_HEADER) {
-        return None;
-    }
+    let v2 = match lines.next()? {
+        h if h == MANIFEST_HEADER => true,
+        h if h == MANIFEST_HEADER_V1 => false,
+        _ => return None,
+    };
     if lines.next()?.parse::<u64>().ok()? != SWARM_CHUNK {
         return None; // chunk size changed — recompute
     }
-    let mut out = Vec::new();
+    // v2 carries the whole-file hash in a fixed slot; v1 has no such line and
+    // its chunk hashes start immediately.
+    let (whole, recorded_size) = if v2 {
+        let w = match lines.next()? {
+            NO_WHOLE_HASH => None,
+            h if h.len() == 64 && hex::decode(h).is_ok() => Some(h.to_string()),
+            _ => return None,
+        };
+        (w, Some(lines.next()?.parse::<u64>().ok()?))
+    } else {
+        (None, None)
+    };
+    let mut chunks = Vec::new();
     for l in lines.filter(|l| !l.trim().is_empty()) {
         let bytes = hex::decode(l.trim()).ok()?;
-        out.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
+        chunks.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
     }
-    Some(out)
+    Some(Sidecar {
+        whole,
+        recorded_size,
+        chunks,
+    })
+}
+
+/// The whole-file hash AND chunk hashes recorded beside `file`, if a complete
+/// v2 sidecar is there and still plausible for the file's current size.
+///
+/// This is what makes a fresh scan cheap (D91): hashing 23 TB takes tens of
+/// hours on the holder, and without a durable record on disk that work dies
+/// with the forest it was computed for. A size check is the honest limit of
+/// what a sidecar can promise — same size and a recorded hash means "almost
+/// certainly the file we hashed"; a changed size means recompute.
+pub fn sidecar_hashes(file: &Path, size: u64) -> Option<(String, Vec<[u8; 32]>)> {
+    let sc = read_manifest_sidecar(file)?;
+    // EXACT size, or nothing. A chunk-count check passes for any size within
+    // the same 8 MiB bucket, so it would hand back the hash of the file that
+    // USED to be at this path — a replacement encode is the common case, and a
+    // wrong hash in the catalog is far worse than the read we saved.
+    if sc.recorded_size? != size {
+        return None;
+    }
+    let expect = if size == 0 { 0 } else { size.div_ceil(SWARM_CHUNK) } as usize;
+    if sc.chunks.len() != expect {
+        return None;
+    }
+    sc.whole.map(|w| (w, sc.chunks))
 }
 
 /// A served file's manifest: the sidecar when present and plausible for the
@@ -304,13 +393,16 @@ pub fn manifest_for(path: &Path) -> Result<Vec<[u8; 32]>> {
         .map_err(|e| PvfsError::io("stat for manifest", e))?
         .len();
     let expect = if size == 0 { 0 } else { size.div_ceil(SWARM_CHUNK) } as usize;
-    if let Some(m) = read_manifest_sidecar(path) {
-        if m.len() == expect {
-            return Ok(m);
+    if let Some(sc) = read_manifest_sidecar(path) {
+        if sc.chunks.len() == expect {
+            return Ok(sc.chunks);
         }
     }
-    let m = compute_manifest(path)?;
-    let _ = write_manifest_sidecar(path, &m);
+    // D91 — take the whole-file hash on the way past. We are already reading
+    // every byte, so it is nearly free here, and it is the difference between a
+    // sidecar that survives a forest rebuild and one that does not.
+    let (whole, m) = hash_with_manifest(path)?;
+    let _ = write_manifest_sidecar(path, Some(&whole), &m);
     Ok(m)
 }
 
@@ -1023,7 +1115,31 @@ pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
         .map(|(_, u)| format!("{}/", u.trim_end_matches('/')))
         .collect();
 
-    for (id, uri, path) in engine.live_own_host_locations()? {
+    // D92 — BOTH live and already-retired own-host locations.
+    //
+    // D85 narrowed this to live ones so the pass could do both halves itself,
+    // and that left a hole nothing else covered: when someone ELSE retires the
+    // location first — the owner's tier does exactly that — the bytes stayed on
+    // disk with no live location, and no job in the fleet would ever reclaim
+    // them. `retired_own_host_locations` was written for precisely this case
+    // and had been left with no callers since.
+    //
+    // The guards below are unchanged and apply to both sets: the root must have
+    // declared it drains, the file must be held somewhere else, and the size on
+    // disk must still match the catalog. Nothing is loosened — the only change
+    // is that "who retired it" stops deciding whether the space is recoverable.
+    let mut candidates: Vec<(NodeId, String, PathBuf, bool)> = engine
+        .live_own_host_locations()?
+        .into_iter()
+        .map(|(i, u, p)| (i, u, p, true))
+        .collect();
+    candidates.extend(
+        engine
+            .retired_own_host_locations()?
+            .into_iter()
+            .map(|(i, u, p)| (i, u, p, false)),
+    );
+    for (id, uri, path, was_live) in candidates {
         // Under a declared draining root, or a migrate-kind binding's source.
         let drains = declared.iter().any(|d| {
             crate::storage::any_path_of(&uri).is_some_and(|p| p.starts_with(
@@ -1087,10 +1203,15 @@ pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
                         // that are gone: stale, and a scan repairs it. That is
                         // strictly better than the reverse, which leaves a file
                         // nothing in the catalog knows about.
-                        if let Err(e) = engine.remove_location(&id, &uri) {
-                            report
-                                .skipped
-                                .push((uri, format!("evicted, but the location remains: {e}")));
+                        // Only retire what is still live. An already-retired
+                        // location has nothing left to retire, and asking again
+                        // would report a failure for work that was already done.
+                        if was_live {
+                            if let Err(e) = engine.remove_location(&id, &uri) {
+                                report
+                                    .skipped
+                                    .push((uri, format!("evicted, but the location remains: {e}")));
+                            }
                         }
                     }
                     Err(e) => report.skipped.push((uri, e.to_string())),
@@ -1307,7 +1428,7 @@ impl Engine {
         std::fs::rename(part, &dest).map_err(|e| PvfsError::io("publish swarm file", e))?;
         // every chunk was verified against this manifest during assembly and
         // the whole just passed the catalog gate — cache it without a re-read
-        let _ = write_manifest_sidecar(&dest, manifest);
+        let _ = write_manifest_sidecar(&dest, Some(&actual), manifest);
         self.conn
             .execute(
                 "DELETE FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
@@ -1361,7 +1482,8 @@ impl Engine {
         if sink.in_chunk > 0 {
             chunks.push(*sink.chunk_hasher.finalize().as_bytes());
         }
-        let _ = write_manifest_sidecar(&sink.dest, &chunks);
+        let whole = (!sink.expected_hash.is_empty()).then(|| sink.expected_hash.clone());
+        let _ = write_manifest_sidecar(&sink.dest, whole.as_deref(), &chunks);
         // A prior copy may have been quarantined (verify-on-read); fresh
         // verified bytes lift it. Projection-local — fine on a replica.
         self.conn
