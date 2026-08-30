@@ -188,6 +188,12 @@ fn unbinding_without_naming_a_root_is_refused_when_there_are_several() {
 /// replica listed one, and `local_bindings` — which the scan walks — returned
 /// one. Chris's NAS would have scanned `Data` and silently ignored `Data_ext`.
 ///
+/// D94 — the policy field here says `never`, not `lazy`: `lazy` is now REFUSED
+/// at parse rather than reinterpreted, so a hand-written fixture carrying it
+/// fails to open the forest at all. That refusal is the point (a stored binding
+/// asking for a mode that no longer exists should say so), and this test is
+/// about multi-root listing, so it just needs a policy that is not `on_add`.
+///
 /// This writes `bindings.local` DIRECTLY, because that is the only way to
 /// exercise the path: `bind_folder` on an owner takes the logged route and
 /// never touches the merge at all. My first attempt at this test used an owner
@@ -207,8 +213,8 @@ fn every_local_root_of_a_folder_is_listed_and_scannable() {
         data_dir.join("bindings.local"),
         format!(
             "pvfs-local-bindings 1\n\
-             bind {m} 1 1 lazy 1000 - file://{}\n\
-             bind {m} 1 1 lazy 1001 - file://{}\n",
+             bind {m} 1 1 never 1000 - file://{}\n\
+             bind {m} 1 1 never 1001 - file://{}\n",
             warm.display(),
             cold.display()
         ),

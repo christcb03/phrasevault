@@ -40,8 +40,13 @@ pub enum HashPolicy {
 impl HashPolicy {
     pub fn parse(s: &str) -> Result<HashPolicy> {
         match s {
-            // D94 — `lazy` is GONE, and existing bindings that still say it on
-            // disk are read as `on_add` rather than broken.
+            // D94 — `lazy` is GONE and is REFUSED, not quietly reinterpreted.
+            //
+            // Chris: it is not a real mode, so accepting the word would leave
+            // something configured for a behaviour that no longer exists and
+            // silently doing something else. A binding still asking for it is
+            // exactly what we want to be told about, loudly, rather than have
+            // work in a way it cannot.
             //
             // It did not defer the hashing, it skipped it: 91.5% of the media
             // forest was unhashed, and an unhashed file has no chunk manifest,
@@ -53,8 +58,15 @@ impl HashPolicy {
             // SUCCESSOR, orphaning the original. That is 1298 orphaned unhashed
             // nodes on the ingest box and one more for every file still to be
             // filled — and an orphan could not even be retired until D90.
-            "lazy" | "on_add" => Ok(HashPolicy::OnAdd),
+            "on_add" => Ok(HashPolicy::OnAdd),
             "never" => Ok(HashPolicy::Never),
+            "lazy" => Err(bad(
+                "hash_policy",
+                "`lazy` was removed (D94): it did not defer hashing, it skipped \
+                 it, and it orphaned a node per file by filling through a \
+                 successor. Use `on_add` to hash on bind (the default), or \
+                 `never` to deliberately leave a library unhashed.",
+            )),
             other => Err(bad("hash_policy", &format!("unknown policy {other:?}"))),
         }
     }

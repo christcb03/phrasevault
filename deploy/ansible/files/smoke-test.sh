@@ -236,17 +236,16 @@ HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
 [ "$HASHED" = "$LAZY" ] && ok "hash on an on_add node is an idempotent no-op" \
   || fail "hash on on_add node re-identified: $LAZY -> $HASHED"
 [ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified" || fail "hashed cat"
-# D94 — `lazy` is gone as a POLICY but still accepted as a WORD, because
-# bindings in the field say it on disk and must not break. It now means
-# `on_add`. This asserts that migration, then uses `never` for the successor
-# case below, which is what `lazy` used to be the lazy way of reaching.
+# D94 — `lazy` is REFUSED, not quietly read as something else. A binding still
+# asking for a mode that no longer exists must say so out loud rather than
+# silently behave differently; that is the whole point of removing it.
 BINDLIB="$DATA/oldword"
 mkdir -p "$BINDLIB"; printf 'x' > "$BINDLIB/f.bin"
 BFOLDER="$($PVFS add "$ROOT" --kind folder --label oldword)"
-$PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy lazy >/dev/null \
-  && ok "the word 'lazy' still binds (reads as on_add)" || fail "lazy word rejected"
-$PVFS bindings | qgrep "hash on_add" \
-  && ok "and is recorded as on_add" || fail "lazy did not migrate to on_add"
+assert_rc 2 "the removed 'lazy' policy is refused, not reinterpreted" -- \
+  $PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy lazy
+$PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy on_add >/dev/null \
+  && ok "on_add binds" || fail "on_add bind"
 
 # The fill happens at `pvfs hash` time — the hash lives in the immutable
 # payload, hence a successor node. `never` is how you ask for an unhashed node
