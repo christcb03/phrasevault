@@ -160,7 +160,13 @@ impl JobsState {
                         }
                     }
                 }
-                if let Some(why) = stalled_reason(&r.state, since, now, interval(&r.name)) {
+                if let Some(why) = stalled_reason(
+                    &r.state,
+                    since,
+                    now,
+                    interval(&r.name),
+                    stall_floor(&r.name),
+                ) {
                     r.state = "stalled".into();
                     r.last_error = Some(why);
                 }
@@ -604,11 +610,23 @@ pub fn stalled_reason(
     since_ms: u64,
     now_ms: u64,
     every: Duration,
+    floor: Duration,
 ) -> Option<String> {
     if state != "running" {
         return None;
     }
-    let limit = every.as_millis() as u64 * STALL_FACTOR;
+    // D96 — the floor applies HERE too, not only to the in-flight check.
+    //
+    // D85 added `stall_floor` because tier and watch legitimately run for hours
+    // or days, and wired it into `pass_stalled_reason`. But that one only fires
+    // when a pass is in flight; execution then falls through to THIS blunt
+    // check, which was still judging by `interval * 3`. For tier that is 300s
+    // * 3 = 15 minutes against passes its own documentation calls "hours", so
+    // the wolf-crying D85 set out to stop carried straight on through the
+    // fallback — seen on the live holder as tier "stalled" at 34 min and watch
+    // at 464 min, both while working perfectly.
+    let limit = ((every.as_millis() as u64).saturating_mul(STALL_FACTOR))
+        .max(floor.as_millis() as u64);
     let waited = now_ms.saturating_sub(since_ms);
     if waited <= limit {
         return None;
