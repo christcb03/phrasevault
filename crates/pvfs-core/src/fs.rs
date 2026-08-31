@@ -378,6 +378,47 @@ impl Engine {
     /// two-volume library because the caller named no root would be a very
     /// quiet way to lose half a catalog's reach. So it is refused, and the
     /// roots are listed.
+    /// D97 — the live locations that unbinding `source_uri` would strand.
+    ///
+    /// `unbind` records `FolderUnboundRoot` and touches no locations, and the
+    /// scan reconciles ONLY under a bound prefix — it builds its candidate set
+    /// from `binding.source_uri`. So the moment a root is unbound, every
+    /// location beneath it falls outside every prefix and is never examined by
+    /// anything again. Retired storage leaks locations permanently: 79 of them
+    /// survived D80's NFS unmount, and a week later the mover was still trying
+    /// to fetch from a mount that no longer existed, 92 attempts apiece.
+    ///
+    /// Same TWO prefixes the scan uses (D81): host-implicit `file:///path` for
+    /// a box that owns the log, and pin-qualified `pvfs-host://<pin>/path` for
+    /// a replica writing through. Matching only the first would report zero on
+    /// exactly the fleet shape where this bites hardest.
+    pub fn locations_under_root(&self, source_uri: &str) -> Result<Vec<(NodeId, String)>> {
+        let prefix = format!("{}/", source_uri.trim_end_matches('/'));
+        let root = crate::storage::uri_to_path(source_uri).ok();
+        let host_prefix = match (self.own_pin(), root.as_ref()) {
+            (Some(pin), Some(r)) => crate::storage::host_uri(pin, r)
+                .ok()
+                .map(|u| format!("{}/", u.trim_end_matches('/'))),
+            _ => None,
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file_id, uri FROM file_locations
+                  WHERE (uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%'))
+                    AND removed_at IS NULL
+                  ORDER BY uri",
+            )
+            .map_err(map_db("locations under root"))?;
+        let rows = stmt
+            .query_map(params![prefix, host_prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_db("locations under root"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("locations under root"))
+    }
+
     pub fn unbind_folder(&mut self, folder: &NodeId, root: Option<&str>) -> Result<()> {
         if !self.replica {
             self.ensure_device_active()?;
