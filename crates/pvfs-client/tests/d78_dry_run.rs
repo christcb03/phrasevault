@@ -18,7 +18,17 @@ fn count_files(dir: &std::path::Path) -> usize {
                 } else if !matches!(
                     p.file_name().and_then(|s| s.to_str()),
                     Some(".pvfs-central") | Some(".pvfs-root")
-                ) {
+                ) && !p
+                    .file_name()
+                    .map(|s| pvfs_core::sync::is_sidecar_name(&s.to_string_lossy()))
+                    .unwrap_or(false)
+                {
+                    // D91 — the chunk-manifest sidecar joins `.pvfs-central` and
+                    // `.pvfs-root` here for the same reason they are already
+                    // listed: this counts the operator's CONTENT, and our own
+                    // bookkeeping beside a file is not content. The fill now
+                    // leaves one next to every hashed file, so without this the
+                    // count doubles.
                     *n += 1;
                 }
             }
@@ -61,7 +71,7 @@ fn a_dry_run_plans_the_work_and_writes_nothing() {
                 recursive: true,
                 auto_index: true,
                 extensions: String::new(),
-                hash_policy: HashPolicy::Lazy,
+                hash_policy: HashPolicy::OnAdd,
             },
         )
         .unwrap();

@@ -158,6 +158,19 @@ enum Cmd {
         #[arg(long)]
         staging: bool,
     },
+    /// Rescue hashes that exist only in this forest's catalog, writing them
+    /// beside the bytes so a re-import can reuse them (D93).
+    ///
+    /// The fill records a content hash in the node and, before D91, wrote
+    /// nothing to disk — so tens of hours of hashing were pinned to one forest
+    /// and would die with it. This leaves the note next to the file. It reads
+    /// no file content, only `stat`, and it retires the pre-D91 sidecar name it
+    /// finds on the way past.
+    SidecarBackfill {
+        /// Report what would be written, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List orphaned durable nodes
     Orphans,
     /// Files the catalog claims that NOBODY holds — the residue of deletions
@@ -1390,7 +1403,7 @@ fn adopt_central_store(
         // placement command into hours of reading. Identity by (name, exact
         // size) is enough to recognise these files, and the first hash that is
         // ever needed settles it (D71 W6).
-        hash_policy: pvfs_core::HashPolicy::Lazy,
+        hash_policy: pvfs_core::HashPolicy::OnAdd,
     };
     let uri = spec.source_uri.clone();
     let stats = engine.scan_unbound(&node.to_string(), &uri, &spec, &mut None, 0)?;
@@ -3368,6 +3381,47 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
             Ok(())
+        }
+        Cmd::SidecarBackfill { dry_run } => {
+            let engine = Engine::open(&ctx?)?;
+            let r = engine.backfill_sidecars(dry_run)?;
+            if json {
+                println!(
+                    "{{\"written\":{},\"whole_hash_only\":{},\"legacy_retired\":{},\
+                      \"already_durable\":{},\"unhashed\":{},\"no_local_copy\":{},\
+                      \"size_mismatch\":{},\"own_bookkeeping\":{},\"dry_run\":{}}}",
+                    r.written,
+                    r.whole_hash_only,
+                    r.legacy_retired,
+                    r.already_durable,
+                    r.unhashed,
+                    r.no_local_copy,
+                    r.size_mismatch,
+                    r.own_bookkeeping,
+                    dry_run
+                );
+            } else {
+                if dry_run {
+                    println!("DRY RUN — nothing was written");
+                }
+                println!("hashes rescued from the catalog : {}", r.written);
+                println!("  of those, whole hash only     : {}", r.whole_hash_only);
+                println!("pre-D91 sidecars retired        : {}", r.legacy_retired);
+                println!("already durable                 : {}", r.already_durable);
+                println!("not hashed yet                  : {}", r.unhashed);
+                println!("no readable copy here           : {}", r.no_local_copy);
+                println!("size disagrees with the catalog : {}", r.size_mismatch);
+                println!("our own sidecars, skipped       : {}", r.own_bookkeeping);
+                if r.size_mismatch > 0 {
+                    eprintln!(
+                        "note: {} file(s) on disk no longer match the size the catalog \
+                         recorded — a replacement written at the same path. Their old \
+                         hash was NOT stamped beside the new bytes.",
+                        r.size_mismatch
+                    );
+                }
+            }
+            engine.close()
         }
         Cmd::Orphans => {
             let engine = Engine::open(&ctx?)?;

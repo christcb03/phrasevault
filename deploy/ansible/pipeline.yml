@@ -73,6 +73,16 @@
         dest: "{{ pvfs_src }}/"
         delete: true
         rsync_opts:
+          # D91 — decide by CONTENT and stamp with the copy time. rsync's
+          # default (-a keeps mtimes) let a freshly-synced file land with an
+          # mtime OLDER than cargo's recorded build, so cargo called the crate
+          # fresh and tested a STALE binary while reporting success. Caught
+          # 2026-08-30: the run said `p1_storage: 11 passed` against a tree
+          # holding 12 tests, and two new regression tests never executed —
+          # exit code 0 throughout. Not clock skew; the hosts agree within 2s.
+          # PVOS fixed this same class already; PVFS never got it.
+          - "--checksum"
+          - "--no-times"
           - "--exclude=.git"
           - "--exclude=old/"
           - "--exclude=v0.0-concept/"
@@ -287,12 +297,31 @@
         - /tmp/pvfsd-journal.txt
       tags: [report]
 
+    # D91 — the summary used to read `test_out.stdout_lines[-1]`, and the LAST
+    # `test result:` line of a cargo run is always the final crate's doc-tests,
+    # which are empty. So a fully green run reported "0 passed; 0 failed" and
+    # exited 0 — a recap that says nothing happened is worse than no recap,
+    # because it gets believed. Aggregate every suite instead.
+    - name: Aggregate real test totals
+      ansible.builtin.shell: |
+        set -o pipefail
+        awk -F'[ ;]+' '/^test result:/{p+=$4; f+=$6; i+=$8; n++}
+                       END {if (n==0) print "NO SUITES RAN — suspect a stale build";
+                            else printf "%d passed, %d failed, %d ignored (%d suites)", p, f, i, n}' \
+          /tmp/pvfs-test-results.txt
+      args:
+        executable: /bin/bash
+      register: test_totals
+      changed_when: false
+      failed_when: false
+      tags: [report]
+
     - name: Pipeline summary
       ansible.builtin.debug:
         msg:
           - "build   : ok"
-          - "tests   : {{ test_out.stdout_lines[-1] | default('see artifacts') }}"
-          - "smoke   : {{ smoke_out.stdout_lines[-1] | default('see artifacts') }}"
+          - "tests   : {{ test_totals.stdout | default('see artifacts') }}"
+          - "smoke   : {{ smoke_out.stdout_lines | default([]) | select('match', '^smoke results') | list | last | default('see artifacts') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"
           - "daemon  : {{ daemon_info2.stdout | default('not run') }}"
       tags: [report]

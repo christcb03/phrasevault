@@ -23,7 +23,7 @@ fn make_mount() -> (tempfile::TempDir, std::path::PathBuf) {
     let mount = fs::canonicalize(dir.path()).unwrap();
     write_file(&mount.join("docs/notes.txt"), b"some notes");
     write_file(&mount.join("photos/2024/pic.jpg"), b"jpegish");
-    let (engine, _m, report) = mount::init_forest(&mount, true, HashPolicy::Lazy).unwrap();
+    let (engine, _m, report) = mount::init_forest(&mount, true, HashPolicy::OnAdd).unwrap();
     assert_eq!(report.unwrap().stats.added, 2, "imported the mount tree");
     engine.close().unwrap();
     (dir, mount)

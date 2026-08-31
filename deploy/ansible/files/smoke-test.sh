@@ -236,21 +236,33 @@ HASHED="$($PVFS hash "$LAZY" 2>/dev/null)"
 [ "$HASHED" = "$LAZY" ] && ok "hash on an on_add node is an idempotent no-op" \
   || fail "hash on on_add node re-identified: $LAZY -> $HASHED"
 [ "$($PVFS cat "$HASHED")" = "lazy-content" ] && ok "hashed node serves verified" || fail "hashed cat"
-# A genuinely lazy binding: scan skips hashing, so the fill happens at `pvfs
-# hash` time — the hash lives in the immutable payload, hence a successor node.
+# D94 — `lazy` is REFUSED, not quietly read as something else. A binding still
+# asking for a mode that no longer exists must say so out loud rather than
+# silently behave differently; that is the whole point of removing it.
+BINDLIB="$DATA/oldword"
+mkdir -p "$BINDLIB"; printf 'x' > "$BINDLIB/f.bin"
+BFOLDER="$($PVFS add "$ROOT" --kind folder --label oldword)"
+assert_rc 2 "the removed 'lazy' policy is refused, not reinterpreted" -- \
+  $PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy lazy
+$PVFS bind "$BFOLDER" "$BINDLIB" --hash-policy on_add >/dev/null \
+  && ok "on_add binds" || fail "on_add bind"
+
+# The fill happens at `pvfs hash` time — the hash lives in the immutable
+# payload, hence a successor node. `never` is how you ask for an unhashed node
+# on purpose now that `on_add` is the default.
 LAZYLIB="$DATA/lazylib"
 mkdir -p "$LAZYLIB"
 printf 'truly-lazy' > "$LAZYLIB/slow.bin"
 ZFOLDER="$($PVFS add "$ROOT" --kind folder --label lazylib)"
-$PVFS bind "$ZFOLDER" "$LAZYLIB" --hash-policy lazy >/dev/null && ok "bind (lazy policy)" || fail "lazy bind"
+$PVFS bind "$ZFOLDER" "$LAZYLIB" --hash-policy never >/dev/null && ok "bind (never policy)" || fail "never bind"
 $PVFS scan "$ZFOLDER" >/dev/null
 SLOW="$($PVFS --json ls "$ZFOLDER" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "slow.bin": print(e["id"])')"
 FILLED="$($PVFS hash "$SLOW" 2>/dev/null)"
-[ ${#FILLED} -eq 64 ] && [ "$FILLED" != "$SLOW" ] && ok "hash created successor node (lazy policy)" \
-  || fail "lazy hash fill: $SLOW -> $FILLED"
+[ ${#FILLED} -eq 64 ] && [ "$FILLED" != "$SLOW" ] && ok "hash created successor node (never policy)" \
+  || fail "unhashed hash fill: $SLOW -> $FILLED"
 [ "$($PVFS cat "$FILLED")" = "truly-lazy" ] && ok "successor serves verified bytes" || fail "successor cat"
 
 say "P4 F0: export (native tree view, doc 17)"
@@ -274,7 +286,15 @@ $PVFS serve watch --debounce-ms 300 >/dev/null 2>&1 &
 SERVE_PID=$!
 sleep 2
 printf 'watched-file' > "$LIB/movies/watched.mkv"
-sleep 3
+# Wait for the ingest rather than assuming a duration. D86 made a directory
+# content in its own right, so the first pass walks more than it used to and a
+# flat 3s stopped being enough on a loaded runner — the watcher was working and
+# the budget was not. Polling exits as soon as it lands, so the common case is
+# faster than the old sleep, and a real failure still fails inside 20s.
+for _ in $(seq 1 40); do
+  $PVFS ls "$MOVIES" | qgrep watched.mkv && break
+  sleep 0.5
+done
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
 $PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"
@@ -682,6 +702,12 @@ fi
 # the edge box syncs the tail, then reclaims its space — never before the
 # catalog shows another live location
 $PVFS --json replica sync "$REPMOUNT" >/dev/null
+# D92 — evict will not delete from a root that never SAID it drains: silence is
+# not consent for a pass whose job is deleting (D85). The live fleet declares
+# feederbox's library exactly this way; the test omitted it and then expected
+# the reclaim to happen anyway, which is why this pair failed. Declaring it is
+# what makes the scenario the one the fleet actually runs.
+$PVFS --data-dir "$REPMOUNT/.pvfs" roots "$DROOT" --add "$DATA" --staging >/dev/null
 EVICTJ="$($PVFS --json --data-dir "$REPMOUNT/.pvfs" evict)"
 [ "$(jget "$EVICTJ" evicted)" -ge 1 ] && ok "edge box evicted the migrated bytes" || fail "evict: $EVICTJ"
 [ ! -f "$DATA/edge.bin" ] && ok "edge bytes deleted — space reclaimed" || fail "edge bytes remain"
@@ -1083,7 +1109,10 @@ NEW_A="$(jget "$($PVFS --json --data-dir "$IGD" ingest commit "$SID" "$NODE_A")"
 $PVFS --data-dir "$IGD" cat "$NEW_A" > "$DATA/ig-got-a" 2>/dev/null
 cmp -s "$DATA/ig-got-a" "$DATA/ig-src-a" \
   && ok "published bytes round-trip bit-perfect" || fail "roundtrip mismatch"
-[ -f "$IGD/synced/${NEW_A:0:2}/$NEW_A.manifest" ] \
+# D91 — the sidecar is a DOTFILE now, so this path gained a leading dot. That
+# rename is the actual fix for the recursion (every walker already skips
+# dotfiles); the guards in the walkers are only the belt.
+[ -f "$IGD/synced/${NEW_A:0:2}/.$NEW_A.manifest" ] \
   && ok "manifest sidecar cached at publish" || fail "no manifest sidecar"
 ATT=$(ig_count "SELECT COUNT(*) FROM chunk_manifests WHERE file_id='$NEW_A'")
 [ "$ATT" -eq 1 ] && ok "attestation folded (the early-serve license)" || fail "no attestation row"

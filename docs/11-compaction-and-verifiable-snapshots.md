@@ -11,6 +11,18 @@ shard the biggest growth away from the top log; fleet rebuilds run in seconds; a
 B's deletion would break doc 23 §8.4's "no orphaned records, ledger self-contained
 forever" property for compacted spans unless typed records are carried forward.
 
+**AMENDED 2026-08-30 (Chris, doc 24).** The trigger stands **unmeasured, by
+choice**: a rebuild into a FRESH FOREST is wanted regardless of what the numbers
+say, because it is the better instrument. Re-genesis exercises the same
+machinery and forces the residue — duplicate live nodes, orphans holding live
+locations, strays pointing at retired mounts — to be resolved rather than
+carried. So the question stopped being "has the log grown enough to justify
+compaction" and became "build the re-genesis path". Two consequences: the
+~2.7% of this log that is junk from the `.manifest` incident is deliberately
+NOT being cleaned up by hand (doc 24 §7 B6) because re-genesis drops it for
+free; and the hash must become portable (`pvfs-manifest 2`, doc 24 §6) or a
+fresh forest re-reads all 23 TB. Option **C first** is unchanged.
+
 Date: 2026-06-21
 Depends on: [02 (P0 core / log & chain)](02-p0-core-engine-spec.md), [03 (federation & trust)](03-federation-trust-and-uris.md), [06 (access control)](06-access-control-and-daemon.md)
 Roadmap: [08 §4 item 15](08-roadmap-and-status.md) (Compaction row)

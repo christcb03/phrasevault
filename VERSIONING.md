@@ -2,6 +2,22 @@
 
 PVFS and the application layers built on top of it use a **layered version scheme**. Each layer's version is its own `MAJOR.MINOR`, followed by the **major** version of each layer beneath it (top to bottom), ending with PVFS.
 
+## A release version is not a build identity (2026-08-30)
+
+**`1.4.0` meant two materially different binaries at once**, and nothing said
+so. `main` sat 80 commits behind the branch the fleet actually ran; both
+reported `pvfs 1.4.0`. A fix was written, tested and clippy-cleaned against the
+stale tree before anyone noticed, and the only reliable tell was **content** —
+`grep -c MediaQuality crates/pvfs-core/src/event.rs`, an event kind the live log
+held 24,585 of and the stale tree had never heard of.
+
+**RULE: the version a binary reports must identify the build, not just the
+release.** Put `git describe --tags --dirty` into `--version` so a tree that is
+27 commits past `v1.4` cannot present itself as the same thing as one that is
+107 past. Until that lands, verify a deploy by grepping the installed binary for
+a string only the intended build has — never by its version, and never by a
+green pipeline recap (doc 24 §7 A2–A4).
+
 ## Wire protocol version (`pvfs_proto::PROTO_VERSION`)
 
 Separate from the release version above: a single monotonic integer sent

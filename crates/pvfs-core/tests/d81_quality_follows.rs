@@ -13,13 +13,19 @@
 use pvfs_core::media::MediaQuality;
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FILE, TYPE_FOLDER};
 
+// D94 — `Never`, deliberately. Both tests here are about what happens when
+// attestation mints a SUCCESSOR node, and `on_add` gives a node its hash at
+// birth, so there is nothing left to fill and no successor to mint. `Never` is
+// now the way to ask for an unhashed node on purpose. (Dropping `lazy` is what
+// stops successors — and the orphans they leave — being the normal path; the
+// mechanism still exists for a changed file, which is what these pin.)
 fn spec(dir: &std::path::Path) -> BindSpec {
     BindSpec {
         source_uri: format!("file://{}", dir.display()),
         recursive: true,
         auto_index: true,
         extensions: String::new(),
-        hash_policy: HashPolicy::Lazy,
+        hash_policy: HashPolicy::Never,
     }
 }
 

@@ -278,6 +278,102 @@ fn manifest_sidecar_roundtrips_and_caches() {
 // The cache must never lay a sidecar down FOR a sidecar — that is the recursion.
 // A forest that already adopted `.manifest` nodes still serves them; it just
 // recomputes each time instead of growing the chain another level.
+// D88 — hashing now runs across all cores (`update_rayon`) and reads a whole
+// swarm chunk per pass instead of 1 MiB. Both are invisible by contract: BLAKE3
+// is defined by its input, not by how many threads or how many `update` calls
+// carried it. This pins that, because a hash that changed silently would
+// invalidate every id in the forest.
+#[test]
+fn parallel_hash_matches_the_serial_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("multi.bin");
+    // 2.5 chunks, so the read buffer, the chunk boundary and EOF all disagree
+    let data: Vec<u8> = (0..(sync::SWARM_CHUNK * 5 / 2) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&f, &data).unwrap();
+
+    let (whole, chunks) = sync::hash_with_manifest(&f).unwrap();
+    assert_eq!(
+        whole,
+        blake3::hash(&data).to_hex().to_string(),
+        "whole-file hash must equal a plain one-shot BLAKE3 of the same bytes"
+    );
+    assert_eq!(chunks.len(), 3, "ceil(2.5) chunks");
+    for (i, h) in chunks.iter().enumerate() {
+        let off = i * sync::SWARM_CHUNK as usize;
+        let end = (off + sync::SWARM_CHUNK as usize).min(data.len());
+        assert_eq!(blake3::hash(&data[off..end]).as_bytes(), h, "chunk {i}");
+    }
+    // and the cancellable path agrees with the plain one
+    let again = sync::hash_with_manifest_until(&f, None).unwrap().unwrap();
+    assert_eq!(again.0, whole);
+    assert_eq!(again.1, chunks);
+}
+
+// D91 — the sidecar carries the WHOLE-file hash and is a dotfile.
+//
+// Both matter for the same reason: a library must be re-importable into a fresh
+// forest without paying for the hashing again. Hashing 23TB takes tens of hours
+// on the holder, and before this the result lived only in the node payload — it
+// died with the forest it was computed for. And the old undotted name is what a
+// scan adopted as media in the first place.
+#[test]
+fn sidecar_carries_the_whole_hash_and_is_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("movie.mkv");
+    let data: Vec<u8> = (0..(sync::SWARM_CHUNK * 3 / 2) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&f, &data).unwrap();
+    let size = data.len() as u64;
+
+    // nothing recorded yet
+    assert!(sync::sidecar_hashes(&f, size).is_none());
+
+    // serving the file records it
+    let chunks = sync::manifest_for(&f).unwrap();
+    let side = sync::manifest_sidecar_path(&f);
+    assert!(side.exists(), "sidecar written");
+    assert!(
+        side.file_name().unwrap().to_string_lossy().starts_with('.'),
+        "the sidecar must be a DOTFILE — the undotted name is what a scan adopted"
+    );
+
+    // and it round-trips the whole-file hash, which is the point
+    let (whole, got) = sync::sidecar_hashes(&f, size).expect("v2 sidecar readable");
+    assert_eq!(whole, blake3::hash(&data).to_hex().to_string());
+    assert_eq!(got, chunks);
+
+    // A size that no longer matches means recompute, not trust — and it must be
+    // EXACT. `size + 1` lands in the same 8 MiB chunk bucket, so a chunk-count
+    // check would have accepted it and handed back the hash of the file that
+    // used to be here. That is the arr-replaces-an-encode case, and a wrong
+    // hash in the catalog is far worse than the read it saved.
+    assert!(
+        sync::sidecar_hashes(&f, size + 1).is_none(),
+        "one byte different is a different file, even inside the same chunk"
+    );
+    assert!(sync::sidecar_hashes(&f, size - 1).is_none());
+
+    // a v1 sidecar at the OLD path is still honoured, so an existing library
+    // keeps its chunk work — it just has no whole hash to offer.
+    let f2 = dir.path().join("old.mkv");
+    std::fs::write(&f2, b"small").unwrap();
+    let legacy = sync::legacy_manifest_sidecar_path(&f2);
+    let one = blake3::hash(b"small");
+    std::fs::write(
+        &legacy,
+        format!("pvfs-manifest 1\n{}\n{}\n", sync::SWARM_CHUNK, one.to_hex()),
+    )
+    .unwrap();
+    assert!(
+        sync::sidecar_hashes(&f2, 5).is_none(),
+        "v1 has no whole hash, so it cannot seed a re-import"
+    );
+    assert_eq!(sync::manifest_for(&f2).unwrap().len(), 1, "but it still serves");
+}
+
 #[test]
 fn no_sidecar_for_a_sidecar() {
     let dir = tempfile::tempdir().unwrap();

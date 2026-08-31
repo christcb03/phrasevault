@@ -33,7 +33,6 @@ pub const WATCH_SETTLE_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashPolicy {
-    Lazy,
     OnAdd,
     Never,
 }
@@ -41,15 +40,38 @@ pub enum HashPolicy {
 impl HashPolicy {
     pub fn parse(s: &str) -> Result<HashPolicy> {
         match s {
-            "lazy" => Ok(HashPolicy::Lazy),
+            // D94 — `lazy` is GONE and is REFUSED, not quietly reinterpreted.
+            //
+            // Chris: it is not a real mode, so accepting the word would leave
+            // something configured for a behaviour that no longer exists and
+            // silently doing something else. A binding still asking for it is
+            // exactly what we want to be told about, loudly, rather than have
+            // work in a way it cannot.
+            //
+            // It did not defer the hashing, it skipped it: 91.5% of the media
+            // forest was unhashed, and an unhashed file has no chunk manifest,
+            // so a mount cannot stream it and blocks on a whole-file fetch —
+            // 115.8s to read 1MB against 0.10s for a hashed one.
+            //
+            // Worse, it was the ORPHAN FACTORY. `on_add` gives a node its hash
+            // at birth; `lazy` creates it bare and lets the fill mint a
+            // SUCCESSOR, orphaning the original. That is 1298 orphaned unhashed
+            // nodes on the ingest box and one more for every file still to be
+            // filled — and an orphan could not even be retired until D90.
             "on_add" => Ok(HashPolicy::OnAdd),
             "never" => Ok(HashPolicy::Never),
+            "lazy" => Err(bad(
+                "hash_policy",
+                "`lazy` was removed (D94): it did not defer hashing, it skipped \
+                 it, and it orphaned a node per file by filling through a \
+                 successor. Use `on_add` to hash on bind (the default), or \
+                 `never` to deliberately leave a library unhashed.",
+            )),
             other => Err(bad("hash_policy", &format!("unknown policy {other:?}"))),
         }
     }
     pub fn as_str(&self) -> &'static str {
         match self {
-            HashPolicy::Lazy => "lazy",
             HashPolicy::OnAdd => "on_add",
             HashPolicy::Never => "never",
         }
@@ -114,6 +136,30 @@ pub struct BindingRow {
     /// forest's enrollments — an operator wants to see the fleet — and marks
     /// which ones are local rather than hiding the rest.
     pub is_local: bool,
+}
+
+/// What `backfill_sidecars` did (D93).
+#[derive(Debug, Default, Clone)]
+pub struct BackfillReport {
+    /// Hashes rescued out of the catalog and written beside the bytes.
+    pub written: u64,
+    /// Of those, ones with no chunk hashes to carry — the whole hash only.
+    pub whole_hash_only: u64,
+    /// Pre-D91 sidecars removed after their content was rewritten at the
+    /// dotfile name.
+    pub legacy_retired: u64,
+    /// Already had a usable v2 sidecar; nothing to do.
+    pub already_durable: u64,
+    /// The catalog has no hash for these yet — the fill has not reached them.
+    pub unhashed: u64,
+    /// No readable copy on this box, so nowhere to leave the note.
+    pub no_local_copy: u64,
+    /// On-disk size disagrees with the catalog: a replacement at the same path,
+    /// not the file that was hashed. Never stamped with the old hash.
+    pub size_mismatch: u64,
+    /// Nodes the catalog adopted that are actually PVFS's own sidecars. Skipped
+    /// outright: a hash-rescue pass has no business touching our bookkeeping.
+    pub own_bookkeeping: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -982,11 +1028,40 @@ impl Engine {
             // operation that destroys information is worse than no counter.
             let mut removed_here = false;
             if active.is_some() {
-                match writer {
-                    Some(w) => w.remove_location(&file_id, &uri)?,
-                    None => self.remove_location(&file_id, &uri)?,
+                let attempt = match writer {
+                    Some(w) => w.remove_location(&file_id, &uri),
+                    None => self.remove_location(&file_id, &uri),
+                };
+                // D89 — the same rule the ingest arm above already follows: one
+                // file the catalog will never accept must not stop the line.
+                // Retiring is where it was missing, and the cost was total: a
+                // single refusal propagated and abandoned the WHOLE pass, so
+                // every later file went unreconciled and the next pass met the
+                // same node and died in the same place. Seen in the field as
+                // `watch` stuck in backoff for hours while the tree drifted.
+                //
+                // The refusal is real and not ours to override: an ORPHANED node
+                // has no live `contains` parent, `effective_rights` resolves
+                // authority by walking exactly that chain, and the grants live
+                // at the root — so a node you authored, holding your own bytes,
+                // becomes unwritable the moment it is unlinked. Quarantine says
+                // so out loud instead of hiding it in a dead pass.
+                //
+                // scan_state is deliberately NOT cleared here: the location is
+                // still live, so a later pass (or a repaired grant) must be able
+                // to try again. Deleting it would forget the only record that
+                // this needs fixing.
+                match attempt {
+                    Ok(()) => removed_here = true,
+                    Err(e) if is_transient(&e) => return Err(e),
+                    Err(e) => {
+                        stats.needs_attention += 1;
+                        if stats.quarantined.len() < 8 {
+                            stats.quarantined.push((uri.clone(), e.to_string()));
+                        }
+                        continue;
+                    }
                 }
-                removed_here = true;
             }
             self.conn
                 .execute("DELETE FROM scan_state WHERE uri = ?1", params![uri])
@@ -1566,7 +1641,9 @@ impl Engine {
             .map_err(map_db("policy lookup"))?;
         match got {
             Some(s) => HashPolicy::parse(&s),
-            None => Ok(HashPolicy::Lazy),
+            // D94 — binding a library now hashes it. The old default was
+            // `lazy`, which is why so little of the fleet was ever hashed.
+            None => Ok(HashPolicy::OnAdd),
         }
     }
 
@@ -1864,18 +1941,54 @@ impl Engine {
                 return id.clone();
             }
         };
-        eprintln!("scan: hashing {} ({size} bytes)", path.display());
-        let (content_hash, chunks) =
-            match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
-                Ok(Some(v)) => v,
-                // Asked to stop mid-file. Not a failure: nothing is recorded, and
-                // the next pass hashes it from the start.
-                Ok(None) => return id.clone(),
-                Err(e) => {
-                    eprintln!("scan: could not hash {}: {e}", path.display());
-                    return id.clone();
+        // D91 — a sidecar beside the file may already hold this hash, written by
+        // an earlier pass or by a PREVIOUS FOREST. Reading 20 GB to recompute
+        // what is sitting next to it is exactly the cost the record exists to
+        // avoid: it is what lets the library be re-imported into a fresh forest
+        // without paying for the hashing again. The size check inside is the
+        // honest limit of what a sidecar can promise.
+        let (content_hash, chunks) = match crate::sync::sidecar_hashes(&path, size) {
+            Some(known) => {
+                eprintln!("scan: hash from sidecar {} ({size} bytes)", path.display());
+                known
+            }
+            // A sidecar carrying only the whole hash still saves the whole read,
+            // which is the entire cost here. `sidecar backfill` writes these when
+            // it rescues a hash that existed only in a previous forest's catalog.
+            // Chunks stay unrecorded rather than guessed — `manifest_for`
+            // computes them the first time the file is actually served.
+            None if crate::sync::sidecar_whole_hash(&path, size).is_some() => {
+                let w = crate::sync::sidecar_whole_hash(&path, size).unwrap();
+                eprintln!(
+                    "scan: hash from sidecar (no chunks) {} ({size} bytes)",
+                    path.display()
+                );
+                (w, Vec::new())
+            }
+            None => {
+                eprintln!("scan: hashing {} ({size} bytes)", path.display());
+                match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
+                    Ok(Some(v)) => v,
+                    // Asked to stop mid-file. Not a failure: nothing is recorded,
+                    // and the next pass hashes it from the start.
+                    Ok(None) => return id.clone(),
+                    Err(e) => {
+                        eprintln!("scan: could not hash {}: {e}", path.display());
+                        return id.clone();
+                    }
                 }
-            };
+            }
+        };
+        // Persist it beside the file. The fill used to record the hash ONLY in
+        // the node payload, so tens of hours of holder time lived in one
+        // forest's catalog and died with it — 2918 hashed nodes against 90
+        // sidecars on disk. Best-effort: a read-only store still fills, it just
+        // cannot leave the note.
+        // Do not overwrite a good sidecar with a chunkless one: if we got here
+        // FROM a chunkless sidecar there is nothing new to record.
+        if !chunks.is_empty() {
+            let _ = crate::sync::write_manifest_sidecar(&path, Some(&content_hash), &chunks);
+        }
         // The bytes are read and hashed — that is the whole cost of this
         // function. A TRANSIENT failure to record it must not throw that away.
         //
@@ -1951,8 +2064,102 @@ impl Engine {
         };
         let all = self.locations(id)?;
         let new_id = self.successor_node(&n, payload.encode(), &all)?;
-        self.attest_manifest(&new_id, content_hash, chunks)?;
+        // Attest ONLY what we actually computed. `manifest_root(&[])` is the
+        // root of an empty manifest, so attesting with no chunks would sign a
+        // statement that this file HAS no chunks — false for every non-empty
+        // file, and signed. A hash recovered from a sidecar that carries no
+        // chunk hashes is still worth recording; the manifest is simply built
+        // the first time the file is served.
+        if !chunks.is_empty() {
+            self.attest_manifest(&new_id, content_hash, chunks)?;
+        }
         Ok(new_id)
+    }
+
+    /// D93 — rescue hashes that exist ONLY in this forest's catalog, and retire
+    /// the pre-D91 sidecar name while we are there.
+    ///
+    /// The fill recorded a content hash in the node payload and wrote nothing to
+    /// disk, so tens of hours of holder time were pinned to one forest and would
+    /// die with it: 3005 hashed nodes against 90 sidecars. This walks what the
+    /// catalog knows and leaves it beside the bytes, where a re-import can find
+    /// it. It reads no file content — only `stat` — so it costs nothing next to
+    /// the hashing it preserves.
+    ///
+    /// Chunk hashes are carried forward when a v1 sidecar happens to hold them,
+    /// and otherwise left unrecorded rather than invented. The whole hash is the
+    /// half that cost a full read and the half that gives a node its identity.
+    pub fn backfill_sidecars(&self, dry_run: bool) -> Result<BackfillReport> {
+        let mut report = BackfillReport::default();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, payload FROM nodes WHERE node_type = 'file'")
+            .map_err(map_db("backfill scan"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .map_err(map_db("backfill scan"))?;
+        for row in rows {
+            let (id, payload) = row.map_err(map_db("backfill scan"))?;
+            let Ok(p) = FilePayload::decode(&payload) else {
+                continue;
+            };
+            if p.content_hash.is_empty() {
+                report.unhashed += 1;
+                continue;
+            }
+            let Some(path) = self.readable_path(&id)? else {
+                report.no_local_copy += 1;
+                continue;
+            };
+            // D95 — never treat our OWN bookkeeping as content, even when the
+            // catalog has adopted it as a node (which it did, ~1667 times,
+            // before D87). `write_manifest_sidecar` already refuses these, so
+            // nothing was written — but they were still COUNTED as rescued,
+            // and worse: for a node at `x.mkv.manifest` the "legacy" path
+            // resolves to `x.mkv.manifest.manifest`, so the real run would have
+            // deleted the next level of the chain as a side effect of a rule
+            // written for something else entirely. Cleaning that junk is a
+            // separate, deliberate act — not something a hash-rescue pass does
+            // by accident.
+            if crate::sync::is_sidecar_path(&path) {
+                report.own_bookkeeping += 1;
+                continue;
+            }
+            let Ok(md) = std::fs::metadata(&path) else {
+                report.no_local_copy += 1;
+                continue;
+            };
+            // The same exact-size rule the read path uses: a file whose size
+            // disagrees with the catalog is a replacement written at the same
+            // path, and stamping the OLD hash beside it would be a lie that
+            // outlives this forest.
+            if md.len() != p.size_bytes {
+                report.size_mismatch += 1;
+                continue;
+            }
+            if crate::sync::sidecar_whole_hash(&path, p.size_bytes).is_some() {
+                report.already_durable += 1;
+                continue;
+            }
+            // A v1 sidecar lying here still holds real chunk work — carry it.
+            let chunks = crate::sync::sidecar_chunks(&path);
+            let legacy = crate::sync::legacy_manifest_sidecar_path(&path);
+            let had_legacy = legacy.exists();
+            if !dry_run {
+                crate::sync::write_manifest_sidecar(&path, Some(&p.content_hash), &chunks)?;
+                if had_legacy {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+            }
+            report.written += 1;
+            if had_legacy {
+                report.legacy_retired += 1;
+            }
+            if chunks.is_empty() {
+                report.whole_hash_only += 1;
+            }
+        }
+        Ok(report)
     }
 
     pub fn readable_path(&self, id: &NodeId) -> Result<Option<std::path::PathBuf>> {

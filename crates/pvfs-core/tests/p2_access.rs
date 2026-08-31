@@ -160,6 +160,107 @@ fn can_and_readable_children() {
 }
 
 // doc 07 §5 — two-phase member write: prepare (daemon) → member signs → commit
+// D90 — an orphan resumes the authority walk at the forest ROOT.
+//
+// Authority is resolved by walking `contains` parents to a grant, and the grants
+// sit at the root, so an orphan used to reach none: a node its author had
+// created, holding bytes that author held, became unwritable the moment its last
+// live link went. In the field that was a `watch` job wedged for hours — it could
+// see the file was gone and could not say so.
+//
+// A tree must be able to retire what no longer exists, so the walk now resumes
+// at the root once. The widening is BOUNDED to the root's own grants, which the
+// second half of this test is what actually pins: a member granted only on a
+// subfolder still gets nothing on an orphan.
+#[test]
+fn an_orphan_resumes_at_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+
+    let member_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member_key);
+    engine.authorize_member(&owner_mn, &member_pub).unwrap();
+    // granted at the ROOT — the shape the live fleet actually has
+    engine
+        .set_acl(
+            &root,
+            &acl::Principal::Key(member_pub.clone()),
+            acl::ACL_R | acl::ACL_W | acl::ACL_A,
+        )
+        .unwrap();
+
+    let folder_id = engine.add_node(&root, folder("library")).unwrap();
+    let file_id = engine
+        .add_node(
+            &folder_id,
+            NodeSpec {
+                node_type: pvfs_core::TYPE_FILE.into(),
+                label: "episode.mkv".into(),
+                payload: pvfs_core::node::FilePayload {
+                    content_hash: String::new(),
+                    size_bytes: 4,
+                    mime_type: String::new(),
+                    original_name: "episode.mkv".into(),
+                }
+                .encode(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap();
+    let uri = "file:///tmp/episode.mkv";
+    engine.add_location(&file_id, uri).unwrap();
+
+    // while it is IN the tree the member can retire the location
+    assert!(
+        engine.prepare_remove_location(&member_pub, &file_id, uri).is_ok(),
+        "a linked node resolves the root grant"
+    );
+
+    // orphan it: drop the only live `contains` link
+    let link_id = engine
+        .children(&folder_id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == file_id)
+        .expect("child present")
+        .link_id;
+    engine.remove_link(&link_id).unwrap();
+
+    // ORPHANED, and still writable: the walk resumes at the root, so the same
+    // grant that covered it in the tree covers it out of the tree. This is what
+    // lets the watcher retire a location for a file that is genuinely gone.
+    assert!(
+        engine
+            .prepare_remove_location(&member_pub, &file_id, uri)
+            .is_ok(),
+        "an orphan must resume at the root, or nothing can ever retire it"
+    );
+
+    // …and the widening stops there. A member granted only on a SUBFOLDER has
+    // nothing at the root, so an orphan gives them nothing either — resuming at
+    // the root is not the same as allowing everything.
+    let sub_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let sub_pub = crypto::pubkey_bytes(&sub_key);
+    engine.authorize_member(&owner_mn, &sub_pub).unwrap();
+    engine
+        .set_acl(
+            &folder_id,
+            &acl::Principal::Key(sub_pub.clone()),
+            acl::ACL_R | acl::ACL_W,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            engine.prepare_remove_location(&sub_pub, &file_id, uri),
+            Err(PvfsError::Forbidden { .. })
+        ),
+        "a subfolder grant must not reach an orphan — it is not under that folder any more"
+    );
+    engine.close().unwrap();
+}
+
 #[test]
 fn member_write_two_phase() {
     let dir = tempfile::tempdir().unwrap();

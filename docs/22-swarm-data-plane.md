@@ -3,6 +3,30 @@
 **Status: BUILT + FLEET-VALIDATED (P9.0–P9.1, released 1.4.0) — see §6's
 close-outs. Authored as a build spec 2026-08-12; every decision was recorded
 before code, and deviations landed in §6 honestly.**
+**AMENDED 2026-08-30 (D87/D88, doc 24).** Two defects in the sidecar, both from
+its NAME rather than its contents:
+
+1. **It is the only bookkeeping we write into the operator's tree that is not a
+   dotfile.** `.pvfs-root` and `.{id}.swarmpart` are; `<file>.manifest` is not,
+   so a scan with no extension filter adopted sidecars as media, and serving one
+   wrote a sidecar FOR it — a chain that reached **23 levels and ~3,000 junk
+   files** before it was caught. Guarded now at both ends (`walk_disk` skips
+   them; `write_manifest_sidecar` refuses a sidecar-for-a-sidecar), but the guard
+   is a name check, which is the same shape as the one in `advertise.rs` that
+   already existed and did not save us. **The real fix is to make the name a
+   dotfile** — doc 24 §7 C1.
+2. **It does not record the whole-file hash.** It stores the header, the chunk
+   size and the per-chunk hashes. Under 8 MiB the single chunk hash coincides
+   with the file hash; above it, it does not. So a sidecar cannot seed a fresh
+   forest's `content_hash`, and a re-genesis would re-read all 23 TB — which
+   defeats the point of carrying hash work forward. **`pvfs-manifest 2` should
+   put the whole-file BLAKE3 in the header**, in the same format bump as the
+   dotfile rename so there is one migration, not two (doc 24 §6).
+
+Also: hashing is now parallel (`update_rayon`) and reads a full swarm chunk per
+pass. BLAKE3 only parallelises WITHIN an update call, so the buffer size was the
+width of the hash — see doc 24 §5b for the measurements.
+
 Prerequisite reading: doc 20 §6 (the promoted arc + Chris's requirement,
 verbatim: reads pull **from every known holder in parallel, BitTorrent-style,
 for the fastest possible read**), doc 21 §3.3 (mirror copies join the seed

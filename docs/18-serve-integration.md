@@ -19,6 +19,46 @@ so a box, once configured, keeps itself fresh:
 | **export** | `pvfs export --prune` after changes — keep the Plex view fresh | consumers |
 | **tier** | `pvfs tier` — migrate placed subtrees into the central store | owner |
 | **evict** | `pvfs evict` after a sync learns retirements | ingest/edge |
+| **reclaim** | trash central-store bytes whose node has NO live link anywhere | owner |
+
+### What each job actually does (2026-08-30, read from the code)
+
+Added because the one-line table above says where each job runs, not what it
+will and will not touch — and the difference is where the surprises live.
+
+- **follow** — long-polls the source log, ingests and folds. **Catalogue only,
+  never bytes.** Continuous.
+- **watch** — indexes the local library: filesystem events plus a periodic
+  reconcile scan. Ingests new files AND fills content hashes (D85). On a replica
+  its writes route to the owner.
+- **sync** — fetches missing **bytes** for subtrees placed `sync`.
+- **export** — refreshes the materialised symlink tree (the Plex view).
+- **tier** — the mover. **Places** bytes into a central store at their tree path;
+  on the **owner** it also **retires** other boxes' locations. A replica may
+  place but never retire (D75) — retiring is an authority decision about someone
+  else's copy.
+- **evict** — reclaims local disk. **Five conditions, all required:** the
+  location is LIVE and own-host (already-retired ones are skipped); its root
+  DECLARED draining (a D81 staging-root, or a `migrate`-kind binding's source) —
+  *silence is not consent for a pass whose job is deleting*; the file is held
+  somewhere else, excluding our own location and the sync store; the on-disk
+  SIZE matches the catalog (a mismatch means an arr wrote a replacement at the
+  same path, and evicting it destroys an upgrade before it is catalogued — this
+  happened, a 1080p replacement was deleted silently); and then, in order,
+  **delete the file, THEN retire the location** — the location is the only record
+  of WHERE the bytes are, so retiring first throws away the address of the thing
+  being deleted.
+- **reclaim** — trashes central-store bytes whose node has no live link anywhere.
+  **Trash, not unlink**: after evict has taken the edge copy this is the only
+  one, and an automated deletion that turns out to be wrong is unrecoverable.
+
+**The interaction that surprises people:** owner-side `tier` retires, and evict
+only acts on LIVE locations — so if tier retires first, **evict does nothing and
+the edge bytes are never reclaimed**. The production fleet cannot hit this (the
+holder's tier is `pull_only` and never retires; the owner does not run tier), but
+the smoke suite builds exactly that shape and fails on it. Doc 24 §3 carries the
+decision.
+
 
 End state: zero cron entries in doc 17 §7.6's four-machine story. New episode lands →
 cataloged (write-through, already built) → followers see it in seconds (F5.4, already

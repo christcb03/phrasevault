@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use pvfsd::jobs::stalled_reason;
+use pvfsd::jobs::{stall_floor, stalled_reason, PASS_STALL_FLOOR};
 
 const EVERY: Duration = Duration::from_secs(300);
 const MIN: u64 = 60_000;
@@ -22,7 +22,7 @@ const MIN: u64 = 60_000;
 fn a_job_stuck_for_hours_is_reported_stalled() {
     let now = 100 * 60 * MIN;
     let since = now - (384 * MIN); // 6.4 h
-    let why = stalled_reason("running", since, now, EVERY).expect("must be stalled");
+    let why = stalled_reason("running", since, now, EVERY, PASS_STALL_FLOOR).expect("must be stalled");
     assert!(why.contains("384 min"), "says how long: {why}");
     assert!(
         why.contains("stuck, not working"),
@@ -37,15 +37,15 @@ fn a_job_stuck_for_hours_is_reported_stalled() {
 fn a_slow_pass_within_tolerance_is_not_stalled() {
     let now = 100 * MIN;
     assert!(
-        stalled_reason("running", now - (10 * MIN), now, EVERY).is_none(),
+        stalled_reason("running", now - (10 * MIN), now, EVERY, PASS_STALL_FLOOR).is_none(),
         "10 min on a 5 min interval is slow, not stuck (tolerance is 3x)"
     );
     assert!(
-        stalled_reason("running", now - (14 * MIN), now, EVERY).is_none(),
+        stalled_reason("running", now - (14 * MIN), now, EVERY, PASS_STALL_FLOOR).is_none(),
         "just inside 3x must still pass"
     );
     assert!(
-        stalled_reason("running", now - (16 * MIN), now, EVERY).is_some(),
+        stalled_reason("running", now - (16 * MIN), now, EVERY, PASS_STALL_FLOOR).is_some(),
         "past 3x is stalled"
     );
 }
@@ -58,12 +58,12 @@ fn only_a_running_job_can_stall() {
     let ancient = 0;
     for state in ["idle", "disabled", "backoff", "stalled"] {
         assert!(
-            stalled_reason(state, ancient, now, EVERY).is_none(),
+            stalled_reason(state, ancient, now, EVERY, PASS_STALL_FLOOR).is_none(),
             "{state} must not be reported as stalled"
         );
     }
     assert!(
-        stalled_reason("running", ancient, now, EVERY).is_some(),
+        stalled_reason("running", ancient, now, EVERY, PASS_STALL_FLOOR).is_some(),
         "but running certainly can be"
     );
 }
@@ -75,7 +75,7 @@ fn a_job_that_never_completed_a_pass_still_trips() {
     let started = 0;
     let now = 60 * MIN;
     assert!(
-        stalled_reason("running", started, now, EVERY).is_some(),
+        stalled_reason("running", started, now, EVERY, PASS_STALL_FLOOR).is_some(),
         "never having finished is not an excuse for never reporting"
     );
 }
@@ -85,7 +85,7 @@ fn a_job_that_never_completed_a_pass_still_trips() {
 // typical pass duration rather than against an interval nobody chose.
 // ---------------------------------------------------------------------------
 
-use pvfsd::jobs::{pass_stalled_reason, PASS_STALL_FLOOR};
+use pvfsd::jobs::pass_stalled_reason;
 
 /// A pass running far longer than this job's passes normally take is stuck.
 #[test]
@@ -147,5 +147,50 @@ fn quiet_is_not_stuck() {
     assert!(
         pass_stalled_reason(now, now, Some(20_000), PASS_STALL_FLOOR).is_none(),
         "a pass that just started is not stalled"
+    );
+}
+
+/// D96 — a job whose real passes take HOURS must not be called stalled at
+/// three times its poll interval.
+///
+/// `tier` polls every 300s and moves hundreds of GB across a WAN; `watch` polls
+/// hourly and now hashes whatever it finds unhashed. D85 wrote `stall_floor`
+/// for exactly this and wired it into the in-flight check — but execution falls
+/// through to THIS one, which was still judging by interval * 3. On the live
+/// holder that reported tier stalled at 34 min and watch at 464 min, both while
+/// working perfectly. A detector that cries wolf on healthy work is worse than
+/// no detector, because it is the one people learn to ignore.
+#[test]
+fn a_long_running_job_is_judged_by_its_own_floor() {
+    let now = 1000 * MIN;
+    let tier_every = Duration::from_secs(300);
+
+    // 34 minutes: what the holder actually reported, and it must NOT be stalled
+    assert!(
+        stalled_reason("running", now - (34 * MIN), now, tier_every, stall_floor("tier")).is_none(),
+        "tier at 34 min is working, not stuck — its floor is 6h"
+    );
+    // 464 minutes on watch: the other false alarm from the same night
+    assert!(
+        stalled_reason(
+            "running",
+            now - (464 * MIN),
+            now,
+            Duration::from_secs(3600),
+            stall_floor("watch")
+        )
+        .is_none(),
+        "watch at 464 min is working — its floor is 36h"
+    );
+    // but genuinely past its own floor, it still reports
+    assert!(
+        stalled_reason("running", now - (7 * 60 * MIN), now, tier_every, stall_floor("tier"))
+            .is_some(),
+        "past 6h, tier really is stuck and must still say so"
+    );
+    // a job with no special floor keeps the old tolerance
+    assert!(
+        stalled_reason("running", now - (16 * MIN), now, EVERY, stall_floor("sync")).is_some(),
+        "an ordinary job is still judged at 3x its interval"
     );
 }

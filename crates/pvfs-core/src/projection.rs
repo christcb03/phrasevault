@@ -1994,6 +1994,8 @@ pub fn effective_rights_at(
     let mut rights = 0u8;
     let mut cur = Some(node_id.to_string());
     let mut guard = 0u32;
+    // D90: the orphan resume below may fire at most once per walk.
+    let mut orphan_resumed = false;
     while let Some(n) = cur {
         if include_public {
             rights |= grant_for(conn, &n, 2, &[], &[], as_of_ms)?; // Public — applies to everyone
@@ -2022,7 +2024,35 @@ pub fn effective_rights_at(
         if rights & acl::ACL_RWA == acl::ACL_RWA {
             break; // already maximal — stop walking
         }
-        cur = contains_parent(conn, &n)?;
+        cur = match contains_parent(conn, &n)? {
+            Some(p) => Some(p),
+            // D90 — running out of links means one of two very different
+            // things, and treating them alike was the bug: either `n` IS the
+            // forest root and there is genuinely nothing above it, or `n` is an
+            // ORPHAN and the chain to the grants has been cut.
+            //
+            // Grants live at the root, so an orphan reached NONE of them: a node
+            // became unwritable by its own author the moment its last live link
+            // went, and the watcher could not retire the location of a file it
+            // could plainly see was gone. An orphan is still IN the forest — it
+            // should not fall off a cliff. The walk therefore resumes at the
+            // root exactly once, so orphans are governed by the forest's own
+            // grants like everything else.
+            //
+            // This is a widening, deliberately: anyone holding `w` at the root
+            // can now act on any orphan. That is the same authority that already
+            // covers every linked node in the tree, and an orphan has no claim
+            // to be better protected than the tree it fell out of.
+            None if !orphan_resumed => {
+                orphan_resumed = true;
+                match meta_get(conn, "forest_root_node_id")? {
+                    // `n` was the root: a real end, not a cut chain.
+                    Some(root) if root != n => Some(root),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
         guard += 1;
         if guard > 100_000 {
             break; // defensive: never loop forever on a malformed graph
