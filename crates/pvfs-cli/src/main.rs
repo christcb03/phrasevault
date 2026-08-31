@@ -281,10 +281,12 @@ enum Cmd {
         /// chunk manifest, so the swarm refuses it and a mount cannot stream
         /// it, which is the whole point of the filesystem. Chris: "It seems
         /// that isn't very useful since it can't serve the files properly in a
-        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// swarm." D94 removed `lazy` entirely: it did not defer the hashing,
+        /// it skipped it, and it orphaned a node per file by filling through a
+        /// successor. Use `never` for a deliberate opt-out. A scan fills any
         /// scan now fills any empty hash it meets, so choosing it only defers
         /// the cost rather than avoiding it.
-        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
+        #[arg(long, default_value = "on_add", value_parser = ["on_add", "never"])]
         hash_policy: String,
         /// P8 (doc 21): how this space is enrolled — in-place (bytes stay,
         /// today's bind), migrate (staging: the mover drains it to a central
@@ -304,6 +306,14 @@ enum Cmd {
         /// are asked, and a folder with exactly one root needs no answer.
         #[arg(long)]
         root: Option<String>,
+        /// D97 — retire the locations recorded under this root as part of
+        /// unbinding. Omitted, you are asked; there is no silent default,
+        /// because both answers are destructive in different directions.
+        #[arg(long)]
+        retire_locations: bool,
+        /// Keep them, without being asked. For scripts that mean it.
+        #[arg(long, conflicts_with = "retire_locations")]
+        keep_locations: bool,
     },
     /// Scan bound folders against their directories
     Scan { folder: Option<String> },
@@ -684,10 +694,12 @@ enum ForestCmd {
         /// chunk manifest, so the swarm refuses it and a mount cannot stream
         /// it, which is the whole point of the filesystem. Chris: "It seems
         /// that isn't very useful since it can't serve the files properly in a
-        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// swarm." D94 removed `lazy` entirely: it did not defer the hashing,
+        /// it skipped it, and it orphaned a node per file by filling through a
+        /// successor. Use `never` for a deliberate opt-out. A scan fills any
         /// scan now fills any empty hash it meets, so choosing it only defers
         /// the cost rather than avoiding it.
-        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
+        #[arg(long, default_value = "on_add", value_parser = ["on_add", "never"])]
         hash_policy: String,
         /// Root-sign genesis with a running companion (existing seed; no new phrase)
         #[arg(long)]
@@ -6195,7 +6207,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Unbind { folder, root } => {
+        Cmd::Unbind {
+            folder,
+            root,
+            retire_locations,
+            keep_locations,
+        } => {
             let mut engine = Engine::open(&ctx?)?;
             // D81 — a folder can have many roots, and "unbind the folder" would
             // then mean "detach the library from every volume it lives on".
@@ -6222,13 +6239,101 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                 }
             };
+            // D97 — say what this strands, BEFORE doing it.
+            //
+            // `unbind` records the event and touches no locations, and the scan
+            // reconciles only under a BOUND prefix — so every location beneath
+            // this root is about to become permanently unreachable by any
+            // automatic pass. 79 survived D80's unmount, and a week later the
+            // mover was still fetching from a mount that no longer existed.
+            //
+            // Not automatic in either direction. An unbind can be temporary and
+            // a location is the only record of WHERE bytes were, so silently
+            // retiring is as wrong as silently leaking — the same shape as
+            // evict's rule about retiring before deleting.
+            let target = match &chosen {
+                Some(r) => Some(r.clone()),
+                None => engine
+                    .bindings_for(&folder)?
+                    .first()
+                    .map(|b| b.source_uri.clone()),
+            };
+            let stranded = match &target {
+                Some(r) => engine.locations_under_root(r)?,
+                None => Vec::new(),
+            };
+            let mut retired = 0u64;
+            let mut refused: Vec<String> = Vec::new();
+            if !stranded.is_empty() {
+                if !json {
+                    println!(
+                        "{} live location(s) are recorded under this root.",
+                        stranded.len()
+                    );
+                    println!(
+                        "Once it is unbound nothing reconciles them: the scan only looks under"
+                    );
+                    println!(
+                        "bound roots, so they would survive pointing at storage the forest no"
+                    );
+                    println!("longer tracks, and the mover would keep trying to fetch them.");
+                }
+                let do_retire = if retire_locations {
+                    true
+                } else if keep_locations {
+                    false
+                } else if json {
+                    // A machine caller must say which it means.
+                    return Err(PvfsError::BadInput {
+                        field: "retire_locations".into(),
+                        reason: "this root has locations under it — pass --retire-locations \
+                                 or --keep-locations to say which"
+                            .into(),
+                    });
+                } else {
+                    prompt_line("retire them now? [y/N]", Some("n"))?
+                        .trim()
+                        .eq_ignore_ascii_case("y")
+                };
+                if do_retire {
+                    for (id, uri) in &stranded {
+                        match engine.remove_location(id, uri) {
+                            Ok(()) => retired += 1,
+                            // One refusal must not abandon the rest.
+                            Err(e) => refused.push(format!("{}: {e}", &uri[..uri.len().min(70)])),
+                        }
+                    }
+                } else if !json {
+                    println!(
+                        "keeping them — `pvfs missing` lists files the catalog claims nobody holds."
+                    );
+                }
+            }
             engine.unbind_folder(&folder, chosen.as_deref())?;
             if json {
-                println!("{{\"unbound\":true}}");
+                println!(
+                    "{{\"unbound\":true,\"locations_found\":{},\"locations_retired\":{},\"refused\":{}}}",
+                    stranded.len(),
+                    retired,
+                    refused.len()
+                );
             } else {
                 match &chosen {
                     Some(r) => println!("unbound {folder} <- {r}"),
                     None => println!("unbound {folder}"),
+                }
+                if retired > 0 {
+                    println!("retired {retired} location(s) under it");
+                }
+                if !refused.is_empty() {
+                    eprintln!(
+                        "note: {} location(s) could not be retired and are now unreachable by \
+                         any automatic pass — `pvfs missing` will list them:",
+                        refused.len()
+                    );
+                    for r in refused.iter().take(5) {
+                        eprintln!("  {r}");
+                    }
                 }
             }
             engine.close()

@@ -52,6 +52,20 @@ pub fn load_instances() -> Result<Vec<(String, String, String)>, PvfsError> {
 pub struct Fetcher {
     pool: HashMap<String, Client>,
     dead: HashSet<String>,
+    /// D98 — nodes every holder answered `not_found` for.
+    ///
+    /// That is not a transient failure. The bytes are not somewhere busy, they
+    /// are nowhere: the location is stale and nothing in the fleet can satisfy
+    /// it until the CATALOG changes. Re-asking on the next pass asks the same
+    /// question of the same peers and gets the same answer.
+    ///
+    /// Measured on the holder: 317 such nodes, 29,093 attempts, ~92 apiece —
+    /// and every genuine failure was buried among identical lines. The mover
+    /// was not broken; it was shouting.
+    ///
+    /// Seeded by the caller (the daemon carries it across passes, since a
+    /// `Fetcher` lives for one) and read back after.
+    unfetchable: HashSet<String>,
     instances: Vec<(String, String, String)>,
     source: Option<ReplicaSource>,
     /// F5.7: catalog-published endpoints (pin → addr), lazily loaded once
@@ -73,6 +87,7 @@ impl Fetcher {
         Fetcher {
             pool: HashMap::new(),
             dead: HashSet::new(),
+            unfetchable: HashSet::new(),
             instances: load_instances().unwrap_or_default(),
             endpoints: None,
             source: ReplicaSource::load(data_dir).ok(),
@@ -82,6 +97,20 @@ impl Fetcher {
 
     /// D83 — give this fetcher a cancellation flag. The daemon hands it the
     /// job's stop flag so a shutdown can abandon a transfer in progress.
+    /// D98 — seed the known-unfetchable set (the daemon carries it between
+    /// passes) and read it back afterwards.
+    pub fn seed_unfetchable(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.unfetchable.extend(ids);
+    }
+
+    pub fn unfetchable(&self) -> &HashSet<String> {
+        &self.unfetchable
+    }
+
+    fn note_unfetchable(&mut self, id: &str) {
+        self.unfetchable.insert(id.to_string());
+    }
+
     pub fn set_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.cancel = Some(flag);
     }
@@ -518,6 +547,10 @@ pub struct TierReport {
     pub migrated: u64,
     pub satisfied: u64,
     pub retired: u64,
+    /// D98 — skipped because a previous pass established that no holder has
+    /// these bytes. Counted, not reported as failures: they are a catalog
+    /// problem to fix once, not news every 300 seconds.
+    pub unfetchable: u64,
     pub failed: Vec<(String, String)>,
     /// D83 — the pass was told to stop rather than reaching the end.
     ///
@@ -972,7 +1005,19 @@ fn tier_pass_inner(
                         report.migrated += 1;
                         continue;
                     }
+                    // D98 — do not re-ask a question already answered "nowhere".
+                    if fetcher.unfetchable().contains(&id) {
+                        report.unfetchable += 1;
+                        continue;
+                    }
                     if let Err(e) = fetcher.fetch(engine, &id) {
+                        // "no readable location" means every holder was asked
+                        // and none has it — stale catalog, not a busy peer.
+                        // Remember it, so the next pass spends its time on work
+                        // that can actually succeed.
+                        if e.contains("no readable location") {
+                            fetcher.note_unfetchable(&id);
+                        }
                         report.failed.push((label, e));
                         continue; // never retire without a central copy
                     }

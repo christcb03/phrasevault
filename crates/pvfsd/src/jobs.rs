@@ -35,6 +35,11 @@ const PERIODIC: [&str; 5] = ["sync", "export", "tier", "evict", "reclaim"];
 /// hang hide for hours.
 const STALL_FACTOR: u64 = 3;
 
+/// D98 — how many tier passes before the unfetchable memory is re-tested.
+/// At the 300s interval that is roughly two hours: long enough to stop the
+/// hammering, short enough that a repaired catalog recovers on its own.
+const UNFETCHABLE_RECHECK_PASSES: u64 = 24;
+
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const EXPORT_INTERVAL: Duration = Duration::from_secs(300);
 const TIER_INTERVAL: Duration = Duration::from_secs(300);
@@ -73,6 +78,14 @@ pub struct JobsState {
     /// How long each job's last completed pass took — the baseline a stall is
     /// judged against.
     pass_dur: Mutex<std::collections::HashMap<String, u64>>,
+    /// D98 — nodes the mover has established that nobody holds, carried across
+    /// passes because a `Fetcher` lives for exactly one.
+    ///
+    /// Cleared every `UNFETCHABLE_RECHECK_PASSES`, so a location repaired by a
+    /// scan, a rebind, or an operator is picked up again without a restart —
+    /// the memory bounds the noise, it must not become a permanent blindfold.
+    tier_unfetchable: Mutex<std::collections::HashSet<String>>,
+    tier_passes: std::sync::atomic::AtomicU64,
 }
 
 impl JobsState {
@@ -90,6 +103,8 @@ impl JobsState {
             nudge_tier: AtomicBool::new(false),
             pass_started: Mutex::new(std::collections::HashMap::new()),
             pass_dur: Mutex::new(std::collections::HashMap::new()),
+            tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
+            tier_passes: std::sync::atomic::AtomicU64::new(0),
         };
         s.reload()?;
         Ok(s)
@@ -453,7 +468,23 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
                 let mut fetcher = pvfs_client::fetch::Fetcher::new(st.data_dir());
                 fetcher.set_cancel(cancel);
+                // D98 — carry what we already know is nowhere into this pass,
+                // and periodically forget it so a repaired catalog recovers.
+                let n = st
+                    .tier_passes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n % UNFETCHABLE_RECHECK_PASSES == 0 {
+                    st.tier_unfetchable.lock().unwrap().clear();
+                } else {
+                    fetcher.seed_unfetchable(
+                        st.tier_unfetchable.lock().unwrap().iter().cloned(),
+                    );
+                }
                 let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
+                st.tier_unfetchable
+                    .lock()
+                    .unwrap()
+                    .extend(fetcher.unfetchable().iter().cloned());
                 engine.close()?;
                 r
             })();
