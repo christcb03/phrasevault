@@ -6,6 +6,12 @@
 #   ansible-playbook -i inventory.ini pipeline.yml
 #   ansible-playbook -i inventory.ini pipeline.yml --tags test,smoke   # re-run checks only
 #
+# Run it from your session's worktree with `-e session=<name>` so the build
+# host gives that session its own source tree (/opt/pvfs-<name>/src) instead
+# of sharing one slot with every other concurrent run — see `pvfs_root` below.
+#
+#   ansible-playbook -i inventory.ini pipeline.yml -e session=d99-my-change
+#
 # The pipeline FAILS if `cargo test` fails or any CLI smoke test fails.
 # Test logs are fetched back to ./artifacts/<host>/ on the control machine.
 
@@ -14,7 +20,19 @@
   gather_facts: true
 
   vars:
-    pvfs_src: /opt/pvfs/src
+    # A SESSION'S OWN BUILD SLOT. Pass `-e session=<name>` and this run gets
+    # /opt/pvfs-<name> to itself. Without it, concurrent sessions rsync into
+    # the one directory with `delete: true`, so one run's source is replaced
+    # under another run's compiler. The errors that produces look impossible
+    # — a field the file plainly has, reported missing — and cost hours before
+    # the cause is even guessed. PVOS hit exactly this (2026-08-16) and fixed
+    # it this way; CLAUDE.md tells every session to pass the variable.
+    #
+    # The install/daemon stages deliberately get NO per-session slot:
+    # /usr/local/bin/pvfs, ~/.local/bin and the pvfsd@ user unit are
+    # machine-global, and there is only one of each on the host.
+    pvfs_root: "/opt/pvfs{{ ('-' + session) if session is defined else '' }}"
+    pvfs_src: "{{ pvfs_root }}/src"
     pvfs_bin: /usr/local/bin/pvfs
     pvfs_user_bin: "{{ ansible_facts.env.HOME }}/.local/bin"
     # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
@@ -89,6 +107,12 @@
           - "--exclude=target/"
           - "--exclude=.pvfs/"
           - "--exclude=artifacts/"
+          # Other sessions' git worktrees live under .claude/worktrees/ —
+          # whole extra copies of this repo. Syncing them wastes gigabytes on
+          # the target and puts a second copy of every crate under the build
+          # tree, which is confusing at best. Nothing under .claude/ is
+          # tracked or needed to build.
+          - "--exclude=.claude/"
       tags: [deploy]
 
     # ---- build ------------------------------------------------------------------
