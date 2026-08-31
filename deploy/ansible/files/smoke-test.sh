@@ -281,8 +281,13 @@ mkdir -p "$OCCUPIED"; printf 'x' > "$OCCUPIED/keep.txt"
 assert_rc 2 "export refuses foreign non-empty dir → 2" -- $PVFS export "$LFOLDER" "$OCCUPIED"
 [ -f "$OCCUPIED/keep.txt" ] && ok "foreign dir untouched" || fail "foreign dir untouched"
 
-say "P1: the watcher (punch E: now `serve watch` / the watch job)"
-$PVFS serve watch --debounce-ms 300 >/dev/null 2>&1 &
+say 'P1: the watcher (punch E: now `serve watch` / the watch job)'
+# D99: keep the watcher's own output. Sending it to /dev/null made a daemon
+# that REFUSED TO START (a stale serve.lock) and a daemon that was merely slow
+# produce the identical failure — a bare `FAIL watcher ingested new file` with
+# nothing to read. CI hit this and the log could not say which it was.
+WATCH_LOG="$DATA/watcher.log"
+$PVFS serve watch --debounce-ms 300 > "$WATCH_LOG" 2>&1 &
 SERVE_PID=$!
 sleep 2
 printf 'watched-file' > "$LIB/movies/watched.mkv"
@@ -290,11 +295,20 @@ printf 'watched-file' > "$LIB/movies/watched.mkv"
 # content in its own right, so the first pass walks more than it used to and a
 # flat 3s stopped being enough on a loaded runner — the watcher was working and
 # the budget was not. Polling exits as soon as it lands, so the common case is
-# faster than the old sleep, and a real failure still fails inside 20s.
-for _ in $(seq 1 40); do
+# faster than the old sleep. D99 raises the ceiling to 60s: a 2-core CI runner
+# is slower than the build host, and how FAST the watcher ingests is not what
+# this assertion is about.
+for _ in $(seq 1 120); do
   $PVFS ls "$MOVIES" | qgrep watched.mkv && break
   sleep 0.5
 done
+if ! $PVFS ls "$MOVIES" | qgrep watched.mkv; then
+  echo "--- watcher did not ingest; its log follows ---"
+  kill -0 "$SERVE_PID" 2>/dev/null && echo "(watcher process still alive)" \
+                                   || echo "(watcher process EXITED early)"
+  sed 's/^/    /' "$WATCH_LOG" 2>/dev/null | tail -20
+  echo "--- end watcher log ---"
+fi
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
 $PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"
