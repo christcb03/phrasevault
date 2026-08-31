@@ -1890,8 +1890,9 @@ impl Engine {
     ///
     /// The migration's last step, and the one the drain got wrong. Eligibility
     /// is the whole safety story: a location goes only while the same file
-    /// keeps another live one, so an interrupted or partial run leaves files
-    /// with MORE locations than they need, never fewer. Nothing can strand.
+    /// keeps another live one WORTH HAVING — live, outside the prefix, and not
+    /// quarantined — so an interrupted or partial run leaves files with MORE
+    /// locations than they need, never fewer. Nothing can strand.
     ///
     /// Per file through the CLI this is a process spawn and an fsync each —
     /// 3.2/s, which is what made D80 an overnight job. The events are
@@ -1908,16 +1909,37 @@ impl Engine {
         batch: usize,
     ) -> Result<RetireReport> {
         self.ensure_device_active()?;
+
+        // The eligibility question, written ONCE: does this file keep a live
+        // location outside the prefix that we have not caught lying?
+        //
+        // The two queries below are complements — eligible is EXISTS over this
+        // condition, refused is NOT EXISTS over the same one. A location that
+        // matched neither would be dropped from the removals AND from the
+        // report, which is a worse failure than the one fixed here. Sharing the
+        // text makes that unrepresentable; while it was duplicated, keeping the
+        // halves in step was a comment's job.
+        //
+        // D99 §9b-ii — the quarantine clause is the fix. A quarantined location
+        // is one PVFS has caught serving bytes that are not what the catalog
+        // names, so counting it as proof the file is held elsewhere retires the
+        // record for the GOOD copy and leaves only the bad one. Retire removes
+        // a catalog record and deletes no bytes, so a rescan repairs it — which
+        // is why `evict_pass` was fixed first and this one left standing.
+        const HELD_ELSEWHERE: &str = "SELECT 1 FROM file_locations o
+                 WHERE o.file_id = l.file_id AND o.removed_at IS NULL
+                   AND o.uri NOT LIKE ?1 || '%'
+                   AND NOT EXISTS (SELECT 1 FROM location_quarantine q
+                                   WHERE q.file_id = o.file_id AND q.uri = o.uri)";
+
         let mut eligible: Vec<(NodeId, String)> = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT l.file_id, l.uri FROM file_locations l
                  WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
-                   AND EXISTS (SELECT 1 FROM file_locations o
-                               WHERE o.file_id = l.file_id AND o.removed_at IS NULL
-                                 AND o.uri NOT LIKE ?1 || '%')
-                 ORDER BY l.file_id",
-            )
+                   AND EXISTS ({HELD_ELSEWHERE})
+                 ORDER BY l.file_id"
+            ))
             .map_err(map_db("retire scan"))?
             .query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(map_db("retire scan"))?
@@ -1930,14 +1952,12 @@ impl Engine {
         // check can only ever move a location OUT of refusal.
         let maybe_refused: Vec<(NodeId, String)> = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT l.file_id, l.uri FROM file_locations l
                  WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM file_locations o
-                                   WHERE o.file_id = l.file_id AND o.removed_at IS NULL
-                                     AND o.uri NOT LIKE ?1 || '%')
-                 ORDER BY l.file_id",
-            )
+                   AND NOT EXISTS ({HELD_ELSEWHERE})
+                 ORDER BY l.file_id"
+            ))
             .map_err(map_db("retire scan"))?
             .query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(map_db("retire scan"))?
@@ -1946,7 +1966,13 @@ impl Engine {
 
         let mut refused: Vec<(NodeId, String)> = Vec::new();
         for (file, uri) in maybe_refused {
-            if crate::sync::sync_store_lookup(&self.data_dir, &file)?.is_some() {
+            // The store copy has to answer the same question the SQL just
+            // asked of every recorded one. Existence alone is not evidence if
+            // those are the bytes we caught lying. Ordered so the cheap stat
+            // gates the query: only a file the store actually holds pays.
+            if crate::sync::sync_store_lookup(&self.data_dir, &file)?.is_some()
+                && !self.uri_quarantined(&file, &crate::sync::sync_uri(&file))?
+            {
                 eligible.push((file, uri));
             } else {
                 refused.push((file, uri));
@@ -1984,6 +2010,23 @@ impl Engine {
             report.removed += chunk.len();
         }
         Ok(report)
+    }
+
+    /// Has this location been caught serving bytes the catalog does not name?
+    ///
+    /// For the one copy the retire guard cannot ask about in SQL: the managed
+    /// sync store is found by existence, not by a `file_locations` row.
+    fn uri_quarantined(&self, file: &str, uri: &str) -> Result<bool> {
+        let hit: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
+                params![file, uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("quarantine lookup"))?;
+        Ok(hit.is_some())
     }
 
     /// D82 — what the tree holds: total bytes across file nodes, and how many.
