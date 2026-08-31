@@ -1179,10 +1179,18 @@ pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
         // Held somewhere that is NOT us and NOT the sync store. Our own
         // location is now live (it is what we are about to retire), so it must
         // be excluded or every file would look safe to delete.
-        let live_elsewhere = engine
-            .locations(&id)?
-            .iter()
-            .any(|u| u != &uri && !u.starts_with(SYNC_URI_PREFIX));
+        //
+        // D99 — and NOT quarantined. A quarantined location is one we have
+        // caught serving bytes that are not what the catalog names; treating it
+        // as "held elsewhere" would delete our good copy on the strength of a
+        // copy already known to be wrong. That is the same silent loss the size
+        // check below was added for, arriving by a different door — and D99
+        // creates these quarantines where previously there were none, so the
+        // door only opened once the mover started recording what it found.
+        let banned = engine.quarantined_uris(&id).unwrap_or_default();
+        let live_elsewhere = engine.locations(&id)?.iter().any(|u| {
+            u != &uri && !u.starts_with(SYNC_URI_PREFIX) && !banned.contains(u)
+        });
         if !live_elsewhere {
             report
                 .skipped

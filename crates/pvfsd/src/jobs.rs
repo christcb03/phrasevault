@@ -473,18 +473,48 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 let n = st
                     .tier_passes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if n % UNFETCHABLE_RECHECK_PASSES == 0 {
+                if n == 0 {
+                    // D99 — the FIRST pass of a daemon lifetime reads what
+                    // earlier runs learned. Held only in memory, this set died
+                    // with every restart, and the pass that followed spent
+                    // eight hours re-asking ~24k holders a question already
+                    // answered "nobody". n == 0 also satisfies the periodic
+                    // clear below, so it must be handled first or a restart
+                    // would wipe the very memory it should be loading.
+                    let known = engine.unfetchable_load().unwrap_or_default();
+                    let mut mem = st.tier_unfetchable.lock().unwrap();
+                    mem.extend(known.iter().cloned());
+                    fetcher.seed_unfetchable(mem.iter().cloned());
+                } else if n % UNFETCHABLE_RECHECK_PASSES == 0 {
+                    // periodic amnesia, so a repaired catalog gets a fresh
+                    // hearing — now clearing the durable copy too, or the
+                    // next restart would resurrect what we just forgave.
                     st.tier_unfetchable.lock().unwrap().clear();
+                    let _ = engine.unfetchable_clear();
                 } else {
                     fetcher.seed_unfetchable(
                         st.tier_unfetchable.lock().unwrap().iter().cloned(),
                     );
                 }
                 let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
-                st.tier_unfetchable
-                    .lock()
-                    .unwrap()
-                    .extend(fetcher.unfetchable().iter().cloned());
+                // Persist only what THIS pass newly learned: the fetcher's set
+                // includes everything it was seeded with, and rewriting all of
+                // it every five minutes would be thousands of pointless writes.
+                let learned: Vec<String> = {
+                    let mut mem = st.tier_unfetchable.lock().unwrap();
+                    let fresh: Vec<String> = fetcher
+                        .unfetchable()
+                        .iter()
+                        .filter(|id| !mem.contains(*id))
+                        .cloned()
+                        .collect();
+                    mem.extend(fresh.iter().cloned());
+                    fresh
+                };
+                if !learned.is_empty() {
+                    // best-effort: losing the hint costs time, never truth
+                    let _ = engine.unfetchable_save(&learned);
+                }
                 engine.close()?;
                 r
             })();

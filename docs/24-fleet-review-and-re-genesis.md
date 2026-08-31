@@ -564,3 +564,169 @@ Ordered so each step is verifiable before the next.
    retired own-host locations. Option three changes production eviction.
 4. **A2–A4 — the pipeline can lie.** It reports "0 passed" on a green run and
    can test stale binaries at exit 0. Both bit this review.
+
+---
+
+## 9. D99 — the mover throws away what it learns
+
+Found 2026-08-31 on the live holder, eight hours after a restart: `tier` had
+**never completed a pass** (`last_ok_ms: null`), against 33,928 `stream failed`
+and 1,204 `streamed but commit failed` lines in its log.
+
+Two independent defects, one shared shape — **a discovery the system makes and
+then discards.**
+
+### 9a. A remote integrity violation is not recorded (the headline)
+
+1,814 `integrity violation` lines come from **five files**, retried forever.
+The cause is not subtle, and the numbers name it exactly:
+
+| | `Piccolo's Return.mkv` |
+|---|---|
+| catalog says | 3,371,964,304 bytes |
+| disk holds | 3,694,978,150 bytes |
+
+The *arr stack grabbed a better encode and overwrote the path. PVFS still binds
+the **old** content id there. The holder fetches, receives bytes that hash to
+something else, correctly refuses the commit — and repeats, every pass, forever.
+
+**PVFS already knows how to handle this. It just does it in one place and not
+its sibling:**
+
+- `Engine::read_verified` (`fs.rs`) — a local read whose bytes miss their hash
+  calls `self.quarantine(id, &uri, "hash mismatch on read")`. Durable, visible
+  in `loc ls`, liftable by `loc verify`.
+- `Fetcher::fetch` (`fetch.rs`) — a **remote** stream whose bytes miss their
+  hash calls `eprintln!`. Nothing durable. Nothing visible. Nothing to lift.
+
+Same failure, same available remedy, applied once. This is exactly the pattern
+the §1 review was meant to catch and did not.
+
+**Why local drift detection does not cover it.** `walk_disk` *does* sense a
+changed file and parks it in `pending_changes` for an operator decision (doc 04
+§4.4) — 51 of them are waiting on the holder right now. But that check runs
+against **a host's own disk**. The five poison files' bytes live on feederbox,
+and three of them are no longer even on its local disk (cloudplow moved them, so
+feederbox reads them back through `/mnt/unionfs` — the holder pulling its own
+bytes in a circle). A holder can only discover that a *remote* location has
+drifted at fetch time. That discovery is the only signal there is, and it is
+thrown away.
+
+**The fix.** On a commit failure that is `PvfsError::Integrity`, quarantine the
+serving location — every location of that node whose URI carries the failing
+candidate's pin. `ReplicaSource` keeps only the pin, not the URI it came from,
+so the mapping is recovered from `engine.locations(id)` rather than by widening
+a core type used elsewhere.
+
+**What this deliberately does NOT do:** it does not re-hash and adopt the new
+bytes. A file that changed underneath the catalog is exactly the case doc 04
+§4.4 reserves for a human — corruption and an upgrade are indistinguishable to
+the scanner, and silently adopting either would make the log ratify whatever
+last overwrote the disk. Quarantine stops the bleeding and makes the choice
+visible; `resolve --replace` remains the operator's.
+
+### 9b. The mover forgets across restarts, and pays ~8 hours for it
+
+`tier_unfetchable` is a `Mutex<HashSet<String>>` on the daemon's state struct.
+In memory only. Every restart empties it, so the first pass afterwards must
+re-attempt **every** doomed node over the network before the set is rebuilt.
+
+The arithmetic matches the symptom: ~24k unreachable nodes at roughly a second
+each of connect-and-be-refused is ~6.7 hours. The observed figure was 477
+minutes and still climbing. D98 stopped the *within-session* retry storm and was
+verified doing so; it just never survived a restart.
+
+**The fix.** Persist the set in `index.db` beside `location_quarantine` — it is
+derived state, so it belongs in the projection and never in the log. Load at
+startup, save after each pass, and keep D98's 24-pass expiry so a repaired
+catalog still recovers on its own.
+
+**These two compose — but only because a third thing was fixed to make it so.**
+9a quarantines a bad location; a node whose only location is quarantined stops
+being a candidate; it then falls into 9b's memory and stops being asked for at
+all. The five files stop costing anything, and stay visible.
+
+That chain was broken in the middle when first written, and tracing it rather
+than assuming it is what found the break: with every location quarantined,
+`fetch` returned *"no reachable source holds this file"*, which D98's memory
+does **not** key on — deliberately, since that wording also means "no instance
+registered", an operator's problem to fix and the wrong thing to cache. So the
+mover would have swapped one error repeated every pass for a different error
+repeated every pass. `fetch` now tells the two apart and gives the
+all-quarantined case the "no readable location" wording D98 already acts on.
+
+### 9b-ii. The hazard the fix opened, and one it did not
+
+Quarantining more locations makes any code that treats "has another location"
+as "is safely held elsewhere" more dangerous. Two such places exist.
+
+**`evict_pass` — fixed here, and it destroys files.** Its `live_elsewhere` test
+read `engine.locations()`, which returns quarantined URIs. So: the NAS copy of a
+file drifts and gets quarantined; feederbox's evict sees a location that is not
+its own, calls the file safely held, and deletes the local copy — leaving only
+the copy already known to be wrong. That is the same silent loss the size check
+immediately below it was written for after a 1080p replacement was deleted in
+the lab. D99 excludes quarantined URIs from that test.
+
+**`retire_locations_under` — found, NOT fixed, deliberately.** Its guard is a
+SQL `EXISTS`/`NOT EXISTS` pair over `file_locations` and has the same blind
+spot. Three reasons it is left: it retires a catalog *record* and deletes no
+bytes, so a rescan repairs it; the hazard predates D99, since `read_verified`
+and `loc_verify` have always been able to quarantine; and the two queries are
+complements, so editing one side without the other creates a location that
+falls into neither set — a worse failure than the one being fixed, and not
+something to land in the same pass as the fix it rides along with.
+
+### 9c. Not in scope, and why
+
+- **The 32 no-op pending changes.** Of 51 flagged, 32 show `N -> N bytes` — same
+  size, flagged on mtime alone (rclone and cloudplow touch mtimes), and 23 of
+  those are `.manifest` recursion nodes. Noise, not corruption, and it clears
+  with re-genesis (§6). Worth its own decision, not this fix.
+- **Adopting the new encode automatically.** See 9a — that is §4.4's call to
+  make, and it belongs to a human.
+
+## 10. D99 turnkey checklist
+
+### A — the parity fix (9a)
+1. `Engine::quarantine_location(id, uri, reason)` — a public wrapper over the
+   existing private `quarantine`, so the client crate can reach it.
+2. In `Fetcher::fetch`, match the commit error before stringifying it; on
+   `PvfsError::Integrity`, quarantine every location of `id` whose URI parses to
+   the failing candidate's pin.
+3. ~~Same treatment in `swarm_fetch`.~~ **Deliberately NOT done, on inspection.**
+   The swarm assembles a file from chunks pulled from *every* holder, so a
+   whole-file mismatch at `swarm_publish` cannot name which one served bad
+   bytes — and since each chunk is already verified against the signed manifest
+   during assembly, a whole-file failure there points at the manifest, not at a
+   holder. Blaming a pin would strand good holders on the strength of a guess.
+   The swarm already falls through to single-stream, which retries per-holder
+   and *can* attribute the failure; production's log shows exactly that
+   sequence. The single-stream fix therefore closes this path too.
+4. **`candidates()` must SKIP quarantined locations.** Found while implementing
+   3, and without it the whole fix is cosmetic: `Engine::locations()` returns
+   quarantined URIs on purpose — evict, reclaim and `loc_verify` all need to
+   see them, and re-reading one is how a quarantine gets LIFTED — so recording
+   the quarantine would have changed nothing about what the mover tried next
+   pass. The filter belongs in the fetcher's candidate list and nowhere else.
+5. Test: quarantining one location of a node bans exactly that one, leaves a
+   second holder usable, and does not hide either from `locations()`.
+   **Lab, not unit:** that a live peer serving wrong bytes ends up quarantined
+   needs a real peer — the same gap D98's marking path has, recorded rather
+   than papered over.
+
+### B — the memory fix (9b)
+6. Table `fetch_unfetchable (file_id TEXT PRIMARY KEY, noted_at INTEGER)` in the
+   projection schema, additive.
+7. Daemon loads it into `tier_unfetchable` at startup; writes back after each
+   pass; the 24-pass clear truncates the table too.
+8. Test: a daemon restart does not re-attempt a node already known unfetchable,
+   and the 24-pass expiry still lets a repaired one back in.
+
+### C — verification that would have caught this
+9. **A successful fetch logs nothing today.** `fetch.rs` has an `eprintln!` on
+   each failure branch and none on success, so "zero successes in the log"
+   proved nothing and cost an hour of the wrong diagnosis. Log the success too.
+10. Re-check on the live holder after deploy: `serve status` shows tier
+   completing passes, and `loc ls` on the five names shows a quarantined
+   location with its reason.

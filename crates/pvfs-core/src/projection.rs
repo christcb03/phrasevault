@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -245,6 +245,16 @@ CREATE TABLE IF NOT EXISTS location_quarantine (
   PRIMARY KEY (file_id, uri)
 );
 
+-- D99 — nodes the mover has established nobody can serve. Derived state, so
+-- it lives here and never in the log. Held only in daemon memory until D99,
+-- which meant every restart re-attempted ~24k doomed fetches over the network
+-- before relearning what it already knew: the holder's first pass after a
+-- restart took eight hours and moved nothing.
+CREATE TABLE IF NOT EXISTS fetch_unfetchable (
+  file_id  TEXT PRIMARY KEY,
+  noted_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS scan_state (
   uri        TEXT PRIMARY KEY,
   size_bytes INTEGER NOT NULL,
@@ -325,6 +335,7 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "folder_bindings",
     "pending_changes",
     "location_quarantine",
+    "fetch_unfetchable",
     "scan_state",
     "projection_meta",
     "media_quality",
@@ -2777,6 +2788,7 @@ fn migrate_projection(
             10 => migrate_v10_to_v11(conn).map(|_| "idx_links_label"),
             11 => migrate_v11_to_v12(conn).map(|_| "media_quality"),
             12 => migrate_v12_to_v13(conn).map(|_| "folder_bindings keyed (folder_id, source_uri)"),
+            13 => migrate_v13_to_v14(conn).map(|_| "fetch_unfetchable"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -2938,6 +2950,19 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add temp_links.label"))?;
     }
+    Ok(())
+}
+
+fn migrate_v13_to_v14(conn: &mut Connection) -> Result<()> {
+    // D99 — purely additive: a new cache table, no existing row touched. The
+    // mover simply starts empty on first run and refills as it learns.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fetch_unfetchable (
+           file_id  TEXT PRIMARY KEY,
+           noted_at INTEGER NOT NULL
+         );",
+    )
+    .map_err(map_db("migrate v13→v14"))?;
     Ok(())
 }
 

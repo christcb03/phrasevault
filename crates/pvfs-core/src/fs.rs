@@ -2291,6 +2291,96 @@ impl Engine {
         Ok(())
     }
 
+    /// D99 — the URIs of `id` currently quarantined.
+    ///
+    /// Deliberately NOT folded into `locations()`. That call feeds evict,
+    /// reclaim, health and `loc_verify`, and verify in particular MUST still
+    /// see a quarantined location — re-reading it is how the quarantine gets
+    /// lifted. Only the fetcher's candidate list wants them gone.
+    pub fn quarantined_uris(&self, id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uri FROM location_quarantine WHERE file_id = ?1")
+            .map_err(map_db("quarantined uris"))?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get::<_, String>(0))
+            .map_err(map_db("quarantined uris"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("quarantined uris"))
+    }
+
+    /// D99 — the mover's memory of nodes nobody can serve, across restarts.
+    ///
+    /// Derived state: a hint that saves network round-trips, never authority.
+    /// Losing it costs time and nothing else, which is why it lives in the
+    /// projection and is written best-effort.
+    pub fn unfetchable_load(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id FROM fetch_unfetchable")
+            .map_err(map_db("load unfetchable"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_db("load unfetchable"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("load unfetchable"))
+    }
+
+    pub fn unfetchable_save(&self, ids: &[String]) -> Result<()> {
+        let now = now_ms() as i64;
+        for id in ids {
+            self.conn
+                .execute(
+                    "INSERT INTO fetch_unfetchable (file_id, noted_at) VALUES (?1, ?2)
+                     ON CONFLICT(file_id) DO NOTHING",
+                    params![id, now],
+                )
+                .map_err(map_db("save unfetchable"))?;
+        }
+        Ok(())
+    }
+
+    /// Forget everything learned, so a repaired catalog gets a fresh hearing
+    /// (D98's periodic re-check, now surviving restarts alongside the set).
+    pub fn unfetchable_clear(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM fetch_unfetchable", [])
+            .map_err(map_db("clear unfetchable"))?;
+        Ok(())
+    }
+
+    /// D99 — quarantine every location of `id` served by `pin`.
+    ///
+    /// A fetch that streams bytes and then fails its integrity check has
+    /// discovered exactly what `read_verified` discovers locally: the bytes at
+    /// that location are no longer the bytes the catalog names. Until D99 the
+    /// remote case only printed a line, so the mover re-fetched the same
+    /// doomed node every pass — 1,814 log lines from five files, and nothing
+    /// an operator could see or lift.
+    ///
+    /// Keyed by pin rather than URI because `ReplicaSource` carries only the
+    /// pin; widening that core type to thread a URI through would touch
+    /// replication paths that have no stake in this.
+    ///
+    /// Returns the URIs it quarantined.
+    pub fn quarantine_locations_at_pin(
+        &self,
+        id: &str,
+        pin: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        let mut hit = Vec::new();
+        for uri in self.locations(&id.to_string())? {
+            if let Some((p, _path)) = crate::storage::parse_host_uri(&uri) {
+                if p == pin {
+                    self.quarantine(id, &uri, reason)?;
+                    hit.push(uri);
+                }
+            }
+        }
+        Ok(hit)
+    }
+
     /// Re-check a file's locations; lift quarantine where bytes match again.
     pub fn loc_verify(&mut self, id: &NodeId) -> Result<Vec<(String, VerifyOutcome)>> {
         let n = fetch_node(&self.conn, id)?.ok_or(PvfsError::NotFound {

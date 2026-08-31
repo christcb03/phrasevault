@@ -12,6 +12,34 @@ use pvfs_core::{identity, Engine, PvfsError, ReplicaSource};
 use crate::follow::dial_source;
 use crate::Client;
 
+/// D99 — a commit that failed its integrity check means the holder's bytes are
+/// not the bytes the catalog names. Quarantine that location so it stops being
+/// a candidate, and so `loc ls` can show a human why.
+///
+/// Only `Integrity` qualifies. A disk-full or permission failure is the local
+/// machine's problem and says nothing about the remote's bytes — quarantining
+/// on those would strand good holders.
+///
+/// Free function, not a method: the caller is inside a `self.pool` borrow, and
+/// taking `&self` here would fight it for nothing. Nothing about this needs
+/// fetcher state.
+fn quarantine_stale(engine: &Engine, id: &str, pin: &str, e: &PvfsError) {
+    if !matches!(e, PvfsError::Integrity { .. }) {
+        return;
+    }
+    let reason = format!("id mismatch on fetch: {e}");
+    match engine.quarantine_locations_at_pin(id, pin, &reason) {
+        Ok(uris) => {
+            for uri in uris {
+                eprintln!("fetch: quarantined stale location {uri} ({id})");
+            }
+        }
+        // Recording the discovery is best-effort; losing it must not fail the
+        // pass, which would trade a stuck file for a stuck mover.
+        Err(err) => eprintln!("fetch: could not quarantine {id} at {pin}: {err}"),
+    }
+}
+
 /// The instance registry file (`pvfs instance add`): `<config>/instances`,
 /// one `name addr pin` triple per line. Reads live here so the daemon's jobs
 /// resolve holders exactly like the CLI; the CLI still owns writes.
@@ -134,7 +162,16 @@ impl Fetcher {
     /// replica's source. Public because tests and tooling reason about it.
     pub fn candidates(&mut self, engine: &Engine, id: &str) -> Vec<ReplicaSource> {
         let mut out: Vec<ReplicaSource> = Vec::new();
+        // D99 — a location we have already caught serving the wrong bytes is
+        // not a candidate. Without this the quarantine would only RECORD the
+        // problem: `locations()` deliberately still returns quarantined URIs
+        // (evict, reclaim and `loc_verify` all need them), so the mover would
+        // have gone right on re-fetching the same doomed node every pass.
+        let banned = engine.quarantined_uris(id).unwrap_or_default();
         for loc in engine.locations(&id.to_string()).unwrap_or_default() {
+            if banned.contains(&loc) {
+                continue;
+            }
             if let Some((pin, _path)) = pvfs_core::storage::parse_host_uri(&loc) {
                 // Registry first — the operator's word beats the log; the
                 // catalog's endpoint directory (F5.7) covers unknown pins,
@@ -175,6 +212,23 @@ impl Fetcher {
     pub fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), String> {
         let candidates = self.candidates(engine, id);
         if candidates.is_empty() {
+            // D99 — two very different reasons to have no candidate, and they
+            // must not be reported the same way.
+            //
+            // Everything quarantined = the catalog names bytes no holder
+            // actually has any more. Nothing will change until the CATALOG
+            // does, so it carries the "no readable location" wording D98 keys
+            // its memory on, and the mover stops asking. Without this the fix
+            // merely swapped one error repeated every pass for another.
+            //
+            // No instance registered is an operator's to fix, and D98
+            // deliberately does NOT cache it — caching would hide the very
+            // condition the operator needs to see.
+            if !engine.quarantined_uris(id).unwrap_or_default().is_empty() {
+                return Err("no readable location for file: every known holder is \
+                            quarantined (its bytes did not match the catalog)"
+                    .into());
+            }
             return Err("no reachable source holds this file (register the holding \
                         instance with `pvfs instance add`)"
                 .into());
@@ -229,12 +283,24 @@ impl Fetcher {
             };
             match client.cat(id, &mut sink) {
                 Ok(_) => match engine.sync_commit(sink) {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        // D99 — say so. Every branch here logged a failure and
+                        // none logged a success, so an empty log could not tell
+                        // "moving nothing" from "moving everything quietly",
+                        // and a live investigation read it the wrong way.
+                        eprintln!("fetch: {id} committed from {key}");
+                        return Ok(());
+                    }
                     Err(e) => {
                         // D83 — the bytes arrived and the COMMIT refused. A
                         // different failure entirely from a broken stream, and
                         // indistinguishable in `last_err` alone.
                         eprintln!("fetch: {id} streamed but commit failed from {key}: {e}");
+                        // D99 — an id mismatch is not a transient failure: the
+                        // holder's bytes are not what the catalog names, and
+                        // they will not become so by asking again. Record it
+                        // where `read_verified` records the local equivalent.
+                        quarantine_stale(engine, id, &cand.pin, &e);
                         last_err = e.to_string();
                     }
                 },
