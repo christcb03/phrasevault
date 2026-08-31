@@ -281,10 +281,12 @@ enum Cmd {
         /// chunk manifest, so the swarm refuses it and a mount cannot stream
         /// it, which is the whole point of the filesystem. Chris: "It seems
         /// that isn't very useful since it can't serve the files properly in a
-        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// swarm." D94 removed `lazy` entirely: it did not defer the hashing,
+        /// it skipped it, and it orphaned a node per file by filling through a
+        /// successor. Use `never` for a deliberate opt-out. A scan fills any
         /// scan now fills any empty hash it meets, so choosing it only defers
         /// the cost rather than avoiding it.
-        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
+        #[arg(long, default_value = "on_add", value_parser = ["on_add", "never"])]
         hash_policy: String,
         /// P8 (doc 21): how this space is enrolled — in-place (bytes stay,
         /// today's bind), migrate (staging: the mover drains it to a central
@@ -692,10 +694,12 @@ enum ForestCmd {
         /// chunk manifest, so the swarm refuses it and a mount cannot stream
         /// it, which is the whole point of the filesystem. Chris: "It seems
         /// that isn't very useful since it can't serve the files properly in a
-        /// swarm." `lazy` remains available for a deliberate opt-out, and a
+        /// swarm." D94 removed `lazy` entirely: it did not defer the hashing,
+        /// it skipped it, and it orphaned a node per file by filling through a
+        /// successor. Use `never` for a deliberate opt-out. A scan fills any
         /// scan now fills any empty hash it meets, so choosing it only defers
         /// the cost rather than avoiding it.
-        #[arg(long, default_value = "on_add", value_parser = ["lazy", "on_add", "never"])]
+        #[arg(long, default_value = "on_add", value_parser = ["on_add", "never"])]
         hash_policy: String,
         /// Root-sign genesis with a running companion (existing seed; no new phrase)
         #[arg(long)]
