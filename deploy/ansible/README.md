@@ -19,12 +19,27 @@ Requires `rsync` on both ends (the playbook installs it on the target).
 ansible-playbook -i inventory.ini pipeline.yml
 ```
 
+### One build slot per session
+
+Several sessions work in this repo at once. Pass `-e session=<name>` and the
+run builds in `/opt/pvfs-<name>/src` instead of the shared `/opt/pvfs/src`:
+
+```sh
+ansible-playbook -i inventory.ini pipeline.yml -e session=d99-my-change
+```
+
+Without it, concurrent runs rsync into the same directory with `delete: true`
+and replace each other's source mid-compile — the resulting errors point at
+code that is plainly correct. Run the pipeline from your session's worktree
+with the same name you gave the worktree, and delete `/opt/pvfs-<name>` on the
+test host when the work merges.
+
 Stages (also usable as `--tags`):
 
 | Tag | What it does |
 |---|---|
 | `prepare` | apt build deps + rustup (stable, minimal profile) |
-| `deploy` | rsync the repo to `/opt/pvfs/src` (excludes `.git`, `old/`, `v0.0-concept/`, `target/`) |
+| `deploy` | rsync the repo to `/opt/pvfs/src` — or `/opt/pvfs-<session>/src`, see above (excludes `.git`, `old/`, `v0.0-concept/`, `target/`, `.claude/`) |
 | `build` | `cargo build --release --workspace` |
 | `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure** |
 | `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts |
