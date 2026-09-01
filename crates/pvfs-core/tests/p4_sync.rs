@@ -258,7 +258,7 @@ fn manifest_sidecar_roundtrips_and_caches() {
         .map(|i| (i % 251) as u8)
         .collect();
     std::fs::write(&f, &data).unwrap();
-    let m1 = sync::manifest_for(&f).unwrap();
+    let m1 = sync::manifest_for_caching(&f).unwrap();
     assert_eq!(m1.len(), 3, "ceil(2.5) chunks");
     assert!(sync::manifest_sidecar_path(&f).exists(), "sidecar cached");
     // per-chunk hashes match independent computation
@@ -268,10 +268,10 @@ fn manifest_sidecar_roundtrips_and_caches() {
         assert_eq!(blake3::hash(&data[off..end]).as_bytes(), h, "chunk {i}");
     }
     // second call reads the cache (same result)
-    assert_eq!(sync::manifest_for(&f).unwrap(), m1);
+    assert_eq!(sync::manifest_for_caching(&f).unwrap(), m1);
     // a stale sidecar for different-size content is recomputed
     std::fs::write(&f, &data[..data.len() / 2]).unwrap();
-    let m2 = sync::manifest_for(&f).unwrap();
+    let m2 = sync::manifest_for_caching(&f).unwrap();
     assert_eq!(m2.len(), 2, "recomputed for the new size");
 }
 
@@ -332,7 +332,7 @@ fn sidecar_carries_the_whole_hash_and_is_hidden() {
     assert!(sync::sidecar_hashes(&f, size).is_none());
 
     // serving the file records it
-    let chunks = sync::manifest_for(&f).unwrap();
+    let chunks = sync::manifest_for_caching(&f).unwrap();
     let side = sync::manifest_sidecar_path(&f);
     assert!(side.exists(), "sidecar written");
     assert!(
@@ -371,7 +371,7 @@ fn sidecar_carries_the_whole_hash_and_is_hidden() {
         sync::sidecar_hashes(&f2, 5).is_none(),
         "v1 has no whole hash, so it cannot seed a re-import"
     );
-    assert_eq!(sync::manifest_for(&f2).unwrap().len(), 1, "but it still serves");
+    assert_eq!(sync::manifest_for_caching(&f2).unwrap().len(), 1, "but it still serves");
 }
 
 #[test]
@@ -380,17 +380,17 @@ fn no_sidecar_for_a_sidecar() {
     let f = dir.path().join("blob.bin");
     std::fs::write(&f, b"some bytes").unwrap();
 
-    let m = sync::manifest_for(&f).unwrap();
+    let m = sync::manifest_for_caching(&f).unwrap();
     let side = sync::manifest_sidecar_path(&f);
     assert!(side.exists(), "sidecar cached for real content");
 
-    let m_side = sync::manifest_for(&side).unwrap();
+    let m_side = sync::manifest_for_caching(&side).unwrap();
     assert_eq!(m_side.len(), 1, "still answers for the sidecar's own bytes");
     assert!(
         !sync::manifest_sidecar_path(&side).exists(),
         "no .manifest.manifest written"
     );
-    assert_eq!(sync::manifest_for(&f).unwrap(), m, "real file unaffected");
+    assert_eq!(sync::manifest_for_caching(&f).unwrap(), m, "real file unaffected");
 
     assert!(sync::is_sidecar_name("a.mkv.manifest"));
     assert!(!sync::is_sidecar_name("a.mkv"));
@@ -423,4 +423,26 @@ fn swarm_commit_keeps_the_whole_file_gate() {
     let mut out = Vec::new();
     engine.cat(&file, None, &mut out).unwrap();
     assert_eq!(out, content);
+}
+
+/// D100 — the getter is a getter. `manifest_for` used to write a sidecar on
+/// its way out, so asking a file what its chunks were modified the filesystem.
+/// The caching is still available and still wanted (D91/D93 carry hash work
+/// across a rebuild); it just has to be asked for by name.
+#[test]
+fn manifest_for_does_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("blob.bin");
+    std::fs::write(&f, vec![7u8; 4096]).unwrap();
+
+    let m = sync::manifest_for(&f).unwrap();
+    assert_eq!(m.len(), 1);
+    assert!(
+        !sync::manifest_sidecar_path(&f).exists(),
+        "a read must not leave a file behind"
+    );
+
+    // and the caching variant still does what it says
+    assert_eq!(sync::manifest_for_caching(&f).unwrap(), m);
+    assert!(sync::manifest_sidecar_path(&f).exists(), "asked for, so written");
 }

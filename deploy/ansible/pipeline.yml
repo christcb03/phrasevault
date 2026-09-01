@@ -33,6 +33,15 @@
     # machine-global, and there is only one of each on the host.
     pvfs_root: "/opt/pvfs{{ ('-' + session) if session is defined else '' }}"
     pvfs_src: "{{ pvfs_root }}/src"
+    # D100 — the results files get the SAME namespacing as the source tree.
+    # Giving each session its own /opt slot while every run still tee'd into
+    # one /tmp/pvfs-test-results.txt left the hazard one directory over: the
+    # totals are what a run is VERIFIED by, so two sessions could read each
+    # other's numbers and both call themselves green.
+    pvfs_suffix: "{{ ('-' + session) if session is defined else '' }}"
+    test_results: "/tmp/pvfs-test-results{{ pvfs_suffix }}.txt"
+    smoke_results: "/tmp/pvfs-smoke-results{{ pvfs_suffix }}.txt"
+    smoke_script: "/tmp/pvfs-smoke-test{{ pvfs_suffix }}.sh"
     pvfs_bin: /usr/local/bin/pvfs
     pvfs_user_bin: "{{ ansible_facts.env.HOME }}/.local/bin"
     # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
@@ -41,6 +50,9 @@
     cargo_env:
       PATH: "{{ ansible_facts.env.HOME }}/.cargo/bin:{{ ansible_facts.env.PATH }}"
       CARGO_TERM_COLOR: never
+      # D100 — stamped into --version by crates/pvfs-cli/build.rs. Empty until
+      # the task above runs, and build.rs falls back rather than failing.
+      PVFS_BUILD: "{{ build_describe.stdout | default('', true) | trim }}"
     # systemctl --user over ssh needs the user manager's runtime dir + bus.
     user_systemd_env:
       XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
@@ -65,11 +77,16 @@
       register: cargo_stat
       tags: [prepare]
 
-    - name: Install Rust toolchain (rustup, stable)
+    # D100 — PINNED, and pinned to the SAME version .github/workflows/ci.yml
+    # uses. Floating on `stable` here meant the build host could run a newer
+    # rustc and clippy than CI: a change passes on presubuntu and fails on
+    # GitHub, in the direction that wastes the most time. CI's own comment
+    # says why it stopped floating; the pipeline never got the message.
+    - name: Install Rust toolchain (rustup, 1.96.0 — matches CI)
       ansible.builtin.shell: |
         set -o pipefail
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain stable --profile minimal
+          | sh -s -- -y --default-toolchain 1.96.0 --profile minimal
       args:
         executable: /bin/bash
       when: not cargo_stat.stat.exists
@@ -115,6 +132,22 @@
           - "--exclude=.claude/"
       tags: [deploy]
 
+    # D100 — the build's identity, taken HERE. The source that reaches the
+    # build host has no .git (see the rsync excludes), so `git describe` there
+    # returns nothing and every pipeline binary would stamp itself "unknown" —
+    # useless on precisely the builds that get deployed. VERSIONING.md made
+    # this a rule after 1.4.0 meant two different binaries at once.
+    - name: Resolve the build identity from the control machine's checkout
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      ansible.builtin.command:
+        cmd: git describe --tags --always --dirty
+        chdir: "{{ playbook_dir }}/../.."
+      register: build_describe
+      tags: [build]
+
     # ---- build ------------------------------------------------------------------
     - name: Build (release)
       ansible.builtin.command:
@@ -129,7 +162,7 @@
     - name: Run cargo test suite
       ansible.builtin.shell: |
         set -o pipefail
-        cargo test --workspace 2>&1 | tee /tmp/pvfs-test-results.txt
+        cargo test --workspace 2>&1 | tee {{ test_results }}
       args:
         chdir: "{{ pvfs_src }}"
         executable: /bin/bash
@@ -142,15 +175,15 @@
     - name: Upload CLI smoke test
       ansible.builtin.copy:
         src: files/smoke-test.sh
-        dest: /tmp/pvfs-smoke-test.sh
+        dest: "{{ smoke_script }}"
         mode: "0755"
       tags: [smoke]
 
     - name: Run CLI smoke tests
       ansible.builtin.shell: |
         set -o pipefail
-        PVFS_BIN={{ pvfs_src }}/target/release/pvfs /tmp/pvfs-smoke-test.sh 2>&1 \
-          | tee /tmp/pvfs-smoke-results.txt
+        PVFS_BIN={{ pvfs_src }}/target/release/pvfs {{ smoke_script }} 2>&1 \
+          | tee {{ smoke_results }}
       args:
         executable: /bin/bash
       register: smoke_out
@@ -316,8 +349,8 @@
         dest: "{{ playbook_dir }}/artifacts/"
         fail_on_missing: false
       loop:
-        - /tmp/pvfs-test-results.txt
-        - /tmp/pvfs-smoke-results.txt
+        - "{{ test_results }}"
+        - "{{ smoke_results }}"
         - /tmp/pvfsd-journal.txt
       tags: [report]
 
@@ -332,7 +365,7 @@
         awk -F'[ ;]+' '/^test result:/{p+=$4; f+=$6; i+=$8; n++}
                        END {if (n==0) print "NO SUITES RAN — suspect a stale build";
                             else printf "%d passed, %d failed, %d ignored (%d suites)", p, f, i, n}' \
-          /tmp/pvfs-test-results.txt
+          {{ test_results }}
       args:
         executable: /bin/bash
       register: test_totals

@@ -403,6 +403,22 @@ pub fn try_fold_lock_for_test(
     lock_folds_within(data_dir, budget).map(|_| ())
 }
 
+/// D100 — run the member-event rights check against a forest on disk.
+///
+/// Test-only, and it exists because the check is not reachable otherwise:
+/// `check_member_event` needs a `Connection`, `Engine` exposes none, and the
+/// two callers that reach it (`fold_one` on replay, `check_member_event_batched`
+/// on live commit) both need a validly signed event to get that far. Signing is
+/// not what these tests are about — WHICH RIGHT each event kind demands is.
+pub fn check_member_event_for_test(
+    data_dir: &std::path::Path,
+    ev: &Event,
+    as_of_ms: u64,
+) -> Result<()> {
+    let conn = Connection::open(data_dir.join("index.db")).map_err(map_db("open index"))?;
+    check_member_event(&conn, ev, as_of_ms)
+}
+
 pub(crate) fn lock_folds_within(
     data_dir: &std::path::Path,
     budget: std::time::Duration,
@@ -1745,36 +1761,55 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
                 None => require_right(conn, author, node_id, acl::ACL_A, "move out", as_of_ms)?,
             }
         }
+        // D100 — every event that mutates a link goes through the same rule
+        // `LinkRemoved` already used. Relabel, reorder, supersede, suspend and
+        // unsuspend all reached the catch-all below and were allowed on nothing
+        // but "is this key live?".
         Event::LinkRemoved { link_id, .. } => {
-            // Unlinking needs write on the removed link's parent (admin on the node
-            // itself for a root link). A link that's already gone ⇒ no-op, allowed.
-            let row: Option<(Option<String>, String)> = conn
-                .query_row(
-                    "SELECT parent_id, child_id FROM links WHERE id = ?1",
-                    params![link_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(map_db("acl link lookup"))?;
-            if let Some((parent, child)) = row {
-                let (target, needed) = match parent {
-                    Some(p) => (p, acl::ACL_W),
-                    None => (child, acl::ACL_A),
-                };
-                require_right(conn, author, &target, needed, "remove link", as_of_ms)?;
-            }
+            require_link_write(conn, author, link_id, "remove link", as_of_ms)?
+        }
+        Event::LinkRelabeled { link_id, .. } => {
+            require_link_write(conn, author, link_id, "relabel link", as_of_ms)?
+        }
+        Event::LinkReordered { link_id, .. } => {
+            require_link_write(conn, author, link_id, "reorder link", as_of_ms)?
+        }
+        Event::LinkSuspended { link_id, .. } => {
+            require_link_write(conn, author, link_id, "suspend link", as_of_ms)?
+        }
+        Event::LinkUnsuspended { link_id, .. } => {
+            require_link_write(conn, author, link_id, "unsuspend link", as_of_ms)?
+        }
+        // Both ends: superseding writes the old link out and the new one in, so
+        // holding rights over one half is not permission to move the other.
+        Event::LinkSuperseded { old_link_id, new_link_id, .. } => {
+            require_link_write(conn, author, old_link_id, "supersede link", as_of_ms)?;
+            require_link_write(conn, author, new_link_id, "supersede link", as_of_ms)?;
         }
         Event::FileLocationAdded { file_id, .. } => {
             require_right(conn, author, file_id, acl::ACL_W, "add location", as_of_ms)?
         }
-        Event::MemberTagged { .. } => {
-            // Per-key tags (doc 10 §4): any authorized member may assign a tag under
-            // its **own** authority — and the authority *is* the signed author, so a
-            // member cannot forge a tag under another key. The active-author check at
-            // the top of this function is therefore sufficient; the old "admin on the
-            // forest root" requirement was over-broad (it existed only because tags
-            // were unscoped) and is dropped. A key-scoped membership only unlocks
-            // nodes whose `Tag` grant that same key authored — i.e. nodes it controls.
+        // D100 — the exact counterpart of FileLocationAdded above, and it was
+        // allowed unchecked. Retiring a location is how bytes stop being
+        // findable; it is a write to the file by any reading.
+        Event::FileLocationRemoved { file_id, .. } => {
+            require_right(conn, author, file_id, acl::ACL_W, "remove location", as_of_ms)?
+        }
+        // Hard delete. Admin, not write — `unlink` is the write-tier act, and
+        // this is the one that cannot be undone.
+        Event::NodePurged { node_id, .. } => {
+            require_right(conn, author, node_id, acl::ACL_A, "purge node", as_of_ms)?
+        }
+        // What a file IS (D76) is content about that node.
+        Event::MediaQuality { node_id, .. } => {
+            require_right(conn, author, node_id, acl::ACL_W, "record quality", as_of_ms)?
+        }
+        // Binding decides what a folder INGESTS from disk, and unbinding
+        // strands every location under it (D97). Write on the folder.
+        Event::FolderBound { folder_id, .. }
+        | Event::FolderUnbound { folder_id, .. }
+        | Event::FolderUnboundRoot { folder_id, .. } => {
+            require_right(conn, author, folder_id, acl::ACL_W, "bind folder", as_of_ms)?
         }
         // P9.1 (doc 22 §2): attesting a chunk layout licenses EARLY serving,
         // which bypasses the whole-file gate — owner/admin tier only.
@@ -1786,7 +1821,83 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
             // a content change needs, enforced identically live and at replay.
             require_right(conn, ev.author(), blob_id, acl::ACL_W, "update secure blob", as_of_ms)?
         }
-        _ => {}
+
+        // ---- allowed here, each for a stated reason -------------------------
+        //
+        // D100: this match was `_ => {}`. A catch-all is DEFAULT-ALLOW, which
+        // is the opposite of this system's posture, and it silently swallowed
+        // eleven kinds that mutate the tree — including FileLocationRemoved and
+        // NodePurged. Every variant is now named, so adding an event kind
+        // FAILS TO COMPILE until someone decides what right it needs. That
+        // decision should cost a build error, not a security review.
+
+        // A bare node is unreachable and confers nothing: it has no parent to
+        // inherit an ACL from and no link placing it anywhere. The gated act is
+        // the `LinkCreated` that puts it somewhere, which needs write on the
+        // parent. There is genuinely nothing to check rights AGAINST here.
+        Event::NodeCreated(_) => {}
+
+        // Per-key tags (doc 10 §4): any authorized member may assign a tag
+        // under its OWN authority — and the authority IS the signed author, so
+        // a member cannot forge a tag under another key. The active-author
+        // check at the top of this function is therefore sufficient; the old
+        // "admin on the forest root" requirement was over-broad (it existed
+        // only because tags were unscoped) and is dropped. A key-scoped
+        // membership only unlocks nodes whose `Tag` grant that same key
+        // authored — i.e. nodes it controls.
+        Event::MemberTagged { .. } => {}
+
+        // Authorized by the CALLER, not here, and at both commit and replay:
+        // device certs take the root-or-admin rule via `check_device_cert`,
+        // root rotation the root-or-recovery-key rule, recovery keys the
+        // current root (doc 15 §C2/§C5/§C6a). `fold_one` and `append_durable`
+        // both match these ahead of dispatching here; reaching this arm means
+        // a caller skipped its own gate, so nothing is asserted about them.
+        Event::DeviceAuthorized { .. }
+        | Event::DeviceRevoked { .. }
+        | Event::RootRotated { .. }
+        | Event::RecoveryKeyRegistered { .. }
+        | Event::RecoveryKeyRevoked { .. } => {}
+
+        // Genesis, seq 1, root-authored — there is no prior state to check.
+        Event::ForestCreated { .. } => {}
+
+        // D72 Part A: an author we cannot parse cannot be authorized, and the
+        // fold ignores the event entirely. DEFERRED, NOT WAIVED — the first
+        // binary that understands the kind runs the full check and rejects it
+        // then. It can sit in a log unread; it can never take effect unread.
+        Event::Unknown { .. } => {}
+    }
+    Ok(())
+}
+
+/// D100 — the rule `LinkRemoved` has always used, now shared by every event
+/// that mutates a link: write on the link's parent, or admin on the node
+/// itself for a root link (which has no parent to hold rights over).
+///
+/// A link that is already gone is a no-op and allowed: replay must be able to
+/// re-apply a removal it has already folded without inventing a rights failure.
+fn require_link_write(
+    conn: &Connection,
+    author: &[u8],
+    link_id: &str,
+    action: &'static str,
+    as_of_ms: u64,
+) -> Result<()> {
+    let row: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT parent_id, child_id FROM links WHERE id = ?1",
+            params![link_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_db("acl link lookup"))?;
+    if let Some((parent, child)) = row {
+        let (target, needed) = match parent {
+            Some(p) => (p, acl::ACL_W),
+            None => (child, acl::ACL_A),
+        };
+        require_right(conn, author, &target, needed, action, as_of_ms)?;
     }
     Ok(())
 }

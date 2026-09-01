@@ -32,13 +32,12 @@ env/
 *.db-shm
 *.pvx
 
-# Forest files — only examples/ should contain JSON
-*.json
-!examples/*.json
+# D100 — ignore by PATH, not by extension. A blanket `*.json` meant every new
+# config had to be rescued by an exception, and one that nobody thought to add
+# would simply never be committed — silently, which is the whole problem.
+/artifacts/**/*.json
+**/target/**/*.json
 !pyproject.toml
-!package.json
-!package-lock.json
-!tsconfig*.json
 !terraform.tfvars.example
 
 # Secrets

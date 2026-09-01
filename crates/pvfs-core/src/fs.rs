@@ -405,7 +405,8 @@ impl Engine {
             .conn
             .prepare(
                 "SELECT file_id, uri FROM file_locations
-                  WHERE (uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%'))
+                  WHERE (substr(uri, 1, length(?1)) = ?1
+                         OR (?2 IS NOT NULL AND substr(uri, 1, length(?2)) = ?2))
                     AND removed_at IS NULL
                   ORDER BY uri",
             )
@@ -1021,10 +1022,12 @@ impl Engine {
                 .conn
                 .prepare(
                     "SELECT uri, file_id FROM scan_state
-                      WHERE uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%')
+                      WHERE substr(uri, 1, length(?1)) = ?1
+                         OR (?2 IS NOT NULL AND substr(uri, 1, length(?2)) = ?2)
                      UNION
                      SELECT uri, file_id FROM file_locations
-                      WHERE (uri LIKE ?1 || '%' OR (?2 IS NOT NULL AND uri LIKE ?2 || '%'))
+                      WHERE (substr(uri, 1, length(?1)) = ?1
+                         OR (?2 IS NOT NULL AND substr(uri, 1, length(?2)) = ?2))
                         AND removed_at IS NULL",
                 )
                 .map_err(map_db("scan removals"))?;
@@ -2060,6 +2063,11 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    // D100 — stamp the count INTO the error too. This line
+                    // already said "after N retries" while the error it
+                    // embedded said "retried 0x", so the two halves of one
+                    // sentence disagreed and the inner one was believed.
+                    let e = e.with_retries(attempt);
                     eprintln!(
                         "scan: hash fill failed for {} after {attempt} retries: {e}",
                         path.display()

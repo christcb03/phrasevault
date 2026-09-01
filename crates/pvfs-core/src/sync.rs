@@ -412,25 +412,49 @@ pub fn sidecar_hashes(file: &Path, size: u64) -> Option<(String, Vec<[u8; 32]>)>
     sc.whole.map(|w| (w, sc.chunks))
 }
 
-/// A served file's manifest: the sidecar when present and plausible for the
-/// file's size, else computed and cached (best-effort — a read-only store
-/// still answers, just without the cache).
+/// A file's chunk manifest: the sidecar when present and plausible for the
+/// file's size, else computed from the bytes.
+///
+/// D100 — **this reads and returns; it does not write.** It used to cache the
+/// result to disk on its way out, so a getter with an innocuous name modified
+/// the filesystem as a side effect of being asked a question. Callers that
+/// WANT the cache say so, by calling [`manifest_for_caching`].
 pub fn manifest_for(path: &Path) -> Result<Vec<[u8; 32]>> {
+    Ok(manifest_of(path)?.1)
+}
+
+/// [`manifest_for`], and write the sidecar back beside the bytes.
+///
+/// The caching is worth keeping and is why the split is a rename rather than a
+/// deletion: the whole-file hash comes almost free while every byte is already
+/// being read, and a sidecar is the difference between hash work that survives
+/// a forest rebuild and hash work that has to be done again (D91, D93). Only
+/// the hiding of it was wrong.
+///
+/// Best-effort: a read-only store still answers, just without the cache.
+pub fn manifest_for_caching(path: &Path) -> Result<Vec<[u8; 32]>> {
+    let (computed, m) = manifest_of(path)?;
+    if let Some(whole) = computed {
+        let _ = write_manifest_sidecar(path, Some(&whole), &m);
+    }
+    Ok(m)
+}
+
+/// The shared body. `Some(whole)` means the bytes were read here and the
+/// whole-file hash is fresh; `None` means a usable sidecar answered and there
+/// is nothing new to write.
+fn manifest_of(path: &Path) -> Result<(Option<String>, Vec<[u8; 32]>)> {
     let size = std::fs::metadata(path)
         .map_err(|e| PvfsError::io("stat for manifest", e))?
         .len();
     let expect = if size == 0 { 0 } else { size.div_ceil(SWARM_CHUNK) } as usize;
     if let Some(sc) = read_manifest_sidecar(path) {
         if sc.chunks.len() == expect {
-            return Ok(sc.chunks);
+            return Ok((None, sc.chunks));
         }
     }
-    // D91 — take the whole-file hash on the way past. We are already reading
-    // every byte, so it is nearly free here, and it is the difference between a
-    // sidecar that survives a forest rebuild and one that does not.
     let (whole, m) = hash_with_manifest(path)?;
-    let _ = write_manifest_sidecar(path, Some(&whole), &m);
-    Ok(m)
+    Ok((Some(whole), m))
 }
 
 /// The resumable swarm partial for a fetch (doc 22 §3). Deliberately NOT a
@@ -1422,7 +1446,9 @@ impl Engine {
         let size = std::fs::metadata(&path)
             .map_err(|e| PvfsError::io("stat for manifest", e))?
             .len();
-        Ok((size, SWARM_CHUNK, manifest_for(&path)?))
+        // Caching deliberately, and now visibly: serving reads every byte
+        // anyway, so this is where a durable sidecar is cheapest to make.
+        Ok((size, SWARM_CHUNK, manifest_for_caching(&path)?))
     }
 
     /// P9 (doc 22): verify and publish an assembled swarm partial — the SAME

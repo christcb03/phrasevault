@@ -182,7 +182,11 @@ impl JobsState {
                     interval(&r.name),
                     stall_floor(&r.name),
                 ) {
-                    r.state = "stalled".into();
+                    // D100 — `overdue`, not `stalled`. See `stalled_reason`:
+                    // this branch has no evidence the job is wedged, only that
+                    // no pass has finished lately, and on a library this size
+                    // that is the normal state of a healthy long pass.
+                    r.state = "overdue".into();
                     r.last_error = Some(why);
                 }
                 r
@@ -692,8 +696,26 @@ pub fn stalled_reason(
     if waited <= limit {
         return None;
     }
+    // D100 — say what is OBSERVED, and stop asserting what is not known.
+    //
+    // This check sees one thing: no pass has completed for a while. It cannot
+    // see whether the job is working, because nothing reports progress WITHIN a
+    // pass. Claiming "the pass is stuck, not working" turned that single
+    // observation into a diagnosis, and the diagnosis was wrong every time it
+    // fired on the live holder — three times, against a `watch` steadily
+    // writing sidecars and a `tier` steadily fetching.
+    //
+    // The state is `overdue`, not `stalled`. `stalled` is reserved for
+    // `pass_stalled_reason`, which HAS evidence: a pass in flight far past this
+    // job's own measured typical duration.
+    //
+    // The real fix is a progress signal — files hashed, bytes moved — plumbed
+    // out of `scan_routed` and `tier_pass` so a long pass that is advancing can
+    // be told from one that is wedged. That is a cross-crate change to core's
+    // API and belongs in its own milestone; this one stops the lying.
     Some(format!(
-        "no pass has completed in {} min (interval is {}s) — the pass is stuck, not working",
+        "no pass has completed in {} min (interval is {}s) — overdue, which is \
+         not the same as stuck: nothing here reports progress within a pass",
         waited / 60_000,
         every.as_secs()
     ))
