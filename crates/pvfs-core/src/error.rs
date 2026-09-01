@@ -106,6 +106,20 @@ pub enum PvfsError {
 }
 
 impl PvfsError {
+    /// D100 — record how many times the CALLER retried before giving up.
+    ///
+    /// `map_db` builds `Busy` with `retries: 0`, which is honest at that point
+    /// and misleading by the time it reaches a human: the live holder reported
+    /// `SQLite is busy/locked during scan state (retried 0x)` from a path that
+    /// had just retried five times. A retry count nobody updates is worse than
+    /// none, because it reads as evidence that no retry happened.
+    pub fn with_retries(self, n: u32) -> Self {
+        match self {
+            PvfsError::Busy { op, .. } => PvfsError::Busy { op, retries: n },
+            other => other,
+        }
+    }
+
     pub fn db(op: &str, source: rusqlite::Error) -> Self {
         PvfsError::Db {
             op: op.to_string(),
@@ -131,6 +145,10 @@ pub fn map_db(op: &str) -> impl Fn(rusqlite::Error) -> PvfsError + '_ {
         {
             PvfsError::Busy {
                 op: op.to_string(),
+                // D100 — 0 is the truth AT CONSTRUCTION: nothing has retried
+                // yet. Retry loops stamp the real count with `with_retries`
+                // before surfacing, or the message reports the retries the
+                // MAPPER did (none) rather than the ones the CALLER did.
                 retries: 0,
             }
         }

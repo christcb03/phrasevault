@@ -32,7 +32,10 @@ jobs:
       - name: Test (spec §14 suite)
         run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        # D100 — --all-targets, so tests, benches and examples are linted too.
+        # Without it the ad-hoc runs done by hand were STRICTER than the gate,
+        # which is the wrong way round for a gate.
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: CLI smoke suite
         run: |
           cargo build --release -p pvfs-cli -p pvfsd -p pvfs-companion

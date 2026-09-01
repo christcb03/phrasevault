@@ -16,8 +16,18 @@ use pvfs_core::{
     OrderKey, PvfsError, Registry, ResolveAction, VerifyOutcome, TYPE_FILE, TYPE_FOLDER,
 };
 
+// D100 — the release number AND the build it came from (see VERSIONING.md).
+// `pvfs 1.4.0 (v1.4-27-gabc1234-dirty)` cannot be mistaken for a different
+// tree reporting the same 1.4.0.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PVFS_BUILD"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "pvfs", version, about = "PVFS — PhraseVault File System")]
+#[command(name = "pvfs", version = VERSION, about = "PVFS — PhraseVault File System")]
 struct Cli {
     /// Low-level state-dir override for tests/scripts (or $PVFS_DATA_DIR).
     /// Interactive use: run inside a mount or pass --forest.

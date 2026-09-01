@@ -17,16 +17,33 @@ const EVERY: Duration = Duration::from_secs(300);
 const MIN: u64 = 60_000;
 
 /// The production case: 6.4 hours past the last completed pass, on a 5 minute
-/// interval, still calling itself `running`.
+/// interval, still calling itself `running`. It must be REPORTED — that part
+/// was always right and is what D78 exists for.
+///
+/// D100 changed what it is reported AS. This check knows exactly one thing:
+/// no pass has completed lately. It cannot see whether the job is working,
+/// because nothing reports progress within a pass — so it used to turn one
+/// observation into the diagnosis "the pass is stuck, not working", and that
+/// diagnosis was wrong all three times it fired on the live holder, against a
+/// `watch` steadily writing sidecars and a `tier` steadily fetching.
+///
+/// `overdue` is what this evidence supports. `stalled` is reserved for
+/// `pass_stalled_reason`, which HAS evidence: a pass in flight far past this
+/// job's own measured typical duration.
 #[test]
-fn a_job_stuck_for_hours_is_reported_stalled() {
+fn a_job_past_its_interval_is_reported_overdue() {
     let now = 100 * 60 * MIN;
     let since = now - (384 * MIN); // 6.4 h
-    let why = stalled_reason("running", since, now, EVERY, PASS_STALL_FLOOR).expect("must be stalled");
+    let why =
+        stalled_reason("running", since, now, EVERY, PASS_STALL_FLOOR).expect("must be reported");
     assert!(why.contains("384 min"), "says how long: {why}");
     assert!(
-        why.contains("stuck, not working"),
-        "and says plainly what that means: {why}"
+        why.contains("overdue"),
+        "and names it as overdue, not diagnosed as stuck: {why}"
+    );
+    assert!(
+        !why.contains("stuck, not working"),
+        "must NOT claim a diagnosis it has no evidence for: {why}"
     );
 }
 
@@ -56,7 +73,7 @@ fn a_slow_pass_within_tolerance_is_not_stalled() {
 fn only_a_running_job_can_stall() {
     let now = 1000 * MIN;
     let ancient = 0;
-    for state in ["idle", "disabled", "backoff", "stalled"] {
+    for state in ["idle", "disabled", "backoff", "stalled", "overdue"] {
         assert!(
             stalled_reason(state, ancient, now, EVERY, PASS_STALL_FLOOR).is_none(),
             "{state} must not be reported as stalled"

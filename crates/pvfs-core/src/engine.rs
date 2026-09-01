@@ -1233,6 +1233,8 @@ impl Engine {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
                 }
+                // D100 — carry the real attempt count out with the error.
+                Err(e) => return Err(e.with_retries(attempt)),
                 other => return other,
             }
         }
@@ -1928,7 +1930,7 @@ impl Engine {
         // is why `evict_pass` was fixed first and this one left standing.
         const HELD_ELSEWHERE: &str = "SELECT 1 FROM file_locations o
                  WHERE o.file_id = l.file_id AND o.removed_at IS NULL
-                   AND o.uri NOT LIKE ?1 || '%'
+                   AND substr(o.uri, 1, length(?1)) <> ?1
                    AND NOT EXISTS (SELECT 1 FROM location_quarantine q
                                    WHERE q.file_id = o.file_id AND q.uri = o.uri)";
 
@@ -1936,7 +1938,7 @@ impl Engine {
             .conn
             .prepare(&format!(
                 "SELECT l.file_id, l.uri FROM file_locations l
-                 WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
+                 WHERE substr(l.uri, 1, length(?1)) = ?1 AND l.removed_at IS NULL
                    AND EXISTS ({HELD_ELSEWHERE})
                  ORDER BY l.file_id"
             ))
@@ -1954,7 +1956,7 @@ impl Engine {
             .conn
             .prepare(&format!(
                 "SELECT l.file_id, l.uri FROM file_locations l
-                 WHERE l.uri LIKE ?1 || '%' AND l.removed_at IS NULL
+                 WHERE substr(l.uri, 1, length(?1)) = ?1 AND l.removed_at IS NULL
                    AND NOT EXISTS ({HELD_ELSEWHERE})
                  ORDER BY l.file_id"
             ))
@@ -1971,7 +1973,9 @@ impl Engine {
             // those are the bytes we caught lying. Ordered so the cheap stat
             // gates the query: only a file the store actually holds pays.
             if crate::sync::sync_store_lookup(&self.data_dir, &file)?.is_some()
-                && !self.uri_quarantined(&file, &crate::sync::sync_uri(&file))?
+                && !self
+                    .quarantined_uris(&file)?
+                    .contains(&crate::sync::sync_uri(&file))
             {
                 eligible.push((file, uri));
             } else {
@@ -2010,23 +2014,6 @@ impl Engine {
             report.removed += chunk.len();
         }
         Ok(report)
-    }
-
-    /// Has this location been caught serving bytes the catalog does not name?
-    ///
-    /// For the one copy the retire guard cannot ask about in SQL: the managed
-    /// sync store is found by existence, not by a `file_locations` row.
-    fn uri_quarantined(&self, file: &str, uri: &str) -> Result<bool> {
-        let hit: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
-                params![file, uri],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(map_db("quarantine lookup"))?;
-        Ok(hit.is_some())
     }
 
     /// D82 — what the tree holds: total bytes across file nodes, and how many.
@@ -2116,7 +2103,8 @@ impl Engine {
                     -- 34 orphans because every one of them was written
                     -- `pvfs-host://<own pin>/…`. The owner, which this test was
                     -- written for, holds no media at all.
-                    AND (l.uri LIKE 'file://%' OR (?1 IS NOT NULL AND l.uri LIKE ?1 || '%'))
+                    AND (l.uri LIKE 'file://%'
+                         OR (?1 IS NOT NULL AND substr(l.uri, 1, length(?1)) = ?1))
                     AND NOT EXISTS (SELECT 1 FROM links k
                                     WHERE k.child_id = l.file_id
                                       AND k.removed_at IS NULL)
@@ -2199,7 +2187,7 @@ impl Engine {
             .conn
             .prepare(
                 "SELECT DISTINCT file_id, uri FROM file_locations
-                 WHERE (uri LIKE ?1 || '%' OR uri LIKE 'file://%')
+                 WHERE (substr(uri, 1, length(?1)) = ?1 OR uri LIKE 'file://%')
                    AND removed_at IS NULL",
             )
             .map_err(map_db("live own locations"))?;
@@ -2232,7 +2220,7 @@ impl Engine {
             .conn
             .prepare(
                 "SELECT DISTINCT file_id, uri FROM file_locations l1
-                 WHERE (uri LIKE ?1 || '%' OR uri LIKE 'file://%')
+                 WHERE (substr(uri, 1, length(?1)) = ?1 OR uri LIKE 'file://%')
                    AND removed_at IS NOT NULL
                    AND NOT EXISTS (SELECT 1 FROM file_locations l2
                                    WHERE l2.file_id = l1.file_id AND l2.uri = l1.uri
