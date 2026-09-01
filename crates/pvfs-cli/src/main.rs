@@ -810,9 +810,10 @@ enum LocCmd {
     /// This is the NAS migration's last step, and the one that is dangerous
     /// done naively — removing a location that is a file's only one strands
     /// it, which is exactly how 26,729 files were stranded before. So
-    /// eligibility is decided per file: anything held nowhere else is REFUSED
-    /// and listed, never removed. Run `--dry-run` first; it prints the same
-    /// counts and touches nothing.
+    /// eligibility is decided per file: anything with no OTHER copy worth
+    /// trusting — held nowhere else, or held only where `loc verify` has
+    /// caught the wrong bytes — is REFUSED and listed, never removed. Run
+    /// `--dry-run` first; it prints the same counts and touches nothing.
     Retire {
         /// URI prefix to retire, e.g. file:///mnt/nas-media/
         /// Prompted for when omitted.
@@ -3111,9 +3112,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         );
                     } else {
                         // The refused list is the part worth reading: each one
-                        // is a file this prefix is the LAST record of.
+                        // is a file this prefix is the last record of that is
+                        // worth keeping. Two ways in, and they want different
+                        // remedies — nothing else holds it (rescan the holder),
+                        // or the only other copy is quarantined (`loc verify`)
+                        // — so the line no longer claims to know which.
                         for (file, uri) in report.refused.iter().take(20) {
-                            println!("  REFUSED  {} — held nowhere else ({uri})", &file[..16.min(file.len())]);
+                            println!("  REFUSED  {} — no other copy we trust ({uri})", &file[..16.min(file.len())]);
                         }
                         if report.refused.len() > 20 {
                             println!("  … and {} more refused", report.refused.len() - 20);
