@@ -837,3 +837,77 @@ when someone is next in that code.
 ceiling and prints the watcher's log on failure, but has not yet run on a GitHub
 runner. If it still fails there, the output will finally say whether the daemon
 was slow or refused to start.
+
+
+---
+
+## 12. D100 close-out — the queue, and what it cost
+
+All fourteen items of §11 are addressed in `1405868`. Verified on presubuntu:
+**103 suites, 481 tests, 377 smoke, 0 failed**, clippy `--all-targets -D
+warnings` clean. Deviations, honestly:
+
+### Corrections to §11 item 1 as reported
+
+- **The identity kinds were never in the hole.** `DeviceAuthorized`,
+  `DeviceRevoked`, `RootRotated` and the recovery keys are gated at BOTH commit
+  and replay on a separate path (`check_device_cert`, current-root rules). They
+  now sit in named arms saying so, rather than in a catch-all where "allowed"
+  and "nobody looked" are indistinguishable.
+- **The exposure was narrower than stated.** `prepare_remove_location` and its
+  siblings already check rights, so the remote-member path was covered. The gap
+  was replay and local commit — which is precisely where `fold_one`'s own
+  comment promises "a tampered or synced log can't carry an event its author had
+  no right to". For eleven kinds that promise was not kept.
+
+### Verified against production, not just tests
+
+This change could have been fleet-down: the new checks run on replay of a log
+whose events predate them. A 148 MB copy of the owner's `log.db` (~241k events)
+was replayed **with `index.db` absent**, so the entire log folded through the
+new rules. It rebuilt a 116 MB projection with **zero rejections**.
+
+A negative control ran too: with the six new checks neutered, all six denial
+tests fail and the positive test still passes — the correct signature, since
+removing a check allows everything.
+
+### Done honestly, not fully
+
+**§11 item 10 (the stall metric).** The blunt check now reports `overdue` and
+states what it observed. It no longer asserts "the pass is stuck, not working",
+a diagnosis it has no evidence for and got wrong all three times it fired. The
+REAL fix — progress within a pass, so a long pass that is advancing can be told
+from one that is wedged — needs a signal plumbed out of `scan_routed` and
+`tier_pass`, a cross-crate API change that belongs in its own milestone. This
+one stops the lying; it does not add the sense.
+
+**§11 item 9 (lazy remap)** remains rejected, per Chris.
+
+**§11 item 12 (the D99 marking path)** still needs a live peer. Production has
+five files waiting.
+
+### Two failures worth keeping
+
+**The version fix did not work where it mattered, first time.** `build.rs` ran
+`git describe` on the build host — which receives an rsync copy with `.git`
+excluded. Every pipeline binary stamped itself `unknown`: useless on exactly
+the builds that get deployed, which is the case VERSIONING.md wrote the rule
+for. The playbook now resolves it on the control machine and passes it in.
+
+**The build-slot fix filled the build host.** Each session slot is a full
+source + target tree, ~6 GB. Three MERGED slots were never removed and
+presubuntu reached 96G/96G — which is what failed two pipeline runs, not the
+code. CLAUDE.md says to delete the slot on merge; the rule survived about a
+day. **Reaping merged slots should be automatic, and is now the one open item
+this milestone leaves behind.**
+
+## 13. Open after D100
+
+1. **Automate build-slot reaping.** See above. A rule that depends on memory
+   already failed once, loudly.
+2. **The stall metric proper** — progress within a pass (§12).
+3. **D99's marking path end to end** — needs a live peer (§11 item 12).
+4. **The rebuild** (§6), and the `D84` duplicate nodes it clears.
+5. **`watch` on the holder sits in `backoff`** — SQLite busy during scan state.
+   The retry count it reports is now honest; whether the retries are ENOUGH is
+   a separate question nobody has asked yet.
