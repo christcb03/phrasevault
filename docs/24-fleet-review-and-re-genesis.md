@@ -730,3 +730,110 @@ something to land in the same pass as the fix it rides along with.
 10. Re-check on the live holder after deploy: `serve status` shows tier
    completing passes, and `loc ls` on the five names shows a quarantined
    location with its reason.
+
+---
+
+## 11. Review queue — open after D99 merged (2026-09-01)
+
+Everything below is **found and verified, not fixed**. Items 1–9 came from an
+independent review Chris commissioned; each carries the verdict from checking
+it against the tree, because a second reader's report is a lead, not a finding.
+Items 10–14 are what this workstream knows it left standing.
+
+### Verified — security
+
+**1. `check_member_event` fails OPEN, and wider than reported.** CONFIRMED, and
+worse than the report said. `projection.rs:1789` ends the match with `_ => {}`,
+so any kind not named passes on `require_active_author` alone — "is this device
+key live?" and never "may this key do this to this node?". **19 of 32 event
+kinds** land there, including `FileLocationRemoved`, `NodePurged`, `NodeCreated`,
+`LinkRelabeled`, `LinkReordered`, `LinkSuperseded`, `LinkSuspended`,
+`LinkUnsuspended`, `FolderBound`, `FolderUnbound`, `FolderUnboundRoot` and
+`MediaQuality`. `LinkRemoved` right above it does the per-node rights match
+properly, which is the shape the rest want.
+
+This contradicts the standing posture — no authority outside explicit ACL
+grants, **default-deny** — and a catch-all arm is default-allow. Caveat before
+anyone writes the fix: some identity kinds in that list (`DeviceAuthorized`,
+`DeviceRevoked`, `RootRotated`, `RecoveryKey*`, `ForestCreated`) may be
+authorised on a different path, so each needs checking rather than a blanket
+`require_right`. Tests must cover **both** live commit and projection replay —
+the two paths judge separately and have diverged before.
+
+### Verified — correctness
+
+**2. `LIKE ?1 || '%'` with no `ESCAPE`.** CONFIRMED at **9 sites** in
+`engine.rs`, including both halves of `retire_locations_under` — the function
+D99 just touched. In SQLite `_` is a single-character wildcard, so a prefix
+matches more than it names. Fleet paths carry underscores (`Data_ext`,
+`CACHEDEV1_DATA`), so this is not hypothetical, and the operation it guards
+REMOVES location records. Fix by escaping `_ % \` in the bound prefix, or by
+`substr(uri, 1, length(?1)) = ?1`.
+
+**3. `manifest_for` writes to disk on a read.** CONFIRMED — `sync.rs:418` calls
+`write_manifest_sidecar` at :432. Split the getter from an explicit write at
+adopt/verify time.
+
+### Verified — the tooling that judges the code
+
+**4. Pipeline and CI run different toolchains.** CONFIRMED. `ci.yml` pins
+`1.96.0` and says in its own comment why floating on `@stable` was wrong;
+`pipeline.yml:72` still installs `--default-toolchain stable`. So presubuntu
+can pass a clippy that CI fails, in the direction that matters.
+
+**5. CI clippy is not `--all-targets`.** CONFIRMED —
+`cargo clippy --workspace -- -D warnings` leaves test code unlinted. The ad-hoc
+runs this workstream does by hand ARE `--all-targets`, so the manual check is
+stricter than the gate.
+
+**6. `/tmp/pvfs-*-results.txt` is still one shared path.** CONFIRMED, and it is
+the unfinished half of the build-slot fix: sessions now get
+`/opt/pvfs-<session>/src` but still `tee` into the same two result files.
+Verification reads those files, so concurrent sessions can read each other's
+totals — the failure mode the slot fix exists to prevent, one directory over.
+
+**7. `--version` reports 1.4.0 for every build.** CONFIRMED, and already written
+up as a RULE in `VERSIONING.md` after `1.4.0` meant two materially different
+binaries at once. Bake `git describe --tags --dirty` in via `build.rs`/vergen.
+Until then, deploys are verified by grepping the binary for a string only the
+intended build has — which is what this workstream does.
+
+**8. `.gitignore` blanket-ignores `*.json`.** CONFIRMED (line 36, with
+exceptions). Ignore by path instead, so a legitimate config cannot go missing
+silently.
+
+### Verified, but the recommendation is REJECTED
+
+**9. Remap `hash_policy = lazy` to `on_add` in the loader.** The behaviour is
+confirmed — D94 makes a `lazy` binding refuse to load. The proposed remedy is
+the one Chris explicitly turned down: *"that isn't a real mode and it will be
+confusing... I'd want to know if one gets left laying around trying to work in
+a way it can't."* The refusal is the feature; it found a live `lazy` binding on
+the NAS within minutes of shipping. A **one-shot migration that remaps and says
+loudly what it changed** would satisfy both readings — silent reinterpretation
+would not. Chris's call, not the reviewer's.
+
+### This workstream's own leftovers
+
+**10. The stall detector still measures the wrong thing.** D96 fixed a real bug
+and is live, but "no pass has completed in N minutes" cannot describe a job
+whose healthy pass takes days. It has now cried wolf three times, and it is the
+detector the fleet monitoring of §5 would be built on.
+
+**11. `watch` on the holder sits in `backoff`** — *"SQLite is busy/locked during
+scan state (retried 0x)"*. Hashing advances regardless, so it recovers, but
+`retried 0x` on a busy error is the wrong number for a retry path.
+
+**12. The D99 marking path is unproven end to end.** Unit tests cover the
+pieces; a live peer serving wrong bytes does not. Production will exercise it
+the moment D99 reaches the holder — five files are waiting.
+
+**13. Two quarantine helpers now coexist.** `uri_quarantined(file, uri) -> bool`
+in `engine.rs` and `quarantined_uris(id) -> Vec<String>` in `fs.rs`, from two
+sessions that could not see each other. Same table, different shapes. Consolidate
+when someone is next in that code.
+
+**14. The CI watcher fix is unproven on GitHub.** `5a4711e` raises the poll
+ceiling and prints the watcher's log on failure, but has not yet run on a GitHub
+runner. If it still fails there, the output will finally say whether the daemon
+was slow or refused to start.
