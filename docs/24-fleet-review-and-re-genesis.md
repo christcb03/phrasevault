@@ -952,6 +952,14 @@ held open. Both would have left the holder rolled but down.
 2. **The play should bracket the watchdog** around a NAS swap (§13).
 3. **`build-nas.sh` does not stamp `PVFS_BUILD`**, so QNAP binaries report
    `unknown` and must be verified by content (VERSIONING.md).
+4. **A disabled job keeps its last status row.** After `serve disable sync` +
+   SIGHUP the holder reports `sync  idle  (last error: 82 fetch failures…)`
+   while `serve.jobs` correctly lists only `follow, tier, watch`. Verified it
+   is genuinely NOT working — the not_found count is static across 45s — so
+   this is a reporting bug, not a runaway job. But it reads as a live job with
+   a live error, which is the same category as §11 item 10: the status saying
+   something it cannot support. The row should reset to `disabled` and drop
+   the stale error.
 2. **The stall metric proper** — progress within a pass (§12).
 3. **D99's marking path end to end** — needs a live peer (§11 item 12).
 4. **The rebuild** (§6), and the `D84` duplicate nodes it clears.
