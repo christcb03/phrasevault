@@ -945,28 +945,47 @@ held open. Both would have left the holder rolled but down.
 
 ## 14. Open after D102
 
-1. **Automate build-slot reaping.** Each session slot is a full source + target
-   tree (~6 GB); three MERGED ones went unreaped and presubuntu hit 96G/96G,
-   which failed two pipeline runs and looked like a code failure. CLAUDE.md says
-   to delete them on merge; the rule lasted a day.
-2. **The play should bracket the watchdog** around a NAS swap (§13).
-3. **`build-nas.sh` does not stamp `PVFS_BUILD`**, so QNAP binaries report
-   `unknown` and must be verified by content (VERSIONING.md).
-4. **A disabled job keeps its last status row.** After `serve disable sync` +
-   SIGHUP the holder reports `sync  idle  (last error: 82 fetch failures…)`
-   while `serve.jobs` correctly lists only `follow, tier, watch`. Verified it
-   is genuinely NOT working — the not_found count is static across 45s — so
-   this is a reporting bug, not a runaway job. But it reads as a live job with
-   a live error, which is the same category as §11 item 10: the status saying
-   something it cannot support. The row should reset to `disabled` and drop
-   the stale error.
-2. **The stall metric proper** — progress within a pass (§12).
-3. **D99's marking path end to end** — needs a live peer (§11 item 12).
-4. **The rebuild** (§6), and the `D84` duplicate nodes it clears.
-5. **`watch` on the holder sits in `backoff`** — SQLite busy during scan state.
-   The retry count it reports is now honest; whether the retries are ENOUGH is
-   a separate question nobody has asked yet.
+Renumbered 2026-09-02; item 3 of the old list (D99's marking path end to end)
+is CLOSED — it fired in production on Reacher s03e08 (§11 item 12).
 
+**Code**
+
+1. **The stall metric proper.** D100 stopped the detector asserting "stuck"
+   with no evidence, but it still cannot tell a long pass that is ADVANCING
+   from one that is wedged. That needs a progress signal out of `scan_routed`
+   and `tier_pass` — a cross-crate API change, its own milestone (§12).
+2. **A disabled job keeps its last status row.** After `serve disable sync` +
+   SIGHUP the holder still reports `sync  idle  (last error: 82 fetch
+   failures…)` while `serve.jobs` correctly lists only `follow, tier, watch`.
+   Verified genuinely idle — the not_found count is static — so a reporting
+   bug, not a runaway job. Same category as item 1: a status saying what it
+   cannot support. The row should reset to `disabled` and drop the error.
+3. **`watch` hits SQLite BUSY during scan state.** The retry count it reports
+   is honest since D100; whether the retries are ENOUGH is a separate question
+   nobody has asked.
+4. **165 pending changes** on the holder, most flagged on mtime alone with no
+   size change (rclone and cloudplow touch mtimes) and many of them
+   `.manifest` recursion nodes. Noise that clears with the rebuild, but it
+   buries the real drift among it.
+
+**Tooling / operations**
+
+5. **Automate build-slot reaping.** Each session slot is a full source + target
+   tree (~6 GB); three MERGED ones went unreaped, presubuntu hit 96G/96G, and
+   two pipeline runs failed in a way that read as a code error. CLAUDE.md says
+   to delete them on merge; the rule lasted a day.
+6. **The play should bracket the watchdog** around a NAS swap. It restarts
+   pvfsd inside the 30s window the play waits for it to exit, so a roll needs
+   the watchdog stopped and RESTARTED by hand — and forgetting the restart
+   leaves the holder unsupervised, the exact outage D83 exists for (§13).
+7. **`build-nas.sh` does not stamp `PVFS_BUILD`**, so QNAP binaries report
+   `unknown` and can only be verified by content (VERSIONING.md).
+
+**The big one**
+
+8. **The rebuild** (§6) — re-genesis carrying the hashes forward, which also
+   clears the D84 duplicate nodes, the manifest-recursion junk and most of
+   item 4. Sidecar coverage is now ~96%, which was the precondition.
 
 ## 15. D102 — the two gaps the roll itself found
 
