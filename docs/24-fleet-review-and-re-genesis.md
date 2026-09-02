@@ -694,15 +694,14 @@ something to land in the same pass as the fix it rides along with.
 2. In `Fetcher::fetch`, match the commit error before stringifying it; on
    `PvfsError::Integrity`, quarantine every location of `id` whose URI parses to
    the failing candidate's pin.
-3. ~~Same treatment in `swarm_fetch`.~~ **Deliberately NOT done, on inspection.**
-   The swarm assembles a file from chunks pulled from *every* holder, so a
-   whole-file mismatch at `swarm_publish` cannot name which one served bad
-   bytes — and since each chunk is already verified against the signed manifest
-   during assembly, a whole-file failure there points at the manifest, not at a
-   holder. Blaming a pin would strand good holders on the strength of a guess.
-   The swarm already falls through to single-stream, which retries per-holder
-   and *can* attribute the failure; production's log shows exactly that
-   sequence. The single-stream fix therefore closes this path too.
+3. ~~Same treatment in `swarm_fetch`.~~ **Deferred in D99 — and SUPERSEDED by
+   D102 (§15).** The reasoning was that a swarm pulls chunks from *every*
+   holder, so a whole-file mismatch cannot name which one served bad bytes, and
+   blaming a pin would strand good holders. That holds for a real multi-holder
+   swarm. It does not hold when there is exactly ONE candidate, which is the
+   production shape — so the case D99 declined was the only one occurring, and
+   the fallback re-downloaded 5.5 GB per pass to fail the same check. D102
+   quarantines when `candidates.len() == 1`.
 4. **`candidates()` must SKIP quarantined locations.** Found while implementing
    3, and without it the whole fix is cosmetic: `Engine::locations()` returns
    quarantined URIs on purpose — evict, reclaim and `loc_verify` all need to
@@ -824,9 +823,17 @@ detector the fleet monitoring of §5 would be built on.
 scan state (retried 0x)"*. Hashing advances regardless, so it recovers, but
 `retried 0x` on a busy error is the wrong number for a retry path.
 
-**12. The D99 marking path is unproven end to end.** Unit tests cover the
-pieces; a live peer serving wrong bytes does not. Production will exercise it
-the moment D99 reaches the holder — five files are waiting.
+**12. ~~The D99 marking path is unproven end to end.~~ CLOSED 2026-09-01, in
+production.** Within hours of the roll:
+
+```
+fetch: quarantined stale location
+  pvfs-host://64b88868…/mnt/local/Media/TV/Reacher (2022)/Season 03/
+  Reacher - s03e08 - Unfinished Business.mkv
+```
+
+A real peer, bytes that genuinely no longer match, a durable quarantine — the
+proof no unit test could give, on one of the five files that started this.
 
 **13. Two quarantine helpers now coexist.** `uri_quarantined(file, uri) -> bool`
 in `engine.rs` and `quarantined_uris(id) -> Vec<String>` in `fs.rs`, from two
@@ -951,3 +958,31 @@ held open. Both would have left the holder rolled but down.
 5. **`watch` on the holder sits in `backoff`** — SQLite busy during scan state.
    The retry count it reports is now honest; whether the retries are ENOUGH is
    a separate question nobody has asked yet.
+
+
+## 15. D102 — the two gaps the roll itself found
+
+Neither came from a test. Both came from reading production logs after D99 and
+D100 were live.
+
+**Swarm attribution.** D99 declined to quarantine on a swarm integrity failure
+because a multi-holder swarm cannot attribute a bad chunk. True in general, and
+irrelevant here: the holder pulls from one peer. The log showed
+`swarm: resumed 663/663 chunks` — the file complete on disk and already proven
+not to match — then a single-stream re-download of 5.5 GB across a WAN to fail
+the identical check, every pass. D102 quarantines when there is exactly one
+candidate, where attribution is not a guess.
+
+**`sync` never had `tier`'s memory.** `sync_pass` built its `Fetcher` bare and
+`sync_pull` never consulted the unfetchable set, so D98 and D99 covered `tier`
+alone. Invisible while `sync` was off on the box that had the problem — and the
+D99 roll turned it on (§13), bringing the entire not_found retry storm back
+within minutes through a job that had simply never been given the fix. Both
+jobs now share `fetch_unfetchable`.
+
+**The pattern worth keeping:** every one of D99, D100, D101 and D102 is the
+same shape — a fix applied at one site and not its siblings. `read_verified`
+quarantined and `fetch` did not; `LinkRemoved` checked rights and eleven
+siblings did not; `evict` learned about quarantine and `retire` did not;
+`tier` got a memory and `sync` did not. Searching for the siblings is now the
+cheapest review this project has.
