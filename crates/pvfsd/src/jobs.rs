@@ -387,7 +387,25 @@ fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsErro
     }
     let mut engine = pvfs_core::Engine::open(&data_dir)?;
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
+    // D102 — `sync` gets the SAME memory `tier` has. It never did: this
+    // Fetcher was built bare, so D98's "stop asking a question already
+    // answered nowhere" did not apply to it. Enabling `sync` on the
+    // production holder brought the whole not_found retry storm straight back
+    // through a job that had never been given the fix — the sibling-gap shape
+    // this project keeps finding. Shared durably via `fetch_unfetchable`
+    // (D99), so the two jobs teach each other and both survive a restart.
+    let known = engine.unfetchable_load().unwrap_or_default();
+    fetcher.seed_unfetchable(known.iter().cloned());
     let r = pvfs_client::fetch::sync_pull(&mut engine, &mut fetcher, &roots);
+    let learned: Vec<String> = fetcher
+        .unfetchable()
+        .iter()
+        .filter(|id| !known.contains(*id))
+        .cloned()
+        .collect();
+    if !learned.is_empty() {
+        let _ = engine.unfetchable_save(&learned);
+    }
     let is_replica = engine.is_replica();
     engine.close()?;
     // F5.5: advertise fetched copies for `sync --advertise` subtrees — the
