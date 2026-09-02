@@ -23,6 +23,25 @@ use crate::Client;
 /// Free function, not a method: the caller is inside a `self.pool` borrow, and
 /// taking `&self` here would fight it for nothing. Nothing about this needs
 /// fetcher state.
+/// D102 — the `String` form. `swarm_fetch` returns `Result<_, String>`, so the
+/// typed `PvfsError` is gone by the time the caller sees it; match on the
+/// wording `swarm_publish` produces instead. Narrow on purpose: only an id
+/// mismatch means "these bytes are not what the catalog names".
+fn quarantine_stale_str(engine: &Engine, id: &str, pin: &str, e: &str) {
+    if !e.contains("integrity violation") || !e.contains("id mismatch") {
+        return;
+    }
+    let reason = format!("id mismatch on swarm fetch: {e}");
+    match engine.quarantine_locations_at_pin(id, pin, &reason) {
+        Ok(uris) => {
+            for uri in uris {
+                eprintln!("fetch: quarantined stale location {uri} ({id})");
+            }
+        }
+        Err(err) => eprintln!("fetch: could not quarantine {id} at {pin}: {err}"),
+    }
+}
+
 fn quarantine_stale(engine: &Engine, id: &str, pin: &str, e: &PvfsError) {
     if !matches!(e, PvfsError::Integrity { .. }) {
         return;
@@ -255,6 +274,26 @@ impl Fetcher {
                     // the partial (if any) stays for resume; a fresh attempt
                     // may still succeed single-stream from one good holder
                     eprintln!("swarm: falling back to single-stream ({e})");
+                    // D102 — with exactly ONE candidate, a whole-file mismatch
+                    // names its source: there is nowhere else the bytes could
+                    // have come from. D99 declined to quarantine here because a
+                    // multi-holder swarm cannot attribute a bad chunk — sound,
+                    // and incomplete, because the production holder pulls from
+                    // a single peer, so the case it declined is the only one
+                    // that occurs.
+                    //
+                    // Cost of leaving it: the log showed `resumed 663/663
+                    // chunks` — the file complete on disk and already proven
+                    // not to match — followed by a single-stream re-download of
+                    // 5.5 GB over the WAN to fail the identical check, every
+                    // pass, forever.
+                    if candidates.len() == 1 {
+                        if let Some(pin) = candidates.first().map(|c| c.pin.clone()) {
+                            if !pin.is_empty() {
+                                quarantine_stale_str(engine, id, &pin, &e);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1590,9 +1629,21 @@ pub fn sync_pull(
     let mut failed = Vec::new();
     for root in roots {
         for (id, label) in engine.missing_bytes(root)? {
+            // D102 — honour the same memory `tier_pass` honours. Seeding the
+            // fetcher was not enough on its own: this loop never consulted the
+            // set, so a node known to be nowhere was re-asked every pass, and
+            // never recorded when it turned out to be nowhere either.
+            if fetcher.unfetchable().contains(&id) {
+                continue;
+            }
             match fetcher.fetch(engine, &id) {
                 Ok(()) => fetched += 1,
-                Err(e) => failed.push((label, e)),
+                Err(e) => {
+                    if e.contains("no readable location") {
+                        fetcher.note_unfetchable(&id);
+                    }
+                    failed.push((label, e));
+                }
             }
         }
     }
