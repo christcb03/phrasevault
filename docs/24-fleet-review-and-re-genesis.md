@@ -395,10 +395,23 @@ a wrong-arch binary there means a dead daemon and no systemd to notice.
 
 ### Why it works
 
-Node ids are content-addressed and link ids exclude `created_at`/`author`
+~~Node ids are content-addressed and link ids exclude `created_at`/`author`
 (doc 03 §3.2, restated in doc 11 §2: *"Identities survive"*). A fresh forest
 built from the same bytes mints **the same ids**. Re-genesis is therefore a
-rebuild, not a rename-everything migration.
+rebuild, not a rename-everything migration.~~
+
+> **FALSE. Disproved by rehearsal, 2026-09-02 — see §16.** Two fresh forests
+> over byte-identical libraries produced **completely different ids for every
+> node**. The paragraph above misread its own source: doc 03 §3.2 says the
+> **LINK** id preimage excludes `created_at` and `author`. **Node** ids include
+> both, *and* a `creation_nonce` drawn from `rand::thread_rng()`
+> (`crates/pvfs-core/src/node.rs`, `preimage()`). A random nonce makes
+> reproduction impossible by construction — no amount of identical bytes can
+> defeat it.
+>
+> Re-genesis is therefore exactly what this paragraph said it was not: a
+> rename-everything migration. That does not kill it, but it changes the plan —
+> see §16.
 
 ### What it buys
 
@@ -1013,3 +1026,52 @@ quarantined and `fetch` did not; `LinkRemoved` checked rights and eleven
 siblings did not; `evict` learned about quarantine and `retire` did not;
 `tier` got a memory and `sync` did not. Searching for the siblings is now the
 cheapest review this project has.
+
+
+## 16. The re-genesis rehearsal (2026-09-02) — the premise was wrong
+
+Run on presubuntu against a synthetic library of four files deliberately larger
+than the 8 MiB chunk size, so a whole-file hash and a single chunk hash differ
+(below that they coincide and the test proves nothing).
+
+**Q1: do node ids survive a fresh genesis? NO.** Two independent forests over
+the same bytes agreed on node COUNT and on labels, and on nothing else. Every
+id differed. The cause is in `node::preimage()`: the id covers
+`creation_nonce`, `created_at` and `author`. The nonce is random; `created_at`
+is a wall clock; `author` is the signing device. §6 read doc 03 §3.2's
+statement about **link** ids as though it were about node ids.
+
+**What that costs.** Re-genesis cannot preserve node identity. Anything holding
+a node id outside the log — PVOS bindings, exports, the *arr hook's recorded
+ids, shares, anything a user bookmarked — points at nothing afterwards. The
+migration is real work, not a rebuild-in-place.
+
+**What still holds.** The hash work genuinely survives, which was the expensive
+half: production shows `scan: hash from sidecar` at scale, and sidecar coverage
+on the holder reached 96% before this was written. A re-genesis re-reads
+metadata, not 40 TB of bytes.
+
+**Q2: unresolved, and the test was wrong twice before it was right.** The
+one-shot `pvfs scan` adds files without hashing them, so the first rehearsal
+measured nothing; the watcher then found nothing to do because the files were
+already added. `loc hash` answered *"already hashed — id unchanged"* while no
+sidecar existed on disk — so **when a sidecar actually gets written is still
+unclear**, and it matters, because sidecars are the whole cost saving. Next
+rehearsal must establish it directly rather than inferring from log lines.
+
+**A note on the rehearsal itself.** The first version suppressed setup errors,
+so the forest was never built and every assertion compared empty to empty and
+reported `ok` — a vacuous pass, the exact failure this document catalogues
+elsewhere. The second compared `walk` output that turned out to be **labels,
+not ids**, and would have "confirmed" the false premise. Both were caught by
+noticing that counts looked impossible, not by the assertions.
+
+### What this changes about the plan
+
+1. **Re-genesis needs an id-mapping story**, or an explicit decision that old
+   ids are abandoned. That decision belongs to Chris and to PVOS, not to PVFS.
+2. **The compaction alternative deserves a second look** (doc 11). It targets
+   the same problem — log size and replay time — WITHOUT changing identity, and
+   the identity-preservation that made re-genesis look strictly better was
+   imaginary.
+3. **The cheap-hash property is real and worth keeping** either way.
