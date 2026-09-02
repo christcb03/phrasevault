@@ -191,3 +191,28 @@ Deviations from the plan, honestly:
   it can find without scanning the filesystem for export dirs.
 - `ServeStatus` answers Info-tier (anon-readable operational metadata, like `Info`);
   revisit only if job rows ever carry content-derived detail.
+
+## 8. What a job may assume about another job's memory (D98–D102)
+
+`tier` learned in D98 to stop re-asking for nodes every holder answered
+`not_found` for, and in D99 to keep that memory across restarts in
+`fetch_unfetchable`. `sync` had neither: `sync_pass` built its `Fetcher` bare
+and `sync_pull` never consulted the set.
+
+That stayed invisible while `sync` was off on the box that had the problem.
+Enabling it during the D99 production roll brought the whole retry storm back
+within minutes, through a job that had simply never been given the fix. D102
+gives `sync` the same durable set, so the two jobs teach each other.
+
+**The rule this leaves:** a fix to one job's fetch path is not done until every
+job that fetches has it. `tier`, `sync` and the mount's read-through all reach
+`Fetcher`, and each has its own construction site — a fix applied at one is
+invisible at the others until someone looks.
+
+**Job state vocabulary (D100).** `stalled` means a pass is in flight far past
+this job's own measured typical duration — evidence of being stuck. `overdue`
+means only that no pass has completed lately, which on a library this size is
+the normal state of a healthy long pass. The blunt check reported `stalled`
+until D100 and was wrong all three times it fired. Distinguishing "advancing
+slowly" from "wedged" needs a progress signal out of `scan_routed` and
+`tier_pass` that does not exist yet.

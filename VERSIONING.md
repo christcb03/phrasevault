@@ -14,9 +14,23 @@ held 24,585 of and the stale tree had never heard of.
 **RULE: the version a binary reports must identify the build, not just the
 release.** Put `git describe --tags --dirty` into `--version` so a tree that is
 27 commits past `v1.4` cannot present itself as the same thing as one that is
-107 past. Until that lands, verify a deploy by grepping the installed binary for
-a string only the intended build has — never by its version, and never by a
-green pipeline recap (doc 24 §7 A2–A4).
+107 past.
+
+**LANDED in D100** — `pvfs 1.4.0 (v1.4-133-g82bd163)`. Two things about how,
+because the obvious implementation does not work here:
+
+* `build.rs` cannot run `git describe` on the build host. The pipeline rsyncs
+  the repo with `.git` excluded, so the first attempt stamped `unknown` on
+  precisely the builds that get deployed. The playbook resolves it on the
+  CONTROL machine and passes `PVFS_BUILD` in; `build.rs` prefers that, falls
+  back to git, then to `unknown`.
+* **The NAS binaries still say `unknown`.** `build-nas.sh` cross-compiles
+  outside the playbook and no one passes it `PVFS_BUILD`. Until that is fixed,
+  a QNAP deploy is verified by CONTENT — grep the installed binary for a string
+  only the intended build has — not by version.
+
+That content check remains the fallback everywhere, and the only check that has
+never been wrong (doc 24 §7 A2–A4).
 
 ## Wire protocol version (`pvfs_proto::PROTO_VERSION`)
 

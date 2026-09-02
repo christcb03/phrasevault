@@ -174,3 +174,41 @@ chunks** and completed from both holders. Findings, honestly:
   the fleet carries that proof; the smoke pins attestation shipping and
   read correctness. And pvos-test earned its keep once more: it has no
   `sqlite3` CLI, which taught the smoke to probe through python instead.
+
+## 7. Integrity failures are evidence (D99, D102)
+
+A fetch that streams bytes and then fails its whole-file hash has learned
+something durable: the bytes at that location are not the bytes the catalog
+names. Until D99 the remote path only printed a line, while `read_verified`
+had always quarantined the identical failure found locally. Five production
+files produced 1,814 log lines re-fetching what could never commit.
+
+**Single-stream** (D99): an `Integrity` commit failure quarantines every
+location of that node at the failing candidate's pin. `candidates()` then skips
+quarantined URIs — `Engine::locations()` deliberately still returns them, since
+evict, reclaim and `loc_verify` all need to see one and re-reading is how a
+quarantine is LIFTED.
+
+**Swarm** (D102): quarantines only when there is exactly ONE candidate. A swarm
+assembles chunks from every holder, so a whole-file mismatch cannot name which
+one served bad bytes, and each chunk was already verified against the signed
+manifest during assembly — blaming a pin would strand good holders. With a
+single candidate that ambiguity does not exist.
+
+D99 declined the swarm case entirely on that reasoning. It was sound and
+incomplete: the production holder pulls from one peer, so the declined case was
+the only one occurring. The cost was visible in the log —
+
+```
+swarm: resumed 663/663 chunks from a previous attempt
+swarm: falling back to single-stream (integrity violation on cb1f74a5…)
+```
+
+— a file already complete on disk and already proven not to match, re-fetched
+whole (5.5 GB, over a WAN) to fail the identical check, every pass.
+
+**What none of this does** is adopt the new bytes. A file that changed under
+the catalog is doc 04 §4.4's case: corruption and an upgrade are
+indistinguishable to a scanner, and silently adopting either would make the log
+ratify whatever last overwrote the disk. Quarantine stops the bleeding and
+makes the choice visible; `resolve --replace` stays the operator's.

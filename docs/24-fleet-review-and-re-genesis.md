@@ -901,10 +901,50 @@ code. CLAUDE.md says to delete the slot on merge; the rule survived about a
 day. **Reaping merged slots should be automatic, and is now the one open item
 this milestone leaves behind.**
 
-## 13. Open after D100
+## 13. The production roll (2026-09-01) — what deploying it taught
 
-1. **Automate build-slot reaping.** See above. A rule that depends on memory
-   already failed once, loudly.
+D99+D100 rolled owner → ingest → holder, each verified before the next. Every
+box MIGRATED 13→14 in place; no replay. Owner and ingest report
+`v1.4-133-g82bd163`, the first deploy here whose binaries can prove which build
+they are. The holder's `tier` went from `stalled` at 2,112 minutes with zero
+completed passes to `idle`.
+
+Three things only a real roll could show.
+
+**The watchdog races the play.** `bin/watchdog.sh` (D83, written after the NAS
+sat down for ten hours unnoticed) restarts pvfsd every 30s — inside the exact
+window the play waits for it to exit, so the play concludes "still holding its
+binary" forever. Neither knows the other exists. A NAS roll currently needs the
+watchdog stopped by hand and RESTARTED afterwards; forgetting the restart
+leaves the holder unsupervised, which is the outage D83 exists to prevent.
+**Not yet fixed** — the play should bracket the swap itself.
+
+**`Daemon up` passed by coincidence.** `grep -c listening pvfsd.log`, failing
+unless the digit `1` appeared in the total — a count of every start the log had
+ever held. It passes at 1 and 10–19, fails at 20 and 30. It failed this roll at
+exactly 30 on a daemon that was up and serving. D101 asks instead whether the
+daemon is running, matched on this mount's own argv.
+
+**The play forced `sync` on, against the inventory.** The holder declares
+`follow,tier` with sync deliberately off. Turning it on was not cosmetic:
+`sync_pass` built its `Fetcher` with no `seed_unfetchable`, so D98's memory
+never covered it and the not_found retry storm returned within minutes through
+a job that had never been given the fix. D101 removes the forcing; D102 gives
+`sync` the memory.
+
+Two guards were RIGHT and stay: refusing when `media_node` was unset — before
+the binary swap, not after — and refusing to overwrite a binary pvfsd still
+held open. Both would have left the holder rolled but down.
+
+## 14. Open after D102
+
+1. **Automate build-slot reaping.** Each session slot is a full source + target
+   tree (~6 GB); three MERGED ones went unreaped and presubuntu hit 96G/96G,
+   which failed two pipeline runs and looked like a code failure. CLAUDE.md says
+   to delete them on merge; the rule lasted a day.
+2. **The play should bracket the watchdog** around a NAS swap (§13).
+3. **`build-nas.sh` does not stamp `PVFS_BUILD`**, so QNAP binaries report
+   `unknown` and must be verified by content (VERSIONING.md).
 2. **The stall metric proper** — progress within a pass (§12).
 3. **D99's marking path end to end** — needs a live peer (§11 item 12).
 4. **The rebuild** (§6), and the `D84` duplicate nodes it clears.

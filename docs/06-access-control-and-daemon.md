@@ -247,3 +247,42 @@ P0 kernel encodings unchanged through A; B adds one event kind and one table; C/
 | Access control | Per-node ACLs (`r`/`w`/`a`), inherited, grant-only v1, owner always full |
 | Registration | One-time `sudo`; registry is a trusted discovery map (forest → owner → socket) |
 | Surfaces | library (same-user) · daemon socket (cross-user) · FUSE (admin/`sudo`) |
+
+## D100 — the catch-all that was default-allow
+
+`check_member_event` matched a handful of event kinds and ended `_ => {}`.
+Everything unnamed passed on `require_active_author` alone: "is this device key
+live?", never "may this key do this to this node?". Eleven tree-mutating kinds
+fell through — `FileLocationRemoved`, `NodePurged`, `NodeCreated`,
+`MediaQuality`, the link relabel/reorder/supersede/suspend family, and folder
+bind/unbind — while `LinkRemoved` sat directly above them doing the per-node
+match properly.
+
+**Where the exposure was.** Narrower than it first looks: the prepared-write
+path a remote member uses (`prepare_remove_location` and friends) has always
+checked rights. The gap was the two paths that judge an event already in hand —
+`fold_one` on replay and `check_member_event_batched` on local commit.
+`fold_one`'s own comment promises "a tampered or synced log can't carry an event
+its author had no right to". For eleven kinds it did not.
+
+**The rights each takes now:** write on the file to retire a location (the exact
+counterpart of `FileLocationAdded`); **admin** to purge, because that one cannot
+be undone and `unlink` is the write-tier act; write on the link's parent for the
+whole link family, via one shared helper; write on the folder to bind or unbind,
+since binding decides what a folder ingests and unbinding strands every location
+under it.
+
+**The part that outlives the eleven arms: the match is now exhaustive.** Adding
+an event kind FAILS TO COMPILE until someone decides what right it needs. That
+decision should cost a build error, not a security review. Kinds that are
+allowed are allowed by a named arm giving the reason — `NodeCreated` confers
+nothing until a gated `LinkCreated` places it; `MemberTagged` acts under its own
+signed authority; the identity kinds are gated by the caller at both commit and
+replay; `Unknown` is D72's bounded deferral.
+
+**Verifying a change here.** These checks run on replay of events that predate
+them, so a projection rebuild can refuse a log that has always been fine. D100
+was checked against a copy of the production log — 148 MB, ~241k events, with
+`index.db` absent so the whole log folded through the new rules — and rebuilt a
+116 MB projection with zero rejections. Do that for any change to
+`check_member_event` or `fold_one`; the unit tests cannot see it.
