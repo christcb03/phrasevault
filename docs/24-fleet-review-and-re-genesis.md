@@ -1067,13 +1067,24 @@ half: production shows `scan: hash from sidecar` at scale, and sidecar coverage
 on the holder reached 96% before this was written. A re-genesis re-reads
 metadata, not 40 TB of bytes.
 
-**Q2: unresolved, and the test was wrong twice before it was right.** The
-one-shot `pvfs scan` adds files without hashing them, so the first rehearsal
-measured nothing; the watcher then found nothing to do because the files were
-already added. `loc hash` answered *"already hashed — id unchanged"* while no
-sidecar existed on disk — so **when a sidecar actually gets written is still
-unclear**, and it matters, because sidecars are the whole cost saving. Next
-rehearsal must establish it directly rather than inferring from log lines.
+**Q2: RESOLVED, and the answer was a bug (D103).** Sidecars were written by
+`fill_hash_if_needed` — the path for files added *unhashed* — and by nothing
+else. Both `on_add` paths, which are the ones a re-import takes, called
+`hash_with_manifest` directly: they neither read a sidecar nor wrote one. The
+record built to make re-genesis cheap did not apply to re-genesis.
+
+So before D103, re-genesis would have re-read all 40 TB against 98% sidecar
+coverage already on disk. D103 gives both `on_add` sites the same reuse-and-
+record helper.
+
+**How it was proved matters, because two obvious methods cannot.** Timing tells
+you nothing — blake3 with rayon does 600 MB in about a second, so cold and warm
+scans look alike. Making the bytes unreadable tells you nothing either: the
+scan marks an unreadable file skipped *before* hashing, so the file never
+reaches the code under test (that run reported `1 skipped, 1 unreadable`, which
+confirmed the bug but could never confirm a fix). What works is a **sentinel
+hash** in the sidecar that the bytes cannot produce, size left honest — if the
+forest records it, it read the sidecar.
 
 **A note on the rehearsal itself.** The first version suppressed setup errors,
 so the forest was never built and every assertion compared empty to empty and
@@ -1092,4 +1103,14 @@ noticing that counts looked impossible, not by the assertions.
    the same problem — log size and replay time — WITHOUT changing identity, and
    the identity-preservation that made re-genesis look strictly better was
    imaginary.
-3. **The cheap-hash property is real and worth keeping** either way.
+3. **The cheap-hash property is real** — but it was not actually wired up until
+   D103. Worth keeping either way.
+4. **Quality, and anything else keyed by node id, can be CARRIED rather than
+   lost.** Chris's suggestion, and the machinery already exists: `fs.rs:1846`
+   does exactly this whenever hashing mints a successor id — read
+   `media_quality(&old)`, then `set_media_quality(&new, …)`, re-signed as a
+   fresh event for the new id rather than moved, because the log is
+   append-only. A re-genesis can open the old forest read-only and, for each
+   file it adds, carry the old record across matched **by path**. The same
+   shape works for ACL grants. That shrinks "what is lost" to things genuinely
+   tied to the old topology.
