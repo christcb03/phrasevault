@@ -1041,10 +1041,26 @@ id differed. The cause is in `node::preimage()`: the id covers
 is a wall clock; `author` is the signing device. §6 read doc 03 §3.2's
 statement about **link** ids as though it were about node ids.
 
-**What that costs.** Re-genesis cannot preserve node identity. Anything holding
-a node id outside the log — PVOS bindings, exports, the *arr hook's recorded
-ids, shares, anything a user bookmarked — points at nothing afterwards. The
-migration is real work, not a rebuild-in-place.
+**What that costs — MUCH LESS than first written.** The sentence here used to
+read "anything holding a node id outside the log — PVOS bindings, exports, the
+*arr hook's recorded ids, shares — points at nothing afterwards". That was
+asserted, not checked. Checked (2026-09-07), the real set is small:
+
+| holder | addresses by | survives re-genesis? |
+|---|---|---|
+| *arrs, rclone, anything on the mount | path + filename | **yes** — never sees an id |
+| PVOS `MountBind` | a **tree path**, resolved to an id at call time (`mounts.rs:231`) | **yes** |
+| PVOS regions / `folder_id` | read back from PVFS, not persisted | **yes** |
+| `fleet-prod.ini` `media_node` | one node id | no — one line to re-point |
+| `.pvfs/placement` on each box | the same id, 2–4 keys | no — one value per box |
+
+So the durable external references amount to **a single node id — the Media
+folder — written in one inventory line and one placement file per box.** Not
+nothing, but a five-minute edit rather than a migration.
+
+What is genuinely lost is log CONTENT, which was already known and listed: ACL
+grants, the 24,585 `MediaQuality` events (re-derivable by re-running the *arr
+hook), tags, and locations held by other hosts.
 
 **What still holds.** The hash work genuinely survives, which was the expensive
 half: production shows `scan: hash from sidecar` at scale, and sidecar coverage
@@ -1068,8 +1084,10 @@ noticing that counts looked impossible, not by the assertions.
 
 ### What this changes about the plan
 
-1. **Re-genesis needs an id-mapping story**, or an explicit decision that old
-   ids are abandoned. That decision belongs to Chris and to PVOS, not to PVFS.
+1. ~~**Re-genesis needs an id-mapping story.**~~ Largely moot — see the table
+   above. Non-native apps address by path and never see an id; PVOS resolves
+   paths to ids at call time and persists none. Re-pointing `media_node` and
+   the placement files is the whole of it.
 2. **The compaction alternative deserves a second look** (doc 11). It targets
    the same problem — log size and replay time — WITHOUT changing identity, and
    the identity-preservation that made re-genesis look strictly better was
