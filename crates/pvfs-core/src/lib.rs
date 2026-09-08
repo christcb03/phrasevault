@@ -46,7 +46,8 @@ pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
     BindKind, BindSpec, Binding, BindingRow, HashPolicy, NodeStat, PendingChange, ResolveAction,
-    BackfillReport, ScanReport, ScanStats, ScanWriter, VerifyOutcome, WATCH_SETTLE_MS,
+    BackfillReport, ScanReport, ScanStats, ScanWriter, VerifyOutcome, UNLINK_GRACE_MS,
+    WATCH_SETTLE_MS,
 };
 pub use identity::Mnemonic;
 pub use link::{Link, LinkId, LINK_CONTAINS, LINK_REF};

@@ -24,6 +24,11 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_ms: u64,
+    /// When this entry last changed on THIS filesystem: `max(mtime, ctime)`.
+    ///
+    /// D112 — the settle window needs a "has it stopped moving" signal, and
+    /// mtime is not one when the writer back-dates it. See [`changed_ms`].
+    pub changed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +231,38 @@ pub fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// When a file last changed on THIS filesystem — `max(mtime, ctime)`.
+///
+/// D112. The settle window asks "has it stopped moving?" and used mtime alone,
+/// on the reasoning that a growing file's mtime keeps advancing. That holds for
+/// a local copier like Sonarr. It is FALSE for anything that back-dates the
+/// destination: rclone preserves the SOURCE mtime, so a file that landed thirty
+/// seconds ago carries an mtime from two days back, clears a 15-second window
+/// instantly, and gets catalogued mid-copy at a partial size.
+///
+/// Measured on the production holder 2026-09-08 — arrivals whose mtime sat
+/// 41.8h and 56.5h BEHIND their ctime. Every one of them was ingested at the
+/// wrong size, failed the name+size identity match against the node the ingest
+/// box had already made, and minted a duplicate. That is where the forest's
+/// 1,901 `missing` entries came from: not deletions, and not lag — the ORIGINAL
+/// node of each pair, stripped of its location by its own twin.
+///
+/// ctime is set by the kernel on every content or metadata change and cannot be
+/// back-dated from userspace (`utimes` moves mtime and atime, never ctime), so
+/// it marks when the bytes really last moved here. Taking the max keeps mtime's
+/// behaviour wherever mtime is the later of the two.
+fn changed_ms(md: &fs::Metadata) -> u64 {
+    let m = mtime_ms(md);
+    #[cfg(unix)]
+    let m = {
+        use std::os::unix::fs::MetadataExt;
+        let secs = md.ctime().max(0) as u64;
+        let nanos = md.ctime_nsec().max(0) as u64;
+        m.max(secs.saturating_mul(1_000).saturating_add(nanos / 1_000_000))
+    };
+    m
+}
+
 fn mtime_ms(md: &fs::Metadata) -> u64 {
     md.modified()
         .ok()
@@ -311,6 +348,7 @@ impl StorageBackend for LocalBackend {
                 is_dir: md.is_dir(),
                 size: md.len(),
                 mtime_ms: mtime_ms(&md),
+                changed_ms: changed_ms(&md),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));

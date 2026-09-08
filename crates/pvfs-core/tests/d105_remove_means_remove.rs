@@ -58,6 +58,17 @@ fn names(e: &Engine, folder: &str) -> Vec<String> {
 }
 
 /// The whole point: delete a file, and it leaves the tree — no second step.
+///
+/// **D112 made that eventual rather than immediate**, and this test says so.
+/// The original asserted the node was gone on the very pass that saw the file
+/// disappear, which is right on a forest whose own boxes are the only writers
+/// and wrong on a fleet whose mover works outside the catalogue: between the
+/// ingest retiring its location and the holder recording its own, a file the
+/// NAS is holding has no live location at all. `UNLINK_GRACE_MS` is the
+/// difference between "this box lost its copy" and "this file is gone".
+///
+/// No second manual step, which was Chris's requirement — just a day's wait
+/// that a real deletion sails through and a mover-in-flight never reaches.
 #[test]
 fn a_deleted_file_leaves_the_tree() {
     let dir = tempfile::tempdir().unwrap();
@@ -65,6 +76,32 @@ fn a_deleted_file_leaves_the_tree() {
     assert_eq!(names(&e, &folder).len(), 2, "both indexed to begin with");
 
     std::fs::remove_file(lib.join("gone.mkv")).unwrap();
+    let reports = e.scan_routed(Some(&folder), None, 0).unwrap();
+    assert_eq!(
+        reports.iter().map(|r| r.stats.unlinked).sum::<u64>(),
+        0,
+        "not on the pass that first sees it gone (D112)"
+    );
+    assert_eq!(
+        reports.iter().map(|r| r.stats.pending_unlink).sum::<u64>(),
+        1,
+        "it is waiting, and the wait is reported"
+    );
+
+    // Age the note by a day, exactly as real time would. The state dir comes
+    // from the engine rather than being reconstructed from the tempdir path —
+    // guessing it wrong fails as CannotOpen, which reads like a bug in the
+    // thing under test rather than in the test.
+    let data = e.data_dir().to_path_buf();
+    e.close().unwrap();
+    let conn = rusqlite::Connection::open(data.join("index.db")).unwrap();
+    conn.execute(
+        "UPDATE scan_unheld SET since_ms = since_ms - ?1",
+        rusqlite::params![(pvfs_core::UNLINK_GRACE_MS + 60_000) as i64],
+    )
+    .unwrap();
+    drop(conn);
+    let mut e = Engine::open(&data).unwrap();
     let reports = e.scan_routed(Some(&folder), None, 0).unwrap();
 
     let left = names(&e, &folder);

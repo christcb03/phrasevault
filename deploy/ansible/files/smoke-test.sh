@@ -276,10 +276,32 @@ say "P1: disk deletion removes the file from the tree (D105)"
 # retires the location AND drops the link. Before D105 the node stayed listed
 # and unavailable, waiting for a manual `missing --forget` — in production that
 # left 1,849 records from one folder.
+#
+# D112 — the link goes EVENTUALLY, not on the pass that first sees the file
+# gone. Having no live location is not the same statement as nobody having the
+# bytes: cloudplow moves files off the ingest without telling PVFS, so between
+# the ingest retiring its location and the holder recording its own, a file the
+# NAS is holding has none at all. Unlinking there removes something that exists.
 rm "$LIB/notes.txt"
 DEL_JSON="$($PVFS --json scan "$LFOLDER")"
 echo "$DEL_JSON" | qgrep '"removed":1' && ok "deletion retired the location" || fail "deletion retired the location"
-echo "$DEL_JSON" | qgrep '"unlinked":1' && ok "and unlinked the node" || fail "and unlinked the node"
+echo "$DEL_JSON" | qgrep '"unlinked":0' && ok "but did NOT unlink on the first pass" || fail "but did NOT unlink on the first pass"
+echo "$DEL_JSON" | qgrep '"pending_unlink":1' && ok "the wait is reported" || fail "the wait is reported"
+$PVFS --json ls "$LFOLDER" | qgrep 'notes.txt' \
+  && ok "and the file is still browsable while the grace runs" \
+  || fail "and the file is still browsable while the grace runs"
+
+# Age the note by a day, exactly as real time would, and the node goes. This is
+# the half that proves the grace EXPIRES — a wait that never ends is just the
+# old manual-step problem wearing a clock.
+python3 - "$PVFS_DATA_DIR/index.db" <<'AGE'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("UPDATE scan_unheld SET since_ms = since_ms - ?", (25*60*60*1000,))
+c.commit()
+AGE
+DEL_JSON="$($PVFS --json scan "$LFOLDER")"
+echo "$DEL_JSON" | qgrep '"unlinked":1' && ok "and unlinked the node once the grace expired" || fail "and unlinked the node once the grace expired"
 $PVFS --json ls "$LFOLDER" | qgrep 'notes.txt' \
   && fail "deleted file must not still be listed" || ok "deleted file is out of the listing"
 
@@ -391,23 +413,27 @@ $PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail
 # a pass that retired a location on a box still holding a copy. Delete the file
 # the watcher just ingested and watch it leave, then read the count out of the
 # watcher's own output rather than out of the forest.
+# D112 — the watcher notices, retires the location and starts the clock; the
+# node itself stays until the grace expires. So what is asserted here is that
+# the watcher SAW it and said so, not that the file vanished on the spot.
 rm -f "$LIB/movies/watched.mkv"
 for _ in $(seq 1 120); do
-  $PVFS ls "$MOVIES" | qgrep watched.mkv || break
+  qgrep '!0 -1' <"$WATCH_LOG" && break
   sleep 0.5
 done
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
-$PVFS ls "$MOVIES" | qgrep watched.mkv && fail "watcher unlinked a deleted file" \
-  || ok "watcher unlinked a deleted file"
-if qgrep '~1' <"$WATCH_LOG"; then
-  ok "watcher REPORTED the unlink count"
+if qgrep '!0 -1' <"$WATCH_LOG"; then
+  ok "watcher saw the deletion and retired the location"
 else
-  fail "watcher REPORTED the unlink count"
-  echo "--- watcher log (expected an ingested line ending ~1) ---"
+  fail "watcher saw the deletion and retired the location"
+  echo "--- watcher log ---"
   sed 's/^/    /' "$WATCH_LOG" 2>/dev/null | tail -20
   echo "--- end watcher log ---"
 fi
+$PVFS ls "$MOVIES" | qgrep watched.mkv \
+  && ok "and left it in the tree while the grace runs" \
+  || fail "and left it in the tree while the grace runs"
 
 say "P1.5: forest init / registry / mount URIs"
 MOUNT="$DATA/workspace"

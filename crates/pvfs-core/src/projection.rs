@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -255,6 +255,23 @@ CREATE TABLE IF NOT EXISTS fetch_unfetchable (
   noted_at INTEGER NOT NULL
 );
 
+-- D112 — files a scan found held NOWHERE, and WHEN it first found that.
+--
+-- Having no live location is NOT the same statement as nobody having these
+-- bytes. On a fleet whose mover works OUTSIDE the catalog (cloudplow rclones
+-- feederbox to the NAS and deletes the local copy), a file is routinely
+-- location-less for as long as it takes the holder to notice and record it.
+-- D105 unlinked on that signal alone, which would have taken files out of the
+-- tree that the NAS was holding the whole time.
+--
+-- So the observation is recorded and the decision deferred: unlink only if the
+-- file is STILL held nowhere a grace period later, and drop the row the moment
+-- any location appears. Derived state, never in the log.
+CREATE TABLE IF NOT EXISTS scan_unheld (
+  file_id  TEXT PRIMARY KEY,
+  since_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS scan_state (
   uri        TEXT PRIMARY KEY,
   size_bytes INTEGER NOT NULL,
@@ -336,6 +353,7 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "pending_changes",
     "location_quarantine",
     "fetch_unfetchable",
+    "scan_unheld",
     "scan_state",
     "projection_meta",
     "media_quality",
@@ -1162,6 +1180,14 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                 params![file_id, uri, *added_at as i64],
             )
             .map_err(&m)?;
+            // D112 — somebody holds these bytes again, so the unlink clock
+            // stops. Cleared HERE, in the fold, and not in `add_location`,
+            // because the location that matters usually belongs to ANOTHER BOX
+            // and reaches this one as a followed event: the holder records the
+            // copy cloudplow moved, and the ingest — which is the box counting
+            // down — learns it only through the log.
+            tx.execute("DELETE FROM scan_unheld WHERE file_id = ?1", params![file_id])
+                .map_err(&m)?;
         }
         Event::FileLocationRemoved {
             file_id,
@@ -2900,6 +2926,7 @@ fn migrate_projection(
             11 => migrate_v11_to_v12(conn).map(|_| "media_quality"),
             12 => migrate_v12_to_v13(conn).map(|_| "folder_bindings keyed (folder_id, source_uri)"),
             13 => migrate_v13_to_v14(conn).map(|_| "fetch_unfetchable"),
+            14 => migrate_v14_to_v15(conn).map(|_| "scan_unheld"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -3061,6 +3088,21 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add temp_links.label"))?;
     }
+    Ok(())
+}
+
+fn migrate_v14_to_v15(conn: &mut Connection) -> Result<()> {
+    // D112 — purely additive, like v13→v14: a new cache table, no existing row
+    // touched. Starting empty is the RIGHT start: every file already held
+    // nowhere gets its grace clock set on the next pass that sees it, rather
+    // than being unlinked immediately on an upgrade.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scan_unheld (
+           file_id  TEXT PRIMARY KEY,
+           since_ms INTEGER NOT NULL
+         );",
+    )
+    .map_err(map_db("migrate v14→v15"))?;
     Ok(())
 }
 

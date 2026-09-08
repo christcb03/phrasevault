@@ -6512,13 +6512,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"pending_unlink\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
                             r.stats.changed,
                             r.stats.removed,
                             r.stats.unlinked,
+                            r.stats.pending_unlink,
                             r.stats.skipped,
                             r.stats.unreadable,
                             r.stats.empty_dirs
@@ -6529,13 +6530,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 for r in &reports {
                     println!(
-                        "{}: +{} added, {} unchanged, {} changed, -{} removed, -{} unlinked, {} skipped, {} unreadable, {} empty folders",
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, -{} unlinked, {} awaiting unlink, {} skipped, {} unreadable, {} empty folders",
                         r.folder_id,
                         r.stats.added,
                         r.stats.unchanged,
                         r.stats.changed,
                         r.stats.removed,
                         r.stats.unlinked,
+                        r.stats.pending_unlink,
                         r.stats.skipped,
                         r.stats.unreadable,
                         r.stats.empty_dirs
@@ -6548,6 +6550,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let unreadable: u64 = reports.iter().map(|r| r.stats.unreadable).sum();
                 if unreadable > 0 {
                     eprintln!("note: {unreadable} path(s) skipped — not readable by your user");
+                }
+                // D112 — say WHY nothing was unlinked, rather than leaving a
+                // zero that reads as "nothing was gone".
+                let waiting: u64 = reports.iter().map(|r| r.stats.pending_unlink).sum();
+                if waiting > 0 {
+                    eprintln!(
+                        "note: {waiting} file(s) are held nowhere but inside the grace period — \
+                         they leave the tree only if still unheld 24h after first being seen so. \
+                         `pvfs missing` lists them; a location appearing anywhere cancels it."
+                    );
                 }
             }
             engine.close()
