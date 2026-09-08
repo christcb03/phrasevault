@@ -31,6 +31,23 @@ const TMP_URI_PREFIX: &str = "pvfs-tmp:///";
 /// genuinely races an import — passes a non-zero window.
 pub const WATCH_SETTLE_MS: u64 = 15_000;
 
+/// How long a file must be held NOWHERE before a scan takes it out of the tree
+/// (D112).
+///
+/// D105 unlinked the instant the last location was retired. That is right on a
+/// forest whose boxes are the only writers, and wrong on this fleet: cloudplow
+/// rclones feederbox → NAS and deletes the local copy WITHOUT telling PVFS, so
+/// between the ingest retiring its location and the holder recording its own,
+/// a file the NAS is holding has no live location at all. Unlinking there takes
+/// a file that exists out of the catalogue.
+///
+/// A day is chosen against the measured gap rather than a feeling: the holder
+/// watches all 6,051 of its directories with inotify and sees an arrival within
+/// seconds, so the real window is seconds-to-minutes and 24h is orders of
+/// magnitude of headroom. It is also short enough that a genuine deletion
+/// clears itself without anyone doing anything, which was the point of D105.
+pub const UNLINK_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashPolicy {
     OnAdd,
@@ -180,6 +197,12 @@ pub struct ScanStats {
     /// they are different acts: one says "this box no longer holds it", the
     /// other says "it is not in the tree".
     pub unlinked: u64,
+    /// D112 — held nowhere, but not for long enough yet. These are the files
+    /// `UNLINK_GRACE_MS` is protecting: on this fleet a file the NAS holds is
+    /// briefly location-less every time cloudplow moves it, and unlinking on
+    /// that signal alone removes something that exists. Reported so the wait is
+    /// visible rather than looking like a scan that did nothing.
+    pub pending_unlink: u64,
     /// D71 W6: still being written when we looked, so deliberately NOT
     /// catalogued yet. Deferred, never dropped — the next pass takes it.
     pub settling: u64,
@@ -1145,28 +1168,27 @@ impl Engine {
                 // unlinked, the locations correctly retired, and 1,849 node
                 // records left behind for a fortnight in no report an operator
                 // reads (doc 24 §18).
+                // D112 — held nowhere is an OBSERVATION, not yet a verdict.
+                // See `UNLINK_GRACE_MS`: on this fleet the mover works outside
+                // the catalogue, so a file the NAS holds is routinely
+                // location-less for as long as it takes the holder to record
+                // it. All this arm does is write down WHEN it was first seen
+                // unheld; `unheld_sweep` below decides, later.
                 if self.locations(&file_id)?.is_empty() {
-                    for link in self.links_of(&file_id)? {
-                        let done = match writer {
-                            Some(w) => w.remove_link(&link),
-                            None => self.remove_link(&link),
-                        };
-                        match done {
-                            Ok(()) => stats.unlinked += 1,
-                            Err(e) if is_transient(&e) => return Err(e),
-                            // Same rule as the location arm above: one node the
-                            // catalog will not accept must not stop the line.
-                            Err(e) => {
-                                stats.needs_attention += 1;
-                                if stats.quarantined.len() < 8 {
-                                    stats.quarantined.push((uri.clone(), e.to_string()));
-                                }
-                            }
-                        }
-                    }
+                    self.unheld_note(&file_id)?;
                 }
             }
         }
+        // D112 — the decision, made over the NOTES rather than inside the
+        // removal arm above.
+        //
+        // It has to be here. The arm only runs for a location this pass has
+        // just retired, and a file's location is retired exactly once — so a
+        // deadline that falls due days later would never be reached from
+        // there, and the grace would be a wait that never ends. That is worse
+        // than the immediate unlink it replaced: it is the old manual-step
+        // problem wearing a clock.
+        self.unheld_sweep(&mut stats, writer)?;
         Ok(stats)
     }
 
@@ -1253,6 +1275,92 @@ impl Engine {
 
     /// D105 — this node's live links, so a file gone from disk can be taken
     /// out of the tree it is no longer in.
+    /// D112 — write down that this file is held nowhere, if we had not already.
+    ///
+    /// `INSERT OR IGNORE`, not `REPLACE`: the clock must start at the FIRST
+    /// sighting and keep running. Refreshing it on every pass would reset the
+    /// deadline forever and the file would never leave the tree.
+    fn unheld_note(&self, file_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO scan_unheld (file_id, since_ms) VALUES (?1, ?2)",
+                params![file_id, now_ms() as i64],
+            )
+            .map_err(map_db("unheld note"))?;
+        Ok(())
+    }
+
+    /// Forget that a file was ever seen unheld — it has a location again, or it
+    /// has just left the tree and the note has nothing left to protect.
+    fn unheld_clear(&self, file_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM scan_unheld WHERE file_id = ?1",
+                params![file_id],
+            )
+            .map_err(map_db("unheld clear"))?;
+        Ok(())
+    }
+
+    /// Act on the notes: unlink what has been held nowhere for a whole grace
+    /// period, and forget anything that has a location again.
+    ///
+    /// Runs at the end of every scan pass rather than inside the removal arm,
+    /// because the arm sees a file only on the one pass that retires its last
+    /// location — a deadline a day out would never be revisited from there.
+    fn unheld_sweep(
+        &mut self,
+        stats: &mut ScanStats,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> Result<()> {
+        let now = now_ms();
+        let rows: Vec<(String, u64)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT file_id, since_ms FROM scan_unheld")
+                .map_err(map_db("unheld sweep"))?;
+            let it = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+                .map_err(map_db("unheld sweep"))?;
+            it.collect::<std::result::Result<_, _>>()
+                .map_err(map_db("unheld sweep"))?
+        };
+        for (file_id, since) in rows {
+            // Somebody holds it again — the note has nothing left to protect.
+            // The fold clears these too; this is the belt to that braces, and
+            // it also catches a location that arrived before this box ever
+            // wrote the note.
+            if !self.locations(&file_id)?.is_empty() {
+                self.unheld_clear(&file_id)?;
+                continue;
+            }
+            if now.saturating_sub(since) < UNLINK_GRACE_MS {
+                stats.pending_unlink += 1;
+                continue;
+            }
+            for link in self.links_of(&file_id)? {
+                let done = match writer {
+                    Some(w) => w.remove_link(&link),
+                    None => self.remove_link(&link),
+                };
+                match done {
+                    Ok(()) => stats.unlinked += 1,
+                    Err(e) if is_transient(&e) => return Err(e),
+                    // Same rule as the location arm: one node the catalog will
+                    // not accept must not stop the line.
+                    Err(e) => {
+                        stats.needs_attention += 1;
+                        if stats.quarantined.len() < 8 {
+                            stats.quarantined.push((file_id.clone(), e.to_string()));
+                        }
+                    }
+                }
+            }
+            self.unheld_clear(&file_id)?;
+        }
+        Ok(())
+    }
+
     fn links_of(&self, file_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -3085,10 +3193,26 @@ fn walk_disk(
         // cataloguing a half-copied file records a wrong size and then
         // confidently mis-identifies it later.
         //
-        // mtime is the cheapest possible "has it stopped moving" test and
-        // needs no stored state: a growing file's mtime keeps advancing.
-        // Deferred, never dropped — counted, and the watcher comes back.
-        if ctx.settle_ms > 0 && entry.mtime_ms.saturating_add(ctx.settle_ms) > now_ms() {
+        // mtime was the cheapest possible "has it stopped moving" test and
+        // needs no stored state: a LOCALLY growing file's mtime keeps
+        // advancing. Deferred, never dropped — counted, and the watcher
+        // comes back.
+        //
+        // D112 — but mtime alone is not that test when the writer back-dates
+        // it. rclone preserves the SOURCE mtime on the destination, so a file
+        // cloudplow is still copying to the holder carries an mtime from days
+        // earlier, clears a 15-second window on its very first sighting, and is
+        // catalogued mid-copy at a partial size. That mis-sized node then fails
+        // the name+size identity match against the one the ingest box already
+        // made, and a DUPLICATE is minted — which is where this forest's 1,901
+        // `missing` entries came from (the original of each pair, stripped of
+        // its location by its twin). Measured on the holder: arrivals with
+        // mtime 41.8h and 56.5h behind their ctime.
+        //
+        // `changed_ms` is `max(mtime, ctime)`, and ctime cannot be back-dated
+        // from userspace — so this now asks the filesystem when the bytes last
+        // moved HERE, which is the question the window was always meant to ask.
+        if ctx.settle_ms > 0 && entry.changed_ms.saturating_add(ctx.settle_ms) > now_ms() {
             stats.settling += 1;
             continue;
         }

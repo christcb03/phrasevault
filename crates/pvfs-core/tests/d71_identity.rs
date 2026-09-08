@@ -48,6 +48,17 @@ fn folder(engine: &mut Engine, parent: &String, label: &str) -> String {
 
 /// Make a file old enough that the scan considers it settled. std's
 /// `FileTimes` keeps this dependency-free.
+/// Write a file and back-date its mtime.
+///
+/// D112 — this NO LONGER makes a file eligible for the settle window, and that
+/// is the point of D112: back-dating mtime is exactly what rclone does to every
+/// file it delivers, and treating it as "this has stopped moving" is how the
+/// holder catalogued half-copied files. The window now uses max(mtime, ctime),
+/// and ctime cannot be set from userspace.
+///
+/// Still used where a test needs an OLD mtime for its own sake. A test that
+/// needs a file to become settle-eligible must let real time pass — see
+/// `a_file_still_being_written_is_deferred_then_taken`.
 fn aged(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
     let f = fs::File::options().write(true).open(path).unwrap();
@@ -188,20 +199,30 @@ fn a_file_still_being_written_is_deferred_then_taken() {
     let src = tempfile::tempdir().unwrap();
     engine.bind_folder(&f, spec(src.path())).unwrap();
 
-    // Fresh mtime = Sonarr is still copying. The window is the WATCHER's, not
-    // every scan's — a one-shot scan indexes what is on disk now.
+    // A short window, and REAL time to cross it.
+    //
+    // This used to back-date the mtime to say "the copy finished". D112 made
+    // that ineffective on purpose: rclone back-dates the mtime of every file it
+    // delivers, so treating an old mtime as proof a file has stopped moving is
+    // how the production holder catalogued half-copied files at the wrong size
+    // and minted a duplicate node for each one. The window is `max(mtime,
+    // ctime)` now, and ctime cannot be back-dated from userspace — so the only
+    // honest way to become eligible is to actually stop changing for long
+    // enough, which is what the window means.
+    const SETTLE: u64 = 400;
     fs::write(src.path().join("growing.mkv"), b"first half").unwrap();
-    let rep = engine
-        .scan_routed(Some(&f), None, pvfs_core::WATCH_SETTLE_MS)
-        .unwrap();
+    let rep = engine.scan_routed(Some(&f), None, SETTLE).unwrap();
     assert_eq!(rep[0].stats.settling, 1, "still moving — must not be catalogued");
     assert_eq!(rep[0].stats.added, 0);
 
     // The copy finishes and the file stops changing.
-    aged(&src.path().join("growing.mkv"), b"first half and second half");
-    let rep = engine
-        .scan_routed(Some(&f), None, pvfs_core::WATCH_SETTLE_MS)
-        .unwrap();
+    fs::write(
+        src.path().join("growing.mkv"),
+        b"first half and second half",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(SETTLE + 250));
+    let rep = engine.scan_routed(Some(&f), None, SETTLE).unwrap();
     assert_eq!(rep[0].stats.settling, 0);
     assert_eq!(rep[0].stats.added, 1, "deferred, never dropped");
     engine.close().unwrap();

@@ -227,6 +227,22 @@ fn disk_delete_and_restore() {
     // tree. Before D105 the node stayed, listed to anyone browsing, waiting
     // for a manual `missing --forget` that in production nobody ran (1,849
     // such nodes from a single folder — doc 24 section 18).
+    //
+    // D112 — but not on THIS pass. Held-nowhere is an observation, and on a
+    // fleet whose mover works outside the catalogue it is a routine transient
+    // one, so the node leaves only if it is still unheld a day later. The
+    // no-second-manual-step property is intact; the timing is not immediate.
+    assert_eq!(r[0].stats.unlinked, 0, "not yet — the grace is running");
+    assert_eq!(r[0].stats.pending_unlink, 1, "and the wait is visible");
+    {
+        let conn = rusqlite::Connection::open(engine.data_dir().join("index.db")).unwrap();
+        conn.execute(
+            "UPDATE scan_unheld SET since_ms = since_ms - ?1",
+            rusqlite::params![(pvfs_core::UNLINK_GRACE_MS + 60_000) as i64],
+        )
+        .unwrap();
+    }
+    let r = engine.scan(Some(&folder)).unwrap();
     assert_eq!(r[0].stats.unlinked, 1, "and the node leaves the tree with it");
 
     // The EVENT history is still there — unlink is a soft remove on an
