@@ -1114,3 +1114,60 @@ noticing that counts looked impossible, not by the assertions.
    file it adds, carry the old record across matched **by path**. The same
    shape works for ACL grants. That shrinks "what is lost" to things genuinely
    tied to the old topology.
+
+
+## 17. Open before the real re-genesis (2026-09-07)
+
+D103 proved the cheap-hash property on live data: `TV/Reacher (2022)`, 67 GB,
+30 files, **83 seconds** — 27 hashes reused from sidecars, 3 hashed fresh and
+recorded, and `loc verify` confirmed a reused hash against the real bytes. The
+live forest was untouched throughout.
+
+That test was a **single-box forest**, and production is not one. What is still
+open:
+
+### Blocking
+
+1. **The fleet shape is untested.** The subset ran a scratch forest on the
+   holder, which was therefore its own owner. In production BOTH feederbox and
+   the holder are replicas that cannot write: every node and every location
+   goes to the owner as a member-signed prepared write. The `relocated` path —
+   a second box finding a file the catalog already knows and adding a location
+   instead of a node — has never been exercised through that routing, at any
+   scale. This is checklist F4, and it is the one that decides whether
+   re-genesis works at all.
+
+2. **There is no re-genesis tool** (F2 was never built). Every step is manual:
+   init, create folders, bind, scan on each box in the right order, re-grant,
+   re-point `media_node` and each box's `placement`. Nobody has written that
+   runbook, let alone rehearsed it.
+
+3. **The `MediaQuality` carry is designed, not built.** 24,585 events. The
+   machinery exists (`media_quality` / `set_media_quality`, and `fs.rs:1846`
+   already does exactly this for successor ids) — but nothing walks the old
+   forest and re-signs those records against the new ids. Without it the data
+   is lost, re-derivable only by re-running the *arr hook over the library.
+
+4. **No cutover plan for the mount.** Sonarr, Radarr and rclone read through a
+   mount pointed at a forest. Nothing says what they see while the new forest
+   is being built and verified, or how the swap happens without the *arrs
+   deciding their library vanished.
+
+### Worth settling, not blocking
+
+5. **Rollback.** The old forest must survive until the new one is verified, and
+   somebody has to define "verified" in advance — a file count, a hash
+   spot-check, a `missing` count — or the decision gets made under pressure.
+6. **F3's consistency check needs a before/after comparison to mean anything.**
+   Re-genesis silently drops the 1,416 `missing` entries and the 165 pending
+   changes. That is the point — but only if the counts are recorded first, so
+   the residue is seen rather than merely gone.
+
+### Already small — checked, not assumed
+
+- **ACLs: three grants, all `rwa` at the root.** Trivial to re-establish.
+- **External node-id references: one id** (the Media folder) in
+  `fleet-prod.ini` and one `placement` file per box.
+- **Duplicate nodes (D84) should NOT recur.** `match_by_identity` matches on
+  name + size, so a second box relocates rather than re-adds; and the cause of
+  the 206 (a stale node label after a rename) was fixed in D72.
