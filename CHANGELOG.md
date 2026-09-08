@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Detached subtrees are reported now (D106, doc 24 §18-19):** `pvfs
+  islands` walks from the forest root and names every live-linked node the
+  walk never reaches, **grouped by the folder whose link was cut** — one
+  line, not 1,849. Nothing could see these before: `orphans` asks whether a
+  node has a live link, `missing` whether a file is held, `reclaim` whether
+  central bytes have a live node, and a detached subtree answers all three
+  healthily because the only broken thing is one removed edge at its top,
+  which no node inside is adjacent to. Production carried 1,849 such nodes
+  (1,358 files, 491 folders) for a fortnight under a folder unlinked on
+  2026-08-24, in no report at all, holding space `reclaim` can never sweep.
+  The report dates the cut and sizes the loss. `pvfs unlink` now **counts
+  the subtree first and says what it is about to strand** — the operator
+  used to see one success and no number — and asks for confirmation at a
+  terminal (`--yes` skips it; scripted runs warn and proceed, so no
+  pipeline breaks). Unlink stays non-cascading: the semantics were never
+  the bug, the silence after was.
 - **The identity model, settled and frictionless (doc 18 §4, decided
   2026-08-13):** every outbound connection authenticates as the box's
   client identity — never the forest device key — and `pvfs forest init`

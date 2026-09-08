@@ -144,7 +144,7 @@ T_LINK="$($PVFS --json ls "$ROOT" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "scratch": print(e["link_id"])')"
-$PVFS unlink "$T_LINK" >/dev/null
+$PVFS unlink --yes "$T_LINK" >/dev/null
 assert_rc 3 "temp node purged on orphan → 3" -- $PVFS node "$T"
 
 say "orphans / purge"
@@ -156,7 +156,7 @@ import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "movies": print(e["link_id"])')"
 assert_rc 4 "purge non-orphan → 4" -- $PVFS purge "$A"
-$PVFS unlink "$A_LINK" >/dev/null
+$PVFS unlink --yes "$A_LINK" >/dev/null
 $PVFS orphans | qgrep "$A" && ok "orphan listed" || fail "orphan listed"
 $PVFS purge "$A" >/dev/null && ok "purge orphan" || fail "purge orphan"
 $PVFS orphans | qgrep "$G" && ok "ref-less child became orphan after purge" || fail "ref-less child became orphan after purge"
@@ -165,6 +165,62 @@ if $PVFS orphans | qgrep "$F"; then
 else
   ok "file with active refs is not an orphan"
 fi
+
+say "islands (D106) — a detached subtree, and the warning before the cut"
+# Unlink does not cascade: cut a folder's only inbound link and everything
+# beneath it stays live-linked to a live parent while leaving the tree. Every
+# node inside answers orphans/missing/reclaim healthily, so only a walk from
+# the root can see it (doc 24 §18).
+ISL="$($PVFS add "$ROOT" --kind folder --label Backups)"
+ISL_SUB="$($PVFS add "$ISL" --kind folder --label Feederbox)"
+$PVFS add "$ISL_SUB" --kind file --label saltbox.tar >/dev/null
+ISL_LINK="$($PVFS --json ls "$ROOT" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "Backups": print(e["link_id"])')"
+
+# By now this forest has a second tree (`tree create`) and a file held only by
+# refs from it. Both are reachable — from the OTHER tree's root — and a check
+# seeded from the forest root alone called both of them islands.
+$PVFS islands | qgrep "every live-linked node is reachable" \
+  && ok "a second tree and its ref-held file are not islands" \
+  || { fail "a whole forest reported an island"; $PVFS islands; }
+
+# The warning names the count BEFORE the cut, on stderr so a script still gets
+# its own stdout. Deliberately WITHOUT --yes and with stdin closed: that is the
+# scripted path, and it must warn and proceed rather than stall on a prompt.
+$PVFS unlink "$ISL_LINK" 2>"$DATA/unlink-warn.txt" >/dev/null </dev/null
+qgrep "strands 2 node(s)" <"$DATA/unlink-warn.txt" \
+  && ok "unlink warned what it was about to strand" \
+  || { fail "unlink warning"; cat "$DATA/unlink-warn.txt"; }
+
+$PVFS islands | qgrep "Backups" \
+  && ok "island reported, named by the folder that was unlinked" \
+  || { fail "island not reported"; $PVFS islands; }
+$PVFS --json islands | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["stranded"] == 2, r
+assert r["reachable"] < r["live_linked"], r
+assert len(r["islands"]) == 1, r
+i = r["islands"][0]
+assert i["label"] == "Backups", i
+assert (i["nodes"], i["files"], i["folders"]) == (2, 1, 1), i
+assert i["detached_at_ms"] is not None, i
+' && ok "island counts and grouping" || fail "island counts"
+
+# The stranded nodes are NOT orphans. That is the whole finding.
+if $PVFS orphans | qgrep "$ISL_SUB"; then
+  fail "a stranded child was listed as an orphan"
+else
+  ok "a stranded child keeps its live link, so orphans calls it healthy"
+fi
+
+# Re-linking clears it: the report is a cue, and it stops once acted on.
+$PVFS link "$ROOT" "$ISL" --type contains --nonce 1 >/dev/null
+$PVFS islands | qgrep "every live-linked node is reachable" \
+  && ok "re-linking cleared the island" \
+  || { fail "island survived re-linking"; $PVFS islands; }
 
 say "device certificates"
 DEV1_JSON="$($PVFS --json device authorize --mnemonic "$MNEMONIC" --index 1)"
@@ -560,7 +616,7 @@ P6LINK="$(jget "$($PVFS --json --data-dir "$REPMOUNT/.pvfs" link "$P6DIR" "$ATXT
 [ ${#P6LINK} -eq 64 ] && ok "member link wrote through (ref link created)" || fail "p6 link: $P6LINK"
 $PVFS remote --socket "$SOCK" --anon ls "$P6DIR" | qgrep a.txt \
   && ok "…and the ref landed in the owner's log" || fail "p6 link not on owner"
-$PVFS --data-dir "$REPMOUNT/.pvfs" unlink "$P6LINK" >/dev/null \
+$PVFS --data-dir "$REPMOUNT/.pvfs" unlink --yes "$P6LINK" >/dev/null \
   && ok "member unlink wrote through" || fail "p6 unlink"
 $PVFS remote --socket "$SOCK" --anon ls "$P6DIR" | qgrep a.txt \
   && fail "unlinked ref still visible" || ok "unlinked ref gone from the owner"
@@ -871,7 +927,7 @@ XLINK="$($PVFS --json ls "$ROOT" | python3 -c '
 import json,sys
 for e in json.load(sys.stdin):
     if e["label"] == "adoptee": print(e["link_id"])')"
-$PVFS unlink "$XLINK" >/dev/null
+$PVFS unlink --yes "$XLINK" >/dev/null
 $PVFS link "$PR" "$XADOPT" --type contains >/dev/null \
   && ok "cross-region orphan adoption (paired protocol)" || fail "orphan adoption"
 $PVFS --json region ls "$XADOPT" | qgrep "\"region\":\"$PR\"" \
