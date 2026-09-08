@@ -5,7 +5,7 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
-- **Detached subtrees are reported now (D105, doc 24 §18-19):** `pvfs
+- **Detached subtrees are reported now (D106, doc 24 §18-19):** `pvfs
   islands` walks from the forest root and names every live-linked node the
   walk never reaches, **grouped by the folder whose link was cut** — one
   line, not 1,849. Nothing could see these before: `orphans` asks whether a

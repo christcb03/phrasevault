@@ -1,4 +1,4 @@
-//! D105 — the island check: live-linked nodes the root cannot reach.
+//! D106 — the island check: live-linked nodes the root cannot reach.
 //!
 //! Unlink is a soft-remove of ONE link and does not cascade, so removing a
 //! folder's only inbound edge detaches everything beneath it in a single

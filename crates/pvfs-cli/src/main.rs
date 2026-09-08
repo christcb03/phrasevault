@@ -6508,12 +6508,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
                             r.stats.changed,
                             r.stats.removed,
+                            r.stats.unlinked,
                             r.stats.skipped,
                             r.stats.unreadable,
                             r.stats.empty_dirs
@@ -6524,12 +6525,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 for r in &reports {
                     println!(
-                        "{}: +{} added, {} unchanged, {} changed, -{} removed, {} skipped, {} unreadable, {} empty folders",
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, -{} unlinked, {} skipped, {} unreadable, {} empty folders",
                         r.folder_id,
                         r.stats.added,
                         r.stats.unchanged,
                         r.stats.changed,
                         r.stats.removed,
+                        r.stats.unlinked,
                         r.stats.skipped,
                         r.stats.unreadable,
                         r.stats.empty_dirs

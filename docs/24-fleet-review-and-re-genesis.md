@@ -1202,27 +1202,66 @@ Found while dry-running D104's carry: 24,585 quality measurements, 581 on a
 live-linked node, but only **119 reachable from the forest root**. The gap is
 not an accounting quirk.
 
-**Measured on the live owner index:**
+**Measured on the live owner index.** The first version of this table listed
+"with a live link: 36,120" beside "reachable: 34,271" as though they were rival
+totals, and omitted the largest group entirely — so the figures could not be
+made to add up. Chris said so. They do add up; here is the whole forest:
 
-| | |
-|---|---|
-| nodes total | 61,722 |
-| reachable from root | 34,271 |
-| with a live link | 36,120 |
-| **live-linked but UNREACHABLE** | **1,849** (1,358 files, 491 folders) |
+| group | nodes | |
+|---|---|---|
+| reachable from the root | 34,279 | the live tree |
+| live-linked but UNREACHABLE | 1,849 | the islands (1,358 files, 491 folders) |
+| **no live link at all** | **25,602** | **the group that was missing** |
+| **total** | **61,730** | 34,279 + 1,849 + 25,602 |
 
-**One cause, one edge.** `Backups` was unlinked on **2026-08-24 22:07 UTC**. It
-had three children — `Feederbox`, `Mac_iCloud_old`, `Mediabox` — holding
-Saltbox configs and archives. Unlink is a soft-remove of THAT LINK and does not
-cascade, so every node beneath kept its own live link to its own live parent
-and the whole subtree detached from the root in one operation.
+(36,120 was simply reachable + island, not a third category.)
 
-**Why nothing noticed.** From the inside the subtree is perfectly healthy: every
-node live-linked, every parent live, nothing marked removed except the single
-edge at the top. Only a walk from the root can see it, and the checks this
-system has ask a different question — "does this node have a live link?" — which
-all 1,849 answer yes to. That is exactly why `orphans` reports 939 while these
-1,849 appear in no report at all.
+**The 25,602 are not junk — they are the successor tax.** 25,589 are file
+nodes, and **25,587 of them have a live twin under the same name**: they are
+the PREDECESSORS left behind when a hash fill minted a successor. Exactly two
+are genuinely gone, and one is `.manifest` residue. So roughly **41% of the
+forest is superseded copies of files that are still there**, one per file
+hashed — the cost of successor-per-fill, at library scale. It is the strongest
+size argument for re-genesis, and it has nothing to do with the islands.
+
+**One cause, one edge — and the removal was INTENTIONAL.** `Backups` was
+unlinked on **2026-08-24 22:07 UTC**, when Chris moved the backups out of
+`/Media`. Those files are supposed to be gone from the forest, and the top-level
+unlink was the right call.
+
+What went wrong is what it left. Unlink soft-removes THAT LINK and does not
+cascade, so every node beneath — `Feederbox`, `Mac_iCloud_old`, `Mediabox` and
+their contents — kept its own live link to its own live parent. The subtree
+detached from the root in one operation and 1,849 node records stayed behind,
+describing files that are no longer in the library at all.
+
+**The removal mechanism DID work — every step but the last.** Chris asked
+whether something should detect a file moved out of a bound folder and drop its
+link. Something does, and it ran:
+
+1. The scan noticed the files were gone and removed their **locations**. All
+   1,849 island nodes now hold **zero live locations** — confirmed.
+2. It deliberately does NOT remove the **link**. `walk_disk`'s removal arm calls
+   `remove_location`, never unlink, because a scan cannot tell a deliberate
+   deletion from an accident from an unmounted volume (doc 04 / D81).
+3. `pvfs missing` reports exactly these — **715 of the entries in feederbox's
+   current report are Backups files** — and says what to do:
+   *"`pvfs missing --forget` unlinks them once you have decided."*
+4. Nobody has run `--forget`.
+
+So this is not a missing mechanism. It is an unrun command, and the design is
+deliberate: the last step is a human decision by construction.
+
+**The genuine gap is narrower than it first looked.** `missing` lists FILES, so
+an operator sees 1,416 filenames rather than "the Backups subtree is detached
+from the root; 1,849 nodes; run --forget". The 491 detached FOLDERS appear in no
+report at all, and nothing says the subtree is unreachable — which is why this
+sat for two weeks and was found during an unrelated investigation.
+
+**A correction this forces.** Earlier analysis in this document read the ~1,272
+photo-and-archive entries in `missing` as residue from an old, unrelated photo
+root. They are not: they are the Backups island, reported correctly the whole
+time and misread here.
 
 **What it costs a live forest.** Nothing on disk: the bytes are untouched and
 this is purely the catalog's shape. But `reclaim` trashes central bytes with no
@@ -1243,7 +1282,7 @@ unrelated investigation.
 
 ---
 
-## 19. D105 — the island check, and a warning before the cut
+## 19. D106 — the island check, and a warning before the cut
 
 Closes the gap §18 names. Two pieces: a report that finds a detached subtree,
 and a word from `unlink` at the moment one is about to be created.
