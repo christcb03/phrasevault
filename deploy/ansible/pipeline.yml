@@ -206,29 +206,6 @@
       changed_when: false
       tags: [install]
 
-    # D110 — the DAEMON's identity, which is the one that answers "what is this
-    # box running?" after a roll. `pvfsd --version` said a bare `pvfsd 1.4.0`
-    # until D110, so the only way to tell was to hash the binary.
-    - name: Verify the installed daemon reports its build
-      ansible.builtin.command: "{{ pvfs_user_bin }}/pvfsd --version"
-      register: pvfsd_version_out
-      changed_when: false
-      failed_when: false
-      tags: [install, daemon]
-
-    - name: The daemon's build identity is real, not "unknown"
-      ansible.builtin.assert:
-        that:
-          - pvfsd_version_out.rc == 0
-          - "'(' in pvfsd_version_out.stdout"
-          - "'unknown' not in pvfsd_version_out.stdout"
-        fail_msg: >-
-          pvfsd reports "{{ pvfsd_version_out.stdout | default('nothing') }}".
-          A daemon that cannot name its own build cannot be verified after a
-          roll except by hashing the binary — which on the holder is the box
-          where that is hardest. Check that PVFS_BUILD reached the build.
-        quiet: true
-      tags: [install, daemon]
 
     # ---- daemon (pvfsd as a systemd user service — INSTALL.md Option C, automated) ----
     # Proves the *service* lifecycle on the target, not just the ad-hoc daemon the
@@ -254,6 +231,36 @@
         mode: "0755"
         remote_src: true
       loop: [pvfs, pvfsd, pvfs-companion]
+      tags: [daemon]
+
+    # D110 — the DAEMON's identity, which is the one that answers "what is this
+    # box running?" after a roll. `pvfsd --version` said a bare `pvfsd 1.4.0`
+    # until D110, so the only way to tell was to hash the binary.
+    #
+    # AFTER the install above, not with the `pvfs` check in the install stage:
+    # that binary goes to /usr/local/bin while the daemon goes to ~/.local/bin
+    # HERE, so asking earlier reads whatever pvfsd the box had before this run.
+    # The first version of this check did exactly that and failed against a
+    # stale binary while the fresh one sat unbuilt-for two lines below.
+    - name: Verify the installed daemon reports its build
+      ansible.builtin.command: "{{ pvfs_user_bin }}/pvfsd --version"
+      register: pvfsd_version_out
+      changed_when: false
+      failed_when: false
+      tags: [daemon]
+
+    - name: The daemon's build identity is real, not "unknown"
+      ansible.builtin.assert:
+        that:
+          - pvfsd_version_out.rc == 0
+          - "'(' in pvfsd_version_out.stdout"
+          - "'unknown' not in pvfsd_version_out.stdout"
+        fail_msg: >-
+          pvfsd reports "{{ pvfsd_version_out.stdout | default('nothing') }}".
+          A daemon that cannot name its own build cannot be verified after a
+          roll except by hashing the binary — which on the holder is the box
+          where that is hardest. Check that PVFS_BUILD reached the build.
+        quiet: true
       tags: [daemon]
 
     - name: Install the shared socket-dir tmpfiles snippet (doc 06 §2)

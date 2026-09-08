@@ -232,7 +232,15 @@ fn follow_job_keeps_a_replica_fresh() {
 
     // the status row reflects a working follower (the fold lands just before
     // the CaughtUp callback stamps the row — give it a beat)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    //
+    // 20s, matching the fold above, not 5. The old asymmetry was the flake:
+    // the HARD part got 20s and the trivial callback that follows it got 5, on
+    // a machine that had just spent the fold's whole budget being slow. It
+    // failed on the slower of the two build hosts on 2026-09-08 with
+    // `last_ok_ms: None` while the fold itself had passed. Polling breaks as
+    // soon as the row lands, so a healthy box pays nothing for the larger
+    // ceiling — how FAST the stamp arrives is not what this asserts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let row = jobs
             .snapshot()
