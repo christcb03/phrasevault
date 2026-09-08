@@ -1194,3 +1194,49 @@ open:
 - **Duplicate nodes (D84) should NOT recur.** `match_by_identity` matches on
   name + size, so a second box relocates rather than re-adds; and the cause of
   the 206 (a stale node label after a rename) was fixed in D72.
+
+
+## 18. The islands — measured, and the mechanism (2026-09-07)
+
+Found while dry-running D104's carry: 24,585 quality measurements, 581 on a
+live-linked node, but only **119 reachable from the forest root**. The gap is
+not an accounting quirk.
+
+**Measured on the live owner index:**
+
+| | |
+|---|---|
+| nodes total | 61,722 |
+| reachable from root | 34,271 |
+| with a live link | 36,120 |
+| **live-linked but UNREACHABLE** | **1,849** (1,358 files, 491 folders) |
+
+**One cause, one edge.** `Backups` was unlinked on **2026-08-24 22:07 UTC**. It
+had three children — `Feederbox`, `Mac_iCloud_old`, `Mediabox` — holding
+Saltbox configs and archives. Unlink is a soft-remove of THAT LINK and does not
+cascade, so every node beneath kept its own live link to its own live parent
+and the whole subtree detached from the root in one operation.
+
+**Why nothing noticed.** From the inside the subtree is perfectly healthy: every
+node live-linked, every parent live, nothing marked removed except the single
+edge at the top. Only a walk from the root can see it, and the checks this
+system has ask a different question — "does this node have a live link?" — which
+all 1,849 answer yes to. That is exactly why `orphans` reports 939 while these
+1,849 appear in no report at all.
+
+**What it costs a live forest.** Nothing on disk: the bytes are untouched and
+this is purely the catalog's shape. But `reclaim` trashes central bytes with no
+live link, and these all HAVE live links — so the space they occupy is
+invisible to the sweeper and will not come back. And it scales with one
+command: unlinking a folder with 10,000 descendants strands 10,000 nodes while
+the operator sees one success.
+
+**For re-genesis this is an argument, not an obstacle.** A new forest is built
+by walking directories on disk, so an island simply never appears — the 1,849
+are dropped by construction. Better grounds for rebuilding than log size.
+
+**The gap worth closing regardless:** nothing detects or reports a detached
+subtree. Unlink's non-cascading semantics are defensible; the silence after is
+not. A check that walks from the root — rather than asking about links — would
+surface an island the day it forms instead of a fortnight later during an
+unrelated investigation.
