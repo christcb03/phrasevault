@@ -130,6 +130,10 @@ pub struct DuplicateGroup {
     pub drop: Vec<NodeId>,
     /// Live locations across the whole group — what a merge has to preserve.
     pub locations: u64,
+    /// Every member's recorded size. **These usually DISAGREE** — that
+    /// disagreement is why the pair exists, since the identity match joins on
+    /// size and so could never see them as the same file (D114).
+    pub sizes: Vec<u64>,
 }
 
 /// Duplicate files, and what a merge would do about them (D113).
@@ -2796,9 +2800,20 @@ impl Engine {
 
     /// Files the catalogue holds MORE THAN ONCE at the same place (D113).
     ///
-    /// A group is: same live parent, same effective name, same size — which is
-    /// the identity rule `match_by_identity` uses, so a group here is exactly a
-    /// set the scan can no longer tell apart.
+    /// A group is: same live parent, same effective name. **Not size.**
+    ///
+    /// D114 — grouping by the identity rule (name AND size) found NOTHING on
+    /// production, because the identity rule is exactly what failed to match
+    /// these nodes: they differ in size, which is why each pair exists at all.
+    /// Measured on one pair — 1,594,457,815 against 1,544,349,595 for the same
+    /// episode, ~50 MB apart, with the file actually on disk matching the node
+    /// that holds NO location. Grouping by the broken rule reproduces the
+    /// breakage.
+    ///
+    /// A directory cannot hold two files with one name, so the parent and the
+    /// effective name are sufficient and the size is evidence rather than a
+    /// key. It is reported per member so the operator can see the disagreement
+    /// that made the pair.
     ///
     /// Production made ~1,910 of these and D112 explains how: rclone preserves
     /// the source mtime, the settle window trusted mtime, and the holder
@@ -2833,32 +2848,32 @@ impl Engine {
             })
             .map_err(map_db("duplicates"))?;
 
-        // (parent, name, size) → [(id, created_at)]
-        let mut groups: HashMap<(String, String, u64), Vec<(String, i64)>> = HashMap::new();
+        // (parent, name) → [(id, created_at, size)]
+        let mut groups: HashMap<(String, String), Vec<(String, i64, u64)>> = HashMap::new();
         for row in rows {
             let (parent, name, id, payload, created) = row.map_err(map_db("duplicates"))?;
-            // A payload that will not decode has no size to group by, and
-            // guessing one would put unrelated files in the same group.
-            let Ok(fp) = node::FilePayload::decode(&payload) else {
-                continue;
-            };
-            groups
-                .entry((parent, name, fp.size_bytes))
-                .or_default()
-                .push((id, created));
+            // A payload that will not decode still belongs to its group — the
+            // name and parent are the key, and an unreadable size is a reason
+            // to report the node, not to drop it.
+            let size = node::FilePayload::decode(&payload)
+                .map(|fp| fp.size_bytes)
+                .unwrap_or(0);
+            groups.entry((parent, name)).or_default().push((id, created, size));
         }
 
         let mut report = DuplicateReport::default();
-        for ((parent, label, size), mut members) in groups {
+        for ((parent, label), mut members) in groups {
             if members.len() < 2 {
                 continue;
             }
+            let sizes: Vec<u64> = members.iter().map(|(_, _, sz)| *sz).collect();
+            let size = sizes.iter().copied().max().unwrap_or(0);
             // Deterministic keeper: most live locations, then oldest, then
             // lowest id. Locations first because the node the fleet already
             // points at is the one worth keeping — moving fewer locations means
             // fewer events and less to go wrong.
             let mut scored: Vec<(usize, i64, String)> = Vec::new();
-            for (id, created) in members.drain(..) {
+            for (id, created, _sz) in members.drain(..) {
                 let n = self.locations(&id)?.len();
                 scored.push((n, created, id));
             }
@@ -2883,6 +2898,7 @@ impl Engine {
                 keep,
                 drop,
                 locations: total,
+                sizes,
             });
         }
         // Biggest first, then by name so the report is stable between runs.

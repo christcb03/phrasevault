@@ -60,6 +60,41 @@ fn duplicated_pair(e: &mut Engine) -> (String, String, String) {
     (season, ingest_node, holder_node)
 }
 
+/// D114 — the pairs production actually made DISAGREE ABOUT SIZE, and that is
+/// the whole reason they exist: the identity match joins on name AND size, so
+/// it could never see them as one file.
+///
+/// The first version of `list_duplicates` grouped by the identity rule and
+/// therefore found NOTHING on a forest holding 587 of these. Grouping by the
+/// broken rule reproduces the breakage. A directory cannot hold two files with
+/// one name, so parent + name is the key and size is evidence.
+#[test]
+fn duplicates_that_disagree_about_size_are_still_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+    // The real numbers from the production pair, ~50 MB apart.
+    let partial = file_node(&mut e, &season, "ep04.mkv", 1_594_457_815);
+    let complete = file_node(&mut e, &season, "ep04.mkv", 1_544_349_595);
+    e.add_location(&partial, "pvfs-host://nas/share/Media/ep04.mkv")
+        .unwrap();
+
+    let r = e.list_duplicates().unwrap();
+    assert_eq!(r.groups.len(), 1, "one file, two nodes, two sizes");
+    let g = &r.groups[0];
+    assert_eq!(g.drop.len(), 1);
+    let mut sizes = g.sizes.clone();
+    sizes.sort_unstable();
+    assert_eq!(
+        sizes,
+        vec![1_544_349_595, 1_594_457_815],
+        "and the report shows the disagreement rather than hiding it"
+    );
+    assert!(g.keep == partial || g.keep == complete);
+    e.close().unwrap();
+}
+
 /// The report names the pair, and says which node survives BEFORE anything is
 /// merged — so the merge cannot surprise the person who read it.
 #[test]
