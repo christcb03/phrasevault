@@ -3573,7 +3573,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .map(|g| {
                         format!(
                             "{{\"parent\":\"{}\",\"label\":\"{}\",\"size\":{},\
-                             \"keep\":\"{}\",\"drop\":[{}],\"locations\":{}}}",
+                             \"keep\":\"{}\",\"drop\":[{}],\"locations\":{},\"sizes\":[{}]}}",
                             g.parent,
                             json_escape(&g.label),
                             g.size,
@@ -3584,6 +3584,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 .collect::<Vec<_>>()
                                 .join(","),
                             g.locations,
+                            g.sizes
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join(","),
                         )
                     })
                     .collect();
@@ -3614,11 +3619,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 );
                 println!();
                 for g in r.groups.iter().take(20) {
+                    // Show the sizes: they normally DISAGREE, and that
+                    // disagreement is the whole reason the pair exists.
+                    let mut sz: Vec<String> =
+                        g.sizes.iter().map(|s| s.to_string()).collect();
+                    sz.dedup();
                     println!(
-                        "  {}  {} copies, {} location(s)  {}",
+                        "  {}  {} copies, {} location(s), sizes {}  {}",
                         &g.keep[..12.min(g.keep.len())],
                         g.drop.len() + 1,
                         g.locations,
+                        sz.join(" / "),
                         g.label
                     );
                 }
