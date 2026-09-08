@@ -1153,11 +1153,23 @@ open:
    re-point `media_node` and each box's `placement`. Nobody has written that
    runbook, let alone rehearsed it.
 
-3. **The `MediaQuality` carry is designed, not built.** 24,585 events. The
-   machinery exists (`media_quality` / `set_media_quality`, and `fs.rs:1846`
-   already does exactly this for successor ids) — but nothing walks the old
-   forest and re-signs those records against the new ids. Without it the data
-   is lost, re-derivable only by re-running the *arr hook over the library.
+3. ~~**The `MediaQuality` carry is designed, not built.**~~ **BUILT (D104):
+   `pvfs forest carry-quality --from <old> [--dry-run]`**, matched by tree path
+   and re-signed against the new ids.
+
+   Dry-running it against a copy of the production log measured something more
+   interesting than the tool: **of 24,585 recorded measurements, 119 are
+   reachable from the forest root.** 581 sit on a node with a live containing
+   link; the other 462 of those have live links to live parents whose chain
+   never reaches the root. 34,269 nodes are reachable in total, against 56,155
+   file nodes.
+
+   So the quality data is not something re-genesis would destroy — **it is
+   already gone**, stranded on superseded and disconnected nodes, and 119 is
+   what there is to carry. The same numbers say the forest holds substantial
+   disconnected structure: islands of live-linked nodes that no walk from the
+   root can see. That is a stronger argument for re-genesis than the log size
+   ever was.
 
 4. **No cutover plan for the mount.** Sonarr, Radarr and rclone read through a
    mount pointed at a forest. Nothing says what they see while the new forest
