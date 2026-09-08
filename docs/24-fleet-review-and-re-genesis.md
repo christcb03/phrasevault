@@ -1240,3 +1240,93 @@ subtree. Unlink's non-cascading semantics are defensible; the silence after is
 not. A check that walks from the root — rather than asking about links — would
 surface an island the day it forms instead of a fortnight later during an
 unrelated investigation.
+
+---
+
+## 19. D105 — the island check, and a warning before the cut
+
+Closes the gap §18 names. Two pieces: a report that finds a detached subtree,
+and a word from `unlink` at the moment one is about to be created.
+
+### 19.1 Why the existing checks cannot see this
+
+Every check this system has asks a question **about a node**:
+
+| check | question | answer for the 1,849 |
+|---|---|---|
+| `orphans` | has this node no live link? | no — it has one |
+| `missing` | does nobody hold this file's bytes? | no — somebody does |
+| `reclaim` | do these central bytes have no live node? | no — they do |
+
+All three are local predicates, and a detached subtree is locally perfect: the
+only broken thing is a single removed edge at the top, and no node inside it is
+adjacent to that edge. The question has to be **about the graph** — *is there a
+path from the root to here?* — and nothing asked it.
+
+### 19.2 What "reachable" means here
+
+Reachability mirrors `walk()`, the engine's own pre-order tree semantics
+(spec §12): **descend `contains` only, but count a `ref` child of a reached
+folder as reached.** A ref child is listed when you browse its parent, so it is
+plainly in the tree even though the walk does not descend it — flagging it
+would be crying wolf on the very first run.
+
+A link counts as live on the **same predicate `orphans` uses**: `removed_at IS
+NULL`, nothing more. In particular a *suspended* link still traverses. That
+symmetry is the point — the report is exactly the set difference between two
+sets defined by the same edge test, so a node cannot fall into it because the
+two halves disagreed about what a live edge is. Suspension is a deliberate,
+recorded state with an operator behind it; treating it as detachment would
+report a decision back to the person who made it.
+
+Both `links` and `temp_links` traverse, for the same reason: `orphans` counts a
+temp link as a live link, so the walk must be able to cross one or every staged
+node would surface as an island.
+
+### 19.3 Grouping — name the folder, not the children
+
+The one-home rule makes `contains` a strict tree, so the ascent is unambiguous.
+For each stranded node, climb live `contains` parents until either there is no
+parent or the parent is reachable; that node is the island root. For the
+production case every one of the 1,849 climbs to `Backups`, so the report is
+**one line, not 1,849**.
+
+The island root is normally *not* itself in the stranded set — its inbound link
+is the one that was removed, so it has no live link at all and it is already an
+`orphans` row. That is the useful part: `orphans` was reporting `Backups` all
+along, in a list of 939, with nothing to say that this one had 1,849 nodes
+hanging off it. The island report is what makes that row mean something.
+
+`detached_at` comes from the retired edge itself — `MAX(removed_at)` over
+removed `contains` links into the island root — so the report dates the cut.
+
+### 19.4 The unlink warning
+
+`unlink` stays non-cascading; §18 is right that the semantics are defensible.
+What changes is that it counts the subtree first and says what it is about to
+strand.
+
+- **TTY, no `--yes`:** print the count, prompt `[y/N]`, default no.
+- **Not a TTY, or `--yes`, or `--json`:** proceed, but print the warning.
+  `prompt_line` *errors* without a TTY, so prompting unconditionally would turn
+  every scripted folder unlink into a failure — including six in the smoke
+  suite. A soft-remove is reversible by re-linking; a broken pipeline is the
+  larger harm.
+- Only for a live `contains` link to a node with at least one descendant. A
+  file, a `ref`, or an empty folder is silent, as now.
+
+### 19.5 Turnkey checklist
+
+- [ ] **A.** `Engine::list_islands()` → `IslandReport { nodes_total,
+      reachable, live_linked, stranded, islands }` — the four numbers of §18's
+      table plus the grouped rows.
+- [ ] **B.** `Engine::subtree_size()` → `SubtreeSize { nodes, files, folders,
+      bytes }`, shared by the report and the unlink warning.
+- [ ] **C.** `pvfs islands` — human and `--json`; exit 0 when clean.
+- [ ] **D.** `pvfs unlink` warns and prompts per 19.4; `--yes` skips the prompt.
+- [ ] **E.** Tests: a clean forest reports nothing; unlinking a folder strands
+      its subtree and the report names the folder with the right counts; nested
+      islands group to the topmost; a `ref`-only child is not an island; the
+      island root is the `orphans` row.
+- [ ] **F.** Pipeline green on presubuntu (`-e session=d105-islands`), clippy
+      `-D warnings` clean.
