@@ -1052,11 +1052,21 @@ asserted, not checked. Checked (2026-09-07), the real set is small:
 | PVOS `MountBind` | a **tree path**, resolved to an id at call time (`mounts.rs:231`) | **yes** |
 | PVOS regions / `folder_id` | read back from PVFS, not persisted | **yes** |
 | `fleet-prod.ini` `media_node` | one node id | no — one line to re-point |
-| `.pvfs/placement` on each box | the same id, 2–4 keys | no — one value per box |
+| `.pvfs/placement` on the owner and holder | the same id, 2–3 keys each | no — one file per box |
+| `.pvfs/bindings.local` on the ingest and holder | the same id, 1–2 binding rows | no |
+| **`pvfs-mount.service` on the ingest** | the forest **ROOT** id — a SECOND id | no |
 
-So the durable external references amount to **a single node id — the Media
-folder — written in one inventory line and one placement file per box.** Not
-nothing, but a five-minute edit rather than a migration.
+This paragraph used to read "**a single node id — the Media folder — written
+in one inventory line and one placement file per box**". **Measured against
+the running fleet on 2026-09-08, that was wrong on all three counts:** there
+are **two** distinct ids (the Media folder AND the forest root, the latter in
+the ingest's `pvfs-mount.service`), spread over **six files**, in **ten**
+key/row occurrences. The ingest carries no `placement` file at all — it holds
+its id in `bindings.local`.
+
+Still a small edit rather than a migration, and the conclusion survives. But
+the enumeration is the thing a runbook needs to be exhaustive about, and it
+was written from memory. Doc 25 §3 has the measured table.
 
 What is genuinely lost is log CONTENT, which was already known and listed: ACL
 grants, the 24,585 `MediaQuality` events (re-derivable by re-running the *arr
@@ -1148,10 +1158,21 @@ open:
    production is configured, which is why neither shows up until you build a
    forest from scratch.
 
-2. **There is no re-genesis tool** (F2 was never built). Every step is manual:
-   init, create folders, bind, scan on each box in the right order, re-grant,
-   re-point `media_node` and each box's `placement`. Nobody has written that
-   runbook, let alone rehearsed it.
+2. ~~**There is no re-genesis tool** (F2 was never built).~~ **The RUNBOOK is
+   written — doc 25 (D107, 2026-09-08).** Still no tool: every step is a
+   command an operator runs. What changed is that the order, the checks, and
+   the two constraints the lab run taught are now written down, along with the
+   measured list of everything that has to be re-pointed.
+
+   Writing it turned up three traps, each of which would have cost a run:
+   `library_node` is undefined in `fleet-prod.ini`, so the ingest bind task
+   **silently skips** in production and a green play run binds nothing;
+   `pvfs-mount.service` is **live on the ingest**, not "dead" as that file
+   claims, and the play cannot re-point it because its vars are absent; and
+   the external-id set is twice what §16 said (doc 25 §3).
+
+   **NOT rehearsed end to end** — doc 25 §10. A runbook that has not been
+   executed is a hypothesis.
 
 3. ~~**The `MediaQuality` carry is designed, not built.**~~ **BUILT (D104):
    `pvfs forest carry-quality --from <old> [--dry-run]`**, matched by tree path
@@ -1171,26 +1192,38 @@ open:
    root can see. That is a stronger argument for re-genesis than the log size
    ever was.
 
-4. **No cutover plan for the mount.** Sonarr, Radarr and rclone read through a
-   mount pointed at a forest. Nothing says what they see while the new forest
-   is being built and verified, or how the swap happens without the *arrs
-   deciding their library vanished.
+4. ~~**No cutover plan for the mount.**~~ **Written (doc 25 §7) — and the
+   premise was wrong.** "Sonarr, Radarr and rclone read through a mount
+   pointed at a forest" was assumed, never checked. Checked 2026-09-08:
+   mergerfs on the ingest has branches
+   `/mnt/local=RW:/mnt/remote/nas=NC:/mnt/remote/nas2=NC` — **`/mnt/pvfs-root`
+   is not among them**, nothing holds a file open on it, and no container
+   mounts it. The *arrs read `/mnt/unionfs/Media`, which is local disk plus
+   rclone. **PVFS is not in their read path**, so a forest swap is invisible
+   to them and the library-vanished risk does not exist.
+
+   What remains is re-pointing a mount unit nothing consumes, and restarting
+   three daemons in roll order.
 
 ### Worth settling, not blocking
 
-5. **Rollback.** The old forest must survive until the new one is verified, and
-   somebody has to define "verified" in advance — a file count, a hash
-   spot-check, a `missing` count — or the decision gets made under pressure.
-6. **F3's consistency check needs a before/after comparison to mean anything.**
-   Re-genesis silently drops the 1,416 `missing` entries and the 165 pending
-   changes. That is the point — but only if the counts are recorded first, so
-   the residue is seen rather than merely gone.
+5. ~~**Rollback.**~~ **Defined: doc 25 §2 (six pass conditions) and §8
+   (rollback).** The old forest is a different directory and its daemons are
+   the ones still running, so rollback before cutover is doing nothing, and
+   after cutover is re-pointing three units back.
+6. ~~**F3's consistency check needs a before/after comparison.**~~ **Doc 25 §1
+   is that step, with the commands.** Baseline re-taken 2026-09-08 on the live
+   owner: **`missing` 1,894** (up from the 1,416 recorded here — it has grown),
+   **`orphans` 25,602**, three `rwa` root grants. The islands count needs D106
+   deployed to take at all.
 
 ### Already small — checked, not assumed
 
 - **ACLs: three grants, all `rwa` at the root.** Trivial to re-establish.
-- **External node-id references: one id** (the Media folder) in
-  `fleet-prod.ini` and one `placement` file per box.
+- ~~**External node-id references: one id**~~ — **two ids, six files, ten
+  occurrences** when finally measured rather than recalled (doc 25 §3). The
+  extra one is the forest ROOT, in the ingest's `pvfs-mount.service`. Still
+  small; the point is that "already checked" was not true of this line.
 - **Duplicate nodes (D84) should NOT recur.** `match_by_identity` matches on
   name + size, so a second box relocates rather than re-adds; and the cause of
   the 206 (a stale node label after a rename) was fixed in D72.
