@@ -1128,14 +1128,25 @@ open:
 
 ### Blocking
 
-1. **The fleet shape is untested.** The subset ran a scratch forest on the
-   holder, which was therefore its own owner. In production BOTH feederbox and
-   the holder are replicas that cannot write: every node and every location
-   goes to the owner as a member-signed prepared write. The `relocated` path —
-   a second box finding a file the catalog already knows and adding a location
-   instead of a node — has never been exercised through that routing, at any
-   scale. This is checklist F4, and it is the one that decides whether
-   re-genesis works at all.
+1. ~~**The fleet shape is untested.**~~ **TESTED 2026-09-07 on the lab pair —
+   it works.** Owner `pvfs-lab-owner` built a fresh forest over 8 files (11
+   nodes) and served it; `pvfs-lab-ingest` was enrolled `rwa`, took a replica,
+   bound the SAME bytes at a DIFFERENT path, and ran `watch` as a daemon job.
+
+   Result: **node count stayed 11 on both boxes**, and all 8 files ended with
+   locations from both. `film1` carries three — the ingest's `file://` path,
+   the owner's `file://` path, and the ingest's pin-qualified `pvfs-host://`.
+   The `relocated` path works through replica → owner routing, which was the
+   question that decided whether re-genesis is possible at all.
+
+   **Two things the test taught that the runbook needs.** A replica REFUSES a
+   bare `pvfs scan` — *"a replica has no local writer, so its scan must be
+   routed to the owner — run it from the `watch` serve job"*. And `serve watch`
+   in the foreground is not enough either: it arms inotify for NEW writes,
+   while an existing library is picked up by the reconcile pass, so the routed
+   import has to run as the `watch` DAEMON JOB. Both are exactly how
+   production is configured, which is why neither shows up until you build a
+   forest from scratch.
 
 2. **There is no re-genesis tool** (F2 was never built). Every step is manual:
    init, create folders, bind, scan on each box in the right order, re-grant,
