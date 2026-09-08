@@ -383,9 +383,31 @@ if ! $PVFS ls "$MOVIES" | qgrep watched.mkv; then
   sed 's/^/    /' "$WATCH_LOG" 2>/dev/null | tail -20
   echo "--- end watcher log ---"
 fi
+$PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"
+
+# D111 — and it must SAY what it did, including the count that D105 made
+# possible. The watch job is how the fleet actually scans, and it reported its
+# numbers to nobody: a pass that took files out of the tree looked exactly like
+# a pass that retired a location on a box still holding a copy. Delete the file
+# the watcher just ingested and watch it leave, then read the count out of the
+# watcher's own output rather than out of the forest.
+rm -f "$LIB/movies/watched.mkv"
+for _ in $(seq 1 120); do
+  $PVFS ls "$MOVIES" | qgrep watched.mkv || break
+  sleep 0.5
+done
 kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$PVFS_DATA_DIR/serve.lock"
-$PVFS ls "$MOVIES" | qgrep watched.mkv && ok "watcher ingested new file" || fail "watcher ingested new file"
+$PVFS ls "$MOVIES" | qgrep watched.mkv && fail "watcher unlinked a deleted file" \
+  || ok "watcher unlinked a deleted file"
+if qgrep '~1' <"$WATCH_LOG"; then
+  ok "watcher REPORTED the unlink count"
+else
+  fail "watcher REPORTED the unlink count"
+  echo "--- watcher log (expected an ingested line ending ~1) ---"
+  sed 's/^/    /' "$WATCH_LOG" 2>/dev/null | tail -20
+  echo "--- end watcher log ---"
+fi
 
 say "P1.5: forest init / registry / mount URIs"
 MOUNT="$DATA/workspace"

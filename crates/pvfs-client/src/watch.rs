@@ -19,8 +19,17 @@ const SETTLE_RECHECK: Duration = Duration::from_secs(20);
 
 /// Progress callbacks: stdout lines in the CLI, status rows in pvfsd.
 pub enum WatchEvent {
-    /// A scan pass ingested changes: (folder_id, added, changed, removed).
-    Ingested(String, u64, u64, u64),
+    /// A scan pass ingested changes:
+    /// (folder_id, added, changed, removed, unlinked).
+    ///
+    /// D111 — `unlinked` is the fifth field because D105 made a scan able to
+    /// take a file OUT OF THE TREE, not merely retire its location, and this
+    /// event is the only thing the daemon's watch job reports. Without it the
+    /// operation that changes the shape of the forest is the one operation
+    /// nobody can see: `removed` counts retired locations, and a node dropped
+    /// from the tree looks identical to a location going away on a box that
+    /// still holds a copy elsewhere.
+    Ingested(String, u64, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
     /// A scan pass has BEGUN (D81) — what lets the daemon tell a wedged
@@ -105,6 +114,7 @@ pub fn run(
                         r.stats.added,
                         r.stats.changed,
                         r.stats.removed,
+                        r.stats.unlinked,
                     ));
                 }
             }
@@ -182,16 +192,17 @@ pub fn run(
                             retry_at = Some(Instant::now() + SETTLE_RECHECK);
                         }
                         let mut said_something = false;
-                        for r in reports
-                            .iter()
-                            .filter(|r| r.stats.added + r.stats.changed + r.stats.removed > 0)
-                        {
+                        for r in reports.iter().filter(|r| {
+                            r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked
+                                > 0
+                        }) {
                             said_something = true;
                             notify_cb(WatchEvent::Ingested(
                                 r.folder_id.clone(),
                                 r.stats.added,
                                 r.stats.changed,
                                 r.stats.removed,
+                                r.stats.unlinked,
                             ));
                         }
                         // The pass ran cleanly either way — say so, so progress
@@ -271,10 +282,9 @@ fn scan_pass(
             // pass cannot find the folder it just created, so it makes a
             // second one: the D71 lab produced two `Season 03` nodes exactly
             // this way before the catch-up was added.
-            if reports
-                .iter()
-                .any(|r| r.stats.added + r.stats.changed + r.stats.removed > 0)
-            {
+            if reports.iter().any(|r| {
+                r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked > 0
+            }) {
                 crate::advertise::catch_up(engine.data_dir(), client);
             }
             Ok(reports)
