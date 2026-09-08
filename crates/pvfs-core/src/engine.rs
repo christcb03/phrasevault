@@ -2849,7 +2849,12 @@ impl Engine {
             .map_err(map_db("duplicates"))?;
 
         // (parent, name) → [(id, created_at, size)]
-        let mut groups: HashMap<(String, String), Vec<(String, i64, u64)>> = HashMap::new();
+        //
+        // Named, because the bare form trips `clippy::type_complexity` — and it
+        // reached production untripped, since D114 was merged and rolled on a
+        // green PIPELINE without the ad-hoc clippy run that CLAUDE.md asks for.
+        type Member = (NodeId, i64, u64);
+        let mut groups: HashMap<(String, String), Vec<Member>> = HashMap::new();
         for row in rows {
             let (parent, name, id, payload, created) = row.map_err(map_db("duplicates"))?;
             // A payload that will not decode still belongs to its group — the
