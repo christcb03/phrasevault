@@ -1,0 +1,211 @@
+//! D113 — the duplicate pairs D112 stopped making, and the amplifier that
+//! turned each one into a family.
+//!
+//! `match_by_identity` returned `Option<NodeId>` and answered `None` both for
+//! "never seen this file" and for "more than one candidate". The caller read
+//! `None` as "new", so every later sighting of an already-duplicated file added
+//! another node — and each new node made the next sighting ambiguous too.
+//!
+//! Two candidates in DIFFERENT folders really is a tie nothing can break: an
+//! unrelated `poster.jpg` of the same size is a different file, and a new node
+//! is right (that case is pinned in `d71_identity`). Two under the SAME parent
+//! is not a tie at all — it is one file the catalogue holds twice.
+
+use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FILE, TYPE_FOLDER};
+
+fn folder(e: &mut Engine, parent: &str, label: &str) -> String {
+    e.add_node(
+        &parent.to_string(),
+        NodeSpec {
+            node_type: TYPE_FOLDER.into(),
+            label: label.into(),
+            payload: Vec::new(),
+            is_temp: false,
+            creation_nonce: None,
+        },
+    )
+    .unwrap()
+}
+
+fn file_node(e: &mut Engine, parent: &str, label: &str, size: u64) -> String {
+    e.add_node(
+        &parent.to_string(),
+        NodeSpec {
+            node_type: TYPE_FILE.into(),
+            label: label.into(),
+            payload: pvfs_core::FilePayload {
+                content_hash: String::new(),
+                size_bytes: size,
+                mime_type: "video/x-matroska".into(),
+                original_name: label.into(),
+            }
+            .encode(),
+            is_temp: false,
+            creation_nonce: None,
+        },
+    )
+    .unwrap()
+}
+
+/// Exactly production's shape: one file, two nodes, same parent, one holding
+/// the location and one holding nothing. That empty half is what `missing`
+/// reports, and there are ~1,910 of them.
+fn duplicated_pair(e: &mut Engine) -> (String, String, String) {
+    let root = e.identity.root_node_id.clone();
+    let season = folder(e, &root, "Season 01");
+    let ingest_node = file_node(e, &season, "ep04.mkv", 1024);
+    let holder_node = file_node(e, &season, "ep04.mkv", 1024);
+    e.add_location(&holder_node, "pvfs-host://nas/share/Media/ep04.mkv")
+        .unwrap();
+    (season, ingest_node, holder_node)
+}
+
+/// The report names the pair, and says which node survives BEFORE anything is
+/// merged — so the merge cannot surprise the person who read it.
+#[test]
+fn a_duplicated_file_is_reported_with_its_keeper_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let (_season, ingest_node, holder_node) = duplicated_pair(&mut e);
+
+    let r = e.list_duplicates().unwrap();
+    assert_eq!(r.groups.len(), 1, "one file, held twice");
+    assert_eq!(r.redundant, 1, "one node would go");
+    let g = &r.groups[0];
+    assert_eq!(g.label, "ep04.mkv");
+    assert_eq!(
+        g.keep, holder_node,
+        "the node holding the location is the keeper — the fleet already points at it"
+    );
+    assert_eq!(g.drop, vec![ingest_node]);
+    assert_eq!(g.locations, 1);
+    e.close().unwrap();
+}
+
+/// The merge preserves every location and destroys nothing.
+#[test]
+fn merging_moves_locations_before_it_unlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let (season, ingest_node, holder_node) = duplicated_pair(&mut e);
+    // Give the loser a location too, so the merge has something to move.
+    e.add_location(&ingest_node, "file:///mnt/local/Media/ep04.mkv")
+        .unwrap();
+
+    let done = e.merge_duplicates(false).unwrap();
+    assert_eq!(done.groups.len(), 1);
+    assert_eq!(done.locations_moved, 1, "one location had to move");
+
+    // Ask the REPORT which node survived rather than assuming. With a location
+    // each, the tie breaks on age, and asserting against a guess would test the
+    // test rather than the merge.
+    let keep = done.groups[0].keep.clone();
+    let loser = done.groups[0].drop[0].clone();
+    assert!(keep == holder_node || keep == ingest_node);
+
+    let kept: Vec<String> = e.locations(&keep).unwrap();
+    assert_eq!(kept.len(), 2, "both locations now sit on the keeper: {kept:?}");
+    assert!(
+        e.locations(&loser).unwrap().is_empty(),
+        "and none are left claimed by the node that was unlinked — an unlinked \
+         node holding a live location is its own bad state (D84 counted 95)"
+    );
+
+    let listed: Vec<String> = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.node.id)
+        .collect();
+    assert_eq!(listed, vec![keep], "only one node left in the tree");
+
+    // Nothing destroyed — unlink is a soft remove on an append-only log.
+    assert!(
+        e.get_node(&loser).unwrap().is_some(),
+        "the loser's record survives; only its place in the tree is gone"
+    );
+    e.close().unwrap();
+}
+
+/// The amplifier. Scanning a file the catalogue already holds twice HERE must
+/// not enrol a third — that is how one duplicate became a family.
+#[test]
+fn a_scan_will_not_make_a_third_copy_of_an_already_duplicated_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+    file_node(&mut e, &season, "ep04.mkv", 4);
+    file_node(&mut e, &season, "ep04.mkv", 4);
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("ep04.mkv"), b"abcd").unwrap();
+    e.bind_folder(
+        &season,
+        BindSpec {
+            source_uri: format!("file://{}", lib.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy: HashPolicy::OnAdd,
+        },
+    )
+    .unwrap();
+
+    let rep = e.scan_routed(Some(&season), None, 0).unwrap();
+    assert_eq!(
+        rep[0].stats.added, 0,
+        "the file is already catalogued — twice. A third node is not a fix"
+    );
+    assert_eq!(rep[0].stats.ambiguous, 1, "and the scan says why it did nothing");
+
+    let files = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.node.node_type == TYPE_FILE)
+        .count();
+    assert_eq!(files, 2, "still two, not three");
+    e.close().unwrap();
+}
+
+/// …and once merged, the same scan catalogues normally again. The two halves
+/// compose: D113 stops the growth, and the merge restores the match.
+#[test]
+fn after_a_merge_the_scan_matches_instead_of_refusing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+    file_node(&mut e, &season, "ep04.mkv", 4);
+    file_node(&mut e, &season, "ep04.mkv", 4);
+    e.merge_duplicates(false).unwrap();
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("ep04.mkv"), b"abcd").unwrap();
+    e.bind_folder(
+        &season,
+        BindSpec {
+            source_uri: format!("file://{}", lib.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy: HashPolicy::OnAdd,
+        },
+    )
+    .unwrap();
+
+    let rep = e.scan_routed(Some(&season), None, 0).unwrap();
+    assert_eq!(rep[0].stats.ambiguous, 0, "no longer ambiguous");
+    assert_eq!(
+        rep[0].stats.added, 0,
+        "and still not a new node — it matched the survivor"
+    );
+    assert_eq!(
+        rep[0].stats.relocated, 1,
+        "the on-disk copy became a LOCATION on the node that survived"
+    );
+    e.close().unwrap();
+}

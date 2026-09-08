@@ -179,6 +179,28 @@ pub struct BackfillReport {
     pub own_bookkeeping: u64,
 }
 
+/// What the identity match found (D113).
+///
+/// `None` and `Ambiguous` are DIFFERENT answers and the caller must not
+/// collapse them: "I have never seen this file" means catalogue it, while
+/// "I already hold this file twice, right here" means do not make it three.
+///
+/// The old signature was `Option<NodeId>` and returned `None` for both, which
+/// the caller read as "new". That is the amplifier behind production's
+/// duplicate pairs: every later sighting of an already-duplicated file added
+/// another node, and each new node made the next sighting ambiguous too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityMatch {
+    /// Exactly one live-linked node has this name and size.
+    One(NodeId),
+    /// Nothing matches — this file is new to the catalogue.
+    None,
+    /// The catalogue already holds this file more than once UNDER THIS PARENT.
+    /// Not a new file, and not something to guess between; `pvfs duplicates`
+    /// is what resolves it.
+    Ambiguous,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     pub added: u64,
@@ -203,6 +225,12 @@ pub struct ScanStats {
     /// that signal alone removes something that exists. Reported so the wait is
     /// visible rather than looking like a scan that did nothing.
     pub pending_unlink: u64,
+    /// D113 — files the catalogue already holds MORE THAN ONCE under this
+    /// parent, so the scan declined to add yet another node. Not an error and
+    /// not a skip: the file is catalogued, twice, and `pvfs duplicates` is what
+    /// resolves it. Counted so a scan that quietly does nothing for a file says
+    /// why.
+    pub ambiguous: u64,
     /// D71 W6: still being written when we looked, so deliberately NOT
     /// catalogued yet. Deferred, never dropped — the next pass takes it.
     pub settling: u64,
@@ -1361,7 +1389,7 @@ impl Engine {
         Ok(())
     }
 
-    fn links_of(&self, file_id: &str) -> Result<Vec<String>> {
+    pub(crate) fn links_of(&self, file_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM links WHERE child_id = ?1 AND removed_at IS NULL")
@@ -1373,7 +1401,45 @@ impl Engine {
             .map_err(map_db("links of"))
     }
 
-    fn match_by_identity(&self, label: &str, size: u64) -> Result<Option<NodeId>> {
+    /// The identity match, in two passes: UNDER THIS PARENT first, then the
+    /// whole forest.
+    ///
+    /// D113 — position is evidence and the forest-wide query threw it away. A
+    /// single candidate sitting under the very folder being scanned is not
+    /// ambiguous by any reading; it is the same file, seen again where it
+    /// already lives. Only the second pass, which exists for the genuinely
+    /// interesting case (a file that MOVED), has to refuse a tie.
+    ///
+    /// Returns `Ambiguous` distinctly from `None`, because the caller must
+    /// treat them differently — see `IdentityMatch`.
+    fn match_by_identity(&self, parent: &NodeId, label: &str, size: u64) -> Result<IdentityMatch> {
+        let here = self.identity_candidates(Some(parent), label, size)?;
+        match here.len() {
+            1 => return Ok(IdentityMatch::One(here.into_iter().next().unwrap())),
+            // Two nodes with the same name AND the same size under the SAME
+            // parent are not two files — they are one file the catalogue holds
+            // twice (D112 explains how production made ~1,910 of them). Minting
+            // a third helps nobody and is how one duplicate becomes a family.
+            n if n > 1 => return Ok(IdentityMatch::Ambiguous),
+            _ => {}
+        }
+        let anywhere = self.identity_candidates(None, label, size)?;
+        match anywhere.len() {
+            1 => Ok(IdentityMatch::One(anywhere.into_iter().next().unwrap())),
+            // Elsewhere in the forest, a tie really is a tie: two unrelated
+            // files can share a name and a size (`poster.jpg`, 3 bytes) and
+            // nothing here can say which one arrived. A NEW node is right.
+            n if n > 1 => Ok(IdentityMatch::None),
+            _ => Ok(IdentityMatch::None),
+        }
+    }
+
+    fn identity_candidates(
+        &self,
+        parent: Option<&NodeId>,
+        label: &str,
+        size: u64,
+    ) -> Result<Vec<NodeId>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1395,33 +1461,34 @@ impl Engine {
                 // Written as two indexed branches rather than a COALESCE so
                 // both sides can still use an index (`idx_links_label`,
                 // `idx_nodes_label`); COALESCE would force a scan.
+                // D113 — `?3` scopes the search to one parent when given, and
+                // is NULL for the forest-wide pass. Same statement either way,
+                // so the two passes cannot drift apart in what they consider a
+                // live edge or an effective name.
                 "SELECT DISTINCT n.id, n.payload FROM nodes n
                    JOIN links l ON l.child_id = n.id AND l.removed_at IS NULL
                   WHERE n.node_type = ?2
+                    AND (?3 IS NULL OR l.parent_id = ?3)
                     AND ( (l.label <> '' AND l.label = ?1)
                        OR (l.label =  '' AND n.label = ?1) )",
             )
             .map_err(map_db("identity match"))?;
         let rows = stmt
-            .query_map(params![label, node::TYPE_FILE], |r| {
+            .query_map(params![label, node::TYPE_FILE, parent], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })
             .map_err(map_db("identity match"))?;
-        let mut hit: Option<NodeId> = None;
+        let mut hits: Vec<NodeId> = Vec::new();
         for row in rows {
             let (id, payload) = row.map_err(map_db("identity match"))?;
             let same = FilePayload::decode(&payload)
                 .map(|p| p.size_bytes == size)
                 .unwrap_or(false);
-            if !same {
-                continue;
+            if same {
+                hits.push(id);
             }
-            if hit.is_some() {
-                return Ok(None); // ambiguous — refuse rather than guess
-            }
-            hit = Some(id);
         }
-        Ok(hit)
+        Ok(hits)
     }
 
     fn ingest_file(
@@ -1601,7 +1668,19 @@ impl Engine {
         // D71 W6 — before deciding this is new, ask whether the catalog already
         // knows it under another path. A migrated copy, a moved folder, a
         // re-import: same file, new place. Record the location, not a new node.
-        if let Some(known) = self.match_by_identity(&f.name, f.size)? {
+        let known = match self.match_by_identity(parent, &f.name, f.size)? {
+            IdentityMatch::One(id) => Some(id),
+            IdentityMatch::None => None,
+            // D113 — already held twice under this very parent. Do NOT enrol a
+            // third: the file is not new, and a new node would only widen the
+            // duplicate set that made the answer ambiguous in the first place.
+            // Skipped and counted; `pvfs duplicates --merge` is the resolution.
+            IdentityMatch::Ambiguous => {
+                stats.ambiguous += 1;
+                return Ok(());
+            }
+        };
+        if let Some(known) = known {
             // D85 — SELF-HEALING HASH FILL.
             //
             // Chris: "It seems [lazy hashing] isn't very useful since it can't
