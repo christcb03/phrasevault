@@ -74,10 +74,34 @@ fn a_library_whose_files_are_all_present_reports_nothing() {
 /// finishes the job: the node leaves the tree and there is nothing left to
 /// report. Before D105 it survived here "holding nothing", waiting for a
 /// manual `missing --forget` that nobody ran.
+///
+/// D112 — with a day's grace in front of it. And during that grace this report
+/// is exactly where the file belongs: `missing` IS the pending-unlink list, so
+/// an operator can see what is about to leave the tree before it does. The
+/// sweep empties it once the deadline passes, with nobody running anything.
 #[test]
 fn a_file_deleted_outside_pvfs_is_swept_on_a_proven_mount() {
     let (_t, mut engine, media, lib) = rig();
     std::fs::remove_file(lib.join("TV/Show/gone.mkv")).unwrap();
+    engine.scan(Some(&media)).unwrap();
+
+    let held = engine.files_held_by_nobody().unwrap();
+    assert_eq!(
+        held.len(),
+        1,
+        "during the grace it is REPORTED, which is the point — the operator can \
+         see what is about to go: {held:?}"
+    );
+
+    // A day passes.
+    {
+        let conn = rusqlite::Connection::open(engine.data_dir().join("index.db")).unwrap();
+        conn.execute(
+            "UPDATE scan_unheld SET since_ms = since_ms - ?1",
+            rusqlite::params![(pvfs_core::UNLINK_GRACE_MS + 60_000) as i64],
+        )
+        .unwrap();
+    }
     engine.scan(Some(&media)).unwrap();
 
     let held = engine.files_held_by_nobody().unwrap();
