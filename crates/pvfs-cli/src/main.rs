@@ -93,7 +93,19 @@ enum Cmd {
         nonce: u64,
     },
     /// Soft-remove a link (triggers temp purge check)
-    Unlink { link_id: String },
+    ///
+    /// Does NOT cascade — by design. Removing a folder's only inbound link
+    /// leaves everything beneath it live-linked to live parents and detached
+    /// from the root, which is how production stranded 1,849 nodes on one
+    /// command and saw one success (doc 24 §18). So this counts the subtree
+    /// first and says what it is about to strand; `pvfs islands` finds ones
+    /// that already happened.
+    Unlink {
+        link_id: String,
+        /// Skip the confirmation on a folder with descendants.
+        #[arg(long)]
+        yes: bool,
+    },
     /// What a media file IS — record it, or read it back (D76).
     ///
     /// Quality must be captured while the source still knows: once an arr
@@ -183,6 +195,18 @@ enum Cmd {
     },
     /// List orphaned durable nodes
     Orphans,
+    /// Detached subtrees — live-linked nodes no tree root reaches (doc 24 §19).
+    ///
+    /// `orphans`, `missing` and `reclaim` all ask a question about one node:
+    /// has it a live link, is its file held, have its bytes a live node. A
+    /// subtree whose top edge was unlinked answers all three healthily — every
+    /// node inside it is still linked to a live parent — and only a walk from
+    /// the tree roots can see that nothing leads to it. Production carried
+    /// 1,849 such nodes for a fortnight with no report naming one.
+    ///
+    /// A REPORT, not a sweep: which parent to re-link an island to is not
+    /// something a walk can know.
+    Islands,
     /// Files the catalog claims that NOBODY holds — the residue of deletions
     /// made outside PVFS (D81).
     ///
@@ -2339,8 +2363,32 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             emit_id(json, "link_id", &id);
             engine.close()
         }
-        Cmd::Unlink { link_id } => {
+        Cmd::Unlink { link_id, yes } => {
             let mut engine = Engine::open(&ctx?)?;
+            // Count BEFORE the cut. Unlink does not cascade, so a folder's
+            // whole subtree stays live-linked and leaves the tree in one
+            // operation — the operator saw one success and no number
+            // (doc 24 §18). Silent for a file, a `ref`, or an empty folder.
+            if let Some((label, size)) = engine.unlink_would_strand(&link_id)? {
+                eprintln!(
+                    "unlinking \"{label}\" strands {} node(s) — {} file(s), {} folder(s), \
+                     {} — beneath it.\n\
+                     They keep their own live links, so `orphans`, `missing` and `reclaim` \
+                     will all call them healthy;\n`pvfs islands` is what reports them.",
+                    size.nodes,
+                    size.files,
+                    size.folders,
+                    fmt_bytes(size.bytes),
+                );
+                use std::io::IsTerminal;
+                if !yes && !json && std::io::stdin().is_terminal() {
+                    let a = prompt_line("unlink it anyway? [y/N]", Some("N"))?;
+                    if !a.trim().eq_ignore_ascii_case("y") {
+                        println!("nothing was changed");
+                        return engine.close();
+                    }
+                }
+            }
             if engine.is_replica() {
                 let data_dir = engine.data_dir().to_path_buf();
                 engine.close()?;
@@ -3491,6 +3539,85 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     println!("{}  {:<8} {}", n.id, n.node_type, n.label);
                 }
             }
+            engine.close()
+        }
+        Cmd::Islands => {
+            let engine = Engine::open(&ctx?)?;
+            let r = engine.list_islands()?;
+            if json {
+                let items: Vec<String> = r
+                    .islands
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{{\"id\":\"{}\",\"label\":\"{}\",\"type\":\"{}\",\
+                             \"detached_at_ms\":{},\"nodes\":{},\"files\":{},\
+                             \"folders\":{},\"bytes\":{}}}",
+                            i.root.id,
+                            json_escape(&i.root.label),
+                            json_escape(&i.root.node_type),
+                            match i.detached_at {
+                                Some(t) => t.to_string(),
+                                None => "null".into(),
+                            },
+                            i.size.nodes,
+                            i.size.files,
+                            i.size.folders,
+                            i.size.bytes,
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"nodes_total\":{},\"reachable\":{},\"live_linked\":{},\
+                     \"stranded\":{},\"islands\":[{}]}}",
+                    r.nodes_total,
+                    r.reachable,
+                    r.live_linked,
+                    r.stranded,
+                    items.join(",")
+                );
+                return engine.close();
+            }
+            println!("nodes total               : {}", r.nodes_total);
+            println!("reachable from a tree root: {}", r.reachable);
+            println!("with a live link          : {}", r.live_linked);
+            println!("live-linked, UNREACHABLE  : {}", r.stranded);
+            if r.islands.is_empty() {
+                println!("\nevery live-linked node is reachable from the root");
+                return engine.close();
+            }
+            println!("\n{} detached subtree(s):", r.islands.len());
+            for i in &r.islands {
+                println!(
+                    "  {}  {:<8} {}",
+                    &i.root.id[..12.min(i.root.id.len())],
+                    i.root.node_type,
+                    i.root.label
+                );
+                println!(
+                    "      {} node(s) stranded beneath it: {} file(s), {} folder(s), {}",
+                    i.size.nodes,
+                    i.size.files,
+                    i.size.folders,
+                    fmt_bytes(i.size.bytes)
+                );
+                match i.detached_at {
+                    Some(t) => println!("      inbound link removed {}", ago(t)),
+                    // No retired edge means nothing was cut here. On a replica
+                    // still catching up that is the honest reading: the edge
+                    // has not arrived yet, not that someone removed it.
+                    None => println!(
+                        "      no removed inbound link on record — never linked, \
+                         or the edge has not synced yet"
+                    ),
+                }
+            }
+            println!(
+                "\nthese are REPORTED, not swept. Every node above still has a live link, so\n\
+                 `orphans`, `missing` and `reclaim` all call them healthy and the space they\n\
+                 hold never comes back. `pvfs link <parent> <id> --type contains` re-attaches\n\
+                 one; which parent it belongs under is not something a walk can know."
+            );
             engine.close()
         }
         Cmd::Purge { ids } => {
@@ -7587,6 +7714,43 @@ fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
         })?)
     };
     Ok(ByteRange { start, end })
+}
+
+/// Raw bytes plus a human read — the raw number stays greppable, the unit
+/// makes 1.4 TiB legible where 1539000000000 is not.
+fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if b < 1024 {
+        return format!("{b} bytes");
+    }
+    let mut v = b as f64 / 1024.0;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{b} bytes ({v:.1} {})", UNITS[u])
+}
+
+/// How long ago an ms-epoch stamp was. No date crate in this tree, and for a
+/// detached subtree the age is the number that matters anyway — "a fortnight"
+/// is the finding, not the calendar date.
+fn ago(ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if ms > now {
+        return format!("at {ms} (ms epoch)");
+    }
+    let secs = (now - ms) / 1000;
+    let (n, unit) = match secs {
+        s if s < 60 => (s, "second"),
+        s if s < 3600 => (s / 60, "minute"),
+        s if s < 86_400 => (s / 3600, "hour"),
+        s => (s / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago (at {ms} ms epoch)", if n == 1 { "" } else { "s" })
 }
 
 fn emit_id(json: bool, key: &str, id: &str) {

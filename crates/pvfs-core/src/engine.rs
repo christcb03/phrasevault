@@ -56,6 +56,65 @@ pub struct ChildEntry {
     pub label: String,
 }
 
+/// How much of the tree hangs under something — used both by the island
+/// report and by `unlink`, which counts before it cuts (doc 24 §19).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtreeSize {
+    pub nodes: u64,
+    pub files: u64,
+    pub folders: u64,
+    /// Bytes the catalog attributes to those files. Under an island this is
+    /// space `reclaim` can never sweep: every one of them still HAS a live
+    /// link, which is the only thing the sweeper asks about.
+    pub bytes: u64,
+}
+
+impl SubtreeSize {
+    fn add(&mut self, node_type: &str, payload: &[u8]) {
+        self.nodes += 1;
+        match node_type {
+            node::TYPE_FILE => {
+                self.files += 1;
+                // A payload that will not decode still counts as a file; the
+                // report's job is to name what is stranded, not to audit
+                // encodings, and refusing the whole report over one bad row
+                // would be the wrong trade.
+                if let Ok(p) = node::FilePayload::decode(payload) {
+                    self.bytes += p.size_bytes;
+                }
+            }
+            node::TYPE_FOLDER => self.folders += 1,
+            _ => {}
+        }
+    }
+}
+
+/// One detached subtree: the node at its top, and everything stranded under it.
+#[derive(Debug, Clone)]
+pub struct Island {
+    /// The topmost node of the component — the folder whose inbound link was
+    /// removed. Normally NOT itself live-linked, so it is already an `orphans`
+    /// row; what `orphans` cannot say is that 1,849 nodes hang off it.
+    pub root: Node,
+    /// When that inbound `contains` link was retired (ms epoch), if the
+    /// projection still holds the removed edge. Dates the cut.
+    pub detached_at: Option<u64>,
+    pub size: SubtreeSize,
+}
+
+/// The four numbers of doc 24 §18's table, plus the rows behind the last one.
+#[derive(Debug, Clone)]
+pub struct IslandReport {
+    pub nodes_total: u64,
+    pub reachable: u64,
+    pub live_linked: u64,
+    /// `live_linked` minus `reachable ∩ live_linked` — the nodes every existing
+    /// check calls healthy and no path from the root reaches.
+    pub stranded: u64,
+    /// Grouped by topmost detached node, biggest first.
+    pub islands: Vec<Island>,
+}
+
 /// What a bulk retire did, and what it deliberately would not do (D80 §8).
 #[derive(Debug, Clone)]
 pub struct RetireReport {
@@ -2425,6 +2484,284 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Nodes and bytes hanging under a node by live `contains` links — the
+    /// node itself excluded.
+    ///
+    /// `unlink` and the island report need the same number: one to say what a
+    /// cut is about to strand, the other to say what a cut already did.
+    ///
+    /// Durable links only. A temp child is not stranded by a cut above it —
+    /// `remove_link` runs the temp purge cascade and it goes — so counting one
+    /// as about-to-be-stranded would overstate what the operator is deciding.
+    pub fn subtree_size(&self, node: &NodeId) -> Result<SubtreeSize> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT child_id FROM links
+                      WHERE parent_id = ?1 AND link_type = ?2 AND removed_at IS NULL
+                   UNION
+                     SELECT l.child_id FROM links l JOIN sub s ON l.parent_id = s.id
+                      WHERE l.link_type = ?2 AND l.removed_at IS NULL
+                 )
+                 SELECT n.node_type, n.payload FROM nodes n JOIN sub ON n.id = sub.id",
+            )
+            .map_err(map_db("subtree size"))?;
+        let rows = stmt
+            .query_map(params![node, LINK_CONTAINS], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_db("subtree size"))?;
+        let mut size = SubtreeSize::default();
+        for row in rows {
+            let (node_type, payload) = row.map_err(map_db("subtree size"))?;
+            size.add(&node_type, &payload);
+        }
+        Ok(size)
+    }
+
+    /// What `unlink` on this link would strand: the child's label and the
+    /// subtree hanging under it, or `None` when there is nothing to warn about
+    /// — a file, a `ref`, an already-removed link, an empty folder.
+    ///
+    /// Separate from `remove_link` on purpose. The engine's semantics are not
+    /// changing (doc 24 §19.4 keeps unlink non-cascading); what was missing is
+    /// that the caller had no way to say what the cut was about to do.
+    pub fn unlink_would_strand(&self, link_id: &LinkId) -> Result<Option<(String, SubtreeSize)>> {
+        let Some(l) = fetch_link(&self.conn, link_id)? else {
+            return Ok(None); // a temp link, or not there — `remove_link` reports it
+        };
+        if l.removed_at.is_some() || l.link_type != LINK_CONTAINS {
+            return Ok(None);
+        }
+        let size = self.subtree_size(&l.child_id)?;
+        if size.nodes == 0 {
+            return Ok(None);
+        }
+        // The same name the operator sees when browsing: the edge's label if
+        // it has one, otherwise the node's (D72). `Link` does not carry the
+        // column, so it is read here.
+        let edge_label: String = self
+            .conn
+            .query_row(
+                "SELECT label FROM links WHERE id = ?1",
+                params![link_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db("unlink preview"))?
+            .unwrap_or_default();
+        let label = if !edge_label.is_empty() {
+            edge_label
+        } else {
+            match fetch_node(&self.conn, &l.child_id)? {
+                Some(n) => n.label,
+                None => l.child_id.clone(),
+            }
+        };
+        Ok(Some((label, size)))
+    }
+
+    /// Detached subtrees — live-linked nodes no tree root can reach
+    /// (doc 24 §18, §19).
+    ///
+    /// Unlink is a soft-remove of ONE link and does not cascade, so removing a
+    /// folder's only inbound edge detaches everything beneath it in a single
+    /// operation while leaving the subtree internally perfect: every node still
+    /// live-linked, every parent still live, nothing marked removed but the one
+    /// edge at the top. Production carried 1,849 such nodes for a fortnight
+    /// (`Backups`, unlinked 2026-08-24) and no check named one of them.
+    ///
+    /// None of the existing checks can. `orphans` asks whether a NODE has a
+    /// live link, `missing` whether a FILE is held, `reclaim` whether central
+    /// BYTES have a live node. All three are local predicates and every
+    /// stranded node answers them healthily — what is missing is a PATH, and a
+    /// path is only visible from the root.
+    ///
+    /// Reachability starts at every TREE root — a forest holds more than one
+    /// tree and `walk` stays inside one — and is then `walk()`'s (spec §12):
+    /// descend `contains`, but count a `ref` child of a reached folder as
+    /// reached, because browsing its parent lists it. Liveness is
+    /// `list_orphans`' — `removed_at IS NULL`, both link tables, suspended
+    /// links included. Deliberately the same predicate on both halves: this is
+    /// a set difference, and no node should land in it because the two sides
+    /// disagreed about what a live edge is.
+    ///
+    /// A REPORT, not a sweep, for the same reason `missing` is one: which
+    /// parent to re-link an island to is not something a walk can know.
+    pub fn list_islands(&self) -> Result<IslandReport> {
+        use std::collections::{HashMap, HashSet};
+
+        // Seeded from EVERY tree root, not just the forest root. A forest holds
+        // more than one tree (`pvfs tree create`), each rooted by a live
+        // `contains` link with a NULL parent — the forest root's own link has
+        // exactly that shape — and `walk` deliberately stays inside one tree.
+        // Seeding from one root reported every other tree as detached, which
+        // the CLI smoke suite caught on its second tree and its ref-held file.
+        //
+        // Otherwise `walk()` semantics (spec §12): `descend` is 1 for a node
+        // reached by a `contains` edge, 0 for one reached only by a `ref`.
+        // UNION dedupes whole rows, so a node reached both ways keeps its
+        // descending copy — and a cycle, were one ever folded past the
+        // write-path check, terminates instead of spinning.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE reach(id, descend) AS (
+                     SELECT child_id, 1 FROM links
+                      WHERE parent_id IS NULL AND link_type = ?1 AND removed_at IS NULL
+                   UNION
+                     SELECT l.child_id, l.link_type = ?1 FROM links l
+                       JOIN reach r ON l.parent_id = r.id
+                      WHERE r.descend = 1 AND l.removed_at IS NULL
+                   UNION
+                     SELECT t.child_id, t.link_type = ?1 FROM temp_links t
+                       JOIN reach r ON t.parent_id = r.id
+                      WHERE r.descend = 1 AND t.removed_at IS NULL
+                 )
+                 SELECT DISTINCT id FROM reach",
+            )
+            .map_err(map_db("islands: reach"))?;
+        let reachable: HashSet<String> = stmt
+            .query_map(params![LINK_CONTAINS], |r| r.get::<_, String>(0))
+            .map_err(map_db("islands: reach"))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(map_db("islands: reach"))?;
+
+        // Every durable node, with the two facts the report counts by. Temp
+        // nodes live in their own table and are out of scope here, exactly as
+        // they are for `orphans`.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.id, n.node_type, n.payload,
+                        n.id IN (SELECT child_id FROM links WHERE removed_at IS NULL
+                                 UNION
+                                 SELECT child_id FROM temp_links WHERE removed_at IS NULL)
+                   FROM nodes n",
+            )
+            .map_err(map_db("islands: nodes"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            })
+            .map_err(map_db("islands: nodes"))?;
+
+        let mut nodes_total = 0u64;
+        let mut reachable_nodes = 0u64;
+        let mut live_linked = 0u64;
+        let mut stranded: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for row in rows {
+            let (id, node_type, payload, has_live_link) = row.map_err(map_db("islands: nodes"))?;
+            nodes_total += 1;
+            let reached = reachable.contains(&id);
+            if reached {
+                reachable_nodes += 1;
+            }
+            if has_live_link {
+                live_linked += 1;
+                if !reached {
+                    stranded.push((id, node_type, payload));
+                }
+            }
+        }
+
+        let mut report = IslandReport {
+            nodes_total,
+            reachable: reachable_nodes,
+            live_linked,
+            stranded: stranded.len() as u64,
+            islands: Vec::new(),
+        };
+        if stranded.is_empty() {
+            return Ok(report);
+        }
+
+        // The home-parent map: at most one live `contains` parent per child
+        // (the one-home rule), so the ascent below is unambiguous.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT child_id, parent_id FROM links
+                  WHERE link_type = ?1 AND removed_at IS NULL AND parent_id IS NOT NULL",
+            )
+            .map_err(map_db("islands: home parents"))?;
+        let rows = stmt
+            .query_map(params![LINK_CONTAINS], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_db("islands: home parents"))?;
+        let mut home: HashMap<String, String> = HashMap::new();
+        for row in rows {
+            let (child, parent) = row.map_err(map_db("islands: home parents"))?;
+            home.insert(child, parent);
+        }
+
+        // Climb to the top of each detached component. Stop at a node with no
+        // live `contains` parent — that is the folder whose edge was cut — or
+        // at one whose parent IS reachable, which happens only when the parent
+        // was reached by a `ref` and so never descended into.
+        let mut grouped: HashMap<String, SubtreeSize> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (id, node_type, payload) in &stranded {
+            let mut cur = id.clone();
+            seen.clear();
+            while seen.insert(cur.clone()) {
+                match home.get(&cur) {
+                    Some(p) if !reachable.contains(p) => cur = p.clone(),
+                    _ => break,
+                }
+            }
+            grouped.entry(cur).or_default().add(node_type, payload);
+        }
+
+        // When each cut happened. `idx_links_child` is partial on live links,
+        // so a per-island lookup of a REMOVED edge is a table scan each time —
+        // one grouped pass instead, however many islands there turn out to be.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT child_id, MAX(removed_at) FROM links
+                  WHERE link_type = ?1 AND removed_at IS NOT NULL
+                  GROUP BY child_id",
+            )
+            .map_err(map_db("islands: detached at"))?;
+        let rows = stmt
+            .query_map(params![LINK_CONTAINS], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(map_db("islands: detached at"))?;
+        let mut cut_at: HashMap<String, i64> = HashMap::new();
+        for row in rows {
+            let (child, at) = row.map_err(map_db("islands: detached at"))?;
+            cut_at.insert(child, at);
+        }
+
+        for (island_root, size) in grouped {
+            let Some(node) = fetch_node(&self.conn, &island_root)? else {
+                continue;
+            };
+            report.islands.push(Island {
+                detached_at: cut_at.get(&island_root).map(|v| *v as u64),
+                root: node,
+                size,
+            });
+        }
+        // Biggest first — the island that matters is the one holding the most.
+        report.islands.sort_by(|a, b| {
+            b.size
+                .nodes
+                .cmp(&a.size.nodes)
+                .then_with(|| a.root.label.cmp(&b.root.label))
+        });
+        Ok(report)
     }
 
     /// Explicit hard delete — purge protocol (spec §9.2): orphans only;

@@ -1265,9 +1265,18 @@ path from the root to here?* — and nothing asked it.
 
 ### 19.2 What "reachable" means here
 
-Reachability mirrors `walk()`, the engine's own pre-order tree semantics
-(spec §12): **descend `contains` only, but count a `ref` child of a reached
-folder as reached.** A ref child is listed when you browse its parent, so it is
+**From every tree root, not "the" root.** A forest holds more than one tree —
+`pvfs tree create` makes one, rooted by a live `contains` link with a NULL
+parent, which is the same shape `forest init` gives the forest root — and
+`walk` deliberately stays inside one tree. Seeding the walk from the forest
+root alone therefore reports every *other* tree as detached. The first build
+did exactly that; the CLI smoke suite caught it, having made a second tree
+120 lines earlier and hung a ref-held file off it. The seed is now every live
+NULL-parent `contains` edge.
+
+From those seeds, reachability mirrors `walk()`, the engine's own pre-order
+tree semantics (spec §12): **descend `contains` only, but count a `ref` child
+of a reached folder as reached.** A ref child is listed when you browse its parent, so it is
 plainly in the tree even though the walk does not descend it — flagging it
 would be crying wolf on the very first run.
 
@@ -1300,6 +1309,12 @@ hanging off it. The island report is what makes that row mean something.
 `detached_at` comes from the retired edge itself — `MAX(removed_at)` over
 removed `contains` links into the island root — so the report dates the cut.
 
+It also *discriminates*, which matters on a replica. A node may be linked under
+a folder that is itself linked into the tree later, so a replica caught up
+between those two events shows a real, transient island. A cut has a removed
+edge on record and a not-yet-synced edge does not, so the report says which it
+is looking at rather than calling both a detachment.
+
 ### 19.4 The unlink warning
 
 `unlink` stays non-cascading; §18 is right that the semantics are defensible.
@@ -1317,16 +1332,70 @@ strand.
 
 ### 19.5 Turnkey checklist
 
-- [ ] **A.** `Engine::list_islands()` → `IslandReport { nodes_total,
+- [x] **A.** `Engine::list_islands()` → `IslandReport { nodes_total,
       reachable, live_linked, stranded, islands }` — the four numbers of §18's
       table plus the grouped rows.
-- [ ] **B.** `Engine::subtree_size()` → `SubtreeSize { nodes, files, folders,
+- [x] **B.** `Engine::subtree_size()` → `SubtreeSize { nodes, files, folders,
       bytes }`, shared by the report and the unlink warning.
-- [ ] **C.** `pvfs islands` — human and `--json`; exit 0 when clean.
-- [ ] **D.** `pvfs unlink` warns and prompts per 19.4; `--yes` skips the prompt.
-- [ ] **E.** Tests: a clean forest reports nothing; unlinking a folder strands
+- [x] **C.** `pvfs islands` — human and `--json`. Always exit 0: a report,
+      like `orphans` and `missing`, and the exit codes in this CLI mean
+      *the command failed*, not *the forest has a finding*.
+- [x] **D.** `pvfs unlink` warns and prompts per 19.4; `--yes` skips the prompt.
+- [x] **E.** Tests: a clean forest reports nothing; unlinking a folder strands
       its subtree and the report names the folder with the right counts; nested
       islands group to the topmost; a `ref`-only child is not an island; the
-      island root is the `orphans` row.
-- [ ] **F.** Pipeline green on presubuntu (`-e session=d105-islands`), clippy
+      island root is the `orphans` row. Plus two the design did not foresee —
+      a second tree is not an island, and a file held only by a `ref` from
+      another tree is reachable (see 19.6). **9 tests**, and a CLI section in
+      the smoke suite.
+- [x] **F.** Pipeline green on presubuntu (`-e session=d105-islands`), clippy
       `-D warnings` clean.
+
+### 19.6 Close-out
+
+Built as designed. Four corrections, one of them the design's own fault.
+
+**1. "The forest root" was the wrong seed — a forest has many trees.**
+
+§19.2 as written said *walk from the forest root*, and the first build did. But
+`pvfs tree create` makes a second tree, rooted by a live `contains` link with a
+NULL parent — the same shape `forest init` gives the forest root — and `walk`
+deliberately stays inside one tree (the smoke suite asserts exactly that:
+"walk stays within one tree"). So a check seeded from one root calls every
+other tree detached.
+
+The CLI smoke suite caught it on the first run that reached it, and it caught
+two shapes at once: `second-tree` itself, and `fifth-element.mkv`, a file whose
+`contains` parent had been purged and which survives only on refs *from* that
+second tree. Both reported as islands. Neither is one.
+
+Fixed by seeding from every live NULL-parent `contains` edge. The check did not
+weaken: a cut *inside* the second tree is still found, which is now a test.
+Worth saying plainly — the unit tests did not find this, because they were
+written from the same wrong sentence in the design. The end-to-end suite found
+it because it was built by someone modelling a real forest, and a real forest
+has more than one tree in it.
+
+**2. The root has a live link.** `forest init` gives it a NULL-parent
+`contains` link, so in a whole forest `live_linked` equals `nodes_total`, not
+`nodes_total − 1` as the first test asserted. Only the test was wrong. The same
+shape is what made correction 1 both possible and, once seen, obvious.
+
+**3. `Link` does not carry `label`.** The projection has the column (D72) but
+the struct does not map it, so `unlink_would_strand` reads it directly. It is
+the name the operator sees; falling back to the node's label would have printed
+the wrong one for any renamed edge.
+
+**4. `detached_at` became one grouped pass.** `idx_links_child` is partial on
+`removed_at IS NULL`, so asking for a *removed* edge by child id is a table
+scan every time. One `GROUP BY child_id` over the retired `contains` edges
+instead, so the cost no longer scales with how many islands a forest has.
+
+**Scope held.** Unlink still does not cascade. `islands` still exits 0. Neither
+is exposed over the daemon protocol, matching `orphans` and `missing`.
+
+**One thing the design did not raise.** On a replica still catching up, a
+folder linked into the tree *after* its children were populated shows as a real
+island until the parent edge arrives. `detached_at` separates the two cases — a
+cut has a retired edge on record, a not-yet-synced one does not — and the
+report says which it is looking at instead of calling both a detachment.

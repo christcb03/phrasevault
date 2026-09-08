@@ -38,7 +38,10 @@ pub mod sync;
 pub mod walk;
 
 pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
-pub use engine::{ChildEntry, Engine, NodeSpec, PreparedEvent, PreparedWrite, RegionInfo};
+pub use engine::{
+    ChildEntry, Engine, Island, IslandReport, NodeSpec, PreparedEvent, PreparedWrite, RegionInfo,
+    SubtreeSize,
+};
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
