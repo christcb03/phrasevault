@@ -1710,6 +1710,45 @@ impl Engine {
             return Ok(());
         }
 
+        // D115 — A DIRECTORY CANNOT HOLD TWO FILES WITH ONE NAME.
+        //
+        // Before minting, ask the question the identity match structurally
+        // cannot: is there already a live node called this, right here? The
+        // match joins on name AND size, so a file whose CONTENT changed is not
+        // a candidate at all — the scan concluded "new" and added a second node
+        // beside the first, at the same path, forever.
+        //
+        // That is where production's duplicate pairs came from once D112 closed
+        // the half-copied case: an *arr upgrades an episode, the size changes,
+        // and the catalogue grows a node per version. Measured on the fleet —
+        // `Alone - s11e01` at 1.22 GB and 4.68 GB, `A Good Day to Die Hard` at
+        // 14.0 and 9.6 GB, one file on disk for each.
+        //
+        // Same name, same parent, different size means the file was REPLACED,
+        // and the system already has a path for that: flag it and let an
+        // operator resolve it (doc 04 §4.4). Nothing is minted, so no pair is
+        // created and there is nothing to clean up afterwards.
+        //
+        // This also answers a question a merge could never answer well. Deciding
+        // WHICH of two nodes to keep was guesswork on the owner, which holds no
+        // media; here the file is in front of us and the node that matches it is
+        // simply the one that is right.
+        //
+        // SCOPED TO THIS ROOT, and that scoping is load-bearing. D81 4c exists
+        // for the case where the same title is upgraded on a DIFFERENT volume —
+        // a cold copy on Data_ext superseded by one arriving in staging — and
+        // that is emphatically not an in-place replacement. Same name, same
+        // parent, but the existing copy lives somewhere else, so the cross-root
+        // path below must get it. Firing here instead turned four of D81's
+        // tests into "it must NAME the volume holding the other copy: []".
+        if let Some((existing, old_size, old_mtime)) = self.live_child_by_name(parent, &f.name)? {
+            if self.has_location_under(&existing, &b.source_uri)? {
+                self.flag_change(&existing, uri, old_size, old_mtime, f)?;
+                stats.changed += 1;
+                return Ok(());
+            }
+        }
+
         // brand-new file ⇒ pointer node + location. P9.1: hashing computes
         // the chunk manifest in the same read and attests it after the node
         // exists (doc 22 §2).
@@ -1760,6 +1799,64 @@ impl Engine {
         self.set_scan_state(uri, f.size, f.mtime_ms, &id)?;
         stats.added += 1;
         Ok(())
+    }
+
+    /// Does this node hold a live location under `root_uri`?
+    ///
+    /// D115 — the difference between "this file was replaced where it lives"
+    /// and "a copy of this title turned up on another volume". The first is a
+    /// change; the second is D81 4c's cross-root upgrade, and conflating them
+    /// loses the volume the superseded copy is on.
+    fn has_location_under(&self, file_id: &NodeId, root_uri: &str) -> Result<bool> {
+        let root = root_uri.trim_end_matches('/');
+        for uri in self.locations(file_id)? {
+            if uri == root || uri.starts_with(&format!("{root}/")) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The live node with this effective name under this parent, with the size
+    /// and mtime the catalogue currently records for it.
+    ///
+    /// D115 — the by-NAME question, as opposed to `match_by_identity`'s
+    /// by-name-AND-size one. One directory, one name, one file: if this
+    /// answers, the file on disk IS that node, whatever its size has become.
+    fn live_child_by_name(&self, parent: &NodeId, name: &str) -> Result<Option<(NodeId, u64, u64)>> {
+        let hit: Option<(String, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT n.id, n.payload FROM nodes n
+                   JOIN links l ON l.child_id = n.id AND l.removed_at IS NULL
+                  WHERE n.node_type = ?3 AND l.parent_id = ?1
+                    AND ( (l.label <> '' AND l.label = ?2)
+                       OR (l.label =  '' AND n.label = ?2) )
+                  LIMIT 1",
+                params![parent, name, node::TYPE_FILE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("child by name"))?;
+        let Some((id, payload)) = hit else {
+            return Ok(None);
+        };
+        let size = FilePayload::decode(&payload)
+            .map(|p| p.size_bytes)
+            .unwrap_or(0);
+        // The mtime the catalogue last saw for this node, if a scan recorded
+        // one. Absent is fine — `flag_change` only reports it.
+        let mtime: u64 = self
+            .conn
+            .query_row(
+                "SELECT mtime_ms FROM scan_state WHERE file_id = ?1 LIMIT 1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_db("child by name mtime"))?
+            .unwrap_or(0) as u64;
+        Ok(Some((id, size, mtime)))
     }
 
     fn flag_change(
