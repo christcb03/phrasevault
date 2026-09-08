@@ -338,9 +338,23 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 let cb = Arc::clone(&st);
                 let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| match ev {
                     WatchEvent::PassStarted => cb.mark_pass_start("watch"),
-                    WatchEvent::Ingested(_, a, c, rm) => {
+                    WatchEvent::Ingested(ref folder, a, c, rm, un) => {
                         cb.mark_pass_end("watch");
                         cb.mark_ok("watch");
+                        // D111 — SAY WHAT THE PASS DID. This job is how the
+                        // fleet actually scans, and it reported its numbers to
+                        // nobody: the counts went into the status row's
+                        // liveness bookkeeping and were then dropped. So the
+                        // one place a scan can now take files out of the tree
+                        // (D105) was the one place with no record of it, and
+                        // "how many did that unlink?" could only be answered
+                        // by diffing the forest before and after.
+                        if a + c + rm + un > 0 {
+                            eprintln!(
+                                "pvfsd: watch ingested {folder}: \
+                                 +{a} changed {c} removed {rm} unlinked {un}"
+                            );
+                        }
                         if a + c + rm > 0 {
                             // local ingest = new content: views, placed
                             // subtrees, the mover — all should wake

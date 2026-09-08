@@ -5196,9 +5196,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         debounce_ms,
                         &never,
                         |ev| match ev {
-                            pvfs_client::watch::WatchEvent::Ingested(f, a, c, r) => {
-                                if !json && a + c + r > 0 {
-                                    println!("ingested {f}: +{a} !{c} -{r}");
+                            pvfs_client::watch::WatchEvent::Ingested(f, a, c, r, u) => {
+                                if !json && a + c + r + u > 0 {
+                                    // D111 — `-{r}` is retired LOCATIONS; `~{u}`
+                                    // is nodes taken out of the tree (D105).
+                                    // Reporting only the first reads as "the
+                                    // file moved" for something that left.
+                                    println!("ingested {f}: +{a} !{c} -{r} ~{u}");
                                 }
                             }
                             // A quiet pass is progress for the daemon's stall
