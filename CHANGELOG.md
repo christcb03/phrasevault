@@ -5,6 +5,20 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A cache older than the current DDL opens again (D108):** `create_schema`
+  ran with `?` at the top of the projection open path, so applying
+  `INDEX_SCHEMA` to a pre-v10 cache failed on `idx_links_label` — a column
+  `links` does not have until v10, indexed unconditionally since D72
+  (2026-08-19) — and the error reached the caller. **`pvfsd` exited 1 and
+  systemd restart-looped it** on `no such column: label`, which reads as a
+  corrupt forest rather than as one wanting its migration. The DDL is now
+  applied AFTER the migration ladder has added the columns it indexes, so the
+  cheap door stays open for exactly the forest that needs it — old, large,
+  where the alternative is replaying the whole log — and any remaining failure
+  routes to `full_rebuild` like every other probe there. The test helper that
+  should have caught this was relabelling a current cache `v7` rather than
+  reshaping it; it now drops `links.label` too.
+
 - **The identity model, settled and frictionless (doc 18 §4, decided
   2026-08-13):** every outbound connection authenticates as the box's
   client identity — never the forest device key — and `pvfs forest init`
