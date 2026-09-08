@@ -1467,7 +1467,8 @@ impl Engine {
         // exists (doc 22 §2).
         let (content_hash, chunks) = match b.hash_policy {
             HashPolicy::OnAdd => {
-                crate::sync::hash_with_manifest(&crate::storage::uri_to_path(uri)?)?
+                let p = crate::storage::uri_to_path(uri)?;
+                self.hash_reusing_sidecar(&p, f.size)?
             }
             _ => (String::new(), Vec::new()),
         };
@@ -1714,7 +1715,8 @@ impl Engine {
         }
         let (content_hash, chunks) = match hash_policy {
             HashPolicy::OnAdd => {
-                crate::sync::hash_with_manifest(&crate::storage::uri_to_path(uri)?)?
+                let p = crate::storage::uri_to_path(uri)?;
+                self.hash_reusing_sidecar(&p, st.size)?
             }
             _ => (String::new(), Vec::new()),
         };
@@ -1942,6 +1944,39 @@ impl Engine {
     ///
     /// Never fails a scan. A file that cannot be hashed right now is recorded
     /// as it was and retried next pass.
+    /// D103 — the hash for a file about to be indexed, reusing the sidecar
+    /// beside it when there is one, and leaving one behind when there is not.
+    ///
+    /// This existed only inside `fill_hash_if_needed`, whose own comment says
+    /// the record "is what lets the library be re-imported into a fresh forest
+    /// without paying for the hashing again". The `on_add` paths — the ones a
+    /// re-import actually takes — called `hash_with_manifest` directly and so
+    /// did neither half: they re-read every byte with a valid sidecar sitting
+    /// next to the file, and wrote nothing for the next forest.
+    ///
+    /// Proved rather than reasoned: with the bytes chmod 000 and a good
+    /// sidecar present, a fresh `on_add` scan reported `1 skipped, 1
+    /// unreadable`. On the production library that is 40 TB of re-reading for
+    /// a record already on disk.
+    fn hash_reusing_sidecar(&self, path: &std::path::Path, size: u64) -> Result<(String, Vec<[u8; 32]>)> {
+        if let Some(known) = crate::sync::sidecar_hashes(path, size) {
+            eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
+            return Ok(known);
+        }
+        if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
+            // Whole hash only still saves the whole read, which is the cost.
+            eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
+            return Ok((w, Vec::new()));
+        }
+        let (content_hash, chunks) = crate::sync::hash_with_manifest(path)?;
+        // Leave the note for the next forest. Best-effort: a read-only store
+        // still indexes, it just cannot record.
+        if !chunks.is_empty() {
+            let _ = crate::sync::write_manifest_sidecar(path, Some(&content_hash), &chunks);
+        }
+        Ok((content_hash, chunks))
+    }
+
     fn fill_hash_if_needed(
         &mut self,
         id: &NodeId,
