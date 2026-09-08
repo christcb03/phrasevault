@@ -193,6 +193,28 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Files the catalogue holds MORE THAN ONCE at the same place (D113).
+    ///
+    /// Same parent, same name, same size — the identity rule the scan itself
+    /// uses, so a group here is a set the scan can no longer tell apart. It
+    /// stops matching them at all and declines to add more, which is why they
+    /// have to be resolved rather than waited out.
+    ///
+    /// Production made ~1,910 of these: rclone preserves the source mtime, the
+    /// settle window trusted mtime, and the holder catalogued half-copied
+    /// arrivals at a partial size that then failed to match the node the ingest
+    /// had already made. D112 stopped new ones; this clears the backlog.
+    ///
+    /// A REPORT unless you pass --merge.
+    Duplicates {
+        /// Merge each group onto one node: locations moved first, then the
+        /// others unlinked. Reversible — unlink is a soft remove.
+        #[arg(long)]
+        merge: bool,
+        /// Skip the confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List orphaned durable nodes
     Orphans,
     /// Detached subtrees — live-linked nodes no tree root reaches (doc 24 §19).
@@ -3538,6 +3560,111 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 for n in orphans {
                     println!("{}  {:<8} {}", n.id, n.node_type, n.label);
                 }
+            }
+            engine.close()
+        }
+        Cmd::Duplicates { merge, yes } => {
+            let mut engine = Engine::open(&ctx?)?;
+            let r = engine.list_duplicates()?;
+            if json && !merge {
+                let items: Vec<String> = r
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "{{\"parent\":\"{}\",\"label\":\"{}\",\"size\":{},\
+                             \"keep\":\"{}\",\"drop\":[{}],\"locations\":{}}}",
+                            g.parent,
+                            json_escape(&g.label),
+                            g.size,
+                            g.keep,
+                            g.drop
+                                .iter()
+                                .map(|d| format!("\"{d}\""))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            g.locations,
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"groups\":{},\"redundant\":{},\"locations_to_move\":{},\
+                     \"already_consolidated\":{},\"items\":[{}]}}",
+                    r.groups.len(),
+                    r.redundant,
+                    r.locations_moved,
+                    r.already_consolidated,
+                    items.join(",")
+                );
+                return engine.close();
+            }
+            if r.groups.is_empty() {
+                if !json {
+                    println!("no duplicates — every file is catalogued once where it lives");
+                }
+                return engine.close();
+            }
+            if !json {
+                println!("duplicate groups        : {}", r.groups.len());
+                println!("nodes that would go     : {}", r.redundant);
+                println!("locations to move first : {}", r.locations_moved);
+                println!(
+                    "groups already holding all their locations on one node: {}",
+                    r.already_consolidated
+                );
+                println!();
+                for g in r.groups.iter().take(20) {
+                    println!(
+                        "  {}  {} copies, {} location(s)  {}",
+                        &g.keep[..12.min(g.keep.len())],
+                        g.drop.len() + 1,
+                        g.locations,
+                        g.label
+                    );
+                }
+                if r.groups.len() > 20 {
+                    println!("  … and {} more", r.groups.len() - 20);
+                }
+            }
+            if !merge {
+                if !json {
+                    println!(
+                        "\nnothing was changed. `pvfs duplicates --merge` moves every location \
+                         onto one node\nand unlinks the rest — a soft remove, so it is reversible."
+                    );
+                }
+                return engine.close();
+            }
+            use std::io::IsTerminal;
+            if !yes && !json && std::io::stdin().is_terminal() {
+                let a = prompt_line(
+                    &format!(
+                        "merge {} group(s), unlinking {} node(s)? [y/N]",
+                        r.groups.len(),
+                        r.redundant
+                    ),
+                    Some("N"),
+                )?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return engine.close();
+                }
+            }
+            let done = engine.merge_duplicates(false)?;
+            if json {
+                println!(
+                    "{{\"merged\":{},\"unlinked\":{},\"locations_moved\":{}}}",
+                    done.groups.len(),
+                    done.redundant,
+                    done.locations_moved
+                );
+            } else {
+                println!(
+                    "merged {} group(s): {} location(s) moved, {} node(s) unlinked",
+                    done.groups.len(),
+                    done.locations_moved,
+                    done.redundant
+                );
             }
             engine.close()
         }

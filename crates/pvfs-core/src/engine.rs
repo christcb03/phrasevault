@@ -115,6 +115,36 @@ pub struct IslandReport {
     pub islands: Vec<Island>,
 }
 
+/// One file the catalogue holds more than once at the same place (D113).
+#[derive(Debug, Clone)]
+pub struct DuplicateGroup {
+    pub parent: NodeId,
+    pub label: String,
+    pub size: u64,
+    /// The node that survives a merge: most live locations, then oldest, then
+    /// lowest id. Deterministic on purpose — a report an operator reads and a
+    /// merge that runs later must agree about which node is the keeper.
+    pub keep: NodeId,
+    /// The other nodes for the same file. A merge moves their locations onto
+    /// `keep` and unlinks them.
+    pub drop: Vec<NodeId>,
+    /// Live locations across the whole group — what a merge has to preserve.
+    pub locations: u64,
+}
+
+/// Duplicate files, and what a merge would do about them (D113).
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateReport {
+    pub groups: Vec<DuplicateGroup>,
+    /// Nodes that would be unlinked — the sum of every group's `drop`.
+    pub redundant: u64,
+    /// Locations moved onto a keeper. Nothing is ever dropped.
+    pub locations_moved: u64,
+    /// Groups whose keeper already holds every location: nothing to move, the
+    /// losers are simply unlinked.
+    pub already_consolidated: u64,
+}
+
 /// What a bulk retire did, and what it deliberately would not do (D80 §8).
 #[derive(Debug, Clone)]
 pub struct RetireReport {
@@ -2761,6 +2791,151 @@ impl Engine {
                 .cmp(&a.size.nodes)
                 .then_with(|| a.root.label.cmp(&b.root.label))
         });
+        Ok(report)
+    }
+
+    /// Files the catalogue holds MORE THAN ONCE at the same place (D113).
+    ///
+    /// A group is: same live parent, same effective name, same size — which is
+    /// the identity rule `match_by_identity` uses, so a group here is exactly a
+    /// set the scan can no longer tell apart.
+    ///
+    /// Production made ~1,910 of these and D112 explains how: rclone preserves
+    /// the source mtime, the settle window trusted mtime, and the holder
+    /// catalogued half-copied arrivals at a partial size that later failed to
+    /// match the ingest's node. D112 stops new ones; this finds the ones
+    /// already made.
+    ///
+    /// A REPORT by itself. Which node survives is stated here so the merge
+    /// cannot surprise anyone, but nothing changes until `merge_duplicates`.
+    pub fn list_duplicates(&self) -> Result<DuplicateReport> {
+        use std::collections::HashMap;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT l.parent_id,
+                        CASE WHEN l.label <> '' THEN l.label ELSE n.label END AS name,
+                        n.id, n.payload, n.created_at
+                   FROM nodes n
+                   JOIN links l ON l.child_id = n.id AND l.removed_at IS NULL
+                  WHERE n.node_type = ?1 AND l.parent_id IS NOT NULL",
+            )
+            .map_err(map_db("duplicates"))?;
+        let rows = stmt
+            .query_map(params![node::TYPE_FILE], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(map_db("duplicates"))?;
+
+        // (parent, name, size) → [(id, created_at)]
+        let mut groups: HashMap<(String, String, u64), Vec<(String, i64)>> = HashMap::new();
+        for row in rows {
+            let (parent, name, id, payload, created) = row.map_err(map_db("duplicates"))?;
+            // A payload that will not decode has no size to group by, and
+            // guessing one would put unrelated files in the same group.
+            let Ok(fp) = node::FilePayload::decode(&payload) else {
+                continue;
+            };
+            groups
+                .entry((parent, name, fp.size_bytes))
+                .or_default()
+                .push((id, created));
+        }
+
+        let mut report = DuplicateReport::default();
+        for ((parent, label, size), mut members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            // Deterministic keeper: most live locations, then oldest, then
+            // lowest id. Locations first because the node the fleet already
+            // points at is the one worth keeping — moving fewer locations means
+            // fewer events and less to go wrong.
+            let mut scored: Vec<(usize, i64, String)> = Vec::new();
+            for (id, created) in members.drain(..) {
+                let n = self.locations(&id)?.len();
+                scored.push((n, created, id));
+            }
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            let total: u64 = scored.iter().map(|(n, _, _)| *n as u64).sum();
+            let keep = scored[0].2.clone();
+            let keeps_all = scored[0].0 as u64 == total;
+            let drop: Vec<NodeId> = scored[1..].iter().map(|(_, _, id)| id.clone()).collect();
+            report.redundant += drop.len() as u64;
+            report.locations_moved += total - scored[0].0 as u64;
+            if keeps_all {
+                report.already_consolidated += 1;
+            }
+            report.groups.push(DuplicateGroup {
+                parent,
+                label,
+                size,
+                keep,
+                drop,
+                locations: total,
+            });
+        }
+        // Biggest first, then by name so the report is stable between runs.
+        report.groups.sort_by(|a, b| {
+            b.drop
+                .len()
+                .cmp(&a.drop.len())
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        Ok(report)
+    }
+
+    /// Merge each duplicate group onto its keeper (D113).
+    ///
+    /// Locations are ADDED to the keeper before the losers are unlinked, in
+    /// that order and never the reverse: a location must never be momentarily
+    /// held by nobody, or D112's grace clock starts on a file that is fine.
+    ///
+    /// Nothing is destroyed. Unlink is a soft remove on an append-only log, so
+    /// a merge is reversible, and the losers' own records survive.
+    pub fn merge_duplicates(&mut self, dry_run: bool) -> Result<DuplicateReport> {
+        let report = self.list_duplicates()?;
+        if dry_run {
+            return Ok(report);
+        }
+        for g in &report.groups {
+            for loser in &g.drop {
+                for uri in self.locations(loser)? {
+                    // Idempotent: `add_location` is a no-op when the keeper
+                    // already has this uri.
+                    self.add_location(&g.keep, &uri)?;
+                    // Then take it off the loser. An UNLINKED node holding a
+                    // LIVE location is its own bad state — D84 counted 95 of
+                    // them — and it would leave the same bytes claimed by two
+                    // nodes, which is the condition this command exists to end.
+                    // Strictly after the add: there must be no instant where
+                    // nobody holds the file.
+                    self.remove_location(loser, &uri)?;
+                }
+                // MediaQuality is keyed by node id, so it is stranded on the
+                // loser exactly as a re-genesis would strand it (D104). Carry
+                // it, unless the keeper already has its own — a measurement the
+                // keeper made is at least as current.
+                if self.media_quality(&g.keep)?.is_none() {
+                    if let Some((q, src)) = self.media_quality(loser)? {
+                        self.set_media_quality(&g.keep, &q, &src)?;
+                    }
+                }
+                for link in self.links_of(loser)? {
+                    self.remove_link(&link)?;
+                }
+            }
+        }
         Ok(report)
     }
 
