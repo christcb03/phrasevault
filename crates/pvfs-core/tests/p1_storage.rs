@@ -219,21 +219,42 @@ fn disk_delete_and_restore() {
 
     fs::remove_file(fixture.path().join("notes.txt")).unwrap();
     let r = engine.scan(Some(&folder)).unwrap();
-    assert_eq!(r[0].stats.removed, 1);
+    assert_eq!(r[0].stats.removed, 1, "the location goes");
     assert!(engine.locations(&notes).unwrap().is_empty());
-    let st = engine.stat_node(&notes).unwrap();
-    assert!(st.unavailable, "no readable location ⇒ unavailable");
+
+    // D105 — and because that was its LAST location on a mount whose marker
+    // verified, the link goes too: the file is gone, so the node leaves the
+    // tree. Before D105 the node stayed, listed to anyone browsing, waiting
+    // for a manual `missing --forget` that in production nobody ran (1,849
+    // such nodes from a single folder — doc 24 section 18).
+    assert_eq!(r[0].stats.unlinked, 1, "and the node leaves the tree with it");
+
+    // The EVENT history is still there — unlink is a soft remove on an
+    // append-only log, so this is reversible and nothing was destroyed.
     assert!(
         engine.get_node(&notes).unwrap().is_some(),
-        "node + metadata kept (soft)"
+        "the node record survives; only its place in the tree is gone"
     );
 
-    // restore identical bytes ⇒ same node gets its location back
+    // Restoring the bytes re-catalogues the file — under a NEW node.
+    //
+    // This is the cost of D105 and it is deliberate. `match_by_identity`
+    // matches only nodes with a live containing link, on the stated grounds
+    // that "a deletion is a decision, and the same bytes arriving later are
+    // new". Before D105 the link survived a delete, so this path was never
+    // reached and a restore silently revived the old node. Now it is reached,
+    // and the file comes back with a new identity.
+    //
+    // A MOVE is not affected: removals run after additions, so the new
+    // location is recorded before the old one is retired and the node never
+    // reaches zero locations.
     write_file(&fixture.path().join("notes.txt"), b"hello notes");
     let r = engine.scan(Some(&folder)).unwrap();
     assert_eq!(r[0].stats.added, 1);
-    assert_eq!(engine.locations(&notes).unwrap().len(), 1);
-    assert!(!engine.stat_node(&notes).unwrap().unavailable);
+    let restored = find_by_label(&engine, &folder, "notes.txt").unwrap();
+    assert_ne!(restored, notes, "a restored file is a new node, not a revival");
+    assert_eq!(engine.locations(&restored).unwrap().len(), 1);
+    assert!(!engine.stat_node(&restored).unwrap().unavailable);
 }
 
 // §10.5 — changed file: flag, refuse to serve, operator resolve

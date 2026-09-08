@@ -416,6 +416,15 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
             .map_err(scan_remote_err)
     }
 
+    fn remove_link(&mut self, link_id: &str) -> pvfs_core::Result<()> {
+        // D105 — routed like every other replica write. The wire op already
+        // existed (Op::Unlink), so this needs no protocol change.
+        self.client
+            .unlink(link_id, |d| (self.sign)(d))
+            .map(|_| ())
+            .map_err(scan_remote_err)
+    }
+
     fn remove_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
         self.client

@@ -214,14 +214,18 @@ NEW_ALPHA="$($PVFS resolve "$ALPHA" --replace)"
 [ "$($PVFS cat "$NEW_ALPHA")" = "alpha-bytes-changed-longer" ] && ok "successor serves new bytes" || fail "successor serves new bytes"
 $PVFS orphans | qgrep "$ALPHA" && ok "old node kept as orphan" || fail "old node kept as orphan"
 
-say "P1: disk deletion is soft"
+say "P1: disk deletion removes the file from the tree (D105)"
+# Held-nowhere-else, on a mount whose .pvfs-root marker verifies, so the scan
+# has PROVEN the volume is there and a vanished file is genuinely gone. It
+# retires the location AND drops the link. Before D105 the node stayed listed
+# and unavailable, waiting for a manual `missing --forget` — in production that
+# left 1,849 records from one folder.
 rm "$LIB/notes.txt"
-$PVFS --json scan "$LFOLDER" | qgrep '"removed":1' && ok "deletion soft-removed location" || fail "deletion soft-removed location"
-NOTES="$($PVFS --json ls "$LFOLDER" | python3 -c '
-import json,sys
-for e in json.load(sys.stdin):
-    if e["label"] == "notes.txt": print(e["id"])')"
-$PVFS stat "$NOTES" | qgrep UNAVAILABLE && ok "node kept, marked unavailable" || fail "node kept, marked unavailable"
+DEL_JSON="$($PVFS --json scan "$LFOLDER")"
+echo "$DEL_JSON" | qgrep '"removed":1' && ok "deletion retired the location" || fail "deletion retired the location"
+echo "$DEL_JSON" | qgrep '"unlinked":1' && ok "and unlinked the node" || fail "and unlinked the node"
+$PVFS --json ls "$LFOLDER" | qgrep 'notes.txt' \
+  && fail "deleted file must not still be listed" || ok "deleted file is out of the listing"
 
 say "P1: hash fill"
 # Under --hash-policy on_add the scan already content-addresses the file, so
@@ -271,7 +275,21 @@ $PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"exported":2' && ok "expor
 [ -L "$EXPORT_DIR/movies/alpha.mkv" ] && ok "export entry is a symlink" || fail "export entry is a symlink"
 [ "$(cat "$EXPORT_DIR/movies/alpha.mkv")" = "alpha-bytes-changed-longer" ] && ok "export reads through" || fail "export reads through"
 $PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"unchanged":2' && ok "re-export idempotent" || fail "re-export idempotent"
-$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"path":"notes.txt"' && ok "unavailable file reported skipped" || fail "unavailable file reported skipped"
+# D105 — notes.txt is no longer the fixture for this: a deleted file now leaves
+# the tree, so it cannot be exported-and-skipped. Make an honestly unavailable
+# file instead — one the catalog says is held on ANOTHER box, so it keeps its
+# link (nothing to unlink) while this box has no bytes for it.
+printf 'far-away' > "$LIB/movies/elsewhere.bin"
+$PVFS scan "$LFOLDER" >/dev/null
+FAR="$($PVFS --json ls "$MOVIES" | python3 -c '
+import json,sys
+for e in json.load(sys.stdin):
+    if e["label"] == "elsewhere.bin": print(e["id"])')"
+$PVFS loc add "$FAR" "pvfs-host://$(printf 'ab%.0s' $(seq 32))/somewhere/elsewhere.bin" >/dev/null 2>&1
+rm "$LIB/movies/elsewhere.bin"
+$PVFS --json scan "$LFOLDER" | qgrep '"unlinked":0' \
+  && ok "a file held elsewhere is NOT unlinked" || fail "a file held elsewhere is NOT unlinked"
+$PVFS --json export "$LFOLDER" "$EXPORT_DIR" | qgrep '"path":"movies/elsewhere.bin"' && ok "unavailable file reported skipped" || fail "unavailable file reported skipped"
 COPY_DIR="$DATA/exportcopy"
 $PVFS export "$LFOLDER" "$COPY_DIR" --mode copy >/dev/null
 [ ! -L "$COPY_DIR/movies/lazy.bin" ] && [ "$(cat "$COPY_DIR/movies/lazy.bin")" = "lazy-content" ] \

@@ -6,10 +6,23 @@
 //! retired — the residue of a file deleted outside PVFS. Production had 22 of
 //! them and nothing that would have named one.
 //!
-//! It is a REPORT, not a sweep. A scan cannot tell a deliberate deletion from
-//! an accident from an unavailable volume — D81 4a-ii's case matrix — so
-//! unlinking automatically would be inferring intent from a filesystem diff,
-//! which is the mistake this milestone exists to stop making.
+//! It WAS a report, not a sweep, on the reasoning that a scan cannot tell a
+//! deliberate deletion from an accident from an unavailable volume (D81
+//! 4a-ii's case matrix), so unlinking would be inferring intent from a
+//! filesystem diff.
+//!
+//! **D105 answers that objection with D81's own tool.** The unavailable-volume
+//! case is exactly what `verify_root_marker` was added for — Chris's
+//! suggestion, in this same milestone — and `scan_binding` calls it before the
+//! removal loop runs. On a mount PROVEN live, a file that is gone is gone, and
+//! requiring a second manual step only asks the operator to confirm what the
+//! marker established. Unlink is a soft remove on an append-only log, so the
+//! act is reversible and nothing is destroyed.
+//!
+//! `files_held_by_nobody` therefore reports a SMALLER set now: what remains is
+//! residue this scan could not adjudicate — a root whose marker is missing, a
+//! box that has not scanned, or the backlog from before D105 (production had
+//! 1,849 such nodes from one folder, doc 24 section 18).
 
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FILE, TYPE_FOLDER};
 
@@ -57,28 +70,40 @@ fn a_library_whose_files_are_all_present_reports_nothing() {
     engine.close().unwrap();
 }
 
-/// Delete a file outside PVFS: the node survives, holding nothing, and says so.
+/// D105 — delete a file from a mount whose marker verifies, and the scan
+/// finishes the job: the node leaves the tree and there is nothing left to
+/// report. Before D105 it survived here "holding nothing", waiting for a
+/// manual `missing --forget` that nobody ran.
 #[test]
-fn a_file_deleted_outside_pvfs_is_named() {
+fn a_file_deleted_outside_pvfs_is_swept_on_a_proven_mount() {
     let (_t, mut engine, media, lib) = rig();
     std::fs::remove_file(lib.join("TV/Show/gone.mkv")).unwrap();
     engine.scan(Some(&media)).unwrap();
 
     let held = engine.files_held_by_nobody().unwrap();
-    assert_eq!(held.len(), 1, "exactly the deleted one: {held:?}");
-    assert_eq!(held[0].1, "gone.mkv");
+    assert!(
+        held.is_empty(),
+        "the scan proved the mount and removed it; nothing should be left to \
+         report: {held:?}"
+    );
 
-    // And it is STILL IN THE TREE — which is the point. Anyone browsing the
-    // catalog is being shown a file that does not exist anywhere.
+    // And it is OUT OF THE TREE. Before D105 the node survived the file and
+    // anyone browsing the catalog was shown something that existed nowhere.
     let still_listed = engine
         .walk(&media)
         .unwrap()
         .into_iter()
-        .any(|e| e.node.node_type == TYPE_FILE && e.node.label == "gone.mkv");
+        .any(|e| e.node.node_type == TYPE_FILE && e.label == "gone.mkv");
     assert!(
-        still_listed,
-        "the node survives the file — that is exactly why this needs reporting"
+        !still_listed,
+        "a file deleted from a proven mount must not still be listed"
     );
+    // The one that stayed is untouched.
+    assert!(engine
+        .walk(&media)
+        .unwrap()
+        .into_iter()
+        .any(|e| e.node.node_type == TYPE_FILE && e.label == "keep.mkv"));
     engine.close().unwrap();
 }
 
@@ -106,7 +131,8 @@ fn a_moved_file_is_not_reported_as_missing() {
     engine.close().unwrap();
 }
 
-/// Reporting is not sweeping: nothing is unlinked without being asked.
+/// Reading a report must still never change it. The property survives D105 —
+/// what changed is what the scan does, not what the reader does.
 #[test]
 fn the_report_changes_nothing_by_itself() {
     let (_t, mut engine, media, lib) = rig();
@@ -115,9 +141,8 @@ fn the_report_changes_nothing_by_itself() {
 
     let before = engine.files_held_by_nobody().unwrap().len();
     let again = engine.files_held_by_nobody().unwrap().len();
-    assert_eq!(before, 1);
     assert_eq!(
-        again, 1,
+        before, again,
         "reading the report twice must not change what it says — it is a \
          report, and a report that acts is a sweep"
     );

@@ -175,6 +175,11 @@ pub struct ScanStats {
     /// D71 W6: recognised as a file the catalog already knows, found somewhere
     /// else in the tree. No new node was made — only a location added.
     pub relocated: u64,
+    /// D105 — nodes whose LAST location went away on a mount proven live, so
+    /// the link went too. Counted separately from `removed` (locations) because
+    /// they are different acts: one says "this box no longer holds it", the
+    /// other says "it is not in the tree".
+    pub unlinked: u64,
     /// D71 W6: still being written when we looked, so deliberately NOT
     /// catalogued yet. Deferred, never dropped — the next pass takes it.
     pub settling: u64,
@@ -1118,6 +1123,48 @@ impl Engine {
                 .map_err(map_db("scan removals"))?;
             if removed_here {
                 stats.removed += 1;
+                // D105 — a removal that leaves the file held NOWHERE means the
+                // file is gone, and the node should go with it.
+                //
+                // This used to stop at the location, on the reasoning that a
+                // scan cannot tell a deliberate deletion from an unmounted
+                // volume — so `pvfs missing` reported the residue and waited
+                // for `--forget`. But by the time this loop runs the mount has
+                // been PROVEN live: `scan_binding` calls `verify_root_marker`
+                // before any of this, which is the check Chris asked for in
+                // D81 precisely so the difference could be told. Requiring a
+                // second manual step to finish removing something already
+                // deliberately deleted is asking the operator to confirm what
+                // the marker just established.
+                //
+                // Left alone when ANY live location remains: another box still
+                // holds these bytes, and this box's copy going away is not the
+                // file leaving the tree. That is the whole safety rule.
+                //
+                // The Backups subtree is what this omission cost: one folder
+                // unlinked, the locations correctly retired, and 1,849 node
+                // records left behind for a fortnight in no report an operator
+                // reads (doc 24 §18).
+                if self.locations(&file_id)?.is_empty() {
+                    for link in self.links_of(&file_id)? {
+                        let done = match writer {
+                            Some(w) => w.remove_link(&link),
+                            None => self.remove_link(&link),
+                        };
+                        match done {
+                            Ok(()) => stats.unlinked += 1,
+                            Err(e) if is_transient(&e) => return Err(e),
+                            // Same rule as the location arm above: one node the
+                            // catalog will not accept must not stop the line.
+                            Err(e) => {
+                                stats.needs_attention += 1;
+                                if stats.quarantined.len() < 8 {
+                                    stats.quarantined.push((uri.clone(), e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(stats)
@@ -1202,6 +1249,20 @@ impl Engine {
         Ok(crate::engine::active_home(&self.conn, id)?
             .and_then(|(_, parent)| parent)
             .is_some())
+    }
+
+    /// D105 — this node's live links, so a file gone from disk can be taken
+    /// out of the tree it is no longer in.
+    fn links_of(&self, file_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM links WHERE child_id = ?1 AND removed_at IS NULL")
+            .map_err(map_db("links of"))?;
+        let rows = stmt
+            .query_map(params![file_id], |r| r.get::<_, String>(0))
+            .map_err(map_db("links of"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("links of"))
     }
 
     fn match_by_identity(&self, label: &str, size: u64) -> Result<Option<NodeId>> {
@@ -2766,6 +2827,8 @@ pub trait ScanWriter {
     /// D85 — fill a lazy hash on an EXISTING node, returning the successor id.
     /// The caller computed it from bytes it holds; the owner records it.
     fn set_content_hash(&mut self, file: &str, content_hash: &str, size: u64) -> Result<NodeId>;
+    /// D105 — drop a link whose file is gone from a mount PROVEN live.
+    fn remove_link(&mut self, link_id: &str) -> Result<()>;
 }
 
 /// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and
