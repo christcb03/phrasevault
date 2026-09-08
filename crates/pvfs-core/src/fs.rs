@@ -1944,6 +1944,87 @@ impl Engine {
     ///
     /// Never fails a scan. A file that cannot be hashed right now is recorded
     /// as it was and retried next pass.
+    /// D104 — every file's tree path and the quality recorded against it.
+    ///
+    /// Re-genesis mints new node ids (they cover a random `creation_nonce`, so
+    /// they cannot reproduce — doc 24 §16), which strands anything keyed by the
+    /// old id. `MediaQuality` is the big one: 24,585 events on the production
+    /// forest, each a real measurement of what a file IS, and none of it
+    /// derivable from the bytes.
+    ///
+    /// Path is the join key because it is what survives: the *arrs, the mount
+    /// and every non-native reader already address by path, and a re-genesis
+    /// rebuilds the same tree from the same directories.
+    ///
+    /// Returns `path -> (quality, source)` for files that HAVE a measurement.
+    pub fn quality_by_path(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, (crate::media::MediaQuality, String)>> {
+        let root = self.identity.root_node_id.clone();
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack: Vec<String> = Vec::new();
+        for e in self.walk(&root)? {
+            // `walk` is pre-order with a depth, so a stack truncated to that
+            // depth is the entry's parent chain. Read `e.label` (the name the
+            // PARENT uses), never `node.label` — D72 moved names onto links,
+            // and matching the node label is the bug that made a renamed file
+            // enrol as a duplicate.
+            stack.truncate(e.depth);
+            stack.push(e.label.clone());
+            if e.node.node_type != node::TYPE_FILE {
+                continue;
+            }
+            if let Some((q, src)) = self.media_quality(&e.node.id)? {
+                out.insert(stack.join("/"), (q, src));
+            }
+        }
+        Ok(out)
+    }
+
+    /// D104 — carry measurements from a previous forest onto this one, matched
+    /// by tree path. Returns (carried, already-present, unmatched).
+    ///
+    /// Re-signed as fresh events against THIS forest's ids rather than copied:
+    /// the log is append-only and these are different nodes that happen to
+    /// describe the same bytes. `successor_node` has always done exactly this
+    /// when a hash fill mints a new id; this is the same move across forests.
+    ///
+    /// Never overwrites: a measurement already recorded here was made by this
+    /// forest and is at least as current as the one being carried.
+    pub fn carry_quality(
+        &mut self,
+        from: &std::collections::BTreeMap<String, (crate::media::MediaQuality, String)>,
+        dry_run: bool,
+    ) -> Result<(u64, u64, u64)> {
+        let root = self.identity.root_node_id.clone();
+        let mut here: std::collections::BTreeMap<String, NodeId> = std::collections::BTreeMap::new();
+        let mut stack: Vec<String> = Vec::new();
+        for e in self.walk(&root)? {
+            stack.truncate(e.depth);
+            stack.push(e.label.clone());
+            if e.node.node_type == node::TYPE_FILE {
+                here.insert(stack.join("/"), e.node.id.clone());
+            }
+        }
+        let (mut carried, mut kept, mut unmatched) = (0u64, 0u64, 0u64);
+        for (path, (quality, source)) in from {
+            match here.get(path) {
+                None => unmatched += 1,
+                Some(id) => {
+                    if self.media_quality(id)?.is_some() {
+                        kept += 1;
+                    } else {
+                        if !dry_run {
+                            self.set_media_quality(id, quality, source)?;
+                        }
+                        carried += 1;
+                    }
+                }
+            }
+        }
+        Ok((carried, kept, unmatched))
+    }
+
     /// D103 — the hash for a file about to be indexed, reusing the sidecar
     /// beside it when there is one, and leaving one behind when there is not.
     ///
