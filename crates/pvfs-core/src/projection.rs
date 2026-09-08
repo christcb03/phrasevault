@@ -3252,19 +3252,10 @@ fn check_pending_moves(conn: &Connection, data_dir: &std::path::Path) -> Result<
 /// the genesis identity. Any mismatch is a hard error: a read view cannot (and
 /// must not) rebuild.
 pub fn read_view_check(conn: &Connection) -> Result<ForestIdentity> {
-    let version: u32 = match meta_get(conn, "schema_version") {
-        Ok(v) => v
-            .unwrap_or_else(|| SCHEMA_VERSION.to_string())
-            .parse()
-            .unwrap_or(SCHEMA_VERSION),
-        // A cache whose DDL would not apply AND whose version cannot be read is
-        // past reasoning about. Rebuilding is always correct, and reaching the
-        // caller with an error here would be the old bug in a new place.
-        Err(e) if schema_ddl.is_err() => {
-            return full_rebuild(conn, data_dir, &format!("the cache schema is unreadable ({e})"))
-        }
-        Err(e) => return Err(e),
-    };
+    let version: u32 = meta_get(conn, "schema_version")?
+        .unwrap_or_else(|| SCHEMA_VERSION.to_string())
+        .parse()
+        .unwrap_or(SCHEMA_VERSION);
     if version != SCHEMA_VERSION {
         return Err(PvfsError::SchemaVersion {
             found: version,
@@ -3373,10 +3364,19 @@ pub fn startup_check(
     // meant — a truncated or swapped log — and still rebuilds.
     let racing_writer = others_alive && si > sl;
 
-    let version: u32 = meta_get(conn, "schema_version")?
-        .unwrap_or_else(|| SCHEMA_VERSION.to_string())
-        .parse()
-        .unwrap_or(SCHEMA_VERSION);
+    let version: u32 = match meta_get(conn, "schema_version") {
+        Ok(v) => v
+            .unwrap_or_else(|| SCHEMA_VERSION.to_string())
+            .parse()
+            .unwrap_or(SCHEMA_VERSION),
+        // A cache whose DDL would not apply AND whose version cannot be read is
+        // past reasoning about. Rebuilding is always correct, and returning an
+        // error to the caller here would be the bug above in a new place.
+        Err(e) if schema_ddl.is_err() => {
+            return full_rebuild(conn, data_dir, &format!("the cache schema is unreadable ({e})"))
+        }
+        Err(e) => return Err(e),
+    };
     if version != SCHEMA_VERSION {
         // The projection is a pure, rebuildable cache of the log. An **older** schema
         // self-heals: drop the projection and replay under the current schema (doc 10
