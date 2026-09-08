@@ -1235,12 +1235,33 @@ their contents — kept its own live link to its own live parent. The subtree
 detached from the root in one operation and 1,849 node records stayed behind,
 describing files that are no longer in the library at all.
 
-**Why nothing noticed.** From the inside the subtree is perfectly healthy: every
-node live-linked, every parent live, nothing marked removed except the single
-edge at the top. Only a walk from the root can see it, and the checks this
-system has ask a different question — "does this node have a live link?" — which
-all 1,849 answer yes to. That is exactly why `orphans` reports 939 while these
-1,849 appear in no report at all.
+**The removal mechanism DID work — every step but the last.** Chris asked
+whether something should detect a file moved out of a bound folder and drop its
+link. Something does, and it ran:
+
+1. The scan noticed the files were gone and removed their **locations**. All
+   1,849 island nodes now hold **zero live locations** — confirmed.
+2. It deliberately does NOT remove the **link**. `walk_disk`'s removal arm calls
+   `remove_location`, never unlink, because a scan cannot tell a deliberate
+   deletion from an accident from an unmounted volume (doc 04 / D81).
+3. `pvfs missing` reports exactly these — **715 of the entries in feederbox's
+   current report are Backups files** — and says what to do:
+   *"`pvfs missing --forget` unlinks them once you have decided."*
+4. Nobody has run `--forget`.
+
+So this is not a missing mechanism. It is an unrun command, and the design is
+deliberate: the last step is a human decision by construction.
+
+**The genuine gap is narrower than it first looked.** `missing` lists FILES, so
+an operator sees 1,416 filenames rather than "the Backups subtree is detached
+from the root; 1,849 nodes; run --forget". The 491 detached FOLDERS appear in no
+report at all, and nothing says the subtree is unreachable — which is why this
+sat for two weeks and was found during an unrelated investigation.
+
+**A correction this forces.** Earlier analysis in this document read the ~1,272
+photo-and-archive entries in `missing` as residue from an old, unrelated photo
+root. They are not: they are the Backups island, reported correctly the whole
+time and misread here.
 
 **What it costs a live forest.** Nothing on disk: the bytes are untouched and
 this is purely the catalog's shape. But `reclaim` trashes central bytes with no
