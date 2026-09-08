@@ -3296,7 +3296,30 @@ pub fn startup_check(
     //     only earns its cost where we already distrust the file: an unclean
     //     shutdown, where we are about to REPLAY the log and want to know it
     //     is sound before trusting it.
-    create_schema(conn)?; // tables must exist before the meta reads below
+    // Tables must exist before the meta reads below — but a FAILURE here is
+    // NOT an error to the caller, and it is not yet a rebuild either.
+    //
+    // `INDEX_SCHEMA` indexes columns that older projections do not have:
+    // `idx_links_label` joined it with D72 (2026-08-19) while `links.label`
+    // itself only arrives at v10. Applying the whole DDL to a v7 cache
+    // therefore fails on that index, and nothing is wrong with the forest —
+    // the cache is simply older than the shape being asked of it.
+    //
+    // This used to be `create_schema(conn)?`, so a pre-v10 cache could not be
+    // opened AT ALL by a post-D72 binary: the daemon exited 1 and systemd
+    // restart-looped it on `no such column: label`, which reads as corruption
+    // rather than as an upgrade wanting its migration. Found 2026-09-08, the
+    // first time the pipeline's daemon stage had run since 14 August — the
+    // three weeks in between are how long a hard failure on the ONE path
+    // nothing exercises can sit in a green tree.
+    //
+    // The DDL is re-applied below once the migration ladder has added the
+    // columns it indexes, which keeps D71's cheap door open for exactly the
+    // forest that needs it most: an old, large cache, where the alternative is
+    // replaying the whole log. Every statement is `IF NOT EXISTS`, so a
+    // partial application leaves nothing to undo. If the second attempt fails
+    // too, this routes to `full_rebuild` like every other probe here.
+    let schema_ddl = create_schema(conn);
     let clean = meta_get(conn, "clean_shutdown")?.unwrap_or_else(|| "1".into());
     let crashed = clean != "1" && !others_alive;
     if crashed && !quick_check(conn, "log")? {
@@ -3341,10 +3364,19 @@ pub fn startup_check(
     // meant — a truncated or swapped log — and still rebuilds.
     let racing_writer = others_alive && si > sl;
 
-    let version: u32 = meta_get(conn, "schema_version")?
-        .unwrap_or_else(|| SCHEMA_VERSION.to_string())
-        .parse()
-        .unwrap_or(SCHEMA_VERSION);
+    let version: u32 = match meta_get(conn, "schema_version") {
+        Ok(v) => v
+            .unwrap_or_else(|| SCHEMA_VERSION.to_string())
+            .parse()
+            .unwrap_or(SCHEMA_VERSION),
+        // A cache whose DDL would not apply AND whose version cannot be read is
+        // past reasoning about. Rebuilding is always correct, and returning an
+        // error to the caller here would be the bug above in a new place.
+        Err(e) if schema_ddl.is_err() => {
+            return full_rebuild(conn, data_dir, &format!("the cache schema is unreadable ({e})"))
+        }
+        Err(e) => return Err(e),
+    };
     if version != SCHEMA_VERSION {
         // The projection is a pure, rebuildable cache of the log. An **older** schema
         // self-heals: drop the projection and replay under the current schema (doc 10
@@ -3362,6 +3394,16 @@ pub fn startup_check(
         // unavailable. Refusal is always safe — it just means the slow door.
         match migrate_projection(conn, data_dir, version) {
             Some(what) => {
+                // The ladder has now added the columns `INDEX_SCHEMA` indexes,
+                // so finish applying it. A genuine v7 cache arrives here with
+                // `idx_links_label` still uncreated.
+                if let Err(e) = create_schema(conn) {
+                    return full_rebuild(
+                        conn,
+                        data_dir,
+                        &format!("the migrated cache still does not fit this schema ({e})"),
+                    );
+                }
                 eprintln!(
                     "pvfs: projection migrated v{version} → v{SCHEMA_VERSION} ({what}) \
                      — no replay needed"
@@ -3371,6 +3413,14 @@ pub fn startup_check(
                 return full_rebuild(conn, data_dir, "projection schema is older than this binary")
             }
         }
+    } else if let Err(e) = schema_ddl {
+        // Current version, and the DDL still will not apply: the cache claims a
+        // shape it does not have, which no migration step covers.
+        return full_rebuild(
+            conn,
+            data_dir,
+            &format!("the cache does not match the schema it claims ({e})"),
+        );
     }
 
     // Step 3 — verify the index agrees with the top log at its applied point.

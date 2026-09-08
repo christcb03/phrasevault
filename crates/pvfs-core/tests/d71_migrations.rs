@@ -59,15 +59,90 @@ fn sentinel_alive(data_dir: &Path) -> bool {
         > 0
 }
 
-/// Rewind the cache to v7: drop the column v8 added and set the version back,
-/// which is exactly what a box still running the previous binary looks like.
+/// Rewind the cache to v7: undo what the versions after it added, and set the
+/// version back — what a box still running a much older binary looks like.
+///
+/// **This used to drop only `folder_bindings.bound_by` (v8) and relabel the
+/// cache v7.** That is a v14 shape wearing a v7 label, and it hid a hard
+/// failure for three weeks: a REAL v7 cache also has no `links.label` (v10),
+/// so `create_schema`'s `idx_links_label` — which joined `INDEX_SCHEMA` with
+/// D72 on 2026-08-19 — fails on it before the migration ladder is ever
+/// reached. Every test here passed while the daemon could not open such a
+/// forest at all.
+///
+/// Still not a complete v7 (the tables v12 and v14 added are left in place,
+/// since `CREATE TABLE IF NOT EXISTS` makes their absence uninteresting), but
+/// it now reproduces the one difference that the DDL cannot paper over.
 fn rewind_to_v7(data_dir: &Path) {
     let conn = rusqlite::Connection::open(data_dir.join("index.db")).unwrap();
     conn.execute_batch(
-        "ALTER TABLE folder_bindings DROP COLUMN bound_by;
+        "DROP INDEX IF EXISTS idx_links_label;
+         ALTER TABLE links DROP COLUMN label;
+         ALTER TABLE folder_bindings DROP COLUMN bound_by;
          UPDATE projection_meta SET v = '7' WHERE k = 'schema_version';",
     )
     .unwrap();
+}
+
+/// A cache old enough that the current DDL will not apply to it must still
+/// OPEN — and must still take the cheap door.
+///
+/// The regression: `create_schema` ran with `?` at the top of the open path,
+/// so `no such column: label` reached the caller as an error. `pvfsd` exited 1
+/// and systemd restart-looped it, which reads as a corrupt forest rather than
+/// as one wanting its migration. Found 2026-09-08 when the pipeline's daemon
+/// stage ran for the first time since 14 August.
+///
+/// The sentinel is the point: opening must MIGRATE, not replay. Falling back
+/// to a rebuild would also "work", and on a 241k-event forest it is minutes of
+/// a box being unavailable — the exact cost D71's ladder exists to avoid.
+#[test]
+fn a_cache_the_current_ddl_cannot_extend_still_migrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, _mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let f = engine.add_node(&root, folder_spec("library")).unwrap();
+    engine.close().unwrap();
+
+    rewind_to_v7(dir.path());
+    // Prove the premise rather than trusting the helper: the column the DDL
+    // indexes is genuinely gone.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+        let has_label: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('links') WHERE name = 'label'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_label, 0, "the rewind must actually remove links.label");
+    }
+    plant_sentinel(dir.path());
+
+    let engine = Engine::open(dir.path()).expect("a v7 cache must open, not error");
+    assert!(
+        sentinel_alive(dir.path()),
+        "it must migrate in place — a rebuild here is the slow door for no reason"
+    );
+    // The tree is intact and the DDL finished: the index the failure was about
+    // exists now.
+    let kids = engine.children(&root).unwrap();
+    assert!(
+        kids.iter().any(|c| c.node.id == f),
+        "the tree survived the open"
+    );
+    engine.close().unwrap();
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    let idx: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_links_label'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "the deferred DDL must be applied after the migration");
 }
 
 #[test]
