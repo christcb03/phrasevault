@@ -12,8 +12,13 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use pvfs_core::mount;
 use pvfsd::{serve_until, Daemon};
 
+// D110 — the release number AND the build it came from (see VERSIONING.md),
+// matching the CLI. A bare `version` here resolves to CARGO_PKG_VERSION, which
+// is the same `1.4.0` for every tree that ever built this crate.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PVFS_BUILD"), ")");
+
 #[derive(Parser)]
-#[command(name = "pvfsd", version, about = "PVFS per-user daemon")]
+#[command(name = "pvfsd", version = VERSION, about = "PVFS per-user daemon")]
 struct Cli {
     /// Mount directory of the forest to serve
     #[arg(long)]
