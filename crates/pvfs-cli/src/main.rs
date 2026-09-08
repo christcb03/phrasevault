@@ -729,6 +729,26 @@ enum ForestCmd {
     },
     /// Remove a forest from the registry (never deletes .pvfs/)
     Unregister { name: String },
+    /// D104 — carry MediaQuality from a previous forest onto this one, matched
+    /// by tree path.
+    ///
+    /// Re-genesis mints new node ids, so anything keyed by the old id is
+    /// stranded — 24,585 measurements on the production forest, none of them
+    /// recoverable from the bytes. Path is the join key because it is what
+    /// survives a rebuild.
+    ///
+    /// Run it on the OWNER, against the new forest, once the new forest has
+    /// been scanned. Nothing is overwritten: a measurement already here was
+    /// made by this forest and is at least as current.
+    CarryQuality {
+        /// The OLD forest to read from — an alias or a mount path. Opened
+        /// read-only; nothing is written to it.
+        #[arg(long)]
+        from: String,
+        /// Report what would be carried, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Fix `.pvfs/` ownership after a mistaken `sudo forest init` (or run via sudo register)
     FixPermissions {
         /// Mount directory (default: current directory if it is a mount)
@@ -7241,6 +7261,42 @@ fn forest_cmd(
                 println!("{{\"unregistered\":true}}");
             } else {
                 println!("unregistered {name} (mount and .pvfs/ untouched)");
+            }
+            Ok(())
+        }
+        ForestCmd::CarryQuality { from, dry_run } => {
+            // The OLD forest is opened first and separately, so a bad --from
+            // fails before anything is written to the new one.
+            // --from is a MOUNT (an alias or the directory holding .pvfs/),
+            // because that is what an operator has in hand. `Engine::open`
+            // wants the data dir, so go through `open_mount`, which also says
+            // "mount not found" rather than a bare missing-device.key errno
+            // when the path is wrong.
+            let old_dir = mount::resolve_target(&Registry::system(), &from)
+                .map(|t| t.mount)
+                .unwrap_or_else(|_| PathBuf::from(&from));
+            let mut old = mount::open_mount(&old_dir)?;
+            let carried_from = old.quality_by_path()?;
+            old.close()?;
+
+            let mut engine = Engine::open(&ctx?)?;
+            let (carried, kept, unmatched) = engine.carry_quality(&carried_from, dry_run)?;
+            engine.close()?;
+
+            if json {
+                println!(
+                    "{{\"read\":{},\"carried\":{carried},\"already_present\":{kept},\"unmatched\":{unmatched},\"dry_run\":{dry_run}}}",
+                    carried_from.len()
+                );
+            } else {
+                let verb = if dry_run { "would carry" } else { "carried" };
+                println!("read {} measurement(s) from {}", carried_from.len(), old_dir.display());
+                println!("  {verb:<12} {carried}");
+                println!("  already here {kept}");
+                // Not an error: a path in the old forest that this one has no
+                // file for is exactly the residue a re-genesis is meant to
+                // drop — but it should be SEEN, not silently absent.
+                println!("  unmatched    {unmatched}  (old paths this forest has no file at)");
             }
             Ok(())
         }
