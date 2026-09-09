@@ -314,7 +314,13 @@ P0 has no scanning, but the model for picking up files added to a tracked folder
   1. a **live filesystem watcher** (OS notifications via the `notify` crate) that ingests changes in real time while the daemon runs, and
   2. a **reconciliation scan** on startup and on a schedule, which diffs the directory against the index. The scan is required because a watcher captures nothing that happens while PVFS is off and can drop events under load.
 - **New files** are indexed as **pointers** (a `file` node + location URI), consistent with "PVFS indexes external files, it does not copy them," with lazy hashing by default.
-- **On-disk deletion (decided: soft).** When a tracked file disappears from disk, PVFS **soft-removes the location/link and marks it unavailable** but keeps the node, its metadata, and any cross-references (surfaced for review). It does not cascade-delete by default, because PVFS does not own external bytes.
+- **On-disk deletion (decided: soft, then AMENDED).** When a tracked file disappears from disk, PVFS soft-removes the location. The original decision stopped there — keep the node, mark it unavailable, surface it for review — on the sound reasoning that PVFS does not own external bytes and cannot tell a deletion from an unmounted volume.
+
+  **D81 gave it a way to tell** (`.pvfs-root`, a marker proving the mount is live), and **D105 acted on it**: once the mount is proven and no other box holds the file, the node leaves the tree as well. Keeping it had a cost that only showed at scale — production carried 1,849 node records from one removed folder for a fortnight, in no report anyone reads, because "surfaced for review" means nothing if the surface is a report nobody runs.
+
+  **D112 then put a day's grace in front of the unlink**, because on a fleet whose mover works outside the catalogue, "held nowhere" is a routine transient state rather than a verdict. Full contract in doc 04 §11 item 4.
+
+  Still no cascade: unlinking a folder does not unlink its children (that is what `pvfs islands` reports and `--drop` resolves), and a file another box holds is never touched.
 - A **manual scan** command remains available as the fallback when no daemon/watcher is running.
 
 ---
