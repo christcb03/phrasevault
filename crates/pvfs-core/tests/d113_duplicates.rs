@@ -244,3 +244,81 @@ fn after_a_merge_the_scan_matches_instead_of_refusing() {
     );
     e.close().unwrap();
 }
+
+/// D117 — the check D115 leans on has to know BOTH spellings of a location.
+///
+/// A replica records its locations pin-qualified (`pvfs-host://<own pin>/path`,
+/// D75), not as bare `file://` paths. D115 asked "does this node already have a
+/// location under the root I am scanning?" using only the bare form, so on
+/// every replica the answer was `false` — and D115 is a no-op exactly on the
+/// boxes that scan media. Duplicates kept being minted after it shipped.
+///
+/// Measured on the live forest at the time: 30,677 of 30,782 locations were
+/// `pvfs-host://`.
+#[test]
+fn a_pin_qualified_location_counts_as_this_box_holding_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("ep01.mkv"), vec![9u8; 4096]).unwrap();
+
+    let (mut e, _mn) = Engine::init(&dir.path().join("forest")).unwrap();
+    // Give this forest a transport pin, as a served instance has.
+    let pin = "ab".repeat(32);
+    let nettls = e.data_dir().join("nettls");
+    std::fs::create_dir_all(&nettls).unwrap();
+    std::fs::write(nettls.join("pin"), &pin).unwrap();
+
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+    e.bind_folder(
+        &season,
+        BindSpec {
+            source_uri: format!("file://{}", lib.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy: HashPolicy::OnAdd,
+        },
+    )
+    .unwrap();
+    e.scan_routed(Some(&season), None, 0).unwrap();
+    e.close().unwrap();
+
+    // Re-open so `own_pin` is read, then rewrite the location the way a replica
+    // spells it and change the file's size — the *arr-upgrade shape.
+    let mut e = Engine::open(&dir.path().join("forest")).unwrap();
+    let id = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.node_type == TYPE_FILE)
+        .unwrap()
+        .node
+        .id;
+    for uri in e.locations(&id).unwrap() {
+        e.remove_location(&id, &uri).unwrap();
+    }
+    let qualified = format!("{}{}{}/ep01.mkv", "pvfs-host://", pin, lib.display());
+    e.add_location(&id, &qualified).unwrap();
+
+    std::fs::write(lib.join("ep01.mkv"), vec![9u8; 8192]).unwrap();
+    let rep = e.scan_routed(Some(&season), None, 0).unwrap();
+
+    assert_eq!(
+        rep[0].stats.added, 0,
+        "the box already holds this file — pin-qualified is still holding it"
+    );
+    assert_eq!(
+        rep[0].stats.changed, 1,
+        "a different size at the same path is a CHANGE, not a new file"
+    );
+    let files = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.node.node_type == TYPE_FILE)
+        .count();
+    assert_eq!(files, 1, "and emphatically not two nodes");
+    e.close().unwrap();
+}

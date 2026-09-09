@@ -1801,17 +1801,43 @@ impl Engine {
         Ok(())
     }
 
-    /// Does this node hold a live location under `root_uri`?
+    /// Does this node hold a live location THIS BOX would have written for a
+    /// file under `root_uri`?
     ///
     /// D115 — the difference between "this file was replaced where it lives"
     /// and "a copy of this title turned up on another volume". The first is a
     /// change; the second is D81 4c's cross-root upgrade, and conflating them
     /// loses the volume the superseded copy is on.
+    ///
+    /// D117 — BOTH FORMS, and the second is the one that matters. A replica
+    /// records its locations PIN-QUALIFIED (`pvfs-host://<own pin>/path`, D75),
+    /// not as bare `file://` paths. Checking only the bare form made this
+    /// answer `false` on every replica — which is to say on the holder and the
+    /// ingest, the only boxes that scan media — so D115 was a no-op exactly
+    /// where it was needed and duplicates kept being minted. Measured on the
+    /// live forest: 30,677 of 30,782 locations are `pvfs-host://`, which was
+    /// on screen hours before this check was written.
+    ///
+    /// The same equivalence D81 already needed on the add side and the deletion
+    /// pass; a third place that has to know a location can wear two spellings.
     fn has_location_under(&self, file_id: &NodeId, root_uri: &str) -> Result<bool> {
         let root = root_uri.trim_end_matches('/');
+        let root_path = crate::storage::uri_to_path(root).ok();
+        let own = self.own_pin().map(|p| p.to_string());
         for uri in self.locations(file_id)? {
             if uri == root || uri.starts_with(&format!("{root}/")) {
                 return Ok(true);
+            }
+            // …and the pin-qualified spelling of the same thing: our own pin,
+            // and a path under this binding's root.
+            if let (Some(pin), Some(rp)) = (own.as_deref(), root_path.as_ref()) {
+                let want = format!("{}{}/", crate::storage::HOST_URI_PREFIX, pin);
+                if let Some(rest) = uri.strip_prefix(&want) {
+                    let p = std::path::Path::new("/").join(rest);
+                    if p == *rp || p.starts_with(rp) {
+                        return Ok(true);
+                    }
+                }
             }
         }
         Ok(false)
