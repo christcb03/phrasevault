@@ -262,6 +262,20 @@ meaningful on the download server itself, which is exactly what F5.1 fixes.
 A `file://` location is host-implicit — it resolves wherever the path happens to exist, which is
 wrong the moment locations cross machines. Doc 03 §2.1's reserved "future schemes" row fills in:
 
+> **A location has TWO SPELLINGS, and comparing only one is a recurring bug.**
+> The same copy of the same file is `file:///abs/path` when the owner records it
+> and `pvfs-host://<own pin>/abs/path` when a REPLICA does (F5.1/D75) — and on
+> the media fleet the replicas are the boxes that scan, so 30,677 of 30,782 live
+> locations wear the second form.
+>
+> Any check of the shape "does this node already have a location under X?" must
+> accept both, or it silently answers `false` on every box that matters. That
+> has now been fixed three separate times: D81 on the scan's add side (where it
+> caused 1,998 pointless routed writes per pass), D81 again in the deletion
+> pass, and D117 — where it made D115's duplicate-prevention a no-op on the
+> only boxes that scan media, so duplicates kept being minted after the fix
+> shipped. Prefer a shared helper over a fourth prefix comparison.
+
 - **`pvfs-host://<transport-pin>/<abs-path>`** — bytes live at `<path>` **on the instance whose
   transport pin this is** (the F1 pin is already the stable, verifiable instance identity; a host
   that has never run `pvfsd --listen` has no pin — and correctly, no location to offer, since

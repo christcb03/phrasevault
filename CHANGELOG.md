@@ -5,6 +5,46 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Duplicates: the cause, the cleanup, and the check that was a no-op
+  (D112–D117).** Two mechanisms were minting a node per file version, and
+  production held 588 duplicate groups.
+
+  **D112** — the settle window asked "has this stopped moving?" as
+  `mtime + 15s > now`. rclone preserves the SOURCE mtime, so a file that landed
+  seconds ago carried an mtime from days back, cleared the window on its first
+  sighting, and was catalogued mid-copy at a partial size (measured: arrivals
+  41.8h and 56.5h behind their ctime). Now `max(mtime, ctime)`; ctime cannot be
+  back-dated from userspace. D112 also put a **24-hour grace** in front of
+  D105's unlink — "no live location" is a routine transient state on a fleet
+  whose mover works outside the catalogue, and unlinking on it removed files
+  the NAS was holding. Recorded in `scan_unheld` (schema 15) and decided by a
+  SWEEP at the end of a pass, not a branch in the removal arm, which sees a
+  file only once.
+
+  **D115/D117** — the scan matched on name AND size, so a file whose CONTENT
+  changed was not a candidate and it concluded "new": an *arr upgrade grew a
+  node per version. **A directory cannot hold two files with one name**, so
+  same name + same parent + same root is now a CHANGE. Scoped to the root
+  because D81 4c handles the same title upgraded on a different volume — and
+  D117 taught that check the second spelling of a location, since a replica
+  records `pvfs-host://<own pin>/path` and the bare-prefix test made D115 a
+  no-op on every box that scans media.
+
+  **D113/D114/D116** — `pvfs duplicates [--merge]` finds groups by parent and
+  name (not size: the pairs exist BECAUSE their sizes disagree, so grouping by
+  the identity rule found nothing) and merges them onto one node.
+  `pvfs islands --drop <id>` unlinks a named detached subtree.
+
+- **The daemon names its own build (D110), and so does the NAS binary.** D100
+  stamped the CLI and stopped; `pvfsd --version` said a bare `1.4.0` on every
+  arch, so after a roll the only way to identify the running daemon was to hash
+  it — on the holder, the box where that is hardest.
+
+- **The watch job reports what it took out of the tree (D111).** It is how the
+  fleet actually scans and it reported its counts to nobody, so the one
+  operation that changes the shape of the forest had no record.
+
+
 - **A cache older than the current DDL opens again (D108):** `create_schema`
   ran with `?` at the top of the projection open path, so applying
   `INDEX_SCHEMA` to a pre-v10 cache failed on `idx_links_label` — a column

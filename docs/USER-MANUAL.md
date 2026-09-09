@@ -757,7 +757,16 @@ second copy of the index while it runs.
 | `pvfs mount <target> <dir>` · `pvfs umount <dir>` | Live read-only FUSE view — bytes stream on demand (§6.2, Linux). |
 | `pvfs region mark\|ls\|unmark <node>` | Make a subtree its own signed-log replication/audit unit (§6.3). |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
-| `pvfs islands` | Detached subtrees: live-linked nodes no tree root reaches. `orphans`/`missing`/`reclaim` ask about one node and call every one of them healthy; only a walk from the tree roots sees that nothing leads there (doc 24 §19). |
+| `pvfs link <parent> <child> [--type contains\|ref]` | Create an explicit link. Defaults to `ref`; `--type contains` is what re-attaches an island (§ `islands`). |
+| `pvfs mv <node> <new-parent>` | Move a node to a new containing parent. The NAME is unchanged — use `relabel` to rename. Prompts for anything omitted. |
+| `pvfs relabel <link> <name>` | Set a link's display label: the name **this parent** uses for this child. Renaming happens on the EDGE, not the node, so the same file can be called different things in different places (D72). |
+| `pvfs reorder <link> <key>` | Change a link's sibling order key. |
+| `pvfs roots <folder> [...]` | Declare which directories are roots of a folder's library, and which of them DRAIN (D81) — a staging root empties, a library root keeps. |
+| `pvfs quality <node> [...]` | What a media file IS — record it, or read it back (D76). Capture it while the source still knows; an arr forgets. |
+| `pvfs collide` | Resolve path collisions: two live nodes at one tree path (D84). |
+| `pvfs explain <a> <b>` | Which of two copies would survive, and why — **without touching either**. The dry run for an upgrade decision. |
+| `pvfs duplicates [--merge]` | Files the catalogue holds MORE THAN ONCE at the same place — same parent, same name. Reports by default and names the keeper before anything moves; `--merge` moves every location onto that node, retires it from the others, carries MediaQuality, then unlinks. Soft removes, so it is reversible. Production held 588 such groups (D113/D114). |
+| `pvfs islands [--drop <id>]` | Detached subtrees: live-linked nodes no tree root reaches. `orphans`/`missing`/`reclaim` ask about one node and call every one of them healthy; only a walk from the tree roots sees that nothing leads there (doc 24 §19). `--drop` unlinks a NAMED island and everything under it — named, not swept, because whether a detached subtree is finished with is a judgement (D116). |
 | `pvfs audit` | Authorization health check: tag grants/memberships under a revoked authority, `key:` grants to revoked devices, and expired grants. |
 | `pvfs secure create <parent> <label> [--path P]` | Create an encrypted-at-rest blob (managed storage; `--path` pins a location). |
 | `pvfs secure put <node> <file\|-> [--raw]` | Encrypt (companion) & write the blob's bytes; `--raw` stores app ciphertext as-is. |
