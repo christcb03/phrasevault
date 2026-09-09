@@ -483,13 +483,37 @@ pub fn meta_get(conn: &Connection, k: &str) -> Result<Option<String>> {
     .map_err(map_db("read projection_meta"))
 }
 
+/// A bounded retry for a write that can meet a lock, with the same policy the
+/// durable append already uses (D120).
+///
+/// The append path has had this since a 28,000-file adoption died five minutes
+/// in because one fold met one lock. Everything ELSE kept the original
+/// behaviour of failing on the first BUSY — which is why the flake that finally
+/// surfaced it carried `retries: 0`, a number that says plainly nobody had
+/// tried. Safe for a single statement: BUSY means nothing was applied.
+pub(crate) fn retry_busy<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Err(PvfsError::Busy { .. }) if attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 << attempt));
+            }
+            Err(e) => return Err(e.with_retries(attempt)),
+            other => return other,
+        }
+    }
+}
+
 pub fn meta_set(conn: &Connection, k: &str, v: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO projection_meta (k, v) VALUES (?1, ?2)
-         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        params![k, v],
-    )
-    .map_err(map_db("write projection_meta"))?;
+    retry_busy(|| {
+        conn.execute(
+            "INSERT INTO projection_meta (k, v) VALUES (?1, ?2)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![k, v],
+        )
+        .map_err(map_db("write projection_meta"))
+    })?;
     Ok(())
 }
 
