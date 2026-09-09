@@ -130,6 +130,18 @@ pub struct DuplicateGroup {
     pub drop: Vec<NodeId>,
     /// Live locations across the whole group — what a merge has to preserve.
     pub locations: u64,
+    /// True when more than one member holds live bytes AND those holders
+    /// disagree about size — two versions of one path, mid-upgrade. Never
+    /// merged (D119).
+    pub contested: bool,
+    /// How many MEMBERS hold live bytes (D119).
+    ///
+    /// More than one is not a duplicate at all: it is the same tree path held
+    /// by two boxes at two different versions — an upgrade in flight. Merging
+    /// those picks one real file and unlinks another, which is what happened to
+    /// `Lanterns - s01e04` on 2026-09-08: the holder's copy lost its catalogue
+    /// entry to the ingest's newer one. `--merge` refuses these.
+    pub holders: u64,
     /// Every member's recorded size. **These usually DISAGREE** — that
     /// disagreement is why the pair exists, since the identity match joins on
     /// size and so could never see them as the same file (D114).
@@ -147,6 +159,9 @@ pub struct DuplicateReport {
     /// Groups whose keeper already holds every location: nothing to move, the
     /// losers are simply unlinked.
     pub already_consolidated: u64,
+    /// Groups where MORE THAN ONE member holds live bytes — two boxes, two
+    /// versions, one path. Reported and never merged (D119).
+    pub contested: u64,
 }
 
 /// What a bulk retire did, and what it deliberately would not do (D80 §8).
@@ -2872,6 +2887,10 @@ impl Engine {
                 continue;
             }
             let sizes: Vec<u64> = members.iter().map(|(_, _, sz)| *sz).collect();
+            let by_id: std::collections::HashMap<String, u64> = members
+                .iter()
+                .map(|(id, _, sz)| (id.clone(), *sz))
+                .collect();
             let size = sizes.iter().copied().max().unwrap_or(0);
             // Deterministic keeper: most live locations, then oldest, then
             // lowest id. Locations first because the node the fleet already
@@ -2891,8 +2910,28 @@ impl Engine {
             let keep = scored[0].2.clone();
             let keeps_all = scored[0].0 as u64 == total;
             let drop: Vec<NodeId> = scored[1..].iter().map(|(_, _, id)| id.clone()).collect();
-            report.redundant += drop.len() as u64;
-            report.locations_moved += total - scored[0].0 as u64;
+            // D119 — how many members actually hold bytes, and do the holders
+            // AGREE ABOUT SIZE?
+            //
+            // Two boxes holding the SAME file at one path is a genuine
+            // duplicate: merge it and move the locations onto one node. Two
+            // boxes holding DIFFERENT sizes is not — it is one version
+            // superseding another, mid-flight, and picking one unlinks a real
+            // file. Size is the only evidence available here; the owner holds
+            // no media and cannot look.
+            let holder_sizes: std::collections::BTreeSet<u64> = scored
+                .iter()
+                .filter(|(n, _, _)| *n > 0)
+                .filter_map(|(_, _, id)| by_id.get(id).copied())
+                .collect();
+            let holders = scored.iter().filter(|(n, _, _)| *n > 0).count() as u64;
+            let contested = holders > 1 && holder_sizes.len() > 1;
+            if contested {
+                report.contested += 1;
+            } else {
+                report.redundant += drop.len() as u64;
+                report.locations_moved += total - scored[0].0 as u64;
+            }
             if keeps_all {
                 report.already_consolidated += 1;
             }
@@ -2904,6 +2943,8 @@ impl Engine {
                 drop,
                 locations: total,
                 sizes,
+                holders,
+                contested,
             });
         }
         // Biggest first, then by name so the report is stable between runs.
@@ -2982,6 +3023,21 @@ impl Engine {
             return Ok(report);
         }
         for g in &report.groups {
+            // D119 — REFUSE a contested group. More than one member holding
+            // live bytes means two boxes have two different files at one tree
+            // path — an *arr upgrade in flight, not a catalogue error. Merging
+            // it picks one real file and unlinks another: on 2026-09-08 that
+            // cost `Lanterns - s01e04` the catalogue entry for the holder's
+            // copy, in favour of a node whose size matched nothing on disk.
+            //
+            // The scan resolves these properly, because it has the file in
+            // front of it (D115): the box that holds a copy flags its own node
+            // as CHANGED when the size disagrees, and `pvfs changes` /
+            // `resolve` settle which version wins. Nothing here can know that
+            // — this runs on the owner, which holds no media.
+            if g.contested {
+                continue;
+            }
             for loser in &g.drop {
                 for uri in self.locations(loser)? {
                     // Idempotent: `add_location` is a no-op when the keeper

@@ -322,3 +322,90 @@ fn a_pin_qualified_location_counts_as_this_box_holding_the_file() {
     assert_eq!(files, 1, "and emphatically not two nodes");
     e.close().unwrap();
 }
+
+/// D119 — two boxes holding two DIFFERENT files at one tree path is not a
+/// duplicate, and merging it destroys a real file's catalogue entry.
+///
+/// This is what the merge did to `Lanterns - s01e04` on 2026-09-08. The holder
+/// had 1,544,349,595 bytes; the ingest had a newer *arr copy at 1,594,289,811.
+/// Same name, same folder, two boxes, two versions — an upgrade in flight. The
+/// merge saw "two nodes at one path", kept the one with more locations, and
+/// unlinked the other: the holder's real file lost its entry, and the surviving
+/// node claimed a size no file anywhere had.
+///
+/// Nothing on the OWNER can tell which version should win — it holds no media.
+/// The box that holds a copy settles it on its next scan (D115 flags its own
+/// node as changed), so the right thing here is to refuse.
+#[test]
+fn holders_that_disagree_about_size_are_two_versions_not_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+
+    let holders_copy = file_node(&mut e, &season, "ep04.mkv", 1_544_349_595);
+    e.add_location(&holders_copy, "pvfs-host://nas/share/Media/ep04.mkv")
+        .unwrap();
+    let ingests_copy = file_node(&mut e, &season, "ep04.mkv", 1_594_289_811);
+    e.add_location(&ingests_copy, "file:///mnt/local/Media/ep04.mkv")
+        .unwrap();
+
+    let r = e.list_duplicates().unwrap();
+    assert_eq!(r.groups.len(), 1);
+    assert_eq!(r.groups[0].holders, 2, "both members hold live bytes");
+    assert_eq!(r.contested, 1, "and that makes the group CONTESTED");
+    assert_eq!(
+        r.redundant, 0,
+        "nothing here is redundant — both nodes are a real file somewhere"
+    );
+
+    let done = e.merge_duplicates(false).unwrap();
+    assert_eq!(done.contested, 1);
+
+    // Both survive, both keep their bytes.
+    let live: Vec<String> = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.node.node_type == TYPE_FILE)
+        .map(|c| c.node.id)
+        .collect();
+    assert_eq!(live.len(), 2, "the merge must not have touched them");
+    assert!(live.contains(&holders_copy) && live.contains(&ingests_copy));
+    assert_eq!(e.locations(&holders_copy).unwrap().len(), 1);
+    assert_eq!(e.locations(&ingests_copy).unwrap().len(), 1);
+    e.close().unwrap();
+}
+
+/// …while a genuine duplicate — one real file plus a stale artefact holding no
+/// bytes at all — still merges. The refusal must be narrow, or the command
+/// stops being useful.
+#[test]
+fn a_group_with_one_holder_still_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+    let season = folder(&mut e, &root, "Season 01");
+
+    let real = file_node(&mut e, &season, "ep04.mkv", 1_000);
+    e.add_location(&real, "pvfs-host://nas/share/Media/ep04.mkv")
+        .unwrap();
+    let stale = file_node(&mut e, &season, "ep04.mkv", 900); // holds nothing
+
+    let r = e.list_duplicates().unwrap();
+    assert_eq!(r.groups[0].holders, 1, "only one member holds bytes");
+    assert_eq!(r.contested, 0);
+    assert_eq!(r.redundant, 1);
+
+    e.merge_duplicates(false).unwrap();
+    let live: Vec<String> = e
+        .children(&season)
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.node.node_type == TYPE_FILE)
+        .map(|c| c.node.id)
+        .collect();
+    assert_eq!(live, vec![real], "the stale artefact went, the real file stayed");
+    assert!(e.get_node(&stale).unwrap().is_some(), "and nothing was destroyed");
+    e.close().unwrap();
+}

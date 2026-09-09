@@ -3626,6 +3626,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     "groups already holding all their locations on one node: {}",
                     r.already_consolidated
                 );
+                if r.contested > 0 {
+                    println!(
+                        "CONTESTED, will NOT be merged  : {}",
+                        r.contested
+                    );
+                }
                 println!();
                 for g in r.groups.iter().take(20) {
                     // Show the sizes: they normally DISAGREE, and that
@@ -3634,7 +3640,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         g.sizes.iter().map(|s| s.to_string()).collect();
                     sz.dedup();
                     println!(
-                        "  {}  {} copies, {} location(s), sizes {}  {}",
+                        "  {}{}  {} copies, {} location(s), sizes {}  {}",
+                        if g.contested { "CONTESTED " } else { "" },
                         &g.keep[..12.min(g.keep.len())],
                         g.drop.len() + 1,
                         g.locations,
@@ -3652,6 +3659,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "\nnothing was changed. `pvfs duplicates --merge` moves every location \
                          onto one node\nand unlinks the rest — a soft remove, so it is reversible."
                     );
+                    if r.contested > 0 {
+                        println!(
+                            "\n{} group(s) are CONTESTED and --merge will skip them: more than one\n\
+                             member holds live bytes, which means two boxes have two DIFFERENT files\n\
+                             at one tree path — an upgrade in flight, not a catalogue error. Merging\n\
+                             one would unlink a real file. The box holding a copy flags its own node\n\
+                             as changed on its next scan; `pvfs changes` and `resolve` settle it.",
+                            r.contested
+                        );
+                    }
                 }
                 return engine.close();
             }
