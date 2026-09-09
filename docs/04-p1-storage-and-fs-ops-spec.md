@@ -16,7 +16,7 @@ On top of the P0 kernel (`pvfs-core`):
 - **`stat`** — node metadata joined with live backend info.
 - **`cat`** — stream a file node's bytes, with **read-path integrity verification**.
 - **`hash`** — compute/fill a file node's lazy `content_hash`.
-- **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes (design doc §8.5).
+- **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes the location, and takes the node out of the tree too once the file is held nowhere for a day (§11 item 4; design doc §8.5).
 - **`pvfs serve`** — minimal daemon: filesystem watcher + scheduled reconciliation. No HTTP (that's P3). *(Since P5, doc 18: `pvfs serve` is the job supervisor; the P1 watcher lives on as the `watch` job.)*
 - **Managed temp spool** — `<data_dir>/tmp/`, with the startup cleanup sweep (design doc §6.3).
 
@@ -146,7 +146,15 @@ Scan is **transactional per file** (a crash mid-scan leaves a valid partial
 index; the next reconciliation completes it) and **idempotent** (event
 idempotency from P0 §7 absorbs re-runs).
 
-Scan stats are returned and printed: `added / unchanged / changed / removed / skipped`.
+Scan stats are returned and printed: `added / unchanged / changed / removed /
+skipped`, plus — as later milestones gave the scan more it could do and more it
+had to explain — `relocated`, `settling`, `unreadable`, `empty_dirs`,
+`unlinked` (nodes taken OUT OF THE TREE, distinct from `removed` locations,
+D105), `pending_unlink` (held nowhere but inside the grace, D112) and
+`ambiguous` (already catalogued more than once here, so nothing was added,
+D113). A count that exists and is never printed is a count nobody can act on;
+each of these was added because a scan was otherwise silent about something it
+had decided.
 
 ---
 
@@ -292,8 +300,24 @@ location) maps to exit 3 (not-found family).
    completes); scan stats correct.
 3. **Pointer semantics** — scanned files get location events, bytes never
    copied; node id stable across location changes (P0 §14.13 extended).
-4. **Disk deletion** — file removed on disk ⇒ location soft-removed, node kept,
-   flagged unavailable; file restored ⇒ location re-added, flag clears.
+4. **Disk deletion** — file removed on disk ⇒ location soft-removed. **The node
+   goes too, if the file ends up held NOWHERE and stays that way for
+   `UNLINK_GRACE_MS` (24h)** — D105 as amended by D112. This clause used to end
+   "node kept, flagged unavailable", which left production carrying 1,849 node
+   records from a single removed folder, in no report an operator reads.
+
+   Three conditions, and each earns its place. The mount must be PROVEN live by
+   its `.pvfs-root` marker (D81), or an unmounted volume looks like a deletion.
+   No other box may hold the file, or one box evicting its copy deletes the file
+   for everyone. And the grace must expire, because "no live location" is a
+   routine transient state on a fleet whose mover works outside the catalogue —
+   between one box retiring its location and another recording its own, a file
+   that exists has none at all. `pvfs missing` IS the pending list.
+
+   A file restored inside the grace re-adds its location and the clock stops.
+   Restored AFTER it, the node is gone and the bytes come back as a NEW node: a
+   deletion is a decision, and `match_by_identity` joins only on nodes with a
+   live containing link.
 5. **Changed file** — modification flags the node (`pending_changes`) and the
    stale location is not served; `pvfs changes` lists it; `resolve --replace`
    creates the successor node + `LinkSuperseded` trail and clears the flag;
