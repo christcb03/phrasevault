@@ -1485,3 +1485,69 @@ folder linked into the tree *after* its children were populated shows as a real
 island until the parent edge arrives. `detached_at` separates the two cases — a
 cut has a retired edge on record, a not-yet-synced one does not — and the
 report says which it is looking at instead of calling both a detachment.
+
+
+## 20. The night the residue was cleared (2026-09-08) — close-out
+
+Everything §17 and §18 catalogued as waiting for re-genesis to drop was
+instead **fixed in place**, with the causes closed rather than outrun. This
+section records what happened and, more usefully, what it cost to find.
+
+### The numbers
+
+| | before | after |
+|---|---|---|
+| `missing` | 1,913 | **0** |
+| duplicate groups | 588 | **0** |
+| islands | 1,849 nodes | **0** |
+| manifest recursion on disk | 1,577 files | **0** (25,135 real sidecars intact) |
+| `with a live link` vs `reachable` | 34,216 / 33,725 | **33,725 / 33,725** |
+
+That last row is the one worth keeping. Those two numbers had never agreed.
+
+### What `missing` actually was
+
+Three causes, none of them "files that went away", and the mix is the lesson —
+a single number had been standing in for three unrelated problems:
+
+| cause | count | resolution |
+|---|---|---|
+| duplicate-pair halves | 506 | `pvfs duplicates --merge` (D113/D114) |
+| the `Backups` island | 1,314 | `missing --forget`, then `islands --drop` for the 491 folders left behind |
+| D80 NFS residue (`file:///mnt/nas-media`) | 96 | `--forget`; the mount has been gone since August |
+
+### The chain of mistakes, in order
+
+Worth reading as a sequence, because each fix exposed the next:
+
+1. **D105 unlinked on "no live location"** — which on a fleet whose mover works
+   outside the catalogue is a routine transient state. It went live on the
+   ingest and was caught within the hour; nothing was lost. D112 put a day's
+   grace behind it.
+2. **The settle window trusted mtime**, which rclone back-dates. Half-copied
+   files were catalogued at partial sizes and became duplicate pairs (D112).
+3. **The merge that cleaned up the pairs was CREATING them.** It chose a keeper
+   on the owner — a box that holds no media and so had to guess — and kept
+   nodes whose size disagreed with disk, so the next scan could not match the
+   real file and minted a fresh one. Chris: *"Can't the system just scan what
+   is actually on disk where there is a question and keep the one that matches
+   exactly what is actually there?"* That question produced D115.
+4. **D115 was a no-op on every box that scans media**, because it compared a
+   bare `file://` prefix against locations a replica writes pin-qualified. The
+   measurement that would have caught it — 30,677 of 30,782 locations are
+   `pvfs-host://` — had been on screen hours earlier (D117).
+
+### What this does to the case for re-genesis
+
+§16 argued the disconnected structure was *"a stronger argument for re-genesis
+than the log size ever was."* That argument is gone. The duplicates, the
+islands, the junk nodes and the manifest recursion — the things a rebuild was
+going to clear for free — are cleared, and the mechanisms that produced them
+are closed.
+
+What remains is log size, replay time, and a deliberate clean baseline. Chris
+(2026-09-08): *"I want to re-genesis more for a clean start without any baggage
+from iterations and as a test to see how a fresh install would perform."* That
+is a fair reason and a different one, and it should be stated as such rather
+than inherited from an argument that no longer holds. Doc 11's compaction
+targets the same log-size problem without changing identity.
