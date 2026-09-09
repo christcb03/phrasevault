@@ -1,6 +1,8 @@
 # 25 — The re-genesis runbook
 
-**Status: written 2026-09-08, NOT yet rehearsed end to end on the fleet.**
+**Status: written 2026-09-08. REHEARSED end to end on the live fleet the same
+night over a real subset — see §11, which is where the numbers and the four
+things this document got wrong are recorded.**
 Doc 24 §17 lists "no re-genesis tool, and nobody has written the runbook" as
 blocker 2. This is that runbook. It also settles blockers 4 (cutover), 5
 (what "verified" means) and 6 (record the residue first), because all three
@@ -29,7 +31,8 @@ previous write-up of this plan.
 | | why |
 |---|---|
 | D103 deployed on every box that will scan | before D103 the `on_add` paths neither read nor wrote sidecars, so a re-import re-reads all 40 TB. This is the property the whole plan rests on. |
-| Sidecar coverage checked, not assumed | `pvfs sidecar-backfill --dry-run` on each holder. It was ~96% on the QNAP when last measured. Coverage is what makes the import metadata-speed rather than byte-speed. |
+| Sidecar coverage checked **per bound root**, not fleet-wide | `pvfs sidecar-backfill --dry-run` on each holder. Fleet-wide averages hide the case that matters: on 2026-09-08 `Data/Media` was at 97.5% while `Data_ext/Media` — 18 TB, a separate bound root — had **zero**. That looked like a day and a half of re-hashing, and was not: the files WERE hashed, the sidecars had simply never been written, and the backfill rescued 3,165 hashes from the catalogue without reading a byte. Both roots are now ~99%. Ask of any gap: missing hashes, or missing writes? |
+| A daemon for the NEW forest, on its own port | **The runbook originally omitted this and the rehearsal stopped dead on it.** A replica reaches the owner over the network, so the new forest needs its own listener before Phase C — the existing `pvfsd` serves the OLD forest only. See §11. |
 | D105 deployed | a scan on a marker-verified mount now unlinks files that are genuinely gone. On the FIRST scan after the roll this clears a backlog; do it before re-genesis so the old forest's residue counts (§1) are honest. |
 | D106 deployed | `pvfs islands` is how §1 records the detached-subtree residue. Without it that number cannot be taken at all. |
 | The recovery phrase for the OLD forest is in custody | rollback (§8) needs the old forest openable. |
@@ -58,14 +61,25 @@ cd /srv/pvfs/media
 } | tee ~/regenesis-before-$(date +%Y%m%d).txt
 ```
 
-Baseline measured 2026-09-08, for comparison when the real run happens:
+Baseline measured 2026-09-08. **Both columns are given because the residue was
+cleared that night** — the "before" is what the numbers looked like when this
+document was written, the "after" is what a re-genesis would now be starting
+from, and the difference is the argument for doing it shrinking:
 
-| | count |
-|---|---|
-| `missing` — catalogued, held by nobody | 1,894 |
-| `orphans` — no live link | 25,602 |
-| islands — live-linked, unreachable | 1,849 at last count (doc 24 §18); re-take with D106 |
-| root ACL grants | 3, all `rwa`, all `key:` principals |
+| | before | after |
+|---|---|---|
+| `missing` — catalogued, held by nobody | 1,894 | **0** |
+| `orphans` — no live link | 25,602 | 28,172 (higher: unlink is a SOFT remove, so everything cleared became an orphan) |
+| islands — live-linked, unreachable | 1,849 | **0** |
+| duplicate groups | 588 | 0 |
+| root ACL grants | 3, all `rwa`, all `key:` principals | unchanged |
+
+The residue this document was written to record before losing has largely been
+fixed IN PLACE instead, with the causes closed (D112, D115, D117) rather than
+outrun. Doc 24 §16 argued the disconnected structure was "a stronger argument
+for re-genesis than the log size ever was"; that argument is gone. What remains
+is log size, replay time, and a deliberate clean baseline — which is a fair
+reason, but a different one, and worth stating rather than inheriting.
 
 The same commands run against the NEW forest after §6 are what "verified"
 compares against.
@@ -162,6 +176,25 @@ echo "root=$NEW_ROOT media=$NEW_MEDIA"   # WRITE THESE DOWN — §5 needs both
 
 **Check:** `pvfs --forest media2 ls "$NEW_ROOT"` shows exactly `Media`.
 
+Two things the rehearsal hit here that this document did not say (§11):
+
+```bash
+# `forest register` is HOST-WIDE and needs root. The fleet play uses
+# `become: true` for exactly this; a bare call fails with
+# "I/O error during write registry file: Permission denied".
+sudo pvfs forest register /srv/pvfs/media2 --alias media2
+
+# And the NEW forest needs its OWN listener before any replica can reach it.
+# The running pvfsd serves the OLD forest; nothing serves this one yet.
+pvfsd --mount /srv/pvfs/media2 --listen 0.0.0.0:7431 &
+cat /srv/pvfs/media2/.pvfs/nettls/pin      # Phase C pins against THIS
+```
+
+Also: `/srv/pvfs` itself is not writable by `chris`, so redirecting the
+recovery phrase to `{{ pvfs_mount }}/../forest-init.txt` — which is what the
+fleet play does — fails with `Permission denied`. Write it under `~` and move
+it to custody from there.
+
 ### Phase B — re-grant the ACLs
 
 Three `rwa` grants at the root (§1). Take the three pubkeys from the old
@@ -235,8 +268,17 @@ pvfs --forest media2 forest carry-quality --from /srv/pvfs/media --dry-run
 pvfs --forest media2 forest carry-quality --from /srv/pvfs/media
 ```
 
-Matched by tree path and re-signed against the new ids. Expect roughly **119
-carried** out of 24,585 recorded measurements — the rest are already stranded
+Matched by **full tree path** and re-signed against the new ids.
+
+**That path match is exact, and silent when it misses.** The rehearsal bound
+`Media` straight to one show's directory, so the new tree read
+`Media/Season 04/…` against the old forest's
+`Media/TV/Ted Lasso (2020)/Season 04/…` — and the carry reported `74 read, 0
+carried, 74 unmatched`, which is indistinguishable from "there was nothing to
+carry". Bind the new forest at the SAME roots as the old one, or this step
+quietly does nothing.
+
+Expect roughly **119 carried** out of the 24,585 recorded measurements — the rest are already stranded
 on superseded and disconnected nodes in the old forest, which is a finding
 about the old forest, not a failure of the carry (doc 24 §17 item 3).
 
@@ -342,3 +384,54 @@ cloudplow cycle, a NAS reboot, and an *arr import — and after `pvfs islands`,
 3. **§7 assumes the mount has no consumers.** True on 2026-09-08 and checked;
    re-check on the day, because the D82 union mount being live-but-forgotten
    is exactly the kind of thing that changes without anyone recording it.
+
+
+## 11. The rehearsal (2026-09-08) — it works, and four things here were wrong
+
+Run on the live fleet, over a real subset: `TV/Ted Lasso (2020)` — 40 files and
+152 GB on the holder, plus one recent arrival still in the ingest's staging
+that the holder did not have. Every phase from §4 executed for real, on the
+real boxes, with real routing through the owner. The production forest was
+untouched throughout and everything was torn down afterwards.
+
+### What it proved
+
+| | |
+|---|---|
+| holder import | **40 files, 152 GB, 26 seconds** |
+| sidecar reuse | **40 of 40. Zero full hashing** |
+| three-box convergence | **47 nodes** on owner, ingest and holder alike |
+| new forest health | 0 duplicates, 0 islands, 48/48 reachable |
+| routed import | `add: hash from sidecar … (3704387836 bytes)` — a 3.7 GB file catalogued without reading it |
+
+**The timing question §10 asked is answered.** The import is bound by file
+count, not bytes: 40 files in 26s is ~0.65 s/file, so the ~27,000-file library
+extrapolates to roughly **5 hours**, not days. The 152 GB moved through in
+those 26 seconds because nothing was read — which is the cheap-hash property
+working on real media rather than on a synthetic fixture.
+
+**Convergence is the other half.** The ingest's copy and the holder's 40 became
+one 47-node tree on all three boxes, and the one file only the ingest had
+stayed a single node with a single location. No duplicates in the new forest.
+
+### The four things this document got wrong
+
+1. **The new forest needs its own daemon and port.** Not mentioned anywhere.
+   The rehearsal reached Phase C and could not take a replica, because the only
+   listener was serving the old forest. Now in §0 and Phase A.
+2. **`forest register` needs root.** The registry is host-wide. The fleet play
+   knew (`become: true`); this document did not.
+3. **`/srv/pvfs` is not writable by the forest user**, so the recovery-phrase
+   capture fails — and the fleet play writes to exactly that path, so it has
+   the same latent bug.
+4. **`carry-quality` matches on full tree path and is silent when it misses.**
+   `74 read, 0 carried, 74 unmatched` reads the same as "nothing to carry".
+
+### What is still untested
+
+- **The cutover (§7).** A subset cannot honestly rehearse it: the swap is
+  fleet-wide by nature. It remains the one step never performed.
+- **Scale.** 40 files is not 27,000. The per-file cost should hold, but the
+  fold and the owner's log growth at 27,000 routed writes were not exercised.
+- **`carry-quality` actually carrying.** It ran and matched nothing, for the
+  path reason above — so the carry path itself is still only unit-tested.
