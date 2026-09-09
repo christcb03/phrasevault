@@ -146,6 +146,30 @@ Scan is **transactional per file** (a crash mid-scan leaves a valid partial
 index; the next reconciliation completes it) and **idempotent** (event
 idempotency from P0 §7 absorbs re-runs).
 
+### The settle window
+
+A file that is still being written must NOT be catalogued: identity is by exact
+size, so recording a half-copied file records a wrong size and then confidently
+mis-identifies it ever after. The scan therefore DEFERS any file that changed
+within `WATCH_SETTLE_MS` (15s) — counted as `settling`, never dropped, and
+picked up by a later pass.
+
+**The test is `max(mtime, ctime)`, not mtime.** mtime alone reads as "has it
+stopped moving?" only for a writer that lets mtime advance — true of a local
+copier like Sonarr, false of anything that back-dates the destination. rclone
+preserves the SOURCE mtime, so a file that landed thirty seconds ago can carry
+an mtime from two days back and clear the window on its first sighting.
+Measured on the production holder (2026-09-08): arrivals whose mtime sat 41.8h
+and 56.5h BEHIND their ctime, each catalogued mid-copy at a partial size, each
+then failing the identity match against the node another box had already made —
+which is where several hundred duplicate pairs came from.
+
+ctime is set by the kernel on every content or metadata change and cannot be
+back-dated from userspace (`utimes` moves mtime and atime, never ctime), so it
+answers the question the window is actually asking: when did these bytes last
+change *here*. A one-shot `pvfs scan` passes `settle_ms = 0` and indexes what is
+on disk now; the window is the WATCHER's concern.
+
 Scan stats are returned and printed: `added / unchanged / changed / removed /
 skipped`, plus — as later milestones gave the scan more it could do and more it
 had to explain — `relocated`, `settling`, `unreadable`, `empty_dirs`,
