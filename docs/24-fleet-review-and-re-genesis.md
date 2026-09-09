@@ -1545,6 +1545,17 @@ islands, the junk nodes and the manifest recursion — the things a rebuild was
 going to clear for free — are cleared, and the mechanisms that produced them
 are closed.
 
+**And the cleanup itself grew the log.** Measured after the work: the log holds
+**409,072 events**, against the ~241,000 this document records elsewhere.
+Tonight's 1,445 unlinks, 617 merges, location moves and island drop cost
+roughly 168,000 events — because unlink is a soft remove on an append-only log,
+so tidying the forest is written INTO the thing whose size is the complaint.
+
+That partially rebuilds the case this section just said had weakened. Clearing
+residue in place fixes the tree and enlarges the log; only a rebuild or
+compaction (doc 11) shrinks it. Worth stating plainly rather than leaving the
+reader to notice the contradiction.
+
 What remains is log size, replay time, and a deliberate clean baseline. Chris
 (2026-09-08): *"I want to re-genesis more for a clean start without any baggage
 from iterations and as a test to see how a fresh install would perform."* That
