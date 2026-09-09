@@ -1224,9 +1224,23 @@ open:
   occurrences** when finally measured rather than recalled (doc 25 §3). The
   extra one is the forest ROOT, in the ingest's `pvfs-mount.service`. Still
   small; the point is that "already checked" was not true of this line.
-- **Duplicate nodes (D84) should NOT recur.** `match_by_identity` matches on
-  name + size, so a second box relocates rather than re-adds; and the cause of
-  the 206 (a stale node label after a rename) was fixed in D72.
+- ~~**Duplicate nodes (D84) should NOT recur.**~~ **FALSE, and it was being
+  disproved while this line sat here.** They were being minted on every new
+  arrival right up to 2026-09-08, and 588 groups were found the moment anything
+  looked. The reasoning — "`match_by_identity` matches on name + size, so a
+  second box relocates rather than re-adds" — inverted the truth: matching on
+  SIZE is what fails, because the two nodes of a pair disagree about size, and
+  that is the whole reason each pair exists.
+
+  Two causes, both now closed. **D112**: rclone preserves the source mtime, the
+  settle window trusted mtime, and the holder catalogued half-copied arrivals at
+  a partial size. **D115/D117**: the scan matched on name AND size, so a file
+  whose CONTENT changed was not a candidate at all and an *arr upgrade grew a
+  node per version — with D115 a no-op on every replica until D117 taught its
+  check that a location can be pin-qualified.
+
+  The lesson worth more than the fix: this bullet is in a section headed
+  "Already small — CHECKED, not assumed", and it was neither.
 
 
 ## 18. The islands — measured, and the mechanism (2026-09-07)
