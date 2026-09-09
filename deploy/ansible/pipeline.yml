@@ -40,8 +40,11 @@
     # other's numbers and both call themselves green.
     pvfs_suffix: "{{ ('-' + session) if session is defined else '' }}"
     test_results: "/tmp/pvfs-test-results{{ pvfs_suffix }}.txt"
+    clippy_results: "/tmp/pvfs-clippy-results{{ pvfs_suffix }}.txt"
     smoke_results: "/tmp/pvfs-smoke-results{{ pvfs_suffix }}.txt"
     smoke_script: "/tmp/pvfs-smoke-test{{ pvfs_suffix }}.sh"
+    # How idle a build slot must be before the pipeline reclaims it (D121).
+    reap_after_days: 2
     pvfs_bin: /usr/local/bin/pvfs
     pvfs_user_bin: "{{ ansible_facts.env.HOME }}/.local/bin"
     # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
@@ -170,6 +173,30 @@
       register: test_out
       changed_when: false
       tags: [test]
+
+    # ---- lint (D121) -------------------------------------------------------
+    # CLIPPY IS PART OF THE PIPELINE NOW.
+    #
+    # It was an ad-hoc step CLAUDE.md asked for after a deploy, and being
+    # ad-hoc it got skipped: D114 reached PRODUCTION with a `type_complexity`
+    # error in it, and D120 was green on 512 tests while carrying five
+    # `unused_mut` errors. `cargo test` does not lint, so "the pipeline passed"
+    # has twice meant less than it sounded like. A check a human has to
+    # remember is a check that eventually does not happen.
+    #
+    # `--all-targets` because both misses were in TEST code, which a bare
+    # `cargo clippy` never compiles.
+    - name: Clippy (-D warnings, all targets)
+      ansible.builtin.shell: |
+        set -o pipefail
+        cargo clippy --all-targets --workspace -- -D warnings 2>&1 | tee {{ clippy_results }}
+      args:
+        chdir: "{{ pvfs_src }}"
+        executable: /bin/bash
+      environment: "{{ cargo_env }}"
+      register: clippy_out
+      changed_when: false
+      tags: [test, lint]
 
     # ---- smoke (every CLI function end-to-end) ------------------------------------
     - name: Upload CLI smoke test
@@ -373,7 +400,52 @@
       changed_when: false
       tags: [daemon]
 
-    # ---- report ----------------------------------------------------------------------
+        # ---- reap (D121) -------------------------------------------------------
+    # DELETE THE SLOTS NOBODY IS USING.
+    #
+    # Each session slot is a full source + target tree, 6-8 GB. CLAUDE.md says
+    # to delete yours when the work merges, and that rule has now failed twice
+    # in one project: presubuntu hit 96G/96G on 2026-08-16 and 100% again on
+    # 2026-09-08, the second time taking the smoke suite down with a disk-space
+    # error that looked nothing like one ("declared 12588912 B ... exceeds
+    # 105365504 B free"). Doc 24 section 14 item 5 asked for this to be
+    # automated; a rule that depends on remembering is not a rule.
+    #
+    # Conservative on purpose: only slots whose target tree has not been
+    # touched in REAP_AFTER_DAYS, never the one this run is using, and never
+    # the canonical /opt/pvfs. An old slot is worth 7 GB; a slot someone is
+    # mid-build in is worth an afternoon.
+    - name: Reap idle build slots
+      ansible.builtin.shell: |
+        set -o pipefail
+        keep="{{ pvfs_root }}"
+        reaped=""
+        for d in /opt/pvfs-*; do
+          [ -d "$d" ] || continue
+          [ "$d" = "$keep" ] && continue
+          [ "$d" = "/opt/pvfs" ] && continue
+          # Anything still being written to is in use, whatever its age.
+          if [ -n "$(find "$d" -mindepth 1 -mmin -{{ reap_after_days | int * 1440 }} -print -quit 2>/dev/null)" ]; then
+            continue
+          fi
+          sz=$(du -sh "$d" 2>/dev/null | cut -f1)
+          rm -rf "$d" && reaped="$reaped $d($sz)"
+        done
+        echo "reaped:${reaped:- none}"
+        df -h / | tail -1
+      args:
+        executable: /bin/bash
+      become: true
+      register: reap_out
+      changed_when: "'reaped: none' not in reap_out.stdout"
+      tags: [reap, report]
+
+    - name: Say what was reaped
+      ansible.builtin.debug:
+        msg: "{{ reap_out.stdout_lines }}"
+      tags: [reap, report]
+
+# ---- report ----------------------------------------------------------------------
     - name: Fetch test results to control machine
       ansible.builtin.fetch:
         src: "{{ item }}"
@@ -381,6 +453,7 @@
         fail_on_missing: false
       loop:
         - "{{ test_results }}"
+        - "{{ clippy_results }}"
         - "{{ smoke_results }}"
         - /tmp/pvfsd-journal.txt
       tags: [report]
@@ -408,6 +481,10 @@
       ansible.builtin.debug:
         msg:
           - "build   : ok"
+          # Honest about not having run. A recap that claims a check passed
+          # when it was skipped is worse than omitting it — that is the same
+          # failure as the "0 passed; 0 failed" recap D91 fixed below.
+          - "clippy  : {{ 'clean (-D warnings, --all-targets)' if clippy_out is defined and not clippy_out.skipped | default(false) else 'NOT RUN in this invocation' }}"
           - "tests   : {{ test_totals.stdout | default('see artifacts') }}"
           - "smoke   : {{ smoke_out.stdout_lines | default([]) | select('match', '^smoke results') | list | last | default('see artifacts') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"
