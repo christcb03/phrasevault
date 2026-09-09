@@ -2916,6 +2916,58 @@ impl Engine {
         Ok(report)
     }
 
+    /// Drop a detached subtree: unlink every node under `island_root`, and the
+    /// root itself (D116).
+    ///
+    /// `list_islands` deliberately only REPORTS, because which parent an island
+    /// belongs under is not something a walk can know. Dropping needs the same
+    /// judgement in the other direction — that the subtree is genuinely finished
+    /// with — so the caller NAMES the island rather than asking for a sweep.
+    ///
+    /// Production's case: `Backups` was moved out of the media library in
+    /// August. Its files were forgotten once they were seen held by nobody, but
+    /// 491 empty folder nodes stayed behind — unreachable from any tree root, so
+    /// no scan revisits them, and `orphans`/`missing`/`reclaim` all call them
+    /// healthy because each still has a live link to its own live parent.
+    ///
+    /// Soft removes on an append-only log, so this is reversible.
+    pub fn drop_island(&mut self, island_root: &NodeId) -> Result<u64> {
+        // Collect first, unlink second: the walk reads the very links the
+        // unlinking removes.
+        let mut order: Vec<NodeId> = Vec::new();
+        let mut queue = vec![island_root.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            order.push(id.clone());
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT child_id FROM links
+                      WHERE parent_id = ?1 AND removed_at IS NULL",
+                )
+                .map_err(map_db("island children"))?;
+            let kids: Vec<String> = stmt
+                .query_map(params![id], |r| r.get::<_, String>(0))
+                .map_err(map_db("island children"))?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(map_db("island children"))?;
+            queue.extend(kids);
+        }
+        // Deepest first, so a parent is never unlinked out from under a child
+        // that still has to be walked.
+        let mut dropped = 0u64;
+        for id in order.into_iter().rev() {
+            for link in self.links_of(&id)? {
+                self.remove_link(&link)?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Merge each duplicate group onto its keeper (D113).
     ///
     /// Locations are ADDED to the keeper before the losers are unlinked, in

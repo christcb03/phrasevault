@@ -340,3 +340,59 @@ fn re_linking_the_island_root_clears_the_report() {
     assert_eq!(r.stranded, 0);
     engine.close().unwrap();
 }
+
+/// D116 — a named island can be DROPPED, and the report empties.
+///
+/// `islands` reports rather than sweeps because which parent an island belongs
+/// under is not something a walk can know. Dropping needs the same judgement in
+/// the other direction, so the caller names the island — there is no sweep-all.
+///
+/// Production's case: `Backups` left the media library in August. Its files
+/// were forgotten once seen held by nobody, but 491 empty FOLDER nodes stayed —
+/// unreachable, so no scan revisits them, and every existing check calls them
+/// healthy because each still has a live link to its own live parent.
+#[test]
+fn a_named_island_can_be_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let root = e.identity.root_node_id.clone();
+
+    let backups = folder(&mut e, &root, "Backups");
+    let sub = folder(&mut e, &backups, "Feederbox");
+    folder(&mut e, &sub, "archived");
+    let keep = folder(&mut e, &root, "Media");
+
+    // Cut the top edge — exactly how production made its island.
+    let link = e
+        .children(&root)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.node.id == backups)
+        .unwrap()
+        .link_id;
+    e.remove_link(&link).unwrap();
+
+    let r = e.list_islands().unwrap();
+    assert_eq!(r.islands.len(), 1, "one detached subtree");
+    assert_eq!(r.islands[0].root.label, "Backups");
+
+    let dropped = e.drop_island(&backups).unwrap();
+    assert!(dropped >= 2, "every link beneath it went: {dropped}");
+
+    let r = e.list_islands().unwrap();
+    assert!(r.islands.is_empty(), "and the report is empty afterwards");
+    assert_eq!(r.stranded, 0);
+
+    // The rest of the forest is untouched — a drop is not a sweep.
+    let kids: Vec<String> = e
+        .children(&root)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.node.id)
+        .collect();
+    assert_eq!(kids, vec![keep], "Media is still there");
+
+    // Nothing destroyed: soft removes on an append-only log.
+    assert!(e.get_node(&sub).unwrap().is_some());
+    e.close().unwrap();
+}
