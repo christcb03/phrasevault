@@ -228,7 +228,16 @@ enum Cmd {
     ///
     /// A REPORT, not a sweep: which parent to re-link an island to is not
     /// something a walk can know.
-    Islands,
+    Islands {
+        /// Unlink this island and everything beneath it (D116). Name the island
+        /// by the id the report prints — there is no sweep-all, because whether
+        /// a detached subtree is finished with is a judgement, not a walk.
+        #[arg(long)]
+        drop: Option<String>,
+        /// Skip the confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Files the catalog claims that NOBODY holds — the residue of deletions
     /// made outside PVFS (D81).
     ///
@@ -3679,7 +3688,37 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
-        Cmd::Islands => {
+        Cmd::Islands { drop, yes } => {
+            if let Some(root) = drop {
+                let mut engine = Engine::open(&ctx?)?;
+                let r = engine.list_islands()?;
+                let Some(isl) = r.islands.iter().find(|i| i.root.id.starts_with(&root)) else {
+                    return Err(PvfsError::NotFound {
+                        kind: "island",
+                        id: root,
+                    });
+                };
+                let (id, label, n) = (isl.root.id.clone(), isl.root.label.clone(), isl.size.nodes);
+                use std::io::IsTerminal;
+                if !yes && !json && std::io::stdin().is_terminal() {
+                    let a = prompt_line(
+                        &format!("drop \"{label}\" and the {n} node(s) beneath it? [y/N]"),
+                        Some("N"),
+                    )?;
+                    if !a.trim().eq_ignore_ascii_case("y") {
+                        println!("nothing was changed");
+                        return engine.close();
+                    }
+                }
+                let dropped = engine.drop_island(&id)?;
+                if json {
+                    println!("{{\"island\":\"{id}\",\"links_removed\":{dropped}}}");
+                } else {
+                    println!("dropped \"{label}\": {dropped} link(s) removed");
+                    println!("soft removes on an append-only log — the records survive.");
+                }
+                return engine.close();
+            }
             let engine = Engine::open(&ctx?)?;
             let r = engine.list_islands()?;
             if json {
