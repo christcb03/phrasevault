@@ -65,7 +65,7 @@ fn rig(first: usize, second: usize) -> (tempfile::TempDir, Engine, String, Strin
 /// A significantly larger incoming copy wins on the size rung, and says so.
 #[test]
 fn a_bigger_incoming_copy_wins_and_explains_itself() {
-    let (_d, mut e, _f, id) = rig(1_000_000, 2_000_000);
+    let (_d, e, _f, id) = rig(1_000_000, 2_000_000);
     let (incoming_wins, verdict) = e.weigh_pending_change(&id, &Rules::default()).unwrap();
     assert!(incoming_wins, "twice the size should win: {}", verdict.reason());
     assert!(verdict.decided(), "and it must be a DECISION, not a shrug");
@@ -80,7 +80,7 @@ fn a_bigger_incoming_copy_wins_and_explains_itself() {
 /// still the wrong one, and something has to keep saying so.
 #[test]
 fn a_smaller_incoming_copy_does_not_win() {
-    let (_d, mut e, _f, id) = rig(2_000_000, 1_000_000);
+    let (_d, e, _f, id) = rig(2_000_000, 1_000_000);
     let (incoming_wins, verdict) = e.weigh_pending_change(&id, &Rules::default()).unwrap();
     assert!(
         !incoming_wins,
@@ -100,7 +100,7 @@ fn a_smaller_incoming_copy_does_not_win() {
 /// A genuinely truncated rewrite is caught earlier, by `truncation_pct`.
 #[test]
 fn a_comparable_size_falls_through_to_recency() {
-    let (_d, mut e, _f, id) = rig(1_000_000, 1_020_000); // 2%, inside the 10% margin
+    let (_d, e, _f, id) = rig(1_000_000, 1_020_000); // 2%, inside the 10% margin
     let (incoming_wins, verdict) = e.weigh_pending_change(&id, &Rules::default()).unwrap();
     assert!(
         verdict.reason().contains("newer"),
@@ -119,7 +119,7 @@ fn a_comparable_size_falls_through_to_recency() {
 /// rung fires before recency can.
 #[test]
 fn a_truncated_rewrite_does_not_win_on_being_newer() {
-    let (_d, mut e, _f, id) = rig(2_000_000, 1_000_000); // half the size
+    let (_d, e, _f, id) = rig(2_000_000, 1_000_000); // half the size
     let (incoming_wins, verdict) = e.weigh_pending_change(&id, &Rules::default()).unwrap();
     assert!(
         !incoming_wins,
@@ -134,7 +134,7 @@ fn a_truncated_rewrite_does_not_win_on_being_newer() {
 #[test]
 fn weighing_a_file_with_no_pending_change_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+    let (e, _mn) = Engine::init(dir.path()).unwrap();
     let root = e.identity.root_node_id.clone();
     let err = e.weigh_pending_change(&root, &Rules::default());
     assert!(err.is_err(), "expected NotFound, got {err:?}");
