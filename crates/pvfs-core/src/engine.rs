@@ -2798,6 +2798,75 @@ impl Engine {
         Ok(report)
     }
 
+    /// Weigh a pending change on the D76 ladder: should the file now on disk
+    /// REPLACE the node, or has the node got the better copy? (D120)
+    ///
+    /// A pending change says "the file at this path is not the file I
+    /// catalogued". Deciding which is better was, until now, entirely manual —
+    /// `pvfs resolve --replace` or `--delete`, chosen blind, with `pvfs explain`
+    /// available only as a separate thing you had to know to run. The ladder
+    /// that `collide` and the mover already use lives in `media::choose`; this
+    /// points it at the change.
+    ///
+    /// `Ok(true)` means the INCOMING file wins.
+    ///
+    /// The incoming candidate has a size and an mtime and no measured quality,
+    /// which is not the same as having no opinion: the ladder falls through
+    /// empty rungs to the next one, and reaches size. That is deliberate — on
+    /// this library the unmeasured files ARE the interesting ones.
+    pub fn weigh_pending_change(
+        &self,
+        file_id: &NodeId,
+        rules: &crate::media::Rules,
+    ) -> Result<(bool, crate::media::Verdict)> {
+        let (uri, new_size, new_mtime): (String, i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT uri, new_size, new_mtime FROM pending_changes WHERE file_id = ?1",
+                params![file_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(map_db("read pending change"))?
+            .ok_or(PvfsError::NotFound {
+                kind: "pending change",
+                id: file_id.clone(),
+            })?;
+        let node = fetch_node(&self.conn, file_id)?.ok_or(PvfsError::NotFound {
+            kind: "node",
+            id: file_id.clone(),
+        })?;
+        let payload = node::FilePayload::decode(&node.payload)?;
+        let (quality, _src) = self
+            .media_quality(file_id)?
+            .unwrap_or_else(|| (Default::default(), "never measured".into()));
+
+        let occupant = crate::media::Candidate {
+            label: node.label.clone(),
+            quality,
+            size_bytes: payload.size_bytes,
+            mtime_ms: node.created_at,
+            integrity_ok: true,
+        };
+        let incoming = crate::media::Candidate {
+            // Same path, so the same name — what differs is the bytes.
+            label: node.label.clone(),
+            // Nothing has measured the file on disk; it has only just appeared.
+            quality: Default::default(),
+            size_bytes: new_size.max(0) as u64,
+            mtime_ms: new_mtime.max(0) as u64,
+            integrity_ok: true,
+        };
+        let _ = uri;
+        // `choose` answers "does A win"; A here is the incoming copy.
+        let media = crate::media::is_media_file(&node.label, &payload.mime_type);
+        Ok(if media {
+            crate::media::choose(&incoming, &occupant, rules)
+        } else {
+            crate::media::choose_non_media(&incoming, &occupant)
+        })
+    }
+
     /// Files the catalogue holds MORE THAN ONCE at the same place (D113).
     ///
     /// A group is: same live parent, same effective name. **Not size.**

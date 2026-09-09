@@ -547,6 +547,24 @@ enum Cmd {
         /// with --delete: hard-delete instead of leaving an orphan
         #[arg(long, requires = "delete")]
         purge: bool,
+        /// D120 — let the D76 ladder decide, instead of deciding blind.
+        ///
+        /// A pending change is "the file at this path is not the file I
+        /// catalogued", and until now the only way to learn WHICH is better was
+        /// to run `pvfs explain` separately and read it yourself. The ladder
+        /// that `collide` and the mover already use is right here; this points
+        /// it at the change and prints the reason it gives.
+        ///
+        /// OFF by default, and for the same reason `collide --rules` is: a
+        /// genuine two-copy conflict is worth a human's attention.
+        #[arg(long, conflicts_with_all = ["replace", "delete"])]
+        rules: bool,
+        /// Percent larger that counts as "significantly" (with --rules).
+        #[arg(long, default_value_t = 10, requires = "rules")]
+        size_margin: u32,
+        /// Say what the ladder decides and change NOTHING.
+        #[arg(long, requires = "rules")]
+        dry_run: bool,
     },
     /// pvfsd's background jobs (doc 18): bare `pvfs serve` shows status;
     /// subcommands manage jobs, kept-fresh exports, and the foreground watcher
@@ -7147,7 +7165,52 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             replace,
             delete,
             purge,
+            rules,
+            size_margin,
+            dry_run,
         } => {
+            if rules {
+                let mut engine = Engine::open(&ctx?)?;
+                let r = pvfs_core::media::Rules {
+                    size_margin_pct: size_margin,
+                    ..Default::default()
+                };
+                let (incoming_wins, verdict) = engine.weigh_pending_change(&id, &r)?;
+                if json {
+                    println!(
+                        "{{\"id\":\"{}\",\"incoming_wins\":{},\"decided\":{},\"reason\":\"{}\"}}",
+                        id,
+                        incoming_wins,
+                        verdict.decided(),
+                        json_escape(verdict.reason())
+                    );
+                } else {
+                    println!(
+                        "{}: {}",
+                        if incoming_wins { "REPLACE" } else { "KEEP" },
+                        verdict.reason()
+                    );
+                }
+                if dry_run || !verdict.decided() {
+                    if !json && !verdict.decided() {
+                        eprintln!(
+                            "the ladder could not separate them — left for you. \
+                             `pvfs resolve {id} --replace` or `--delete` decides it."
+                        );
+                    }
+                    return engine.close();
+                }
+                if incoming_wins {
+                    let new_id = engine.resolve(&id, ResolveAction::Replace)?;
+                    if !json {
+                        println!("{new_id}");
+                    }
+                }
+                // The occupant winning means the change is NOT applied; the
+                // flag stays, because the file on disk is still the wrong one
+                // and something has to notice that.
+                return engine.close();
+            }
             if replace == delete {
                 return Err(PvfsError::BadInput {
                     field: "action".into(),
