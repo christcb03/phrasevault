@@ -48,7 +48,7 @@ fn a_replica_is_promoted_with_the_phrase_and_the_old_writer_is_revoked() {
     folder(&mut owner, &root, "Before");
     let old_device = owner.devices().unwrap();
     assert_eq!(old_device.len(), 1, "the forest's one device, index 0");
-    let old_pub = hex::decode(&old_device[0].0).unwrap();
+    let old_pub = hex::decode(&old_device[0].pubkey).unwrap();
     let tip_a = owner.log_tip().unwrap();
     owner.close().unwrap();
 
@@ -63,8 +63,8 @@ fn a_replica_is_promoted_with_the_phrase_and_the_old_writer_is_revoked() {
     assert_eq!(b_engine.log_tip().unwrap(), tip_a + 2, "DeviceAuthorized + DeviceRevoked, at the tip");
     let devices = b_engine.devices().unwrap();
     assert_eq!(devices.len(), 2);
-    assert!(devices[0].3.is_some(), "device 0 (the old owner) is revoked");
-    assert_eq!((devices[1].1, devices[1].3), (1, None), "device 1 (this box) is live");
+    assert!(devices[0].revoked_at.is_some(), "device 0 (the old owner) is revoked");
+    assert_eq!((devices[1].index, devices[1].revoked_at), (1, None), "device 1 (this box) is live");
     let after = folder(&mut b_engine, &root, "After");
     assert!(b_engine.children(&root).unwrap().iter().any(|c| c.node.id == after), "b appends");
     b_engine.close().unwrap();

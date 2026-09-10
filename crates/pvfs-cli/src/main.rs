@@ -8068,19 +8068,21 @@ fn forest_cmd(
             };
             if !json {
                 println!("devices of this forest:");
-                for (pk, idx, _, revoked) in &devs {
+                for d in &devs {
                     println!(
-                        "  {idx:>3}  {pk}  {}",
-                        if revoked.is_some() { "revoked" } else { "live" }
+                        "  {:>3}  {}  {}",
+                        d.index,
+                        d.pubkey,
+                        if d.revoked_at.is_some() { "revoked" } else { "live" }
                     );
                 }
             }
-            if let Some(taken) = devs.iter().find(|d| d.1 == device_index && d.3.is_none()) {
+            if let Some(taken) = devs.iter().find(|d| d.index == device_index && d.revoked_at.is_none()) {
                 return Err(PvfsError::BadInput {
                     field: "device-index".into(),
                     reason: format!(
                         "index {device_index} is already device {}; pick an unused --device-index",
-                        taken.0
+                        taken.pubkey
                     ),
                 });
             }
@@ -8093,8 +8095,8 @@ fn forest_cmd(
                 })?)
             } else {
                 devs.iter()
-                    .find(|d| d.1 == 0 && d.3.is_none())
-                    .and_then(|d| hex::decode(&d.0).ok())
+                    .find(|d| d.index == 0 && d.revoked_at.is_none())
+                    .and_then(|d| hex::decode(&d.pubkey).ok())
             };
             let mn = read_phrase_stdin("recovery phrase (to promote this replica to owner)")?;
             let engine = Engine::promote(&data_dir, &mn, device_index, old.as_deref())?;

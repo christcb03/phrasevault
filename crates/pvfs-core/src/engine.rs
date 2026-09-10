@@ -36,6 +36,18 @@ pub struct NodeSpec {
 /// `(content_hash, size, updated_at, author)`.
 pub type SecureBlobHead = (Vec<u8>, u64, u64, Vec<u8>);
 
+/// D128 — one device certificate as the projection holds it (`device_keys`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCert {
+    /// Device pubkey, hex.
+    pub pubkey: String,
+    /// Derivation index under the identity root (`forest init` made 0).
+    pub index: u64,
+    pub authorized_at: u64,
+    /// Set once a root-signed `DeviceRevoked` is folded.
+    pub revoked_at: Option<u64>,
+}
+
 /// One ordered child of a parent (merged `contains` + `ref`).
 #[derive(Debug, Clone)]
 pub struct ChildEntry {
@@ -940,9 +952,8 @@ impl Engine {
         Ok(engine)
     }
 
-    /// D128 — every device certificate the log carries: `(pubkey hex,
-    /// device index, authorized_at, revoked_at)`, in index order.
-    pub fn devices(&self) -> Result<Vec<(String, u64, u64, Option<u64>)>> {
+    /// D128 — every device certificate the log carries, in index order.
+    pub fn devices(&self) -> Result<Vec<DeviceCert>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -952,12 +963,12 @@ impl Engine {
             .map_err(map_db("devices"))?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((
-                    hex::encode(r.get::<_, Vec<u8>>(0)?),
-                    r.get::<_, i64>(1)? as u64,
-                    r.get::<_, i64>(2)? as u64,
-                    r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                ))
+                Ok(DeviceCert {
+                    pubkey: hex::encode(r.get::<_, Vec<u8>>(0)?),
+                    index: r.get::<_, i64>(1)? as u64,
+                    authorized_at: r.get::<_, i64>(2)? as u64,
+                    revoked_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                })
             })
             .map_err(map_db("devices"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
