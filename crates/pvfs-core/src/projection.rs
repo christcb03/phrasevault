@@ -288,7 +288,7 @@ CREATE TABLE IF NOT EXISTS region_entries (
   kind         TEXT    NOT NULL,
   size_bytes   INTEGER NOT NULL,
   mtime_ms     INTEGER NOT NULL,
-  ctime_ms     INTEGER NOT NULL,
+  changed_ms     INTEGER NOT NULL,   -- max(mtime, ctime) on THIS box: the D112 settle signal; never in the manifest
   content_hash TEXT,
   quality      TEXT,
   seen_at      INTEGER NOT NULL,
@@ -3156,7 +3156,7 @@ fn migrate_v15_to_v16(conn: &mut Connection) -> Result<()> {
     // D125 — additive. `kind` is appended, which is also where the fresh DDL
     // puts it, so the layout test's positional-copy invariant holds. Every
     // existing region is a 'log' region and stays one; nothing is re-read.
-    // Guarded like v7→v8's `links.label`: a cache that already carries the
+    // Guarded like v9→v10's `links.label`: a cache that already carries the
     // column (a test rewind, a half-applied bump) must not be sent through
     // the slow door by a duplicate-column error.
     let have: i64 = conn
@@ -3177,7 +3177,7 @@ fn migrate_v15_to_v16(conn: &mut Connection) -> Result<()> {
            kind         TEXT    NOT NULL,
            size_bytes   INTEGER NOT NULL,
            mtime_ms     INTEGER NOT NULL,
-           ctime_ms     INTEGER NOT NULL,
+           changed_ms     INTEGER NOT NULL,   -- max(mtime, ctime) on THIS box: the D112 settle signal; never in the manifest
            content_hash TEXT,
            quality      TEXT,
            seen_at      INTEGER NOT NULL,

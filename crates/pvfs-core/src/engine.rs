@@ -1180,7 +1180,7 @@ impl Engine {
                 | Event::FolderBound { folder_id: node_id, .. }
                 | Event::FolderUnbound { folder_id: node_id, .. }
                 | Event::FolderUnboundRoot { folder_id: node_id, .. }
-                | Event::AclSet { node_id, .. } => self.resolve_region(node_id, &batch_homes)?,
+                | Event::AclSet { node_id, .. } => self.boundary_route(node_id, &batch_homes)?,
                 Event::SecureBlobUpdated { blob_id, .. } => {
                     self.resolve_region(blob_id, &batch_homes)?
                 }
@@ -4873,6 +4873,40 @@ impl Engine {
             .map_err(map_db("regions"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("regions"))
+    }
+
+    /// D125 — whether `node` is the root of a catalogue region: one that
+    /// catalogues its own files (`region_entries`) and has no event log.
+    pub fn is_catalogue_region(&self, node: &str) -> Result<bool> {
+        let kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM regions WHERE node_id = ?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region kind"))?;
+        Ok(kind.as_deref() == Some("catalogue"))
+    }
+
+    /// D125 — where an event about a region's ROOT node (its binding, its
+    /// ACL, its purge) goes. For a log region that is the region's own
+    /// generation, as before. A catalogue region has no log, so its boundary
+    /// events go to the enclosing one — where its `RegionMarked` and
+    /// `SubRegionHead` rows already live. Events about nodes INSIDE a
+    /// catalogue region still resolve to it, and the append gate refuses
+    /// them: a catalogue region takes no nodes.
+    fn boundary_route(
+        &self,
+        node: &str,
+        batch_homes: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let region = self.resolve_region(node, batch_homes)?;
+        if region == node && self.is_catalogue_region(node)? {
+            return self.enclosing_log(node);
+        }
+        Ok(region)
     }
 
     /// The region `node` belongs to: the nearest marked ancestor (a marked
