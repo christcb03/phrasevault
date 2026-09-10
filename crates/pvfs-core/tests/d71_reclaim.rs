@@ -79,7 +79,7 @@ fn retiring_the_last_link_makes_a_node_unlinked() {
 fn reclaim_is_inert_without_a_tree_root() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _mn) = Engine::init(dir.path()).unwrap();
-    let rep = pvfs_core::sync::reclaim_pass(&engine, dir.path()).unwrap();
+    let rep = pvfs_core::sync::reclaim_pass(&engine, dir.path(), &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(rep.removed, 0);
     engine.close().unwrap();
 }

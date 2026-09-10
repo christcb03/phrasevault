@@ -1711,6 +1711,11 @@ pub fn sync_pull(
     let mut failed = Vec::new();
     for root in roots {
         for (id, label) in engine.missing_bytes(root)? {
+            // D123 — a disabled `sync` job stops at the next file. The swarm
+            // already honours the flag mid-transfer; this is the gap between.
+            if fetcher.cancelled() {
+                return Ok((fetched, failed));
+            }
             // D102 — honour the same memory `tier_pass` honours. Seeding the
             // fetcher was not enough on its own: this loop never consulted the
             // set, so a node known to be nowhere was re-asked every pass, and

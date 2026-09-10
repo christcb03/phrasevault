@@ -5290,7 +5290,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 pvfs_client::advertise::retract_pass(&dir, route)?
             };
             let mut engine = Engine::open(&dir)?;
-            let report = pvfs_core::sync::evict_pass(&mut engine)?;
+            let report = pvfs_core::sync::evict_pass(&mut engine, &std::sync::atomic::AtomicBool::new(false))?;
             let (evicted, freed, skipped) = (
                 report.evicted + retract.retracted,
                 report.freed_bytes + retract.freed_bytes,

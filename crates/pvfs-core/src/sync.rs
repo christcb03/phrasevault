@@ -16,6 +16,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::{bad, fetch_node, Engine};
 use crate::error::{IntegrityReason, PvfsError, Result};
@@ -481,7 +482,10 @@ pub fn swarm_part_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
 /// * and the bytes go to the **trash**, not to `unlink`. After `evict` has
 ///   reclaimed the ingest copy this is the only copy, and an automated
 ///   deletion that turns out to be wrong is otherwise unrecoverable.
-pub fn reclaim_pass(engine: &Engine, data_dir: &Path) -> Result<TrashPurge> {
+///
+/// `cancel` (D123): checked between files, so a disabled `reclaim` job stops
+/// at the next file rather than at the end of the trash.
+pub fn reclaim_pass(engine: &Engine, data_dir: &Path, cancel: &AtomicBool) -> Result<TrashPurge> {
     let mut report = TrashPurge::default();
     let placement = load_placement_full(data_dir)?;
     if placement.central_tree.is_empty() {
@@ -498,6 +502,9 @@ pub fn reclaim_pass(engine: &Engine, data_dir: &Path) -> Result<TrashPurge> {
         return Ok(report);
     }
     for (_id, path) in engine.orphaned_local_locations()? {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(root) = roots.iter().find(|r| path.starts_with(r)) else {
             continue; // not in a tree-layout root — evict's territory
         };
@@ -1143,7 +1150,10 @@ pub struct EvictReport {
 /// the thing being deleted. And if the delete succeeds but the retire fails,
 /// the result is a stale location a scan repairs; reversed, it is an orphaned
 /// file nothing knows about.
-pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
+///
+/// `cancel` (D123): checked between files, so a disabled `evict` job stops at
+/// the next file rather than at the end of its candidate list.
+pub fn evict_pass(engine: &mut Engine, cancel: &AtomicBool) -> Result<EvictReport> {
     let mut report = EvictReport::default();
     // P8 (doc 21): retired plain file:// locations are evictable ONLY under a
     // migrate-kind binding's source dir — that binding consented to draining
@@ -1191,6 +1201,9 @@ pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
             .map(|(i, u, p)| (i, u, p, false)),
     );
     for (id, uri, path, was_live) in candidates {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
         // Under a declared draining root, or a migrate-kind binding's source.
         let drains = declared.iter().any(|d| {
             crate::storage::any_path_of(&uri).is_some_and(|p| p.starts_with(

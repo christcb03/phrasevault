@@ -59,7 +59,7 @@ fn it_deletes_the_file_and_then_retires_the_location() {
     let (mut e, id, path) = staged(dir.path(), b"the-bytes");
     holder_copy(&mut e, &id);
 
-    let r = pvfs_core::sync::evict_pass(&mut e).unwrap();
+    let r = pvfs_core::sync::evict_pass(&mut e, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(r.evicted, 1, "skipped: {:?}", r.skipped);
     assert!(!path.exists(), "the local copy must be gone");
     let left = e.locations(&id).unwrap();
@@ -82,7 +82,7 @@ fn the_only_copy_is_never_evicted() {
     let (mut e, id, path) = staged(dir.path(), b"the-bytes");
     // no holder copy added
 
-    let r = pvfs_core::sync::evict_pass(&mut e).unwrap();
+    let r = pvfs_core::sync::evict_pass(&mut e, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(r.evicted, 0);
     assert!(path.exists(), "the only copy must survive");
     assert!(!e.locations(&id).unwrap().is_empty());
@@ -101,7 +101,7 @@ fn an_undeclared_root_is_never_drained() {
     let sroot = pvfs_core::storage::path_to_uri(&dir.path().join("staging")).unwrap();
     pvfs_core::sync::set_staging_root(e.data_dir(), &root, &sroot, false).unwrap();
 
-    let r = pvfs_core::sync::evict_pass(&mut e).unwrap();
+    let r = pvfs_core::sync::evict_pass(&mut e, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(r.evicted, 0, "no declaration, no draining");
     assert!(path.exists());
     e.close().unwrap();
@@ -118,7 +118,7 @@ fn a_replacement_at_the_same_path_is_never_evicted() {
     // the arr overwrites with a bigger encode
     std::fs::write(&path, b"a-much-larger-replacement-encode").unwrap();
 
-    let r = pvfs_core::sync::evict_pass(&mut e).unwrap();
+    let r = pvfs_core::sync::evict_pass(&mut e, &std::sync::atomic::AtomicBool::new(false)).unwrap();
     assert_eq!(r.evicted, 0, "size disagrees, so these are not the migrated bytes");
     assert!(path.exists(), "an uncatalogued upgrade must survive");
     e.close().unwrap();
