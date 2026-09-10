@@ -23,6 +23,11 @@ fn folder(e: &mut Engine, parent: &str, label: &str) -> String {
 fn replica_of(owner_dir: &std::path::Path, dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::copy(owner_dir.join("log.db"), dir.join("log.db")).unwrap();
+    for side in ["log.db-wal", "log.db-shm"] {
+        if owner_dir.join(side).exists() {
+            std::fs::copy(owner_dir.join(side), dir.join(side)).unwrap();
+        }
+    }
     ReplicaSource {
         transport: "tcp".into(),
         target: "192.0.2.1:7421".into(),
@@ -71,8 +76,11 @@ fn a_replica_is_promoted_with_the_phrase_and_the_old_writer_is_revoked() {
     again.close().unwrap();
 
     // A second promotion is refused: it is not a replica any more.
-    let err = Engine::promote(&b, &mn, 2, None).expect_err("already an owner");
-    assert!(err.to_string().contains("not a replica"), "{err}");
+    let err = match Engine::promote(&b, &mn, 2, None) {
+        Ok(_) => panic!("a second promotion must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("not a replica"), "{err}");
 }
 
 #[test]
