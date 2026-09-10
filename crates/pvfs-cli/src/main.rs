@@ -1200,6 +1200,13 @@ enum ViewCmd {
     /// Every conflicting path: two hashes at one path, or a file in one
     /// region against a folder in another
     Conflicts,
+    /// D127: for the draining regions THIS box owns, move losing or redundant
+    /// copies to that region's trash (doc 26 §7.3); library regions are never
+    /// touched. `--dry-run` says what would move.
+    Resolve {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1224,6 +1231,13 @@ enum RegionCmd {
     /// D125: a catalogue region's own index — one row per file and folder on
     /// disk under its root — and the last head it published
     Entries { target: String },
+    /// D127: declare a catalogue region draining (staging — its copies drain
+    /// into the library) or not. Fleet-visible. Prompts when omitted.
+    Drain {
+        target: String,
+        /// on | off
+        state: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1764,8 +1778,10 @@ fn view_state_str(s: &pvfs_core::ViewState) -> String {
     }
 }
 
-fn view_json(e: &pvfs_core::ViewEntry) -> serde_json::Value {
+fn view_json(e: &pvfs_core::ViewEntry, drains: &std::collections::HashMap<String, bool>) -> serde_json::Value {
+    let served = pvfs_core::Engine::served_copy(e, &pvfs_core::media::Rules::default()).map(|c| c.region.clone());
     serde_json::json!({
+        "served": served,
         "path": e.rel_path,
         "kind": e.kind,
         "size": e.size_bytes,
@@ -1780,7 +1796,8 @@ fn view_json(e: &pvfs_core::ViewEntry) -> serde_json::Value {
         "copies": e.copies,
         "sources": e.sources.iter().map(|c| serde_json::json!({
             "region": c.region, "kind": c.kind, "size": c.size_bytes,
-            "mtime_ms": c.mtime_ms, "hash": c.content_hash,
+            "mtime_ms": c.mtime_ms, "hash": c.content_hash, "quality": c.quality,
+            "drains": drains.get(&c.region).copied().unwrap_or(false),
         })).collect::<Vec<_>>(),
     })
 }
@@ -5848,14 +5865,57 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 })
             }
         }
+        Cmd::View(ViewCmd::Resolve { dry_run }) => {
+            let mut engine = Engine::open(&ctx?)?;
+            let rep = engine.resolve_conflicts(
+                &pvfs_core::media::Rules::default(),
+                dry_run,
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "dry_run": dry_run,
+                        "trashed": rep.trashed.iter().map(|(p, r)| serde_json::json!({"path": p, "region": r})).collect::<Vec<_>>(),
+                        "kept_winners": rep.kept_winners,
+                        "reported": rep.reported,
+                    })
+                );
+            } else {
+                let verb = if dry_run { "would trash" } else { "trashed" };
+                for (p, r) in &rep.trashed {
+                    println!("{verb}\t{p}\t(draining region {})", &r[..r.len().min(12)]);
+                }
+                for p in &rep.kept_winners {
+                    println!("kept\t{p}\t(the draining copy wins; the library's loser is not this box's)");
+                }
+                for p in &rep.reported {
+                    println!("report\t{p}\t(nothing here may act on it)");
+                }
+                if rep.trashed.is_empty() && rep.kept_winners.is_empty() && rep.reported.is_empty() {
+                    println!("nothing to resolve");
+                }
+            }
+            engine.close()
+        }
         Cmd::View(cmd) => {
             let engine = Engine::open(&ctx?)?;
             let entries = match &cmd {
                 ViewCmd::Ls { dir } => engine.merged_view(dir.as_deref().unwrap_or(""))?,
                 ViewCmd::Conflicts => engine.view_conflicts()?,
+                ViewCmd::Resolve { .. } => unreachable!("handled above"),
             };
             if json {
-                let items: Vec<serde_json::Value> = entries.iter().map(view_json).collect();
+                let drains: std::collections::HashMap<String, bool> = engine
+                    .regions()?
+                    .into_iter()
+                    .map(|(id, _, _)| {
+                        let d = engine.region_drains(&id).unwrap_or(false);
+                        (id, d)
+                    })
+                    .collect();
+                let items: Vec<serde_json::Value> = entries.iter().map(|e| view_json(e, &drains)).collect();
                 println!("{}", serde_json::Value::Array(items));
             } else {
                 for e in &entries {
@@ -5933,6 +5993,33 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     engine.close()
                 }
+                RegionCmd::Drain { target, state } => {
+                    let (mut engine, id) = engine_and_node(ctx, &target)?;
+                    let state = match state {
+                        Some(s) => s,
+                        None => prompt_line(
+                            "drain — on (staging: its copies drain into the library) or off (library)",
+                            Some("off"),
+                        )?,
+                    };
+                    let on = match state.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            return Err(PvfsError::BadInput {
+                                field: "state".into(),
+                                reason: format!("{other:?} — say on or off"),
+                            })
+                        }
+                    };
+                    engine.set_region_drain(&id, on)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"drains\":{on}}}");
+                    } else {
+                        println!("{id} {}", if on { "drains (staging)" } else { "is a library region" });
+                    }
+                    engine.close()
+                }
                 RegionCmd::Entries { target } => {
                     let (engine, id) = engine_and_node(ctx, &target)?;
                     if !engine.is_catalogue_region(&id)? {
@@ -5990,7 +6077,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         let rows: Vec<String> = regions
                             .iter()
                             .map(|(id, at, kind)| {
-                                format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\"}}")
+                                let drains = engine.region_drains(id).unwrap_or(false);
+                                format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\",\"drains\":{drains}}}")
                             })
                             .collect();
                         println!("[{}]", rows.join(","));
@@ -5998,7 +6086,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("no marked regions (the forest root is the implicit top region)");
                     } else {
                         for (id, _, kind) in &regions {
-                            println!("{id}\t{kind}");
+                            let drains = engine.region_drains(id).unwrap_or(false);
+                            println!("{id}\t{kind}{}", if drains { "\tdrains" } else { "" });
                         }
                     }
                     engine.close()
@@ -8060,7 +8149,7 @@ fn serve_status_print(
         crypto::sign_digest(&key, d).unwrap_or_default()
     })
     .map_err(remote_err)?;
-    let (runner, jobs) = client.serve_status().map_err(remote_err)?;
+    let (runner, jobs, conflicts) = client.serve_status_conflicts().map_err(remote_err)?;
     if json {
         let rows: Vec<String> = jobs
             .iter()
@@ -8079,12 +8168,15 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}]}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts}}}",
             json_escape(&runner),
             rows.join(",")
         );
     } else {
         println!("runner: {runner}");
+        if conflicts > 0 {
+            println!("conflicts: {conflicts}  (see `pvfs view conflicts`; D127)");
+        }
         for j in &jobs {
             let mut line = format!("{:<8} {}", j.name, j.state);
             if let Some(e) = &j.last_error {

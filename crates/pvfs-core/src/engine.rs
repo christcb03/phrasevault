@@ -1147,7 +1147,8 @@ impl Engine {
                 Event::RegionMarked { node_id, .. }
                 | Event::RegionUnmarked { node_id, .. }
                 | Event::RegionBaseline { node_id, .. }
-                | Event::SubRegionHead { node_id, .. } => self.enclosing_log(node_id)?,
+                | Event::SubRegionHead { node_id, .. }
+                | Event::RegionDrainSet { node_id, .. } => self.enclosing_log(node_id)?,
                 Event::NodeCreated(n) => self.resolve_region(&n.id, &batch_homes)?,
                 // A quality measurement is a fact about a NODE, so it routes
                 // with that node, exactly as its creation did.
@@ -4955,6 +4956,43 @@ impl Engine {
             .map_err(map_db("regions"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("regions"))
+    }
+
+    /// D127 — declare a catalogue region draining (staging: its copies drain
+    /// into the library) or not. Fleet-visible, in the log, under the same
+    /// admin rule as the mark, so every box agrees which copy is redundant.
+    pub fn set_region_drain(&mut self, region: &NodeId, drains: bool) -> Result<()> {
+        self.ensure_device_active()?;
+        if !self.is_catalogue_region(region)? {
+            return Err(bad("region", &format!("{region} is not a catalogue region")));
+        }
+        let t = now_ms();
+        let me = self.device.pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_region_drain_set(region, drains, t, &me),
+        )?;
+        self.append_durable(vec![Event::RegionDrainSet {
+            node_id: region.clone(),
+            drains,
+            at: t,
+            author: me,
+            sig,
+        }])
+    }
+
+    /// D127 — whether `region` drains (a staging region), per the log.
+    pub fn region_drains(&self, region: &str) -> Result<bool> {
+        let d: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT drains FROM regions WHERE node_id = ?1",
+                params![region],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region drains"))?;
+        Ok(d.unwrap_or(0) != 0)
     }
 
     /// D125 — whether `node` is the root of a catalogue region: one that

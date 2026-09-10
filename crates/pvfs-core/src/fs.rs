@@ -350,6 +350,22 @@ pub struct ViewCopy {
     pub size_bytes: u64,
     pub mtime_ms: u64,
     pub content_hash: Option<String>,
+    /// D76 encoding, when this region measured it (D127: the ladder's input).
+    pub quality: Option<String>,
+}
+
+/// D127 — what one resolution pass did (doc 26 §7.3). Paths, with the region
+/// whose copy was trashed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveReport {
+    /// Losing or redundant copies moved to their draining region's trash.
+    pub trashed: Vec<(String, NodeId)>,
+    /// Conflicts where the draining copy WON the ladder: it stays, and the
+    /// library's loser is not this box's to touch.
+    pub kept_winners: Vec<String>,
+    /// Conflicts nothing here may act on (library only, or a kind clash).
+    pub reported: Vec<String>,
+    pub cancelled: bool,
 }
 
 /// D126 — how the merged view admits a path (doc 26 §6): exactly one
@@ -1386,6 +1402,146 @@ impl Engine {
     /// D126 — every conflicting path in every catalogue region this box
     /// holds: what phase 4 resolves and what D83 is told about.
     pub fn view_conflicts(&self) -> Result<Vec<ViewEntry>> {
+        Ok(self
+            .view_paths()?
+            .into_iter()
+            .filter(|e| matches!(e.state, ViewState::ConflictHashes(_) | ViewState::ConflictKind))
+            .collect())
+    }
+
+    /// D127 — the served copy of a view entry (doc 26 §7.1): for an admitted
+    /// file the copies agree, so the first by region id; for a hash conflict
+    /// the D76 ladder over the hashed copies — quality where a region
+    /// measured it, else the size and recency rungs. Deterministic: same
+    /// inputs, same answer on every box. Directories, unhashed and kind
+    /// conflicts serve nothing.
+    pub fn served_copy<'a>(entry: &'a ViewEntry, rules: &crate::media::Rules) -> Option<&'a ViewCopy> {
+        if entry.kind == "dir" {
+            return None;
+        }
+        let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
+        match &entry.state {
+            ViewState::Admitted => hashed.first().copied(),
+            ViewState::ConflictHashes(_) => {
+                let cand = |c: &ViewCopy| crate::media::Candidate {
+                    label: format!("{}@{}", entry.rel_path, &c.region[..c.region.len().min(8)]),
+                    quality: c
+                        .quality
+                        .as_deref()
+                        .and_then(|q| crate::media::MediaQuality::decode(q).ok())
+                        .unwrap_or_default(),
+                    size_bytes: c.size_bytes,
+                    mtime_ms: c.mtime_ms,
+                    integrity_ok: true,
+                };
+                let mut best = *hashed.first()?;
+                for c in hashed.iter().skip(1) {
+                    let (best_wins, _) = crate::media::choose(&cand(best), &cand(c), rules);
+                    if !best_wins {
+                        best = c;
+                    }
+                }
+                Some(best)
+            }
+            ViewState::Unhashed | ViewState::ConflictKind => None,
+        }
+    }
+
+    /// D127 — resolve what this box may (doc 26 §7.3): for every path whose
+    /// copies include one in a **draining region this box owns**, trash that
+    /// copy when the library already has the bytes (agreeing hashes) or the
+    /// ladder picked a library copy over it. A draining copy that wins stays;
+    /// two draining copies with no library copy stay (nothing to drain into);
+    /// nothing on a library region is ever touched. The region's next scan
+    /// drops the row and publishes a new head, and the view resolves itself.
+    pub fn resolve_conflicts(
+        &mut self,
+        rules: &crate::media::Rules,
+        dry_run: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ResolveReport> {
+        let mut report = ResolveReport::default();
+        // The catalogue regions THIS box owns: a local binding on their root.
+        let mut mine: HashMap<NodeId, PathBuf> = HashMap::new();
+        for b in self.local_bindings()? {
+            if self.is_catalogue_region(&b.folder_id)? {
+                mine.insert(b.folder_id.clone(), uri_to_path(&b.source_uri)?);
+            }
+        }
+        if mine.is_empty() {
+            return Ok(report);
+        }
+        let drains: HashMap<NodeId, bool> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT node_id, drains FROM regions WHERE kind = 'catalogue'")
+                .map_err(map_db("region drains"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
+                .map_err(map_db("region drains"))?;
+            rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+                .map_err(map_db("region drains"))?
+        };
+        let draining = |region: &str| drains.get(region).copied().unwrap_or(false);
+        for entry in self.view_paths()? {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                report.cancelled = true;
+                break;
+            }
+            if entry.kind == "dir" {
+                continue;
+            }
+            let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
+            let library_has_it = hashed.iter().any(|c| !draining(&c.region));
+            let trash = |c: &ViewCopy, report: &mut ResolveReport| -> Result<()> {
+                let root = &mine[&c.region];
+                if !dry_run {
+                    crate::sync::move_to_trash(root, &root.join(&entry.rel_path))?;
+                }
+                report.trashed.push((entry.rel_path.clone(), c.region.clone()));
+                Ok(())
+            };
+            match &entry.state {
+                ViewState::Admitted if hashed.len() >= 2 && library_has_it => {
+                    for c in &hashed {
+                        if mine.contains_key(&c.region) && draining(&c.region) {
+                            trash(c, &mut report)?;
+                        }
+                    }
+                }
+                ViewState::ConflictHashes(_) => {
+                    let Some(winner) = Self::served_copy(&entry, rules) else {
+                        continue;
+                    };
+                    let winner = winner.clone();
+                    let mut acted = false;
+                    for c in &hashed {
+                        if c.region == winner.region || !mine.contains_key(&c.region) || !draining(&c.region) {
+                            continue;
+                        }
+                        if !draining(&winner.region) {
+                            trash(c, &mut report)?;
+                            acted = true;
+                        }
+                    }
+                    if draining(&winner.region) && mine.contains_key(&winner.region) {
+                        report.kept_winners.push(entry.rel_path.clone());
+                        acted = true;
+                    }
+                    if !acted {
+                        report.reported.push(entry.rel_path.clone());
+                    }
+                }
+                ViewState::ConflictKind => report.reported.push(entry.rel_path.clone()),
+                _ => {}
+            }
+        }
+        Ok(report)
+    }
+
+    /// D126/D127 — every path in every catalogue region this box holds, all
+    /// levels, merged.
+    pub fn view_paths(&self) -> Result<Vec<ViewEntry>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1411,10 +1567,7 @@ impl Engine {
             .map_err(map_db("view conflicts"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("view conflicts"))?;
-        Ok(Self::merge_rows(rows)
-            .into_iter()
-            .filter(|e| matches!(e.state, ViewState::ConflictHashes(_) | ViewState::ConflictKind))
-            .collect())
+        Ok(Self::merge_rows(rows))
     }
 
     /// The admission rule (doc 26 §6), over rows sorted by path then region.
@@ -1432,12 +1585,13 @@ impl Engine {
             let rel_path = group[0].1.clone();
             let sources: Vec<ViewCopy> = group
                 .iter()
-                .map(|(region, _, kind, size, mtime, hash, _)| ViewCopy {
+                .map(|(region, _, kind, size, mtime, hash, q)| ViewCopy {
                     region: region.clone(),
                     kind: kind.clone(),
                     size_bytes: *size,
                     mtime_ms: *mtime,
                     content_hash: hash.clone(),
+                    quality: q.clone(),
                 })
                 .collect();
             let quality = group.iter().find_map(|(.., q)| q.clone());

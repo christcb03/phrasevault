@@ -275,6 +275,18 @@ impl Daemon {
         self.engine.lock().unwrap().commit_region_heads()
     }
 
+    /// D127 — conflicting paths in the merged view this box holds, for
+    /// `serve status`. Best-effort: a lookup error reads as 0, and the CLI
+    /// says so itself when asked directly.
+    pub fn view_conflict_count(&self) -> u64 {
+        self.engine
+            .lock()
+            .unwrap()
+            .view_conflicts()
+            .map(|v| v.len() as u64)
+            .unwrap_or(0)
+    }
+
     /// Check out an engine for a **read**: round-robin over the read pool, so
     /// up to `READ_POOL` metadata reads run concurrently (plus writes on the
     /// writer). Falls back to the writer lock when the pool is empty.
@@ -536,10 +548,12 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                     Some(j) => ServerMsg::ServeJobs {
                         runner: "on".into(),
                         jobs: j.snapshot(),
+                        conflicts: daemon.view_conflict_count(),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
+                        conflicts: daemon.view_conflict_count(),
                     },
                 }
             }
