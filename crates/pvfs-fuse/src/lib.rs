@@ -66,7 +66,7 @@ impl PvfsFs {
     pub fn new(data_dir: &Path, target: &NodeId) -> Result<PvfsFs, PvfsError> {
         let engine = Engine::open(data_dir)?;
         let engine_is_replica = engine.is_replica();
-        let fetcher = Fetcher::new(data_dir);
+        let fetcher = Fetcher::with_memory(&engine, data_dir);
         let mut fs = PvfsFs {
             engine,
             fetcher,

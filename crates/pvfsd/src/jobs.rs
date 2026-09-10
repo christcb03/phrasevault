@@ -400,26 +400,16 @@ fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsErro
         return Ok((0, Vec::new()));
     }
     let mut engine = pvfs_core::Engine::open(&data_dir)?;
-    let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
     // D102 — `sync` gets the SAME memory `tier` has. It never did: this
     // Fetcher was built bare, so D98's "stop asking a question already
     // answered nowhere" did not apply to it. Enabling `sync` on the
     // production holder brought the whole not_found retry storm straight back
     // through a job that had never been given the fix — the sibling-gap shape
-    // this project keeps finding. Shared durably via `fetch_unfetchable`
-    // (D99), so the two jobs teach each other and both survive a restart.
-    let known = engine.unfetchable_load().unwrap_or_default();
-    fetcher.seed_unfetchable(known.iter().cloned());
+    // this project keeps finding. D122: one constructor carries it, so the
+    // next sibling cannot miss it.
+    let mut fetcher = pvfs_client::fetch::Fetcher::with_memory(&engine, &data_dir);
     let r = pvfs_client::fetch::sync_pull(&mut engine, &mut fetcher, &roots);
-    let learned: Vec<String> = fetcher
-        .unfetchable()
-        .iter()
-        .filter(|id| !known.contains(*id))
-        .cloned()
-        .collect();
-    if !learned.is_empty() {
-        let _ = engine.unfetchable_save(&learned);
-    }
+    fetcher.persist_learned(&engine);
     let is_replica = engine.is_replica();
     engine.close()?;
     // F5.5: advertise fetched copies for `sync --advertise` subtrees — the
@@ -448,7 +438,8 @@ fn export_pass(state: &JobsState) -> Result<u64, PvfsError> {
     let mut exported = 0u64;
     for e in &entries {
         if e.fetch {
-            let f = fetcher.get_or_insert_with(|| pvfs_client::fetch::Fetcher::new(&data_dir));
+            let f = fetcher
+                .get_or_insert_with(|| pvfs_client::fetch::Fetcher::with_memory(&engine, &data_dir));
             // per-file fetch failures are the export's skips, not a pass error
             let _ = pvfs_client::fetch::sync_pull(&mut engine, f, std::slice::from_ref(&e.node));
         }
@@ -533,24 +524,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     );
                 }
                 let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
-                // Persist only what THIS pass newly learned: the fetcher's set
-                // includes everything it was seeded with, and rewriting all of
-                // it every five minutes would be thousands of pointless writes.
-                let learned: Vec<String> = {
-                    let mut mem = st.tier_unfetchable.lock().unwrap();
-                    let fresh: Vec<String> = fetcher
-                        .unfetchable()
-                        .iter()
-                        .filter(|id| !mem.contains(*id))
-                        .cloned()
-                        .collect();
-                    mem.extend(fresh.iter().cloned());
-                    fresh
-                };
-                if !learned.is_empty() {
-                    // best-effort: losing the hint costs time, never truth
-                    let _ = engine.unfetchable_save(&learned);
-                }
+                // Persist only what THIS pass newly learned (D122: the fetcher
+                // knows what it was seeded with), and carry it in the job's
+                // own memory for the passes until the next amnesia.
+                let learned = fetcher.persist_learned(&engine);
+                st.tier_unfetchable.lock().unwrap().extend(learned);
                 engine.close()?;
                 r
             })();

@@ -1211,7 +1211,9 @@ pub fn evict_pass(engine: &mut Engine) -> Result<EvictReport> {
         // check below was added for, arriving by a different door — and D99
         // creates these quarantines where previously there were none, so the
         // door only opened once the mover started recording what it found.
-        let banned = engine.quarantined_uris(&id).unwrap_or_default();
+        // D122 — fail closed: a DB error here must not read as "nothing is
+        // quarantined", which is the one answer that lets eviction proceed.
+        let banned = engine.quarantined_uris(&id)?;
         let live_elsewhere = engine.locations(&id)?.iter().any(|u| {
             u != &uri && !u.starts_with(SYNC_URI_PREFIX) && !banned.contains(u)
         });

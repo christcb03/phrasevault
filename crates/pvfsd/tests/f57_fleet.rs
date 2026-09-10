@@ -127,7 +127,7 @@ fn fleet_teaches_new_members_the_holders() {
     // …and the fetcher resolves the holder with NO registry entry: the
     // catalog-taught candidate first, then the replica source fallback.
     let mut fetcher = Fetcher::new(&data_dir);
-    let cands = fetcher.candidates(&replica, &file);
+    let cands = fetcher.candidates(&replica, &file).unwrap();
     assert!(
         cands
             .iter()
@@ -144,7 +144,7 @@ fn fleet_teaches_new_members_the_holders() {
     )
     .unwrap();
     let mut fetcher2 = Fetcher::new(&data_dir);
-    let cands2 = fetcher2.candidates(&replica, &file);
+    let cands2 = fetcher2.candidates(&replica, &file).unwrap();
     assert!(
         cands2.iter().any(|c| c.target == "192.168.9.9:1111" && c.pin == holder_pin),
         "registry overrides the catalog: {:?}",
