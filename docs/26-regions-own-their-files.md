@@ -288,7 +288,15 @@ Admission by hash agreement. Conflict detection. Directory entries unioned.
 bytes; assert one entry per path, the right copies admitted, the conflict
 flagged.
 
-**Phase 4 — resolution.** Ladder-based serving winner; drain behaviour; the
+**Phase 4 — resolution. BUILT (PVOS D127).** `served_copy` (the D76 ladder
+over a conflict's hashed copies), `region drain on|off` (a fleet-visible
+`RegionDrainSet` in the log — a local flag would have let two draining boxes
+trash each other's bytes), `resolve_conflicts` / `pvfs view resolve` (a
+draining region's redundant or losing copy goes to that region's trash;
+library regions are never touched; a winning draining copy stays and is
+reported), a `resolve` serve job, and `conflicts: N` in `serve status`.
+Retention (§7.4) and the push to D83 stay open. The original spec follows.
+Ladder-based serving winner; drain behaviour; the
 retention policy. *Testable alone:* every cell of the §7.3 table.
 
 **Phase 5 — replication.** Fetch-and-verify a region's catalogue by its signed
