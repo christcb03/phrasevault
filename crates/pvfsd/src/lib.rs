@@ -1904,6 +1904,8 @@ fn write_target(op: &WriteOp) -> Option<&str> {
         | WriteOp::Mv { node: _, new_parent: node } => Some(node),
         WriteOp::AddLocation { file, .. } => Some(file),
         WriteOp::CommitRegionHead { region, .. } => Some(region),
+        WriteOp::Purge { ids } => ids.first().map(String::as_str),
+        WriteOp::SetQuality { node, .. } => Some(node),
         _ => None,
     }
 }
@@ -2090,6 +2092,15 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u
             WriteOp::CommitRegionHead { region, seq, hash } => {
                 e.prepare_commit_region_head(&author, &region, seq, &hash)
             }
+            WriteOp::Purge { ids } => e.prepare_purge(&author, &ids),
+            WriteOp::SetQuality {
+                node,
+                quality,
+                source,
+            } => match pvfs_core::media::MediaQuality::decode(&quality) {
+                Ok(q) => e.prepare_set_quality(&author, &node, &q, &source),
+                Err(err) => Err(err),
+            },
             WriteOp::TagMember {
                 member,
                 tag,

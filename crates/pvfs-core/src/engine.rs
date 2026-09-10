@@ -5190,6 +5190,149 @@ impl Engine {
         })
     }
 
+    /// Phase 1 of a routed purge (D124 item 7): the same checks `purge` makes
+    /// — the node exists, is not a temp node, encloses no region boundary and
+    /// has no active inbound link — plus admin (`a`) on it for `author_pub`,
+    /// which is what the fold requires of a `NodePurged`. The events are the
+    /// ones `purge` writes: a `LinkRemoved` per outbound link, then the purge.
+    /// A node with temp children is refused here: the temp cascade is local
+    /// to the owner's spool and cannot be expressed as a routed write.
+    pub fn prepare_purge(&self, author_pub: &[u8], ids: &[NodeId]) -> Result<PreparedWrite> {
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        let t = now_ms();
+        let mut events = Vec::new();
+        for id in ids {
+            let n = fetch_node(&self.conn, id)?.ok_or(PvfsError::NotFound {
+                kind: "node",
+                id: id.clone(),
+            })?;
+            if n.is_temp {
+                return Err(bad("purge", "a temp node is purged on the owner, not through it"));
+            }
+            if projection::effective_rights(&self.conn, &who, id)? & crate::acl::ACL_A == 0 {
+                return Err(PvfsError::Forbidden {
+                    action: "purge".into(),
+                    reason: format!("you lack admin (a) on {id}"),
+                });
+            }
+            let marked_inside: Option<String> = self
+                .conn
+                .query_row(
+                    "WITH RECURSIVE sub(nid) AS (
+                       SELECT ?1
+                       UNION
+                       SELECT l.child_id FROM links l JOIN sub s ON l.parent_id = s.nid
+                       WHERE l.link_type = ?2 AND l.removed_at IS NULL
+                     )
+                     SELECT r.node_id FROM regions r JOIN sub s ON r.node_id = s.nid LIMIT 1",
+                    params![id, LINK_CONTAINS],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("purge region check"))?;
+            if let Some(region) = marked_inside {
+                return Err(bad(
+                    "purge",
+                    &format!("subtree contains region boundary {region} — unmark it first (doc 20 §2.3)"),
+                ));
+            }
+            let inbound = active_inbound_count(&self.conn, id)?;
+            if inbound > 0 {
+                return Err(PvfsError::NotOrphan {
+                    id: id.clone(),
+                    active_inbound: inbound,
+                });
+            }
+            let temp_children: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM temp_links WHERE parent_id = ?1 AND removed_at IS NULL",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(map_db("purge temp outbound"))?;
+            if temp_children > 0 {
+                return Err(bad(
+                    "purge",
+                    &format!("{id} has {temp_children} temp child(ren); purge it on the owner"),
+                ));
+            }
+            let outbound: Vec<String> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM links WHERE parent_id = ?1 AND removed_at IS NULL")
+                    .map_err(map_db("purge outbound"))?;
+                let rows = stmt
+                    .query_map(params![id], |r| r.get::<_, String>(0))
+                    .map_err(map_db("purge outbound"))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(map_db("purge outbound"))?
+            };
+            for link_id in outbound {
+                events.push(PreparedEvent {
+                    digest: event::msg_link_removed(&link_id, t, author_pub),
+                    event: Event::LinkRemoved {
+                        link_id,
+                        removed_at: t,
+                        removed_by: author_pub.to_vec(),
+                        removal_sig: Vec::new(),
+                    },
+                });
+            }
+            events.push(PreparedEvent {
+                digest: event::msg_node_purged(id, t, author_pub),
+                event: Event::NodePurged {
+                    node_id: id.clone(),
+                    purged_at: t,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            });
+        }
+        Ok(PreparedWrite {
+            result_id: ids.last().cloned().unwrap_or_default(),
+            events,
+        })
+    }
+
+    /// Phase 1 of a routed quality record (D124 item 7): write (`w`) on the
+    /// node, as the fold requires of a `MediaQuality`.
+    pub fn prepare_set_quality(
+        &self,
+        author_pub: &[u8],
+        node: &NodeId,
+        quality: &crate::media::MediaQuality,
+        source: &str,
+    ) -> Result<PreparedWrite> {
+        if fetch_node(&self.conn, node)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: node.clone(),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, node)? & crate::acl::ACL_W == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "record quality".into(),
+                reason: format!("you lack write (w) on {node}"),
+            });
+        }
+        let encoded = quality.encode();
+        Ok(PreparedWrite {
+            result_id: node.clone(),
+            events: vec![PreparedEvent {
+                digest: event::msg_media_quality(node, &encoded, source, author_pub),
+                event: Event::MediaQuality {
+                    node_id: node.clone(),
+                    quality: encoded,
+                    source: source.to_string(),
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
     /// Phase 1: build an unsigned `MemberTagged`. Per-key tags (doc 10 §4): any
     /// authorized member may assign a tag under its own authority, so the author need
     /// only be an active member (not an admin). Re-checked on commit/replay.

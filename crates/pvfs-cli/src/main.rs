@@ -2772,8 +2772,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             if !codec.is_empty() {
                 q.video_codec = codec;
             }
-            engine.set_media_quality(&node, &q, &source)?;
-            engine.close()?;
+            // D124 item 7 — a replica routes through the owner, like `mv`.
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client
+                    .set_quality(&node, &q.encode(), &source, |d| sign(d))
+                    .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.set_media_quality(&node, &q, &source)?;
+                engine.close()?;
+            }
             println!("recorded [{source}] {}x{}", q.width, q.height);
             Ok(())
         }
@@ -3854,13 +3865,24 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 });
             }
             let mut engine = Engine::open(&ctx?)?;
-            engine.purge(&ids)?;
+            // D124 item 7 — a replica routes through the owner, like `mv`.
+            // Before this it called the engine and was refused as read-only.
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client.purge(&ids, |d| sign(d)).map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.purge(&ids)?;
+                engine.close()?;
+            }
             if json {
                 println!("{{\"purged\":{}}}", ids.len());
             } else {
                 println!("purged {} node(s)", ids.len());
             }
-            engine.close()
+            Ok(())
         }
         Cmd::Device(dev) => {
             let state_dir = ctx?;
