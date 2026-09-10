@@ -274,7 +274,15 @@ catalogue region holds rows, never nodes: it is marked once, on an empty
 folder, and refuses unmark and re-mark. *Still to run:* the two-box lab pair
 (D125 item 9), the milestone's exit criterion.
 
-**Phase 3 — the merged view.** Union region catalogues by relative path.
+**Phase 3 — the merged view. BUILT (PVOS D126).** `merged_view(dir)` and
+`view_conflicts()` union every catalogue region's rows by relative path, one
+level at a time in the manifest's bytewise order; a path is `Admitted` when
+every known hash agrees (copies = hashed copies), `Unhashed` when none is,
+`ConflictHashes`/`ConflictKind` otherwise — never merged, nothing deleted.
+`pvfs view ls [dir]` / `pvfs view conflicts`. What phase 4 receives: the
+conflict entries, each carrying every copy (region, size, mtime, hash) and,
+for now, the newest copy as the description. The original spec follows.
+Union region catalogues by relative path.
 Admission by hash agreement. Conflict detection. Directory entries unioned.
 *Testable alone:* two regions, overlapping paths, identical and differing
 bytes; assert one entry per path, the right copies admitted, the conflict
