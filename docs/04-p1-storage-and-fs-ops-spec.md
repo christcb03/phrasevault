@@ -15,7 +15,7 @@ On top of the P0 kernel (`pvfs-core`):
 - **`scan`** — index a real directory into a tree (file nodes as pointers + location events; PVFS copies nothing).
 - **`stat`** — node metadata joined with live backend info.
 - **`cat`** — stream a file node's bytes, with **read-path integrity verification**.
-- **`hash`** — compute/fill a file node's lazy `content_hash`.
+- **`hash`** — compute/fill a file node's missing `content_hash`.
 - **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes the location, and takes the node out of the tree too once the file is held nowhere for a day (§11 item 4; design doc §8.5).
 - **`pvfs serve`** — minimal daemon: filesystem watcher + scheduled reconciliation. No HTTP (that's P3). *(Since P5, doc 18: `pvfs serve` is the job supervisor; the P1 watcher lives on as the `watch` job.)*
 - **Managed temp spool** — `<data_dir>/tmp/`, with the startup cleanup sweep (design doc §6.3).
@@ -57,7 +57,7 @@ Binding descriptor fields:
 | `recursive` | bool | descend subdirectories (default true) |
 | `auto_index` | bool | watcher/reconciliation act on it (default true) |
 | `extensions` | string | comma-list filter, `""` = all (e.g. `"mkv,mp4,srt"`) |
-| `hash_policy` | string | `lazy` (default) \| `on_add` \| `never` |
+| `hash_policy` | string | `on_add` (default since D94) \| `never` — `lazy` was removed in D94 and is refused at bind |
 | `on_disk_delete` | string | `soft` (only value in P1) |
 
 > **Decided — bindings are events** (supersedes design doc §8.5's
@@ -298,12 +298,12 @@ mutable events, root-or-device authored, replicated.
 
 ```
 pvfs bind <folder-id> <dir> [--no-recursive] [--no-auto-index]
-                            [--extensions mkv,mp4] [--hash-policy lazy|on_add|never]
+                            [--extensions mkv,mp4] [--hash-policy on_add|never]
 pvfs unbind <folder-id>
 pvfs scan [<folder-id>]        # all bound folders if omitted
 pvfs stat <node-id>            # node + locations + availability + quarantine
 pvfs cat <node-id> [--range A-B] [-o FILE]
-pvfs hash <node-id>            # fill lazy content_hash
+pvfs hash <node-id>            # fill a missing content_hash (a `never` binding, or pre-D94 nodes)
 pvfs loc verify <file-id>      # re-check quarantined/all locations
 pvfs changes                   # list nodes flagged invalid: changed-on-disk
 pvfs resolve <node-id> --replace | --delete [--purge]   # operator decision (§4.4)
@@ -351,7 +351,7 @@ location) maps to exit 3 (not-found family).
    (hash mismatch) ⇒ error + quarantine per [OPEN-3]; quarantined location
    skipped on next read; `loc verify` lifts quarantine after repair; range
    reads work and skip verification.
-7. **Lazy hashing** — `hash_policy` honored; `pvfs hash` fills and persists.
+7. **Hash policy** — `on_add` hashes at bind/scan; `never` leaves nodes unhashed and `pvfs hash` fills and persists; `lazy` is refused (D94).
 8. **Watcher** — create/modify/delete on disk reflected while `serve` runs;
    debounce coalesces bursts; events while daemon stopped are caught by the
    startup reconciliation.

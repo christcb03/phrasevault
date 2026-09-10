@@ -38,10 +38,12 @@ Stages (also usable as `--tags`):
 
 | Tag | What it does |
 |---|---|
-| `prepare` | apt build deps + rustup (stable, minimal profile) |
+| `prepare` | apt build deps + rustup pinned to **1.96.0** (matches CI; minimal profile) — installed only when cargo is absent; an existing host keeps whatever toolchain it has (doc 26, D124) |
 | `deploy` | rsync the repo to `/opt/pvfs/src` — or `/opt/pvfs-<session>/src`, see above (excludes `.git`, `old/`, `v0.0-concept/`, `target/`, `.claude/`) |
 | `build` | `cargo build --release --workspace` |
 | `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure** |
+| `lint` | `cargo clippy --all-targets --workspace -- -D warnings` (D121; also runs under `test`) |
+| `reap` | delete `/opt/pvfs-<session>` slots idle for 2+ days, never this run's or `/opt/pvfs` (D121; also runs under `report`) |
 | `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts |
 | `install` | copy the release binary to `/usr/local/bin/pvfs` |
 | `daemon` | run `pvfsd` as a **systemd user service** (INSTALL.md Option C, automated): installs `pvfs`/`pvfsd`/`pvfs-companion` to `~/.local/bin`, the `pvfsd@` user unit + `/run/pvfs` tmpfiles snippet, inits a test forest at `~/pvfs-mounts/smoke`, then proves the lifecycle — enable → client answers over `/run/pvfs` → clean stop (socket removed) → restart. **Leaves the service enabled + running** as a standing daemon testbed |
@@ -63,7 +65,8 @@ ansible-playbook -i inventory.ini pipeline.yml --tags daemon,report
 
 - The smoke suite creates its forest under `mktemp -d` and cleans up after
   itself; it never touches an existing data dir.
-- The pipeline is idempotent: rustup is only installed if missing, rsync only
+- The pipeline is idempotent: rustup is only installed if missing (and never
+  upgraded or re-pinned — see doc 26), rsync only
   ships changes, and install always reflects the binary that passed the tests
   in this run (tests run before install).
 - The `daemon` stage's test forest (`~/pvfs-mounts/smoke`) is disposable — its
