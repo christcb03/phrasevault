@@ -940,6 +940,82 @@ impl Engine {
         Ok(engine)
     }
 
+    /// D128 — every device certificate the log carries: `(pubkey hex,
+    /// device index, authorized_at, revoked_at)`, in index order.
+    pub fn devices(&self) -> Result<Vec<(String, u64, u64, Option<u64>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT device_pubkey, device_index, authorized_at, revoked_at
+                   FROM device_keys ORDER BY device_index, authorized_at",
+            )
+            .map_err(map_db("devices"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    hex::encode(r.get::<_, Vec<u8>>(0)?),
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                ))
+            })
+            .map_err(map_db("devices"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("devices"))
+    }
+
+    /// D128 — promote a REPLICA data dir to the forest's writer, once and
+    /// explicitly, with the recovery phrase (doc 03 §6 Q3, doc 20's standby
+    /// note: never automatic). The replica already holds the whole verified
+    /// log; what changes is who may append to it:
+    ///
+    /// 1. the replica marker (which carries the old owner's address and pin)
+    ///    is kept as `promoted-from` — the runbook's evidence — and removed;
+    /// 2. [`Engine::recover`] derives device `device_index` from the phrase
+    ///    and appends its root-signed `DeviceAuthorized` at the log's tip;
+    /// 3. `revoke`, when given (the old owner's device), gets a root-signed
+    ///    `DeviceRevoked`, so a forgotten daemon there can never append again.
+    ///
+    /// Whether the old owner is DOWN is the caller's check (it needs the
+    /// network); two writers must never coexist.
+    pub fn promote(
+        data_dir: &Path,
+        mnemonic: &Mnemonic,
+        device_index: u64,
+        revoke: Option<&[u8]>,
+    ) -> Result<Engine> {
+        let marker = crate::replica::marker_path(data_dir);
+        if !marker.exists() {
+            return Err(bad(
+                "promote",
+                &format!("{} is not a replica (no marker) — already an owner?", data_dir.display()),
+            ));
+        }
+        crate::replica::ReplicaSource::load(data_dir)?; // a marker we understand
+        if probe_other_writers(data_dir) {
+            return Err(bad(
+                "promote",
+                "another process holds this replica open (pvfsd?) — stop it first",
+            ));
+        }
+        let kept = data_dir.join("promoted-from");
+        std::fs::rename(&marker, &kept).map_err(|e| PvfsError::io("keep replica marker", e))?;
+        let mut engine = match Engine::recover(data_dir, mnemonic, device_index) {
+            Ok(e) => e,
+            Err(e) => {
+                // Put the marker back: a failed promotion leaves a replica.
+                let _ = std::fs::rename(&kept, &marker);
+                return Err(e);
+            }
+        };
+        if let Some(old) = revoke {
+            if old != engine.device.pubkey().as_slice() {
+                engine.revoke_device(mnemonic, old)?;
+            }
+        }
+        Ok(engine)
+    }
+
     /// Graceful close — sets the clean-shutdown flag (spec §9.3).
     pub fn close(mut self) -> Result<()> {
         // P7.2a: leave every region head attested at rest (doc 20 §2.3).

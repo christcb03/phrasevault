@@ -805,6 +805,30 @@ enum ForestCmd {
         #[arg(long)]
         alias: Option<String>,
     },
+    /// D128 — make this REPLICA the forest's owner (its one writer), with
+    /// the recovery phrase. Never automatic: two writers must never coexist,
+    /// so it refuses while the recorded owner still answers. Stop pvfsd on
+    /// both boxes first; afterwards start pvfsd here with --listen and
+    /// re-point the fleet (`pvfs replica repoint`, or the fleet play).
+    Promote {
+        /// The replica's mount directory
+        mount: PathBuf,
+        /// Device index for this box's key (must differ from the old
+        /// owner's, whose key is revoked; the box that ran `forest init` is 0)
+        #[arg(long, default_value_t = 1)]
+        device_index: u64,
+        /// Old owner's device pubkey (hex) to revoke. Default: the forest's
+        /// device 0, the one `forest init` created.
+        #[arg(long)]
+        revoke: Option<String>,
+        /// Revoke nothing (the old device stays authorized — only when it
+        /// really is destroyed, e.g. the box is gone with its key)
+        #[arg(long, conflicts_with = "revoke")]
+        keep_old_device: bool,
+        /// Promote even though the recorded owner's address still answers
+        #[arg(long)]
+        force: bool,
+    },
     /// Remove a forest from the registry (never deletes .pvfs/)
     Unregister { name: String },
     /// D104 — carry MediaQuality from a previous forest onto this one, matched
@@ -1167,6 +1191,26 @@ enum ReplicaCmd {
     /// Follow the source live (F5.4): long-poll for new events, ingest and
     /// fold them within seconds, reconnect on failure. Runs until killed.
     Follow { mount: PathBuf },
+    /// D128 — follow a different source from now on: the owner moved
+    /// (`pvfs forest promote` on another box). Keeps the region scope,
+    /// checks the new source is the same forest, then rewrites the marker.
+    /// Restart pvfsd afterwards — its follow job read the marker at start.
+    Repoint {
+        /// The replica's mount directory
+        mount: PathBuf,
+        /// A named instance from `pvfs instance add`
+        #[arg(long)]
+        instance: Option<String>,
+        /// Network address of a `pvfsd --listen` daemon (host:port); needs --pin
+        #[arg(long, conflicts_with = "instance")]
+        connect: Option<String>,
+        /// The server's transport pin (with --connect)
+        #[arg(long, requires = "connect")]
+        pin: Option<String>,
+        /// A local daemon socket (same-host replication)
+        #[arg(long, conflicts_with_all = ["instance", "connect", "pin"])]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1425,6 +1469,23 @@ fn resolve_replica_dial(
         reason: "pass --instance <name>, --connect <host:port> --pin <hex>, or --socket <path>"
             .into(),
     })
+}
+
+/// D128 — does anything answer at a replica source's address? A TCP accept
+/// (or a present socket file) is enough to refuse a promotion: it errs
+/// toward "the old owner is still up", which is the safe direction.
+fn source_answers(src: &pvfs_core::ReplicaSource) -> bool {
+    use std::net::ToSocketAddrs;
+    match src.transport.as_str() {
+        "tcp" => src
+            .target
+            .to_socket_addrs()
+            .ok()
+            .into_iter()
+            .flatten()
+            .any(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(3)).is_ok()),
+        _ => Path::new(&src.target).exists(),
+    }
 }
 
 /// Dial a replica source as the client identity (log shipping is gated on
@@ -5773,6 +5834,45 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
                 Ok(())
             }
+            ReplicaCmd::Repoint {
+                mount,
+                instance,
+                connect,
+                pin,
+                socket,
+            } => {
+                let data_dir = mount.join(".pvfs");
+                let old = pvfs_core::ReplicaSource::load(&data_dir)?;
+                let mut dial = resolve_replica_dial(instance, connect, pin, socket)?;
+                dial.region = old.region.clone();
+                // The same forest, or nothing: a wrong address would make the
+                // follow job ship a foreign log into this projection.
+                let (_, ours) = pvfs_core::ReplicaStore::open(&data_dir)?.identity()?;
+                let mut client = replica_client(&dial)?;
+                let info = client.info().map_err(remote_err)?;
+                if info.forest_id != ours {
+                    return Err(PvfsError::BadInput {
+                        field: "repoint".into(),
+                        reason: format!(
+                            "{} serves forest {} but this replica is of {}",
+                            dial.target, info.forest_id, ours
+                        ),
+                    });
+                }
+                dial.save(&data_dir)?;
+                if json {
+                    println!(
+                        "{{\"repointed\":true,\"mount\":\"{}\",\"from\":\"{}\",\"to\":\"{}\"}}",
+                        json_escape(&mount.to_string_lossy()),
+                        json_escape(&old.target),
+                        json_escape(&dial.target),
+                    );
+                } else {
+                    println!("{}: now following {} (was {})", mount.display(), dial.target, old.target);
+                    println!("restart pvfsd here so its follow job picks the new source up.");
+                }
+                Ok(())
+            }
             ReplicaCmd::Follow { mount } => {
                 // The loop itself is shared with pvfsd's `follow` job (P5.1,
                 // doc 18 §5) — this command is the ad-hoc, foreground driver.
@@ -7844,6 +7944,98 @@ fn forest_cmd(
                     f.mount.display(),
                     f.alias.as_deref().unwrap_or("no alias")
                 );
+            }
+            Ok(())
+        }
+        ForestCmd::Promote {
+            mount,
+            device_index,
+            revoke,
+            keep_old_device,
+            force,
+        } => {
+            let data_dir = mount.join(".pvfs");
+            let src = pvfs_core::ReplicaSource::load(&data_dir)?;
+            if !force && source_answers(&src) {
+                return Err(PvfsError::BadInput {
+                    field: "promote".into(),
+                    reason: format!(
+                        "the recorded owner at {} still answers — stop pvfsd there first \
+                         (two writers must never coexist), or pass --force if that address \
+                         now belongs to something else",
+                        src.target
+                    ),
+                });
+            }
+            // The forest's devices, so the operator sees what is being
+            // decided: the index this box takes must be unused (a taken
+            // index would make it share another device's key), and the
+            // default revocation is device 0, the one `forest init` made.
+            let devs = {
+                let ro = Engine::open(&data_dir)?;
+                let d = ro.devices()?;
+                ro.close()?;
+                d
+            };
+            if !json {
+                println!("devices of this forest:");
+                for (pk, idx, _, revoked) in &devs {
+                    println!(
+                        "  {idx:>3}  {pk}  {}",
+                        if revoked.is_some() { "revoked" } else { "live" }
+                    );
+                }
+            }
+            if let Some(taken) = devs.iter().find(|d| d.1 == device_index && d.3.is_none()) {
+                return Err(PvfsError::BadInput {
+                    field: "device-index".into(),
+                    reason: format!(
+                        "index {device_index} is already device {}; pick an unused --device-index",
+                        taken.0
+                    ),
+                });
+            }
+            let old: Option<Vec<u8>> = if keep_old_device {
+                None
+            } else if let Some(h) = &revoke {
+                Some(hex::decode(h).map_err(|_| PvfsError::BadInput {
+                    field: "revoke".into(),
+                    reason: "--revoke takes the device pubkey as hex".into(),
+                })?)
+            } else {
+                devs.iter()
+                    .find(|d| d.1 == 0 && d.3.is_none())
+                    .and_then(|d| hex::decode(&d.0).ok())
+            };
+            let mn = read_phrase_stdin("recovery phrase (to promote this replica to owner)")?;
+            let engine = Engine::promote(&data_dir, &mn, device_index, old.as_deref())?;
+            let pubkey = hex::encode(engine.device_pubkey());
+            let tip = engine.log_tip()?;
+            engine.close()?;
+            if json {
+                println!(
+                    "{{\"promoted\":true,\"mount\":\"{}\",\"device_index\":{},\"device_pubkey\":\"{}\",\"revoked\":{},\"was_following\":\"{}\",\"tip\":{}}}",
+                    json_escape(&mount.to_string_lossy()),
+                    device_index,
+                    pubkey,
+                    old.as_ref()
+                        .map(|k| format!("\"{}\"", hex::encode(k)))
+                        .unwrap_or_else(|| "null".into()),
+                    json_escape(&src.target),
+                    tip,
+                );
+            } else {
+                println!("promoted {} to owner", mount.display());
+                println!("  this device : {device_index} ({pubkey})");
+                match &old {
+                    Some(k) => println!("  revoked     : {}", hex::encode(k)),
+                    None => println!("  revoked     : nothing (--keep-old-device)"),
+                }
+                println!("  followed    : {} (kept as .pvfs/promoted-from)", src.target);
+                println!("  log tip     : {tip}");
+                println!();
+                println!("next: start pvfsd here with --listen, then re-point every replica");
+                println!("      (`pvfs replica repoint <mount> --instance <name>`, or the fleet play).");
             }
             Ok(())
         }
