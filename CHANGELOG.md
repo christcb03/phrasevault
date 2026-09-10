@@ -5,6 +5,33 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The merge no longer combines two boxes' DIFFERENT files (D119).** A
+  duplicate group is CONTESTED when more than one member holds live bytes and
+  those holders disagree about size — two versions of one path, an upgrade in
+  flight — and `--merge` skips it. It had kept the node with more locations
+  and unlinked the other, which cost `Lanterns s01e04` the catalogue entry for
+  the holder's real copy. Two boxes at the SAME size still merge.
+- **`resolve --rules` weighs a pending change on the D76 ladder (D120)** and
+  prints the reason, instead of `--replace`/`--delete` chosen blind. The
+  ladder's last rung is recency, so two comparable copies still get a decision
+  — the newer one — while a truncated rewrite is refused before recency can
+  fire. Also D120: `meta_set` retries a BUSY lock with the bounded backoff the
+  durable append has had since a 28,000-file adoption died on one; the flake
+  that surfaced it carried `retries: 0`.
+- **The pipeline runs clippy and reaps idle build slots (D121).** Clippy was
+  ad-hoc and got skipped: D114 reached production with a lint error, D120 was
+  green on 512 tests while carrying five. `--all-targets`, because both misses
+  were in test code. Slots idle for two days are reaped at report time, never
+  this run's or `/opt/pvfs` — presubuntu hit 100% twice under the old
+  delete-on-merge rule. The recap says NOT RUN when tags skipped clippy rather
+  than claiming clean.
+- **Docs (D118).** A full review: doc 24's "duplicates should NOT recur" (in a
+  section headed CHECKED, not assumed) corrected; docs 01/04's pre-D105
+  deletion contract updated; the settle window specified for the first time;
+  eight undocumented commands added to the manual; doc 08 flagged as frozen at
+  D29. Doc 25 §11 records the re-genesis rehearsal: 40 files, 152 GB, 26
+  seconds, 40 of 40 sidecars reused.
+
 - **Duplicates: the cause, the cleanup, and the check that was a no-op
   (D112–D117).** Two mechanisms were minting a node per file version, and
   production held 588 duplicate groups.
