@@ -977,6 +977,9 @@ is CLOSED — it fired in production on Reacher s03e08 (§11 item 12).
    Verified genuinely idle — the not_found count is static — so a reporting
    bug, not a runaway job. Same category as item 1: a status saying what it
    cannot support. The row should reset to `disabled` and drop the error.
+   *Closed by D123 (2026-09-10): the runner stops a live periodic pass on
+   disable, the passes honour the flag between files, and the row reads
+   `disabled` with no stale error.*
 3. **`watch` hits SQLite BUSY during scan state.** The retry count it reports
    is honest since D100; whether the retries are ENOUGH is a separate question
    nobody has asked.
