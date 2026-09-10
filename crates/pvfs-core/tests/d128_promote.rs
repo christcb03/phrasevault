@@ -48,10 +48,12 @@ fn a_replica_is_promoted_with_the_phrase_and_the_old_writer_is_revoked() {
     owner.close().unwrap();
 
     replica_of(&a, &b);
-    assert!(Engine::open(&b).unwrap().is_replica(), "premise: b is a replica");
+    let premise = Engine::open(&b).unwrap();
+    assert!(premise.is_replica(), "premise: b is a replica");
+    premise.close().unwrap();
 
     // Promote b as device 1, revoking a's device 0.
-    let mut b_engine = Engine::promote(&b, &mn, 1, Some(&old_pub)).unwrap();
+    let mut b_engine = Engine::promote(&b, &mn, 1, Some(old_pub.as_slice())).unwrap();
     assert!(!b_engine.is_replica());
     assert_eq!(b_engine.log_tip().unwrap(), tip_a + 2, "DeviceAuthorized + DeviceRevoked, at the tip");
     let devices = b_engine.devices().unwrap();
@@ -84,5 +86,7 @@ fn a_wrong_phrase_leaves_the_replica_a_replica() {
     let wrong = pvfs_core::identity::generate_mnemonic().unwrap();
     assert!(Engine::promote(&b, &wrong, 1, None).is_err());
     assert!(b.join("replica").exists() && !b.join("promoted-from").exists(), "the marker went back");
-    assert!(Engine::open(&b).unwrap().is_replica());
+    let still = Engine::open(&b).unwrap();
+    assert!(still.is_replica());
+    still.close().unwrap();
 }
