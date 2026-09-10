@@ -83,12 +83,12 @@ reason to be** (§6, D122 item 2).
 
 ## 2. High — all four confirmed open
 
-**H1. The replica source is always retried.** Confirmed: `fetch.rs:220-224`
+**H1. The replica source is always retried.** *Built — D122 item 2 (2026-09-10).* Confirmed: `fetch.rs:220-224`
 pushes `self.source` unconditionally. Reframed by §0: in production the source
 is not the quarantined pin, it is a box that has never held a byte. Fix: D122
 item 2.
 
-**H2. Fall-through to single-stream after a swarm whole-file mismatch.**
+**H2. Fall-through to single-stream after a swarm whole-file mismatch.** *Built — D122 items 3–4 (2026-09-10).*
 Confirmed: `fetch.rs:270-301` may quarantine, then `fetch.rs:300` runs the
 single-stream loop regardless. Proven on the fleet (§0, item 1). Also
 confirmed that the guard itself is dead in production. Fix: D122 items 3-4 —
@@ -112,7 +112,7 @@ Confirmed in three places:
   `evict`, `reclaim` passes ignore the `stop` their `Managed` carries.
 Fix: D123.
 
-**H4. The mover's "already satisfied" ignores quarantine.** Confirmed:
+**H4. The mover's "already satisfied" ignores quarantine.** *Built — D122 item 6 (2026-09-10).* Confirmed:
 both arms of `has_central` (`fetch.rs:1055-1100`) iterate
 `engine.locations(&id)?` unfiltered, while `readable_path` (used only when
 `has_central` is false) does exclude quarantined URIs via
@@ -132,10 +132,10 @@ says so.
 |---|---|---|
 | Toolchain pin not enforced on existing hosts | **Open** (see §1 row). | `pipeline.yml:95`; presubuntu on `stable` |
 | Daemon/companion version identity | Daemon fixed (D110); **companion open**. | `pvfs-companion/src/main.rs:25` |
-| `export --fetch` has no unfetchable memory | **Open.** `export_pass` builds a bare `Fetcher` (`jobs.rs:451`); so do the CLI's one-shot `tier`, `sync`, `export --fetch` and `cat` (`pvfs-cli/src/main.rs:5179, 5524, 7020, 7055`). Only `sync_pass` and the `tier` job seed and persist, each with its own copy of the same ten lines. | D122 item 7 |
+| `export --fetch` has no unfetchable memory | **Built — D122 item 7 (2026-09-10)** (`Fetcher::with_memory` / `persist_learned`). Was: `export_pass` builds a bare `Fetcher` (`jobs.rs:451`); so do the CLI's one-shot `tier`, `sync`, `export --fetch` and `cat` (`pvfs-cli/src/main.rs:5179, 5524, 7020, 7055`). Only `sync_pass` and the `tier` job seed and persist, each with its own copy of the same ten lines. | D122 item 7 |
 | `policy_for_uri` unescaped LIKE | **Open.** `?1 LIKE source_uri \|\| '/%'` at `fs.rs:2051`. The NAS binds `…/Data_ext/Media`, so the `_` wildcard is live in production; no sibling path differs at that character today, so the only cost is the one waiting to happen. The other LIKEs (`fs.rs:3051`, `engine.rs:2214/2298/2331`) match constant prefixes and are fine. | D124 item 1 |
-| Quarantine lookup fail-open | **Open.** `unwrap_or_default()` at `fetch.rs:189`, `fetch.rs:246`, `sync.rs:1214`. A DB error reads as "nothing quarantined" in the three places quarantine is supposed to protect. | D122 item 1 |
-| Integrity mismatches never enter `fetch_unfetchable` | **Open in code, masked on the fleet** (§0 item 3). | D122 item 5 |
+| Quarantine lookup fail-open | **Built — D122 item 1 (2026-09-10)**: the three sites propagate. Was: `unwrap_or_default()` at `fetch.rs:189`, `fetch.rs:246`, `sync.rs:1214`. A DB error reads as "nothing quarantined" in the three places quarantine is supposed to protect. | D122 item 1 |
+| Integrity mismatches never enter `fetch_unfetchable` | **Built — D122 item 5 (2026-09-10)**: an attributed mismatch is `Permanent` and remembered. Was open in code, masked on the fleet (§0 item 3). | D122 item 5 |
 | Pipeline slot reaping | **Fixed by D121** (`906c39b`): idle slots older than two days are reaped at report time. presubuntu is at 58 % with two slots (`/opt/pvfs` 25 G, `/opt/pvfs-roll` 624 M). | — |
 | Stale docs | `docs/04` and `deploy/ansible/README.md` corrected in this branch (§7). `docs/08`'s header still says 2026-08-13, but D118 put a banner under it naming D117 and saying plainly that the body stopped tracking reality at D29 — honest as it stands. | — |
 | Stall detector is "overdue", not progress | **Open by design** — doc 24 §14 item 1; needs a progress signal out of `scan_routed` and `tier_pass`. The QNAP shows `follow overdue` right now for exactly this reason. | deferred |
@@ -193,6 +193,10 @@ Numbers are provisional (D105 was taken once already); renumber if a
 concurrent session claims them.
 
 ### D122 — quarantine is consulted everywhere, and the source earns its place
+
+*Built 2026-09-10, branch `d122-quarantine-everywhere`; deviations in PVOS
+`docs/milestones/D122-quarantine-everywhere.md` §7. Item 8's one-holder
+swarm-mismatch integration test is the one piece not written (see there).*
 
 The theme: every place that decides "where can the bytes come from" or "are
 the bytes already here" asks the same question of the same table, fails

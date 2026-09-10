@@ -853,6 +853,10 @@ in `engine.rs` and `quarantined_uris(id) -> Vec<String>` in `fs.rs`, from two
 sessions that could not see each other. Same table, different shapes. Consolidate
 when someone is next in that code.
 
+*D122 (2026-09-10) deleted `quarantine_stale_str` — its one caller went with the
+`candidates.len() == 1` rule. `uri_quarantined` beside `quarantined_uris` is
+still D124 item 6.*
+
 **14. The CI watcher fix is unproven on GitHub.** `5a4711e` raises the poll
 ceiling and prints the watcher's log on failure, but has not yet run on a GitHub
 runner. If it still fails there, the output will finally say whether the daemon
