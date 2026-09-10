@@ -246,20 +246,33 @@ when a drive is unplugged.
 Phased so that each phase is buildable, testable and useful on its own, and so
 that the current forest keeps working until the last phase.
 
-**Phase 0 — spike (days).** Prove `SubRegionHead` will carry a manifest hash
-for a region that has NO event log of its own. If it will not without change,
-this is the first thing to change and it is small.
+**Phase 0 — spike (days). BUILT (PVOS D125 items 0–1).** `SubRegionHead`
+carries a manifest hash for a region that has no log of its own once the
+region row knows its `kind` (`log` | `catalogue`): five readers that presumed
+a split log each grew a one-line predicate, and the shape held.
 
-**Phase 1 — the region catalogue.** A per-region local index of entries (files
-and directories) keyed by relative path, with size/mtime/ctime/hash/quality.
-The scan writes rows here instead of emitting events. Signed manifest publish
-on a cadence. *Testable alone:* catalogue a directory, publish, verify the
-manifest reproduces the catalogue. Sidecar reuse carries over unchanged.
+**Phase 1 — the region catalogue. BUILT (D125 items 2–5).** `region_entries`
+(one row per file AND per directory, empty ones included, keyed by relative
+path; size, mtime, `changed_ms`, hash from the sidecar when there is one,
+quality) and `region_snapshots`, both projection-side. A binding on a
+catalogue region's root writes rows and emits no node, link or location
+event. The manifest is canonical bytes (`pvfs-region-manifest 1`, region,
+seq, one tab-separated line per row in bytewise path order), hashed with
+blake3, written to `regions/<id>/manifest.<seq>`; a pass that changed the
+catalogue publishes seq+1 and ONE `SubRegionHead`, an unchanged pass publishes
+nothing. Sidecar reuse carried over unchanged.
 
-**Phase 2 — region ownership.** A region declares itself (root, owner key,
-drains, name) and the shared log records its mark and heads. The forest-level
-`replica` gate (28 sites) becomes "do I own this region?". *Testable alone:*
-two boxes, two regions, each cataloguing its own disk, neither routing.
+**Phase 2 — region ownership. BUILT, smaller than planned (D125 items 6–8).**
+No declaration record: a region's owner IS an admin (`a`) grant on its root,
+made in the same batch as the mark (`region mark --catalogue --owner
+key:<hex>`), and the kind rides on `RegionMarked` as a trailing optional field
+(byte-identical for log regions). The 28 `replica` gate sites stay as they
+are — a replica still never appends locally; it publishes its head through
+the forest owner with ONE routed op, `WriteOp::CommitRegionHead` (proto 4→5),
+which the owner prepares under that grant and refuses for anyone else. A
+catalogue region holds rows, never nodes: it is marked once, on an empty
+folder, and refuses unmark and re-mark. *Still to run:* the two-box lab pair
+(D125 item 9), the milestone's exit criterion.
 
 **Phase 3 — the merged view.** Union region catalogues by relative path.
 Admission by hash agreement. Conflict detection. Directory entries unioned.

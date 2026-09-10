@@ -337,6 +337,10 @@ pub struct RegionSnapshot {
     pub published_at: u64,
 }
 
+/// One catalogue row on its way to `region_entries` (D125):
+/// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
+type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
+
 impl Engine {
     // ---- bindings (doc 04 §3) --------------------------------------------------
 
@@ -1026,6 +1030,7 @@ impl Engine {
         files: &[DiskFile],
         dirs: &[Vec<String>],
         mut stats: ScanStats,
+        writer: &mut Option<&mut dyn ScanWriter>,
     ) -> Result<ScanStats> {
         let region = b.folder_id.as_str();
         let pass = now_ms() as i64;
@@ -1039,7 +1044,7 @@ impl Engine {
         // (rel_path, kind, size, mtime, changed, hash). Directories carry no
         // times: theirs change whenever an entry does, which the file rows
         // already say, and two identical libraries must hash identically.
-        let mut rows: Vec<(String, &str, u64, u64, u64, Option<String>)> =
+        let mut rows: Vec<CatalogueRow> =
             dirs.iter().map(|d| (d.join("/"), "dir", 0, 0, 0, None)).collect();
         // Hashes first, outside any transaction: this is the slow part, and a
         // pass abandoned here has cost nothing but time.
@@ -1145,7 +1150,7 @@ impl Engine {
         tx.commit().map_err(map_db("commit catalogue"))?;
         // Item 4 — a changed catalogue publishes its head; an unchanged one
         // publishes nothing.
-        self.publish_region_snapshot(&b.folder_id)?;
+        self.publish_region_snapshot(&b.folder_id, writer)?;
         Ok(stats)
     }
 
@@ -1209,7 +1214,11 @@ impl Engine {
     /// change test re-serialises the rows at the LAST seq, so an unchanged
     /// catalogue re-hashes to the last hash and publishes nothing.
     /// Returns the new seq, or `None` when nothing changed.
-    pub fn publish_region_snapshot(&mut self, region: &NodeId) -> Result<Option<u64>> {
+    pub fn publish_region_snapshot(
+        &mut self,
+        region: &NodeId,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> Result<Option<u64>> {
         if !self.is_catalogue_region(region)? {
             return Err(bad("region", "not a catalogue region"));
         }
@@ -1236,6 +1245,21 @@ impl Engine {
         let hash = blake3::hash(&bytes).to_hex().to_string();
         let dir = self.data_dir.join("regions").join(region);
         crate::storage::atomic_overwrite(&dir.join(format!("manifest.{seq}")), &bytes)?;
+        // The head is the ONE thing the log learns about a catalogue region.
+        // A replica publishes it through its route to the forest owner (item
+        // 8) and records the snapshot only once the owner has taken the head:
+        // a refused head is retried by the next pass, not remembered as done.
+        if self.replica {
+            match writer {
+                Some(w) => w.commit_region_head(region, seq, &hash)?,
+                None => {
+                    return Err(PvfsError::Forbidden {
+                        action: "publish region head".into(),
+                        reason: "a replica publishes through its owner, and no route was given".into(),
+                    })
+                }
+            }
+        }
         self.conn
             .execute(
                 "INSERT INTO region_snapshots (region_id, seq, manifest_hash, entries, published_at)
@@ -1243,8 +1267,6 @@ impl Engine {
                 params![region, seq as i64, hash, rows.len() as i64, now_ms() as i64],
             )
             .map_err(map_db("insert snapshot"))?;
-        // The head is the ONE thing the log learns about a catalogue region.
-        // A replica publishes it through its route (item 8); the owner, here.
         if !self.replica {
             self.commit_region_heads()?;
         }
@@ -1316,7 +1338,7 @@ impl Engine {
         // Rows, not nodes: nothing below this point runs for it, and nothing
         // it does reaches the log (doc 26 §4–§5).
         if self.is_catalogue_region(&b.folder_id)? {
-            return self.scan_region_catalogue(b, &root, &files, &dirs, stats);
+            return self.scan_region_catalogue(b, &root, &files, &dirs, stats, writer);
         }
 
         // 2. mirror folders + ingest files
@@ -3455,6 +3477,9 @@ pub trait ScanWriter {
     fn set_content_hash(&mut self, file: &str, content_hash: &str, size: u64) -> Result<NodeId>;
     /// D105 — drop a link whose file is gone from a mount PROVEN live.
     fn remove_link(&mut self, link_id: &str) -> Result<()>;
+    /// D125 item 8 — publish the head of a catalogue region this box owns:
+    /// the ONE routed write ownership grants (milestone §4.3).
+    fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> Result<()>;
 }
 
 /// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and

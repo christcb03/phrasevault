@@ -1190,12 +1190,26 @@ enum ServeCmd {
 
 #[derive(Subcommand)]
 enum RegionCmd {
-    /// Mark a node as a region boundary (its subtree becomes a unit)
-    Mark { target: String },
+    /// Mark a node as a region boundary (its subtree becomes a unit). With
+    /// `--catalogue` the region catalogues its own files instead of holding
+    /// nodes (D125); `--owner` grants a box admin on it so that box may
+    /// publish the region's head. Prompts for both at a terminal when omitted.
+    Mark {
+        target: String,
+        /// D125: the region catalogues its own files and has no event log
+        #[arg(long)]
+        catalogue: bool,
+        /// Principal to grant admin (a) on the region — key:<hex> or tag:<name>
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Remove a region boundary (the subtree folds back in)
     Unmark { target: String },
     /// List marked regions, and which region a node is in with a target
     Ls { target: Option<String> },
+    /// D125: a catalogue region's own index — one row per file and folder on
+    /// disk under its root — and the last head it published
+    Entries { target: String },
 }
 
 #[derive(Subcommand)]
@@ -5767,13 +5781,50 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
         Cmd::Region(cmd) => {
             match cmd {
-                RegionCmd::Mark { target } => {
+                RegionCmd::Mark {
+                    target,
+                    catalogue,
+                    owner,
+                } => {
                     let (mut engine, id) = engine_and_node(ctx, &target)?;
-                    engine.region_mark(&id)?;
+                    // Prompts over flags — at a terminal. A script that passes
+                    // nothing gets what it always got: a log region, no grant.
+                    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    let catalogue = catalogue
+                        || (interactive
+                            && prompt_line(
+                                "region kind — log (holds nodes) or catalogue (catalogues its own files, D125)",
+                                Some("log"),
+                            )? == "catalogue");
+                    let owner = match owner {
+                        Some(o) => Some(o),
+                        None if interactive => Some(prompt_line(
+                            "owner to grant admin on the region — key:<hex> or tag:<name> (blank = none)",
+                            Some(""),
+                        )?)
+                        .filter(|o| !o.is_empty()),
+                        None => None,
+                    };
+                    let principal = owner
+                        .as_deref()
+                        .map(pvfs_core::acl::Principal::parse)
+                        .transpose()?;
+                    let kind = if catalogue { "catalogue" } else { "log" };
+                    engine.region_mark_as(&id, kind, principal.as_ref())?;
                     if json {
-                        println!("{{\"region\":\"{id}\",\"marked\":true}}");
+                        let owner_json = owner
+                            .as_deref()
+                            .map(|o| format!("\"{o}\""))
+                            .unwrap_or_else(|| "null".into());
+                        println!(
+                            "{{\"region\":\"{id}\",\"marked\":true,\"kind\":\"{kind}\",\"owner\":{owner_json}}}"
+                        );
                     } else {
-                        println!("{id} is now a region boundary");
+                        let owned = owner
+                            .as_deref()
+                            .map(|o| format!(", owned by {o}"))
+                            .unwrap_or_default();
+                        println!("{id} is now a {kind} region boundary{owned}");
                     }
                     engine.close()
                 }
@@ -5784,6 +5835,46 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{{\"region\":\"{id}\",\"marked\":false}}");
                     } else {
                         println!("{id} is no longer a region boundary");
+                    }
+                    engine.close()
+                }
+                RegionCmd::Entries { target } => {
+                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    if !engine.is_catalogue_region(&id)? {
+                        return Err(PvfsError::BadInput {
+                            field: "target".into(),
+                            reason: format!("{id} is not a catalogue region (see `region ls`)"),
+                        });
+                    }
+                    let rows = engine.region_entries(&id)?;
+                    let head = engine.region_snapshots(&id)?.pop();
+                    if json {
+                        let out = serde_json::json!({
+                            "region": id,
+                            "head": head.as_ref().map(|s| serde_json::json!({
+                                "seq": s.seq, "hash": s.manifest_hash, "entries": s.entries,
+                                "published_at": s.published_at,
+                            })),
+                            "entries": rows.iter().map(|r| serde_json::json!({
+                                "path": r.rel_path, "kind": r.kind, "size": r.size_bytes,
+                                "mtime_ms": r.mtime_ms, "hash": r.content_hash, "quality": r.quality,
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{out}");
+                    } else {
+                        match &head {
+                            Some(s) => println!("head seq {} {} ({} entries)", s.seq, s.manifest_hash, s.entries),
+                            None => println!("no head published yet"),
+                        }
+                        for r in &rows {
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                r.kind,
+                                r.size_bytes,
+                                r.content_hash.as_deref().unwrap_or("-"),
+                                r.rel_path
+                            );
+                        }
                     }
                     engine.close()
                 }
@@ -5803,14 +5894,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     if json {
                         let rows: Vec<String> = regions
                             .iter()
-                            .map(|(id, at)| format!("{{\"region\":\"{id}\",\"marked_at\":{at}}}"))
+                            .map(|(id, at, kind)| {
+                                format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\"}}")
+                            })
                             .collect();
                         println!("[{}]", rows.join(","));
                     } else if regions.is_empty() {
                         println!("no marked regions (the forest root is the implicit top region)");
                     } else {
-                        for (id, _) in &regions {
-                            println!("{id}");
+                        for (id, _, kind) in &regions {
+                            println!("{id}\t{kind}");
                         }
                     }
                     engine.close()

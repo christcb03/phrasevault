@@ -181,6 +181,11 @@ pub enum Event {
     RegionMarked {
         node_id: String,
         marked_at: u64,
+        /// D125: "" = a log region (the P7.0 form, byte-identical on the wire);
+        /// "catalogue" = the region catalogues its own files and has no log.
+        /// Trailing on the wire and written only when non-empty — the AclSet
+        /// `expires_at` pattern, so pre-D125 bodies decode unchanged.
+        kind: String,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -444,10 +449,16 @@ pub fn msg_file_location_added(file_id: &str, uri: &str, added_at: u64, author: 
     crypto::domain_digest("pvfs:filelocationadded:v1:", &e.finish())
 }
 
-pub fn msg_region_marked(node_id: &str, marked_at: u64, author: &[u8]) -> [u8; 32] {
+pub fn msg_region_marked(node_id: &str, marked_at: u64, kind: &str, author: &[u8]) -> [u8; 32] {
     let mut e = Enc::new();
-    e.string(node_id).u64(marked_at).bytes(author);
-    crypto::domain_digest("pvfs:regionmarked:v1:", &e.finish())
+    e.string(node_id).u64(marked_at);
+    if kind.is_empty() {
+        e.bytes(author);
+        crypto::domain_digest("pvfs:regionmarked:v1:", &e.finish())
+    } else {
+        e.string(kind).bytes(author);
+        crypto::domain_digest("pvfs:regionmarked:v2:", &e.finish())
+    }
 }
 
 pub fn msg_region_unmarked(node_id: &str, unmarked_at: u64, author: &[u8]) -> [u8; 32] {
@@ -922,10 +933,14 @@ impl Event {
             Event::RegionMarked {
                 node_id,
                 marked_at,
+                kind,
                 author,
                 sig,
             } => {
                 e.string(node_id).u64(*marked_at).bytes(author).bytes(sig);
+                if !kind.is_empty() {
+                    e.string(kind);
+                }
             }
             Event::RegionUnmarked {
                 node_id,
@@ -1255,12 +1270,35 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
-            K_REGION_MARKED => Event::RegionMarked {
-                node_id: d.string()?,
-                marked_at: d.u64()?,
-                author: d.bytes()?,
-                sig: d.bytes()?,
-            },
+            K_REGION_MARKED => {
+                let node_id = d.string()?;
+                let marked_at = d.u64()?;
+                let author = d.bytes()?;
+                let sig = d.bytes()?;
+                // Optional trailing kind (D125): absent on pre-D125 bodies. The
+                // canonical encoding omits an empty kind, so a present "" is
+                // malformed — the AclSet expires_at rule.
+                let kind = if d.remaining() > 0 {
+                    let k = d.string()?;
+                    if k.is_empty() {
+                        return Err(PvfsError::Encoding {
+                            what: "event body".into(),
+                            offset: body.len(),
+                            detail: "non-canonical RegionMarked: an empty kind must be omitted".into(),
+                        });
+                    }
+                    k
+                } else {
+                    String::new()
+                };
+                Event::RegionMarked {
+                    node_id,
+                    marked_at,
+                    kind,
+                    author,
+                    sig,
+                }
+            }
             K_REGION_UNMARKED => Event::RegionUnmarked {
                 node_id: d.string()?,
                 unmarked_at: d.u64()?,
@@ -1617,11 +1655,12 @@ impl Event {
             Event::RegionMarked {
                 node_id,
                 marked_at,
+                kind,
                 author,
                 sig,
             } => crypto::verify_digest(
                 author,
-                &msg_region_marked(node_id, *marked_at, author),
+                &msg_region_marked(node_id, *marked_at, kind, author),
                 sig,
             ),
             Event::RegionUnmarked {

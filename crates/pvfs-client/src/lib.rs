@@ -796,6 +796,22 @@ impl Client {
         )
     }
 
+    /// D125 item 8 — publish the head of a catalogue region this box owns
+    /// (`hash` = hex blake3 of manifest `seq`). Returns the region id.
+    pub fn commit_region_head<F>(&mut self, region: &str, seq: u64, hash: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::CommitRegionHead {
+                region: region.into(),
+                seq,
+                hash: hash.into(),
+            },
+            sign,
+        )
+    }
+
     /// Retract a recorded location (P6.0). Returns the file id.
     pub fn remove_location<F>(&mut self, file: &str, uri: &str, sign: F) -> Result<String>
     where

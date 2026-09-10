@@ -107,18 +107,16 @@ fn a_catalogue_region_commits_its_manifest_hash_as_its_head() {
     let root = e.identity.root_node_id.clone();
     let cat = folder(&mut e, &root, "Library");
     let log = folder(&mut e, &root, "Photos");
-    e.region_mark(&cat).unwrap();
+    e.region_mark_as(&cat, "catalogue", None).unwrap();
     e.region_mark(&log).unwrap();
     e.close().unwrap();
 
-    // Flip one to a catalogue region — the row shape `region mark --catalogue`
-    // (item 6) will produce: no generation file, no state_root, ever — and give
-    // it a published snapshot. The spike proves the head commitment works
-    // before any of that exists.
+    // Give the catalogue region a published snapshot by hand: the spike proves
+    // the head commitment works on the row shape alone, before the scan and
+    // manifest (items 2-5) exist to produce one.
     let fake_hash = "ab".repeat(32);
     {
         let c = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
-        c.execute("UPDATE regions SET kind='catalogue', log_file=NULL, state_root=NULL WHERE node_id=?1", [&cat]).unwrap();
         c.execute(
             "INSERT INTO region_snapshots (region_id, seq, manifest_hash, entries, published_at)
              VALUES (?1, 7, ?2, 41, 0)",
@@ -161,14 +159,8 @@ fn unmarking_a_catalogue_region_is_refused_and_a_log_region_still_works() {
     let root = e.identity.root_node_id.clone();
     let cat = folder(&mut e, &root, "Library");
     let log = folder(&mut e, &root, "Photos");
-    e.region_mark(&cat).unwrap();
+    e.region_mark_as(&cat, "catalogue", None).unwrap();
     e.region_mark(&log).unwrap();
-    e.close().unwrap();
-    {
-        let c = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
-        c.execute("UPDATE regions SET kind='catalogue', log_file=NULL, state_root=NULL WHERE node_id=?1", [&cat]).unwrap();
-    }
-    let mut e = Engine::open(dir.path()).unwrap();
     let err = e.region_unmark(&cat).expect_err("a catalogue region must not unmark");
     assert!(
         matches!(err, pvfs_core::PvfsError::Forbidden { .. }),

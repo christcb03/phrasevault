@@ -432,4 +432,11 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
             .map(|_| ())
             .map_err(scan_remote_err)
     }
+
+    fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> pvfs_core::Result<()> {
+        self.client
+            .commit_region_head(region, seq, hash, |d| (self.sign)(d))
+            .map(|_| ())
+            .map_err(scan_remote_err)
+    }
 }

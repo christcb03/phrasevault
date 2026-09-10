@@ -22,17 +22,7 @@ fn catalogue_forest(data: &std::path::Path, lib: &std::path::Path) -> (Engine, S
     let (mut e, _mn) = Engine::init(data).unwrap();
     let root = e.identity.root_node_id.clone();
     let region = folder(&mut e, &root, "Library");
-    e.region_mark(&region).unwrap();
-    e.close().unwrap();
-    {
-        let c = rusqlite::Connection::open(data.join("index.db")).unwrap();
-        c.execute(
-            "UPDATE regions SET kind='catalogue', log_file=NULL, state_root=NULL WHERE node_id=?1",
-            [&region],
-        )
-        .unwrap();
-    }
-    let mut e = Engine::open(data).unwrap();
+    e.region_mark_as(&region, "catalogue", None).unwrap();
     e.bind_folder(
         &region,
         BindSpec {

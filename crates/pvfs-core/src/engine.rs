@@ -4580,6 +4580,34 @@ impl Engine {
     /// it. A re-mark of an already-split region only re-stamps: its live
     /// generation must not be reset under itself.
     pub fn region_mark(&mut self, node: &NodeId) -> Result<()> {
+        self.region_mark_as(node, "", None)
+    }
+
+    /// D125 — mark `node` as a region of `kind`: `""`/`"log"` is P7.0's split
+    /// event log; `"catalogue"` is a region that catalogues its own files
+    /// (`region_entries`) and has no log at all. `owner`, when given, is
+    /// granted admin (`a`) on the region in the same batch — the one grant
+    /// that lets a replica publish the region's head (milestone §4).
+    ///
+    /// A catalogue region holds rows, never nodes, and its kind is fixed at
+    /// the mark: it must be an EMPTY folder that is not already a region, and
+    /// once marked it is not re-marked (a log re-mark would split it).
+    pub fn region_mark_as(
+        &mut self,
+        node: &NodeId,
+        kind: &str,
+        owner: Option<&crate::acl::Principal>,
+    ) -> Result<()> {
+        let kind = match kind {
+            "" | "log" => "",
+            "catalogue" => "catalogue",
+            other => {
+                return Err(bad(
+                    "kind",
+                    &format!("{other:?} is not a region kind (log | catalogue)"),
+                ))
+            }
+        };
         self.ensure_device_active()?;
         let n = fetch_node(&self.conn, node)?.ok_or(PvfsError::NotFound {
             kind: "node",
@@ -4588,28 +4616,57 @@ impl Engine {
         if n.is_temp {
             return Err(bad("region", "temp nodes are forest-local (no region marks)"));
         }
-        let already_split: Option<i64> = self
+        let existing: Option<(Option<String>, String)> = self
             .conn
             .query_row(
-                "SELECT 1 FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                "SELECT state_root, kind FROM regions WHERE node_id = ?1",
                 params![node],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(map_db("region lookup"))?;
+        let already_split = matches!(existing, Some((Some(_), _)));
+        if let Some((_, k)) = &existing {
+            if k == "catalogue" {
+                return Err(bad(
+                    "region",
+                    &format!("{node} is already a catalogue region; its kind is fixed at the mark"),
+                ));
+            }
+            if kind == "catalogue" {
+                return Err(bad(
+                    "region",
+                    &format!("{node} is already a {k} region; a catalogue region is marked once, on a fresh folder"),
+                ));
+            }
+        }
+        if kind == "catalogue" {
+            if n.node_type != crate::node::TYPE_FOLDER {
+                return Err(bad("region", "a catalogue region is a folder"));
+            }
+            if !self.children(node)?.is_empty() {
+                return Err(bad(
+                    "region",
+                    &format!("{node} has children; a catalogue region holds rows, never nodes — mark an empty folder"),
+                ));
+            }
+        }
         let t = now_ms();
         let me = self.device.pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_region_marked(node, t, &me),
+            &event::msg_region_marked(node, t, kind, &me),
         )?;
         let mut events = vec![Event::RegionMarked {
             node_id: node.clone(),
             marked_at: t,
+            kind: kind.to_string(),
             author: me.clone(),
             sig,
         }];
-        if already_split.is_none() {
+        // P7.2a: a log region is split at the mark — its baseline is the
+        // canonical state of the subtree now. A catalogue region never is.
+        if kind.is_empty() && !already_split {
             let state_root = projection::canonical_state_root(&self.conn, node)?;
             let bsig = crypto::sign_digest(
                 &self.device.signing_key,
@@ -4619,8 +4676,26 @@ impl Engine {
                 node_id: node.clone(),
                 state_root: state_root.to_vec(),
                 at: t,
-                author: me,
+                author: me.clone(),
                 sig: bsig,
+            });
+        }
+        if let Some(p) = owner {
+            let (pk, pid) = (p.kind(), p.id().to_vec());
+            let rights = crate::acl::ACL_A as u64;
+            let asig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_acl_set(node, pk, &pid, rights, t, 0, &me),
+            )?;
+            events.push(Event::AclSet {
+                node_id: node.clone(),
+                principal_kind: pk,
+                principal_id: pid,
+                rights,
+                set_at: t,
+                expires_at: 0,
+                author: me,
+                sig: asig,
             });
         }
         self.append_durable(events)
@@ -4862,14 +4937,21 @@ impl Engine {
         Ok(Some(info))
     }
 
-    /// All marked region boundaries, `(node_id, marked_at)`.
-    pub fn regions(&self) -> Result<Vec<(NodeId, u64)>> {
+    /// All marked region boundaries, `(node_id, marked_at, kind)` — kind is
+    /// `log` or `catalogue` (D125).
+    pub fn regions(&self) -> Result<Vec<(NodeId, u64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT node_id, marked_at FROM regions ORDER BY marked_at")
+            .prepare("SELECT node_id, marked_at, kind FROM regions ORDER BY marked_at")
             .map_err(map_db("regions"))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(map_db("regions"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("regions"))
@@ -5033,6 +5115,74 @@ impl Engine {
                     rights: rights as u64,
                     set_at: t,
                     expires_at,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1 of a routed head publish (D125 item 8): build an unsigned
+    /// `SubRegionHead` for a catalogue region on behalf of `author_pub` — the
+    /// box that owns the region. The author must hold admin (`a`) on the
+    /// region root (the `region mark --owner` grant, §4), the region must be
+    /// a catalogue region, and the seq must advance. Re-checked on commit and
+    /// replay by the same authority rule every region event obeys.
+    pub fn prepare_commit_region_head(
+        &self,
+        author_pub: &[u8],
+        region: &NodeId,
+        seq: u64,
+        hash_hex: &str,
+    ) -> Result<PreparedWrite> {
+        if fetch_node(&self.conn, region)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: region.clone(),
+            });
+        }
+        if !self.is_catalogue_region(region)? {
+            return Err(PvfsError::Forbidden {
+                action: "commit region head".into(),
+                reason: format!("{region} is not a catalogue region"),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, region)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "commit region head".into(),
+                reason: format!("you lack admin (a) on {region} — it is not yours to publish"),
+            });
+        }
+        let committed: i64 = self
+            .conn
+            .query_row(
+                "SELECT committed_seq FROM regions WHERE node_id = ?1",
+                params![region],
+                |r| r.get(0),
+            )
+            .map_err(map_db("region head"))?;
+        if seq as i64 <= committed {
+            return Err(bad(
+                "seq",
+                &format!("head seq {seq} does not advance {region} (at {committed})"),
+            ));
+        }
+        let head_hash = hex::decode(hash_hex)
+            .ok()
+            .filter(|h| h.len() == 32)
+            .ok_or_else(|| bad("hash", "a manifest hash is 32 bytes of hex"))?;
+        let t = now_ms();
+        let digest = event::msg_sub_region_head(region, seq, &head_hash, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: region.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::SubRegionHead {
+                    node_id: region.clone(),
+                    head_seq: seq,
+                    head_hash,
+                    at: t,
                     author: author_pub.to_vec(),
                     sig: Vec::new(),
                 },

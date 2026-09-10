@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 /// ops shipped at 3 without a bump and it cost a live pass).
 ///   2 → 3: the P10 external-ingest ops (IngestBegin/Write/Verified/
 ///          Commit/Abort/List), ranged `Cat`, and P10.2 partial paths.
-pub const PROTO_VERSION: u32 = 4;
+///   4 → 5: D125 `CommitRegionHead` — a region owner publishes its catalogue
+///          head through the forest owner. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 5;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -313,6 +315,15 @@ pub enum WriteOp {
     AuthorizeMember { pubkey: String },
     /// Revoke a device/member key (hex).
     Revoke { pubkey: String },
+    /// D125 item 8 — a region owner publishes the head of its catalogue
+    /// region: `hash` is the hex blake3 of manifest `seq`. The forest owner
+    /// prepares a `SubRegionHead` under the author's admin grant on the
+    /// region (`region mark --owner`) and refuses anything else about it.
+    CommitRegionHead {
+        region: String,
+        seq: u64,
+        hash: String,
+    },
 }
 
 /// Client → server messages.

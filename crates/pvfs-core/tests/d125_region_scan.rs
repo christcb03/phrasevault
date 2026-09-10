@@ -1,9 +1,6 @@
 //! D125 items 2–3 — a catalogue region's binding catalogues instead of
 //! ingesting: rows in `region_entries`, not one event in the log.
 //!
-//! Until item 6 lands `region mark --catalogue`, a region is flipped the way
-//! the spike does it — straight into `regions.kind`, with no generation file
-//! and no state_root, which is the row shape item 6 will produce.
 
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
@@ -49,10 +46,7 @@ fn catalogue_forest(data: &std::path::Path, lib: &std::path::Path, policy: HashP
     let (mut e, _mn) = Engine::init(data).unwrap();
     let root = e.identity.root_node_id.clone();
     let region = folder(&mut e, &root, "Library");
-    e.region_mark(&region).unwrap();
-    e.close().unwrap();
-    flip_to_catalogue(data, &region);
-    let mut e = Engine::open(data).unwrap();
+    e.region_mark_as(&region, "catalogue", None).unwrap();
     bind(&mut e, &region, lib, policy);
     (e, region)
 }
@@ -232,7 +226,10 @@ fn a_binding_inside_a_catalogue_region_is_refused_at_bind_time() {
     let (mut e, _mn) = Engine::init(&data).unwrap();
     let root = e.identity.root_node_id.clone();
     let region = folder(&mut e, &root, "Library");
-    let inner = folder(&mut e, &region, "Sub"); // exists before the mark
+    let inner = folder(&mut e, &region, "Sub");
+    // A catalogue mark refuses a folder with children (d125_region_mark), so
+    // this state cannot be reached through the API. It is forced here to
+    // prove the bind-time guard holds even so.
     e.region_mark(&region).unwrap();
     e.close().unwrap();
     flip_to_catalogue(&data, &region);

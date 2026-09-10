@@ -1261,7 +1261,12 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             )
             .map_err(&m)?;
         }
-        Event::RegionMarked { node_id, marked_at, .. } => {
+        Event::RegionMarked {
+            node_id,
+            marked_at,
+            kind,
+            ..
+        } => {
             // The enclosing region: the marked node's home parent's region
             // (NULL/absent = top). Captured at mark time; reparented if the
             // enclosing region later unmarks.
@@ -1278,9 +1283,16 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                 .flatten();
             let enclosing = enclosing.unwrap_or_default();
             tx.execute(
-                "INSERT INTO regions (node_id, marked_at, parent_log) VALUES (?1, ?2, ?3)
+                // D125: the kind is fixed at the first mark; a re-mark only
+                // re-stamps (the engine refuses one on a catalogue region).
+                "INSERT INTO regions (node_id, marked_at, parent_log, kind) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(node_id) DO UPDATE SET marked_at = excluded.marked_at",
-                params![node_id, *marked_at as i64, enclosing],
+                params![
+                    node_id,
+                    *marked_at as i64,
+                    enclosing,
+                    if kind.is_empty() { "log" } else { kind.as_str() }
+                ],
             )
             .map_err(&m)?;
             // Assign the contains-closure (stopping at nested marks) its region.
