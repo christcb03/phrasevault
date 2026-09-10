@@ -765,6 +765,10 @@ impl Event {
             // home link (doc 23 §9.4) — before that only the owner path
             // authored this kind, pre-signed.
             | Event::LinkSuperseded { sig: s, .. }
+            // D124 item 7: purge and quality are routed writes now, so a
+            // member's signature lands on them here like every other kind.
+            | Event::NodePurged { sig: s, .. }
+            | Event::MediaQuality { sig: s, .. }
             | Event::LinkRemoved { removal_sig: s, .. }
             | Event::FileLocationRemoved { removal_sig: s, .. } => *s = sig,
             _ => {}

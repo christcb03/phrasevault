@@ -1,0 +1,9 @@
+# D124 item 5 — ONE toolchain, one place. CI (`.github/workflows/ci.yml`),
+# the pipeline (`deploy/ansible/pipeline.yml`) and a laptop all resolve this
+# compiler from the checkout; the pipeline used to pin only on a fresh
+# rustup install, so its second host floated on `stable` and clippy
+# disagreed with CI. `clippy` is listed because a pinned channel does not
+# ship it (@stable does).
+[toolchain]
+channel = "1.96.0"
+components = ["clippy"]

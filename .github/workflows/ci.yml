@@ -23,6 +23,9 @@ jobs:
       # ships clippy, a version pin does not, and the Clippy step below then
       # fails with "'cargo-clippy' is not installed". Same shape as the PVOS
       # workflow, which already carries this fix.
+      # D124 item 5: the SOURCE of truth for the version is rust-toolchain.toml
+      # at the repo root; this explicit pin must match it (rustup would read
+      # the toml on its own, but an explicit pin fails loudly on drift).
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy

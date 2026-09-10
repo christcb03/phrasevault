@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 ///          Commit/Abort/List), ranged `Cat`, and P10.2 partial paths.
 ///   4 → 5: D125 `CommitRegionHead` — a region owner publishes its catalogue
 ///          head through the forest owner. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 5;
+///   5 → 6: D124 `Purge` and `SetQuality` — the two CLI commands that did not
+///          route on a replica. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 6;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -323,6 +325,16 @@ pub enum WriteOp {
         region: String,
         seq: u64,
         hash: String,
+    },
+    /// D124 item 7 — purge orphaned nodes (admin on each). A replica used to
+    /// call the engine directly and be refused as read-only.
+    Purge { ids: Vec<String> },
+    /// D124 item 7 — record a D76 quality measurement on a node (write on
+    /// it); `quality` is `MediaQuality::encode`, `source` names the measurer.
+    SetQuality {
+        node: String,
+        quality: String,
+        source: String,
     },
 }
 

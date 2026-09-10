@@ -83,12 +83,12 @@ reason to be** (§6, D122 item 2).
 
 ## 2. High — all four confirmed open
 
-**H1. The replica source is always retried.** Confirmed: `fetch.rs:220-224`
+**H1. The replica source is always retried.** *Built — D122 item 2 (2026-09-10).* Confirmed: `fetch.rs:220-224`
 pushes `self.source` unconditionally. Reframed by §0: in production the source
 is not the quarantined pin, it is a box that has never held a byte. Fix: D122
 item 2.
 
-**H2. Fall-through to single-stream after a swarm whole-file mismatch.**
+**H2. Fall-through to single-stream after a swarm whole-file mismatch.** *Built — D122 items 3–4 (2026-09-10).*
 Confirmed: `fetch.rs:270-301` may quarantine, then `fetch.rs:300` runs the
 single-stream loop regardless. Proven on the fleet (§0, item 1). Also
 confirmed that the guard itself is dead in production. Fix: D122 items 3-4 —
@@ -96,7 +96,7 @@ attribute by which holders actually served chunks, not by how many candidates
 there were, and after a quarantine recompute the candidate set instead of
 falling through.
 
-**H3. Disabling a periodic job does not stop it; the finish reports idle.**
+**H3. Disabling a periodic job does not stop it; the finish reports idle.** *Built — D123 (2026-09-10).*
 Confirmed in three places:
 - `crates/pvfsd/src/jobs.rs:852-858` — the `PERIODIC` arm of the supervisor
   only removes `next_due` for a disabled job; the live `Managed` in `running`
@@ -112,7 +112,7 @@ Confirmed in three places:
   `evict`, `reclaim` passes ignore the `stop` their `Managed` carries.
 Fix: D123.
 
-**H4. The mover's "already satisfied" ignores quarantine.** Confirmed:
+**H4. The mover's "already satisfied" ignores quarantine.** *Built — D122 item 6 (2026-09-10).* Confirmed:
 both arms of `has_central` (`fetch.rs:1055-1100`) iterate
 `engine.locations(&id)?` unfiltered, while `readable_path` (used only when
 `has_central` is false) does exclude quarantined URIs via
@@ -130,16 +130,16 @@ says so.
 
 | Item | Verdict | Where |
 |---|---|---|
-| Toolchain pin not enforced on existing hosts | **Open** (see §1 row). | `pipeline.yml:95`; presubuntu on `stable` |
-| Daemon/companion version identity | Daemon fixed (D110); **companion open**. | `pvfs-companion/src/main.rs:25` |
-| `export --fetch` has no unfetchable memory | **Open.** `export_pass` builds a bare `Fetcher` (`jobs.rs:451`); so do the CLI's one-shot `tier`, `sync`, `export --fetch` and `cat` (`pvfs-cli/src/main.rs:5179, 5524, 7020, 7055`). Only `sync_pass` and the `tier` job seed and persist, each with its own copy of the same ten lines. | D122 item 7 |
-| `policy_for_uri` unescaped LIKE | **Open.** `?1 LIKE source_uri \|\| '/%'` at `fs.rs:2051`. The NAS binds `…/Data_ext/Media`, so the `_` wildcard is live in production; no sibling path differs at that character today, so the only cost is the one waiting to happen. The other LIKEs (`fs.rs:3051`, `engine.rs:2214/2298/2331`) match constant prefixes and are fine. | D124 item 1 |
-| Quarantine lookup fail-open | **Open.** `unwrap_or_default()` at `fetch.rs:189`, `fetch.rs:246`, `sync.rs:1214`. A DB error reads as "nothing quarantined" in the three places quarantine is supposed to protect. | D122 item 1 |
-| Integrity mismatches never enter `fetch_unfetchable` | **Open in code, masked on the fleet** (§0 item 3). | D122 item 5 |
+| Toolchain pin not enforced on existing hosts | **Built — D124 item 5 (2026-09-10)**: `rust-toolchain.toml`, installed every prepare. Was open (see §1 row). | `pipeline.yml:95`; presubuntu on `stable` |
+| Daemon/companion version identity | Daemon fixed (D110); **companion built — D124 item 2 (2026-09-10)**. | `pvfs-companion/src/main.rs:25` |
+| `export --fetch` has no unfetchable memory | **Built — D122 item 7 (2026-09-10)** (`Fetcher::with_memory` / `persist_learned`). Was: `export_pass` builds a bare `Fetcher` (`jobs.rs:451`); so do the CLI's one-shot `tier`, `sync`, `export --fetch` and `cat` (`pvfs-cli/src/main.rs:5179, 5524, 7020, 7055`). Only `sync_pass` and the `tier` job seed and persist, each with its own copy of the same ten lines. | D122 item 7 |
+| `policy_for_uri` unescaped LIKE | **Built — D124 item 1 (2026-09-10)**: a `substr` prefix compare. Was: `?1 LIKE source_uri \|\| '/%'` at `fs.rs:2051`. The NAS binds `…/Data_ext/Media`, so the `_` wildcard is live in production; no sibling path differs at that character today, so the only cost is the one waiting to happen. The other LIKEs (`fs.rs:3051`, `engine.rs:2214/2298/2331`) match constant prefixes and are fine. | D124 item 1 |
+| Quarantine lookup fail-open | **Built — D122 item 1 (2026-09-10)**: the three sites propagate. Was: `unwrap_or_default()` at `fetch.rs:189`, `fetch.rs:246`, `sync.rs:1214`. A DB error reads as "nothing quarantined" in the three places quarantine is supposed to protect. | D122 item 1 |
+| Integrity mismatches never enter `fetch_unfetchable` | **Built — D122 item 5 (2026-09-10)**: an attributed mismatch is `Permanent` and remembered. Was open in code, masked on the fleet (§0 item 3). | D122 item 5 |
 | Pipeline slot reaping | **Fixed by D121** (`906c39b`): idle slots older than two days are reaped at report time. presubuntu is at 58 % with two slots (`/opt/pvfs` 25 G, `/opt/pvfs-roll` 624 M). | — |
 | Stale docs | `docs/04` and `deploy/ansible/README.md` corrected in this branch (§7). `docs/08`'s header still says 2026-08-13, but D118 put a banner under it naming D117 and saying plainly that the body stopped tracking reality at D29 — honest as it stands. | — |
 | Stall detector is "overdue", not progress | **Open by design** — doc 24 §14 item 1; needs a progress signal out of `scan_routed` and `tier_pass`. The QNAP shows `follow overdue` right now for exactly this reason. | deferred |
-| No `prepare_purge` / `prepare_quality` | **Confirmed.** `WriteOp` has thirteen variants (`Mkdir … Mv`, `pvfs-proto`) and neither is among them; `Cmd::Purge` calls `engine.purge` directly (`main.rs:3843`) and `Cmd::Quality(Set)` calls `engine.set_media_quality` directly (`main.rs:2761`) with no `is_replica()` branch, unlike `Mv`/`Relabel` beside them. What a replica does on those two commands today was not traced here; at minimum, it does not route. | D124 item 7 |
+| No `prepare_purge` / `prepare_quality` | **Built — D124 item 7 (2026-09-10)**: `WriteOp::Purge` / `SetQuality`, proto 6. Was confirmed: `WriteOp` has thirteen variants (`Mkdir … Mv`, `pvfs-proto`) and neither is among them; `Cmd::Purge` calls `engine.purge` directly (`main.rs:3843`) and `Cmd::Quality(Set)` calls `engine.set_media_quality` directly (`main.rs:2761`) with no `is_replica()` branch, unlike `Mv`/`Relabel` beside them. What a replica does on those two commands today was not traced here; at minimum, it does not route. | D124 item 7 |
 
 ---
 
@@ -147,12 +147,12 @@ says so.
 
 | Item | Verdict |
 |---|---|
-| Shared `/tmp/pvfsd-journal.txt` | Open — `pipeline.yml:398, 458`. Two-line fix (D124 item 4). |
-| `rust-version = "1.75"` vs CI 1.96 | Open — `Cargo.toml:16`. Nothing builds with 1.75 to prove the claim. D124 item 5. |
+| Shared `/tmp/pvfsd-journal.txt` | **Built — D124 item 4 (2026-09-10).** Was open — `pipeline.yml:398, 458`. Two-line fix (D124 item 4). |
+| `rust-version = "1.75"` vs CI 1.96 | **Built — D124 item 5 (2026-09-10)**: `1.96`. Was open — `Cargo.toml:16`. Nothing builds with 1.75 to prove the claim. D124 item 5. |
 | `is_sidecar_name` is `ends_with(".manifest")` | By design: v1 sidecars had no dot prefix and are still on disk. Keep; a coincidental `*.manifest` media file is skipped from the scan, which is the cheaper mistake. |
-| Duplicate quarantine helpers / inline SQL in `stat_node` | Open — `fetch.rs:30` and `:45` differ only in the error type; `stat_node` (`fs.rs:2963`) and `first_readable_location` (`fs.rs:2716`) each spell the same two lookups. D124 item 6. |
+| Duplicate quarantine helpers / inline SQL in `stat_node` | **Built — D124 item 6 (2026-09-10)**: `location_flags`. Was open — `fetch.rs:30` and `:45` differ only in the error type; `stat_node` (`fs.rs:2963`) and `first_readable_location` (`fs.rs:2716`) each spell the same two lookups. D124 item 6. |
 | Watchdog vs NAS binary swap; `watchdog.sh` not in this repo | Both scripts live in the PVOS repo: `deploy/ansible/fleet/nas-watchdog.sh` and `deploy/ansible/fleet/build-nas.sh`. The QNAP's `bin/watchdog.sh` is byte-identical to `nas-watchdog.sh` (trailing whitespace aside). `fleet.yml` still does not bracket it — doc 24 §14 item 6, open. |
-| `build.rs` git-describe cache misses tag-only changes | Confirmed: `rerun-if-changed` names `.git/HEAD` and `.git/index`; a new tag touches `refs/tags/` or `packed-refs`. D124 item 3. Pipeline builds are covered by `PVFS_BUILD`; the NAS build (§1) is not. |
+| `build.rs` git-describe cache misses tag-only changes | **Built — D124 item 3 (2026-09-10).** Was confirmed: `rerun-if-changed` names `.git/HEAD` and `.git/index`; a new tag touches `refs/tags/` or `packed-refs`. D124 item 3. Pipeline builds are covered by `PVFS_BUILD`; the NAS build (§1) is not. |
 
 ---
 
@@ -193,6 +193,10 @@ Numbers are provisional (D105 was taken once already); renumber if a
 concurrent session claims them.
 
 ### D122 — quarantine is consulted everywhere, and the source earns its place
+
+*Built 2026-09-10, branch `d122-quarantine-everywhere`; deviations in PVOS
+`docs/milestones/D122-quarantine-everywhere.md` §7. Item 8's one-holder
+swarm-mismatch integration test is the one piece not written (see there).*
 
 The theme: every place that decides "where can the bytes come from" or "are
 the bytes already here" asks the same question of the same table, fails
@@ -246,6 +250,9 @@ closed, and says what it learned in a type rather than a string.
 
 ### D123 — a disabled job stops, and says so
 
+*Built 2026-09-10, branch `d123-disabled-job-stops`; deviations in PVOS
+`docs/milestones/D123-disabled-job-stops.md` §7.*
+
 Closes doc 24 §14 item 2 and the review's High #3.
 
 1. `PERIODIC` arm of `jobs::run`: a disabled job with a live pass gets
@@ -261,6 +268,9 @@ Closes doc 24 §14 item 2 and the review's High #3.
    is `None`, and the pass thread has exited.
 
 ### D124 — hygiene, one small commit each
+
+*Built 2026-09-10, branch `d124-hygiene` (stacked on D122 → D123); deviations
+in PVOS `docs/milestones/D124-hygiene.md` §6.*
 
 1. `policy_for_uri`: `substr(?1, 1, length(source_uri) + 1) = source_uri || '/'`
    plus a test with a sibling root that differs only at a `_`.

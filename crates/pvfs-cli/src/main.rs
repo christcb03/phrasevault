@@ -2772,8 +2772,19 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             if !codec.is_empty() {
                 q.video_codec = codec;
             }
-            engine.set_media_quality(&node, &q, &source)?;
-            engine.close()?;
+            // D124 item 7 — a replica routes through the owner, like `mv`.
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client
+                    .set_quality(&node, &q.encode(), &source, |d| sign(d))
+                    .map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.set_media_quality(&node, &q, &source)?;
+                engine.close()?;
+            }
             println!("recorded [{source}] {}x{}", q.width, q.height);
             Ok(())
         }
@@ -3854,13 +3865,24 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 });
             }
             let mut engine = Engine::open(&ctx?)?;
-            engine.purge(&ids)?;
+            // D124 item 7 — a replica routes through the owner, like `mv`.
+            // Before this it called the engine and was refused as read-only.
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                client.purge(&ids, |d| sign(d)).map_err(remote_err)?;
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                engine.purge(&ids)?;
+                engine.close()?;
+            }
             if json {
                 println!("{{\"purged\":{}}}", ids.len());
             } else {
                 println!("purged {} node(s)", ids.len());
             }
-            engine.close()
+            Ok(())
         }
         Cmd::Device(dev) => {
             let state_dir = ctx?;
@@ -5190,7 +5212,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // The pass itself is shared with pvfsd's `tier` job (P5.3).
             let mut engine = Engine::open(&ctx?)?;
             let data_dir = engine.data_dir().to_path_buf();
-            let mut fetcher = Fetcher::new(&data_dir);
+            let mut fetcher = Fetcher::with_memory(&engine, &data_dir);
             let ruleset = rules.then(|| pvfs_core::media::Rules {
                 size_margin_pct: size_margin,
                 ..Default::default()
@@ -5201,6 +5223,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 dry_run,
                 ruleset,
             )?;
+            fetcher.persist_learned(&engine);
             let Some(report) = report else {
                 return Err(PvfsError::BadInput {
                     field: "tier".into(),
@@ -5289,7 +5312,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 pvfs_client::advertise::retract_pass(&dir, route)?
             };
             let mut engine = Engine::open(&dir)?;
-            let report = pvfs_core::sync::evict_pass(&mut engine)?;
+            let report = pvfs_core::sync::evict_pass(&mut engine, &std::sync::atomic::AtomicBool::new(false))?;
             let (evicted, freed, skipped) = (
                 report.evicted + retract.retracted,
                 report.freed_bytes + retract.freed_bytes,
@@ -5535,7 +5558,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             };
             let data_dir = engine.data_dir().to_path_buf();
-            let mut fetcher = Fetcher::new(&data_dir);
+            let mut fetcher = Fetcher::with_memory(&engine, &data_dir);
             if !fetcher.has_any_source() {
                 return Err(PvfsError::BadInput {
                     field: "sync".into(),
@@ -5545,6 +5568,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 });
             }
             let (fetched, failed) = sync_pull(&mut engine, &mut fetcher, &roots)?;
+            fetcher.persist_learned(&engine);
             // F5.5 (doc 17 §7.7): subtrees placed `sync --advertise` log
             // their fetched copies as this box's locations — catch-up
             // included, so a re-run advertises files fetched before the
@@ -7110,8 +7134,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 && engine.node(&id)?.map(|n| n.node_type) == Some(pvfs_core::TYPE_FILE.into())
             {
                 let data_dir = engine.data_dir().to_path_buf();
-                let mut fetcher = Fetcher::new(&data_dir);
+                let mut fetcher = Fetcher::with_memory(&engine, &data_dir);
                 if let Err(e) = fetcher.fetch(&mut engine, &id) {
+                    let e = e.to_string();
                     if !e.is_empty() {
                         eprintln!("read-through: {e}");
                     }
@@ -7145,9 +7170,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let (mut engine, id) = engine_and_node(ctx, &target)?;
             if fetch {
                 let data_dir = engine.data_dir().to_path_buf();
-                let mut fetcher = Fetcher::new(&data_dir);
+                let mut fetcher = Fetcher::with_memory(&engine, &data_dir);
                 let (fetched, failed) =
                     sync_pull(&mut engine, &mut fetcher, std::slice::from_ref(&id))?;
+                fetcher.persist_learned(&engine);
                 for (label, e) in &failed {
                     eprintln!("fetch failed: {label} — {e}");
                 }

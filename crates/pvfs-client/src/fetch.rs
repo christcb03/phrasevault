@@ -27,18 +27,42 @@ use crate::Client;
 /// typed `PvfsError` is gone by the time the caller sees it; match on the
 /// wording `swarm_publish` produces instead. Narrow on purpose: only an id
 /// mismatch means "these bytes are not what the catalog names".
-fn quarantine_stale_str(engine: &Engine, id: &str, pin: &str, e: &str) {
-    if !e.contains("integrity violation") || !e.contains("id mismatch") {
-        return;
+/// D122 item 5 — what a failed fetch MEANS, so the callers stop keying on a
+/// sentence. `Permanent`: asking again without a catalogue change cannot
+/// succeed (every holder quarantined; every catalogue-named holder answered
+/// not_found; a mismatch attributed and nothing left). `Transient`: a dial,
+/// read or lookup failed and a later pass may do better.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    Permanent(String),
+    Transient(String),
+}
+
+impl FetchError {
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, FetchError::Permanent(_))
     }
-    let reason = format!("id mismatch on swarm fetch: {e}");
-    match engine.quarantine_locations_at_pin(id, pin, &reason) {
-        Ok(uris) => {
-            for uri in uris {
-                eprintln!("fetch: quarantined stale location {uri} ({id})");
-            }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Permanent(m) | FetchError::Transient(m) => f.write_str(m),
         }
-        Err(err) => eprintln!("fetch: could not quarantine {id} at {pin}: {err}"),
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// D122 item 3 — attribute a whole-file id mismatch by who SERVED: with
+/// exactly one contributor the wrong bytes are its; with none or several
+/// nobody is blamed (the old rule blamed the only CANDIDATE, which on the
+/// holder was a box that had served nothing).
+pub fn attribute_mismatch(counts: &[(String, u64)]) -> Option<&str> {
+    let mut served = counts.iter().filter(|(_, n)| *n > 0);
+    match (served.next(), served.next()) {
+        (Some((key, _)), None) => Some(key.as_str()),
+        _ => None,
     }
 }
 
@@ -113,6 +137,9 @@ pub struct Fetcher {
     /// Seeded by the caller (the daemon carries it across passes, since a
     /// `Fetcher` lives for one) and read back after.
     unfetchable: HashSet<String>,
+    /// D122 — what this fetcher was TOLD (memory loaded or seeded), so
+    /// `persist_learned` writes back only what it found out itself.
+    seeded: HashSet<String>,
     instances: Vec<(String, String, String)>,
     source: Option<ReplicaSource>,
     /// F5.7: catalog-published endpoints (pin → addr), lazily loaded once
@@ -135,6 +162,7 @@ impl Fetcher {
             pool: HashMap::new(),
             dead: HashSet::new(),
             unfetchable: HashSet::new(),
+            seeded: HashSet::new(),
             instances: load_instances().unwrap_or_default(),
             endpoints: None,
             source: ReplicaSource::load(data_dir).ok(),
@@ -147,14 +175,49 @@ impl Fetcher {
     /// D98 — seed the known-unfetchable set (the daemon carries it between
     /// passes) and read it back afterwards.
     pub fn seed_unfetchable(&mut self, ids: impl IntoIterator<Item = String>) {
+        let ids: Vec<String> = ids.into_iter().collect();
+        self.seeded.extend(ids.iter().cloned());
         self.unfetchable.extend(ids);
+    }
+
+    /// D122 item 7 — ONE memory, one constructor: a fetcher that already
+    /// knows what earlier passes found nowhere (`unfetchable_load`, the
+    /// D99 durable set). `sync`, `tier`, `export --fetch` and `cat` each used
+    /// to build a bare fetcher and re-ask the fleet a question answered
+    /// "nobody"; the ten seed/persist lines existed in two hand copies.
+    /// Best-effort on the load: a missing memory costs time, never truth.
+    pub fn with_memory(engine: &Engine, data_dir: &std::path::Path) -> Fetcher {
+        let mut f = Fetcher::new(data_dir);
+        f.seed_unfetchable(engine.unfetchable_load().unwrap_or_default());
+        f
+    }
+
+    /// D122 item 7 — save what THIS fetcher newly learned (its set minus what
+    /// it was told), and return it so a caller keeping its own in-memory copy
+    /// (the tier job) can extend that too. Rewriting the whole set every pass
+    /// would be thousands of pointless writes. Best-effort, like the load.
+    pub fn persist_learned(&mut self, engine: &Engine) -> Vec<String> {
+        let fresh: Vec<String> = self
+            .unfetchable
+            .iter()
+            .filter(|id| !self.seeded.contains(*id))
+            .cloned()
+            .collect();
+        if !fresh.is_empty() {
+            let _ = engine.unfetchable_save(&fresh);
+            self.seeded.extend(fresh.iter().cloned());
+        }
+        fresh
     }
 
     pub fn unfetchable(&self) -> &HashSet<String> {
         &self.unfetchable
     }
 
-    fn note_unfetchable(&mut self, id: &str) {
+    /// Remember that every catalogue-named holder answered "nowhere" for
+    /// `id` (D98). Public since D122, so a caller that learns it another way
+    /// can say so.
+    pub fn note_unfetchable(&mut self, id: &str) {
         self.unfetchable.insert(id.to_string());
     }
 
@@ -179,15 +242,34 @@ impl Fetcher {
     /// Where a file's bytes can be fetched from, in preference order:
     /// registry-resolved holders, catalog-taught holders (F5.7), then the
     /// replica's source. Public because tests and tooling reason about it.
-    pub fn candidates(&mut self, engine: &Engine, id: &str) -> Vec<ReplicaSource> {
+    pub fn candidates(&mut self, engine: &Engine, id: &str) -> Result<Vec<ReplicaSource>, String> {
         let mut out: Vec<ReplicaSource> = Vec::new();
         // D99 — a location we have already caught serving the wrong bytes is
         // not a candidate. Without this the quarantine would only RECORD the
         // problem: `locations()` deliberately still returns quarantined URIs
         // (evict, reclaim and `loc_verify` all need them), so the mover would
         // have gone right on re-fetching the same doomed node every pass.
-        let banned = engine.quarantined_uris(id).unwrap_or_default();
-        for loc in engine.locations(&id.to_string()).unwrap_or_default() {
+        // D122 item 1 — and fail CLOSED: a DB error here is "cannot decide",
+        // never "nothing is quarantined".
+        let banned = engine
+            .quarantined_uris(id)
+            .map_err(|e| format!("quarantine lookup failed for {id}: {e}"))?;
+        let locations = engine
+            .locations(&id.to_string())
+            .map_err(|e| format!("location lookup failed for {id}: {e}"))?;
+        // D122 item 2 — the source is a candidate only when the catalogue says
+        // it could serve: a bare file:// (host-implicit — the owner's own disk,
+        // the lab shape) or a location pin-qualified to the source itself. On
+        // the production holder every location names OTHER boxes, and the
+        // owner, which holds no bytes, was 41,240 of 42,570 failed dials.
+        let source_holds = locations.iter().any(|loc| {
+            !banned.contains(loc)
+                && match pvfs_core::storage::parse_host_uri(loc) {
+                    Some((pin, _)) => self.source.as_ref().is_some_and(|s| s.pin == pin),
+                    None => loc.starts_with("file://"),
+                }
+        });
+        for loc in locations {
             if banned.contains(&loc) {
                 continue;
             }
@@ -217,90 +299,49 @@ impl Fetcher {
                 }
             }
         }
-        if let Some(src) = &self.source {
-            out.push(src.clone());
+        if source_holds {
+            if let Some(src) = &self.source {
+                out.push(src.clone());
+            }
         }
         out.dedup_by(|a, b| a.transport == b.transport && a.target == b.target);
-        out
+        Ok(out)
     }
 
-    /// Fetch one file into the sync store, verified. `Err` is the last
-    /// candidate's failure (or why there were none). P9 (doc 22): with two or
+    /// Fetch one file into the sync store, verified. P9 (doc 22): with two or
     /// more reachable holders and a hashed multi-chunk file, the bytes arrive
     /// as a parallel chunk swarm; anything else takes the single-stream path.
-    pub fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), String> {
-        let candidates = self.candidates(engine, id);
+    ///
+    /// D122: the outcome is TYPED. `Permanent` — asking again without a
+    /// catalogue change cannot succeed: every holder is quarantined, or every
+    /// catalogue-named holder answered not_found (with item 2 that is the only
+    /// kind of holder left), or a mismatch was attributed and nothing remains.
+    /// `Transient` — a dial, read or lookup failed; a later pass may do better.
+    pub fn fetch(&mut self, engine: &mut Engine, id: &str) -> Result<(), FetchError> {
+        let mut candidates = self.candidates(engine, id).map_err(FetchError::Transient)?;
         if candidates.is_empty() {
-            // D99 — two very different reasons to have no candidate, and they
-            // must not be reported the same way.
-            //
-            // Everything quarantined = the catalog names bytes no holder
-            // actually has any more. Nothing will change until the CATALOG
-            // does, so it carries the "no readable location" wording D98 keys
-            // its memory on, and the mover stops asking. Without this the fix
-            // merely swapped one error repeated every pass for another.
-            //
-            // No instance registered is an operator's to fix, and D98
-            // deliberately does NOT cache it — caching would hide the very
-            // condition the operator needs to see.
-            if !engine.quarantined_uris(id).unwrap_or_default().is_empty() {
-                return Err("no readable location for file: every known holder is \
-                            quarantined (its bytes did not match the catalog)"
-                    .into());
-            }
-            return Err("no reachable source holds this file (register the holding \
-                        instance with `pvfs instance add`)"
-                .into());
+            return Err(self.nothing_left(engine, id));
         }
-        // D84 — ALWAYS try the swarm. It used to be gated on `candidates.len()
-        // >= 2`, which skipped it by ARITY rather than capability: the whole
-        // production fleet has one holder for ingest bytes, so every real fetch
-        // took the single-stream path below — a whole-file `cat` with no
-        // resume, no per-chunk verification, and (until D83) no logging. Multi-
-        // GB fetches were abandoned for hours against an empty log.
-        //
-        // A swarm of one is still chunked, resumable and hash-verified per
-        // chunk; it is strictly better than the fallback, and most so on a
-        // single WAN link where a dropped stream is likeliest.
-        //
-        // Chris: "the whole point of this file system was the swarm was the
-        // ability to serve data from any node anywhere in the swarm... that
-        // should be the method to pull files always."
-        {
-            match self.swarm_fetch(engine, id, &candidates) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {} // not swarm-eligible — single-stream below
-                Err(e) => {
-                    // the partial (if any) stays for resume; a fresh attempt
-                    // may still succeed single-stream from one good holder
-                    eprintln!("swarm: falling back to single-stream ({e})");
-                    // D102 — with exactly ONE candidate, a whole-file mismatch
-                    // names its source: there is nowhere else the bytes could
-                    // have come from. D99 declined to quarantine here because a
-                    // multi-holder swarm cannot attribute a bad chunk — sound,
-                    // and incomplete, because the production holder pulls from
-                    // a single peer, so the case it declined is the only one
-                    // that occurs.
-                    //
-                    // Cost of leaving it: the log showed `resumed 663/663
-                    // chunks` — the file complete on disk and already proven
-                    // not to match — followed by a single-stream re-download of
-                    // 5.5 GB over the WAN to fail the identical check, every
-                    // pass, forever.
-                    if candidates.len() == 1 {
-                        if let Some(pin) = candidates.first().map(|c| c.pin.clone()) {
-                            if !pin.is_empty() {
-                                quarantine_stale_str(engine, id, &pin, &e);
-                            }
-                        }
-                    }
+        match self.swarm_fetch(engine, id, &candidates) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {} // not swarm-eligible — single-stream below
+            Err(e) => {
+                eprintln!("swarm: falling back to single-stream ({e})");
+                // D122 item 4 — an attributed mismatch has quarantined its
+                // holder inside the swarm. Ask the catalogue again rather than
+                // stream from the pin that just served the wrong bytes.
+                candidates = self.candidates(engine, id).map_err(FetchError::Transient)?;
+                if candidates.is_empty() {
+                    return Err(self.nothing_left(engine, id));
                 }
             }
         }
         let mut last_err = String::new();
+        let mut transient = false;
         for cand in candidates {
             let key = format!("{}:{}", cand.transport, cand.target);
             if self.dead.contains(&key) {
+                transient = true; // a peer this fetcher could not reach
                 continue;
             }
             if !self.pool.contains_key(&key) {
@@ -311,6 +352,7 @@ impl Fetcher {
                     Err(e) => {
                         last_err = e.to_string();
                         self.dead.insert(key);
+                        transient = true;
                         continue;
                     }
                 }
@@ -318,42 +360,33 @@ impl Fetcher {
             let client = self.pool.get_mut(&key).expect("inserted above");
             let mut sink = match engine.sync_begin(&id.to_string()) {
                 Ok(s) => s,
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(FetchError::Transient(e.to_string())),
             };
             match client.cat(id, &mut sink) {
                 Ok(_) => match engine.sync_commit(sink) {
                     Ok(_) => {
-                        // D99 — say so. Every branch here logged a failure and
-                        // none logged a success, so an empty log could not tell
-                        // "moving nothing" from "moving everything quietly",
-                        // and a live investigation read it the wrong way.
                         eprintln!("fetch: {id} committed from {key}");
                         return Ok(());
                     }
                     Err(e) => {
-                        // D83 — the bytes arrived and the COMMIT refused. A
-                        // different failure entirely from a broken stream, and
-                        // indistinguishable in `last_err` alone.
                         eprintln!("fetch: {id} streamed but commit failed from {key}: {e}");
-                        // D99 — an id mismatch is not a transient failure: the
-                        // holder's bytes are not what the catalog names, and
-                        // they will not become so by asking again. Record it
-                        // where `read_verified` records the local equivalent.
+                        // An id mismatch quarantines THIS holder (D99); the
+                        // loop goes on to the next one, never back to this pin.
                         quarantine_stale(engine, id, &cand.pin, &e);
+                        if !matches!(e, PvfsError::Integrity { .. }) {
+                            transient = true;
+                        }
                         last_err = e.to_string();
                     }
                 },
                 Err(e) => {
-                    // D83 — say it HERE, not only if every candidate fails.
-                    //
-                    // This is the path production actually takes: the swarm
-                    // needs two or more holders, and with one holder it is
-                    // skipped entirely. So the swarm's diagnostics never fire,
-                    // and a stream that dies mid-file left no trace at all —
-                    // fetches were abandoned at multiple GB for hours with an
-                    // empty log and nothing to read.
                     eprintln!("fetch: {id} stream failed from {key}: {e}");
-                    // a failed stream may leave the connection out of step
+                    // A catalogue-named holder without the bytes is the
+                    // catalogue being wrong about it — permanent until it
+                    // changes. Anything else is the network.
+                    if !matches!(&e, crate::ClientError::Server { code, .. } if code == "not_found") {
+                        transient = true;
+                    }
                     last_err = e.to_string();
                     self.pool.remove(&key);
                 }
@@ -365,7 +398,31 @@ impl Fetcher {
                  on the owner, run `pvfs fleet enroll <this box's 'pvfs whoami' pubkey>`",
             );
         }
-        Err(last_err)
+        Err(if transient {
+            FetchError::Transient(last_err)
+        } else {
+            FetchError::Permanent(last_err)
+        })
+    }
+
+    /// Nothing to ask. Permanent when the catalogue's holders are all
+    /// quarantined; transient when no holder is REACHABLE — a registry gap a
+    /// person can close without touching the catalogue — or the lookup
+    /// itself failed.
+    fn nothing_left(&self, engine: &Engine, id: &str) -> FetchError {
+        match engine.quarantined_uris(id) {
+            Err(e) => FetchError::Transient(format!("quarantine lookup failed for {id}: {e}")),
+            Ok(q) if !q.is_empty() => FetchError::Permanent(
+                "no readable location for file: every known holder is \
+                 quarantined (its bytes did not match the catalog)"
+                    .into(),
+            ),
+            Ok(_) => FetchError::Transient(
+                "no reachable source holds this file (register the holding \
+                 instance with `pvfs instance add`)"
+                    .into(),
+            ),
+        }
     }
 
     /// The all-holder parallel pull (P9, doc 22 §3). `Ok(true)` = published;
@@ -414,8 +471,12 @@ impl Fetcher {
 
         // Dial every candidate; each worker owns its connection.
         let mut holders: Vec<(String, Client)> = Vec::new();
+        // D122 item 3 — who is behind each holder key, so a mismatch can be
+        // attributed to the pin that served it.
+        let mut pin_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for cand in candidates {
             let key = format!("{}:{}", cand.transport, cand.target);
+            pin_of.entry(key.clone()).or_insert_with(|| cand.pin.clone());
             if self.dead.contains(&key) || holders.iter().any(|(k, _)| *k == key) {
                 continue;
             }
@@ -617,9 +678,21 @@ impl Fetcher {
             ));
         }
         let stats = counts.into_inner().unwrap();
-        engine
-            .swarm_commit(&id.to_string(), &part, &manifest)
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = engine.swarm_commit(&id.to_string(), &part, &manifest) {
+            // D122 item 3 — attribute by who SERVED, not by how many could
+            // have: with exactly one contributor the wrong bytes are its. The
+            // caller then re-asks the catalogue (item 4) rather than streaming
+            // from the pin that just served them.
+            if matches!(e, PvfsError::Integrity { .. }) {
+                if let Some(pin) = attribute_mismatch(&stats)
+                    .and_then(|key| pin_of.get(key))
+                    .filter(|p| !p.is_empty())
+                {
+                    quarantine_stale(engine, id, pin, &e);
+                }
+            }
+            return Err(e.to_string());
+        }
         let total: u64 = stats.iter().map(|(_, n)| n).sum();
         let desc: Vec<String> = stats.iter().map(|(k, n)| format!("{k}={n}")).collect();
         eprintln!(
@@ -1052,6 +1125,9 @@ fn tier_pass_inner(
                     .collect()
             };
 
+            // D122 item 6 — a quarantined copy is not a central copy, in
+            // either arm; evict_pass has said so since D99.
+            let banned = engine.quarantined_uris(&id)?;
             let has_central = match &tree_dest {
                 Some(want) => {
                     let want_uri = pvfs_core::storage::path_to_uri(want)?;
@@ -1081,6 +1157,9 @@ fn tier_pass_inner(
                         .as_deref()
                         .map(|pin| format!("pvfs-host://{pin}{}", want.display()));
                     engine.locations(&id)?.iter().any(|u| {
+                        if banned.contains(u) {
+                            return false;
+                        }
                         if u == &want_uri || want_host.as_deref().is_some_and(|w| u == w) {
                             return true;
                         }
@@ -1090,6 +1169,9 @@ fn tier_pass_inner(
                     })
                 }
                 None => engine.locations(&id)?.iter().any(|u| {
+                    if banned.contains(u) {
+                        return false;
+                    }
                     if keep {
                         u.starts_with(&dest_prefix)
                     } else {
@@ -1116,14 +1198,14 @@ fn tier_pass_inner(
                         continue;
                     }
                     if let Err(e) = fetcher.fetch(engine, &id) {
-                        // "no readable location" means every holder was asked
-                        // and none has it — stale catalog, not a busy peer.
-                        // Remember it, so the next pass spends its time on work
-                        // that can actually succeed.
-                        if e.contains("no readable location") {
+                        // Permanent means every holder was asked and none can
+                        // have it — stale catalog, not a busy peer. Remember
+                        // it, so the next pass spends its time on work that
+                        // can actually succeed (D98; typed since D122).
+                        if e.is_permanent() {
                             fetcher.note_unfetchable(&id);
                         }
-                        report.failed.push((label, e));
+                        report.failed.push((label, e.to_string()));
                         continue; // never retire without a central copy
                     }
                 }
@@ -1629,6 +1711,11 @@ pub fn sync_pull(
     let mut failed = Vec::new();
     for root in roots {
         for (id, label) in engine.missing_bytes(root)? {
+            // D123 — a disabled `sync` job stops at the next file. The swarm
+            // already honours the flag mid-transfer; this is the gap between.
+            if fetcher.cancelled() {
+                return Ok((fetched, failed));
+            }
             // D102 — honour the same memory `tier_pass` honours. Seeding the
             // fetcher was not enough on its own: this loop never consulted the
             // set, so a node known to be nowhere was re-asked every pass, and
@@ -1639,10 +1726,10 @@ pub fn sync_pull(
             match fetcher.fetch(engine, &id) {
                 Ok(()) => fetched += 1,
                 Err(e) => {
-                    if e.contains("no readable location") {
+                    if e.is_permanent() {
                         fetcher.note_unfetchable(&id);
                     }
-                    failed.push((label, e));
+                    failed.push((label, e.to_string()));
                 }
             }
         }
@@ -1759,7 +1846,7 @@ pub fn fetch_streaming(data_dir: &std::path::Path, id: &str, progress: &SwarmPro
     let result = (|| -> Result<PathBuf, String> {
         let mut engine = Engine::open(data_dir).map_err(|e| e.to_string())?;
         let mut fetcher = Fetcher::new(data_dir);
-        let candidates = fetcher.candidates(&engine, id);
+        let candidates = fetcher.candidates(&engine, id)?;
         if candidates.is_empty() {
             return Err("no reachable source holds this file".into());
         }
@@ -1768,7 +1855,7 @@ pub fn fetch_streaming(data_dir: &std::path::Path, id: &str, progress: &SwarmPro
             Ok(false) | Err(_) => {
                 // ineligible or failed mid-swarm: the blocking path (any
                 // partial stays for a later resume)
-                fetcher.fetch(&mut engine, id)?;
+                fetcher.fetch(&mut engine, id).map_err(|e| e.to_string())?;
             }
         }
         engine

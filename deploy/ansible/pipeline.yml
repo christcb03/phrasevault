@@ -85,14 +85,28 @@
     # rustc and clippy than CI: a change passes on presubuntu and fails on
     # GitHub, in the direction that wastes the most time. CI's own comment
     # says why it stopped floating; the pipeline never got the message.
-    - name: Install Rust toolchain (rustup, 1.96.0 — matches CI)
+    - name: Install rustup (first time only)
       ansible.builtin.shell: |
         set -o pipefail
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain 1.96.0 --profile minimal
+          | sh -s -- -y --profile minimal
       args:
         executable: /bin/bash
       when: not cargo_stat.stat.exists
+      tags: [prepare]
+
+    # D124 item 5 — the checkout's `rust-toolchain.toml` names the compiler;
+    # install it every prepare (idempotent), so a host that pre-dated the pin
+    # does not keep floating on whatever rustup was first told.
+    - name: Toolchain from rust-toolchain.toml (idempotent)
+      ansible.builtin.shell: |
+        set -o pipefail
+        rustup toolchain install 1.96.0 --profile minimal --component clippy 2>&1 | tail -1
+      args:
+        executable: /bin/bash
+      environment: "{{ cargo_env }}"
+      register: toolchain_install
+      changed_when: "'unchanged' not in toolchain_install.stdout and 'is up to date' not in toolchain_install.stdout"
       tags: [prepare]
 
     # ---- deploy ---------------------------------------------------------------
@@ -411,7 +425,7 @@
     - name: Capture the daemon journal for the report
       ansible.builtin.shell: |
         journalctl --user -u pvfsd@{{ daemon_forest }} -n 100 --no-pager \
-          > /tmp/pvfsd-journal.txt 2>&1 || true
+          > /tmp/pvfsd-journal{{ pvfs_suffix }}.txt 2>&1 || true
       environment: "{{ user_systemd_env }}"
       changed_when: false
       tags: [daemon]
@@ -471,7 +485,7 @@
         - "{{ test_results }}"
         - "{{ clippy_results }}"
         - "{{ smoke_results }}"
-        - /tmp/pvfsd-journal.txt
+        - /tmp/pvfsd-journal{{ pvfs_suffix }}.txt
       tags: [report]
 
     # D91 — the summary used to read `test_out.stdout_lines[-1]`, and the LAST

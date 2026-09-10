@@ -48,4 +48,8 @@ fn main() {
     // reusing a cached value that now names the wrong build.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
+    // D124 item 3 — a new tag touches refs/tags or packed-refs, not HEAD or
+    // the index; without these two a tag-only change kept the stale stamp.
+    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
 }

@@ -2385,8 +2385,12 @@ impl Engine {
         let got: Option<String> = self
             .conn
             .query_row(
+                // D124 item 1 — a prefix test, not LIKE: `_` and `%` in a
+                // binding root are wildcards to LIKE, and the NAS binds
+                // `…/Data_ext/Media`. `substr` compares the bytes as bytes.
                 "SELECT hash_policy FROM folder_bindings
-                 WHERE unbound_at IS NULL AND ?1 LIKE source_uri || '/%'
+                 WHERE unbound_at IS NULL
+                   AND substr(?1, 1, length(source_uri) + 1) = source_uri || '/'
                  ORDER BY LENGTH(source_uri) DESC LIMIT 1",
                 params![uri],
                 |r| r.get(0),
@@ -3046,22 +3050,38 @@ impl Engine {
         Ok(Some(path))
     }
 
+    /// D124 item 6 — the one answer to "is this location usable": the
+    /// quarantine reason if any, and whether a change is pending on it.
+    /// `first_readable_location` and `stat_node` used to spell both lookups
+    /// separately, and the review found them drifting.
+    fn location_flags(&self, id: &NodeId, uri: &str) -> Result<(Option<String>, bool)> {
+        let quarantined: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT reason FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
+                params![id, uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("location flags"))?;
+        let pending: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pending_changes WHERE file_id = ?1 AND uri = ?2",
+                params![id, uri],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("location flags"))?;
+        Ok((quarantined, pending.is_some()))
+    }
+
     fn first_readable_location(&self, id: &NodeId) -> Result<Option<String>> {
         let mut candidates = self.locations(id)?;
         candidates.sort(); // file:// before pvfs-tmp:// lexically — both local
         for uri in candidates {
-            let flagged: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM pending_changes WHERE file_id = ?1 AND uri = ?2
-                     UNION ALL
-                     SELECT 1 FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
-                    params![id, uri],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db("read resolution"))?;
-            if flagged.is_some() {
+            let (quarantined, pending) = self.location_flags(id, &uri)?;
+            if quarantined.is_some() || pending {
                 continue;
             }
             let resolved = match self.resolve_uri(&uri) {
@@ -3298,24 +3318,7 @@ impl Engine {
         let mut locations = Vec::new();
         let mut any_good = false;
         for uri in self.locations(id)? {
-            let quarantined: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT reason FROM location_quarantine WHERE file_id = ?1 AND uri = ?2",
-                    params![id, uri],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db("stat"))?;
-            let pending: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM pending_changes WHERE file_id = ?1 AND uri = ?2",
-                    params![id, uri],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db("stat"))?;
+            let (quarantined, pending) = self.location_flags(id, &uri)?;
             let st = self
                 .resolve_uri(&uri)
                 .and_then(|r| LocalBackend.stat(&r))
@@ -3325,14 +3328,14 @@ impl Engine {
                     size: 0,
                     mtime_ms: 0,
                 });
-            let good = st.exists && quarantined.is_none() && pending.is_none();
+            let good = st.exists && quarantined.is_none() && !pending;
             any_good = any_good || good;
             locations.push(LocationStat {
                 uri,
                 exists: st.exists,
                 size: st.size,
                 quarantined,
-                pending_change: pending.is_some(),
+                pending_change: pending,
             });
         }
         Ok(NodeStat {

@@ -21,8 +21,13 @@ use pvfs_companion::{
     TenantRequest, TenantResponse, UnlockedSigner, Vault, VaultStore,
 };
 
+/// D124 item 2 — the same build stamp the CLI and daemon carry (`build.rs`:
+/// `PVFS_BUILD` from the pipeline, else `git describe`), so the companion
+/// reports `1.4.0 (v1.4-…)` rather than the bare crate version.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PVFS_BUILD"), ")");
+
 #[derive(Parser)]
-#[command(name = "pvfs-companion", version, about = "PVFS companion — key vault + signing agent")]
+#[command(name = "pvfs-companion", version = VERSION, about = "PVFS companion — key vault + signing agent")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

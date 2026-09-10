@@ -796,6 +796,30 @@ impl Client {
         )
     }
 
+    /// D124 item 7 — purge orphaned nodes through the owner. Returns the last id.
+    pub fn purge<F>(&mut self, ids: &[String], sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(WriteOp::Purge { ids: ids.to_vec() }, sign)
+    }
+
+    /// D124 item 7 — record a quality measurement on `node` through the owner
+    /// (`quality` = `MediaQuality::encode`). Returns the node id.
+    pub fn set_quality<F>(&mut self, node: &str, quality: &str, source: &str, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(
+            WriteOp::SetQuality {
+                node: node.into(),
+                quality: quality.into(),
+                source: source.into(),
+            },
+            sign,
+        )
+    }
+
     /// D125 item 8 — publish the head of a catalogue region this box owns
     /// (`hash` = hex blake3 of manifest `seq`). Returns the region id.
     pub fn commit_region_head<F>(&mut self, region: &str, seq: u64, hash: &str, sign: F) -> Result<String>

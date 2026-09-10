@@ -13,7 +13,7 @@ resolver = "2"
 [workspace.package]
 version = "1.4.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.96"
 
 [workspace.dependencies]
 # `rayon`: BLAKE3 across all cores. The holder was hashing a 23TB library on

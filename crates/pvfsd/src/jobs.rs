@@ -130,7 +130,13 @@ impl JobsState {
                     enabled: en,
                     state: if en { "idle" } else { "disabled" }.to_string(),
                     last_ok_ms: prev.and_then(|p| p.last_ok_ms),
-                    last_error: prev.and_then(|p| p.last_error.clone()),
+                    // D123 — a job that was just disabled has no current
+                    // error to report; a job that stays as it was keeps its.
+                    last_error: if !en && prev.is_some_and(|p| p.enabled) {
+                        None
+                    } else {
+                        prev.and_then(|p| p.last_error.clone())
+                    },
                 }
             })
             .collect();
@@ -280,11 +286,19 @@ impl JobsState {
     /// a failed pass) land in `last_error` until a clean pass clears them.
     fn mark_pass(&self, name: &str, issue: Option<String>) {
         self.with_row(name, |r| {
-            r.state = "idle".into();
+            // D123 — a pass that ends after its job was disabled does not
+            // resurrect the row: `disabled` stands (the reload wrote it), and
+            // a pass cut short has no error worth reporting either.
             if issue.is_none() {
                 r.last_ok_ms = Some(now_ms());
             }
-            r.last_error = issue;
+            if r.enabled {
+                r.state = "idle".into();
+                r.last_error = issue;
+            } else {
+                r.state = "disabled".into();
+                r.last_error = None;
+            }
         });
     }
 }
@@ -393,33 +407,27 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
 
 /// One sync pass: fetch missing bytes for every `sync`-placed subtree.
 /// Nothing placed is a clean no-op — the job idles until placement exists.
-fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsError> {
+fn sync_pass(
+    state: &JobsState,
+    cancel: Arc<AtomicBool>,
+) -> Result<(u64, Vec<(String, String)>), PvfsError> {
     let data_dir = state.data_dir().clone();
     let roots = pvfs_core::sync::load_placement(&data_dir)?;
     if roots.is_empty() {
         return Ok((0, Vec::new()));
     }
     let mut engine = pvfs_core::Engine::open(&data_dir)?;
-    let mut fetcher = pvfs_client::fetch::Fetcher::new(&data_dir);
     // D102 — `sync` gets the SAME memory `tier` has. It never did: this
     // Fetcher was built bare, so D98's "stop asking a question already
     // answered nowhere" did not apply to it. Enabling `sync` on the
     // production holder brought the whole not_found retry storm straight back
     // through a job that had never been given the fix — the sibling-gap shape
-    // this project keeps finding. Shared durably via `fetch_unfetchable`
-    // (D99), so the two jobs teach each other and both survive a restart.
-    let known = engine.unfetchable_load().unwrap_or_default();
-    fetcher.seed_unfetchable(known.iter().cloned());
+    // this project keeps finding. D122: one constructor carries it, so the
+    // next sibling cannot miss it.
+    let mut fetcher = pvfs_client::fetch::Fetcher::with_memory(&engine, &data_dir);
+    fetcher.set_cancel(cancel);
     let r = pvfs_client::fetch::sync_pull(&mut engine, &mut fetcher, &roots);
-    let learned: Vec<String> = fetcher
-        .unfetchable()
-        .iter()
-        .filter(|id| !known.contains(*id))
-        .cloned()
-        .collect();
-    if !learned.is_empty() {
-        let _ = engine.unfetchable_save(&learned);
-    }
+    fetcher.persist_learned(&engine);
     let is_replica = engine.is_replica();
     engine.close()?;
     // F5.5: advertise fetched copies for `sync --advertise` subtrees — the
@@ -437,7 +445,7 @@ fn sync_pass(state: &JobsState) -> Result<(u64, Vec<(String, String)>), PvfsErro
 
 /// One export pass: re-run every kept-fresh export (`pvfs export
 /// --keep-fresh`), fetching first where the entry asked for it.
-fn export_pass(state: &JobsState) -> Result<u64, PvfsError> {
+fn export_pass(state: &JobsState, cancel: Arc<AtomicBool>) -> Result<u64, PvfsError> {
     let data_dir = state.data_dir().clone();
     let entries = pvfs_core::serve::load_exports(&data_dir)?;
     if entries.is_empty() {
@@ -448,7 +456,11 @@ fn export_pass(state: &JobsState) -> Result<u64, PvfsError> {
     let mut exported = 0u64;
     for e in &entries {
         if e.fetch {
-            let f = fetcher.get_or_insert_with(|| pvfs_client::fetch::Fetcher::new(&data_dir));
+            let f = fetcher.get_or_insert_with(|| {
+                let mut f = pvfs_client::fetch::Fetcher::with_memory(&engine, &data_dir);
+                f.set_cancel(Arc::clone(&cancel));
+                f
+            });
             // per-file fetch failures are the export's skips, not a pass error
             let _ = pvfs_client::fetch::sync_pull(&mut engine, f, std::slice::from_ref(&e.node));
         }
@@ -472,10 +484,13 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
     // The mover now gets the flag and honours it (D83).
     let stop = Arc::new(AtomicBool::new(false));
     let st = Arc::clone(state);
+    // D123 — every pass gets the flag; the runner sets it when the job is
+    // disabled mid-pass (and at shutdown, as before).
+    let cancel = Arc::clone(&stop);
     let handle = match name {
         "sync" => std::thread::spawn(move || {
             st.set_state("sync", "running");
-            match sync_pass(&st) {
+            match sync_pass(&st, cancel) {
                 Ok((fetched, failed)) => {
                     let issue = failed.first().map(|(label, e)| {
                         format!("{} fetch failures (first: {label} — {e})", failed.len())
@@ -491,7 +506,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         }),
         "export" => std::thread::spawn(move || {
             st.set_state("export", "running");
-            match export_pass(&st) {
+            match export_pass(&st, cancel) {
                 Ok(_) => st.mark_pass("export", None),
                 Err(e) => st.mark_pass("export", Some(e.to_string())),
             }
@@ -521,7 +536,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     let mut mem = st.tier_unfetchable.lock().unwrap();
                     mem.extend(known.iter().cloned());
                     fetcher.seed_unfetchable(mem.iter().cloned());
-                } else if n % UNFETCHABLE_RECHECK_PASSES == 0 {
+                } else if n.is_multiple_of(UNFETCHABLE_RECHECK_PASSES) {
                     // periodic amnesia, so a repaired catalog gets a fresh
                     // hearing — now clearing the durable copy too, or the
                     // next restart would resurrect what we just forgave.
@@ -533,24 +548,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     );
                 }
                 let r = pvfs_client::fetch::tier_pass(&mut engine, &mut fetcher);
-                // Persist only what THIS pass newly learned: the fetcher's set
-                // includes everything it was seeded with, and rewriting all of
-                // it every five minutes would be thousands of pointless writes.
-                let learned: Vec<String> = {
-                    let mut mem = st.tier_unfetchable.lock().unwrap();
-                    let fresh: Vec<String> = fetcher
-                        .unfetchable()
-                        .iter()
-                        .filter(|id| !mem.contains(*id))
-                        .cloned()
-                        .collect();
-                    mem.extend(fresh.iter().cloned());
-                    fresh
-                };
-                if !learned.is_empty() {
-                    // best-effort: losing the hint costs time, never truth
-                    let _ = engine.unfetchable_save(&learned);
-                }
+                // Persist only what THIS pass newly learned (D122: the fetcher
+                // knows what it was seeded with), and carry it in the job's
+                // own memory for the passes until the next amnesia.
+                let learned = fetcher.persist_learned(&engine);
+                st.tier_unfetchable.lock().unwrap().extend(learned);
                 engine.close()?;
                 r
             })();
@@ -582,7 +584,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             st.set_state("reclaim", "running");
             let r = (|| -> Result<pvfs_core::sync::TrashPurge, PvfsError> {
                 let engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = pvfs_core::sync::reclaim_pass(&engine, st.data_dir());
+                let r = pvfs_core::sync::reclaim_pass(&engine, st.data_dir(), &cancel);
                 engine.close()?;
                 r
             })();
@@ -606,7 +608,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     .map(|(c, s)| (&mut *c, &**s as &dyn Fn(&[u8; 32]) -> Vec<u8>));
                 let _ = pvfs_client::advertise::retract_pass(st.data_dir(), route)?;
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = pvfs_core::sync::evict_pass(&mut engine);
+                let r = pvfs_core::sync::evict_pass(&mut engine, &cancel);
                 engine.close()?;
                 r
             })();
@@ -833,7 +835,7 @@ pub fn run(
                         retry_at.insert(name.to_string(), Instant::now() + FATAL_RETRY);
                     }
                 }
-                let ready = retry_at.get(name).map_or(true, |t| Instant::now() >= *t);
+                let ready = retry_at.get(name).is_none_or(|t| Instant::now() >= *t);
                 if ready {
                     retry_at.remove(name);
                     running.insert(name.to_string(), spawn_continuous(name, &state));
@@ -853,6 +855,14 @@ pub fn run(
             let enabled = state.row(name).map(|r| r.enabled).unwrap_or(false);
             if !enabled {
                 next_due.remove(name);
+                // D123 — a disabled job STOPS: a live pass gets its flag and
+                // drains, exactly as a continuous job does. Before this the
+                // pass ran to its natural end — hours, for a sync over a
+                // backlog — and then wrote `idle` onto a disabled row.
+                if let Some(m) = running.remove(name) {
+                    m.stop.store(true, Ordering::SeqCst);
+                    draining.push(m);
+                }
                 continue;
             }
             let live = running
@@ -865,7 +875,7 @@ pub fn run(
             if let Some(m) = running.remove(name) {
                 let _ = m.handle.join();
             }
-            let due = next_due.get(name).map_or(true, |t| Instant::now() >= *t);
+            let due = next_due.get(name).is_none_or(|t| Instant::now() >= *t);
             if state.take_nudge(name) || due {
                 next_due.insert(name.to_string(), Instant::now() + interval(name));
                 running.insert(name.to_string(), spawn_pass(name, &state));
