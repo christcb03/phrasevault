@@ -536,7 +536,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     let mut mem = st.tier_unfetchable.lock().unwrap();
                     mem.extend(known.iter().cloned());
                     fetcher.seed_unfetchable(mem.iter().cloned());
-                } else if n % UNFETCHABLE_RECHECK_PASSES == 0 {
+                } else if n.is_multiple_of(UNFETCHABLE_RECHECK_PASSES) {
                     // periodic amnesia, so a repaired catalog gets a fresh
                     // hearing — now clearing the durable copy too, or the
                     // next restart would resurrect what we just forgave.
@@ -835,7 +835,7 @@ pub fn run(
                         retry_at.insert(name.to_string(), Instant::now() + FATAL_RETRY);
                     }
                 }
-                let ready = retry_at.get(name).map_or(true, |t| Instant::now() >= *t);
+                let ready = retry_at.get(name).is_none_or(|t| Instant::now() >= *t);
                 if ready {
                     retry_at.remove(name);
                     running.insert(name.to_string(), spawn_continuous(name, &state));
@@ -875,7 +875,7 @@ pub fn run(
             if let Some(m) = running.remove(name) {
                 let _ = m.handle.join();
             }
-            let due = next_due.get(name).map_or(true, |t| Instant::now() >= *t);
+            let due = next_due.get(name).is_none_or(|t| Instant::now() >= *t);
             if state.take_nudge(name) || due {
                 next_due.insert(name.to_string(), Instant::now() + interval(name));
                 running.insert(name.to_string(), spawn_pass(name, &state));
