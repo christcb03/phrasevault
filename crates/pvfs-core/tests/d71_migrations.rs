@@ -79,6 +79,21 @@ fn rewind_to_v7(data_dir: &Path) {
         "DROP INDEX IF EXISTS idx_links_label;
          ALTER TABLE links DROP COLUMN label;
          ALTER TABLE folder_bindings DROP COLUMN bound_by;
+         -- D125 (schema 16). Rebuilt rather than DROP COLUMN: SQLite edits the
+         -- stored CREATE text in place and trips on the commas inside the DDL
+         -- comments (incomplete input). A real v15 table is exactly this shape.
+         CREATE TABLE regions_v15 (
+           node_id TEXT NOT NULL PRIMARY KEY, marked_at INTEGER NOT NULL,
+           state_root TEXT, baseline_seq INTEGER NOT NULL DEFAULT 0,
+           baseline_log TEXT NOT NULL DEFAULT '', parent_log TEXT NOT NULL DEFAULT '',
+           log_file TEXT, committed_seq INTEGER NOT NULL DEFAULT 0,
+           committed_head TEXT NOT NULL DEFAULT '');
+         INSERT INTO regions_v15 SELECT node_id, marked_at, state_root, baseline_seq,
+           baseline_log, parent_log, log_file, committed_seq, committed_head FROM regions;
+         DROP TABLE regions;
+         ALTER TABLE regions_v15 RENAME TO regions;
+         DROP TABLE region_entries;
+         DROP TABLE region_snapshots;
          UPDATE projection_meta SET v = '7' WHERE k = 'schema_version';",
     )
     .unwrap();
