@@ -20,8 +20,8 @@ Two capabilities, in doc 17 §8's order:
    consumer browses a pointer-mode library as a real filesystem. The materialized
    export stays the zero-dependency path.
 
-Standby failover stays a design note (§6); swarm transfer was built as its own
-arc, P9 (doc 22), and shipped in 1.4.0.
+Standby failover was built as D128 (§6, doc 28); swarm transfer was built as its
+own arc, P9 (doc 22), and shipped in 1.4.0.
 
 ## 2. Region logs — the shape (doc 13 §B, made concrete)
 
@@ -350,10 +350,14 @@ phase validates on presubuntu before its commit, as always.
   transfers** (the chaos caveat) and **serve-while-fetching** mount reads
   (punch J) — a read is served the moment its chunks land. All of it landed as
   written (doc 22 §6); punch J is retired.
-- **Standby failover (doc 03 §6 Q3):** explicit promotion only — a signed
-  `WriterPromoted` event authored with the recovery phrase (never automatic), all
-  replicas refuse the old writer's events after fold. Design compatible with
-  region-scoped writers later (§A).
+- **Standby failover (doc 03 §6 Q3) — BUILT as D128 (2026-09-10).** Explicit
+  promotion only, with the recovery phrase, never automatic — as designed. One
+  deviation: there is no new `WriterPromoted` event. The two certificates the
+  log already has say it exactly: a root-signed `DeviceAuthorized` for the
+  promoted box and a `DeviceRevoked` for the old owner, so every replica's fold
+  refuses the old writer's events by the rule it already keeps. `pvfs forest
+  promote`, `pvfs replica repoint`; runbook in doc 28. Region-scoped writers
+  (§A) remain open.
 
 ## 7. Close-out
 
