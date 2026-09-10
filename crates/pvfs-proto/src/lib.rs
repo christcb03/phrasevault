@@ -105,6 +105,11 @@ pub enum ServerMsg {
     ServeJobs {
         runner: String,
         jobs: Vec<ServeJobWire>,
+        /// D127 (doc 26 §7.5): conflicting paths in the merged view this box
+        /// holds — the in-band signal nobody has to remember to ask for.
+        /// Absent on pre-D127 daemons, so defaulted rather than a proto bump.
+        #[serde(default)]
+        conflicts: u64,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and

@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -112,7 +112,10 @@ CREATE TABLE IF NOT EXISTS regions (
   -- index (region_entries) and publishes a signed manifest hash as its head.
   -- LAST on purpose: full_rebuild copies positionally, and ALTER ADD COLUMN
   -- appends, so a migrated table and a fresh one must agree on column order.
-  kind           TEXT    NOT NULL DEFAULT 'log'
+  kind           TEXT    NOT NULL DEFAULT 'log',
+  -- D127 (doc 26 §7.3): a draining (staging) catalogue region; fleet-visible
+  -- (folded from RegionDrainSet). LAST, for the same positional reason as kind.
+  drains         INTEGER NOT NULL DEFAULT 0
 );
 
 -- P7.2a: per-log replay positions ('' = the top log, else the region root id).
@@ -1379,6 +1382,13 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             )
             .map_err(&m)?;
         }
+        Event::RegionDrainSet { node_id, drains, .. } => {
+            tx.execute(
+                "UPDATE regions SET drains = ?1 WHERE node_id = ?2",
+                params![*drains as i64, node_id],
+            )
+            .map_err(&m)?;
+        }
         Event::ChunkManifestRecorded {
             file_id,
             content_hash,
@@ -1828,7 +1838,8 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
         Event::RegionMarked { node_id, .. }
         | Event::RegionUnmarked { node_id, .. }
         | Event::RegionBaseline { node_id, .. }
-        | Event::SubRegionHead { node_id, .. } => {
+        | Event::SubRegionHead { node_id, .. }
+        | Event::RegionDrainSet { node_id, .. } => {
             require_right(conn, author, node_id, acl::ACL_A, "mark region", as_of_ms)?
         }
         Event::LinkCreated(l) => {
@@ -3000,6 +3011,7 @@ fn migrate_projection(
             13 => migrate_v13_to_v14(conn).map(|_| "fetch_unfetchable"),
             14 => migrate_v14_to_v15(conn).map(|_| "scan_unheld"),
             15 => migrate_v15_to_v16(conn).map(|_| "regions.kind; region_entries; region_snapshots"),
+            16 => migrate_v16_to_v17(conn).map(|_| "regions.drains"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -3160,6 +3172,23 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
     if have_temp == 0 {
         conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add temp_links.label"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v16_to_v17(conn: &mut Connection) -> Result<()> {
+    // D127 — additive: `drains` appended, where the fresh DDL puts it. Every
+    // existing region is a library region (0). Guarded like v15→v16.
+    let have: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('regions') WHERE name = 'drains'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_db("migrate v16→v17: probe regions.drains"))?;
+    if have == 0 {
+        conn.execute_batch("ALTER TABLE regions ADD COLUMN drains INTEGER NOT NULL DEFAULT 0;")
+            .map_err(map_db("migrate v16→v17: regions.drains"))?;
     }
     Ok(())
 }

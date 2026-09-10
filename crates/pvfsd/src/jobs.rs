@@ -29,7 +29,7 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
-const PERIODIC: [&str; 5] = ["sync", "export", "tier", "evict", "reclaim"];
+const PERIODIC: [&str; 6] = ["sync", "export", "tier", "evict", "reclaim", "resolve"];
 /// How many intervals a pass may overrun before it is called stalled. Three is
 /// slack enough for a genuinely long pass (a big tier run) without letting a
 /// hang hide for hours.
@@ -580,6 +580,27 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         // mount retires the link from whatever box the user is on; the box
         // that owns the BYTES moves them to the trash. The owner never reaches
         // across NFS to delete something on the NAS.
+        // D127 (doc 26 §7.3) — resolve the merged view's conflicts and
+        // redundancies for the draining regions THIS box owns: the losing copy
+        // goes to that region's trash; nothing on a library region is touched.
+        "resolve" => std::thread::spawn(move || {
+            st.set_state("resolve", "running");
+            let r = (|| -> Result<pvfs_core::ResolveReport, PvfsError> {
+                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
+                let r = engine.resolve_conflicts(&pvfs_core::media::Rules::default(), false, &cancel);
+                engine.close()?;
+                r
+            })();
+            match r {
+                Ok(rep) => {
+                    if !rep.trashed.is_empty() {
+                        eprintln!("pvfsd: resolve trashed {} losing copies", rep.trashed.len());
+                    }
+                    st.mark_pass("resolve", None)
+                }
+                Err(e) => st.mark_pass("resolve", Some(e.to_string())),
+            }
+        }),
         "reclaim" => std::thread::spawn(move || {
             st.set_state("reclaim", "running");
             let r = (|| -> Result<pvfs_core::sync::TrashPurge, PvfsError> {
@@ -759,6 +780,9 @@ fn interval(name: &str) -> Duration {
     match name {
         "sync" => SYNC_INTERVAL,
         "reclaim" => EVICT_INTERVAL,
+        // D127 — resolution runs on the evict cadence: what it trashes is what
+        // a scan then drops, and there is no hurry a conflict cannot wait.
+        "resolve" => EVICT_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
         // D81 — `watch` is CONTINUOUS: inotify-driven, with a reconcile as the
