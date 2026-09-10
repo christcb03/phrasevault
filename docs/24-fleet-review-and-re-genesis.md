@@ -1001,11 +1001,11 @@ is CLOSED — it fired in production on Reacher s03e08 (§11 item 12).
    item 4. Sidecar coverage is now ~96%, which was the precondition.
 
 > 2026-09-09: an external review of the D102 merge was verified against
-> D121 in [doc 26](26-d102-external-review-response.md). Items 1, 2, 6 and
+> D121 in [doc 27](27-d102-external-review-response.md). Items 1, 2, 6 and
 > 7 above are restated there with their current state; item 5 closed with
 > D121. Doc 26 §0 records the finding that reframes the mover's remaining
 > WAN re-fetches: the holder's replica source is the owner, which holds no
-> bytes.
+> bytes. (Doc 27 §0.)
 
 ## 15. D102 — the two gaps the roll itself found
 

@@ -284,6 +284,14 @@ start on the new model rather than a fresh start on the old one. The rehearsal
 already proved the import is ~5 hours and metadata-bound. Nothing about the
 current forest needs converting, because it is not being kept.
 
+**Milestone numbers.** Doc 27 (the D102 review response, same day) proposes
+D122–D124 for the fetch-path, disabled-job and hygiene fixes. Those numbers
+stand; the phases here start at **D125**. Two of doc 27's items are
+prerequisites rather than neighbours: D122 items 2–4 (the replica source is a
+candidate only when the catalogue says it could serve; attribute a swarm
+mismatch by who served) are exactly the candidate discipline §6 and phase 5–6
+rely on, and are cheaper to land on the current model first.
+
 **Sequencing note.** Phases 1–4 are the design; 5–7 are the delivery; 8 is the
 cutover. Phases 1 and 2 could be built and tested on the lab pair before a
 single production file is touched. The order of 3 and 4 could swap.

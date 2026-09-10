@@ -1,6 +1,9 @@
-# The D102 external review, verified against main (26)
+# The D102 external review, verified against main (27)
 
-Status: **Response, 2026-09-09.** An outside reviewer read `main` at `4b58039`
+Status: **Response, 2026-09-09.** Written as doc 26 by a sibling session and
+renumbered 27 on merge: doc 26 had been claimed the same day by the
+regions-own-their-files design, which the D122+ milestone numbers below will
+also have to make room for. An outside reviewer read `main` at `4b58039`
 (the D102 merge, schema 14) and produced a findings list. This document checks
 every item against `main` at `906c39b` (D121, schema 15) and against the
 production fleet, which has run `v1.4-190-gdcfb522` (D118) on all three boxes
@@ -71,7 +74,7 @@ reason to be** (§6, D122 item 2).
 | `.gitignore` blanket `*.json` | Fixed. Not re-examined here. |
 | Persistent unfetchable | Fixed (schema 14; schema is 15 since D112's `scan_unheld`). |
 | `evict_pass` / `retire_locations_under` quarantine | Fixed (`sync.rs:1214`, `engine.rs:2042`). |
-| `--version` / `git describe` | `pvfs` and `pvfsd` stamped (D110). **`pvfs-companion` is still bare `1.4.0`** (`crates/pvfs-companion/src/main.rs:25`). The QNAP binary now reports `v1.4-190-gdcfb522` — not because `build-nas.sh` stamps it (it does not) but because it builds inside a git checkout, so `build.rs`'s `git describe` fallback happens to work. §3. |
+| `--version` / `git describe` | `pvfs` and `pvfsd` stamped (D110). **`pvfs-companion` is still bare `1.4.0`** (`crates/pvfs-companion/src/main.rs:25`; confirmed on the built binary 2026-09-09). The QNAP binary reports `v1.4-190-gdcfb522` — and `build-nas.sh` on PVOS `main` indeed does not stamp it. **The reason is not a git checkout**: the build slot is rsynced without `.git`, so the `git describe` fallback yields `unknown`. It reports a version because every NAS build to date was run as `PVFS_BUILD=<describe> bash -s < build-nas.sh` from the control machine, and `build.rs` reads that env var. A D109 change that taught the script to resolve and verify the stamp itself was written, run, and then lost — its worktree was force-removed with the edit uncommitted. Re-landed 2026-09-09 (PVOS). §3. |
 | Pipeline rustup vs CI 1.96.0 | **Partial, unchanged by D121.** `pipeline.yml:95` still guards the install with `when: not cargo_stat.stat.exists`. presubuntu today: `rustc 1.96.0` from the `stable` CHANNEL, no pinned toolchain installed — equal to CI by coincidence until stable moves. §3. |
 | Mover remote integrity quarantine | **Partial, and worse than reported** — §0. |
 | `hash_policy=lazy` | By design (refused since D94, `fs.rs:80`). `docs/04` corrected in this branch (§7). The NAS has no lazy bindings — both `/Media` binds are `on_add`, forest-level and `bindings.local` agree. |
