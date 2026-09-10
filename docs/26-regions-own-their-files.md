@@ -1,0 +1,300 @@
+# 26 — Regions own their files
+
+**Status: DESIGN, for review. Argued out with Chris on 2026-09-09; nothing here
+is built. Decisions marked SETTLED were agreed in that conversation; those
+marked OPEN were not. The implementation plan is §10.**
+
+Prerequisite reading: doc 13 §A (the write model, resolved 2026-06-21), doc 20
+(region logs, built), doc 17 §7 (locations), doc 22 (the swarm), doc 24 §20 and
+doc 25 §11 (why this is being proposed now).
+
+
+## 0. The one-paragraph version
+
+Every box catalogues its own files, in its own catalogue, and writes only its
+own log. A file's identity is *where it is* — the region that holds it plus its
+path inside that region — not a content hash, and not a node someone else
+owns. The shared forest log stops carrying file events and carries only
+**which regions exist and a signed hash of each one's current catalogue**. The
+presentation layer unions the regions by relative path and shows one entry per
+path with every copy behind it, admitting only copies whose bytes agree. What
+disagrees is a conflict, decided by a rule rather than a person, and pushed to
+monitoring rather than parked in a report.
+
+
+## 1. Why — what the current model costs
+
+The current model is **one node per logical file, with N locations attached**.
+Every other property follows from that choice, and so does every problem doc 24
+spent a fortnight on:
+
+| symptom | root cause in the model |
+|---|---|
+| a replica cannot scan its own disk; every write routes to the owner | one writer per forest, because there is one node to write |
+| 409,072 log events, 168,000 of them from a single night's cleanup | every location on every box is an event in the one shared log |
+| 588 duplicate groups; two boxes each making a node for the same path | the identity rule (name + size) is trying to reconcile two boxes' views of one object |
+| the merge that unlinked a real file (doc 24 §20) | the owner deciding which of two copies is "the" node, on a box that holds no media |
+| the islands, the one-home rule, the folder collisions | folders are shared objects that need exactly one owner |
+
+None of these are bugs in the code that implements the model. They are the
+model. **A shared object with one owner, written to by N boxes, is a
+coordination problem, and every fix so far has been coordination machinery** —
+routing, settle windows, grace periods, contested-group refusals, keeper rules.
+
+Doc 13 §A saw this coming and drew the line correctly in June: single-writer
+per region keeps every integrity property; true multi-master needs a DAG and
+merge semantics. This design stays on the right side of that line. Every region
+has exactly one writer. It is just that different regions have different ones.
+
+
+## 2. Identity — SETTLED
+
+**A file is identified by `region + relative path`.**
+
+- A **region** is one `device + mount` — a storage root on a specific box. The
+  QNAP's `Data/Media` and `Data_ext/Media` are two regions, not one; the
+  ingest's `/mnt/local/Media` is a third.
+- The **relative path** is the path inside the region's root. `TV/Show (2020)/
+  Season 01/ep01.mkv` on the ingest and the same string on the holder are the
+  same *logical entry* held in two places. Absolute paths never leave the box.
+- This is the key the filesystem already guarantees unique. No hashing is
+  needed to know what a file *is*.
+
+**The content hash becomes what it should have been all along: integrity and
+transfer.** It verifies bytes, drives the swarm, and decides whether two copies
+are the same. It no longer decides identity, which is where it kept going
+wrong — a file whose bytes change is still the same file at the same path, and
+the current model's inability to say so is the entire upgrade-in-place problem.
+
+A file moved between regions is a delete in one and an add in the other. That
+is what happened on disk, and the catalogue should say so.
+
+
+## 3. Ownership — SETTLED
+
+**A region is owned by exactly one box, which is the only writer of that
+region's catalogue.** Nothing in another region's catalogue is ever written by
+anyone but its owner. There is no routing, because there is nothing to route:
+the ingest cataloguing the ingest's disk touches nothing the holder owns.
+
+The forest still has an owner, but what the owner's log carries changes
+completely (§5).
+
+**What a region declares about itself** — OPEN in the details, settled in kind:
+
+| field | notes |
+|---|---|
+| root | the absolute path on the owning box; never shared |
+| owner key | the box's client identity, as today |
+| drains? | per region, reusing D81's per-root DRAIN. A draining region is staging; a non-draining one is library |
+| name | for the presentation layer and for humans |
+| retention | see §7 — OPEN |
+
+
+## 4. What a region catalogues — SETTLED
+
+**Entries. Files AND directories.** A directory entry is an entry with no bytes.
+
+This is the answer to the empty-folder question and it is not a special case:
+a region that holds an empty `TV/Show (2020)/Season 02` records exactly that,
+and the presentation layer shows an empty folder. Two regions both holding
+`TV/Show (2020)/Season 01` is not a collision — it is two regions that both have
+that directory, unioned at read time exactly as two regions holding one file
+are.
+
+What goes away is **folders as shared objects that need an owner**. That is the
+part causing the islands, the one-home rule and the duplicate-folder mess. The
+ability to have a folder — empty or otherwise — is untouched.
+
+Per entry, the region records: relative path, kind (file/dir), size, mtime,
+ctime, content hash (files, when known), and the D76 quality measurement when
+one exists. The scan writes these rows locally, at disk speed, with no signing
+per row. Sidecars stay exactly as they are — the hash cache beside the bytes,
+which is what made the 2026-09-08 rehearsal import 152 GB in 26 seconds.
+
+
+## 5. What the shared log carries — SETTLED (option 3)
+
+Three options were weighed:
+
+1. **A full signed PVFS log per region.** Per-event provenance, chain
+   verification, verified log shipping — all built (doc 20 P7.2). Cost: an
+   append + sign + fold per file event, confined to the owning region but still
+   there.
+2. **A plain local index, nothing signed.** Fastest and cheapest. Cost: no
+   provenance or tamper evidence for the catalogue; replication needs
+   inventing; history gone; the region machinery unused.
+3. **A fast local index, plus a periodically published signed manifest.** The
+   region catalogues locally at full speed; on a cadence it publishes a signed
+   hash of its catalogue state as its head.
+
+**Option 3 is settled for the media library.** Chris's original description was
+option 3 — *"a blob storage that's in the log pointing to where the individual
+trees are doing their own cataloging"* — and the mechanism to carry it is
+already built: `SubRegionHead { region, seq, head_hash }` (doc 20 §2.2) is the
+parent committing a child head. The shared log holds region marks and heads.
+**It does not hold file events.** Log growth stops being a discipline and
+becomes a property.
+
+What is traded: provenance is per-snapshot, not per-event. The catalogue can
+be proven authentic and current; it cannot prove who added one file at 14:32.
+For a media library that is the right trade. The bytes stay hash-verified
+regardless — this is only about the catalogue's own provenance.
+
+**Snapshot cadence — OPEN.** Options: on every scan pass that changed
+anything; on a timer; on demand. Cheap enough that "every pass that changed
+something" is probably right.
+
+
+## 6. The merged view — SETTLED, with one hard rule
+
+**One logical entry per relative path, with every region's copy behind it.**
+This is what the presentation layer shows and what the mount serves.
+
+**Admission requires byte-identical copies.** The merged view admits exactly
+one content hash per relative path. This is not taste; it is forced by the
+swarm: chunk-level transfer fetches ranges from different peers and assembles
+them, and two regions serving different bytes for one path would produce a
+file assembled from two encodings — corrupt if unlucky, hash-failed if lucky.
+"Read both at the same time in a swarm" is only safe when the bytes agree.
+
+It is also forced by the operator's experience. Chris's scenario: a movie
+plays badly partway through; two copies exist with different bytes; which was
+served, and which should be fixed? If the system had pretended they were
+redundant there is no answer. Refusing to merge them is what makes the
+question answerable.
+
+So: **same path, agreeing hashes** = redundancy. **Same path, disagreeing
+hashes** = a conflict (§7). A copy without a hash is not admitted until it has
+one — affordable now that sidecar coverage is ~99% on both production roots.
+
+
+## 7. Conflicts — SETTLED in principle, OPEN in policy
+
+**A conflict is decided by a rule, never left for a person.** This project has
+already proved what "surfaced for an operator" means in practice: `missing`
+sat at 1,913 for weeks; the Backups island sat a fortnight; doc 24 records
+"Nobody has run `--forget`"; 588 duplicate groups existed the first time
+anything asked. A set-and-forget system that resolves conflicts by reporting
+them does not resolve them.
+
+**7.1 Serving auto-resolves, always.** The D76 ladder (`media::choose`) picks
+the served copy: quality, then a truncation guard, then size, then recency.
+Deterministic — same inputs, same answer, on every box. The consumer is served
+the winner, never the stale copy, so the confusing case never reaches them.
+Nothing needs deleting for this to be true.
+
+**7.2 Bytes are never deleted automatically on a non-draining region.**
+Redundancy is the point of a non-draining region; the loser stays addressable
+and fetchable. What to do about the *space* it takes is a retention policy
+(7.4), not a judgement.
+
+**7.3 By mount type:**
+
+| | agreeing hashes | disagreeing hashes |
+|---|---|---|
+| **draining** region involved | one copy is redundant → the drained one goes | ladder picks the winner → it goes to the library region; the loser drains away. Self-resolving: there is an action |
+| **non-draining** only | redundancy → serve nearest, or swarm across all | ladder picks the SERVED copy; both stay; conflict reported (7.5) |
+
+The draining case is the easy one precisely because there is something to
+*do*. The non-draining case only has something to *decide*, and 7.1 decides it.
+
+**7.4 Retention — OPEN.** Per region: "keep newest N versions", "keep all",
+"keep the ladder winner only". Explicit, declared, never inferred.
+
+**7.5 Conflicts PUSH; they do not wait to be asked.** They go to D83's fleet
+monitoring — the mechanism built after the NAS sat down for ten hours
+unnoticed, for exactly this reason. A signal that arrives, not a report to
+remember. They are also exposed **in band** in the presentation layer: the
+served copy is the winner, and "N versions exist" is visible as an attribute of
+the entry, so anyone touching the file can see it without knowing PVFS exists.
+
+
+## 8. Replication — SETTLED, and it gets simpler
+
+A region publishes a signed manifest hash as its head (§5). A replicating box
+fetches the catalogue blob, checks its hash against the signed head, and
+verifies the signature. Done. No fold, no replay, no chain walk for the
+catalogue. Deltas are an optimisation: a 27,000-entry catalogue is a few
+megabytes, so whole-snapshot replication is viable from day one.
+
+Verified log shipping (doc 17) is *more* machinery than this needs. The
+head-commitment path that carries the manifest is the part that is reused.
+
+A box offline means that region's live catalogue is unavailable; the last
+replicated snapshot still serves the merged view, marked stale by its age.
+That is the correct behaviour for a library and it is what a filesystem does
+when a drive is unplugged.
+
+
+## 9. What does NOT change
+
+- **The log's integrity model.** Append-only, hash-chained, signed. The shared
+  log is smaller and quieter; it is not different in kind.
+- **ACLs and authority.** Region ownership is a grant like any other.
+- **The swarm (doc 22).** Serves identical copies from N regions; this design
+  makes "identical" a precondition rather than a hope.
+- **Sidecars (D93/D103).** The hash cache beside the bytes, unchanged.
+- **The D76 ladder.** Reused as the serving decision, unchanged.
+- **Region logs (doc 20).** Head commitment is the carrier for §5. The
+  per-region *event* log becomes optional — a region MAY keep one for
+  provenance, but the media library will not.
+
+
+## 10. Implementation plan
+
+Phased so that each phase is buildable, testable and useful on its own, and so
+that the current forest keeps working until the last phase.
+
+**Phase 0 — spike (days).** Prove `SubRegionHead` will carry a manifest hash
+for a region that has NO event log of its own. If it will not without change,
+this is the first thing to change and it is small.
+
+**Phase 1 — the region catalogue.** A per-region local index of entries (files
+and directories) keyed by relative path, with size/mtime/ctime/hash/quality.
+The scan writes rows here instead of emitting events. Signed manifest publish
+on a cadence. *Testable alone:* catalogue a directory, publish, verify the
+manifest reproduces the catalogue. Sidecar reuse carries over unchanged.
+
+**Phase 2 — region ownership.** A region declares itself (root, owner key,
+drains, name) and the shared log records its mark and heads. The forest-level
+`replica` gate (28 sites) becomes "do I own this region?". *Testable alone:*
+two boxes, two regions, each cataloguing its own disk, neither routing.
+
+**Phase 3 — the merged view.** Union region catalogues by relative path.
+Admission by hash agreement. Conflict detection. Directory entries unioned.
+*Testable alone:* two regions, overlapping paths, identical and differing
+bytes; assert one entry per path, the right copies admitted, the conflict
+flagged.
+
+**Phase 4 — resolution.** Ladder-based serving winner; drain behaviour; the
+retention policy. *Testable alone:* every cell of the §7.3 table.
+
+**Phase 5 — replication.** Fetch-and-verify a region's catalogue by its signed
+head; stale-by-age when the owner is offline.
+
+**Phase 6 — the mount.** The FUSE mount (doc 20 §3, built) over the merged
+view instead of the tree; the swarm over admitted copies. This is D82's
+presentation layer, arriving on a model that can carry it.
+
+**Phase 7 — monitoring.** Conflicts and capacity into D83, and in band.
+
+**Phase 8 — migration.** The planned re-genesis (doc 25) becomes THIS: a fresh
+start on the new model rather than a fresh start on the old one. The rehearsal
+already proved the import is ~5 hours and metadata-bound. Nothing about the
+current forest needs converting, because it is not being kept.
+
+**Sequencing note.** Phases 1–4 are the design; 5–7 are the delivery; 8 is the
+cutover. Phases 1 and 2 could be built and tested on the lab pair before a
+single production file is touched. The order of 3 and 4 could swap.
+
+
+## 11. Open questions, collected
+
+1. Snapshot cadence (§5).
+2. Retention policy shape (§7.4).
+3. The full set of what a region declares (§3).
+4. "Nearest" for the swarm's copy selection — latency-measured, declared
+   priority, or both.
+5. Whether a region may keep a per-event log for provenance as an opt-in.
+6. What the presentation layer shows for a conflict, concretely.
