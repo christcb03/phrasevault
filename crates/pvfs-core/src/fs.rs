@@ -341,6 +341,52 @@ pub struct RegionSnapshot {
 /// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
 type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
 
+/// D126 — one copy of a path in the merged view: which region holds it and
+/// what that region's catalogue says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewCopy {
+    pub region: NodeId,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    pub content_hash: Option<String>,
+}
+
+/// D126 — how the merged view admits a path (doc 26 §6): exactly one
+/// content hash per path, or it is not merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewState {
+    /// Every known hash agrees (or it is a directory). `copies` on the
+    /// entry counts the hashed copies — the redundancy behind the path.
+    Admitted,
+    /// Files only, none hashed yet: visible, not servable until one is.
+    Unhashed,
+    /// Two or more distinct hashes at one path. Served by phase 4's ladder;
+    /// nothing is deleted. The hashes, for the report.
+    ConflictHashes(Vec<String>),
+    /// A file in one region and a directory in another.
+    ConflictKind,
+}
+
+/// D126 — one logical entry per relative path, with every region's copy
+/// behind it (doc 26 §6). Computed on demand from the catalogue rows this
+/// box holds; never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewEntry {
+    pub rel_path: String,
+    /// `file` | `dir`; for `ConflictKind`, `file`.
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    pub content_hash: Option<String>,
+    pub quality: Option<String>,
+    pub state: ViewState,
+    /// Hashed file copies behind an admitted path (redundancy). 0 for
+    /// directories and unhashed paths.
+    pub copies: u64,
+    pub sources: Vec<ViewCopy>,
+}
+
 impl Engine {
     // ---- bindings (doc 04 §3) --------------------------------------------------
 
@@ -1294,6 +1340,158 @@ impl Engine {
             .map_err(map_db("region snapshots"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("region snapshots"))
+    }
+
+    /// D126 — the merged view of `dir` (`""` = every region's root), one
+    /// level deep, in bytewise path order — the manifest's order, so two
+    /// boxes holding the same catalogues list the same thing. Every
+    /// catalogue region whose rows this box holds takes part (doc 26 §6);
+    /// log regions are the tree and stay `ls`'s business.
+    pub fn merged_view(&self, dir: &str) -> Result<Vec<ViewEntry>> {
+        let dir = dir.trim_matches('/');
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue'
+                    AND substr(e.rel_path, 1, length(?1)) = ?1
+                  ORDER BY e.rel_path, e.region_id",
+            )
+            .map_err(map_db("merged view"))?;
+        let rows = stmt
+            .query_map(params![prefix], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(map_db("merged view"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("merged view"))?;
+        // One level: nothing after the prefix may contain another '/'.
+        let rows = rows
+            .into_iter()
+            .filter(|(_, rel, ..)| !rel[prefix.len()..].contains('/') && rel.len() > prefix.len());
+        Ok(Self::merge_rows(rows))
+    }
+
+    /// D126 — every conflicting path in every catalogue region this box
+    /// holds: what phase 4 resolves and what D83 is told about.
+    pub fn view_conflicts(&self) -> Result<Vec<ViewEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue'
+                  ORDER BY e.rel_path, e.region_id",
+            )
+            .map_err(map_db("view conflicts"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(map_db("view conflicts"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("view conflicts"))?;
+        Ok(Self::merge_rows(rows)
+            .into_iter()
+            .filter(|e| matches!(e.state, ViewState::ConflictHashes(_) | ViewState::ConflictKind))
+            .collect())
+    }
+
+    /// The admission rule (doc 26 §6), over rows sorted by path then region.
+    #[allow(clippy::type_complexity)]
+    fn merge_rows(
+        rows: impl IntoIterator<Item = (String, String, String, u64, u64, Option<String>, Option<String>)>,
+    ) -> Vec<ViewEntry> {
+        let mut out: Vec<ViewEntry> = Vec::new();
+        let mut group: Vec<(String, String, String, u64, u64, Option<String>, Option<String>)> = Vec::new();
+        let flush = |group: &mut Vec<(String, String, String, u64, u64, Option<String>, Option<String>)>,
+                     out: &mut Vec<ViewEntry>| {
+            if group.is_empty() {
+                return;
+            }
+            let rel_path = group[0].1.clone();
+            let sources: Vec<ViewCopy> = group
+                .iter()
+                .map(|(region, _, kind, size, mtime, hash, _)| ViewCopy {
+                    region: region.clone(),
+                    kind: kind.clone(),
+                    size_bytes: *size,
+                    mtime_ms: *mtime,
+                    content_hash: hash.clone(),
+                })
+                .collect();
+            let quality = group.iter().find_map(|(.., q)| q.clone());
+            let any_dir = sources.iter().any(|c| c.kind == "dir");
+            let any_file = sources.iter().any(|c| c.kind == "file");
+            let mut hashes: Vec<String> = sources.iter().filter_map(|c| c.content_hash.clone()).collect();
+            hashes.sort();
+            hashes.dedup();
+            // The copy an entry describes: the newest hashed one, else the
+            // newest — phase 4 replaces "newest" with the ladder winner. Ties
+            // (same millisecond) break on size, then region id, so every box
+            // describes the same copy.
+            let newest = |c: &&ViewCopy| (c.mtime_ms, c.size_bytes, c.region.clone());
+            let described = sources
+                .iter()
+                .filter(|c| c.content_hash.is_some())
+                .max_by_key(newest)
+                .or_else(|| sources.iter().max_by_key(newest))
+                .expect("a group has at least one row");
+            let (state, kind, copies) = if any_dir && any_file {
+                (ViewState::ConflictKind, "file".to_string(), 0)
+            } else if any_dir {
+                (ViewState::Admitted, "dir".to_string(), 0)
+            } else if hashes.len() > 1 {
+                (ViewState::ConflictHashes(hashes.clone()), "file".to_string(), 0)
+            } else if hashes.is_empty() {
+                (ViewState::Unhashed, "file".to_string(), 0)
+            } else {
+                let n = sources.iter().filter(|c| c.content_hash.is_some()).count() as u64;
+                (ViewState::Admitted, "file".to_string(), n)
+            };
+            out.push(ViewEntry {
+                rel_path,
+                kind,
+                size_bytes: described.size_bytes,
+                mtime_ms: described.mtime_ms,
+                content_hash: if hashes.len() == 1 { hashes.pop() } else { None },
+                quality,
+                state,
+                copies,
+                sources,
+            });
+            group.clear();
+        };
+        for row in rows {
+            if let Some(first) = group.first() {
+                if first.1 != row.1 {
+                    flush(&mut group, &mut out);
+                }
+            }
+            group.push(row);
+        }
+        flush(&mut group, &mut out);
+        out
     }
 
     fn scan_binding(
