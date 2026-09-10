@@ -848,7 +848,7 @@ fetch: quarantined stale location
 A real peer, bytes that genuinely no longer match, a durable quarantine — the
 proof no unit test could give, on one of the five files that started this.
 
-**13. Two quarantine helpers now coexist.** `uri_quarantined(file, uri) -> bool`
+**13. Two quarantine helpers now coexist.** *Closed by D124 item 6 (2026-09-10): `location_flags`; the named `uri_quarantined` never existed on main.* `uri_quarantined(file, uri) -> bool`
 in `engine.rs` and `quarantined_uris(id) -> Vec<String>` in `fs.rs`, from two
 sessions that could not see each other. Same table, different shapes. Consolidate
 when someone is next in that code.
@@ -998,6 +998,8 @@ is CLOSED — it fired in production on Reacher s03e08 (§11 item 12).
    pvfsd inside the 30s window the play waits for it to exit, so a roll needs
    the watchdog stopped and RESTARTED by hand — and forgetting the restart
    leaves the holder unsupervised, the exact outage D83 exists for (§13).
+   *Closed by D124 item 8 (2026-09-10): `fleet.yml` stops the watchdog by pid
+   before the swap and restarts it after, verified by its log line.*
 7. **`build-nas.sh` does not stamp `PVFS_BUILD`**, so QNAP binaries report
    `unknown` and can only be verified by content (VERSIONING.md).
 
