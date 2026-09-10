@@ -96,7 +96,7 @@ attribute by which holders actually served chunks, not by how many candidates
 there were, and after a quarantine recompute the candidate set instead of
 falling through.
 
-**H3. Disabling a periodic job does not stop it; the finish reports idle.**
+**H3. Disabling a periodic job does not stop it; the finish reports idle.** *Built — D123 (2026-09-10).*
 Confirmed in three places:
 - `crates/pvfsd/src/jobs.rs:852-858` — the `PERIODIC` arm of the supervisor
   only removes `next_due` for a disabled job; the live `Managed` in `running`
@@ -249,6 +249,9 @@ closed, and says what it learned in a type rather than a string.
    line, and `stream failed from tcp:192.168.1.120:7421` never appears again.
 
 ### D123 — a disabled job stops, and says so
+
+*Built 2026-09-10, branch `d123-disabled-job-stops`; deviations in PVOS
+`docs/milestones/D123-disabled-job-stops.md` §7.*
 
 Closes doc 24 §14 item 2 and the review's High #3.
 
