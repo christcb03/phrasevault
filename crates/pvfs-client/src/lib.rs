@@ -272,9 +272,17 @@ impl Client {
     }
 
     /// The daemon's live job-runner state (P5, doc 18 §2): `("on"|"off", rows)`.
+    /// D127 — the serve status with the merged view's conflict count.
+    pub fn serve_status_conflicts(&mut self) -> Result<(String, Vec<ServeJobWire>, u64)> {
+        match self.request(ClientMsg::ServeStatus)? {
+            ServerMsg::ServeJobs { runner, jobs, conflicts } => Ok((runner, jobs, conflicts)),
+            other => Err(unexpected("ServeJobs", &other)),
+        }
+    }
+
     pub fn serve_status(&mut self) -> Result<(String, Vec<ServeJobWire>)> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs } => Ok((runner, jobs)),
+            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((runner, jobs)),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

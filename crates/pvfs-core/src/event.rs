@@ -49,6 +49,7 @@ pub const K_REGION_MARKED: &str = "RegionMarked";
 pub const K_REGION_UNMARKED: &str = "RegionUnmarked";
 pub const K_REGION_BASELINE: &str = "RegionBaseline";
 pub const K_SUB_REGION_HEAD: &str = "SubRegionHead";
+pub const K_REGION_DRAIN_SET: &str = "RegionDrainSet";
 pub const K_NODE_MOVED_OUT: &str = "NodeMovedOut";
 pub const K_NODE_MOVED_IN: &str = "NodeMovedIn";
 pub const K_CHUNK_MANIFEST_RECORDED: &str = "ChunkManifestRecorded";
@@ -216,6 +217,17 @@ pub enum Event {
         node_id: String,
         head_seq: u64,
         head_hash: Vec<u8>,
+        at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// D127 (doc 26 §7.3): a catalogue region drains (is staging — its
+    /// copies drain into the library) or does not. In the LOG, not local
+    /// placement, so every box agrees which copy is redundant: two draining
+    /// boxes each believing the other was the library would both trash.
+    RegionDrainSet {
+        node_id: String,
+        drains: bool,
         at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
@@ -473,6 +485,12 @@ pub fn msg_region_baseline(node_id: &str, state_root: &[u8], at: u64, author: &[
     crypto::domain_digest("pvfs:regionbaseline:v1:", &e.finish())
 }
 
+pub fn msg_region_drain_set(node_id: &str, drains: bool, at: u64, author: &[u8]) -> [u8; 32] {
+    let mut e = Enc::new();
+    e.string(node_id).u64(drains as u64).u64(at).bytes(author);
+    crypto::domain_digest("pvfs:regiondrainset:v1:", &e.finish())
+}
+
 pub fn msg_sub_region_head(
     node_id: &str,
     head_seq: u64,
@@ -678,6 +696,7 @@ impl Event {
             Event::RegionUnmarked { .. } => K_REGION_UNMARKED,
             Event::RegionBaseline { .. } => K_REGION_BASELINE,
             Event::SubRegionHead { .. } => K_SUB_REGION_HEAD,
+            Event::RegionDrainSet { .. } => K_REGION_DRAIN_SET,
             Event::NodeMovedOut { .. } => K_NODE_MOVED_OUT,
             Event::NodeMovedIn { .. } => K_NODE_MOVED_IN,
             Event::ChunkManifestRecorded { .. } => K_CHUNK_MANIFEST_RECORDED,
@@ -715,6 +734,7 @@ impl Event {
             | Event::RegionUnmarked { author, .. }
             | Event::RegionBaseline { author, .. }
             | Event::SubRegionHead { author, .. }
+            | Event::RegionDrainSet { author, .. }
             | Event::NodeMovedOut { author, .. }
             | Event::ChunkManifestRecorded { author, .. }
             | Event::NodePurged { author, .. }
@@ -758,6 +778,7 @@ impl Event {
             | Event::RegionUnmarked { sig: s, .. }
             | Event::RegionBaseline { sig: s, .. }
             | Event::SubRegionHead { sig: s, .. }
+            | Event::RegionDrainSet { sig: s, .. }
             | Event::NodeMovedOut { sig: s, .. }
             | Event::ChunkManifestRecorded { sig: s, .. }
             | Event::LinkReordered { sig: s, .. }
@@ -962,6 +983,15 @@ impl Event {
                 sig,
             } => {
                 e.string(node_id).bytes(state_root).u64(*at).bytes(author).bytes(sig);
+            }
+            Event::RegionDrainSet {
+                node_id,
+                drains,
+                at,
+                author,
+                sig,
+            } => {
+                e.string(node_id).u64(*drains as u64).u64(*at).bytes(author).bytes(sig);
             }
             Event::SubRegionHead {
                 node_id,
@@ -1312,6 +1342,13 @@ impl Event {
             K_REGION_BASELINE => Event::RegionBaseline {
                 node_id: d.string()?,
                 state_root: d.bytes()?,
+                at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
+            K_REGION_DRAIN_SET => Event::RegionDrainSet {
+                node_id: d.string()?,
+                drains: d.u64()? != 0,
                 at: d.u64()?,
                 author: d.bytes()?,
                 sig: d.bytes()?,
@@ -1686,6 +1723,17 @@ impl Event {
             } => crypto::verify_digest(
                 author,
                 &msg_region_baseline(node_id, state_root, *at, author),
+                sig,
+            ),
+            Event::RegionDrainSet {
+                node_id,
+                drains,
+                at,
+                author,
+                sig,
+            } => crypto::verify_digest(
+                author,
+                &msg_region_drain_set(node_id, *drains, *at, author),
                 sig,
             ),
             Event::SubRegionHead {

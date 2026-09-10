@@ -75,7 +75,7 @@ fn a_v15_cache_migrates_to_v16_without_replaying() {
     let v: String = c
         .query_row("SELECT v FROM projection_meta WHERE k='schema_version'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, "16");
+    assert_eq!(v, "17");
     let sentinel: i64 = c
         .query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id='d125-sentinel'", [], |r| r.get(0))
         .unwrap();
@@ -86,7 +86,8 @@ fn a_v15_cache_migrates_to_v16_without_replaying() {
             .unwrap();
         assert_eq!(n, 1, "{t} must exist after the migration");
     }
-    // Layout parity with a fresh cache: `kind` is the LAST column both ways.
+    // Layout parity with a fresh cache: the newest column (`drains`, D127) is
+    // the LAST both ways.
     let last: String = c
         .query_row(
             "SELECT name FROM pragma_table_info('regions') ORDER BY cid DESC LIMIT 1",
@@ -94,7 +95,7 @@ fn a_v15_cache_migrates_to_v16_without_replaying() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(last, "kind", "migrated column order must match the fresh DDL — full_rebuild copies positionally");
+    assert_eq!(last, "drains", "migrated column order must match the fresh DDL — full_rebuild copies positionally");
 }
 
 /// Item 0 — the spike. A catalogue region with a published snapshot gets that

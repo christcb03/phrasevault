@@ -1010,6 +1010,29 @@ import json,sys
 c=json.load(sys.stdin); assert [e["path"] for e in c]==["c.mkv"], c
 ' && ok "view conflicts names the one conflicting path" || fail "view conflicts"
 
+say "D127: resolution — a draining region's losing copy drains away (doc 26 phase 4)"
+$PVFS --json region drain "$CAT2" on | qgrep '"drains":true' && ok "region drain on" || fail "region drain on"
+$PVFS --json region ls | qgrep "\"region\":\"$CAT2\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\",\"drains\":true" \
+  && ok "region ls shows the flag" || fail "region ls drains"
+# Make the LIBRARY copy of c.mkv the ladder's winner (much larger, newer), so
+# the draining region's copy is the loser.
+head -c 20000 /dev/zero | tr '\0' 'x' > "$CATLIB/c.mkv"; $PVFS scan "$CAT" >/dev/null
+# Two things drain from catlib2: c.mkv (the ladder's loser) and sub/b.mkv,
+# whose bytes the library already holds (redundant).
+$PVFS --json view resolve --dry-run | python3 -c '
+import json,sys
+r=json.load(sys.stdin); assert r["dry_run"] and sorted(t["path"] for t in r["trashed"])==["c.mkv","sub/b.mkv"], r
+' && ok "dry run names the losing copy and the redundant one" || fail "resolve dry run"
+[ -f "$CATLIB2/c.mkv" ] && [ -f "$CATLIB2/sub/b.mkv" ] && ok "and moved nothing" || fail "dry run moved a file"
+$PVFS view resolve >/dev/null && [ ! -f "$CATLIB2/c.mkv" ] && [ ! -f "$CATLIB2/sub/b.mkv" ] \
+  && ls "$CATLIB2"/.pvfs-trash/*/c.mkv "$CATLIB2"/.pvfs-trash/*/sub/b.mkv >/dev/null 2>&1 \
+  && ok "both went to the draining region's trash" || fail "resolve"
+[ -f "$CATLIB/c.mkv" ] && [ -f "$CATLIB/sub/b.mkv" ] && ok "the library copies never moved" || fail "library copy moved"
+$PVFS scan "$CAT2" >/dev/null
+$PVFS --json view conflicts | python3 -c 'import json,sys; assert json.load(sys.stdin)==[]' \
+  && ok "the view is clean after the region's rescan" || fail "view still conflicted"
+$PVFS --json region ls | qgrep "\"region\":\"$CAT2\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\",\"drains\":true" >/dev/null; $PVFS --json region drain "$CAT2" off | qgrep '"drains":false' && ok "region drain off" || fail "region drain off"
+
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
 PRIN="$($PVFS add "$PR" --kind folder --label inner)"
