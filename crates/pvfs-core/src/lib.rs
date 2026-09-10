@@ -45,6 +45,7 @@ pub use engine::{
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
+    RegionEntry, RegionSnapshot,
     BindKind, BindSpec, Binding, BindingRow, HashPolicy, NodeStat, PendingChange, ResolveAction,
     BackfillReport, ScanReport, ScanStats, ScanWriter, VerifyOutcome, UNLINK_GRACE_MS,
     WATCH_SETTLE_MS,

@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -106,7 +106,13 @@ CREATE TABLE IF NOT EXISTS regions (
   parent_log     TEXT    NOT NULL DEFAULT '',   -- where future heads/unmark author; reparented on enclosing unmark
   log_file       TEXT,                          -- generation file, relative to the data dir
   committed_seq  INTEGER NOT NULL DEFAULT 0,    -- last SubRegionHead the enclosing log attests
-  committed_head TEXT    NOT NULL DEFAULT ''
+  committed_head TEXT    NOT NULL DEFAULT '',
+  -- D125 (doc 26 phase 1): 'log' = a physical per-region event log (P7.2, as
+  -- before); 'catalogue' = no event log at all — the region keeps a local
+  -- index (region_entries) and publishes a signed manifest hash as its head.
+  -- LAST on purpose: full_rebuild copies positionally, and ALTER ADD COLUMN
+  -- appends, so a migrated table and a fresh one must agree on column order.
+  kind           TEXT    NOT NULL DEFAULT 'log'
 );
 
 -- P7.2a: per-log replay positions ('' = the top log, else the region root id).
@@ -272,6 +278,34 @@ CREATE TABLE IF NOT EXISTS scan_unheld (
   since_ms INTEGER NOT NULL
 );
 
+-- D125 — a catalogue region's own index: what is on ITS disk, keyed by the
+-- path inside its root. Files AND directories (a directory is an entry with
+-- no bytes — Chris's empty-folder requirement, doc 26 §4). Derived state,
+-- never in the log; the log learns only the manifest hash of a snapshot.
+CREATE TABLE IF NOT EXISTS region_entries (
+  region_id    TEXT    NOT NULL,
+  rel_path     TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  mtime_ms     INTEGER NOT NULL,
+  changed_ms     INTEGER NOT NULL,   -- max(mtime, ctime) on THIS box: the D112 settle signal; never in the manifest
+  content_hash TEXT,
+  quality      TEXT,
+  seen_at      INTEGER NOT NULL,
+  PRIMARY KEY (region_id, rel_path)
+);
+-- D125 — each published head of a catalogue region: the seq and manifest
+-- hash that went into the top log as a SubRegionHead. commit_region_heads
+-- reads the latest row here instead of opening a log file.
+CREATE TABLE IF NOT EXISTS region_snapshots (
+  region_id     TEXT    NOT NULL,
+  seq           INTEGER NOT NULL,
+  manifest_hash TEXT    NOT NULL,
+  entries       INTEGER NOT NULL,
+  published_at  INTEGER NOT NULL,
+  PRIMARY KEY (region_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS scan_state (
   uri        TEXT PRIMARY KEY,
   size_bytes INTEGER NOT NULL,
@@ -354,6 +388,8 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "location_quarantine",
     "fetch_unfetchable",
     "scan_unheld",
+    "region_entries",
+    "region_snapshots",
     "scan_state",
     "projection_meta",
     "media_quality",
@@ -1225,7 +1261,12 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             )
             .map_err(&m)?;
         }
-        Event::RegionMarked { node_id, marked_at, .. } => {
+        Event::RegionMarked {
+            node_id,
+            marked_at,
+            kind,
+            ..
+        } => {
             // The enclosing region: the marked node's home parent's region
             // (NULL/absent = top). Captured at mark time; reparented if the
             // enclosing region later unmarks.
@@ -1242,9 +1283,16 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                 .flatten();
             let enclosing = enclosing.unwrap_or_default();
             tx.execute(
-                "INSERT INTO regions (node_id, marked_at, parent_log) VALUES (?1, ?2, ?3)
+                // D125: the kind is fixed at the first mark; a re-mark only
+                // re-stamps (the engine refuses one on a catalogue region).
+                "INSERT INTO regions (node_id, marked_at, parent_log, kind) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(node_id) DO UPDATE SET marked_at = excluded.marked_at",
-                params![node_id, *marked_at as i64, enclosing],
+                params![
+                    node_id,
+                    *marked_at as i64,
+                    enclosing,
+                    if kind.is_empty() { "log" } else { kind.as_str() }
+                ],
             )
             .map_err(&m)?;
             // Assign the contains-closure (stopping at nested marks) its region.
@@ -2951,6 +2999,7 @@ fn migrate_projection(
             12 => migrate_v12_to_v13(conn).map(|_| "folder_bindings keyed (folder_id, source_uri)"),
             13 => migrate_v13_to_v14(conn).map(|_| "fetch_unfetchable"),
             14 => migrate_v14_to_v15(conn).map(|_| "scan_unheld"),
+            15 => migrate_v15_to_v16(conn).map(|_| "regions.kind; region_entries; region_snapshots"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -3112,6 +3161,50 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE temp_links ADD COLUMN label TEXT NOT NULL DEFAULT '';")
             .map_err(map_db("add temp_links.label"))?;
     }
+    Ok(())
+}
+
+fn migrate_v15_to_v16(conn: &mut Connection) -> Result<()> {
+    // D125 — additive. `kind` is appended, which is also where the fresh DDL
+    // puts it, so the layout test's positional-copy invariant holds. Every
+    // existing region is a 'log' region and stays one; nothing is re-read.
+    // Guarded like v9→v10's `links.label`: a cache that already carries the
+    // column (a test rewind, a half-applied bump) must not be sent through
+    // the slow door by a duplicate-column error.
+    let have: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('regions') WHERE name = 'kind'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_db("migrate v15→v16: probe regions.kind"))?;
+    if have == 0 {
+        conn.execute_batch("ALTER TABLE regions ADD COLUMN kind TEXT NOT NULL DEFAULT 'log';")
+            .map_err(map_db("migrate v15→v16: regions.kind"))?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS region_entries (
+           region_id    TEXT    NOT NULL,
+           rel_path     TEXT    NOT NULL,
+           kind         TEXT    NOT NULL,
+           size_bytes   INTEGER NOT NULL,
+           mtime_ms     INTEGER NOT NULL,
+           changed_ms     INTEGER NOT NULL,   -- max(mtime, ctime) on THIS box: the D112 settle signal; never in the manifest
+           content_hash TEXT,
+           quality      TEXT,
+           seen_at      INTEGER NOT NULL,
+           PRIMARY KEY (region_id, rel_path)
+         );
+         CREATE TABLE IF NOT EXISTS region_snapshots (
+           region_id     TEXT    NOT NULL,
+           seq           INTEGER NOT NULL,
+           manifest_hash TEXT    NOT NULL,
+           entries       INTEGER NOT NULL,
+           published_at  INTEGER NOT NULL,
+           PRIMARY KEY (region_id, seq)
+         );",
+    )
+    .map_err(map_db("migrate v15→v16"))?;
     Ok(())
 }
 
@@ -3521,7 +3614,9 @@ pub fn startup_check(
     let mut behind = si < sl;
     let region_rows: Vec<(String, Option<String>)> = {
         let mut stmt = conn
-            .prepare("SELECT node_id, log_file FROM regions WHERE state_root IS NOT NULL")
+            // D125 — a catalogue region has no event log to agree with; its
+            // head is a manifest hash and lives in region_snapshots.
+            .prepare("SELECT node_id, log_file FROM regions WHERE state_root IS NOT NULL AND kind = 'log'")
             .map_err(map_db("list regions"))?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))

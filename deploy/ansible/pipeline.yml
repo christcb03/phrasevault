@@ -186,6 +186,22 @@
     #
     # `--all-targets` because both misses were in TEST code, which a bare
     # `cargo clippy` never compiles.
+    # D125 — the component is not part of `--profile minimal`, and nothing
+    # installed it: the first host beyond presubuntu (pvos-test) failed the
+    # stage with "cargo-clippy is not installed", so D121's "run it every
+    # time" was true on one box. Idempotent and apt-free, so it lives here
+    # rather than in `prepare`.
+    - name: Ensure clippy is installed for the active toolchain
+      ansible.builtin.shell: |
+        set -o pipefail
+        rustup component add clippy 2>&1 | tail -1
+      args:
+        executable: /bin/bash
+      environment: "{{ cargo_env }}"
+      register: clippy_component
+      changed_when: "'is up to date' not in clippy_component.stdout"
+      tags: [test, lint]
+
     - name: Clippy (-D warnings, all targets)
       ansible.builtin.shell: |
         set -o pipefail

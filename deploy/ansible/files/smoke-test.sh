@@ -954,6 +954,36 @@ $PVFS --data-dir "$DMOUNT/.pvfs" region unmark "$RGN" >/dev/null \
 $PVFS remote --socket "$SOCK" mv "$RGNFILE" "$DROOT" >/dev/null \
   && ok "a plain mv once the boundary is gone" || fail "post-unmark mv"
 
+say "D125: catalogue region — rows, no nodes, one head (doc 26 phase 1)"
+CATLIB="$DATA/catlib"
+mkdir -p "$CATLIB/sub" "$CATLIB/empty"
+printf 'cat' > "$CATLIB/a.mkv"; printf 'catcat' > "$CATLIB/sub/b.mkv"
+CAT="$($PVFS add "$ROOT" --kind folder --label catlib)"
+$PVFS --json region mark "$CAT" --catalogue | qgrep '"kind":"catalogue"' \
+  && ok "region mark --catalogue" || fail "catalogue mark"
+$PVFS --json region ls | qgrep "\"region\":\"$CAT\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\"" \
+  && ok "region ls shows the kind" || fail "region ls kind"
+$PVFS bind "$CAT" "$CATLIB" --hash-policy on_add >/dev/null && ok "catalogue root binds" || fail "catalogue bind"
+$PVFS --json region entries "$CAT" | qgrep '"head":null' && ok "no head before the first scan" || fail "head before scan"
+$PVFS scan "$CAT" >/dev/null && ok "catalogue scan" || fail "catalogue scan"
+$PVFS --json region entries "$CAT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+paths=[(e["path"],e["kind"]) for e in d["entries"]]
+assert paths==[("a.mkv","file"),("empty","dir"),("sub","dir"),("sub/b.mkv","file")], paths
+assert d["head"]["seq"]==1, d["head"]
+assert all(e["hash"] for e in d["entries"] if e["kind"]=="file"), "on_add hashes"
+' && ok "two files, two folders (one empty), hashed, head seq 1" || fail "catalogue entries"
+[ "$($PVFS --json ls "$CAT" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = "0" ] \
+  && ok "no nodes minted under a catalogue region" || fail "nodes under a catalogue region"
+$PVFS scan "$CAT" >/dev/null
+head_seq() { $PVFS --json region entries "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["seq"])'; }
+[ "$(head_seq "$CAT")" = "1" ] && ok "an unchanged pass publishes nothing" || fail "second pass republished: seq $(head_seq "$CAT")"
+rm "$CATLIB/a.mkv"; $PVFS scan "$CAT" >/dev/null
+[ "$(head_seq "$CAT")" = "2" ] && ok "a removal is a new head (seq 2)" || fail "removal head: seq $(head_seq "$CAT")"
+$PVFS region unmark "$CAT" >/dev/null 2>&1 && fail "a catalogue region must refuse unmark" || ok "a catalogue region refuses unmark"
+$PVFS region mark "$CAT" >/dev/null 2>&1 && fail "a catalogue region must refuse a re-mark" || ok "a catalogue region refuses a re-mark"
+
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
 PRIN="$($PVFS add "$PR" --kind folder --label inner)"

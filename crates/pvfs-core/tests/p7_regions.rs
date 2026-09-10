@@ -38,7 +38,7 @@ fn regions_mark_membership_replay_and_unmark() {
     e.region_mark(&albums).unwrap();
     assert_eq!(e.region_of(&summer).unwrap(), albums);
     assert_eq!(e.region_of(&photos).unwrap(), photos);
-    let mut listed: Vec<String> = e.regions().unwrap().into_iter().map(|(id, _)| id).collect();
+    let mut listed: Vec<String> = e.regions().unwrap().into_iter().map(|(id, _, _)| id).collect();
     listed.sort();
     let mut expect = vec![photos.clone(), albums.clone()];
     expect.sort();

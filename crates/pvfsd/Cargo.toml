@@ -35,4 +35,5 @@ rcgen.workspace = true
 [dev-dependencies]
 pvfs-client = { path = "../pvfs-client" }
 tempfile.workspace = true
+rusqlite.workspace = true
 hex.workspace = true

@@ -190,6 +190,9 @@ pub struct RegionInfo {
     /// Last head the enclosing log attests (0/"" until the first commitment).
     pub committed_seq: u64,
     pub committed_head: String,
+    /// D125: `log` (a split event log, P7.2) or `catalogue` (the region
+    /// catalogues itself; its head is a manifest hash, not a log chain).
+    pub kind: String,
     /// The region log's live tip.
     pub tip_seq: u64,
 }
@@ -676,12 +679,14 @@ impl Engine {
     /// fresh generation from here. Outer regions split before nested ones so
     /// each baseline's host log exists when it authors.
     fn split_unsplit_regions(&mut self) -> Result<()> {
+        // D125: a catalogue region has no generation to split — state_root stays
+        // NULL for its whole life, so it is neither "unsplit" nor "stuck".
         loop {
             let next: Option<String> = self
                 .conn
                 .query_row(
                     "SELECT r.node_id FROM regions r
-                     WHERE r.state_root IS NULL
+                     WHERE r.state_root IS NULL AND r.kind = 'log'
                        AND (r.parent_log = '' OR EXISTS (
                          SELECT 1 FROM regions p
                          WHERE p.node_id = r.parent_log AND p.state_root IS NOT NULL))
@@ -695,7 +700,7 @@ impl Engine {
                 let stuck: i64 = self
                     .conn
                     .query_row(
-                        "SELECT COUNT(*) FROM regions WHERE state_root IS NULL",
+                        "SELECT COUNT(*) FROM regions WHERE state_root IS NULL AND kind = 'log'",
                         [],
                         |r| r.get(0),
                     )
@@ -1175,7 +1180,7 @@ impl Engine {
                 | Event::FolderBound { folder_id: node_id, .. }
                 | Event::FolderUnbound { folder_id: node_id, .. }
                 | Event::FolderUnboundRoot { folder_id: node_id, .. }
-                | Event::AclSet { node_id, .. } => self.resolve_region(node_id, &batch_homes)?,
+                | Event::AclSet { node_id, .. } => self.boundary_route(node_id, &batch_homes)?,
                 Event::SecureBlobUpdated { blob_id, .. } => {
                     self.resolve_region(blob_id, &batch_homes)?
                 }
@@ -1248,6 +1253,30 @@ impl Engine {
                 )
                 .optional()
                 .map_err(map_db("region log lookup"))?;
+            // D125 — a catalogue region has no split log BY DESIGN: it owns its
+            // files and catalogues them itself; nothing is added to it through
+            // the tree. Reporting that as Corruption was a lie about a healthy
+            // forest. (The routing SELECT below does not read `kind`, so this
+            // asks; the cost is one indexed lookup on a path that is already an
+            // error.)
+            let kind: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT kind FROM regions WHERE node_id = ?1",
+                    params![tgt],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db("region kind"))?;
+            if kind.as_deref() == Some("catalogue") {
+                return Err(PvfsError::Forbidden {
+                    action: "write".into(),
+                    reason: format!(
+                        "node is inside catalogue region {tgt}, which owns its own files; \
+                         nothing is added to it through the tree (D125)"
+                    ),
+                });
+            }
             let file = file.flatten().ok_or_else(|| PvfsError::Corruption {
                 db: format!("region log {tgt}"),
                 detail: "write routed to a region that has no split log".into(),
@@ -4551,6 +4580,34 @@ impl Engine {
     /// it. A re-mark of an already-split region only re-stamps: its live
     /// generation must not be reset under itself.
     pub fn region_mark(&mut self, node: &NodeId) -> Result<()> {
+        self.region_mark_as(node, "", None)
+    }
+
+    /// D125 — mark `node` as a region of `kind`: `""`/`"log"` is P7.0's split
+    /// event log; `"catalogue"` is a region that catalogues its own files
+    /// (`region_entries`) and has no log at all. `owner`, when given, is
+    /// granted admin (`a`) on the region in the same batch — the one grant
+    /// that lets a replica publish the region's head (milestone §4).
+    ///
+    /// A catalogue region holds rows, never nodes, and its kind is fixed at
+    /// the mark: it must be an EMPTY folder that is not already a region, and
+    /// once marked it is not re-marked (a log re-mark would split it).
+    pub fn region_mark_as(
+        &mut self,
+        node: &NodeId,
+        kind: &str,
+        owner: Option<&crate::acl::Principal>,
+    ) -> Result<()> {
+        let kind = match kind {
+            "" | "log" => "",
+            "catalogue" => "catalogue",
+            other => {
+                return Err(bad(
+                    "kind",
+                    &format!("{other:?} is not a region kind (log | catalogue)"),
+                ))
+            }
+        };
         self.ensure_device_active()?;
         let n = fetch_node(&self.conn, node)?.ok_or(PvfsError::NotFound {
             kind: "node",
@@ -4559,28 +4616,57 @@ impl Engine {
         if n.is_temp {
             return Err(bad("region", "temp nodes are forest-local (no region marks)"));
         }
-        let already_split: Option<i64> = self
+        let existing: Option<(Option<String>, String)> = self
             .conn
             .query_row(
-                "SELECT 1 FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                "SELECT state_root, kind FROM regions WHERE node_id = ?1",
                 params![node],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(map_db("region lookup"))?;
+        let already_split = matches!(existing, Some((Some(_), _)));
+        if let Some((_, k)) = &existing {
+            if k == "catalogue" {
+                return Err(bad(
+                    "region",
+                    &format!("{node} is already a catalogue region; its kind is fixed at the mark"),
+                ));
+            }
+            if kind == "catalogue" {
+                return Err(bad(
+                    "region",
+                    &format!("{node} is already a {k} region; a catalogue region is marked once, on a fresh folder"),
+                ));
+            }
+        }
+        if kind == "catalogue" {
+            if n.node_type != crate::node::TYPE_FOLDER {
+                return Err(bad("region", "a catalogue region is a folder"));
+            }
+            if !self.children(node)?.is_empty() {
+                return Err(bad(
+                    "region",
+                    &format!("{node} has children; a catalogue region holds rows, never nodes — mark an empty folder"),
+                ));
+            }
+        }
         let t = now_ms();
         let me = self.device.pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_region_marked(node, t, &me),
+            &event::msg_region_marked(node, t, kind, &me),
         )?;
         let mut events = vec![Event::RegionMarked {
             node_id: node.clone(),
             marked_at: t,
+            kind: kind.to_string(),
             author: me.clone(),
             sig,
         }];
-        if already_split.is_none() {
+        // P7.2a: a log region is split at the mark — its baseline is the
+        // canonical state of the subtree now. A catalogue region never is.
+        if kind.is_empty() && !already_split {
             let state_root = projection::canonical_state_root(&self.conn, node)?;
             let bsig = crypto::sign_digest(
                 &self.device.signing_key,
@@ -4590,8 +4676,26 @@ impl Engine {
                 node_id: node.clone(),
                 state_root: state_root.to_vec(),
                 at: t,
-                author: me,
+                author: me.clone(),
                 sig: bsig,
+            });
+        }
+        if let Some(p) = owner {
+            let (pk, pid) = (p.kind(), p.id().to_vec());
+            let rights = crate::acl::ACL_A as u64;
+            let asig = crypto::sign_digest(
+                &self.device.signing_key,
+                &event::msg_acl_set(node, pk, &pid, rights, t, 0, &me),
+            )?;
+            events.push(Event::AclSet {
+                node_id: node.clone(),
+                principal_kind: pk,
+                principal_id: pid,
+                rights,
+                set_at: t,
+                expires_at: 0,
+                author: me,
+                sig: asig,
             });
         }
         self.append_durable(events)
@@ -4604,21 +4708,33 @@ impl Engine {
     /// it once the region row is gone.
     pub fn region_unmark(&mut self, node: &NodeId) -> Result<()> {
         self.ensure_device_active()?;
-        let row: Option<(Option<String>, Option<String>)> = self
+        let row: Option<(Option<String>, Option<String>, String)> = self
             .conn
             .query_row(
-                "SELECT state_root, log_file FROM regions WHERE node_id = ?1",
+                "SELECT state_root, log_file, kind FROM regions WHERE node_id = ?1",
                 params![node],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(map_db("region lookup"))?;
-        let Some((state_root, log_file)) = row else {
+        let Some((state_root, log_file, kind)) = row else {
             return Err(PvfsError::NotFound {
                 kind: "region",
                 id: node.clone(),
             });
         };
+        // D125 — a catalogue region has no log to fold back into its parent.
+        // `region_log_tip` would return (0, genesis) for it, and this would
+        // commit a bogus final head and unmark — discarding the catalogue
+        // without a word. What unmarking one MEANS is deliberately out of
+        // D125's scope (doc 26 phases 3+ decide it), so refuse, clearly.
+        if kind == "catalogue" {
+            return Err(PvfsError::Forbidden {
+                action: "unmark".into(),
+                reason: "a catalogue region cannot be unmarked (D125): it has no event log to fold back. Remove the binding instead"
+                    .into(),
+            });
+        }
         let t = now_ms();
         let me = self.device.pubkey();
         let mut events = Vec::with_capacity(2);
@@ -4694,12 +4810,12 @@ impl Engine {
         if self.replica {
             return Ok(0);
         }
-        let rows: Vec<(String, Option<String>, u64, String)> = {
+        let rows: Vec<(String, Option<String>, u64, String, String)> = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT node_id, log_file, committed_seq, committed_head
-                     FROM regions WHERE state_root IS NOT NULL",
+                    "SELECT node_id, log_file, committed_seq, committed_head, kind
+                     FROM regions WHERE state_root IS NOT NULL OR kind = 'catalogue'",
                 )
                 .map_err(map_db("list regions"))?;
             let it = stmt
@@ -4709,6 +4825,7 @@ impl Engine {
                         r.get(1)?,
                         r.get::<_, i64>(2)? as u64,
                         r.get(3)?,
+                        r.get(4)?,
                     ))
                 })
                 .map_err(map_db("list regions"))?;
@@ -4718,8 +4835,16 @@ impl Engine {
         let mut events = Vec::new();
         let t = now_ms();
         let me = self.device.pubkey();
-        for (node, file, committed_seq, committed_head) in rows {
-            let (tip, chain) = self.region_log_tip(&node, file.as_deref())?;
+        for (node, file, committed_seq, committed_head, kind) in rows {
+            // D125 — the head of a catalogue region is the hash of its last
+            // published manifest, not the tip of a log it does not have. Same
+            // SubRegionHead, same fold, same authority check; only the source
+            // of (seq, hash) differs. This is the phase 0 spike of doc 26 §10.
+            let (tip, chain) = if kind == "catalogue" {
+                self.catalogue_head(&node)?
+            } else {
+                self.region_log_tip(&node, file.as_deref())?
+            };
             if tip == committed_seq && hex::encode(&chain) == committed_head {
                 continue;
             }
@@ -4746,15 +4871,43 @@ impl Engine {
         Ok(n)
     }
 
+    /// D125 — a catalogue region's current head: the seq and manifest hash of
+    /// its most recently published snapshot, or `(0, [])` if it has never
+    /// published. Reads `region_snapshots`; opens no file.
+    fn catalogue_head(&self, node: &str) -> Result<(u64, Vec<u8>)> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT seq, manifest_hash FROM region_snapshots
+                  WHERE region_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("catalogue head"))?;
+        match row {
+            Some((seq, hex_hash)) => {
+                let hash = hex::decode(&hex_hash).map_err(|e| PvfsError::BadInput {
+                    field: "manifest_hash".into(),
+                    reason: format!("region {node} snapshot {seq}: {e}"),
+                })?;
+                Ok((seq.max(0) as u64, hash))
+            }
+            None => Ok((0, Vec::new())),
+        }
+    }
+
     /// A split region's generation state (P7.2a): the baseline position, the
-    /// generation file, the last attested head, and the log's live tip.
+    /// generation file, the last attested head, and the log's live tip. A
+    /// catalogue region (D125) reports here too — no generation file, and its
+    /// attested head is a manifest hash rather than a log chain.
     pub fn region_info(&self, node: &NodeId) -> Result<Option<RegionInfo>> {
         let row: Option<RegionInfo> = self
             .conn
             .query_row(
                 "SELECT marked_at, baseline_seq, baseline_log, parent_log, log_file,
-                        committed_seq, committed_head
-                 FROM regions WHERE node_id = ?1 AND state_root IS NOT NULL",
+                        committed_seq, committed_head, kind
+                 FROM regions WHERE node_id = ?1 AND (state_root IS NOT NULL OR kind = 'catalogue')",
                 params![node],
                 |r| {
                     Ok(RegionInfo {
@@ -4765,6 +4918,7 @@ impl Engine {
                         log_file: r.get(4)?,
                         committed_seq: r.get::<_, i64>(5)? as u64,
                         committed_head: r.get(6)?,
+                        kind: r.get(7)?,
                         tip_seq: 0,
                     })
                 },
@@ -4774,22 +4928,67 @@ impl Engine {
         let Some(mut info) = row else {
             return Ok(None);
         };
-        let (tip_seq, _) = self.region_log_tip(node, info.log_file.as_deref())?;
+        let (tip_seq, _) = if info.kind == "catalogue" {
+            self.catalogue_head(node)?
+        } else {
+            self.region_log_tip(node, info.log_file.as_deref())?
+        };
         info.tip_seq = tip_seq;
         Ok(Some(info))
     }
 
-    /// All marked region boundaries, `(node_id, marked_at)`.
-    pub fn regions(&self) -> Result<Vec<(NodeId, u64)>> {
+    /// All marked region boundaries, `(node_id, marked_at, kind)` — kind is
+    /// `log` or `catalogue` (D125).
+    pub fn regions(&self) -> Result<Vec<(NodeId, u64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT node_id, marked_at FROM regions ORDER BY marked_at")
+            .prepare("SELECT node_id, marked_at, kind FROM regions ORDER BY marked_at")
             .map_err(map_db("regions"))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(map_db("regions"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("regions"))
+    }
+
+    /// D125 — whether `node` is the root of a catalogue region: one that
+    /// catalogues its own files (`region_entries`) and has no event log.
+    pub fn is_catalogue_region(&self, node: &str) -> Result<bool> {
+        let kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM regions WHERE node_id = ?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("region kind"))?;
+        Ok(kind.as_deref() == Some("catalogue"))
+    }
+
+    /// D125 — where an event about a region's ROOT node (its binding, its
+    /// ACL, its purge) goes. For a log region that is the region's own
+    /// generation, as before. A catalogue region has no log, so its boundary
+    /// events go to the enclosing one — where its `RegionMarked` and
+    /// `SubRegionHead` rows already live. Events about nodes INSIDE a
+    /// catalogue region still resolve to it, and the append gate refuses
+    /// them: a catalogue region takes no nodes.
+    fn boundary_route(
+        &self,
+        node: &str,
+        batch_homes: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let region = self.resolve_region(node, batch_homes)?;
+        if region == node && self.is_catalogue_region(node)? {
+            return self.enclosing_log(node);
+        }
+        Ok(region)
     }
 
     /// The region `node` belongs to: the nearest marked ancestor (a marked
@@ -4916,6 +5115,74 @@ impl Engine {
                     rights: rights as u64,
                     set_at: t,
                     expires_at,
+                    author: author_pub.to_vec(),
+                    sig: Vec::new(),
+                },
+            }],
+        })
+    }
+
+    /// Phase 1 of a routed head publish (D125 item 8): build an unsigned
+    /// `SubRegionHead` for a catalogue region on behalf of `author_pub` — the
+    /// box that owns the region. The author must hold admin (`a`) on the
+    /// region root (the `region mark --owner` grant, §4), the region must be
+    /// a catalogue region, and the seq must advance. Re-checked on commit and
+    /// replay by the same authority rule every region event obeys.
+    pub fn prepare_commit_region_head(
+        &self,
+        author_pub: &[u8],
+        region: &NodeId,
+        seq: u64,
+        hash_hex: &str,
+    ) -> Result<PreparedWrite> {
+        if fetch_node(&self.conn, region)?.is_none() {
+            return Err(PvfsError::NotFound {
+                kind: "node",
+                id: region.clone(),
+            });
+        }
+        if !self.is_catalogue_region(region)? {
+            return Err(PvfsError::Forbidden {
+                action: "commit region head".into(),
+                reason: format!("{region} is not a catalogue region"),
+            });
+        }
+        let who = crate::acl::Principal::Key(author_pub.to_vec());
+        if projection::effective_rights(&self.conn, &who, region)? & crate::acl::ACL_A == 0 {
+            return Err(PvfsError::Forbidden {
+                action: "commit region head".into(),
+                reason: format!("you lack admin (a) on {region} — it is not yours to publish"),
+            });
+        }
+        let committed: i64 = self
+            .conn
+            .query_row(
+                "SELECT committed_seq FROM regions WHERE node_id = ?1",
+                params![region],
+                |r| r.get(0),
+            )
+            .map_err(map_db("region head"))?;
+        if seq as i64 <= committed {
+            return Err(bad(
+                "seq",
+                &format!("head seq {seq} does not advance {region} (at {committed})"),
+            ));
+        }
+        let head_hash = hex::decode(hash_hex)
+            .ok()
+            .filter(|h| h.len() == 32)
+            .ok_or_else(|| bad("hash", "a manifest hash is 32 bytes of hex"))?;
+        let t = now_ms();
+        let digest = event::msg_sub_region_head(region, seq, &head_hash, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: region.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::SubRegionHead {
+                    node_id: region.clone(),
+                    head_seq: seq,
+                    head_hash,
+                    at: t,
                     author: author_pub.to_vec(),
                     sig: Vec::new(),
                 },

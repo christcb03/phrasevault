@@ -262,10 +262,11 @@ fn legacy_p70_marks_split_lazily_at_open() {
             )
             .unwrap();
         let t = written_at as u64 + 1;
-        let sig = crypto::sign_digest(&dev, &event::msg_region_marked(&photos, t, &me)).unwrap();
+        let sig = crypto::sign_digest(&dev, &event::msg_region_marked(&photos, t, "", &me)).unwrap();
         let ev = event::Event::RegionMarked {
             node_id: photos.clone(),
             marked_at: t,
+            kind: String::new(),
             author: me,
             sig,
         };

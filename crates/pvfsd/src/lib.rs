@@ -1903,6 +1903,7 @@ fn write_target(op: &WriteOp) -> Option<&str> {
         // could smuggle a node INTO a leased subtree.
         | WriteOp::Mv { node: _, new_parent: node } => Some(node),
         WriteOp::AddLocation { file, .. } => Some(file),
+        WriteOp::CommitRegionHead { region, .. } => Some(region),
         _ => None,
     }
 }
@@ -2086,6 +2087,9 @@ fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u
                 (Ok(p), Ok(r)) => e.prepare_set_acl_expiring(&author, &node, &p, r, expires_at),
                 (Err(err), _) | (_, Err(err)) => Err(err),
             },
+            WriteOp::CommitRegionHead { region, seq, hash } => {
+                e.prepare_commit_region_head(&author, &region, seq, &hash)
+            }
             WriteOp::TagMember {
                 member,
                 tag,

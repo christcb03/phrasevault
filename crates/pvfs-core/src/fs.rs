@@ -300,8 +300,46 @@ struct DiskFile {
     name: String,
     size: u64,
     mtime_ms: u64,
+    /// D112's settle signal, `max(mtime, ctime)` — kept for the catalogue row.
+    changed_ms: u64,
     path: PathBuf,
 }
+
+/// One row of a catalogue region's own index (D125 `region_entries`): what is
+/// on disk under the region root right now, by relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionEntry {
+    /// Forward-slash, no leading slash, relative to the binding's root.
+    pub rel_path: String,
+    /// `file` | `dir`.
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    /// `max(mtime, ctime)` on THIS box — the D112 settle signal; never in
+    /// the manifest.
+    pub changed_ms: u64,
+    /// Files only; `None` until known (a `never` binding with no sidecar).
+    pub content_hash: Option<String>,
+    /// D76 `MediaQuality` encoding; `None` until measured.
+    pub quality: Option<String>,
+    /// The pass that last confirmed this row.
+    pub seen_at: u64,
+}
+
+/// One published snapshot of a catalogue region (D125 `region_snapshots`):
+/// the manifest hash the log was told about as the region's head at `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionSnapshot {
+    pub seq: u64,
+    /// Hex blake3 of the canonical manifest bytes.
+    pub manifest_hash: String,
+    pub entries: u64,
+    pub published_at: u64,
+}
+
+/// One catalogue row on its way to `region_entries` (D125):
+/// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
+type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
 
 impl Engine {
     // ---- bindings (doc 04 §3) --------------------------------------------------
@@ -319,6 +357,17 @@ impl Engine {
         }
         if n.is_temp {
             return Err(bad("folder", "cannot bind a temp folder"));
+        }
+        // D125 — a catalogue region is bound at its root and catalogues the
+        // whole subtree from there; a second binding inside it would try to
+        // ingest nodes into a region that takes none. Refuse once, here, with
+        // the reason — not per file at the append gate.
+        let region = self.region_of(folder)?;
+        if region != *folder && self.is_catalogue_region(&region)? {
+            return Err(bad(
+                "folder",
+                &format!("{folder} is inside catalogue region {region}, which is bound at its root (D125)"),
+            ));
         }
         let st = LocalBackend.stat(&spec.source_uri)?;
         if !st.exists || !st.is_dir {
@@ -965,6 +1014,288 @@ impl Engine {
         self.scan_binding(&transient, writer, settle_ms)
     }
 
+    /// D125 items 2–3 — the region-kind scan (doc 26 §4, milestone §3.2).
+    ///
+    /// One `region_entries` row per file and per directory — EMPTY ones
+    /// included, which is Chris's requirement and the reason directories are
+    /// rows at all — and not one event: a catalogue region tells the log only
+    /// its manifest hash (item 4). The walk already applied the settle window
+    /// (D112), so a file still being written is simply absent from `files`;
+    /// its last settled row is KEPT, because the stale sweep re-checks the
+    /// disk before deleting and "still copying" is not "gone".
+    fn scan_region_catalogue(
+        &mut self,
+        b: &Binding,
+        root: &std::path::Path,
+        files: &[DiskFile],
+        dirs: &[Vec<String>],
+        mut stats: ScanStats,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> Result<ScanStats> {
+        let region = b.folder_id.as_str();
+        let pass = now_ms() as i64;
+        let dirs_with_files: HashSet<&[String]> =
+            files.iter().map(|f| f.rel_dirs.as_slice()).collect();
+        stats.empty_dirs = dirs
+            .iter()
+            .filter(|d| !dirs_with_files.contains(d.as_slice()))
+            .count() as u64;
+
+        // (rel_path, kind, size, mtime, changed, hash). Directories carry no
+        // times: theirs change whenever an entry does, which the file rows
+        // already say, and two identical libraries must hash identically.
+        let mut rows: Vec<CatalogueRow> =
+            dirs.iter().map(|d| (d.join("/"), "dir", 0, 0, 0, None)).collect();
+        // Hashes first, outside any transaction: this is the slow part, and a
+        // pass abandoned here has cost nothing but time.
+        for f in files {
+            if self.cancelled() {
+                stats.cancelled = true;
+                return Ok(stats);
+            }
+            let mut rel = f.rel_dirs.join("/");
+            if !rel.is_empty() {
+                rel.push('/');
+            }
+            rel.push_str(&f.name);
+            let prior: Option<(u64, u64, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT size_bytes, mtime_ms, content_hash FROM region_entries
+                      WHERE region_id = ?1 AND rel_path = ?2",
+                    params![region, rel],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)? as u64,
+                            r.get::<_, i64>(1)? as u64,
+                            r.get(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db("region entry"))?;
+            let same = matches!(prior, Some((s, m, _)) if s == f.size && m == f.mtime_ms);
+            let known = match &prior {
+                Some((_, _, Some(h))) if same => Some(h.clone()),
+                _ => None,
+            };
+            // A present sidecar is free and is read whatever the policy; only
+            // a MISSING one is where the policy decides whether bytes are
+            // read — the same split ingest makes (D103, D94).
+            let hash = match known {
+                Some(h) => Some(h),
+                None => match b.hash_policy {
+                    HashPolicy::OnAdd => Some(self.hash_reusing_sidecar(&f.path, f.size)?.0),
+                    HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
+                },
+            };
+            match prior {
+                None => stats.added += 1,
+                Some(_) if same => stats.unchanged += 1,
+                Some(_) => stats.changed += 1,
+            }
+            rows.push((rel, "file", f.size, f.mtime_ms, f.changed_ms, hash));
+        }
+
+        // Rows this pass did not produce are gone from disk — or merely unseen
+        // (settling, unreadable). Only the first is a deletion.
+        let produced: HashSet<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let gone: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rel_path FROM region_entries WHERE region_id = ?1")
+                .map_err(map_db("region entries"))?;
+            let all = stmt
+                .query_map(params![region], |r| r.get::<_, String>(0))
+                .map_err(map_db("region entries"))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_db("region entries"))?;
+            all.into_iter()
+                .filter(|rel| !produced.contains(rel.as_str()) && !root.join(rel).exists())
+                .collect()
+        };
+
+        let tx = self.conn.transaction().map_err(map_db("begin catalogue"))?;
+        for (rel, kind, size, mtime, changed, hash) in &rows {
+            tx.execute(
+                "INSERT INTO region_entries
+                   (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
+                    content_hash, quality, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+                 ON CONFLICT(region_id, rel_path) DO UPDATE SET
+                   kind = excluded.kind, size_bytes = excluded.size_bytes,
+                   mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
+                   content_hash = excluded.content_hash, seen_at = excluded.seen_at",
+                params![
+                    region,
+                    rel,
+                    kind,
+                    *size as i64,
+                    *mtime as i64,
+                    *changed as i64,
+                    hash,
+                    pass
+                ],
+            )
+            .map_err(map_db("upsert region entry"))?;
+        }
+        for rel in &gone {
+            tx.execute(
+                "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
+                params![region, rel],
+            )
+            .map_err(map_db("delete region entry"))?;
+            stats.removed += 1;
+        }
+        tx.commit().map_err(map_db("commit catalogue"))?;
+        // Item 4 — a changed catalogue publishes its head; an unchanged one
+        // publishes nothing.
+        self.publish_region_snapshot(&b.folder_id, writer)?;
+        Ok(stats)
+    }
+
+    /// A catalogue region's rows in manifest order — bytewise by path, which
+    /// is SQLite's BINARY collation (D125 §3.3).
+    pub fn region_entries(&self, region: &NodeId) -> Result<Vec<RegionEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rel_path, kind, size_bytes, mtime_ms, changed_ms, content_hash, quality, seen_at
+                   FROM region_entries WHERE region_id = ?1 ORDER BY rel_path",
+            )
+            .map_err(map_db("region entries"))?;
+        let rows = stmt
+            .query_map(params![region], |r| {
+                Ok(RegionEntry {
+                    rel_path: r.get(0)?,
+                    kind: r.get(1)?,
+                    size_bytes: r.get::<_, i64>(2)? as u64,
+                    mtime_ms: r.get::<_, i64>(3)? as u64,
+                    changed_ms: r.get::<_, i64>(4)? as u64,
+                    content_hash: r.get(5)?,
+                    quality: r.get(6)?,
+                    seen_at: r.get::<_, i64>(7)? as u64,
+                })
+            })
+            .map_err(map_db("region entries"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("region entries"))
+    }
+
+    /// D125 item 4 — the canonical manifest of a catalogue region at `seq`
+    /// (milestone §3.3). Deterministic by construction: `rows` as
+    /// [`Engine::region_entries`] returns them (bytewise path order), sizes
+    /// and mtimes as the scan recorded them, and nothing per-box — no
+    /// `changed_ms`, no `seen_at`. A tab, newline or backslash in a path is
+    /// escaped (`\t`, `\n`, `\\`) so a row is always one line of six fields.
+    pub fn region_manifest_bytes(region: &str, seq: u64, rows: &[RegionEntry]) -> Vec<u8> {
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+        }
+        let mut out = format!("pvfs-region-manifest 1\n{region}\n{seq}\n");
+        for r in rows {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                r.kind,
+                esc(&r.rel_path),
+                r.size_bytes,
+                r.mtime_ms,
+                r.content_hash.as_deref().unwrap_or("-"),
+                r.quality.as_deref().unwrap_or("-"),
+            ));
+        }
+        out.into_bytes()
+    }
+
+    /// D125 item 4 — publish the region's catalogue as a new snapshot when it
+    /// differs from the last one: the manifest file at
+    /// `regions/<id>/manifest.<seq>`, a `region_snapshots` row, and — on the
+    /// owner — the `SubRegionHead` that attests it (milestone §3.4). The
+    /// change test re-serialises the rows at the LAST seq, so an unchanged
+    /// catalogue re-hashes to the last hash and publishes nothing.
+    /// Returns the new seq, or `None` when nothing changed.
+    pub fn publish_region_snapshot(
+        &mut self,
+        region: &NodeId,
+        writer: &mut Option<&mut dyn ScanWriter>,
+    ) -> Result<Option<u64>> {
+        if !self.is_catalogue_region(region)? {
+            return Err(bad("region", "not a catalogue region"));
+        }
+        let rows = self.region_entries(region)?;
+        let last: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT seq, manifest_hash FROM region_snapshots
+                  WHERE region_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![region],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("last snapshot"))?;
+        let (last_seq, last_hash) = last.unwrap_or((0, String::new()));
+        if last_seq > 0 {
+            let again = Self::region_manifest_bytes(region, last_seq as u64, &rows);
+            if blake3::hash(&again).to_hex().as_str() == last_hash {
+                return Ok(None);
+            }
+        }
+        let seq = last_seq as u64 + 1;
+        let bytes = Self::region_manifest_bytes(region, seq, &rows);
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let dir = self.data_dir.join("regions").join(region);
+        crate::storage::atomic_overwrite(&dir.join(format!("manifest.{seq}")), &bytes)?;
+        // The head is the ONE thing the log learns about a catalogue region.
+        // A replica publishes it through its route to the forest owner (item
+        // 8) and records the snapshot only once the owner has taken the head:
+        // a refused head is retried by the next pass, not remembered as done.
+        if self.replica {
+            match writer {
+                Some(w) => w.commit_region_head(region, seq, &hash)?,
+                None => {
+                    return Err(PvfsError::Forbidden {
+                        action: "publish region head".into(),
+                        reason: "a replica publishes through its owner, and no route was given".into(),
+                    })
+                }
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO region_snapshots (region_id, seq, manifest_hash, entries, published_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![region, seq as i64, hash, rows.len() as i64, now_ms() as i64],
+            )
+            .map_err(map_db("insert snapshot"))?;
+        if !self.replica {
+            self.commit_region_heads()?;
+        }
+        Ok(Some(seq))
+    }
+
+    /// A catalogue region's published snapshots, oldest first.
+    pub fn region_snapshots(&self, region: &NodeId) -> Result<Vec<RegionSnapshot>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, manifest_hash, entries, published_at
+                   FROM region_snapshots WHERE region_id = ?1 ORDER BY seq",
+            )
+            .map_err(map_db("region snapshots"))?;
+        let rows = stmt
+            .query_map(params![region], |r| {
+                Ok(RegionSnapshot {
+                    seq: r.get::<_, i64>(0)? as u64,
+                    manifest_hash: r.get(1)?,
+                    entries: r.get::<_, i64>(2)? as u64,
+                    published_at: r.get::<_, i64>(3)? as u64,
+                })
+            })
+            .map_err(map_db("region snapshots"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("region snapshots"))
+    }
+
     fn scan_binding(
         &mut self,
         b: &Binding,
@@ -1002,6 +1333,13 @@ impl Engine {
             &mut stats,
             &WalkCtx { binding: b, settle_ms },
         )?;
+
+        // D125 — a catalogue region's binding catalogues; it does not ingest.
+        // Rows, not nodes: nothing below this point runs for it, and nothing
+        // it does reaches the log (doc 26 §4–§5).
+        if self.is_catalogue_region(&b.folder_id)? {
+            return self.scan_region_catalogue(b, &root, &files, &dirs, stats, writer);
+        }
 
         // 2. mirror folders + ingest files
         let mut folder_ids: HashMap<String, NodeId> = HashMap::new();
@@ -3139,6 +3477,9 @@ pub trait ScanWriter {
     fn set_content_hash(&mut self, file: &str, content_hash: &str, size: u64) -> Result<NodeId>;
     /// D105 — drop a link whose file is gone from a mount PROVEN live.
     fn remove_link(&mut self, link_id: &str) -> Result<()>;
+    /// D125 item 8 — publish the head of a catalogue region this box owns:
+    /// the ONE routed write ownership grants (milestone §4.3).
+    fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> Result<()>;
 }
 
 /// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and
@@ -3423,6 +3764,7 @@ fn walk_disk(
             name: entry.name.clone(),
             size: entry.size,
             mtime_ms: entry.mtime_ms,
+            changed_ms: entry.changed_ms,
             path: child,
         });
     }
