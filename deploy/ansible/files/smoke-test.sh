@@ -984,6 +984,32 @@ rm "$CATLIB/a.mkv"; $PVFS scan "$CAT" >/dev/null
 $PVFS region unmark "$CAT" >/dev/null 2>&1 && fail "a catalogue region must refuse unmark" || ok "a catalogue region refuses unmark"
 $PVFS region mark "$CAT" >/dev/null 2>&1 && fail "a catalogue region must refuse a re-mark" || ok "a catalogue region refuses a re-mark"
 
+say "D126: the merged view — one entry per path, admitted only when the bytes agree (doc 26 phase 3)"
+CATLIB2="$DATA/catlib2"
+mkdir -p "$CATLIB2/sub" "$CATLIB2/also"
+printf 'catcat' > "$CATLIB2/sub/b.mkv"      # same bytes as catlib's sub/b.mkv
+printf 'DIFFERENT' > "$CATLIB2/c.mkv"       # a second copy of c.mkv with other bytes
+printf 'other' > "$CATLIB/c.mkv"            # (catlib lost a.mkv above; give it c.mkv)
+CAT2="$($PVFS add "$ROOT" --kind folder --label catlib2)"
+$PVFS region mark "$CAT2" --catalogue >/dev/null && $PVFS bind "$CAT2" "$CATLIB2" --hash-policy on_add >/dev/null \
+  && $PVFS scan "$CAT2" >/dev/null && $PVFS scan "$CAT" >/dev/null && ok "second catalogue region scanned" || fail "second region"
+$PVFS --json view ls | python3 -c '
+import json,sys
+v={e["path"]:e for e in json.load(sys.stdin)}
+assert v["sub"]["kind"]=="dir" and len(v["sub"]["sources"])==2, v["sub"]
+assert v["also"]["kind"]=="dir", v.get("also")
+assert v["c.mkv"]["state"].startswith("conflict"), v["c.mkv"]
+' && ok "view ls: a folder in both, a folder in one, a conflict" || fail "view ls"
+$PVFS --json view ls sub | python3 -c '
+import json,sys
+v={e["path"]:e for e in json.load(sys.stdin)}
+assert v["sub/b.mkv"]["state"]=="admitted" and v["sub/b.mkv"]["copies"]==2, v
+' && ok "identical bytes in two regions merge into one admitted entry with two copies" || fail "view ls sub"
+$PVFS --json view conflicts | python3 -c '
+import json,sys
+c=json.load(sys.stdin); assert [e["path"] for e in c]==["c.mkv"], c
+' && ok "view conflicts names the one conflicting path" || fail "view conflicts"
+
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
 PRIN="$($PVFS add "$PR" --kind folder --label inner)"

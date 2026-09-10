@@ -303,6 +303,11 @@ enum Cmd {
     /// Region boundaries (P7.0, doc 20): per-app replication/compaction units
     #[command(subcommand)]
     Region(RegionCmd),
+    /// D126: the merged view — one entry per path across every catalogue
+    /// region this box holds, admitted only when the copies agree on the
+    /// bytes (doc 26 phase 3)
+    #[command(subcommand)]
+    View(ViewCmd),
     /// Mount a tree read-only as a real filesystem (P7.3, doc 20 §3):
     /// directories from the catalog, file reads resolve live — local bytes,
     /// the sync store, else verified read-through. Blocks until unmounted.
@@ -1189,6 +1194,15 @@ enum ServeCmd {
 }
 
 #[derive(Subcommand)]
+enum ViewCmd {
+    /// One level of the merged view (default: every region's root)
+    Ls { dir: Option<String> },
+    /// Every conflicting path: two hashes at one path, or a file in one
+    /// region against a folder in another
+    Conflicts,
+}
+
+#[derive(Subcommand)]
 enum RegionCmd {
     /// Mark a node as a region boundary (its subtree becomes a unit). With
     /// `--catalogue` the region catalogues its own files instead of holding
@@ -1738,6 +1752,37 @@ fn authority_suffix(authority: &[u8]) -> String {
     } else {
         format!(" (by {})", hex::encode(&authority[..authority.len().min(4)]))
     }
+}
+
+/// D126 — the view state as one word a script can switch on.
+fn view_state_str(s: &pvfs_core::ViewState) -> String {
+    match s {
+        pvfs_core::ViewState::Admitted => "admitted".into(),
+        pvfs_core::ViewState::Unhashed => "unhashed".into(),
+        pvfs_core::ViewState::ConflictHashes(h) => format!("conflict:hashes:{}", h.len()),
+        pvfs_core::ViewState::ConflictKind => "conflict:kind".into(),
+    }
+}
+
+fn view_json(e: &pvfs_core::ViewEntry) -> serde_json::Value {
+    serde_json::json!({
+        "path": e.rel_path,
+        "kind": e.kind,
+        "size": e.size_bytes,
+        "mtime_ms": e.mtime_ms,
+        "hash": e.content_hash,
+        "quality": e.quality,
+        "state": view_state_str(&e.state),
+        "hashes": match &e.state {
+            pvfs_core::ViewState::ConflictHashes(h) => serde_json::json!(h),
+            _ => serde_json::Value::Null,
+        },
+        "copies": e.copies,
+        "sources": e.sources.iter().map(|c| serde_json::json!({
+            "region": c.region, "kind": c.kind, "size": c.size_bytes,
+            "mtime_ms": c.mtime_ms, "hash": c.content_hash,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn json_escape(s: &str) -> String {
@@ -5802,6 +5847,32 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     reason: format!("fusermount failed for {}", dir.display()),
                 })
             }
+        }
+        Cmd::View(cmd) => {
+            let engine = Engine::open(&ctx?)?;
+            let entries = match &cmd {
+                ViewCmd::Ls { dir } => engine.merged_view(dir.as_deref().unwrap_or(""))?,
+                ViewCmd::Conflicts => engine.view_conflicts()?,
+            };
+            if json {
+                let items: Vec<serde_json::Value> = entries.iter().map(view_json).collect();
+                println!("{}", serde_json::Value::Array(items));
+            } else {
+                for e in &entries {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        e.kind,
+                        e.size_bytes,
+                        e.copies,
+                        view_state_str(&e.state),
+                        e.rel_path
+                    );
+                }
+                if entries.is_empty() {
+                    eprintln!("(nothing in the merged view here — no catalogue region holds it)");
+                }
+            }
+            engine.close()
         }
         Cmd::Region(cmd) => {
             match cmd {
