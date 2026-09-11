@@ -36,6 +36,18 @@ pub struct NodeSpec {
 /// `(content_hash, size, updated_at, author)`.
 pub type SecureBlobHead = (Vec<u8>, u64, u64, Vec<u8>);
 
+/// D128 — one device certificate as the projection holds it (`device_keys`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCert {
+    /// Device pubkey, hex.
+    pub pubkey: String,
+    /// Derivation index under the identity root (`forest init` made 0).
+    pub index: u64,
+    pub authorized_at: u64,
+    /// Set once a root-signed `DeviceRevoked` is folded.
+    pub revoked_at: Option<u64>,
+}
+
 /// One ordered child of a parent (merged `contains` + `ref`).
 #[derive(Debug, Clone)]
 pub struct ChildEntry {
@@ -937,6 +949,84 @@ impl Engine {
         projection::meta_set(&engine.conn, "clean_shutdown", "0")?;
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 — rebuild empties temp ⇒ spool emptied
+        Ok(engine)
+    }
+
+    /// D128 — every phrase-derived device certificate the log carries, in
+    /// index order. Member keys (`fleet enroll`, index -1) are not devices
+    /// and are left out.
+    pub fn devices(&self) -> Result<Vec<DeviceCert>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT device_pubkey, device_index, authorized_at, revoked_at
+                   FROM device_keys WHERE device_index >= 0
+                  ORDER BY device_index, authorized_at",
+            )
+            .map_err(map_db("devices"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DeviceCert {
+                    pubkey: hex::encode(r.get::<_, Vec<u8>>(0)?),
+                    index: r.get::<_, i64>(1)? as u64,
+                    authorized_at: r.get::<_, i64>(2)? as u64,
+                    revoked_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                })
+            })
+            .map_err(map_db("devices"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("devices"))
+    }
+
+    /// D128 — promote a REPLICA data dir to the forest's writer, once and
+    /// explicitly, with the recovery phrase (doc 03 §6 Q3, doc 20's standby
+    /// note: never automatic). The replica already holds the whole verified
+    /// log; what changes is who may append to it:
+    ///
+    /// 1. the replica marker (which carries the old owner's address and pin)
+    ///    is kept as `promoted-from` — the runbook's evidence — and removed;
+    /// 2. [`Engine::recover`] derives device `device_index` from the phrase
+    ///    and appends its root-signed `DeviceAuthorized` at the log's tip;
+    /// 3. `revoke`, when given (the old owner's device), gets a root-signed
+    ///    `DeviceRevoked`, so a forgotten daemon there can never append again.
+    ///
+    /// Whether the old owner is DOWN is the caller's check (it needs the
+    /// network); two writers must never coexist.
+    pub fn promote(
+        data_dir: &Path,
+        mnemonic: &Mnemonic,
+        device_index: u64,
+        revoke: Option<&[u8]>,
+    ) -> Result<Engine> {
+        let marker = crate::replica::marker_path(data_dir);
+        if !marker.exists() {
+            return Err(bad(
+                "promote",
+                &format!("{} is not a replica (no marker) — already an owner?", data_dir.display()),
+            ));
+        }
+        crate::replica::ReplicaSource::load(data_dir)?; // a marker we understand
+        if probe_other_writers(data_dir) {
+            return Err(bad(
+                "promote",
+                "another process holds this replica open (pvfsd?) — stop it first",
+            ));
+        }
+        let kept = data_dir.join("promoted-from");
+        std::fs::rename(&marker, &kept).map_err(|e| PvfsError::io("keep replica marker", e))?;
+        let mut engine = match Engine::recover(data_dir, mnemonic, device_index) {
+            Ok(e) => e,
+            Err(e) => {
+                // Put the marker back: a failed promotion leaves a replica.
+                let _ = std::fs::rename(&kept, &marker);
+                return Err(e);
+            }
+        };
+        if let Some(old) = revoke {
+            if old != engine.device.pubkey().as_slice() {
+                engine.revoke_device(mnemonic, old)?;
+            }
+        }
         Ok(engine)
     }
 

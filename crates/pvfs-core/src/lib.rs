@@ -39,6 +39,7 @@ pub mod walk;
 
 pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
 pub use engine::{
+    DeviceCert,
     ChildEntry, DuplicateGroup, DuplicateReport, Engine, Island, IslandReport, NodeSpec,
     PreparedEvent, PreparedWrite, RegionInfo, SubtreeSize,
 };

@@ -237,7 +237,7 @@ The sync/file-server layer (version `1.0.#`) implements transport, auth, and tai
 
 1. **`instance_id` assignment** — How is it chosen at first init (hostname slug, UUID, operator config)? How do peers discover `instance_id` → network address?
 2. **`forest_id` format** — UUID vs human slug; whether compound `<instance_id>:<slug>` is ever used vs always two path segments in URIs.
-3. **Failover writer** — If owner instance is down, can a replica be promoted to append? (Requires explicit protocol; default is **no**.)
+3. **Failover writer** — If owner instance is down, can a replica be promoted to append? (Requires explicit protocol; default is **no**.) **BUILT as D128 (2026-09-10):** `pvfs forest promote` on the replica, with the recovery phrase — a root-signed `DeviceAuthorized` for the new box and a `DeviceRevoked` for the old one, on the log the replica already holds; never automatic. Runbook: doc 28.
 4. **Remote append auth** — *Model decided (§3.6):* the owner accepts appends from device keys certified under its identity root; cross-instance grants (e.g. letting B's identity request `FileLocationAdded` on A's forest) still need a grant mechanism. Wire protocol in sync layer `1.0.#`.
 5. **Selective log subscription** — Subset-of-forest event stream vs full forest only for Mode B imports.
 6. **Content-hash URI** — Whether to add `pvfs:…/file/<hash>` read shortcut in P4 (optional optimization).
