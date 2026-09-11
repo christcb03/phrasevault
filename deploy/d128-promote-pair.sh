@@ -64,7 +64,7 @@ has "$A_OUT" A3=ok && ok "A's daemon up on :7442" || fail "A daemon"
 MN=$(val "$A_OUT" MN); ROOT=$(val "$A_OUT" ROOT); FID=$(val "$A_OUT" FID); PIN=$(val "$A_OUT" PIN); DEV0=$(val "$A_OUT" DEV0)
 [ "$(printf '%s' "$MN" | wc -w)" -ge 12 ] && ok "recovery phrase captured" || fail "phrase: '$MN'"
 [ "${#PIN}" -eq 64 ] && ok "A's transport pin minted" || fail "pin: $PIN"
-[ "${#DEV0}" -eq 64 ] && ok "A's device 0 is $DEV0" || fail "device 0: $DEV0"
+[ "${#DEV0}" -eq 66 ] && ok "A's device 0 is $DEV0 (a 33-byte compressed key)" || fail "device 0: $DEV0"
 gate owner
 
 say "B: the replica — ships A's log, follows it, sees a folder written later through A"
@@ -129,7 +129,7 @@ echo "TIP_PROMOTED=\$(tip "\$RD/log.db")"
 "\$BIN/pvfs" --data-dir "\$RD" add "$ROOT" --kind folder --label After >/dev/null 2>&1 && echo P6=ok
 python3 - "\$RD/index.db" <<'PY'
 import sqlite3, sys
-rows = sqlite3.connect(sys.argv[1]).execute("select device_index, revoked_at is not null from device_keys order by device_index").fetchall()
+rows = sqlite3.connect(sys.argv[1]).execute("select device_index, revoked_at is not null from device_keys where device_index >= 0 order by device_index").fetchall()
 print("DEVICES=" + ";".join(f"{i}:{'revoked' if r else 'live'}" for i, r in rows))
 PY
 printf '%s\n' "$MN" | "\$BIN/pvfs" forest promote "\$R" --device-index 2 >"\$FT/d128-again.txt" 2>&1 && echo P7=PROMOTED_TWICE

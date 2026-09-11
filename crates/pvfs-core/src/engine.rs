@@ -952,13 +952,16 @@ impl Engine {
         Ok(engine)
     }
 
-    /// D128 — every device certificate the log carries, in index order.
+    /// D128 — every phrase-derived device certificate the log carries, in
+    /// index order. Member keys (`fleet enroll`, index -1) are not devices
+    /// and are left out.
     pub fn devices(&self) -> Result<Vec<DeviceCert>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT device_pubkey, device_index, authorized_at, revoked_at
-                   FROM device_keys ORDER BY device_index, authorized_at",
+                   FROM device_keys WHERE device_index >= 0
+                  ORDER BY device_index, authorized_at",
             )
             .map_err(map_db("devices"))?;
         let rows = stmt

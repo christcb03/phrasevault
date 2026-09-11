@@ -8044,7 +8044,21 @@ fn forest_cmd(
             force,
         } => {
             let data_dir = mount.join(".pvfs");
-            let src = pvfs_core::ReplicaSource::load(&data_dir)?;
+            let src = match pvfs_core::ReplicaSource::load(&data_dir) {
+                Ok(s) => s,
+                Err(PvfsError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Err(PvfsError::BadInput {
+                        field: "promote".into(),
+                        reason: format!(
+                            "{} is not a replica (no replica marker) — already the owner?",
+                            mount.display()
+                        ),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
             if !force && source_answers(&src) {
                 return Err(PvfsError::BadInput {
                     field: "promote".into(),
