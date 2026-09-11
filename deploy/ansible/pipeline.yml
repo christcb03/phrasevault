@@ -116,6 +116,8 @@
     # D124 item 5 — the checkout's `rust-toolchain.toml` names the compiler;
     # install it every prepare (idempotent), so a host that pre-dated the pin
     # does not keep floating on whatever rustup was first told.
+    # Tagged `build` ONLY: a task tagged prepare+build is skipped by the usual
+    # `--skip-tags prepare`, which is how the first D132 run built with no wrapper.
     - name: sccache (D132) — the compile cache the build tasks wrap rustc with
       ansible.builtin.shell: |
         set -o pipefail
@@ -127,7 +129,7 @@
       register: sccache_probe
       changed_when: "'linked' in sccache_probe.stdout"
       failed_when: false
-      tags: [prepare, build]
+      tags: [build]
 
     - name: Install sccache from apt when the box has none
       become: true
@@ -135,7 +137,7 @@
         name: sccache
         state: present
       when: sccache_probe.rc == 3
-      tags: [prepare, build]
+      tags: [build]
 
     - name: Link the apt sccache where cargo_env expects it
       ansible.builtin.file:
@@ -143,7 +145,7 @@
         dest: "{{ ansible_facts.env.HOME }}/.cargo/bin/sccache"
         state: link
       when: sccache_probe.rc == 3
-      tags: [prepare, build]
+      tags: [build]
 
     - name: Toolchain from rust-toolchain.toml (idempotent)
       ansible.builtin.shell: |
