@@ -46,9 +46,30 @@ pub use engine::{
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
-    CatalogueStatus, LocalBytes, RegionEntry, RegionSnapshot, ResolveReport, ViewCopy, ViewEntry, ViewState,
-    BindKind, BindSpec, Binding, BindingRow, HashPolicy, NodeStat, PendingChange, ResolveAction,
-    BackfillReport, ScanReport, ScanStats, ScanWriter, VerifyOutcome, UNLINK_GRACE_MS,
+    BackfillReport,
+    Binding,
+    BindingRow,
+    BindKind,
+    BindSpec,
+    CatalogueStatus,
+    HashPolicy,
+    LocalBytes,
+    NodeStat,
+    PendingChange,
+    ReceiveItem,
+    ReceiveSkip,
+    RegionEntry,
+    RegionSnapshot,
+    ResolveAction,
+    ResolveReport,
+    ScanReport,
+    ScanStats,
+    ScanWriter,
+    UNLINK_GRACE_MS,
+    VerifyOutcome,
+    ViewCopy,
+    ViewEntry,
+    ViewState,
     WATCH_SETTLE_MS,
 };
 pub use identity::Mnemonic;
