@@ -9,6 +9,19 @@
 
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 fn spec(dir: &std::path::Path) -> BindSpec {
     BindSpec {
         source_uri: format!("file://{}", dir.display()),
@@ -57,6 +70,7 @@ fn count_files(dir: &std::path::Path) -> usize {
 /// declared instead. A title sitting there must not be fetched back.
 #[test]
 fn a_declared_root_satisfies_even_though_nothing_is_bound_to_it() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let warm = tmp.path().join("Data");
     let cold = tmp.path().join("Data_ext");
@@ -133,6 +147,7 @@ fn a_declared_root_satisfies_even_though_nothing_is_bound_to_it() {
 /// Declaring nothing keeps the old behaviour exactly.
 #[test]
 fn declaring_nothing_falls_back_to_whatever_bindings_this_box_can_see() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("local");
     let store = tmp.path().join("store");

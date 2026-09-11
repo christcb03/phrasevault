@@ -75,3 +75,15 @@ ansible-playbook -i inventory.ini pipeline.yml --tags daemon,report
 - After the run, poke the daemon from the host with
   `PVFS_SOCKET_DIR=/run/pvfs pvfs remote --forest ~/pvfs-mounts/smoke info`
   or watch it with `journalctl --user -fu pvfsd@smoke`.
+
+## Where the suite runs, and why it is fast (D132, 2026-09-11)
+
+The tests, clippy and the smoke run on ONE host (`pvfs_runs_suite`, default
+true; set it false on a second identical VM so it only builds and installs).
+The test and smoke tasks put their temp files on tmpfs (`TMPDIR=/dev/shm`):
+every event append and projection commit fsyncs, the build VMs' virtual disks
+take 65–80 ms per fsync, and that alone made the same 558 tests take 38 min
+on disk against 107 s on tmpfs. `sccache` wraps rustc so a fresh session
+slot does not recompile the dependency tree; `CARGO_INCREMENTAL=0` keeps the
+artifacts cacheable. The suite's config dir (`XDG_CONFIG_HOME`) is a
+per-session throwaway, so no test reads the box's real instance registry.

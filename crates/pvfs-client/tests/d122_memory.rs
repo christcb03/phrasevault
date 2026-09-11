@@ -5,8 +5,22 @@
 use pvfs_client::fetch::Fetcher;
 use pvfs_core::Engine;
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 #[test]
 fn a_fetcher_with_memory_knows_what_was_saved_and_saves_only_what_it_learned() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, _mn) = Engine::init(dir.path()).unwrap();
     e.unfetchable_save(&["old-1".to_string(), "old-2".to_string()]).unwrap();
@@ -31,6 +45,7 @@ fn a_fetcher_with_memory_knows_what_was_saved_and_saves_only_what_it_learned() {
 /// engine at hand — and starts empty.
 #[test]
 fn a_bare_fetcher_starts_with_no_memory() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, _mn) = Engine::init(dir.path()).unwrap();
     e.unfetchable_save(&["old-1".to_string()]).unwrap();

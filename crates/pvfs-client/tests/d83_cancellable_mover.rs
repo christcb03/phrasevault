@@ -19,6 +19,19 @@ use std::sync::Arc;
 use pvfs_client::fetch::Fetcher;
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 fn spec(dir: &std::path::Path) -> BindSpec {
     BindSpec {
         source_uri: format!("file://{}", dir.display()),
@@ -64,6 +77,7 @@ fn library(dir: &std::path::Path, n: usize) -> (Engine, String, std::path::PathB
 /// so nothing that does not ask for it can be stopped by accident.
 #[test]
 fn a_fetcher_without_a_flag_is_never_cancelled() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let f = Fetcher::new(dir.path());
     assert!(!f.cancelled(), "no flag means never cancelled");
@@ -73,6 +87,7 @@ fn a_fetcher_without_a_flag_is_never_cancelled() {
 /// job's stop flag to the mover.
 #[test]
 fn a_raised_flag_is_visible_to_the_mover() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let mut f = Fetcher::new(dir.path());
     let flag = Arc::new(AtomicBool::new(false));
@@ -89,6 +104,7 @@ fn a_raised_flag_is_visible_to_the_mover() {
 /// the daemon restarts, and that is how a real fault gets lost in noise.
 #[test]
 fn a_cancelled_pass_stops_and_is_not_an_error() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (mut engine, media, central) = library(dir.path(), 6);
     let fid = engine.identity.forest_id.clone();
