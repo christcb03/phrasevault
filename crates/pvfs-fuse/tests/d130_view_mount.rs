@@ -111,7 +111,7 @@ fn the_view_mount_lists_the_union_and_serves_admitted_bytes() {
     ];
     let bytes = Engine::region_manifest_bytes(&far, 1, &rows);
     let prep = e
-        .prepare_commit_region_head(&holder_pub, &far, 1, &blake3::hash(&bytes).to_hex().to_string())
+        .prepare_commit_region_head(&holder_pub, &far, 1, blake3::hash(&bytes).to_hex().as_str())
         .unwrap();
     let mut events = Vec::new();
     for pe in prep.events {
