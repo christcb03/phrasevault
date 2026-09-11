@@ -119,6 +119,10 @@ pub enum ServerMsg {
         /// Absent on pre-D129 daemons, so defaulted rather than a proto bump.
         #[serde(default)]
         stale: u64,
+        /// D131 (doc 26 phase 7): the filesystem under this box's sync store
+        /// — on a holder, the library's disk. Absent on older daemons.
+        #[serde(default)]
+        capacity: Option<CapacityWire>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -214,6 +218,13 @@ pub struct ServeJobWire {
     pub last_ok_ms: Option<u64>,
     /// The last failure message, cleared by the next success.
     pub last_error: Option<String>,
+}
+
+/// D131 — free and total bytes of the filesystem under a box's sync store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityWire {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// One shipped log row, verbatim (F2 log shipping, doc 17 §5): the replica

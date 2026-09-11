@@ -18,6 +18,8 @@ rustls.workspace = true
 # D86: flock for `serve.lock` — a watcher's liveness, released by the kernel
 # when it dies, so a crash cannot leave a lock that blocks every later start.
 nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

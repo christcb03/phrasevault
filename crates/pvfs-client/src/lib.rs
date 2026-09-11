@@ -51,6 +51,7 @@ pub mod advertise;
 pub mod catalogue;
 pub mod fetch;
 pub mod follow;
+pub mod health;
 pub mod regions;
 pub mod relocate;
 pub mod watch;
@@ -83,6 +84,17 @@ impl io::Write for Stream {
             Stream::Tls(s) => s.flush(),
         }
     }
+}
+
+/// D131 — what `serve status` answers (doc 18 §5; conflicts D127, stale
+/// D129, capacity D131).
+#[derive(Debug, Clone)]
+pub struct ServeStatusReply {
+    pub runner: String,
+    pub jobs: Vec<ServeJobWire>,
+    pub conflicts: u64,
+    pub stale: u64,
+    pub capacity: Option<pvfs_proto::CapacityWire>,
 }
 
 /// Identity + root of the forest behind the socket.
@@ -277,8 +289,26 @@ impl Client {
     /// `serve status` with the two in-band counts: conflicting view paths
     /// (D127) and stale catalogue regions (D129).
     pub fn serve_status_conflicts(&mut self) -> Result<(String, Vec<ServeJobWire>, u64, u64)> {
+        let s = self.serve_status_full()?;
+        Ok((s.runner, s.jobs, s.conflicts, s.stale))
+    }
+
+    /// D131 — everything `serve status` carries, as one value.
+    pub fn serve_status_full(&mut self) -> Result<ServeStatusReply> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs, conflicts, stale } => Ok((runner, jobs, conflicts, stale)),
+            ServerMsg::ServeJobs {
+                runner,
+                jobs,
+                conflicts,
+                stale,
+                capacity,
+            } => Ok(ServeStatusReply {
+                runner,
+                jobs,
+                conflicts,
+                stale,
+                capacity,
+            }),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

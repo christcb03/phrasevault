@@ -29,7 +29,7 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
-const PERIODIC: [&str; 7] = ["sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue"];
+const PERIODIC: [&str; 8] = ["sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health"];
 /// How many intervals a pass may overrun before it is called stalled. Three is
 /// slack enough for a genuinely long pass (a big tier run) without letting a
 /// hang hide for hours.
@@ -51,6 +51,9 @@ const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 /// D129 — a catalogue region's head moves at most once per watch pass on
 /// its box, so a minute keeps the fleet's view within a pass of live.
 const CATALOGUE_INTERVAL: Duration = Duration::from_secs(60);
+/// D131 — a fleet poll every two minutes: "ten hours unnoticed" becomes
+/// "four minutes" (two misses) without paging on a daemon's own restart.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(120);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -586,6 +589,24 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         // D127 (doc 26 §7.3) — resolve the merged view's conflicts and
         // redundancies for the draining regions THIS box owns: the losing copy
         // goes to that region's trash; nothing on a library region is touched.
+        "health" => std::thread::spawn(move || {
+            st.set_state("health", "running");
+            match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
+                Ok(rec) => {
+                    for (pin, r) in rec.down() {
+                        eprintln!(
+                            "pvfsd: health: {} ({}) not answering since {} — {}",
+                            &pin[..8],
+                            r.addr,
+                            r.unreachable_since_ms.unwrap_or(0),
+                            r.last.error.as_deref().unwrap_or("no detail")
+                        );
+                    }
+                    st.mark_pass("health", None)
+                }
+                Err(e) => st.mark_pass("health", Some(e.to_string())),
+            }
+        }),
         "catalogue" => std::thread::spawn(move || {
             st.set_state("catalogue", "running");
             let r = pvfs_client::catalogue::fetch_pass(st.data_dir(), &cancel);
@@ -803,6 +824,7 @@ fn interval(name: &str) -> Duration {
         // a scan then drops, and there is no hurry a conflict cannot wait.
         "resolve" => EVICT_INTERVAL,
         "catalogue" => CATALOGUE_INTERVAL,
+        "health" => HEALTH_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
         // D81 — `watch` is CONTINUOUS: inotify-driven, with a reconcile as the
