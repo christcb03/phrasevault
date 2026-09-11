@@ -358,6 +358,16 @@ pub struct ViewCopy {
     pub stale: bool,
 }
 
+/// D130 — bytes this box holds for a content hash: the file, its size (as
+/// the row says and the disk agrees), and the region whose binding it is
+/// under (the read gate is that region's root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBytes {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub region: NodeId,
+}
+
 /// D129 — one catalogue region as this box sees it (doc 26 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogueStatus {
@@ -1671,6 +1681,101 @@ impl Engine {
         let mut out = Self::merge_rows(rows);
         self.mark_stale(&mut out)?;
         Ok(out)
+    }
+
+    /// D130 — the merged view's entry for ONE relative path (doc 26 §6): the
+    /// same admission rule as [`Engine::merged_view`] over the rows of that
+    /// path, so a `lookup`/`stat` never lists a directory. `None` when no
+    /// catalogue region holds the path.
+    pub fn view_entry(&self, rel_path: &str) -> Result<Option<ViewEntry>> {
+        let rel = rel_path.trim_matches('/');
+        if rel.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.rel_path = ?1
+                  ORDER BY e.region_id",
+            )
+            .map_err(map_db("view entry"))?;
+        let rows = stmt
+            .query_map(params![rel], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(map_db("view entry"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("view entry"))?;
+        let mut out = Self::merge_rows(rows);
+        self.mark_stale(&mut out)?;
+        Ok(out.pop())
+    }
+
+    /// D130 — where THIS box holds the bytes of content hash `hash`, if it
+    /// does: a file row with that hash in a region this box catalogues, at
+    /// `<binding root>/<rel_path>`, and only when the file on disk has the
+    /// row's size (D112: a row is not a promise about the bytes under it).
+    /// A fetched snapshot's rows are never a local path, and neither is a
+    /// binding that belongs to another box (an owner's `FolderBound` row on
+    /// a replica names a path on the owner's machine).
+    pub fn local_path_for_hash(&self, hash: &str) -> Result<Option<LocalBytes>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.region_id, e.rel_path, e.size_bytes
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.kind = 'file' AND e.content_hash = ?1
+                  ORDER BY e.region_id, e.rel_path",
+            )
+            .map_err(map_db("local path for hash"))?;
+        let rows = stmt
+            .query_map(params![hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64))
+            })
+            .map_err(map_db("local path for hash"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("local path for hash"))?;
+        for (region, rel, size) in rows {
+            if !self.catalogues_here(&region)? {
+                continue;
+            }
+            let mine: Vec<Binding> = if self.replica {
+                load_local_bindings(&self.data_dir)?
+                    .into_iter()
+                    .filter(|b| b.folder_id == region)
+                    .collect()
+            } else {
+                let me = self.device.pubkey();
+                self.bindings_for(&region)?
+                    .into_iter()
+                    .filter(|b| b.bound_by == me)
+                    .collect()
+            };
+            for b in mine {
+                let Ok(root) = self
+                    .resolve_uri(&b.source_uri)
+                    .and_then(|u| crate::storage::uri_to_path(&u))
+                else {
+                    continue;
+                };
+                let p = root.join(&rel);
+                if std::fs::metadata(&p).map(|m| m.is_file() && m.len() == size).unwrap_or(false) {
+                    return Ok(Some(LocalBytes { path: p, size, region: region.clone() }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// D129 — the catalogue regions whose fetched snapshot the log has since

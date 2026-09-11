@@ -92,6 +92,24 @@ pub fn sync_store_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
     })
 }
 
+/// D130 — the hash store: bytes the view mount read through, kept under
+/// the sync store by CONTENT HASH (`by-hash/<2 hex>/<64 hex>`), apart from
+/// the node-keyed files so a node id and a hash can never collide. A file
+/// here is complete and verified; an in-flight read-through carries a
+/// `.partial` suffix beside it.
+pub fn hash_store_path(data_dir: &Path, hash: &str) -> Result<PathBuf> {
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(bad("hash", "a content hash is 64 hex characters"));
+    }
+    Ok(sync_store_dir(data_dir)?.join("by-hash").join(&hash[..2]).join(hash))
+}
+
+/// D130 — a complete, verified copy of `hash` in the hash store, if any.
+pub fn hash_store_lookup(data_dir: &Path, hash: &str) -> Result<Option<PathBuf>> {
+    let p = hash_store_path(data_dir, hash)?;
+    Ok(p.is_file().then_some(p))
+}
+
 /// The store's base directory (P10.0 space preflight, doc 23 §8.3): the
 /// configured root when set, else the default in-data-dir store.
 pub fn sync_store_dir(data_dir: &Path) -> Result<PathBuf> {
