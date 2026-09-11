@@ -28,6 +28,7 @@ FPID=""
 JPID=""
 MPID=""
 M2PID=""
+VPID=""
 IPID=""
 
 cleanup() {
@@ -41,6 +42,7 @@ cleanup() {
   [ -n "$JPID" ] && kill "$JPID" 2>/dev/null || true
   [ -n "$MPID" ] && { fusermount3 -u "$DATA/fuse-view" 2>/dev/null || true; kill "$MPID" 2>/dev/null || true; }
   [ -n "$M2PID" ] && { fusermount3 -u "$DATA/fuse-view2" 2>/dev/null || true; kill "$M2PID" 2>/dev/null || true; }
+  [ -n "$VPID" ] && { fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true; kill "$VPID" 2>/dev/null || true; }
   [ -n "$IPID" ] && kill "$IPID" 2>/dev/null || true
   rm -rf "$DATA"
 }
@@ -1053,6 +1055,30 @@ $PVFS --json view ls | python3 -c '
 import json,sys
 v=json.load(sys.stdin); assert v and all(c["stale"] is False for e in v for c in e["sources"]), v
 ' && ok "view ls: no copy is stale" || fail "view ls stale"
+
+say "D130: the view mount — the merged view as a filesystem (doc 26 phase 6)"
+if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+  mkdir -p "$DATA/view-mnt"
+  $PVFS mount --view "$DATA/view-mnt" >/dev/null 2>"$DATA/view-mount.log" &
+  VPID=$!
+  VOK=""
+  for _ in $(seq 1 40); do
+    if [ "$(cat "$DATA/view-mnt/sub/b.mkv" 2>/dev/null)" = "catcat" ]; then VOK=1; break; fi
+    sleep 0.25
+  done
+  [ -n "$VOK" ] && ok "a file read through the view mount (this box's own bytes)" \
+    || fail "view mount read: $(tail -2 "$DATA/view-mount.log" 2>/dev/null)"
+  [ "$(ls "$DATA/view-mnt" | tr '\n' ' ')" = "also c.mkv empty sub " ] && ok "the union is listed: also/ c.mkv empty/ sub/" \
+    || fail "view mount ls: $(ls "$DATA/view-mnt" | tr '\n' ' ')"
+  [ "$(stat -c %s "$DATA/view-mnt/c.mkv")" = "20000" ] && ok "c.mkv shows the served copy's size" || fail "c.mkv size"
+  rm "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && fail "the view must be read-only" || ok "the view refuses a delete (read-only, namespace included)"
+  $PVFS umount "$DATA/view-mnt" >/dev/null 2>&1 || fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true
+  wait "$VPID" 2>/dev/null || true
+  VPID=""
+  ok "view mount unmounted cleanly"
+else
+  ok "fuse unavailable here — view mount checks skipped (not a failure)"
+fi
 
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"

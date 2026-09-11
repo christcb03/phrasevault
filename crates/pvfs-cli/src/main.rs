@@ -313,13 +313,21 @@ enum Cmd {
     /// the sync store, else verified read-through. Blocks until unmounted.
     #[cfg(target_os = "linux")]
     Mount {
+        /// The node to mount (id / path / URI) — or, with --view, the
+        /// mount directory itself
         target: String,
-        dir: PathBuf,
+        /// Mount directory (omit with --view)
+        dir: Option<PathBuf>,
         /// Let other users read the mount (root, mergerfs, containers).
         /// Off by default: a mount is private to whoever made it. Needs
         /// `user_allow_other` in /etc/fuse.conf.
         #[arg(long)]
         allow_other: bool,
+        /// D130 (doc 26 phase 6): mount the MERGED VIEW — every catalogue
+        /// region's rows as one tree, bytes from this box or read through
+        /// by hash — instead of a node. `pvfs mount --view <dir>`.
+        #[arg(long)]
+        view: bool,
     },
     /// Unmount a pvfs mount (fusermount -u)
     #[cfg(target_os = "linux")]
@@ -5927,15 +5935,34 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             target,
             dir,
             allow_other,
+            view,
         } => {
-            let (engine, id) = engine_and_node(ctx, &target)?;
-            let data_dir = engine.data_dir().to_path_buf();
-            engine.close()?;
+            // With --view the one positional is the mount directory.
+            let (data_dir, id, dir) = if view {
+                if dir.is_some() {
+                    return Err(PvfsError::BadInput {
+                        field: "mount".into(),
+                        reason: "--view mounts the merged view: `pvfs mount --view <dir>` (no node)".into(),
+                    });
+                }
+                (ctx?, "the merged view".to_string(), PathBuf::from(&target))
+            } else {
+                let Some(dir) = dir else {
+                    return Err(PvfsError::BadInput {
+                        field: "mount".into(),
+                        reason: "pass the mount directory: `pvfs mount <node> <dir>` (or `--view <dir>`)".into(),
+                    });
+                };
+                let (engine, id) = engine_and_node(ctx, &target)?;
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                (data_dir, id, dir)
+            };
             std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create mountpoint", e))?;
             eprintln!(
-                "mounting {id} at {} (data read-only; delete/rename write through; \
-                 `pvfs umount {}` to stop)",
+                "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),
+                if view { "read-only, one entry per path across every catalogue region" } else { "data read-only; delete/rename write through" },
                 dir.display()
             );
             eprintln!(
@@ -5951,7 +5978,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             unsafe {
                 let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
             }
-            pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
+            if view {
+                pvfs_fuse::mount_view(&data_dir, &dir, allow_other)?;
+            } else {
+                pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
+            }
             Ok(())
         }
         #[cfg(target_os = "linux")]

@@ -491,6 +491,10 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 do_cat(daemon, &principal, &mut stream, &node, offset, len)?;
                 continue;
             }
+            ClientMsg::CatHash { hash, offset, len } => {
+                do_cat_hash(daemon, &principal, &mut stream, &hash, offset, len)?;
+                continue;
+            }
             ClientMsg::SecureCat { node } => {
                 do_secure_cat(daemon, &principal, &mut stream, &node)?;
                 continue;
@@ -675,6 +679,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
+        | ClientMsg::CatHash { .. }
         | ClientMsg::SecureCat { .. }
         | ClientMsg::SecurePut { .. }
         | ClientMsg::IngestWrite { .. }
@@ -1039,9 +1044,62 @@ fn do_cat<S: io::Read + io::Write>(
             return cat_ingest_partial(daemon, stream, &id, &part, declared, offset, len);
         }
     };
+    stream_local_file(stream, &path, offset, len)
+}
 
-    // --- data plane: stream raw bytes, engine lock free ---
-    let size = match std::fs::metadata(&path) {
+/// D130 (doc 26 phase 6): stream the bytes of a content hash this box
+/// holds in a region it catalogues — the view mount's read-through path.
+/// Gated on read rights at the root of the region the file is under;
+/// `not_found` when no such bytes are here (a fetched snapshot's rows are
+/// not bytes), so the reader asks the next box.
+fn do_cat_hash<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    principal: &Principal,
+    stream: &mut S,
+    hash: &str,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
+    let held = {
+        let e = daemon.reader();
+        match e.local_path_for_hash(hash) {
+            Ok(Some(lb)) => {
+                match e.effective_rights(principal, &lb.region) {
+                    Ok(r) if r & acl::ACL_R != 0 => {}
+                    Ok(_) => {
+                        write_msg(stream, &err("forbidden", "access denied"))?;
+                        return Ok(());
+                    }
+                    Err(pve) => {
+                        write_msg(stream, &err_from(pve))?;
+                        return Ok(());
+                    }
+                }
+                lb
+            }
+            Ok(None) => {
+                write_msg(stream, &err("not_found", "this box holds no bytes for that hash"))?;
+                return Ok(());
+            }
+            Err(pve) => {
+                write_msg(stream, &err_from(pve))?;
+                return Ok(());
+            }
+        }
+    }; // engine lock released here
+    stream_local_file(stream, &held.path, offset, len)
+}
+
+/// The data-plane tail shared by `Cat` and `CatHash`: `CatStart`, the
+/// bytes of `[offset, offset+len)` (`(0, 0)` = whole file) in data frames,
+/// `CatDone`. Engine lock free.
+fn stream_local_file<S: io::Read + io::Write>(
+    stream: &mut S,
+    path: &std::path::Path,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
+    let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(e) => {
             write_msg(stream, &err("internal", &format!("stat failed: {e}")))?;
@@ -1060,7 +1118,7 @@ fn do_cat<S: io::Read + io::Write>(
     };
     write_msg(stream, &ServerMsg::CatStart { size: want })?;
 
-    let mut file = match std::fs::File::open(&path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
             // CatStart already sent — write a zero-length frame to signal abort.

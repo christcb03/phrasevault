@@ -327,7 +327,22 @@ original spec follows.
 Fetch-and-verify a region's catalogue by its signed
 head; stale-by-age when the owner is offline.
 
-**Phase 6 — the mount.** The FUSE mount (doc 20 §3, built) over the merged
+**Phase 6 — the mount. BUILT (PVOS D130).** `pvfs mount --view <dir>`: the
+same `pvfs-fuse` filesystem in a second mode — inodes are relative paths in
+the merged view (`Engine::view_entry` for a lookup, `merged_view` for a
+listing, cached 5 s), directories and admitted files shown, a hash conflict
+shown as its served copy, unhashed files and kind conflicts not admitted
+(§6) and so not shown. Bytes, in order: this box's own disk
+(`local_path_for_hash` — a region it catalogues, size-checked), the hash
+store (`sync/by-hash/`), else a read-through — `CatHash` on the wire (proto
+8, read-gated on the region that holds the file) from the first announced
+endpoint that serves it, into the hash store, served from the growing file
+and verified whole before it is kept; a box that serves other bytes is
+refused and named. Sequential and single-source: the parallel chunked pull
+by hash — doc 22's swarm over N regions — is the next milestone. The
+namespace is read-only. D82's unit gained `pvfs_mount_view`. The original
+spec follows.
+The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.
 

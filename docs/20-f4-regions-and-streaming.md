@@ -319,6 +319,10 @@ v6 (`pending_moves`, `purged_nodes`) — the usual one-time rebuild.
   arc if ever — the catalog write model is the CLI/daemon's.
 - Serving daemons and the mount share the engine via a read view + the fetch pass;
   the mount never holds the writer lock across a stream.
+- *D130 (doc 26 phase 6): the same crate mounts the MERGED VIEW with
+  `pvfs mount --view <dir>` — paths instead of nodes, bytes by content hash
+  (own disk, the hash store, a read-through). The node mount above is
+  unchanged.*
 
 ## 4. Phases + turnkey checklist
 
