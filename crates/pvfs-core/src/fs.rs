@@ -2005,6 +2005,24 @@ impl Engine {
         Ok((items, skips))
     }
 
+    /// D133 — purge the trash of every draining catalogue region this box
+    /// owns, by that region's retention (doc 26 §7.4's trash-age part): the
+    /// step that actually frees a staging disk after `resolve` trashed the
+    /// copies the library now holds. Returns `(region, purge)` per region.
+    pub fn purge_draining_trash(&self) -> Result<Vec<(NodeId, crate::sync::TrashPurge)>> {
+        let mut out = Vec::new();
+        for b in self.local_bindings()? {
+            if !self.is_catalogue_region(&b.folder_id)? || !self.region_drains(&b.folder_id)? {
+                continue;
+            }
+            let root = uri_to_path(&b.source_uri)?;
+            let days = crate::sync::region_retention_days(&self.data_dir, &b.folder_id)?;
+            let purge = crate::sync::purge_trash(&root, days, 0)?;
+            out.push((b.folder_id.clone(), purge));
+        }
+        Ok(out)
+    }
+
     pub fn resolve_conflicts(
         &mut self,
         rules: &crate::media::Rules,

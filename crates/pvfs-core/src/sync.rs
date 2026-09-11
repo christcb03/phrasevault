@@ -313,7 +313,7 @@ pub fn hash_with_manifest_until(
     Ok(Some((whole.finalize().to_hex().to_string(), hashes)))
 }
 
-pub(crate) fn write_manifest_sidecar(
+pub fn write_manifest_sidecar(
     file: &Path,
     whole: Option<&str>,
     hashes: &[[u8; 32]],

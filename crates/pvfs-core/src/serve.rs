@@ -19,7 +19,7 @@ const JOBS_HEADER: &str = "pvfs-serve-jobs 1";
 /// Every job the daemon knows how to run (doc 18 §1's table, in the order
 /// they appear there). An unknown name in the file is a hard error — a typo
 /// silently running zero jobs is exactly the failure mode we refuse.
-pub const JOB_NAMES: [&str; 10] = ["follow", "watch", "sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health"];
+pub const JOB_NAMES: [&str; 11] = ["follow", "watch", "sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health", "receive"];
 
 pub fn jobs_path(data_dir: &Path) -> PathBuf {
     data_dir.join(JOBS_FILE)

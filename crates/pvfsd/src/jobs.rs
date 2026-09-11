@@ -29,7 +29,7 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
-const PERIODIC: [&str; 8] = ["sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health"];
+const PERIODIC: [&str; 9] = ["sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health", "receive"];
 /// How many intervals a pass may overrun before it is called stalled. Three is
 /// slack enough for a genuinely long pass (a big tier run) without letting a
 /// hang hide for hours.
@@ -54,6 +54,8 @@ const CATALOGUE_INTERVAL: Duration = Duration::from_secs(60);
 /// D131 — a fleet poll every two minutes: "ten hours unnoticed" becomes
 /// "four minutes" (two misses) without paging on a daemon's own restart.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(120);
+/// D133 — the mover's cadence on the new model, `tier`'s.
+const RECEIVE_INTERVAL: Duration = Duration::from_secs(300);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -623,18 +625,48 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("catalogue", Some(e.to_string())),
             }
         }),
-        "resolve" => std::thread::spawn(move || {
-            st.set_state("resolve", "running");
-            let r = (|| -> Result<pvfs_core::ResolveReport, PvfsError> {
-                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = engine.resolve_conflicts(&pvfs_core::media::Rules::default(), false, &cancel);
-                engine.close()?;
-                r
-            })();
+        "receive" => std::thread::spawn(move || {
+            st.set_state("receive", "running");
+            let r = pvfs_client::receive::receive_pass(
+                st.data_dir(),
+                &pvfs_core::media::Rules::default(),
+                false,
+                pvfs_client::receive::MIN_FREE_BYTES,
+                &cancel,
+            );
             match r {
                 Ok(rep) => {
+                    for (p, h, _) in &rep.received {
+                        eprintln!("pvfsd: received {p} ({}) into the library (doc 26 §7.3)", &h[..8]);
+                    }
+                    for p in &rep.skipped_no_space {
+                        eprintln!("pvfsd: receive: no space for {p}");
+                    }
+                    for (p, why) in &rep.failed {
+                        eprintln!("pvfsd: receive: {p}: {why}");
+                    }
+                    st.mark_pass("receive", None)
+                }
+                Err(e) => st.mark_pass("receive", Some(e.to_string())),
+            }
+        }),
+        "resolve" => std::thread::spawn(move || {
+            st.set_state("resolve", "running");
+            let r = (|| -> Result<(pvfs_core::ResolveReport, u64), PvfsError> {
+                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
+                let r = engine.resolve_conflicts(&pvfs_core::media::Rules::default(), false, &cancel)?;
+                // D133 — then free what retention allows.
+                let purged: u64 = engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum();
+                engine.close()?;
+                Ok((r, purged))
+            })();
+            match r {
+                Ok((rep, purged)) => {
                     if !rep.trashed.is_empty() {
                         eprintln!("pvfsd: resolve trashed {} losing copies", rep.trashed.len());
+                    }
+                    if purged > 0 {
+                        eprintln!("pvfsd: resolve purged {purged} trash buckets past retention");
                     }
                     st.mark_pass("resolve", None)
                 }
@@ -760,6 +792,8 @@ pub const PASS_STALL_FLOOR: Duration = Duration::from_secs(300);
 pub fn stall_floor(name: &str) -> Duration {
     match name {
         "tier" => Duration::from_secs(6 * 3600),
+        // D133 — a receive pass can move a night's downloads, like tier.
+        "receive" => Duration::from_secs(6 * 3600),
         "watch" => Duration::from_secs(36 * 3600),
         _ => PASS_STALL_FLOOR,
     }
@@ -825,6 +859,7 @@ fn interval(name: &str) -> Duration {
         "resolve" => EVICT_INTERVAL,
         "catalogue" => CATALOGUE_INTERVAL,
         "health" => HEALTH_INTERVAL,
+        "receive" => RECEIVE_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
         // D81 — `watch` is CONTINUOUS: inotify-driven, with a reconcile as the
