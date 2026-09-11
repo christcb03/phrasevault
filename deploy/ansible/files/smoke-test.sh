@@ -1068,7 +1068,7 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   done
   [ -n "$VOK" ] && ok "a file read through the view mount (this box's own bytes)" \
     || fail "view mount read: $(tail -2 "$DATA/view-mount.log" 2>/dev/null)"
-  [ "$(ls "$DATA/view-mnt" | tr '\n' ' ')" = "also c.mkv sub " ] && ok "the union is listed: also/ c.mkv sub/" \
+  [ "$(ls "$DATA/view-mnt" | tr '\n' ' ')" = "also c.mkv empty sub " ] && ok "the union is listed: also/ c.mkv empty/ sub/" \
     || fail "view mount ls: $(ls "$DATA/view-mnt" | tr '\n' ' ')"
   [ "$(stat -c %s "$DATA/view-mnt/c.mkv")" = "20000" ] && ok "c.mkv shows the served copy's size" || fail "c.mkv size"
   rm "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && fail "the view must be read-only" || ok "the view refuses a delete (read-only, namespace included)"
