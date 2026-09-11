@@ -239,7 +239,7 @@
       environment: "{{ cargo_env | combine(suite_env) }}"
       register: test_out
       changed_when: false
-      when: pvfs_runs_suite | default(true)
+      when: pvfs_runs_suite | default(true) | bool
       tags: [test]
 
     # ---- lint (D121) -------------------------------------------------------
@@ -268,7 +268,7 @@
       environment: "{{ cargo_env }}"
       register: clippy_component
       changed_when: "'is up to date' not in clippy_component.stdout"
-      when: pvfs_runs_suite | default(true)
+      when: pvfs_runs_suite | default(true) | bool
       tags: [test, lint]
 
     - name: Clippy (-D warnings, all targets)
@@ -281,7 +281,7 @@
       environment: "{{ cargo_env }}"
       register: clippy_out
       changed_when: false
-      when: pvfs_runs_suite | default(true)
+      when: pvfs_runs_suite | default(true) | bool
       tags: [test, lint]
 
     # ---- smoke (every CLI function end-to-end) ------------------------------------
@@ -290,7 +290,7 @@
         src: files/smoke-test.sh
         dest: "{{ smoke_script }}"
         mode: "0755"
-      when: pvfs_runs_suite | default(true)
+      when: pvfs_runs_suite | default(true) | bool
       tags: [smoke]
 
     - name: Run CLI smoke tests
@@ -304,7 +304,7 @@
         TMPDIR: /dev/shm
       register: smoke_out
       changed_when: false
-      when: pvfs_runs_suite | default(true)
+      when: pvfs_runs_suite | default(true) | bool
       tags: [smoke]
 
     # ---- install -------------------------------------------------------------------
@@ -556,7 +556,7 @@
     - name: Aggregate real test totals
       ansible.builtin.shell: |
         set -o pipefail
-        if [ "{{ pvfs_runs_suite | default(true) }}" = "False" ]; then echo "not run here (pvfs_runs_suite=false)"; exit 0; fi
+        if [ "{{ pvfs_runs_suite | default(true) | bool }}" = "False" ]; then echo "not run here (pvfs_runs_suite=false)"; exit 0; fi
         awk -F'[ ;]+' '/^test result:/{p+=$4; f+=$6; i+=$8; n++}
                        END {if (n==0) print "NO SUITES RAN — suspect a stale build";
                             else printf "%d passed, %d failed, %d ignored (%d suites)", p, f, i, n}' \
