@@ -1380,7 +1380,7 @@ impl Engine {
         if !self.is_catalogue_region(region)? {
             return Err(bad("catalogue", "not a catalogue region"));
         }
-        if !self.bindings_for(region)?.is_empty() {
+        if self.catalogues_here(region)? {
             return Err(bad(
                 "catalogue",
                 "this box catalogues that region itself; its rows are the authority",
@@ -1442,6 +1442,42 @@ impl Engine {
         Ok(rows.len())
     }
 
+    /// D129 — does THIS box catalogue `region` (so its rows are live and
+    /// never to be overwritten by a fetched snapshot)? True when it has
+    /// published a snapshot for it, or binds it: a replica's bindings are
+    /// local (D71 W4), an owner's are the log's `FolderBound` rows authored
+    /// by this device. `bindings_for` alone is wrong here — on a replica it
+    /// also lists the owner's log-recorded bindings, which the lab pair
+    /// showed as "the edge refuses the owner's catalogue as its own".
+    fn catalogues_here(&self, region: &NodeId) -> Result<bool> {
+        let published: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM region_snapshots WHERE region_id = ?1",
+                params![region],
+                |r| r.get(0),
+            )
+            .map_err(map_db("catalogues here"))?;
+        if published > 0 {
+            return Ok(true);
+        }
+        if !self.replica {
+            let mine: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM folder_bindings
+                      WHERE folder_id = ?1 AND unbound_at IS NULL AND bound_by = ?2",
+                    params![region, self.device.pubkey()],
+                    |r| r.get(0),
+                )
+                .map_err(map_db("catalogues here"))?;
+            if mine > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(load_local_bindings(&self.data_dir)?.iter().any(|b| b.folder_id == *region))
+    }
+
     /// D129 — every catalogue region as this box sees it: the head the log
     /// attests, what this box holds of it (its own live rows, or a fetched
     /// snapshot), and whether that is behind. `stale` means the log attests
@@ -1454,7 +1490,6 @@ impl Engine {
             .prepare(
                 "SELECT r.node_id, r.committed_seq, r.committed_head,
                         f.seq, f.fetched_at, f.source,
-                        (SELECT COUNT(*) FROM region_snapshots s WHERE s.region_id = r.node_id),
                         (SELECT COUNT(*) FROM region_entries e WHERE e.region_id = r.node_id)
                    FROM regions r LEFT JOIN region_fetched f ON f.region_id = r.node_id
                   WHERE r.kind = 'catalogue'
@@ -1463,26 +1498,36 @@ impl Engine {
             .map_err(map_db("catalogue status"))?;
         let rows = stmt
             .query_map([], |r| {
-                let head_seq = r.get::<_, i64>(1)? as u64;
-                let held: Option<i64> = r.get(3)?;
-                let published: i64 = r.get(6)?;
-                let local = published > 0;
-                let held_seq = if local { Some(head_seq) } else { held.map(|v| v as u64) };
-                Ok(CatalogueStatus {
-                    region: r.get(0)?,
-                    head_seq,
-                    head_hash: r.get(2)?,
-                    held_seq,
-                    local,
-                    stale: !local && held_seq.unwrap_or(0) < head_seq,
-                    fetched_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                    source: r.get(5)?,
-                    entries: r.get::<_, i64>(7)? as u64,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)? as u64,
+                ))
             })
+            .map_err(map_db("catalogue status"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("catalogue status"))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(map_db("catalogue status"))
+        let mut out = Vec::with_capacity(rows.len());
+        for (region, head_seq, head_hash, held, fetched_at, source, entries) in rows {
+            let local = self.catalogues_here(&region)?;
+            let held_seq = if local { Some(head_seq) } else { held };
+            out.push(CatalogueStatus {
+                region,
+                head_seq,
+                head_hash,
+                held_seq,
+                local,
+                stale: !local && held_seq.unwrap_or(0) < head_seq,
+                fetched_at,
+                source,
+                entries,
+            });
+        }
+        Ok(out)
     }
 
     /// D125 item 4 — publish the region's catalogue as a new snapshot when it
