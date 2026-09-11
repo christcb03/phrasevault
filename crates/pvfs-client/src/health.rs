@@ -68,6 +68,14 @@ pub struct PeerRecord {
     /// Consecutive misses.
     pub misses: u32,
     pub last: PeerHealth,
+    /// D135 — what the owner did about a silence (`start` over the
+    /// supervise channel), newest last; absent on records written before.
+    #[serde(default)]
+    pub actions: Vec<crate::supervise::Action>,
+    /// D135 — starts sent during the current outage (the backoff's input);
+    /// reset when the peer answers.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 impl PeerRecord {
@@ -130,6 +138,7 @@ impl FleetHealth {
             rec.last_ok_ms = Some(now_ms);
             rec.misses = 0;
             rec.unreachable_since_ms = None;
+            rec.attempts = 0;
         } else {
             if rec.misses == 0 {
                 rec.unreachable_since_ms = Some(now_ms);
