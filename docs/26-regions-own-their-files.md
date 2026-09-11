@@ -370,8 +370,14 @@ space. Read-only, no new authority. Notification and remote restart (D83
 follows.
 Conflicts and capacity into D83, and in band.
 
-**Phase 8 — migration.** The planned re-genesis (doc 25) becomes THIS: a fresh
-start on the new model rather than a fresh start on the old one. The rehearsal
+**Phase 8 — migration. RUNBOOK WRITTEN (doc 29, PVOS D137); the cutover
+itself is Chris's.** The planned re-genesis (doc 25) becomes THIS: a fresh
+start on the new model rather than a fresh start on the old one — no import,
+no carry, a catalogue region per box marked and bound by the fleet play
+(D134), the watch jobs cataloguing from sidecars, the merged view verified
+against the roots' file counts, then the units switched. Doc 25's lessons
+stand; its sequence is superseded. The original spec follows.
+The rehearsal
 already proved the import is ~5 hours and metadata-bound. Nothing about the
 current forest needs converting, because it is not being kept.
 
