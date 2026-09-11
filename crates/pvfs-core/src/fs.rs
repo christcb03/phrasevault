@@ -2064,8 +2064,15 @@ impl Engine {
             let library_has_it = hashed.iter().any(|c| !draining(&c.region));
             let trash = |c: &ViewCopy, report: &mut ResolveReport| -> Result<()> {
                 let root = &mine[&c.region];
+                let file = root.join(&entry.rel_path);
+                // D133 — the row outlives the file between a resolve and the
+                // next scan (the watch's, or a manual one): a copy already
+                // gone is nothing to do, not an error that ends the pass.
+                if !file.exists() {
+                    return Ok(());
+                }
                 if !dry_run {
-                    crate::sync::move_to_trash(root, &root.join(&entry.rel_path))?;
+                    crate::sync::move_to_trash(root, &file)?;
                 }
                 report.trashed.push((entry.rel_path.clone(), c.region.clone()));
                 Ok(())
