@@ -1092,6 +1092,48 @@ $PVFS fleet health --now | qgrep 'no announced peers' && ok "a poll with nobody 
 $PVFS --json fleet health | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["peers"]=={} and r["polled_at_ms"]>=0, r' \
   && ok "the record exists after the poll, empty" || fail "fleet health json"
 
+say "D133: receive — the mover on the new model, on one box (doc 26 §7.3)"
+$PVFS --json region receive "$CAT" on | qgrep '"receives":true' && ok "region receive on" || fail "region receive on"
+$PVFS --json region drain "$CAT2" on >/dev/null
+$PVFS --json region ls | python3 -c '
+import json,sys
+rows={r["region"]:r for r in json.load(sys.stdin)}
+assert rows[sys.argv[1]]["receives"] is True and rows[sys.argv[1]]["retention_days"]==7, rows[sys.argv[1]]
+assert rows[sys.argv[2]]["drains"] is True and rows[sys.argv[2]]["receives"] is False, rows[sys.argv[2]]
+' "$CAT" "$CAT2" && ok "region ls shows receives + the 7-day default retention" || fail "region ls receive columns"
+printf 'staged-only-bytes' > "$CATLIB2/staged.mkv"; $PVFS scan "$CAT2" >/dev/null
+$PVFS --json view receive --dry-run | python3 -c '
+import json,sys
+r=json.load(sys.stdin); assert r["dry_run"] and [x["path"] for x in r["received"]]==["staged.mkv"], r
+' && ok "dry run names the staging-only file" || fail "view receive dry run"
+[ ! -e "$CATLIB/staged.mkv" ] && ok "and placed nothing" || fail "dry run placed a file"
+$PVFS --json view receive | python3 -c '
+import json,sys
+r=json.load(sys.stdin); assert not r["dry_run"] and [x["path"] for x in r["received"]]==["staged.mkv"] and r["failed"]==[], r
+' && ok "view receive pulled it (this box's own copy, no dial)" || fail "view receive"
+[ "$(cat "$CATLIB/staged.mkv")" = "staged-only-bytes" ] && ok "the bytes landed in the receiving region" || fail "received bytes"
+ls "$CATLIB"/.staged.mkv.manifest >/dev/null 2>&1 && ok "with a sidecar" || fail "no sidecar beside the received file"
+[ ! -d "$CATLIB/.pvfs-incoming" ] || [ -z "$(ls -A "$CATLIB/.pvfs-incoming")" ] && ok "no partial left behind" || fail "partial left in .pvfs-incoming"
+$PVFS scan "$CAT" >/dev/null
+$PVFS --json view ls | python3 -c '
+import json,sys
+v={e["path"]:e for e in json.load(sys.stdin)}; e=v["staged.mkv"]
+assert e["state"]=="admitted" and e["copies"]==2, e
+' && ok "the view admits it with two agreeing copies" || fail "view after receive"
+$PVFS --json view receive | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["received"]==[], r' \
+  && ok "a second pass has nothing to do" || fail "second receive pass"
+$PVFS --json view resolve | python3 -c '
+import json,sys
+r=json.load(sys.stdin); assert [t["path"] for t in r["trashed"]]==["staged.mkv"] and r["purged"]==0, r
+' && ok "resolve trashed the staging copy; the 7-day retention kept it" || fail "resolve after receive"
+[ ! -e "$CATLIB2/staged.mkv" ] && ls "$CATLIB2"/.pvfs-trash/*/staged.mkv >/dev/null 2>&1 && ok "it sits in the staging region's trash" || fail "staging copy not in trash"
+$PVFS --json region retention "$CAT2" 0 | qgrep '"retention_days":0' && ok "region retention 0" || fail "region retention"
+$PVFS --json view resolve | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["purged"]>=1, r' \
+  && ok "resolve purged the trash past retention" || fail "purge"
+[ -z "$(ls -A "$CATLIB2/.pvfs-trash" 2>/dev/null)" ] && ok "the staging disk is free again" || fail "trash not empty"
+$PVFS --json region receive "$CAT" off | qgrep '"receives":false' && ok "region receive off" || fail "region receive off"
+$PVFS --json region drain "$CAT2" off >/dev/null
+
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
 PRIN="$($PVFS add "$PR" --kind folder --label inner)"
