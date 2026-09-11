@@ -34,7 +34,7 @@ VA=$(ssh "$OWNER" '"$HOME/.local/bin/pvfs" --version' 2>&1); VB=$(ssh "$EDGE" '"
 [ "$VA" = "$VB" ] && ok "both boxes run the same build ($VA)" || fail "builds differ: A=$VA B=$VB"
 for h in "$OWNER" "$EDGE"; do
   ssh "$h" '"$HOME/.local/bin/pvfs" view receive --help >/dev/null 2>&1' && ok "$h has view receive" || fail "$h: not a D133 build"
-  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d129" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d133-*; mkdir -p "$HOME/fleet-test"' \
+  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d133" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d133-*; mkdir -p "$HOME/fleet-test"' \
     && ok "$h: clean slate" || fail "$h: clean slate"
 done
 AKEY=$(ssh "$OWNER" '"$HOME/.local/bin/pvfs" --json whoami' | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')

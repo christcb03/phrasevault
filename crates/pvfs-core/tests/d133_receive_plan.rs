@@ -117,8 +117,8 @@ fn the_plan_follows_the_table() {
     let up = by_path.get("Movies/Up (2002)/up.mkv").expect("a staging winner replaces the library copy");
     assert!(up.replaces);
     assert_eq!(up.dest_region, rl);
-    assert!(by_path.get("Movies/Same (2001)/same.mkv").is_none(), "an agreeing pair needs nothing");
-    assert!(by_path.get("Movies/Old (2003)/old.mkv").is_none(), "the library's winner stays; D127 drains the loser");
+    assert!(!by_path.contains_key("Movies/Same (2001)/same.mkv"), "an agreeing pair needs nothing");
+    assert!(!by_path.contains_key("Movies/Old (2003)/old.mkv"), "the library's winner stays; D127 drains the loser");
     assert_eq!(items.len(), 2, "{items:?}");
     assert!(skips.is_empty(), "{skips:?}");
 
