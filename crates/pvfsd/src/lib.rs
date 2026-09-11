@@ -278,6 +278,12 @@ impl Daemon {
     /// D127 — conflicting paths in the merged view this box holds, for
     /// `serve status`. Best-effort: a lookup error reads as 0, and the CLI
     /// says so itself when asked directly.
+    // D136 — the two counts below answer `serve status`, which is the owner's
+    // health probe (D131). They read through the READ POOL, never the writer
+    // lock: a write that holds the writer for as long as a large file takes
+    // to hash (the swarm commit's whole-file gate) must not make a working
+    // daemon look down. Chris's rule: silence means down, so a live daemon
+    // must always answer.
     /// D131: the filesystem under this box's sync store.
     pub fn store_capacity(&self) -> Option<pvfs_proto::CapacityWire> {
         pvfs_core::sync::store_capacity(&self.data_dir).map(|(free_bytes, total_bytes)| {
@@ -287,21 +293,24 @@ impl Daemon {
 
     /// D129: catalogue regions this box holds a superseded snapshot of.
     pub fn stale_catalogue_count(&self) -> u64 {
-        self.engine
-            .lock()
-            .unwrap()
+        self.reader()
             .catalogue_status()
             .map(|v| v.iter().filter(|s| s.stale).count() as u64)
             .unwrap_or(0)
     }
 
     pub fn view_conflict_count(&self) -> u64 {
-        self.engine
-            .lock()
-            .unwrap()
+        self.reader()
             .view_conflicts()
             .map(|v| v.len() as u64)
             .unwrap_or(0)
+    }
+
+    /// D136 — hold the WRITER lock from outside, for the test that proves
+    /// `serve status` never waits on it. Not for production callers.
+    #[doc(hidden)]
+    pub fn hold_writer_for_test(&self) -> MutexGuard<'_, Engine> {
+        self.engine.lock().unwrap()
     }
 
     /// Check out an engine for a **read**: round-robin over the read pool, so
