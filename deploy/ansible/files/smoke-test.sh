@@ -633,6 +633,10 @@ $PVFS --json --data-dir "$DMOUNT/.pvfs" serve ls | qgrep '"job":"sync","enabled"
 assert_rc 2 "unknown job refused → 2" -- $PVFS --data-dir "$DMOUNT/.pvfs" serve enable defrag
 $PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | qgrep '"runner":"on"' \
   && ok "live status: runner attached" || fail "serve status runner"
+$PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | python3 -c '
+import json,sys
+c=json.load(sys.stdin)["capacity"]; assert c and c["total_bytes"]>0 and c["free_bytes"]<=c["total_bytes"], c
+' && ok "live status carries the store's capacity (D131)" || fail "serve status capacity"
 # the daemon started before the enable — SIGHUP folds the new config in
 kill -HUP "$DPID"
 STATUS_OK=""
@@ -1079,6 +1083,12 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
 else
   ok "fuse unavailable here — view mount checks skipped (not a failure)"
 fi
+
+say "D131: fleet health — the fleet as this box observed it (doc 26 phase 7; D83 piece 1)"
+$PVFS fleet health | qgrep 'no fleet health record yet' && ok "no record yet: says so and how to get one" || fail "fleet health (no record)"
+$PVFS fleet health --now | qgrep 'no announced peers' && ok "a poll with nobody announced says so" || fail "fleet health --now"
+$PVFS --json fleet health | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["peers"]=={} and r["polled_at_ms"]>=0, r' \
+  && ok "the record exists after the poll, empty" || fail "fleet health json"
 
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
