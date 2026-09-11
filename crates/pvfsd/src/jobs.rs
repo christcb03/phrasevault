@@ -29,7 +29,7 @@ const CONTINUOUS: [&str; 2] = ["follow", "watch"];
 /// fetching sync) or a safety interval, whichever comes first. A pass also
 /// runs once at daemon start, catching up after downtime. `tier` (owner) is
 /// interval-only for now — commit-driven nudges are a doc 18 §6 follow-up.
-const PERIODIC: [&str; 6] = ["sync", "export", "tier", "evict", "reclaim", "resolve"];
+const PERIODIC: [&str; 7] = ["sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue"];
 /// How many intervals a pass may overrun before it is called stalled. Three is
 /// slack enough for a genuinely long pass (a big tier run) without letting a
 /// hang hide for hours.
@@ -48,6 +48,9 @@ const TIER_INTERVAL: Duration = Duration::from_secs(300);
 /// drift apart again.
 pub const WATCH_RECONCILE: Duration = Duration::from_secs(3600);
 const EVICT_INTERVAL: Duration = Duration::from_secs(300);
+/// D129 — a catalogue region's head moves at most once per watch pass on
+/// its box, so a minute keeps the fleet's view within a pass of live.
+const CATALOGUE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -583,6 +586,22 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         // D127 (doc 26 §7.3) — resolve the merged view's conflicts and
         // redundancies for the draining regions THIS box owns: the losing copy
         // goes to that region's trash; nothing on a library region is touched.
+        "catalogue" => std::thread::spawn(move || {
+            st.set_state("catalogue", "running");
+            let r = pvfs_client::catalogue::fetch_pass(st.data_dir(), &cancel);
+            match r {
+                Ok(rep) => {
+                    for (region, seq, n) in &rep.fetched {
+                        eprintln!("pvfsd: catalogue {} at head {seq}: {n} rows", &region[..8]);
+                    }
+                    for (region, why) in &rep.failed {
+                        eprintln!("pvfsd: catalogue {}: {why}", &region[..8]);
+                    }
+                    st.mark_pass("catalogue", None)
+                }
+                Err(e) => st.mark_pass("catalogue", Some(e.to_string())),
+            }
+        }),
         "resolve" => std::thread::spawn(move || {
             st.set_state("resolve", "running");
             let r = (|| -> Result<pvfs_core::ResolveReport, PvfsError> {
@@ -783,6 +802,7 @@ fn interval(name: &str) -> Duration {
         // D127 — resolution runs on the evict cadence: what it trashes is what
         // a scan then drops, and there is no hurry a conflict cannot wait.
         "resolve" => EVICT_INTERVAL,
+        "catalogue" => CATALOGUE_INTERVAL,
         "export" => EXPORT_INTERVAL,
         "tier" => TIER_INTERVAL,
         // D81 — `watch` is CONTINUOUS: inotify-driven, with a reconcile as the

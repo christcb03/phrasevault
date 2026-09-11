@@ -166,6 +166,7 @@ fn the_served_copy_follows_the_ladder() {
         mtime_ms: mtime,
         content_hash: hash.map(str::to_string),
         quality: None,
+        stale: false,
     };
     let entry = |state: ViewState, sources: Vec<ViewCopy>| ViewEntry {
         rel_path: "x.mkv".into(),

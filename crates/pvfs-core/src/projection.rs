@@ -35,7 +35,7 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -308,6 +308,19 @@ CREATE TABLE IF NOT EXISTS region_snapshots (
   published_at  INTEGER NOT NULL,
   PRIMARY KEY (region_id, seq)
 );
+-- D129 (doc 26 phase 5) — the catalogue snapshot this box FETCHED for a
+-- region it does not catalogue itself: which attested head its rows are, and
+-- when they arrived. Distinct from region_snapshots on purpose: that table is
+-- what this box published, and commit_region_heads reads it — a fetched copy
+-- must never be re-published as a head.
+CREATE TABLE IF NOT EXISTS region_fetched (
+  region_id     TEXT    NOT NULL PRIMARY KEY,
+  seq           INTEGER NOT NULL,
+  manifest_hash TEXT    NOT NULL,
+  entries       INTEGER NOT NULL,
+  fetched_at    INTEGER NOT NULL,
+  source        TEXT    NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS scan_state (
   uri        TEXT PRIMARY KEY,
@@ -393,6 +406,7 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "scan_unheld",
     "region_entries",
     "region_snapshots",
+    "region_fetched",
     "scan_state",
     "projection_meta",
     "media_quality",
@@ -3012,6 +3026,7 @@ fn migrate_projection(
             14 => migrate_v14_to_v15(conn).map(|_| "scan_unheld"),
             15 => migrate_v15_to_v16(conn).map(|_| "regions.kind; region_entries; region_snapshots"),
             16 => migrate_v16_to_v17(conn).map(|_| "regions.drains"),
+            17 => migrate_v17_to_v18(conn).map(|_| "region_fetched"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -3174,6 +3189,22 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
             .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
+}
+
+fn migrate_v17_to_v18(conn: &mut Connection) -> Result<()> {
+    // D129 — additive: one new table, nothing re-read. `IF NOT EXISTS` is
+    // the guard (a test rewind, a half-applied bump).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS region_fetched (
+           region_id     TEXT    NOT NULL PRIMARY KEY,
+           seq           INTEGER NOT NULL,
+           manifest_hash TEXT    NOT NULL,
+           entries       INTEGER NOT NULL,
+           fetched_at    INTEGER NOT NULL,
+           source        TEXT    NOT NULL
+         );",
+    )
+    .map_err(map_db("migrate v17→v18: region_fetched"))
 }
 
 fn migrate_v16_to_v17(conn: &mut Connection) -> Result<()> {

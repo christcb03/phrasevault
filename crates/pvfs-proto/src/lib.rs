@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 ///          head through the forest owner. Additive; compatible-with stays.
 ///   5 → 6: D124 `Purge` and `SetQuality` — the two CLI commands that did not
 ///          route on a replica. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -90,6 +90,10 @@ pub enum ServerMsg {
         tip_seq: u64,
         events: Vec<LogEventWire>,
     },
+    /// D129: one page of a catalogue region's manifest (response to
+    /// `ClientMsg::RegionManifest`): `total` is the file's length, `bytes`
+    /// the hex of the page at the requested offset.
+    RegionManifest { total: u64, bytes: String },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
     /// P9 (doc 22): the chunk manifest for a file this holder can read —
@@ -110,6 +114,11 @@ pub enum ServerMsg {
         /// Absent on pre-D127 daemons, so defaulted rather than a proto bump.
         #[serde(default)]
         conflicts: u64,
+        /// D129 (doc 26 §8): catalogue regions whose fetched snapshot the
+        /// log has since superseded — the view is serving old rows for them.
+        /// Absent on pre-D129 daemons, so defaulted rather than a proto bump.
+        #[serde(default)]
+        stale: u64,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -413,6 +422,20 @@ pub enum ClientMsg {
         timeout_ms: u64,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         region: String,
+    },
+    /// D129 (doc 26 phase 5): a catalogue region's manifest at `seq` — the
+    /// bytes whose blake3 the log attests as that region's head. Paged by
+    /// `offset`/`max` (server-capped; 0 = the server's page) like `LogRead`;
+    /// `region_not_held` when this box has no such file. Member-gated like
+    /// `LogRead`. Nothing is signed on the wire: the attested head is the
+    /// signature, and the client verifies against it before installing.
+    RegionManifest {
+        region: String,
+        seq: u64,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default)]
+        max: u32,
     },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite { op: WriteOp },

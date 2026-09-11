@@ -75,12 +75,12 @@ fn a_v15_cache_migrates_to_v16_without_replaying() {
     let v: String = c
         .query_row("SELECT v FROM projection_meta WHERE k='schema_version'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, "17");
+    assert_eq!(v, "18");
     let sentinel: i64 = c
         .query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id='d125-sentinel'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(sentinel, 1, "an additive bump must migrate in place, not drop and replay");
-    for t in ["region_entries", "region_snapshots"] {
+    for t in ["region_entries", "region_snapshots", "region_fetched"] {
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get(0))
             .unwrap();

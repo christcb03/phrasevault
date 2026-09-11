@@ -4932,7 +4932,17 @@ impl Engine {
             // SubRegionHead, same fold, same authority check; only the source
             // of (seq, hash) differs. This is the phase 0 spike of doc 26 §10.
             let (tip, chain) = if kind == "catalogue" {
-                self.catalogue_head(&node)?
+                let (tip, chain) = self.catalogue_head(&node)?;
+                if tip == 0 {
+                    // D129 — a catalogue region this box has never published
+                    // a snapshot for is another box's: its heads arrive
+                    // through the routed op, and re-attesting "0, empty"
+                    // here would overwrite them. (Latent since D125; the
+                    // forest owner's heads tick would have done it for every
+                    // region owned by another box.)
+                    continue;
+                }
+                (tip, chain)
             } else {
                 self.region_log_tip(&node, file.as_deref())?
             };

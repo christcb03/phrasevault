@@ -278,6 +278,16 @@ impl Daemon {
     /// D127 — conflicting paths in the merged view this box holds, for
     /// `serve status`. Best-effort: a lookup error reads as 0, and the CLI
     /// says so itself when asked directly.
+    /// D129: catalogue regions this box holds a superseded snapshot of.
+    pub fn stale_catalogue_count(&self) -> u64 {
+        self.engine
+            .lock()
+            .unwrap()
+            .catalogue_status()
+            .map(|v| v.iter().filter(|s| s.stale).count() as u64)
+            .unwrap_or(0)
+    }
+
     pub fn view_conflict_count(&self) -> u64 {
         self.engine
             .lock()
@@ -549,11 +559,13 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         runner: "on".into(),
                         jobs: j.snapshot(),
                         conflicts: daemon.view_conflict_count(),
+                        stale: daemon.stale_catalogue_count(),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
                         conflicts: daemon.view_conflict_count(),
+                        stale: daemon.stale_catalogue_count(),
                     },
                 }
             }
@@ -598,6 +610,12 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             timeout_ms,
             region,
         } => do_log_wait(daemon, principal, from_seq, max, timeout_ms, &region),
+        ClientMsg::RegionManifest {
+            region,
+            seq,
+            offset,
+            max,
+        } => do_region_manifest(daemon, principal, &region, seq, offset, max),
         ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op, conn),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
@@ -717,6 +735,76 @@ fn do_log_read(
     match check_replication_gate(daemon, principal, region) {
         Err(msg) => msg,
         Ok(scope) => log_rows_msg(daemon, from_seq, max, scope.as_ref()),
+    }
+}
+
+/// D129: the largest manifest page one reply carries (hex doubles it on
+/// the wire, well inside `MAX_FRAME`); the client pages to `total`.
+const MANIFEST_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// D129 (doc 26 phase 5): a page of a catalogue region's manifest at `seq`
+/// — the file `publish_region_snapshot` wrote, whose blake3 the log attests
+/// as that region's head. Gated on READ rights at the region root: the
+/// manifest is the region's listing, no more sensitive than `ls` on it.
+/// Anything this box cannot serve — an unknown or non-catalogue region, a
+/// seq it never published — is `region_not_held`, so a fetcher tries the
+/// next box rather than treating it as a fault.
+fn do_region_manifest(
+    daemon: &Daemon,
+    principal: &Principal,
+    region: &str,
+    seq: u64,
+    offset: u64,
+    max: u32,
+) -> ServerMsg {
+    if region.len() != 64 || !region.chars().all(|c| c.is_ascii_hexdigit()) {
+        return err("region_not_held", "a region is named by its 64-hex node id");
+    }
+    let e = daemon.reader();
+    match e.effective_rights(principal, &region.to_string()) {
+        Ok(r) if r & acl::ACL_R != 0 => {}
+        Ok(_) => {
+            return err(
+                "forbidden",
+                "reading a region's manifest requires read rights on the region",
+            )
+        }
+        Err(pvfs_core::PvfsError::NotFound { .. }) => {
+            return err("region_not_held", "this instance has no such region")
+        }
+        Err(pve) => return err_from(pve),
+    }
+    match e.is_catalogue_region(region) {
+        Ok(true) => {}
+        Ok(false) => return err("region_not_held", "not a catalogue region"),
+        Err(pvfs_core::PvfsError::NotFound { .. }) => {
+            return err("region_not_held", "this instance has no such region")
+        }
+        Err(pve) => return err_from(pve),
+    }
+    let path = e
+        .data_dir()
+        .join("regions")
+        .join(region)
+        .join(format!("manifest.{seq}"));
+    drop(e);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
+            return err("region_not_held", "this instance holds no manifest at that seq")
+        }
+        Err(ioe) => return err("io", &format!("read manifest: {ioe}")),
+    };
+    let cap = if max == 0 {
+        MANIFEST_PAGE_BYTES
+    } else {
+        (max as usize).min(MANIFEST_PAGE_BYTES)
+    };
+    let start = (offset as usize).min(bytes.len());
+    let end = (start + cap).min(bytes.len());
+    ServerMsg::RegionManifest {
+        total: bytes.len() as u64,
+        bytes: hex::encode(&bytes[start..end]),
     }
 }
 
