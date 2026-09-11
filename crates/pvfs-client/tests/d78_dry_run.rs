@@ -8,6 +8,19 @@
 
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 fn count_files(dir: &std::path::Path) -> usize {
     fn walk(d: &std::path::Path, n: &mut usize) {
         if let Ok(rd) = std::fs::read_dir(d) {
@@ -42,6 +55,7 @@ fn count_files(dir: &std::path::Path) -> usize {
 /// The core promise: a dry run plans real work and changes nothing.
 #[test]
 fn a_dry_run_plans_the_work_and_writes_nothing() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("local");
     let store = tmp.path().join("store");
@@ -129,6 +143,7 @@ fn a_dry_run_plans_the_work_and_writes_nothing() {
 /// idle case, which must not report phantom work.
 #[test]
 fn a_dry_run_on_settled_state_plans_nothing() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");
     std::fs::create_dir_all(&store).unwrap();
@@ -179,6 +194,7 @@ fn a_dry_run_on_settled_state_plans_nothing() {
 /// This pins the rule as the code states it, so nobody re-merges the halves.
 #[test]
 fn a_replica_places_but_never_retires() {
+    isolate_config();
     // The predicate from tier_pass: `if keep || pull_only { continue; }`
     let stops_before_retiring = |keep: bool, pull_only: bool| keep || pull_only;
 
@@ -206,6 +222,7 @@ fn a_replica_places_but_never_retires() {
 /// reported it as "the catalog has never seen it".
 #[test]
 fn a_holder_recognises_its_own_pin_qualified_copy() {
+    isolate_config();
     let pin = "c4e862c903d3e9954d5848660c04a9085cccb915062dabccf0fb3ba8c2054848";
     let path = "/srv/nas-lib/TV/Show/Season 01/ep.mkv";
     let bare = format!("file://{path}");

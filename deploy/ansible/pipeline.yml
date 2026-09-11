@@ -56,6 +56,24 @@
       # D100 — stamped into --version by crates/pvfs-cli/build.rs. Empty until
       # the task above runs, and build.rs falls back rather than failing.
       PVFS_BUILD: "{{ build_describe.stdout | default('', true) | trim }}"
+      # D132 — sccache: every session builds in a fresh slot, so without a
+      # cache the whole dependency tree compiles twice per run (release, then
+      # the debug test profile). The cache is content-addressed and shared by
+      # every slot on the box — safe where a shared target dir is not (the
+      # 2026-08-16 mid-compile clobber). Incremental artifacts are not
+      # cacheable, so incremental is off; a CI slot never rebuilds anyway.
+      RUSTC_WRAPPER: "{{ ansible_facts.env.HOME }}/.cargo/bin/sccache"
+      SCCACHE_DIR: "{{ ansible_facts.env.HOME }}/.cache/sccache"
+      SCCACHE_CACHE_SIZE: 20G
+      CARGO_INCREMENTAL: "0"
+    # D132 — the suite's temp files live on tmpfs: every event append and
+    # projection commit fsyncs, the build VMs' virtual disks take 65-80 ms per
+    # fsync, and that made each test cost seconds regardless of profile
+    # (measured: 38 min on disk, 107 s on tmpfs, same 558 tests). The config
+    # dir is a throwaway so no suite reads the box's real instance registry.
+    suite_env:
+      TMPDIR: /dev/shm
+      XDG_CONFIG_HOME: "/dev/shm/pvfs-suite-config{{ pvfs_suffix }}"
     # systemctl --user over ssh needs the user manager's runtime dir + bus.
     user_systemd_env:
       XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.user_uid }}"
@@ -98,6 +116,35 @@
     # D124 item 5 — the checkout's `rust-toolchain.toml` names the compiler;
     # install it every prepare (idempotent), so a host that pre-dated the pin
     # does not keep floating on whatever rustup was first told.
+    - name: sccache (D132) — the compile cache the build tasks wrap rustc with
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -x "$HOME/.cargo/bin/sccache" ]; then echo present; exit 0; fi
+        if command -v sccache >/dev/null 2>&1; then ln -sf "$(command -v sccache)" "$HOME/.cargo/bin/sccache"; echo linked; exit 0; fi
+        echo missing; exit 3
+      args:
+        executable: /bin/bash
+      register: sccache_probe
+      changed_when: "'linked' in sccache_probe.stdout"
+      failed_when: false
+      tags: [prepare, build]
+
+    - name: Install sccache from apt when the box has none
+      become: true
+      ansible.builtin.apt:
+        name: sccache
+        state: present
+      when: sccache_probe.rc == 3
+      tags: [prepare, build]
+
+    - name: Link the apt sccache where cargo_env expects it
+      ansible.builtin.file:
+        src: /usr/bin/sccache
+        dest: "{{ ansible_facts.env.HOME }}/.cargo/bin/sccache"
+        state: link
+      when: sccache_probe.rc == 3
+      tags: [prepare, build]
+
     - name: Toolchain from rust-toolchain.toml (idempotent)
       ansible.builtin.shell: |
         set -o pipefail
@@ -176,16 +223,23 @@
       tags: [build]
 
     # ---- test (cargo unit + integration suite, spec §14) -------------------------
+    # D132 — `pvfs_runs_suite: false` on a host (inventory) skips the tests,
+    # clippy and smoke there: a second identical VM running the same suite at
+    # the same time on the same storage slowed both runs about 2x and proved
+    # nothing the first did not. Such a host still builds and installs, which
+    # is what the two-box lab pairs need from it.
     - name: Run cargo test suite
       ansible.builtin.shell: |
         set -o pipefail
+        mkdir -p "$XDG_CONFIG_HOME"
         cargo test --workspace 2>&1 | tee {{ test_results }}
       args:
         chdir: "{{ pvfs_src }}"
         executable: /bin/bash
-      environment: "{{ cargo_env }}"
+      environment: "{{ cargo_env | combine(suite_env) }}"
       register: test_out
       changed_when: false
+      when: pvfs_runs_suite | default(true)
       tags: [test]
 
     # ---- lint (D121) -------------------------------------------------------
@@ -214,6 +268,7 @@
       environment: "{{ cargo_env }}"
       register: clippy_component
       changed_when: "'is up to date' not in clippy_component.stdout"
+      when: pvfs_runs_suite | default(true)
       tags: [test, lint]
 
     - name: Clippy (-D warnings, all targets)
@@ -226,6 +281,7 @@
       environment: "{{ cargo_env }}"
       register: clippy_out
       changed_when: false
+      when: pvfs_runs_suite | default(true)
       tags: [test, lint]
 
     # ---- smoke (every CLI function end-to-end) ------------------------------------
@@ -234,6 +290,7 @@
         src: files/smoke-test.sh
         dest: "{{ smoke_script }}"
         mode: "0755"
+      when: pvfs_runs_suite | default(true)
       tags: [smoke]
 
     - name: Run CLI smoke tests
@@ -243,8 +300,11 @@
           | tee {{ smoke_results }}
       args:
         executable: /bin/bash
+      environment:
+        TMPDIR: /dev/shm
       register: smoke_out
       changed_when: false
+      when: pvfs_runs_suite | default(true)
       tags: [smoke]
 
     # ---- install -------------------------------------------------------------------
@@ -496,6 +556,7 @@
     - name: Aggregate real test totals
       ansible.builtin.shell: |
         set -o pipefail
+        if [ "{{ pvfs_runs_suite | default(true) }}" = "False" ]; then echo "not run here (pvfs_runs_suite=false)"; exit 0; fi
         awk -F'[ ;]+' '/^test result:/{p+=$4; f+=$6; i+=$8; n++}
                        END {if (n==0) print "NO SUITES RAN — suspect a stale build";
                             else printf "%d passed, %d failed, %d ignored (%d suites)", p, f, i, n}' \
@@ -514,7 +575,7 @@
           # Honest about not having run. A recap that claims a check passed
           # when it was skipped is worse than omitting it — that is the same
           # failure as the "0 passed; 0 failed" recap D91 fixed below.
-          - "clippy  : {{ 'clean (-D warnings, --all-targets)' if clippy_out is defined and not clippy_out.skipped | default(false) else 'NOT RUN in this invocation' }}"
+          - "clippy  : {{ 'clean (-D warnings, --all-targets)' if clippy_out is defined and not clippy_out.skipped | default(false) else 'NOT RUN here' }}"
           - "tests   : {{ test_totals.stdout | default('see artifacts') }}"
           - "smoke   : {{ smoke_out.stdout_lines | default([]) | select('match', '^smoke results') | list | last | default('see artifacts') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"

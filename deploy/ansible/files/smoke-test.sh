@@ -6,7 +6,9 @@ set -euo pipefail
 
 PVFS="${PVFS_BIN:-pvfs}"
 PVFSD="${PVFSD_BIN:-$(dirname "$PVFS")/pvfsd}"
-DATA="$(mktemp -d /tmp/pvfs-smoke.XXXXXX)"
+# D132 — honours TMPDIR: the pipeline points it at tmpfs, where the 427
+# commits below cost nothing instead of one 65-80 ms fsync apiece.
+DATA="$(mktemp -d "${TMPDIR:-/tmp}/pvfs-smoke.XXXXXX")"
 export PVFS_DATA_DIR="$DATA/forest"
 export PVFS_REGISTRY_DIR="$DATA/registry"   # user-writable registry for the P1.5 section
 export XDG_CONFIG_HOME="$DATA/config"       # keep the client identity out of $HOME

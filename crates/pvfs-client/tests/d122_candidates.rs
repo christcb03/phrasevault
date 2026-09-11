@@ -10,6 +10,19 @@ use pvfs_client::fetch::{attribute_mismatch, Fetcher};
 use pvfs_core::replica::ReplicaSource;
 use pvfs_core::{Engine, FilePayload, NodeSpec, TYPE_FILE};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 const SOURCE_PIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const OTHER_PIN: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -64,6 +77,7 @@ fn source_candidates(e: &Engine, dir: &std::path::Path, file: &str) -> usize {
 /// the source holds nothing and is not asked.
 #[test]
 fn a_source_that_holds_nothing_is_not_a_candidate() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, file) = replica_with(
         dir.path(),
@@ -76,6 +90,7 @@ fn a_source_that_holds_nothing_is_not_a_candidate() {
 /// own disk — and the source is still asked.
 #[test]
 fn a_bare_file_location_keeps_the_source_as_a_candidate() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, file) = replica_with(dir.path(), &["file:///srv/media/clip.mkv"]);
     assert_eq!(source_candidates(&e, dir.path(), &file), 1);
@@ -84,6 +99,7 @@ fn a_bare_file_location_keeps_the_source_as_a_candidate() {
 /// A location pin-qualified to the source itself says the source holds it.
 #[test]
 fn a_location_at_the_source_pin_keeps_the_source_as_a_candidate() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, file) = replica_with(
         dir.path(),
@@ -95,6 +111,7 @@ fn a_location_at_the_source_pin_keeps_the_source_as_a_candidate() {
 /// A quarantined location does not count as "the source holds it".
 #[test]
 fn a_quarantined_location_at_the_source_does_not_count() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("pvfs-host://{SOURCE_PIN}/Media/clip.mkv");
     let (e, file) = replica_with(dir.path(), &[&uri]);
@@ -107,6 +124,7 @@ fn a_quarantined_location_at_the_source_does_not_count() {
 /// empty list that lets the fetch proceed onto bytes it cannot vouch for.
 #[test]
 fn a_broken_quarantine_lookup_is_an_error_not_an_empty_list() {
+    isolate_config();
     let dir = tempfile::tempdir().unwrap();
     let (e, file) = replica_with(dir.path(), &["file:///srv/media/clip.mkv"]);
     // Pull the table out from under the open engine.
@@ -121,6 +139,7 @@ fn a_broken_quarantine_lookup_is_an_error_not_an_empty_list() {
 /// stale holder; none or several do not.
 #[test]
 fn a_mismatch_is_attributed_only_when_one_holder_served() {
+    isolate_config();
     let one = vec![("tcp:a:1".to_string(), 7u64), ("tcp:b:2".to_string(), 0)];
     assert_eq!(attribute_mismatch(&one), Some("tcp:a:1"));
     let two = vec![("tcp:a:1".to_string(), 3u64), ("tcp:b:2".to_string(), 4)];

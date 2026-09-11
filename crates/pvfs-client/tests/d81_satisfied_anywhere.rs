@@ -12,6 +12,19 @@
 
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 fn spec(dir: &std::path::Path) -> BindSpec {
     BindSpec {
         source_uri: format!("file://{}", dir.display()),
@@ -57,6 +70,7 @@ fn count_files(dir: &std::path::Path) -> usize {
 /// mover must leave it there.
 #[test]
 fn a_title_hand_moved_to_the_cold_volume_is_not_fetched_back() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let warm = tmp.path().join("Data");        // the write target
     let cold = tmp.path().join("Data_ext");    // where Chris files cold titles
@@ -136,6 +150,7 @@ fn a_title_hand_moved_to_the_cold_volume_is_not_fetched_back() {
 /// library nowhere at all still belongs at the write target, and only there.
 #[test]
 fn new_content_still_goes_to_the_write_target_only() {
+    isolate_config();
     let tmp = tempfile::tempdir().unwrap();
     let warm = tmp.path().join("Data");
     let cold = tmp.path().join("Data_ext");

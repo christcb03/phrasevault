@@ -8,6 +8,19 @@
 use pvfs_core::media::Rules;
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
+/// D132 — a throwaway config dir for this binary, so no test here reads the
+/// box's real instance registry (`XDG_CONFIG_HOME/pvfs/instances`). Set once
+/// per process; every test in the file shares it, which is all the isolation
+/// they need. The dir is deliberately leaked: the process is the lifetime.
+fn isolate_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::mem::forget(dir);
+    });
+}
+
 fn spec(dir: &std::path::Path) -> BindSpec {
     BindSpec {
         source_uri: format!("file://{}", dir.display()),
@@ -83,6 +96,7 @@ fn cold_copy(r: &Rig) -> std::path::PathBuf {
 /// now SEE the thing it would have to guess about.
 #[test]
 fn a_copy_on_another_root_is_detected_and_refused_by_default() {
+    isolate_config();
     let mut r = rig(3000, 9000);
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
     let report = pvfs_client::fetch::tier_pass_ruled(&mut r.engine, &mut fetcher, true, None)
@@ -106,6 +120,7 @@ fn a_copy_on_another_root_is_detected_and_refused_by_default() {
 /// WITH `--rules`, and a dry run: plan the trash, on the cold volume.
 #[test]
 fn with_rules_the_dry_run_plans_to_trash_the_loser_where_it_lives() {
+    isolate_config();
     let mut r = rig(3000, 9000);
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
     let report = pvfs_client::fetch::tier_pass_ruled(
@@ -136,6 +151,7 @@ fn with_rules_the_dry_run_plans_to_trash_the_loser_where_it_lives() {
 /// trashed on its OWN volume, and nothing is deleted.
 #[test]
 fn the_superseded_cold_copy_is_trashed_on_its_own_volume() {
+    isolate_config();
     let mut r = rig(3000, 9000);
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
     pvfs_client::fetch::tier_pass_ruled(
@@ -167,6 +183,7 @@ fn the_superseded_cold_copy_is_trashed_on_its_own_volume() {
 /// The occupant can WIN — bigger is not automatically newer-is-better.
 #[test]
 fn when_the_existing_copy_wins_the_incoming_one_does_not_land() {
+    isolate_config();
     let mut r = rig(9000, 3000); // the cold copy is much larger
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
     let report = pvfs_client::fetch::tier_pass_ruled(
@@ -219,6 +236,7 @@ fn walk_find(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
 /// is worse than a phantom.
 #[test]
 fn the_loser_leaves_the_tree_and_takes_its_location_with_it() {
+    isolate_config();
     let mut r = rig(3000, 9000);
     let mut fetcher = pvfs_client::fetch::Fetcher::new(&r.data_dir);
     pvfs_client::fetch::tier_pass_ruled(
