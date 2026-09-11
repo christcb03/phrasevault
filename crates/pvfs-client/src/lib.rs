@@ -52,6 +52,7 @@ pub mod catalogue;
 pub mod fetch;
 pub mod follow;
 pub mod health;
+pub mod receive;
 pub mod regions;
 pub mod relocate;
 pub mod watch;

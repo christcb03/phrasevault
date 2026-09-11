@@ -313,7 +313,7 @@ pub fn hash_with_manifest_until(
     Ok(Some((whole.finalize().to_hex().to_string(), hashes)))
 }
 
-pub(crate) fn write_manifest_sidecar(
+pub fn write_manifest_sidecar(
     file: &Path,
     whole: Option<&str>,
     hashes: &[[u8; 32]],
@@ -743,7 +743,17 @@ pub struct Placement {
     /// — the mover logs central copies as the named instance's pvfs-host://
     /// locations (the NAS serves its own store) alongside the local file://.
     pub served_by: Vec<(NodeId, String, PathBuf)>,
+    /// D133 — catalogue regions on THIS box that receive what only staging
+    /// holds (doc 26 §7.3, the library side). Local: only the box that owns
+    /// the disk decides where its bytes go.
+    pub receive: Vec<NodeId>,
+    /// D133 — days a region's `.pvfs-trash` is kept before `resolve` purges
+    /// it (doc 26 §7.4's trash-age part). Absent = `TRASH_KEEP_DAYS_DEFAULT`.
+    pub retention: Vec<(NodeId, u64)>,
 }
+
+/// D133 — default trash retention, in days.
+pub const TRASH_KEEP_DAYS_DEFAULT: u64 = 7;
 
 pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
     let text = match std::fs::read_to_string(placement_path(data_dir)) {
@@ -786,6 +796,13 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
             }
         } else if let Some(id) = line.strip_prefix("central-tree ") {
             out.central_tree.push(id.to_string());
+        } else if let Some(id) = line.strip_prefix("receive ") {
+            out.receive.push(id.to_string());
+        } else if let Some(rest) = line.strip_prefix("retention ") {
+            match rest.split_once(' ').and_then(|(id, d)| d.parse::<u64>().ok().map(|d| (id, d))) {
+                Some((id, days)) => out.retention.push((id.to_string(), days)),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
         } else if let Some(rest) = line.strip_prefix("central-keep ") {
             match rest.split_once(' ') {
                 Some((id, dir)) => out.central_keep.push((id.to_string(), PathBuf::from(dir))),
@@ -863,7 +880,46 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     for (r, d) in &p.central_keep {
         text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
+    for r in &p.receive {
+        text.push_str(&format!("receive {r}\n"));
+    }
+    for (r, days) in &p.retention {
+        text.push_str(&format!("retention {r} {days}\n"));
+    }
     crate::storage::atomic_overwrite(&placement_path(data_dir), text.as_bytes())
+}
+
+/// D133 — declare (or undeclare) a receiving region on this box.
+pub fn set_region_receive(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.receive.retain(|r| r != id);
+    if on {
+        p.receive.push(id.clone());
+    }
+    save_placement(data_dir, &p)
+}
+
+/// D133 — the regions this box declared receiving.
+pub fn receiving_regions(data_dir: &Path) -> Result<Vec<NodeId>> {
+    Ok(load_placement_full(data_dir)?.receive)
+}
+
+/// D133 — set a region's trash retention in days on this box.
+pub fn set_region_retention(data_dir: &Path, id: &NodeId, days: u64) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.retention.retain(|(r, _)| r != id);
+    p.retention.push((id.clone(), days));
+    save_placement(data_dir, &p)
+}
+
+/// D133 — a region's trash retention in days (the default when undeclared).
+pub fn region_retention_days(data_dir: &Path, id: &str) -> Result<u64> {
+    Ok(load_placement_full(data_dir)?
+        .retention
+        .into_iter()
+        .find(|(r, _)| r == id)
+        .map(|(_, d)| d)
+        .unwrap_or(TRASH_KEEP_DAYS_DEFAULT))
 }
 
 /// Place `id` as `sync` (true) or back to `pointer` (false). Either way any

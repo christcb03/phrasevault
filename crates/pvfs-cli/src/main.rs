@@ -1259,6 +1259,14 @@ enum ViewCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// D133: for the receiving regions THIS box owns, pull by content hash
+    /// every file the view shows only on staging, and the staging winner of
+    /// a conflict, into the library (doc 26 §7.3). `--dry-run` says what
+    /// would land where.
+    Receive {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1289,6 +1297,21 @@ enum RegionCmd {
         target: String,
         /// on | off
         state: Option<String>,
+    },
+    /// D133: declare a catalogue region on THIS box as receiving — the
+    /// library region that takes what only staging holds. Local to this
+    /// box. Prompts when omitted.
+    Receive {
+        target: String,
+        /// on | off
+        state: Option<String>,
+    },
+    /// D133: how many days a draining region's trash is kept before
+    /// `resolve` purges it (default 7). Local to this box. Prompts when
+    /// omitted.
+    Retention {
+        target: String,
+        days: Option<u64>,
     },
     /// D129: fetch the catalogue snapshots this box is behind on — every
     /// stale region, or one — from the fleet's announced endpoints, each
@@ -6021,6 +6044,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 dry_run,
                 &std::sync::atomic::AtomicBool::new(false),
             )?;
+            // D133 — then free what retention allows (never on a dry run).
+            let purged: u64 = if dry_run { 0 } else { engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum() };
             if json {
                 println!(
                     "{}",
@@ -6029,9 +6054,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "trashed": rep.trashed.iter().map(|(p, r)| serde_json::json!({"path": p, "region": r})).collect::<Vec<_>>(),
                         "kept_winners": rep.kept_winners,
                         "reported": rep.reported,
+                        "purged": purged,
                     })
                 );
             } else {
+                if purged > 0 {
+                    println!("purged\t{purged} trash bucket(s) past retention");
+                }
                 let verb = if dry_run { "would trash" } else { "trashed" };
                 for (p, r) in &rep.trashed {
                     println!("{verb}\t{p}\t(draining region {})", &r[..r.len().min(12)]);
@@ -6048,12 +6077,54 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             engine.close()
         }
+        Cmd::View(ViewCmd::Receive { dry_run }) => {
+            let engine = Engine::open(&ctx?)?;
+            let rep = pvfs_client::receive::receive_pass_on(
+                &engine,
+                &pvfs_core::media::Rules::default(),
+                dry_run,
+                pvfs_client::receive::MIN_FREE_BYTES,
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            engine.close()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "dry_run": dry_run,
+                        "received": rep.received.iter().map(|(p, h, r)| serde_json::json!({"path": p, "hash": h, "region": r})).collect::<Vec<_>>(),
+                        "replaced": rep.replaced,
+                        "skipped_no_space": rep.skipped_no_space,
+                        "failed": rep.failed.iter().map(|(p, w)| serde_json::json!({"path": p, "why": w})).collect::<Vec<_>>(),
+                        "reported": rep.reported.iter().map(|(p, w)| serde_json::json!({"path": p, "why": w})).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                let verb = if dry_run { "would receive" } else { "received" };
+                for (p, _, r) in &rep.received {
+                    println!("{verb}\t{p}\t(into {}{})", &r[..r.len().min(12)], if rep.replaced.contains(p) { ", replacing the library copy" } else { "" });
+                }
+                for p in &rep.skipped_no_space {
+                    println!("no space\t{p}");
+                }
+                for (p, w) in &rep.failed {
+                    println!("failed\t{p}\t{w}");
+                }
+                for (p, w) in &rep.reported {
+                    println!("report\t{p}\t{w}");
+                }
+                if rep.received.is_empty() && rep.skipped_no_space.is_empty() && rep.failed.is_empty() && rep.reported.is_empty() {
+                    println!("nothing to receive");
+                }
+            }
+            Ok(())
+        }
         Cmd::View(cmd) => {
             let engine = Engine::open(&ctx?)?;
             let entries = match &cmd {
                 ViewCmd::Ls { dir } => engine.merged_view(dir.as_deref().unwrap_or(""))?,
                 ViewCmd::Conflicts => engine.view_conflicts()?,
-                ViewCmd::Resolve { .. } => unreachable!("handled above"),
+                ViewCmd::Resolve { .. } | ViewCmd::Receive { .. } => unreachable!("handled above"),
             };
             if json {
                 let drains: std::collections::HashMap<String, bool> = engine
@@ -6169,6 +6240,68 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     engine.close()
                 }
+                RegionCmd::Receive { target, state } => {
+                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    if !engine.is_catalogue_region(&id)? {
+                        return Err(PvfsError::BadInput {
+                            field: "region".into(),
+                            reason: format!("{id} is not a catalogue region"),
+                        });
+                    }
+                    let state = match state {
+                        Some(s) => s,
+                        None => prompt_line(
+                            "receive — on (this box's library region takes what only staging holds) or off",
+                            Some("on"),
+                        )?,
+                    };
+                    let on = match state.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            return Err(PvfsError::BadInput {
+                                field: "state".into(),
+                                reason: format!("{other:?} — say on or off"),
+                            })
+                        }
+                    };
+                    pvfs_core::sync::set_region_receive(engine.data_dir(), &id, on)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"receives\":{on}}}");
+                    } else {
+                        println!("{id} {}", if on { "receives (this box's library takes staging-only files)" } else { "does not receive" });
+                    }
+                    engine.close()
+                }
+                RegionCmd::Retention { target, days } => {
+                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    if !engine.is_catalogue_region(&id)? {
+                        return Err(PvfsError::BadInput {
+                            field: "region".into(),
+                            reason: format!("{id} is not a catalogue region"),
+                        });
+                    }
+                    let days = match days {
+                        Some(d) => d,
+                        None => prompt_line(
+                            "days to keep this region's trash before resolve purges it",
+                            Some(&pvfs_core::sync::TRASH_KEEP_DAYS_DEFAULT.to_string()),
+                        )?
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| PvfsError::BadInput {
+                            field: "days".into(),
+                            reason: "a whole number of days".into(),
+                        })?,
+                    };
+                    pvfs_core::sync::set_region_retention(engine.data_dir(), &id, days)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"retention_days\":{days}}}");
+                    } else {
+                        println!("{id} keeps its trash {days} day(s)");
+                    }
+                    engine.close()
+                }
                 RegionCmd::Entries { target } => {
                     let (engine, id) = engine_and_node(ctx, &target)?;
                     if !engine.is_catalogue_region(&id)? {
@@ -6228,6 +6361,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         .into_iter()
                         .map(|s| (s.region.clone(), s))
                         .collect();
+                    // D133: this box's local declarations.
+                    let receiving = pvfs_core::sync::receiving_regions(engine.data_dir())?;
                     if json {
                         let rows: Vec<String> = regions
                             .iter()
@@ -6235,13 +6370,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 let drains = engine.region_drains(id).unwrap_or(false);
                                 let cat = status.get(id).map(|s| {
                                     format!(
-                                        ",\"head\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{}",
+                                        ",\"head\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{},\"receives\":{},\"retention_days\":{}",
                                         s.head_seq,
                                         s.held_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
                                         s.local,
                                         s.stale,
                                         s.fetched_at.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
-                                        s.entries
+                                        s.entries,
+                                        receiving.contains(id),
+                                        pvfs_core::sync::region_retention_days(engine.data_dir(), id).unwrap_or(pvfs_core::sync::TRASH_KEEP_DAYS_DEFAULT)
                                     )
                                 }).unwrap_or_default();
                                 format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\",\"drains\":{drains}{cat}}}")
@@ -6262,10 +6399,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                         (false, None) => "not fetched".to_string(),
                                     };
                                     format!(
-                                        "\thead {}\t{held}\t{} rows{}",
+                                        "\thead {}\t{held}\t{} rows{}{}",
                                         s.head_seq,
                                         s.entries,
-                                        if s.stale { "\tSTALE" } else { "" }
+                                        if s.stale { "\tSTALE" } else { "" },
+                                        if receiving.contains(id) { "\treceives" } else { "" }
                                     )
                                 })
                                 .unwrap_or_default();
