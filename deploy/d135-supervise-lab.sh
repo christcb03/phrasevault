@@ -21,7 +21,14 @@ H=\$(cd "\$(dirname "\$0")/.." && pwd)
 for d in /proc/[0-9]*; do a=\$(tr "\\0" " " < \$d/cmdline 2>/dev/null); case "\$a" in *"pvfsd --mount \$H/replica "*) exit 0;; esac; done
 cd \$H && PATH=\$H/bin:\$PATH setsid pvfsd --mount \$H/replica --listen 0.0.0.0:7422 >> \$H/pvfsd.log 2>&1 &
 EOS
-chmod 755 $H/bin/start-pvfs.sh; echo READY' | grep -q READY && ok "holder-sim home laid out (bin, replica symlink, start script)" || fail "sim home"
+cat > $H/bin/kill-sim.sh <<EOS
+#!/bin/sh
+# kill the sim daemon by exact argv from /proc — never by a pattern on a command line
+for d in /proc/[0-9]*; do a=\$(tr "\\0" " " < \$d/cmdline 2>/dev/null); case "\$a" in *"pvfsd --mount /home/chris/nas-sim/replica "*) kill \${d#/proc/} 2>/dev/null;; esac; done
+for _ in \$(seq 1 90); do [ "\$(/home/chris/nas-sim/bin/pvfs-supervise.sh status | tail -1 | cut -d" " -f1)" = down ] && exit 0; sleep 1; done
+echo "sim daemon still up"; exit 1
+EOS
+chmod 755 $H/bin/start-pvfs.sh $H/bin/kill-sim.sh; echo READY' | grep -q READY && ok "holder-sim home laid out (bin, replica symlink, start script)" || fail "sim home"
 scp -q "$HERE/../../PVOS-d135/deploy/ansible/fleet/pvfs-supervise.sh" "$I:nas-sim/bin/pvfs-supervise.sh" 2>/dev/null || scp -q /Users/chris/Projects/PVOS-d135/deploy/ansible/fleet/pvfs-supervise.sh "$I:nas-sim/bin/pvfs-supervise.sh"
 S $I 'chmod 755 ~/nas-sim/bin/pvfs-supervise.sh; sh -n ~/nas-sim/bin/pvfs-supervise.sh && echo SYNTAX' | grep -q SYNTAX && ok "pvfs-supervise.sh installed on the holder-sim" || fail "script install"
 S $I '~/nas-sim/bin/pvfs-supervise.sh start; sleep 2; ~/nas-sim/bin/pvfs-supervise.sh status' | tail -1 | grep -q '^serving' && ok "start by hand → serving" || fail "sim daemon not serving: $(S $I '~/nas-sim/bin/pvfs-supervise.sh status; tail -3 ~/nas-sim/pvfsd.log')"
@@ -45,14 +52,15 @@ echo "== B: the owner supervises the holder-sim; the health job starts it after 
 PIN=$(S $I 'cat /srv/media-replica/.pvfs/nettls/pin')
 [ "${#PIN}" -eq 64 ] && ok "holder-sim pin $PIN" || fail "pin: $PIN"
 S $O "cd /srv/pvfs/media && /usr/local/bin/pvfs --json fleet supervise $PIN --ssh chris@$I_HOST --key \$HOME/.ssh/pvfs-supervise" | grep -q '"supervised":true' && ok "pvfs fleet supervise registered the channel" || fail "fleet supervise"
-S $I 'pkill -f "pvfsd --mount /home/chris/nas-sim/replica"; for _ in $(seq 1 60); do [ "$(~/nas-sim/bin/pvfs-supervise.sh status | tail -1 | cut -d" " -f1)" = down ] && break; sleep 1; done; ~/nas-sim/bin/pvfs-supervise.sh status' | tail -1 | grep -q '^down' && ok "holder-sim daemon stopped and drained (status: down)" || fail "stop"
+T0=$(date +%s)000
+S $I '~/nas-sim/bin/kill-sim.sh && ~/nas-sim/bin/pvfs-supervise.sh status' | tail -1 | grep -q '^down' && ok "holder-sim daemon stopped and drained (status: down)" || fail "stop"
 echo "     waiting for the owner's health job: two polls at 2 min, then start (up to 7 min)…"
 R=$(S $O 'cd /srv/pvfs/media; for _ in $(seq 1 84); do /usr/local/bin/pvfs --json fleet health 2>/dev/null | python3 -c "
 import json,sys
 r=json.load(sys.stdin); p=r[\"peers\"].get(sys.argv[1]) or {}
-a=(p.get(\"actions\") or [])
+a=[x for x in (p.get(\"actions\") or []) if x[\"at_ms\"] >= int(sys.argv[2])]
 if a: print(\"ACTION rc=%d out=%s\" % (a[-1][\"rc\"], a[-1][\"output\"])); sys.exit(0)
-sys.exit(1)" '"$PIN"' && exit 0; sleep 5; done; echo NOACTION')
+sys.exit(1)" '"$PIN"' '"$T0"' && exit 0; sleep 5; done; echo NOACTION')
 echo "$R" | grep -q 'ACTION rc=0 out=started' && ok "the owner sent start and the script answered: $R" || fail "no start within 7 min: $R $(S $O 'journalctl -u pvfsd-media --since "10 min ago" --no-pager | grep -i supervise | tail -3')"
 S $I 'sleep 3; ~/nas-sim/bin/pvfs-supervise.sh status' | tail -1 | grep -q '^serving' && ok "the holder-sim is serving again" || fail "not serving after start"
 S $O 'cd /srv/pvfs/media; /usr/local/bin/pvfs fleet health | grep -A3 "'"${PIN:0:8}"'"' | grep -q 'supervise: start' && ok "fleet health shows the action" || fail "fleet health table"
@@ -60,12 +68,12 @@ S $O 'cd /srv/pvfs/media; for _ in $(seq 1 40); do /usr/local/bin/pvfs --json fl
 S $I 'tail -4 ~/nas-sim/supervise.log' | grep -q 'start started' && ok "the holder-sim's supervise.log has the start" || fail "supervise.log: $(S $I 'tail -3 ~/nas-sim/supervise.log')"
 
 echo "== C: install over the channel swaps a binary pair and version reports it"
-S $I 'pkill -f "pvfsd --mount /home/chris/nas-sim/replica"; for _ in $(seq 1 60); do [ "$(~/nas-sim/bin/pvfs-supervise.sh status | tail -1 | cut -d" " -f1)" = down ] && break; sleep 1; done; true' >/dev/null
+S $I '~/nas-sim/bin/kill-sim.sh' >/dev/null
 IN=$(S $O "cd /usr/local/bin && tar -cf - pvfs pvfsd | ssh -i ~/.ssh/pvfs-supervise -o BatchMode=yes chris@$I_HOST install")
 echo "$IN" | grep -q '^installed:' && ok "install accepted a tar of pvfs+pvfsd: $IN" || fail "install: $IN"
 S $I 'ls ~/nas-sim/bin/prev/pvfsd >/dev/null && ~/nas-sim/bin/pvfs-supervise.sh version | head -1' | grep -q '^pvfs ' && ok "previous pair kept in bin/prev; version reports the new one" || fail "prev/version"
 
 echo "== D: restore — the holder-sim's own daemon down, the systemd unit back"
 S $O "cd /srv/pvfs/media && /usr/local/bin/pvfs fleet supervise $PIN --off" >/dev/null
-S $I 'pkill -f "pvfsd --mount /home/chris/nas-sim/replica"; for _ in $(seq 1 60); do [ "$(~/nas-sim/bin/pvfs-supervise.sh status | tail -1 | cut -d" " -f1)" = down ] && break; sleep 1; done; sudo systemctl start pvfsd-replica pvfs-mount; sleep 3; systemctl is-active pvfsd-replica' | grep -q '^active' && ok "systemd unit back; the owner no longer supervises the sim" || fail "restore"
+S $I '~/nas-sim/bin/kill-sim.sh; sudo systemctl start pvfsd-replica pvfs-mount; sleep 3; systemctl is-active pvfsd-replica' | grep -q '^active' && ok "systemd unit back; the owner no longer supervises the sim" || fail "restore"
 echo; echo "supervise lab: $PASS ok, $FAIL failed"; [ "$FAIL" -eq 0 ]
