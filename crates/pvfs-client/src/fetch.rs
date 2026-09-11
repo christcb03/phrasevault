@@ -1903,14 +1903,12 @@ impl HashStreamSink<'_> {
 
 impl std::io::Write for HashStreamSink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use std::io::Write as _;
         self.file.write_all(buf)?;
         self.written += buf.len() as u64;
         self.mark_covered(false);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        use std::io::Write as _;
         self.file.flush()
     }
 }

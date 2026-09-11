@@ -679,6 +679,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
+        | ClientMsg::CatHash { .. }
         | ClientMsg::SecureCat { .. }
         | ClientMsg::SecurePut { .. }
         | ClientMsg::IngestWrite { .. }
