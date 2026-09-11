@@ -103,6 +103,13 @@ fn a_box_receives_its_own_staging_files_replaces_a_loser_and_drains_them() {
     assert!(trashed.iter().any(|p| p.ends_with("Movies/Up (2002)/up.mkv")), "the old library copy is in the trash: {trashed:?}");
     assert!(!lib.join(".pvfs-incoming").join(format!("{h_new}.partial")).exists(), "no partial left");
 
+    // Before the library's watch catalogues them, a second pass recognises
+    // its own placements and waits rather than pulling again or failing.
+    let between = receive_pass_on(&e, &Rules::default(), false, 0, &never).unwrap();
+    assert!(between.received.is_empty() && between.failed.is_empty(), "{between:?}");
+    assert_eq!(between.reported.len(), 2, "{between:?}");
+    assert!(between.reported.iter().all(|(_, why)| why.contains("already placed")));
+
     // The library catalogues what landed; the view now sees agreeing pairs.
     e.scan_routed(Some(&rl), None, 0).unwrap();
     let movies: Vec<_> = e.view_paths().unwrap().into_iter().filter(|v| v.kind == "file").collect();
