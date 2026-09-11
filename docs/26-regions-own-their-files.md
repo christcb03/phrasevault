@@ -199,6 +199,17 @@ and fetchable. What to do about the *space* it takes is a retention policy
 The draining case is the easy one precisely because there is something to
 *do*. The non-draining case only has something to *decide*, and 7.1 decides it.
 
+*Both halves of the draining row are BUILT: the staging side as D127
+(`resolve`: the redundant or losing copy goes to its region's trash) and the
+library side as D133 (`receive`: a box's declared receiving region pulls, by
+content hash, what only staging holds, and the staging winner of a
+disagreement replaces the library's loser). One deviation from 7.2's letter:
+that replacement moves the library's losing copy to the library's trash —
+soft, dated, kept for the region's retention — because one path holds one
+file. D133 also settles the trash-age part of 7.4: `pvfs region retention
+<region> <days>` (default 7), applied by `resolve`. The rest of 7.4 stays
+open.*
+
 **7.4 Retention — OPEN.** Per region: "keep newest N versions", "keep all",
 "keep the ladder winner only". Explicit, declared, never inferred.
 
