@@ -226,6 +226,15 @@ replicated snapshot still serves the merged view, marked stale by its age.
 That is the correct behaviour for a library and it is what a filesystem does
 when a drive is unplugged.
 
+*Built as D129 (§10 phase 5). One precision on "stale": the log is the
+reference. A copy is **stale** when the log attests a head newer than the one
+held (the region's box published and this box has not fetched yet); a copy
+whose box is offline is merely **old** — nothing newer is attested — and
+`region ls` shows when it was fetched. Who serves the manifest is whoever
+announced an endpoint and holds the file; nothing is special about the
+owner, and the bytes are verified against the head before a row is written,
+so a wrong box can waste a round trip and nothing else.*
+
 
 ## 9. What does NOT change
 
@@ -299,7 +308,23 @@ Retention (§7.4) and the push to D83 stay open. The original spec follows.
 Ladder-based serving winner; drain behaviour; the
 retention policy. *Testable alone:* every cell of the §7.3 table.
 
-**Phase 5 — replication.** Fetch-and-verify a region's catalogue by its signed
+**Phase 5 — replication. BUILT (PVOS D129).** A catalogue travels as its
+manifest — the exact bytes whose blake3 the log attests as the region's head
+— fetched by a new wire request (`RegionManifest`, proto 7, read-gated on
+the region) from whichever announced endpoint holds it, installed only when
+it is the attested head (`Engine::install_region_snapshot`: a non-catalogue,
+a locally bound region, a non-attested seq, a hash mismatch, a manifest
+naming another region are each refused), into the same `region_entries`
+the view reads; `region_fetched` (schema 18) records what is held.
+`catalogue_status` and `ViewCopy.stale` say when the log attests a newer
+head than the copy held; a box that is offline publishes nothing, so its
+region is old, not stale — the §8 behaviour. The `catalogue` serve job
+(60 s), `pvfs region fetch`, `region ls` head/held/stale, `stale: N` in
+`serve status`. No deltas yet (§8: whole-snapshot is viable from day one).
+Found on the way: since D125 the forest owner's heads tick re-attested
+`(0, empty)` for every catalogue region another box owned; fixed. The
+original spec follows.
+Fetch-and-verify a region's catalogue by its signed
 head; stale-by-age when the owner is offline.
 
 **Phase 6 — the mount.** The FUSE mount (doc 20 §3, built) over the merged
