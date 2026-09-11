@@ -406,6 +406,7 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "scan_unheld",
     "region_entries",
     "region_snapshots",
+    "region_fetched",
     "scan_state",
     "projection_meta",
     "media_quality",
