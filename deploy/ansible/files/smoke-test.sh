@@ -1033,6 +1033,27 @@ $PVFS --json view conflicts | python3 -c 'import json,sys; assert json.load(sys.
   && ok "the view is clean after the region's rescan" || fail "view still conflicted"
 $PVFS --json region ls | qgrep "\"region\":\"$CAT2\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\",\"drains\":true" >/dev/null; $PVFS --json region drain "$CAT2" off | qgrep '"drains":false' && ok "region drain off" || fail "region drain off"
 
+say "D129: catalogue replication — what this box holds of each region (doc 26 phase 5)"
+# This box catalogues $CAT itself: its rows are live, never stale, and the
+# held seq IS the attested head.
+$PVFS --json region ls | python3 -c '
+import json,sys
+rows={r["region"]:r for r in json.load(sys.stdin)}
+r=rows[sys.argv[1]]
+assert r["kind"]=="catalogue" and r["local"] is True and r["stale"] is False, r
+assert r["head"]>=1 and r["held"]==r["head"] and r["entries"]>=1, r
+' "$CAT" && ok "region ls: local region is live at its head" || fail "region ls status"
+$PVFS region ls | grep "^$CAT" | qgrep 'live' && ok "plain region ls says live" || fail "plain region ls"
+$PVFS --json region fetch | python3 -c '
+import json,sys
+r=json.load(sys.stdin); assert r["fetched"]==[] and r["failed"]==[] and r["skipped"]>=1, r
+' && ok "region fetch: nothing to fetch (every region catalogued here)" || fail "region fetch"
+$PVFS region fetch | qgrep 'nothing to fetch' && ok "and says so" || fail "region fetch plain"
+$PVFS --json view ls | python3 -c '
+import json,sys
+v=json.load(sys.stdin); assert v and all(c["stale"] is False for e in v for c in e["sources"]), v
+' && ok "view ls: no copy is stale" || fail "view ls stale"
+
 say "P7.2a: physical region logs — split, routing, seal, tree rebuild (doc 20 §2.3)"
 PR="$($PVFS add "$ROOT" --kind folder --label phys-region)"
 PRIN="$($PVFS add "$PR" --kind folder --label inner)"

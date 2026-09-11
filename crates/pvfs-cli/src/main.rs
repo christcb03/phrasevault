@@ -1282,6 +1282,14 @@ enum RegionCmd {
         /// on | off
         state: Option<String>,
     },
+    /// D129: fetch the catalogue snapshots this box is behind on — every
+    /// stale region, or one — from the fleet's announced endpoints, each
+    /// verified against the head the log attests before it is installed.
+    /// The `catalogue` serve job does this every minute.
+    Fetch {
+        /// A region root (node id / path); default: every stale region
+        target: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1859,6 +1867,7 @@ fn view_json(e: &pvfs_core::ViewEntry, drains: &std::collections::HashMap<String
             "region": c.region, "kind": c.kind, "size": c.size_bytes,
             "mtime_ms": c.mtime_ms, "hash": c.content_hash, "quality": c.quality,
             "drains": drains.get(&c.region).copied().unwrap_or(false),
+            "stale": c.stale,
         })).collect::<Vec<_>>(),
     })
 }
@@ -6173,12 +6182,29 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 RegionCmd::Ls { target: None } => {
                     let engine = Engine::open(&ctx?)?;
                     let regions = engine.regions()?;
+                    // D129: what this box holds of each catalogue region.
+                    let status: std::collections::HashMap<String, pvfs_core::CatalogueStatus> = engine
+                        .catalogue_status()?
+                        .into_iter()
+                        .map(|s| (s.region.clone(), s))
+                        .collect();
                     if json {
                         let rows: Vec<String> = regions
                             .iter()
                             .map(|(id, at, kind)| {
                                 let drains = engine.region_drains(id).unwrap_or(false);
-                                format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\",\"drains\":{drains}}}")
+                                let cat = status.get(id).map(|s| {
+                                    format!(
+                                        ",\"head\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{}",
+                                        s.head_seq,
+                                        s.held_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                                        s.local,
+                                        s.stale,
+                                        s.fetched_at.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                                        s.entries
+                                    )
+                                }).unwrap_or_default();
+                                format!("{{\"region\":\"{id}\",\"marked_at\":{at},\"kind\":\"{kind}\",\"drains\":{drains}{cat}}}")
                             })
                             .collect();
                         println!("[{}]", rows.join(","));
@@ -6187,10 +6213,72 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     } else {
                         for (id, _, kind) in &regions {
                             let drains = engine.region_drains(id).unwrap_or(false);
-                            println!("{id}\t{kind}{}", if drains { "\tdrains" } else { "" });
+                            let cat = status
+                                .get(id)
+                                .map(|s| {
+                                    let held = match (s.local, s.held_seq) {
+                                        (true, _) => "live".to_string(),
+                                        (false, Some(h)) => format!("held {h}"),
+                                        (false, None) => "not fetched".to_string(),
+                                    };
+                                    format!(
+                                        "\thead {}\t{held}\t{} rows{}",
+                                        s.head_seq,
+                                        s.entries,
+                                        if s.stale { "\tSTALE" } else { "" }
+                                    )
+                                })
+                                .unwrap_or_default();
+                            println!("{id}\t{kind}{}{cat}", if drains { "\tdrains" } else { "" });
                         }
                     }
                     engine.close()
+                }
+                RegionCmd::Fetch { target } => {
+                    let (mut engine, only) = match target {
+                        Some(t) => {
+                            let (e, id) = engine_and_node(ctx, &t)?;
+                            let r = e.region_of(&id)?;
+                            (e, Some(r))
+                        }
+                        None => (Engine::open(&ctx?)?, None),
+                    };
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    let rep = pvfs_client::catalogue::fetch_pass_on(&mut engine, &never, only.as_deref())?;
+                    engine.close()?;
+                    if json {
+                        let fetched: Vec<String> = rep
+                            .fetched
+                            .iter()
+                            .map(|(r, s, n)| format!("{{\"region\":\"{r}\",\"seq\":{s},\"rows\":{n}}}"))
+                            .collect();
+                        let failed: Vec<String> = rep
+                            .failed
+                            .iter()
+                            .map(|(r, w)| format!("{{\"region\":\"{r}\",\"why\":\"{}\"}}", json_escape(w)))
+                            .collect();
+                        println!(
+                            "{{\"fetched\":[{}],\"failed\":[{}],\"endpoints\":{},\"skipped\":{}}}",
+                            fetched.join(","),
+                            failed.join(","),
+                            rep.endpoints,
+                            rep.skipped
+                        );
+                    } else {
+                        for (r, s, n) in &rep.fetched {
+                            println!("fetched {r} at head {s}: {n} rows");
+                        }
+                        for (r, w) in &rep.failed {
+                            println!("still behind {r}: {w}");
+                        }
+                        if rep.fetched.is_empty() && rep.failed.is_empty() {
+                            println!(
+                                "nothing to fetch: {} catalogue region(s) up to date or catalogued here",
+                                rep.skipped
+                            );
+                        }
+                    }
+                    Ok(())
                 }
             }
         }
@@ -8357,7 +8445,7 @@ fn serve_status_print(
         crypto::sign_digest(&key, d).unwrap_or_default()
     })
     .map_err(remote_err)?;
-    let (runner, jobs, conflicts) = client.serve_status_conflicts().map_err(remote_err)?;
+    let (runner, jobs, conflicts, stale) = client.serve_status_conflicts().map_err(remote_err)?;
     if json {
         let rows: Vec<String> = jobs
             .iter()
@@ -8376,7 +8464,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale}}}",
             json_escape(&runner),
             rows.join(",")
         );
@@ -8384,6 +8472,9 @@ fn serve_status_print(
         println!("runner: {runner}");
         if conflicts > 0 {
             println!("conflicts: {conflicts}  (see `pvfs view conflicts`; D127)");
+        }
+        if stale > 0 {
+            println!("stale catalogues: {stale}  (see `pvfs region ls`; D129)");
         }
         for j in &jobs {
             let mut line = format!("{:<8} {}", j.name, j.state);

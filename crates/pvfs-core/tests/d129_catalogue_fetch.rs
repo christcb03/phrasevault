@@ -147,7 +147,8 @@ fn a_foreign_region_installs_only_what_the_log_attests_and_goes_stale_after() {
     // every copy from that region says so — until the next fetch.
     let rows2 = vec![row("Shows", "dir", 0, None), row("Shows/far.mkv", "file", 10, Some(&"55".repeat(32)))];
     let bytes2 = Engine::region_manifest_bytes(&far, 2, &rows2);
-    attest(&mut e, &holder_key, &far, 2, &blake3::hash(&bytes2).to_hex().to_string());
+    let hash2 = blake3::hash(&bytes2).to_hex();
+    attest(&mut e, &holder_key, &far, 2, hash2.as_str());
     let far_st = e.catalogue_status().unwrap().into_iter().find(|s| s.region == far).unwrap();
     assert_eq!((far_st.head_seq, far_st.held_seq, far_st.stale), (2, Some(1), true));
     let shows = e.merged_view("Shows").unwrap();

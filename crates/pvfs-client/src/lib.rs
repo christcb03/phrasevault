@@ -48,6 +48,7 @@ pub use pvfs_proto::{
 };
 
 pub mod advertise;
+pub mod catalogue;
 pub mod fetch;
 pub mod follow;
 pub mod regions;
@@ -273,9 +274,11 @@ impl Client {
 
     /// The daemon's live job-runner state (P5, doc 18 §2): `("on"|"off", rows)`.
     /// D127 — the serve status with the merged view's conflict count.
-    pub fn serve_status_conflicts(&mut self) -> Result<(String, Vec<ServeJobWire>, u64)> {
+    /// `serve status` with the two in-band counts: conflicting view paths
+    /// (D127) and stale catalogue regions (D129).
+    pub fn serve_status_conflicts(&mut self) -> Result<(String, Vec<ServeJobWire>, u64, u64)> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs, conflicts } => Ok((runner, jobs, conflicts)),
+            ServerMsg::ServeJobs { runner, jobs, conflicts, stale } => Ok((runner, jobs, conflicts, stale)),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

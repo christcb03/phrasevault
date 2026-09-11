@@ -54,7 +54,8 @@ fn serve_status_reports_config_runner_and_reload() {
     let (runner_state, rows) = client.serve_status().unwrap();
     assert_eq!(runner_state, "on");
     // D127: the status carries the merged view's conflict count (0 here).
-    let (_, _, conflicts) = client.serve_status_conflicts().unwrap();
+    let (_, _, conflicts, stale) = client.serve_status_conflicts().unwrap();
+    assert_eq!(stale, 0, "D129: nothing fetched, nothing stale");
     assert_eq!(conflicts, 0);
     assert_eq!(rows.len(), serve_cfg::JOB_NAMES.len());
     let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();

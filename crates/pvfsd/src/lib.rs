@@ -278,6 +278,16 @@ impl Daemon {
     /// D127 — conflicting paths in the merged view this box holds, for
     /// `serve status`. Best-effort: a lookup error reads as 0, and the CLI
     /// says so itself when asked directly.
+    /// D129: catalogue regions this box holds a superseded snapshot of.
+    pub fn stale_catalogue_count(&self) -> u64 {
+        self.engine
+            .lock()
+            .unwrap()
+            .catalogue_status()
+            .map(|v| v.iter().filter(|s| s.stale).count() as u64)
+            .unwrap_or(0)
+    }
+
     pub fn view_conflict_count(&self) -> u64 {
         self.engine
             .lock()
@@ -549,11 +559,13 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         runner: "on".into(),
                         jobs: j.snapshot(),
                         conflicts: daemon.view_conflict_count(),
+                        stale: daemon.stale_catalogue_count(),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
                         conflicts: daemon.view_conflict_count(),
+                        stale: daemon.stale_catalogue_count(),
                     },
                 }
             }

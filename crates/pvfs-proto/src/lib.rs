@@ -114,6 +114,11 @@ pub enum ServerMsg {
         /// Absent on pre-D127 daemons, so defaulted rather than a proto bump.
         #[serde(default)]
         conflicts: u64,
+        /// D129 (doc 26 §8): catalogue regions whose fetched snapshot the
+        /// log has since superseded — the view is serving old rows for them.
+        /// Absent on pre-D129 daemons, so defaulted rather than a proto bump.
+        #[serde(default)]
+        stale: u64,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and

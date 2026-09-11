@@ -71,9 +71,10 @@ fn a_daemon_serves_the_attested_manifest_and_nothing_else() {
     let stranger_key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
     let stranger_pub = crypto::pubkey_bytes(&stranger_key);
     owner.authorize_member(&mn, &stranger_pub).unwrap();
-    // The manifest is the region's listing: read rights on the region.
+    // The manifest is the region's listing: read rights on it (here granted
+    // at the root, which the rights walk carries down to the region).
     owner
-        .set_acl(&library, &Principal::Key(member_pub.clone()), acl::ACL_R)
+        .set_acl(&root, &Principal::Key(member_pub.clone()), acl::ACL_R)
         .unwrap();
     let (seq, head) = region_head(dir.path(), &library);
     assert!(seq >= 1, "premise: the catalogue region has an attested head");
