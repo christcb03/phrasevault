@@ -53,6 +53,7 @@ pub mod fetch;
 pub mod follow;
 pub mod health;
 pub mod receive;
+pub mod supervise;
 pub mod regions;
 pub mod relocate;
 pub mod watch;

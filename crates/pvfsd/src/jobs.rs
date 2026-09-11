@@ -594,7 +594,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         "health" => std::thread::spawn(move || {
             st.set_state("health", "running");
             match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
-                Ok(rec) => {
+                Ok(mut rec) => {
                     for (pin, r) in rec.down() {
                         eprintln!(
                             "pvfsd: health: {} ({}) not answering since {} — {}",
@@ -604,7 +604,25 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                             r.last.error.as_deref().unwrap_or("no detail")
                         );
                     }
-                    st.mark_pass("health", None)
+                    // D135 — act on silence for the peers this box supervises.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match pvfs_client::supervise::act_on_down(st.data_dir(), &mut rec, now) {
+                        Ok(done) => {
+                            for (pin, a) in &done {
+                                eprintln!("pvfsd: supervise: sent start to {} → rc {} {:?}", &pin[..8], a.rc, a.output);
+                            }
+                            if !done.is_empty() {
+                                if let Err(e) = rec.save(st.data_dir()) {
+                                    eprintln!("pvfsd: supervise: record not saved: {e}");
+                                }
+                            }
+                            st.mark_pass("health", None)
+                        }
+                        Err(e) => st.mark_pass("health", Some(e.to_string())),
+                    }
                 }
                 Err(e) => st.mark_pass("health", Some(e.to_string())),
             }

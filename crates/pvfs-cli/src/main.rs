@@ -1350,6 +1350,22 @@ enum FleetCmd {
         #[arg(long)]
         now: bool,
     },
+    /// D135: supervise a peer — when the health job finds it down (two
+    /// missed polls) the owner runs `start` on it over an ssh key the peer
+    /// binds to one script. With no pin: list what is supervised.
+    Supervise {
+        /// The peer's transport pin (as `fleet health` shows it)
+        pin: Option<String>,
+        /// The ssh destination, user@host (prompted at a terminal when omitted)
+        #[arg(long)]
+        ssh: Option<String>,
+        /// The private key (default ~/.ssh/pvfs-supervise)
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Stop supervising this pin
+        #[arg(long)]
+        off: bool,
+    },
     /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
     /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
     /// member's fetcher learns how to reach this holder from the catalog
@@ -6460,6 +6476,67 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
         }
+        Cmd::Fleet(FleetCmd::Supervise { pin, ssh, key, off }) => {
+            let data_dir = ctx?;
+            let Some(pin) = pin else {
+                let chans = pvfs_client::supervise::load(&data_dir)?;
+                let record = pvfs_client::health::FleetHealth::load(&data_dir)?;
+                if json {
+                    let rows: Vec<serde_json::Value> = chans
+                        .iter()
+                        .map(|c| {
+                            let last = record.as_ref().and_then(|r| r.peers.get(&c.pin)).and_then(|p| p.actions.last().cloned());
+                            serde_json::json!({"pin": c.pin, "ssh": c.ssh, "key": c.key, "last_action": last.map(|a| serde_json::json!({"at_ms": a.at_ms, "verb": a.verb, "rc": a.rc, "output": a.output}))})
+                        })
+                        .collect();
+                    println!("{}", serde_json::Value::Array(rows));
+                } else if chans.is_empty() {
+                    println!("nothing supervised — `pvfs fleet supervise <pin> --ssh user@host`");
+                } else {
+                    for c in &chans {
+                        let last = record.as_ref().and_then(|r| r.peers.get(&c.pin)).and_then(|p| p.actions.last().cloned());
+                        println!(
+                            "{}  {}  key {}  {}",
+                            &c.pin[..8.min(c.pin.len())],
+                            c.ssh,
+                            c.key.display(),
+                            last.map(|a| format!("last: {} rc={} {:?}", a.verb, a.rc, a.output)).unwrap_or_else(|| "no action yet".into())
+                        );
+                    }
+                }
+                return Ok(());
+            };
+            if off {
+                let was = pvfs_client::supervise::unset(&data_dir, &pin)?;
+                if json {
+                    println!("{{\"pin\":\"{}\",\"supervised\":false,\"was\":{was}}}", json_escape(&pin));
+                } else {
+                    println!("{} {}", &pin[..8.min(pin.len())], if was { "no longer supervised" } else { "was not supervised" });
+                }
+                return Ok(());
+            }
+            let ssh = match ssh {
+                Some(s) => s,
+                None => prompt_line("ssh destination for the peer's supervise script (user@host)", None)?,
+            };
+            if !ssh.contains('@') {
+                return Err(PvfsError::BadInput {
+                    field: "ssh".into(),
+                    reason: "expected user@host".into(),
+                });
+            }
+            let key = key.unwrap_or_else(pvfs_client::supervise::default_key);
+            pvfs_client::supervise::set(&data_dir, &pin, &ssh, &key)?;
+            if json {
+                println!("{{\"pin\":\"{}\",\"supervised\":true,\"ssh\":\"{}\",\"key\":\"{}\"}}", json_escape(&pin), json_escape(&ssh), json_escape(&key.to_string_lossy()));
+            } else {
+                println!("{} supervised via {} (key {}); the health job will run `start` on it after two missed polls", &pin[..8.min(pin.len())], ssh, key.display());
+                if !key.exists() {
+                    println!("note: {} does not exist yet — generate it (ssh-keygen -t ed25519 -N '' -f {}) and bind its public key on the peer", key.display(), key.display());
+                }
+            }
+            Ok(())
+        }
         Cmd::Fleet(FleetCmd::Health { now }) => {
             let data_dir = ctx?;
             let record = if now {
@@ -6532,6 +6609,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         notes.push("jobs clean".into());
                     }
                     println!("            {}", notes.join("; "));
+                }
+                if let Some(a) = r.actions.last() {
+                    println!("            supervise: {} {} ago → rc {} {:?}{}", a.verb, age(a.at_ms), a.rc, a.output, if r.attempts > 1 { format!(" ({} starts this outage)", r.attempts) } else { String::new() });
                 }
             }
             Ok(())
