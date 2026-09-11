@@ -53,6 +53,16 @@ pub struct PvfsFs {
     /// every file payload decoded, and a library scan can call `statfs` in a
     /// loop, so it is worth not recomputing per call.
     capacity: Option<((u64, u64), std::time::Instant)>,
+    /// D130 (doc 26 phase 6) — the VIEW mount: inodes are relative paths in
+    /// the merged view, not nodes. `view` picks the mode for every handler.
+    view: bool,
+    ino_to_path: HashMap<u64, String>,
+    path_to_ino: HashMap<String, u64>,
+    /// Directory listings, cached briefly: a library scan issues thousands
+    /// of lookups and the view is a query, not a table.
+    view_cache: HashMap<String, (std::time::Instant, Vec<pvfs_core::ViewEntry>)>,
+    /// Read-throughs in flight, by content hash.
+    active_hash: HashMap<String, Arc<SwarmProgress>>,
 }
 
 /// One in-flight proxy handle: the connection is reused across reads.
@@ -87,6 +97,11 @@ impl PvfsFs {
                 pvfs_client::advertise::replica_route(data_dir, is_replica).unwrap_or(None)
             },
             capacity: None,
+            view: false,
+            ino_to_path: HashMap::new(),
+            path_to_ino: HashMap::new(),
+            view_cache: HashMap::new(),
+            active_hash: HashMap::new(),
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
@@ -107,7 +122,21 @@ impl PvfsFs {
                 return v;
             }
         }
-        let v = self.engine.total_file_bytes().unwrap_or((0, 0));
+        let v = if self.view {
+            // D130: what the view serves — admitted files, their served sizes.
+            self.engine
+                .view_paths()
+                .map(|ps| {
+                    ps.iter()
+                        .filter(|e| e.kind != "dir" && Self::view_shown(e))
+                        .fold((0u64, 0u64), |(b, n), e| {
+                            (b + Self::view_served(e).map(|(_, s, _)| s).unwrap_or(0), n + 1)
+                        })
+                })
+                .unwrap_or((0, 0))
+        } else {
+            self.engine.total_file_bytes().unwrap_or((0, 0))
+        };
         self.capacity = Some((v, std::time::Instant::now()));
         v
     }
@@ -213,12 +242,186 @@ impl PvfsFs {
     }
 }
 
+/// How long a cached view listing is trusted (D130 §3.1).
+const VIEW_TTL: Duration = Duration::from_secs(5);
+
+impl PvfsFs {
+    /// D130 — the VIEW mount over `data_dir`'s merged view (doc 26 §6): one
+    /// entry per relative path across every catalogue region this box
+    /// knows; bytes from its own disk, the hash store, or a read-through.
+    pub fn new_view(data_dir: &Path) -> Result<PvfsFs, PvfsError> {
+        // A node mount of the forest root, then switched: the shared fields
+        // (engine, fetcher, pins, routes) are built the same way.
+        let root = Engine::open(data_dir)?.identity.root_node_id.clone();
+        let mut fs = PvfsFs::new(data_dir, &root)?;
+        fs.view = true;
+        fs.ino_to_node.clear();
+        fs.node_to_ino.clear();
+        fs.ino_to_path.insert(1, String::new());
+        fs.path_to_ino.insert(String::new(), 1);
+        Ok(fs)
+    }
+
+    fn view_ino(&mut self, rel: &str) -> u64 {
+        if let Some(i) = self.path_to_ino.get(rel) {
+            return *i;
+        }
+        let i = self.next_ino;
+        self.next_ino += 1;
+        self.ino_to_path.insert(i, rel.to_string());
+        self.path_to_ino.insert(rel.to_string(), i);
+        i
+    }
+
+    /// What the mount shows (D130 §3.1): directories, admitted files, and
+    /// hash conflicts that have a served copy. Unhashed files and kind
+    /// conflicts are not admitted (doc 26 §6) and stay in `pvfs view ls`.
+    fn view_shown(e: &pvfs_core::ViewEntry) -> bool {
+        use pvfs_core::ViewState;
+        e.kind == "dir"
+            || matches!(e.state, ViewState::Admitted)
+            || (matches!(e.state, ViewState::ConflictHashes(_))
+                && Engine::served_copy(e, &pvfs_core::media::Rules::default()).is_some())
+    }
+
+    fn view_list(&mut self, dir: &str) -> Result<Vec<pvfs_core::ViewEntry>, PvfsError> {
+        if let Some((at, list)) = self.view_cache.get(dir) {
+            if at.elapsed() < VIEW_TTL {
+                return Ok(list.clone());
+            }
+        }
+        let list: Vec<pvfs_core::ViewEntry> = self
+            .engine
+            .merged_view(dir)?
+            .into_iter()
+            .filter(Self::view_shown)
+            .collect();
+        self.view_cache
+            .insert(dir.to_string(), (std::time::Instant::now(), list.clone()));
+        Ok(list)
+    }
+
+    fn view_entry_of(&mut self, rel: &str) -> Option<pvfs_core::ViewEntry> {
+        self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown)
+    }
+
+    /// The copy a file entry serves: hash, size, mtime.
+    fn view_served(e: &pvfs_core::ViewEntry) -> Option<(String, u64, u64)> {
+        Engine::served_copy(e, &pvfs_core::media::Rules::default())
+            .and_then(|c| c.content_hash.clone().map(|h| (h, c.size_bytes, c.mtime_ms)))
+    }
+
+    fn view_attr(&mut self, e: &pvfs_core::ViewEntry) -> FileAttr {
+        let ino = self.view_ino(&e.rel_path);
+        let (kind, size, mtime, perm) = if e.kind == "dir" {
+            (FileType::Directory, 0, e.mtime_ms, 0o555)
+        } else {
+            let (size, mtime) = Self::view_served(e)
+                .map(|(_, s, m)| (s, m))
+                .unwrap_or((e.size_bytes, e.mtime_ms));
+            (FileType::RegularFile, size, mtime, 0o444)
+        };
+        self.plain_attr(ino, kind, size, mtime, perm)
+    }
+
+    fn plain_attr(&self, ino: u64, kind: FileType, size: u64, mtime_ms: u64, perm: u16) -> FileAttr {
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(mtime_ms);
+        FileAttr {
+            ino,
+            size,
+            blocks: size.div_ceil(512),
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            crtime: ts,
+            kind,
+            perm,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
+    }
+
+    fn view_join(parent: &str, name: &str) -> String {
+        if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }
+    }
+
+    /// D130 §3.2 — open a view file: this box's own disk, the hash store,
+    /// else a read-through served from the growing file.
+    fn view_open(&mut self, rel: &str) -> Result<u64, i32> {
+        let entry = self.view_entry_of(rel).ok_or(libc::ENOENT)?;
+        if entry.kind == "dir" {
+            return Err(libc::EISDIR);
+        }
+        let (hash, size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
+        let local = self
+            .engine
+            .local_path_for_hash(&hash)
+            .ok()
+            .flatten()
+            .map(|lb| lb.path)
+            .or_else(|| pvfs_core::sync::hash_store_lookup(&self.data_dir, &hash).ok().flatten());
+        if let Some(path) = local {
+            let f = std::fs::File::open(&path).map_err(|_| libc::EIO)?;
+            let fh = self.next_fh;
+            self.next_fh += 1;
+            self.handles.insert(fh, f);
+            return Ok(fh);
+        }
+        if self.active_hash.get(&hash).is_some_and(|p| p.failed()) {
+            self.active_hash.remove(&hash);
+        }
+        let progress = match self.active_hash.get(&hash) {
+            Some(p) => Arc::clone(p),
+            None => {
+                eprintln!("mount: reading {rel} through by hash {} (doc 26 phase 6)", &hash[..8]);
+                let p: Arc<SwarmProgress> = Arc::new(SwarmProgress::default());
+                let bg = Arc::clone(&p);
+                let dir = self.data_dir.clone();
+                let h = hash.clone();
+                std::thread::spawn(move || {
+                    pvfs_client::fetch::fetch_by_hash(&dir, &h, size, &bg);
+                });
+                self.active_hash.insert(hash.clone(), Arc::clone(&p));
+                p
+            }
+        };
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.streaming.insert(fh, progress);
+        Ok(fh)
+    }
+}
+
 fn enoent<E>(_e: E) -> i32 {
     libc::ENOENT
 }
 
 impl Filesystem for PvfsFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if self.view {
+            let Some(parent_path) = self.ino_to_path.get(&parent).cloned() else {
+                return reply.error(libc::ENOENT);
+            };
+            let Some(name) = name.to_str() else {
+                return reply.error(libc::ENOENT);
+            };
+            let rel = Self::view_join(&parent_path, name);
+            return match self.view_entry_of(&rel) {
+                Some(e) => {
+                    let attr = self.view_attr(&e);
+                    reply.entry(&TTL, &attr, 0)
+                }
+                None => reply.error(libc::ENOENT),
+            };
+        }
         let Some(parent_node) = self.ino_to_node.get(&parent).cloned() else {
             return reply.error(libc::ENOENT);
         };
@@ -239,6 +442,22 @@ impl Filesystem for PvfsFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        if self.view {
+            if ino == 1 {
+                let attr = self.plain_attr(1, FileType::Directory, 0, 0, 0o555);
+                return reply.attr(&TTL, &attr);
+            }
+            let Some(rel) = self.ino_to_path.get(&ino).cloned() else {
+                return reply.error(libc::ENOENT);
+            };
+            return match self.view_entry_of(&rel) {
+                Some(e) => {
+                    let attr = self.view_attr(&e);
+                    reply.attr(&TTL, &attr)
+                }
+                None => reply.error(libc::ENOENT),
+            };
+        }
         let Some(node) = self.ino_to_node.get(&ino).cloned() else {
             return reply.error(libc::ENOENT);
         };
@@ -256,6 +475,31 @@ impl Filesystem for PvfsFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        if self.view {
+            let Some(dir) = self.ino_to_path.get(&ino).cloned() else {
+                return reply.error(libc::ENOENT);
+            };
+            let list = match self.view_list(&dir) {
+                Ok(l) => l,
+                Err(_) => return reply.error(libc::EIO),
+            };
+            let mut entries: Vec<(u64, FileType, String)> = vec![
+                (ino, FileType::Directory, ".".into()),
+                (1, FileType::Directory, "..".into()),
+            ];
+            for e in &list {
+                let kind = if e.kind == "dir" { FileType::Directory } else { FileType::RegularFile };
+                let child_ino = self.view_ino(&e.rel_path);
+                let name = e.rel_path.rsplit('/').next().unwrap_or(&e.rel_path).to_string();
+                entries.push((child_ino, kind, name));
+            }
+            for (i, (child_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(child_ino, (i + 1) as i64, kind, name) {
+                    break;
+                }
+            }
+            return reply.ok();
+        }
         let Some(node) = self.ino_to_node.get(&ino).cloned() else {
             return reply.error(libc::ENOENT);
         };
@@ -289,6 +533,15 @@ impl Filesystem for PvfsFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
             return reply.error(libc::EROFS);
+        }
+        if self.view {
+            let Some(rel) = self.ino_to_path.get(&ino).cloned() else {
+                return reply.error(libc::ENOENT);
+            };
+            return match self.view_open(&rel) {
+                Ok(fh) => reply.opened(fh, 0),
+                Err(code) => reply.error(code),
+            };
         }
         let Some(node) = self.ino_to_node.get(&ino).cloned() else {
             return reply.error(libc::ENOENT);
@@ -531,6 +784,9 @@ impl Filesystem for PvfsFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        if self.view {
+            return reply.error(libc::EROFS);
+        }
         let (Some(from), Some(to)) = (
             self.ino_to_node.get(&parent).cloned(),
             self.ino_to_node.get(&newparent).cloned(),
@@ -931,6 +1187,9 @@ impl PvfsFs {
     /// the owner from reaching across NFS to delete, and what routes every
     /// automated deletion through the trash.
     fn retire(&mut self, parent: u64, name: &OsStr, want_dir: bool) -> Result<(), i32> {
+        if self.view {
+            return Err(libc::EROFS); // D130: the view is read-only, namespace included
+        }
         let parent_node = self
             .ino_to_node
             .get(&parent)
@@ -1007,6 +1266,41 @@ pub fn spawn_mount(
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let fs = PvfsFs::new(data_dir, target)?;
+            fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
+                .map_err(|e| PvfsError::io("fuse mount", e))
+        }
+        Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+/// D130 — mount the merged view of the forest at `data_dir` read-only at
+/// `mountpoint` (doc 26 phase 6), blocking until unmounted.
+pub fn mount_view(data_dir: &Path, mountpoint: &Path, allow_other: bool) -> Result<(), PvfsError> {
+    let fs = PvfsFs::new_view(data_dir)?;
+    match fuser::mount2(fs, mountpoint, &opts(true, allow_other)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let fs = PvfsFs::new_view(data_dir)?;
+            if allow_other {
+                return fuser::mount2(fs, mountpoint, &opts(false, true)).map_err(allow_other_denied);
+            }
+            fuser::mount2(fs, mountpoint, &opts(false, false))
+                .map_err(|e| PvfsError::io("fuse mount", e))
+        }
+        Err(e) => Err(PvfsError::io("fuse mount", e)),
+    }
+}
+
+/// D130 — [`mount_view`] in the background (tests, embedders).
+pub fn spawn_view_mount(
+    data_dir: &Path,
+    mountpoint: &Path,
+) -> Result<fuser::BackgroundSession, PvfsError> {
+    let fs = PvfsFs::new_view(data_dir)?;
+    match fuser::spawn_mount2(fs, mountpoint, &opts(true, false)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let fs = PvfsFs::new_view(data_dir)?;
             fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }

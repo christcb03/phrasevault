@@ -1118,7 +1118,7 @@ fn stream_local_file<S: io::Read + io::Write>(
     };
     write_msg(stream, &ServerMsg::CatStart { size: want })?;
 
-    let mut file = match std::fs::File::open(&path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
             // CatStart already sent — write a zero-length frame to signal abort.
