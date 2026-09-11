@@ -179,7 +179,7 @@ t0=\$(date +%s.%N); got=\$(cat "\$V/x.mkv" 2>/dev/null); t1=\$(date +%s.%N)
 [ "\$got" = "xx" ] && echo E4=ok
 echo "READTHROUGH_S=\$(python3 -c "print(round(\$t1-\$t0,2))")"
 H=\$(python3 -c "import hashlib,sys; print(__import__('blake3').blake3(b'xx').hexdigest())" 2>/dev/null || echo "")
-ls "\$D"/sync/by-hash/*/* 2>/dev/null | grep -v partial | head -3 | sed 's/^/STORE=/'
+find "\$D" -path '*/by-hash/*' -type f ! -name '*.partial' 2>/dev/null | head -3 | sed 's/^/STORE=/'
 grep -c "reading x.mkv through by hash" "\$FT/d130-view.log" | sed 's/^/LOGGED=/'
 [ "\$(cat "\$V/z.mkv")" = "zzz" ] && echo E5=ok
 EOS
