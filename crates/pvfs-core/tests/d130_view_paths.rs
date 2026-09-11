@@ -87,15 +87,19 @@ fn a_single_path_lookup_agrees_with_the_listing_and_bytes_resolve_only_when_real
     let lb = e.local_path_for_hash(&h_same).unwrap().expect("held here");
     assert_eq!(lb.size, 9);
     assert_eq!(std::fs::read(&lb.path).unwrap(), b"identical");
+    // Regions are visited by id, and ids are random: whichever of A and B
+    // sorts first serves first.
+    let (first_dir, second_dir) = if ra < rb { (&a, &b) } else { (&b, &a) };
     let p = lb.path.clone();
-    assert!(p.starts_with(&a), "region A sorts first: {p:?}");
+    assert!(p.starts_with(first_dir), "the first region by id serves first: {p:?}");
     assert_eq!(lb.region, ra.clone().min(rb.clone()), "the first region by id");
     assert!(e.local_path_for_hash(&"00".repeat(32)).unwrap().is_none());
-    // A's copy shrinks on disk (a half-written file): B's copy serves instead.
-    std::fs::write(a.join("Movies/Same (2001)/same.mkv"), b"ident").unwrap();
-    let p2 = e.local_path_for_hash(&h_same).unwrap().expect("B still has it").path;
-    assert!(p2.starts_with(&b), "{p2:?}");
-    std::fs::write(b.join("Movies/Same (2001)/same.mkv"), b"ident").unwrap();
+    // The first region's copy shrinks on disk (a half-written file): the
+    // other region's copy serves instead.
+    std::fs::write(first_dir.join("Movies/Same (2001)/same.mkv"), b"ident").unwrap();
+    let p2 = e.local_path_for_hash(&h_same).unwrap().expect("the other region still has it").path;
+    assert!(p2.starts_with(second_dir), "{p2:?}");
+    std::fs::write(second_dir.join("Movies/Same (2001)/same.mkv"), b"ident").unwrap();
     assert!(e.local_path_for_hash(&h_same).unwrap().is_none(), "no copy of the right size is left");
 
     // A fetched region's row is never a local path, even with a hash nobody

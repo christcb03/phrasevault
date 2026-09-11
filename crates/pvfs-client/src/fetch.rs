@@ -1798,6 +1798,14 @@ impl SwarmProgress {
             .unwrap_or(false)
     }
 
+    /// D130: why a finished fetch failed, if it did.
+    pub fn error(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|st| st.finished.as_ref().and_then(|r| r.as_ref().err().cloned()))
+    }
+
     /// Wait until the chunks covering `[off, off+len)` are verified-present.
     /// `Ok(path)` names where to read: the published file once finished, else
     /// the partial. Errors when the fetch failed or `timeout` lapsed.
@@ -1862,6 +1870,164 @@ pub fn fetch_streaming(data_dir: &std::path::Path, id: &str, progress: &SwarmPro
             .readable_path(&id.to_string())
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "fetched but not readable".into())
+    })();
+    progress.finish(result);
+}
+
+/// D130 — the chunk the read-through's progress is marked in (a mount read
+/// waits for the chunks covering its range).
+const HASH_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// A sink that writes the stream to the partial file and marks each chunk
+/// as it is fully on disk, so `wait_range` can serve the growing file.
+struct HashStreamSink<'a> {
+    file: std::fs::File,
+    written: u64,
+    marked: usize,
+    progress: &'a SwarmProgress,
+}
+
+impl HashStreamSink<'_> {
+    fn mark_covered(&mut self, all: bool) {
+        loop {
+            let end = (self.marked as u64 + 1) * HASH_STREAM_CHUNK;
+            if end <= self.written || (all && self.marked as u64 * HASH_STREAM_CHUNK < self.written) {
+                self.progress.mark(self.marked);
+                self.marked += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl std::io::Write for HashStreamSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        self.file.write_all(buf)?;
+        self.written += buf.len() as u64;
+        self.mark_covered(false);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        self.file.flush()
+    }
+}
+
+/// D130 (doc 26 phase 6): read a content hash through into the hash store
+/// from the fleet's announced endpoints (minus this box, in pin order):
+/// the first box that serves it is the source. Whole and sequential;
+/// `progress` marks the frontier so the mount serves the growing file.
+pub fn fetch_by_hash(data_dir: &std::path::Path, hash: &str, size: u64, progress: &SwarmProgress) {
+    let sources: Vec<ReplicaSource> = match Engine::open(data_dir) {
+        Ok(engine) => {
+            let own = pvfs_core::storage::host_pin(data_dir);
+            let mut eps: Vec<(String, String)> = catalog_endpoints(&engine)
+                .into_iter()
+                .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
+                .collect();
+            let _ = engine.close();
+            eps.sort();
+            eps.into_iter()
+                .map(|(pin, addr)| ReplicaSource {
+                    transport: "tcp".into(),
+                    target: addr,
+                    pin,
+                    region: String::new(),
+                })
+                .collect()
+        }
+        Err(e) => {
+            progress.finish(Err(e.to_string()));
+            return;
+        }
+    };
+    fetch_by_hash_from(data_dir, hash, size, &sources, progress)
+}
+
+/// [`fetch_by_hash`] from an explicit list of boxes. The finished file is
+/// verified against `hash` before the `.partial` suffix comes off; a box
+/// that serves other bytes is refused and NAMED (doc 22 §7: integrity
+/// failures are evidence), and the next box is asked.
+pub fn fetch_by_hash_from(
+    data_dir: &std::path::Path,
+    hash: &str,
+    size: u64,
+    sources: &[ReplicaSource],
+    progress: &SwarmProgress,
+) {
+    let result = (|| -> Result<PathBuf, String> {
+        let final_path = pvfs_core::sync::hash_store_path(data_dir, hash).map_err(|e| e.to_string())?;
+        if final_path.is_file() {
+            return Ok(final_path);
+        }
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("hash store: {e}"))?;
+        }
+        let part = final_path.with_extension("partial");
+        let n_chunks = size.div_ceil(HASH_STREAM_CHUNK).max(1) as usize;
+        let mut last = String::from("no announced endpoint holds these bytes");
+        for src in sources {
+            let mut client = match crate::follow::dial_source(src) {
+                Ok(c) => c,
+                Err(e) => {
+                    last = format!("{}: {e}", src.target);
+                    continue;
+                }
+            };
+            let file = match std::fs::File::create(&part) {
+                Ok(f) => f,
+                Err(e) => return Err(format!("hash store: {e}")),
+            };
+            progress.set_layout(size, HASH_STREAM_CHUNK, n_chunks, part.clone());
+            let mut sink = HashStreamSink {
+                file,
+                written: 0,
+                marked: 0,
+                progress,
+            };
+            let streamed = client.cat_hash_range(hash, 0, 0, &mut sink);
+            let written = sink.written;
+            drop(sink);
+            match streamed {
+                Ok(_) if written == size => {
+                    let got = std::fs::read(&part)
+                        .map(|b| blake3::hash(&b).to_hex().to_string())
+                        .unwrap_or_default();
+                    if got == hash {
+                        std::fs::rename(&part, &final_path).map_err(|e| format!("hash store: {e}"))?;
+                        // Every chunk is on disk and verified.
+                        for i in 0..n_chunks {
+                            progress.mark(i);
+                        }
+                        return Ok(final_path);
+                    }
+                    let _ = std::fs::remove_file(&part);
+                    last = format!(
+                        "{} served bytes whose hash is {}, not {hash} — refused",
+                        src.target,
+                        &got[..got.len().min(16)]
+                    );
+                    continue;
+                }
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&part);
+                    last = format!("{}: short stream, {written} of {size} bytes", src.target);
+                    continue;
+                }
+                Err(crate::ClientError::Server { code, .. }) if code == "not_found" => {
+                    let _ = std::fs::remove_file(&part);
+                    continue;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    last = format!("{}: {e}", src.target);
+                    continue;
+                }
+            }
+        }
+        Err(last)
     })();
     progress.finish(result);
 }

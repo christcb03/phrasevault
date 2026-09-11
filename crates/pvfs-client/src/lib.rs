@@ -414,14 +414,38 @@ impl Client {
         len: u64,
         out: &mut dyn std::io::Write,
     ) -> Result<u64> {
-        write_msg(
-            &mut self.stream,
-            &ClientMsg::Cat {
+        self.cat_with(
+            ClientMsg::Cat {
                 node: node.into(),
                 offset,
                 len,
             },
-        )?;
+            out,
+        )
+    }
+
+    /// D130 (doc 26 phase 6): stream the bytes of a content hash from a box
+    /// that catalogues them — `not_found` means "not here, ask another".
+    /// The caller verifies the finished file against the hash.
+    pub fn cat_hash_range(
+        &mut self,
+        hash: &str,
+        offset: u64,
+        len: u64,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64> {
+        self.cat_with(
+            ClientMsg::CatHash {
+                hash: hash.into(),
+                offset,
+                len,
+            },
+            out,
+        )
+    }
+
+    fn cat_with(&mut self, msg: ClientMsg, out: &mut dyn std::io::Write) -> Result<u64> {
+        write_msg(&mut self.stream, &msg)?;
         // Server responds: CatStart (JSON) → binary data frames → CatDone (JSON).
         let size = match read_msg::<_, ServerMsg>(&mut self.stream)? {
             Some(ServerMsg::CatStart { size }) => size,

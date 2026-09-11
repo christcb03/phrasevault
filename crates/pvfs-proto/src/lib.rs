@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 ///          head through the forest owner. Additive; compatible-with stays.
 ///   5 → 6: D124 `Purge` and `SetQuality` — the two CLI commands that did not
 ///          route on a replica. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -371,6 +371,18 @@ pub enum ClientMsg {
     /// the whole file, so old peers interoperate unchanged.
     Cat {
         node: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        len: u64,
+    },
+    /// D130 (doc 26 phase 6): stream the bytes of a CONTENT HASH — a file
+    /// this box catalogues itself whose row carries `hash`, at the row's
+    /// size. Same framing as `Cat`; `not_found` when this box holds no such
+    /// bytes, so a reader asks the next box. Read-gated on the region that
+    /// holds the file. The reader verifies the whole file against `hash`.
+    CatHash {
+        hash: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         offset: u64,
         #[serde(default, skip_serializing_if = "is_zero")]
