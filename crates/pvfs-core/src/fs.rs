@@ -352,6 +352,30 @@ pub struct ViewCopy {
     pub content_hash: Option<String>,
     /// D76 encoding, when this region measured it (D127: the ladder's input).
     pub quality: Option<String>,
+    /// D129: this copy comes from a fetched snapshot the log has since
+    /// superseded (the region's box published a newer head this box has not
+    /// fetched yet). Never set for a region this box catalogues itself.
+    pub stale: bool,
+}
+
+/// D129 — one catalogue region as this box sees it (doc 26 §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueStatus {
+    pub region: NodeId,
+    /// The head the log attests (0 = none yet).
+    pub head_seq: u64,
+    pub head_hash: String,
+    /// What this box holds: the head itself for a region it catalogues,
+    /// the fetched seq otherwise, `None` when nothing has been fetched.
+    pub held_seq: Option<u64>,
+    /// This box catalogues the region (its rows are live, never stale).
+    pub local: bool,
+    /// The log attests a newer head than the copy held.
+    pub stale: bool,
+    pub fetched_at: Option<u64>,
+    pub source: Option<String>,
+    /// Rows held here.
+    pub entries: u64,
 }
 
 /// D127 — what one resolution pass did (doc 26 §7.3). Paths, with the region
@@ -1269,6 +1293,198 @@ impl Engine {
         out.into_bytes()
     }
 
+    /// D129 — the inverse of [`Engine::region_manifest_bytes`]: the region,
+    /// seq and rows a manifest names, escapes undone. Any other header or a
+    /// malformed line is refused; `changed_ms` and `seen_at` are not in a
+    /// manifest and come back as the mtime and 0 (the installer stamps them).
+    pub fn parse_region_manifest(bytes: &[u8]) -> Result<(String, u64, Vec<RegionEntry>)> {
+        fn unesc(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            let mut it = s.chars();
+            while let Some(c) = it.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match it.next() {
+                    Some('t') => out.push('\t'),
+                    Some('n') => out.push('\n'),
+                    Some('\\') => out.push('\\'),
+                    Some(o) => {
+                        out.push('\\');
+                        out.push(o);
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            out
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| bad("manifest", "not UTF-8"))?;
+        let mut lines = text.split('\n');
+        if lines.next() != Some("pvfs-region-manifest 1") {
+            return Err(bad("manifest", "not a pvfs-region-manifest 1"));
+        }
+        let region = lines.next().unwrap_or("").to_string();
+        if region.len() != 64 || !region.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(bad("manifest", "region line is not a node id"));
+        }
+        let seq: u64 = lines
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| bad("manifest", "seq line is not a number"))?;
+        let mut rows = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if line.is_empty() {
+                continue; // the trailing newline
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 6 {
+                return Err(bad("manifest", &format!("row {} has {} fields, not 6", i + 1, f.len())));
+            }
+            let num = |s: &str, what: &str| -> Result<u64> {
+                s.parse().map_err(|_| bad("manifest", &format!("row {}: {what} is not a number", i + 1)))
+            };
+            let opt = |s: &str| (s != "-").then(|| s.to_string());
+            let mtime_ms = num(f[3], "mtime")?;
+            rows.push(RegionEntry {
+                rel_path: unesc(f[1]),
+                kind: f[0].to_string(),
+                size_bytes: num(f[2], "size")?,
+                mtime_ms,
+                changed_ms: mtime_ms,
+                content_hash: opt(f[4]),
+                quality: opt(f[5]),
+                seen_at: 0,
+            });
+        }
+        Ok((region, seq, rows))
+    }
+
+    /// D129 (doc 26 §8) — install a fetched catalogue snapshot as this box's
+    /// rows for `region`. Refuses rather than guesses, in this order: the
+    /// region is a catalogue region; this box does not bind it (its own rows
+    /// are the authority — a fetched copy never overwrites a live catalogue);
+    /// `seq` is the log's attested head (only the head is installable);
+    /// `blake3(bytes)` is the attested hash; the bytes parse and name this
+    /// region and seq. Then, in one transaction, the region's rows are
+    /// replaced and `region_fetched` records what is held. Returns the row
+    /// count.
+    pub fn install_region_snapshot(
+        &mut self,
+        region: &NodeId,
+        seq: u64,
+        bytes: &[u8],
+        source: &str,
+    ) -> Result<usize> {
+        if !self.is_catalogue_region(region)? {
+            return Err(bad("catalogue", "not a catalogue region"));
+        }
+        if !self.bindings_for(region)?.is_empty() {
+            return Err(bad(
+                "catalogue",
+                "this box catalogues that region itself; its rows are the authority",
+            ));
+        }
+        let info = self.region_info(region)?.ok_or_else(|| bad("catalogue", "no region row"))?;
+        if info.committed_seq == 0 {
+            return Err(bad("catalogue", "the log attests no head for that region yet"));
+        }
+        if seq != info.committed_seq {
+            return Err(bad(
+                "catalogue",
+                &format!("seq {seq} is not the attested head ({})", info.committed_seq),
+            ));
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        if hash != info.committed_head {
+            return Err(bad("catalogue", "manifest hash does not match the attested head"));
+        }
+        let (named, named_seq, rows) = Self::parse_region_manifest(bytes)?;
+        if &named != region || named_seq != seq {
+            return Err(bad("catalogue", "manifest names another region or seq"));
+        }
+        let now = now_ms() as i64;
+        let tx = self.conn.transaction().map_err(map_db("install snapshot"))?;
+        tx.execute("DELETE FROM region_entries WHERE region_id = ?1", params![region])
+            .map_err(map_db("install snapshot: clear"))?;
+        for r in &rows {
+            tx.execute(
+                "INSERT INTO region_entries
+                   (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
+                    content_hash, quality, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    region,
+                    r.rel_path,
+                    r.kind,
+                    r.size_bytes as i64,
+                    r.mtime_ms as i64,
+                    r.changed_ms as i64,
+                    r.content_hash,
+                    r.quality,
+                    now
+                ],
+            )
+            .map_err(map_db("install snapshot: row"))?;
+        }
+        tx.execute(
+            "INSERT INTO region_fetched (region_id, seq, manifest_hash, entries, fetched_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(region_id) DO UPDATE SET
+               seq = excluded.seq, manifest_hash = excluded.manifest_hash,
+               entries = excluded.entries, fetched_at = excluded.fetched_at,
+               source = excluded.source",
+            params![region, seq as i64, hash, rows.len() as i64, now, source],
+        )
+        .map_err(map_db("install snapshot: record"))?;
+        tx.commit().map_err(map_db("install snapshot"))?;
+        Ok(rows.len())
+    }
+
+    /// D129 — every catalogue region as this box sees it: the head the log
+    /// attests, what this box holds of it (its own live rows, or a fetched
+    /// snapshot), and whether that is behind. `stale` means the log attests
+    /// a newer head than the copy held — a box that is offline publishes
+    /// nothing, so its region is not stale, only old (`fetched_at` says how
+    /// old).
+    pub fn catalogue_status(&self) -> Result<Vec<CatalogueStatus>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.node_id, r.committed_seq, r.committed_head,
+                        f.seq, f.fetched_at, f.source,
+                        (SELECT COUNT(*) FROM region_snapshots s WHERE s.region_id = r.node_id),
+                        (SELECT COUNT(*) FROM region_entries e WHERE e.region_id = r.node_id)
+                   FROM regions r LEFT JOIN region_fetched f ON f.region_id = r.node_id
+                  WHERE r.kind = 'catalogue'
+                  ORDER BY r.node_id",
+            )
+            .map_err(map_db("catalogue status"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let head_seq = r.get::<_, i64>(1)? as u64;
+                let held: Option<i64> = r.get(3)?;
+                let published: i64 = r.get(6)?;
+                let local = published > 0;
+                let held_seq = if local { Some(head_seq) } else { held.map(|v| v as u64) };
+                Ok(CatalogueStatus {
+                    region: r.get(0)?,
+                    head_seq,
+                    head_hash: r.get(2)?,
+                    held_seq,
+                    local,
+                    stale: !local && held_seq.unwrap_or(0) < head_seq,
+                    fetched_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    source: r.get(5)?,
+                    entries: r.get::<_, i64>(7)? as u64,
+                })
+            })
+            .map_err(map_db("catalogue status"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("catalogue status"))
+    }
+
     /// D125 item 4 — publish the region's catalogue as a new snapshot when it
     /// differs from the last one: the manifest file at
     /// `regions/<id>/manifest.<seq>`, a `region_snapshots` row, and — on the
@@ -1307,6 +1523,17 @@ impl Engine {
         let hash = blake3::hash(&bytes).to_hex().to_string();
         let dir = self.data_dir.join("regions").join(region);
         crate::storage::atomic_overwrite(&dir.join(format!("manifest.{seq}")), &bytes)?;
+        // D129 hygiene: a fetch only ever asks for the attested seq, so the
+        // two newest files are all that is ever needed; older ones go.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let name = ent.file_name();
+                let Some(old) = name.to_str().and_then(|n| n.strip_prefix("manifest.")) else { continue };
+                if old.parse::<u64>().is_ok_and(|k| k + 1 < seq) {
+                    let _ = std::fs::remove_file(ent.path());
+                }
+            }
+        }
         // The head is the ONE thing the log learns about a catalogue region.
         // A replica publishes it through its route to the forest owner (item
         // 8) and records the snapshot only once the owner has taken the head:
@@ -1396,7 +1623,40 @@ impl Engine {
         let rows = rows
             .into_iter()
             .filter(|(_, rel, ..)| !rel[prefix.len()..].contains('/') && rel.len() > prefix.len());
-        Ok(Self::merge_rows(rows))
+        let mut out = Self::merge_rows(rows);
+        self.mark_stale(&mut out)?;
+        Ok(out)
+    }
+
+    /// D129 — the catalogue regions whose fetched snapshot the log has since
+    /// superseded (doc 26 §8: "marked stale by its age").
+    fn stale_regions(&self) -> Result<std::collections::HashSet<NodeId>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT f.region_id FROM region_fetched f
+                   JOIN regions r ON r.node_id = f.region_id
+                  WHERE f.seq < r.committed_seq",
+            )
+            .map_err(map_db("stale regions"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_db("stale regions"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(map_db("stale regions"))
+    }
+
+    fn mark_stale(&self, entries: &mut [ViewEntry]) -> Result<()> {
+        let stale = self.stale_regions()?;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        for e in entries.iter_mut() {
+            for c in e.sources.iter_mut() {
+                c.stale = stale.contains(&c.region);
+            }
+        }
+        Ok(())
     }
 
     /// D126 — every conflicting path in every catalogue region this box
@@ -1567,7 +1827,9 @@ impl Engine {
             .map_err(map_db("view conflicts"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("view conflicts"))?;
-        Ok(Self::merge_rows(rows))
+        let mut out = Self::merge_rows(rows);
+        self.mark_stale(&mut out)?;
+        Ok(out)
     }
 
     /// The admission rule (doc 26 §6), over rows sorted by path then region.
@@ -1592,6 +1854,7 @@ impl Engine {
                     mtime_ms: *mtime,
                     content_hash: hash.clone(),
                     quality: q.clone(),
+                    stale: false, // stamped by the callers from region_fetched
                 })
                 .collect();
             let quality = group.iter().find_map(|(.., q)| q.clone());

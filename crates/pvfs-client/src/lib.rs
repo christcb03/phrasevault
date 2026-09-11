@@ -330,6 +330,34 @@ impl Client {
     /// One batch of raw signed log rows from `from_seq` (F2). Returns
     /// `(tip_seq, events)`; keep calling from `last.seq + 1` until caught up.
     /// Gated like [`log_info`](Self::log_info).
+    /// D129 (doc 26 phase 5): a catalogue region's manifest at `seq`, whole —
+    /// paged from the server until `total` bytes are in hand. A box that has
+    /// no such file answers `region_not_held` (try the next box). The caller
+    /// verifies the bytes against the attested head before installing them.
+    pub fn region_manifest(&mut self, region: &str, seq: u64) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let (total, page) = match self.request(ClientMsg::RegionManifest {
+                region: region.into(),
+                seq,
+                offset: out.len() as u64,
+                max: 0,
+            })? {
+                ServerMsg::RegionManifest { total, bytes } => (total, bytes),
+                other => return Err(unexpected("RegionManifest", &other)),
+            };
+            let page = hex::decode(&page).map_err(|_| ClientError::Protocol("manifest page not hex".into()))?;
+            if page.is_empty() && (out.len() as u64) < total {
+                return Err(ClientError::Protocol("empty manifest page before the end".into()));
+            }
+            out.extend_from_slice(&page);
+            if out.len() as u64 >= total {
+                out.truncate(total as usize);
+                return Ok(out);
+            }
+        }
+    }
+
     pub fn log_read(
         &mut self,
         from_seq: u64,
