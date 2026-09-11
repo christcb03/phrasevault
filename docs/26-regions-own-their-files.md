@@ -346,7 +346,18 @@ The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.
 
-**Phase 7 — monitoring.** Conflicts and capacity into D83, and in band.
+**Phase 7 — monitoring. BUILT (PVOS D131), as D83's first piece.** In band
+already since D127/D129 (`conflicts`, `stale` in `serve status`); D131 adds
+the store's capacity there and the OBSERVER: a `health` serve job (owner,
+120 s) probes every announced peer — `info` + `serve status` over the
+member-gated dial — and keeps `<data>/fleet-health.json`; `pvfs fleet
+health [--now]` shows each box up, or DOWN with when it stopped answering
+(two consecutive misses, dated from the first, so a restart is not an
+outage), its jobs' errors and stalls, conflicts, stale catalogues, free
+space. Read-only, no new authority. Notification and remote restart (D83
+§4.2–4.3) are not built — they are decisions, not code. The original spec
+follows.
+Conflicts and capacity into D83, and in band.
 
 **Phase 8 — migration.** The planned re-genesis (doc 25) becomes THIS: a fresh
 start on the new model rather than a fresh start on the old one. The rehearsal
