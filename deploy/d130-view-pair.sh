@@ -195,11 +195,14 @@ has "$E_OUT" E5=ok && ok "z.mkv (added later on the edge) reads through too" || 
 gate mount
 
 say "F: the edge goes down — the fetched copy still reads, an unfetched one fails within the bound, ls stays instant"
-ssh "$EDGE" "bash -s" <<EOS
+STOP=$(ssh "$EDGE" "bash -s" <<EOS
 $RH
-stopd "\$FT/d130-replica.pid"
+stopd "\$FT/d130-edge.pid"
+pgrep -f "pvfsd --mount \$R" >/dev/null && echo EDGE_STILL_UP || echo EDGE_DOWN
 EOS
-ok "edge daemon stopped"
+)
+has "$STOP" EDGE_DOWN && ok "edge daemon stopped (verified: no pvfsd on its replica)" || fail "edge daemon still up: $STOP"
+gate edge-down
 F_OUT=$(ssh "$OWNER" "bash -s" <<EOS
 $RH
 V=\$FT/d130-view
