@@ -78,6 +78,15 @@ pub fn receive_pass_on(
             report.cancelled = true;
             break;
         }
+        // Already placed by an earlier pass (or the job, racing a one-shot)
+        // and not yet catalogued by this box's watch: the plan still names
+        // it, and the right move is to wait, not to pull it again or call
+        // it a failure.
+        let dest = it.dest_root.join(&it.rel_path);
+        if !it.replaces && dest.is_file() && sync::sidecar_whole_hash(&dest, it.size_bytes).as_deref() == Some(it.hash.as_str()) {
+            report.reported.push((it.rel_path.clone(), "already placed here, awaiting the watch".into()));
+            continue;
+        }
         let free = pvfs_core::ingest::free_space_at(&it.dest_root).unwrap_or(0);
         if free < it.size_bytes.saturating_add(min_free) {
             report.skipped_no_space.push(it.rel_path.clone());
