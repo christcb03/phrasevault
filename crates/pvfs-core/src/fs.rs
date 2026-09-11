@@ -368,6 +368,31 @@ pub struct LocalBytes {
     pub region: NodeId,
 }
 
+/// D133 — one file the receiving side will pull (doc 26 §7.3): the copy the
+/// view describes, and where on this box it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveItem {
+    pub rel_path: String,
+    pub hash: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    /// The region whose copy is pulled (a draining one).
+    pub from_region: NodeId,
+    /// This box's receiving region that takes it, and its local root.
+    pub dest_region: NodeId,
+    pub dest_root: std::path::PathBuf,
+    /// The library copy already at that path is the ladder's loser and is
+    /// replaced (moved to the destination's trash).
+    pub replaces: bool,
+}
+
+/// D133 — what `receive_plan` would not act on, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveSkip {
+    pub rel_path: String,
+    pub why: String,
+}
+
 /// D129 — one catalogue region as this box sees it (doc 26 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogueStatus {
@@ -1864,6 +1889,122 @@ impl Engine {
     /// two draining copies with no library copy stay (nothing to drain into);
     /// nothing on a library region is ever touched. The region's next scan
     /// drops the row and publishes a new head, and the view resolves itself.
+    /// D133 — this box's receiving regions with their local roots, most free
+    /// bytes first (the destination rule that never fills a disk).
+    pub fn receiving_roots(&self) -> Result<Vec<(NodeId, std::path::PathBuf)>> {
+        let declared = crate::sync::receiving_regions(&self.data_dir)?;
+        let mut out: Vec<(NodeId, std::path::PathBuf, u64)> = Vec::new();
+        for b in self.local_bindings()? {
+            if declared.contains(&b.folder_id) && self.is_catalogue_region(&b.folder_id)? {
+                let root = uri_to_path(&b.source_uri)?;
+                let free = crate::ingest::free_space_at(&root).unwrap_or(0);
+                out.push((b.folder_id.clone(), root, free));
+            }
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(out.into_iter().map(|(r, p, _)| (r, p)).collect())
+    }
+
+    /// D133 — a relative path this box will write under a root: no `..`, no
+    /// empty component, nothing that begins with `.pvfs-` (rows come from
+    /// other boxes' attested manifests; the disk is ours).
+    pub fn safe_rel_path(rel: &str) -> bool {
+        !rel.is_empty()
+            && !rel.starts_with('/')
+            && rel
+                .split('/')
+                .all(|c| !c.is_empty() && c != "." && c != ".." && !c.starts_with(".pvfs-"))
+    }
+
+    /// D133 — the receiving side of doc 26 §7.3, as a plan over the merged
+    /// view: what this box's receiving regions lack and will pull, and what
+    /// they will replace. Nothing is written here.
+    pub fn receive_plan(&self, rules: &crate::media::Rules) -> Result<(Vec<ReceiveItem>, Vec<ReceiveSkip>)> {
+        let dests = self.receiving_roots()?;
+        let mut items = Vec::new();
+        let mut skips = Vec::new();
+        if dests.is_empty() {
+            return Ok((items, skips));
+        }
+        let drains: HashMap<NodeId, bool> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT node_id, drains FROM regions WHERE kind = 'catalogue'")
+                .map_err(map_db("region drains"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
+                .map_err(map_db("region drains"))?;
+            rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+                .map_err(map_db("region drains"))?
+        };
+        let draining = |region: &str| drains.get(region).copied().unwrap_or(false);
+        for entry in self.view_paths()? {
+            if entry.kind == "dir" {
+                continue;
+            }
+            let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
+            if hashed.is_empty() {
+                skips.push(ReceiveSkip { rel_path: entry.rel_path.clone(), why: "no hashed copy yet".into() });
+                continue;
+            }
+            if matches!(entry.state, ViewState::ConflictKind) {
+                skips.push(ReceiveSkip { rel_path: entry.rel_path.clone(), why: "a file against a folder".into() });
+                continue;
+            }
+            let library_has_it = hashed.iter().any(|c| !draining(&c.region));
+            let (from, replaces) = match &entry.state {
+                ViewState::Admitted | ViewState::Unhashed if !library_has_it => {
+                    match Self::served_copy(&entry, rules) {
+                        Some(c) => (c.clone(), false),
+                        None => continue,
+                    }
+                }
+                ViewState::ConflictHashes(_) => {
+                    let Some(winner) = Self::served_copy(&entry, rules) else { continue };
+                    if !draining(&winner.region) {
+                        continue; // the library holds the winner; D127 drains the loser
+                    }
+                    let mine_here = hashed.iter().any(|c| dests.iter().any(|(r, _)| *r == c.region));
+                    if !mine_here && library_has_it {
+                        skips.push(ReceiveSkip {
+                            rel_path: entry.rel_path.clone(),
+                            why: "the losing library copy is on another box".into(),
+                        });
+                        continue;
+                    }
+                    (winner.clone(), mine_here)
+                }
+                _ => continue,
+            };
+            if !Self::safe_rel_path(&entry.rel_path) {
+                skips.push(ReceiveSkip { rel_path: entry.rel_path.clone(), why: "unsafe path".into() });
+                continue;
+            }
+            let (dest_region, dest_root) = if replaces {
+                match hashed
+                    .iter()
+                    .find_map(|c| dests.iter().find(|(r, _)| *r == c.region).cloned())
+                {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                dests[0].clone()
+            };
+            items.push(ReceiveItem {
+                rel_path: entry.rel_path.clone(),
+                hash: from.content_hash.clone().unwrap_or_default(),
+                size_bytes: from.size_bytes,
+                mtime_ms: from.mtime_ms,
+                from_region: from.region.clone(),
+                dest_region,
+                dest_root,
+                replaces,
+            });
+        }
+        Ok((items, skips))
+    }
+
     pub fn resolve_conflicts(
         &mut self,
         rules: &crate::media::Rules,
