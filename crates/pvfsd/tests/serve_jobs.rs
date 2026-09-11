@@ -56,6 +56,9 @@ fn serve_status_reports_config_runner_and_reload() {
     // D127: the status carries the merged view's conflict count (0 here).
     let (_, _, conflicts, stale) = client.serve_status_conflicts().unwrap();
     assert_eq!(stale, 0, "D129: nothing fetched, nothing stale");
+    let full = client.serve_status_full().unwrap();
+    let cap = full.capacity.expect("D131: the store's filesystem is measured");
+    assert!(cap.total_bytes > 0 && cap.free_bytes <= cap.total_bytes, "{cap:?}");
     assert_eq!(conflicts, 0);
     assert_eq!(rows.len(), serve_cfg::JOB_NAMES.len());
     let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();

@@ -104,6 +104,16 @@ pub fn hash_store_path(data_dir: &Path, hash: &str) -> Result<PathBuf> {
     Ok(sync_store_dir(data_dir)?.join("by-hash").join(&hash[..2]).join(hash))
 }
 
+/// D131 — free and total bytes of the filesystem under the sync store (the
+/// library's disk on a holder), or `None` when it cannot be measured.
+pub fn store_capacity(data_dir: &Path) -> Option<(u64, u64)> {
+    let dir = sync_store_dir(data_dir).ok()?;
+    let probe = if dir.exists() { dir } else { data_dir.to_path_buf() };
+    let st = nix::sys::statvfs::statvfs(&probe).ok()?;
+    let frag = st.fragment_size() as u64;
+    Some((st.blocks_available() as u64 * frag, st.blocks() as u64 * frag))
+}
+
 /// D130 — a complete, verified copy of `hash` in the hash store, if any.
 pub fn hash_store_lookup(data_dir: &Path, hash: &str) -> Result<Option<PathBuf>> {
     let p = hash_store_path(data_dir, hash)?;

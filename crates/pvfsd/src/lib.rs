@@ -278,6 +278,13 @@ impl Daemon {
     /// D127 — conflicting paths in the merged view this box holds, for
     /// `serve status`. Best-effort: a lookup error reads as 0, and the CLI
     /// says so itself when asked directly.
+    /// D131: the filesystem under this box's sync store.
+    pub fn store_capacity(&self) -> Option<pvfs_proto::CapacityWire> {
+        pvfs_core::sync::store_capacity(&self.data_dir).map(|(free_bytes, total_bytes)| {
+            pvfs_proto::CapacityWire { free_bytes, total_bytes }
+        })
+    }
+
     /// D129: catalogue regions this box holds a superseded snapshot of.
     pub fn stale_catalogue_count(&self) -> u64 {
         self.engine
@@ -564,12 +571,14 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         jobs: j.snapshot(),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
+                        capacity: daemon.store_capacity(),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
+                        capacity: daemon.store_capacity(),
                     },
                 }
             }

@@ -1318,6 +1318,15 @@ enum FleetCmd {
     /// no SSH, no control host. Answers the question a format flip depends on:
     /// is the fleet uniform yet?
     Versions,
+    /// D131 (doc 26 phase 7; D83): the fleet as this box last observed it —
+    /// every announced peer up or down-since, its jobs' errors and stalls,
+    /// conflicts, stale catalogues, free space. The `health` serve job keeps
+    /// the record; `--now` polls first.
+    Health {
+        /// Poll every peer now, then show
+        #[arg(long)]
+        now: bool,
+    },
     /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
     /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
     /// member's fetcher learns how to reach this holder from the catalog
@@ -6313,6 +6322,82 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
         }
+        Cmd::Fleet(FleetCmd::Health { now }) => {
+            let data_dir = ctx?;
+            let record = if now {
+                let never = std::sync::atomic::AtomicBool::new(false);
+                Some(pvfs_client::health::poll_fleet(&data_dir, &never)?)
+            } else {
+                pvfs_client::health::FleetHealth::load(&data_dir)?
+            };
+            let Some(record) = record else {
+                if json {
+                    println!("null");
+                } else {
+                    println!("no fleet health record yet — enable the `health` serve job on this box, or run `pvfs fleet health --now`");
+                }
+                return Ok(());
+            };
+            if json {
+                println!("{}", serde_json::to_string(&record).unwrap_or_else(|_| "null".into()));
+                return Ok(());
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let age = |ms: u64| -> String {
+                let s = now_ms.saturating_sub(ms) / 1000;
+                if s < 90 { format!("{s}s") } else if s < 5400 { format!("{}m", s / 60) } else if s < 172_800 { format!("{}h", s / 3600) } else { format!("{}d", s / 86400) }
+            };
+            if record.peers.is_empty() {
+                println!("no announced peers (this box is alone, or nobody has run `pvfs fleet announce`)");
+                return Ok(());
+            }
+            println!("fleet as observed from here {} ago:", age(record.polled_at_ms));
+            for (pin, r) in &record.peers {
+                let state = if r.is_down() {
+                    format!("DOWN — not answering since {} ago", age(r.unreachable_since_ms.unwrap_or(r.last_attempt_ms)))
+                } else if r.last.ok() {
+                    "up".to_string()
+                } else if r.last_ok_ms.is_some() {
+                    format!("missed once ({}), not yet called down", r.last.error.as_deref().unwrap_or("no detail"))
+                } else {
+                    "never seen".to_string()
+                };
+                println!(
+                    "  {}  {}  {}  {}",
+                    &pin[..8.min(pin.len())],
+                    r.addr,
+                    r.version.as_deref().unwrap_or("version ?"),
+                    state
+                );
+                if r.last.ok() {
+                    let mut notes: Vec<String> = Vec::new();
+                    for j in &r.last.jobs {
+                        if j.state == "stalled" {
+                            notes.push(format!("{} stalled (for tier/watch check progress by artifact, not this)", j.name));
+                        } else if let Some(e) = &j.last_error {
+                            notes.push(format!("{} error: {e}", j.name));
+                        }
+                    }
+                    if r.last.conflicts > 0 {
+                        notes.push(format!("{} conflicts", r.last.conflicts));
+                    }
+                    if r.last.stale > 0 {
+                        notes.push(format!("{} stale catalogues", r.last.stale));
+                    }
+                    if let Some((free, total)) = r.last.capacity {
+                        notes.push(format!("{} free of {}", fmt_bytes(free), fmt_bytes(total)));
+                    }
+                    if notes.is_empty() {
+                        notes.push("jobs clean".into());
+                    }
+                    println!("            {}", notes.join("; "));
+                }
+            }
+            Ok(())
+        }
         Cmd::Fleet(FleetCmd::Versions) => {
             let engine = Engine::open(&ctx?)?;
             let root = engine.identity.root_node_id.clone();
@@ -8476,7 +8561,8 @@ fn serve_status_print(
         crypto::sign_digest(&key, d).unwrap_or_default()
     })
     .map_err(remote_err)?;
-    let (runner, jobs, conflicts, stale) = client.serve_status_conflicts().map_err(remote_err)?;
+    let st = client.serve_status_full().map_err(remote_err)?;
+    let (runner, jobs, conflicts, stale, capacity) = (st.runner, st.jobs, st.conflicts, st.stale, st.capacity);
     if json {
         let rows: Vec<String> = jobs
             .iter()
@@ -8495,9 +8581,12 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{}}}",
             json_escape(&runner),
-            rows.join(",")
+            rows.join(","),
+            capacity
+                .map(|c| format!("{{\"free_bytes\":{},\"total_bytes\":{}}}", c.free_bytes, c.total_bytes))
+                .unwrap_or_else(|| "null".into()),
         );
     } else {
         println!("runner: {runner}");
@@ -8506,6 +8595,9 @@ fn serve_status_print(
         }
         if stale > 0 {
             println!("stale catalogues: {stale}  (see `pvfs region ls`; D129)");
+        }
+        if let Some(c) = capacity {
+            println!("capacity: {} free of {}  (the sync store's filesystem; D131)", fmt_bytes(c.free_bytes), fmt_bytes(c.total_bytes));
         }
         for j in &jobs {
             let mut line = format!("{:<8} {}", j.name, j.state);
