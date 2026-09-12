@@ -1305,10 +1305,10 @@ enum RegionCmd {
         target: String,
         /// on | off
         state: Option<String>,
-        /// D143: how many files to pull at once (default 2; 1 = one at a time)
+        /// D144: how many files to pull at once (default 2; 1 = one at a time)
         #[arg(long)]
         parallel: Option<u32>,
-        /// D143: how many ranges of one file to keep in flight (default 4; 1 = one at a time)
+        /// D144: how many ranges of one file to keep in flight (default 4; 1 = one at a time)
         #[arg(long)]
         streams: Option<u32>,
     },

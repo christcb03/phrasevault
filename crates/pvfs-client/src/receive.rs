@@ -73,7 +73,7 @@ pub fn receive_pass_on(
         return Ok(report);
     }
     let sources = announced_sources(engine);
-    // D143 — everything that needs the engine is decided here, single-threaded:
+    // D144 — everything that needs the engine is decided here, single-threaded:
     // which items still need pulling, and where a local copy would be. The
     // pulls themselves are network and disk work, and run several at once.
     let mut queue: std::collections::VecDeque<(ReceiveItem, Option<PathBuf>, u32)> = std::collections::VecDeque::new();
@@ -215,7 +215,7 @@ pub fn pull_into_partial(
         }
         file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     }
-    // D143 — the remaining ranges, several in flight at once. Workers fetch
+    // D144 — the remaining ranges, several in flight at once. Workers fetch
     // ranges in index order from a shared counter, each over its own
     // connection; the writer (this thread) appends them IN ORDER, so the
     // partial on disk stays contiguous — which is what makes the resume

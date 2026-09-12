@@ -1,4 +1,4 @@
-//! D143 — the receiving region's parallel setting lives in the placement.
+//! D144 — the receiving region's parallel setting lives in the placement.
 use pvfs_core::sync;
 use pvfs_core::Engine;
 

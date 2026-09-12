@@ -248,7 +248,7 @@ fn over_the_wire_pulls_are_ranged_resumable_cancellable_and_verified() {
     assert!(err.contains("no announced endpoint") || err.contains("not_found") || err.contains("holds"), "{err}");
 }
 
-/// D143 — six files, three workers: every one lands, verified, with its
+/// D144 — six files, three workers: every one lands, verified, with its
 /// sidecar; nothing is pulled twice; and a refused dial leaves no partial.
 #[test]
 fn several_files_pull_at_once() {
