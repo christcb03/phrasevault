@@ -593,6 +593,8 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         // goes to that region's trash; nothing on a library region is touched.
         "health" => std::thread::spawn(move || {
             st.set_state("health", "running");
+            // D142 — the record BEFORE this poll, so what changed can be told.
+            let prev = pvfs_client::health::FleetHealth::load(st.data_dir()).ok().flatten();
             match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
                 Ok(mut rec) => {
                     for (pin, r) in rec.down() {
@@ -618,6 +620,16 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                                 if let Err(e) = rec.save(st.data_dir()) {
                                     eprintln!("pvfsd: supervise: record not saved: {e}");
                                 }
+                            }
+                            // D142 — tell a person, on transitions only; a
+                            // failure to notify never fails the pass.
+                            match pvfs_client::notify::emit(st.data_dir(), prev.as_ref(), &rec, now) {
+                                Ok(sent) => {
+                                    for l in &sent {
+                                        eprintln!("pvfsd: notify: {l}");
+                                    }
+                                }
+                                Err(e) => eprintln!("pvfsd: notify: {e}"),
                             }
                             st.mark_pass("health", None)
                         }

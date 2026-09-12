@@ -1366,6 +1366,23 @@ enum FleetCmd {
         #[arg(long)]
         off: bool,
     },
+    /// D142 — tell a person when the fleet changes: the owner's health job
+    /// POSTs an event to a webhook (Home Assistant, Slack, Discord, ntfy,
+    /// or plain JSON) on transitions only — a peer down, back up, a `start`
+    /// sent, a job's error, and one heartbeat a day. Bare: show or prompt.
+    Notify {
+        /// The webhook URL (prompted at a terminal when omitted)
+        url: Option<String>,
+        /// ha | json | slack | discord | ntfy (default ha)
+        #[arg(long)]
+        format: Option<String>,
+        /// Stop notifying
+        #[arg(long)]
+        off: bool,
+        /// Send a test event now
+        #[arg(long)]
+        test: bool,
+    },
     /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
     /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
     /// member's fetcher learns how to reach this holder from the catalog
@@ -6475,6 +6492,53 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     Ok(())
                 }
             }
+        }
+        Cmd::Fleet(FleetCmd::Notify { url, format, off, test }) => {
+            let data_dir = ctx?;
+            if off {
+                let was = pvfs_client::notify::clear(&data_dir)?;
+                println!("{}", if was { "notifications off" } else { "nothing was configured" });
+                return Ok(());
+            }
+            let current = pvfs_client::notify::load(&data_dir)?;
+            let n = match url {
+                Some(u) => {
+                    let f = format.unwrap_or_else(|| "ha".into());
+                    let n = pvfs_client::notify::set(&data_dir, &u, &f)?;
+                    println!("notify: {} ({})", n.url, n.format);
+                    n
+                }
+                None => match current {
+                    Some(n) if !test => {
+                        if json {
+                            println!("{}", serde_json::json!({"url": n.url, "format": n.format}));
+                        } else {
+                            println!("notify: {} ({}) — `pvfs fleet notify --test` to try it, `--off` to stop", n.url, n.format);
+                        }
+                        return Ok(());
+                    }
+                    Some(n) => n,
+                    None => {
+                        let u = prompt_line("webhook URL", None)?;
+                        let f = match format {
+                            Some(f) => f,
+                            None => prompt_line("format (ha, json, slack, discord, ntfy)", Some("ha"))?,
+                        };
+                        let n = pvfs_client::notify::set(&data_dir, &u, &f)?;
+                        println!("notify: {} ({})", n.url, n.format);
+                        n
+                    }
+                },
+            };
+            if test {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                pvfs_client::notify::send(&n, &pvfs_client::notify::test_event(now))?;
+                println!("test event sent to {}", n.url);
+            }
+            Ok(())
         }
         Cmd::Fleet(FleetCmd::Supervise { pin, ssh, key, off }) => {
             let data_dir = ctx?;
