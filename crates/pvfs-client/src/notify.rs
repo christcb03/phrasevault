@@ -172,7 +172,10 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
 
 /// The daily heartbeat, if it is due.
 pub fn heartbeat(state: &mut State, next: &FleetHealth, now_ms: u64) -> Option<Event> {
-    if now_ms.saturating_sub(state.last_heartbeat_ms) < HEARTBEAT_EVERY_MS {
+    // Never sent one (a fresh configuration): say hello on this poll, so the
+    // person sees the channel work without waiting a day.
+    let due = state.last_heartbeat_ms == 0 || now_ms.saturating_sub(state.last_heartbeat_ms) >= HEARTBEAT_EVERY_MS;
+    if !due {
         return None;
     }
     state.last_heartbeat_ms = now_ms;
