@@ -32,6 +32,7 @@ and the inventory names regions by **label**.
 | The **old** forest's recovery phrase in custody; the new one's will be, the moment `forest init` prints it | rollback needs the old forest openable |
 | The D135 supervisor **rehearsed once on the real QNAP** (stop the daemon by hand; the owner brings it back within five minutes) | the cutover's first NAS restart should not be the first time the channel is used |
 | A window with cloudplow and the arrs quiet | not required — the old forest keeps serving — but arrivals during the window are catalogued by the new forest's first watch pass, not the old one's |
+| The QNAP's clock on NTP — it was **139 s behind** the VMs on 2026-09-11 (D138) | the owner stamps its own health record, so supervision is unaffected; log correlation across boxes and the mtime of received files are not |
 | **Decide the view mount** | doc 25 §7 found PVFS is not in the arrs' read path (mergerfs reads local + rclone). Whether the new forest's view goes into the union is D82's open decision, made separately; nothing here depends on it |
 
 **Nothing here deletes the old forest.** It is a different directory and
@@ -93,7 +94,9 @@ pvfs_mount=/srv/pvfs/media2
 pvfs_listen=0.0.0.0:7431
 pvfs_announce=<owner ip>:7431
 pvfs_unit=pvfsd-media2
-pvfs_serve_jobs=reclaim,health
+# catalogue too (D138): without it the owner's own region ls holds no head
+# and serve status reports every region stale, forever
+pvfs_serve_jobs=reclaim,health,catalogue
 
 [fleet_ingest:vars]
 pvfs_replica=/srv/pvfs/feeder2
@@ -113,8 +116,11 @@ pvfs_mount_view=true
 nas_home=/share/CACHEDEV4_DATA/Data_ext/pvfs2
 pvfs_listen=0.0.0.0:7433
 pvfs_announce=<nas>:7433
-pvfs_serve_jobs=follow,catalogue,receive
+pvfs_serve_jobs=follow,watch,catalogue,receive
 pvfs_supervise=true
+# D138: no local watchdog in the NEW home — the owner supervises it; the old
+# watchdog keeps guarding the old daemon, and the play no longer touches it
+nas_watchdog=false
 # the new model, instead of media_node:
 pvfs_region=library
 library_path=/share/CACHEDEV1_DATA/Data/Media
@@ -165,9 +171,12 @@ hashing at volume means a coverage gap — stop and backfill.
 ansible-playbook -i fleet-prod2.ini fleet.yml --tags nas
 ```
 
-Stop the NAS watchdog before and restart it after, by pid and by the log
-line (fleet README, D101). The play pushes the aarch64 binaries to the
-new `nas_home`, enrols, takes the replica, creates and marks `library`
+**The old daemon and its watchdog are left alone** — since PVOS D138 the
+play kills and restarts only the processes of the `nas_home` it is given
+(as first written it stopped every pvfsd and every watchdog on the box; the
+three-box lab caught it before this phase ever ran). The new home runs
+without a local watchdog (`nas_watchdog=false`): the owner supervises it.
+The play pushes the aarch64 binaries to the new `nas_home`, enrols, takes the replica, creates and marks `library`
 owned by the NAS's key, binds `Data/Media`, declares it receiving, enables
 `follow,catalogue,receive`, starts the daemon on 7433, installs the
 supervise script and the forced-command key, and registers the channel on
@@ -189,9 +198,9 @@ sudo systemctl start pvfsd-media2
 cd $NAS_HOME/replica && pvfs bind "$EXT" /share/CACHEDEV4_DATA/Data_ext/Media --hash-policy on_add
 ```
 
-Both regions are catalogued by the holder's `watch` — which is not in the
-job list above on purpose: **add `watch` to the NAS's `pvfs_serve_jobs`**;
-a box with a region needs it (the D134 lab found exactly this on the owner).
+Both regions are catalogued by the holder's `watch`, which is why it is in
+the job list above (a box with a region needs it — the D134 lab found this
+on the owner, D138 put it in the example).
 
 **Check:** `region ls` on the QNAP: `library` and `library-ext` both
 `local: true`, heads ≥ 1, entries equal to each root's file count;
@@ -207,6 +216,11 @@ conflicts` is empty or names only staging upgrades. Compare the view's
 file count with §2's recorded totals.
 
 ### Phase F — one file through the loop, on the real boxes
+
+Allow for the cadences before judging it: a file lands on the holder
+~6.5 min after it settles in staging (receive 300 s + catalogue 60 s +
+settle 15 s) and leaves staging ~5 min after that (resolve 300 s) — 380 s
+and 687 s measured in the D138 lab for a 3 MB file.
 
 Copy one small file into `/mnt/local/Media/…` on feederbox. Within: a
 settle window + a watch pass (feederbox catalogues it), a minute (the
@@ -267,8 +281,16 @@ after §2's counts have been re-taken and are boring.
 
 ## 9. Rehearsal
 
-Run §4 on the D69 lab VMs first with a subset (`fleet-lab.ini` is already
-on the new model — D134). Then the live fleet over one show's directory,
+**Phases B–D and F ran on the three-box lab on 2026-09-11 (PVOS D138):**
+VMs 300/301 as owner and ingest, the real QNAP as holder in a lab home
+beside the production daemon, main `0abfce1` on all three (the holder's
+first aarch64 run on real QTS), one file through the loop, and the owner
+restarting the killed holder daemon in 2 min 20 s. Two play defects and
+two of the amendments above came out of it. **Still un-rehearsed:** §7 and
+§8 (the switch and the rollback), and a roll of a forest with history —
+the three-box lab is where both go next.
+
+Then run §4 on that lab with a subset before the real boxes. Then the live fleet over one show's directory,
 as doc 25 §11 did, before the whole library. The 2026-09-08 rehearsal's
 numbers (152 GB in 26 s from sidecars) are the expectation for the scan;
 the fetch-and-verify of a 27,000-row manifest is a few megabytes.
@@ -281,5 +303,9 @@ the fetch-and-verify of a 27,000-row manifest is a few megabytes.
    list for the holder; §4 D adds it. The example should carry it once the
    holder has a region.
 3. **Quality re-measurement** on the new model (§3).
-4. **The whole sequence has not run end to end** — this document is a
-   hypothesis until §9 is done, exactly as doc 25 §10 said of itself.
+4. **§7 and §8 have not run anywhere** — the switch and the rollback are
+   the untested half; §4 B–D and F have (§9).
+5. **A drain leaves the sidecar behind** (D138): after `resolve` trashes a
+   losing staging copy its `.<name>.manifest` stays in the staging root, and
+   `.pvfs-trash` lives there too. On feederbox that is one orphan dotfile
+   per moved file. PVFS follow-up: the drain takes the sidecar with the file.
