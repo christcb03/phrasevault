@@ -293,7 +293,7 @@ fn several_files_pull_at_once() {
         dest_root: lib.clone(),
         replaces: false,
     };
-    let dead = vec![ReplicaSource { transport: "tcp".into(), target: "127.0.0.1:9".into(), pin: String::new() }];
+    let dead = vec![ReplicaSource { transport: "tcp".into(), target: "127.0.0.1:9".into(), pin: String::new(), region: String::new() }];
     let r = pull_into_partial(&it, None, &dead, &never, 3);
     assert!(r.is_err(), "{r:?}");
     assert!(!partial_path(&it).exists(), "an empty partial is not left behind");
