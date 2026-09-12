@@ -129,8 +129,11 @@ pvfs_region_receives=true
 ```
 
 `fleet_artifacts` points at a live pipeline slot of the rolled build (slots
-are deleted at merge — set it on the day). The 7431 forward at home (doc 82's
-ingress note) must exist before Phase C, exactly as 7421 does today.
+are deleted at merge — set it on the day). No port forward: feederbox
+reaches the owner over the WireGuard tunnel (`wg0`), any port (D140 checked;
+an earlier draft here asked for a 7431 forward). The owner's forest parent
+(`/srv/pvfs`) is root's on VM 310 — the play now makes the new directory
+with become and writes the phrase to the user's home (PVOS D140).
 
 ### Phase B — the owner
 
@@ -267,7 +270,14 @@ The arrs do not read PVFS (doc 25 §7, re-check on the day). What is left:
 1. Stop the old daemons in roll order — owner (`pvfsd-media`), ingest
    (`pvfsd-replica`), holder (its old start script's daemon, watchdog
    stopped by pid) — and disable the old units. The new ones are already
-   serving on their own ports.
+   serving on their own ports. **Stop cloudplow on feederbox in the same
+   step** (`saltbox_managed_cloudplow.service`, a 50 GB-threshold rclone
+   move that deletes local after transfer): from here the new `receive` is
+   the mover, and two movers on one tree waste the ~8 MB/s WAN (D140 saw
+   the old `tier` and the new `receive` pull the same files side by side).
+   The presentation layer (the arrs' and Plex's union over the rclone mount
+   of the NAS) stays as it is — Chris's call, until the new mover has
+   proved itself.
 2. If the view is to be in the union (D82's decision): mount
    `/mnt/pvfs-view` and add it as a branch; otherwise leave it as it is.
 3. Run the play against the new inventory once more and confirm it changes
@@ -285,7 +295,8 @@ staging region and flows through §4 F on its own.
 ## 8. Rollback
 
 Before §7: nothing to do; the old forest never stopped. After §7: start
-the old units in roll order (owner, ingest, then the holder's old daemon
+the old units in roll order (and re-enable cloudplow if the old mover is
+not to be trusted alone) (owner, ingest, then the holder's old daemon
 and watchdog by its start script — `setsid`, never a bare `&`), restore
 `fleet-prod.ini`, stop the new units and the new holder daemon by pid.
 D139 did exactly this: the old fleet's follow resumed at once and its
@@ -310,8 +321,11 @@ VMs 300/301 as owner and ingest, the real QNAP as holder in a lab home
 beside the production daemon, main `0abfce1` on all three (the holder's
 first aarch64 run on real QTS), one file through the loop, and the owner
 restarting the killed holder daemon in 2 min 20 s. Two play defects and
-two of the amendments above came out of it. **Un-rehearsed:** only the
-real boxes' scale and the WAN — hence "one show first". Then the live fleet over one show's directory,
+two of the amendments above came out of it. **Run for real on 2026-09-12 (PVOS D140)** after a production roll to main
+the same morning: the holder catalogued 27 000 files in one pass from
+sidecars (~35 min); the staging head needed a daemon restart (a routed
+scan write hit a locked index while the catalogue job wrote 30 000 rows —
+PVFS follow-up); receive over the WAN runs at ~8 MB/s. Then the live fleet over one show's directory,
 as doc 25 §11 did, before the whole library. The 2026-09-08 rehearsal's
 numbers (152 GB in 26 s from sidecars) are the expectation for the scan;
 the fetch-and-verify of a 27,000-row manifest is a few megabytes.
