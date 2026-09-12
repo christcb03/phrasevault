@@ -27,6 +27,7 @@ and the inventory names regions by **label**.
 | | why |
 |---|---|
 | Every box on **D135 or later** — the roll of D125–D135 done first, box by box (proto 8 sits inside the compatible window), by the fleet roll runbook | D125 (catalogue regions), D129 (fetching catalogues), D130 (the view mount), D133 (receive), D134 (the play), D135 (the supervisor) are all needed on every box |
+| The play that runs is the one in **local main with PVOS D138 and D139 merged** — `grep -c "this home's only" deploy/ansible/fleet/fleet.yml` ≥ 2 in the checkout you run from | a worktree branched from the pushed main ran the pre-D138 play on 2026-09-11 and took the production holder down; the text is what matters, not the branch |
 | The **aarch64 build** of that same main for the QNAP, tested under qemu (memory: `qnap-arm-build`) | the holder is the box that matters most and the one the pipeline does not build for |
 | Sidecar coverage checked **per root** on both holders' roots (`pvfs sidecar-backfill --dry-run`), ~99% as on 2026-09-08 | the new model's scan hashes what has no sidecar; coverage is the difference between minutes and days |
 | The **old** forest's recovery phrase in custody; the new one's will be, the moment `forest init` prints it | rollback needs the old forest openable |
@@ -207,6 +208,15 @@ on the owner, D138 put it in the example).
 `receives: true` on `library` only. On the owner, `fleet health` lists the
 holder up and supervised.
 
+**The drain of `/mnt/local/Media` begins HERE, not at §7.** The moment the
+holder's `library` head lists a file that staging also holds, feederbox's
+`resolve` moves the staging copy to the 7-day trash (D139 saw 31 copies go
+within ten minutes of Phase D). The arrs keep reading the file through the
+union's rclone branch; the old fleet's watch records the removals; nothing
+is lost — the trash is the rollback for bytes — but expect `/mnt/local`
+to empty while the old fleet is still the live one, and say so before
+running Phase D.
+
 ### Phase E — the fleet fetches, and the view is whole
 
 Within a minute of each head (the `catalogue` job's cadence), every box
@@ -261,10 +271,12 @@ The arrs do not read PVFS (doc 25 §7, re-check on the day). What is left:
 2. If the view is to be in the union (D82's decision): mount
    `/mnt/pvfs-view` and add it as a branch; otherwise leave it as it is.
 3. Run the play against the new inventory once more and confirm it changes
-   nothing but the deliberate always-run steps.
-4. Restart the NAS watchdog for the NEW daemon's start script, or retire it
-   in favour of the supervisor once the supervisor has brought the holder
-   back at least once for real.
+   nothing but the deliberate always-run steps: the binary copies, `serve
+   enable`, the announces, and the NAS binary push with its daemon
+   restart (D139: exactly that list, nothing else).
+4. The NEW home runs without a local watchdog (`nas_watchdog=false`): the
+   owner supervises it, rehearsed in D138 and D139. The OLD home's
+   watchdog was stopped by pid in step 1 with its daemon.
 
 **Anything that arrived during the window** is on feederbox's disk; the new
 forest's watch already catalogues that disk, so it is simply in the
@@ -273,7 +285,11 @@ staging region and flows through §4 F on its own.
 ## 8. Rollback
 
 Before §7: nothing to do; the old forest never stopped. After §7: start
-the old units in roll order, restore `fleet-prod.ini`, stop the new units.
+the old units in roll order (owner, ingest, then the holder's old daemon
+and watchdog by its start script — `setsid`, never a bare `&`), restore
+`fleet-prod.ini`, stop the new units and the new holder daemon by pid.
+D139 did exactly this: the old fleet's follow resumed at once and its
+mover carried a new file to the holder; then §7 again.
 Keep the new forest's directories as the evidence. Delete the OLD forest
 only after the new one has run a full week with a cloudplow cycle, a NAS
 reboot (the supervisor's first real `start`), and an arr import — and
@@ -281,16 +297,21 @@ after §2's counts have been re-taken and are boring.
 
 ## 9. Rehearsal
 
-**Phases B–D and F ran on the three-box lab on 2026-09-11 (PVOS D138):**
+**The whole sequence ran on 2026-09-11/12 (PVOS D139):** an old-model
+fleet at D118 with history (151 → 265 events), rolled to main with
+`upgrade.yml` and `fleet.yml --tags nas` (schema 15 → 18 migrated in place
+on all three, wire 4 → 8 additive), the new fleet stood up beside it from a
+second inventory (phases A–F, one file through in ~192 s), §7 the switch,
+§8 the rollback, and the switch again. The play changes it took are in PVOS
+D139 (an ingest without a mount; the NAS watchdog per home, started with
+`setsid`; the ingest's enrol as a read). Earlier, **phases B–D and F on the
+three-box lab (PVOS D138):**
 VMs 300/301 as owner and ingest, the real QNAP as holder in a lab home
 beside the production daemon, main `0abfce1` on all three (the holder's
 first aarch64 run on real QTS), one file through the loop, and the owner
 restarting the killed holder daemon in 2 min 20 s. Two play defects and
-two of the amendments above came out of it. **Still un-rehearsed:** §7 and
-§8 (the switch and the rollback), and a roll of a forest with history —
-the three-box lab is where both go next.
-
-Then run §4 on that lab with a subset before the real boxes. Then the live fleet over one show's directory,
+two of the amendments above came out of it. **Un-rehearsed:** only the
+real boxes' scale and the WAN — hence "one show first". Then the live fleet over one show's directory,
 as doc 25 §11 did, before the whole library. The 2026-09-08 rehearsal's
 numbers (152 GB in 26 s from sidecars) are the expectation for the scan;
 the fetch-and-verify of a 27,000-row manifest is a few megabytes.
@@ -303,8 +324,7 @@ the fetch-and-verify of a 27,000-row manifest is a few megabytes.
    list for the holder; §4 D adds it. The example should carry it once the
    holder has a region.
 3. **Quality re-measurement** on the new model (§3).
-4. **§7 and §8 have not run anywhere** — the switch and the rollback are
-   the untested half; §4 B–D and F have (§9).
+4. ~~§7 and §8 have not run anywhere~~ — rehearsed in D139 (§9).
 5. **A drain leaves the sidecar behind** (D138): after `resolve` trashes a
    losing staging copy its `.<name>.manifest` stays in the staging root, and
    `.pvfs-trash` lives there too. On feederbox that is one orphan dotfile
