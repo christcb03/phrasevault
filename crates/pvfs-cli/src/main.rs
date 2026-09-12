@@ -1382,6 +1382,10 @@ enum FleetCmd {
         /// Send a test event now
         #[arg(long)]
         test: bool,
+        /// Name a box for the messages: host=name (repeatable), e.g.
+        /// --label 192.168.1.237=NAS
+        #[arg(long = "label", value_name = "HOST=NAME")]
+        labels: Vec<String>,
     },
     /// F5.7 (doc 17 §7.8): publish THIS box's dial address into the
     /// forest's endpoint directory (`.fleet/endpoints/<pin>`), so every
@@ -6493,8 +6497,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
             }
         }
-        Cmd::Fleet(FleetCmd::Notify { url, format, off, test }) => {
+        Cmd::Fleet(FleetCmd::Notify { url, format, off, test, labels }) => {
             let data_dir = ctx?;
+            let pairs: Vec<(String, String)> = labels
+                .iter()
+                .map(|l| {
+                    l.split_once('=')
+                        .map(|(h, n)| (h.trim().to_string(), n.trim().to_string()))
+                        .ok_or_else(|| PvfsError::BadInput { field: "label".into(), reason: format!("{l}: expected host=name") })
+                })
+                .collect::<Result<_, _>>()?;
             if off {
                 let was = pvfs_client::notify::clear(&data_dir)?;
                 println!("{}", if was { "notifications off" } else { "nothing was configured" });
@@ -6504,16 +6516,29 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let n = match url {
                 Some(u) => {
                     let f = format.unwrap_or_else(|| "ha".into());
-                    let n = pvfs_client::notify::set(&data_dir, &u, &f)?;
+                    let mut n = pvfs_client::notify::set(&data_dir, &u, &f)?;
+                    if !pairs.is_empty() {
+                        n = pvfs_client::notify::label(&data_dir, &pairs)?;
+                    }
                     println!("notify: {} ({})", n.url, n.format);
                     n
                 }
                 None => match current {
+                    Some(_) if !pairs.is_empty() && !test => {
+                        let n = pvfs_client::notify::label(&data_dir, &pairs)?;
+                        for (h, name) in &n.labels {
+                            println!("{h} = {name}");
+                        }
+                        return Ok(());
+                    }
                     Some(n) if !test => {
                         if json {
-                            println!("{}", serde_json::json!({"url": n.url, "format": n.format}));
+                            println!("{}", serde_json::json!({"url": n.url, "format": n.format, "labels": n.labels}));
                         } else {
                             println!("notify: {} ({}) — `pvfs fleet notify --test` to try it, `--off` to stop", n.url, n.format);
+                            for (h, name) in &n.labels {
+                                println!("  {h} = {name}");
+                            }
                         }
                         return Ok(());
                     }
