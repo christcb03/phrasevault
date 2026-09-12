@@ -213,6 +213,12 @@ pub fn job_errors(state: &mut State, prev: Option<&FleetHealth>, next: &FleetHea
         let p = prev.and_then(|p| p.peers.get(pin));
         for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
             let err = j.last_error.clone().unwrap_or_default();
+            // The stall detector's "overdue … not the same as stuck" is a
+            // notice, not an error (it cries wolf on follow — a long-poll
+            // never completes a pass); nobody can act on it.
+            if err.contains("overdue") {
+                continue;
+            }
             let key = format!("{}/{}", short(pin), j.name);
             let before = p.and_then(|p| p.last.jobs.iter().find(|pj| pj.name == j.name)).and_then(|pj| pj.last_error.clone());
             if before.as_deref() != Some(err.as_str()) {
@@ -288,8 +294,10 @@ fn minutes(ms: u64) -> String {
 pub fn severity(ev: &Event) -> &'static str {
     match ev.event.as_str() {
         "peer_down" => "critical",
-        "supervise" => if ev.detail.as_deref().is_some_and(|d| d.contains("rc 0")) { "warning" } else { "critical" },
+        // a restart that worked needs nobody; one that failed needs a hand
+        "supervise" => if ev.detail.as_deref().is_some_and(|d| d.contains("rc 0")) { "info" } else { "critical" },
         "job_error" => "warning",
+        "heartbeat" => if ev.down > 0 { "warning" } else { "info" },
         _ => "info",
     }
 }
@@ -321,8 +329,11 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
             format!("On {who}, the {job} job reports an error: {err}")
         }
         "heartbeat" => {
-            let peers = ev.detail.as_deref().unwrap_or("");
-            format!("Daily check-in: {} up, {} down. {}", ev.up, ev.down, peers)
+            if ev.down == 0 {
+                format!("All good: {} boxes up, nothing to do.", ev.up)
+            } else {
+                format!("Daily check-in: {} up, {} DOWN — {}", ev.up, ev.down, ev.detail.as_deref().unwrap_or(""))
+            }
         }
         "test" => "PVFS can reach this webhook — notifications are working.".into(),
         other => format!("{other} on {who}"),

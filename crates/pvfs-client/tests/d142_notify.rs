@@ -117,7 +117,19 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     r3.peers.get_mut(&a).unwrap().actions.push(Action { at_ms: 303_000, verb: "start".into(), rc: 0, output: "started 42".into() });
     let sup = &notify::transitions(Some(&r2), &r3, 303_000)[0];
     assert_eq!(notify::summary(&n, sup), "The owner restarted PVFS on the NAS (started 42).");
-    assert_eq!(notify::severity(sup), "warning");
+    assert_eq!(notify::severity(sup), "info", "a restart that worked is news, not a task");
+    let mut st = notify::State::default();
+    let hb = notify::heartbeat(&mut st, &r4, 1_789_000_000_000).unwrap();
+    assert_eq!(notify::summary(&n, &hb), "All good: 1 boxes up, nothing to do.");
+    assert_eq!(notify::severity(&hb), "info");
+    // an "overdue" notice from the stall detector is not an error anyone can act on
+    let mut overdue = up();
+    overdue.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 34 min (interval is 300s) — overdue, which is not the same as stuck".into()) });
+    let mut o1 = r4.clone();
+    o1.observe(&a, "10.0.0.9:7433", None, 401_000, overdue.clone());
+    let mut o2 = o1.clone();
+    o2.observe(&a, "10.0.0.9:7433", None, 402_000, overdue);
+    assert!(notify::job_errors(&mut st, Some(&o1), &o2, 402_000).is_empty(), "overdue is filtered");
     let mut r4 = r3.clone();
     r4.observe(&a, "10.0.0.9:7433", None, 400_000, up());
     let back = &notify::transitions(Some(&r3), &r4, 400_000)[0];
