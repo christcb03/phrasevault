@@ -348,7 +348,12 @@ fn take_writer_lock(data_dir: &Path) -> Option<nix::fcntl::Flock<std::fs::File>>
 
 pub(crate) fn open_connection(data_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(data_dir.join(INDEX_FILE)).map_err(map_db("open index.db"))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
+    // D141 — 15 s, not 5: a job that opened its own Engine in the daemon's
+    // process (catalogue) installs a 30 000-row snapshot in one transaction,
+    // and the daemon's own writer must be able to wait that out rather than
+    // fail a replica's routed write. Jobs sharing the daemon's engine is the
+    // real cure and is queued.
+    conn.busy_timeout(std::time::Duration::from_secs(15))
         .map_err(map_db("busy timeout"))?;
     let log_path = data_dir
         .join(LOG_FILE)

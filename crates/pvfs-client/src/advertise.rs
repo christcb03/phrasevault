@@ -321,6 +321,47 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
 ///
 /// Sniffing the text is not elegant; it is what the wire leaves us. Anything
 /// unrecognised stays `BadInput`, so the default is still "ask a human".
+/// D141 — how many times a routed write waits out a busy owner before the
+/// pass is failed, and the cap on one wait. 100 ms doubling to 4 s, six
+/// retries: ~14 s in total, which covers a 30 000-row catalogue snapshot
+/// being installed on the other side (the case that stalled feederbox's
+/// staging head for 40 minutes on cutover day — PVOS D140 finding 6). The
+/// same shape as the hash write's retry in `pvfs_core::fs`.
+const ROUTED_WRITE_RETRIES: u32 = 6;
+const ROUTED_WRITE_BACKOFF_MAX_MS: u64 = 4_000;
+
+/// Run one routed write, retrying while the owner is merely busy.
+///
+/// A transient failure used to fail the WHOLE pass on the first `SQLITE_BUSY`;
+/// the watcher then came back after 5 s doubling to 300 s — and on an owner
+/// re-installing a large snapshot every minute, every retry met the next one.
+/// Retrying the single write here costs seconds; failing the pass cost the
+/// head. Permanent errors return at once, unchanged.
+pub(crate) fn retry_routed<T, E: std::fmt::Display>(
+    mut call: impl FnMut() -> std::result::Result<T, E>,
+) -> pvfs_core::Result<T> {
+    let mut attempt = 0u32;
+    loop {
+        match call() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let err = scan_remote_err(e);
+                let transient = matches!(err, PvfsError::Busy { .. });
+                if transient && attempt < ROUTED_WRITE_RETRIES {
+                    attempt += 1;
+                    let ms = (100u64 << attempt).min(ROUTED_WRITE_BACKOFF_MAX_MS);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    continue;
+                }
+                return Err(match err {
+                    PvfsError::Busy { op, .. } => PvfsError::Busy { op, retries: attempt },
+                    other => other,
+                });
+            }
+        }
+    }
+}
+
 fn scan_remote_err(e: impl std::fmt::Display) -> PvfsError {
     let msg = e.to_string();
     let low = msg.to_ascii_lowercase();
@@ -379,9 +420,7 @@ impl<'a> RoutedScanWriter<'a> {
 
 impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
     fn add_folder(&mut self, parent: &str, label: &str) -> pvfs_core::Result<String> {
-        self.client
-            .mkdir(parent, label, |d| (self.sign)(d))
-            .map_err(scan_remote_err)
+        retry_routed(|| self.client.mkdir(parent, label, |d| (self.sign)(d)))
     }
 
     fn add_file(
@@ -392,9 +431,9 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
         mime: &str,
         content_hash: &str,
     ) -> pvfs_core::Result<String> {
-        self.client
-            .add_file(parent, label, size, mime, content_hash, |d| (self.sign)(d))
-            .map_err(scan_remote_err)
+        retry_routed(|| {
+            self.client.add_file(parent, label, size, mime, content_hash, |d| (self.sign)(d))
+        })
     }
 
     fn set_content_hash(
@@ -403,40 +442,69 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
         content_hash: &str,
         size: u64,
     ) -> pvfs_core::Result<String> {
-        self.client
-            .set_content_hash(file, content_hash, size, |d| (self.sign)(d))
-            .map_err(scan_remote_err)
+        retry_routed(|| self.client.set_content_hash(file, content_hash, size, |d| (self.sign)(d)))
     }
 
     fn add_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
-        self.client
-            .add_location(file, &uri, |d| (self.sign)(d))
-            .map(|_| ())
-            .map_err(scan_remote_err)
+        retry_routed(|| self.client.add_location(file, &uri, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn remove_link(&mut self, link_id: &str) -> pvfs_core::Result<()> {
         // D105 — routed like every other replica write. The wire op already
         // existed (Op::Unlink), so this needs no protocol change.
-        self.client
-            .unlink(link_id, |d| (self.sign)(d))
-            .map(|_| ())
-            .map_err(scan_remote_err)
+        retry_routed(|| self.client.unlink(link_id, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn remove_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
-        self.client
-            .remove_location(file, &uri, |d| (self.sign)(d))
-            .map(|_| ())
-            .map_err(scan_remote_err)
+        retry_routed(|| self.client.remove_location(file, &uri, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> pvfs_core::Result<()> {
-        self.client
-            .commit_region_head(region, seq, hash, |d| (self.sign)(d))
+        retry_routed(|| self.client.commit_region_head(region, seq, hash, |d| (self.sign)(d)))
             .map(|_| ())
-            .map_err(scan_remote_err)
+    }
+}
+
+#[cfg(test)]
+mod routed_retry_tests {
+    use super::retry_routed;
+    use pvfs_core::PvfsError;
+
+    #[test]
+    fn a_busy_owner_is_waited_out_and_the_count_is_honest() {
+        let mut calls = 0u32;
+        let r: pvfs_core::Result<u8> = retry_routed(|| {
+            calls += 1;
+            if calls < 3 { Err("SQLite is busy/locked during fold event".to_string()) } else { Ok(7) }
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls, 3, "two busy answers, then the write");
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_not_retried() {
+        let mut calls = 0u32;
+        let r: pvfs_core::Result<u8> = retry_routed(|| {
+            calls += 1;
+            Err::<u8, _>("no such node".to_string())
+        });
+        assert!(matches!(r, Err(PvfsError::BadInput { .. })));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn an_owner_busy_for_too_long_fails_with_the_retry_count() {
+        let mut calls = 0u32;
+        let r: pvfs_core::Result<u8> = retry_routed(|| {
+            calls += 1;
+            Err::<u8, _>("database is locked".to_string())
+        });
+        match r {
+            Err(PvfsError::Busy { retries, .. }) => assert_eq!(retries, super::ROUTED_WRITE_RETRIES),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert_eq!(calls, super::ROUTED_WRITE_RETRIES + 1);
     }
 }
