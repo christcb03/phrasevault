@@ -17,6 +17,9 @@ fn parallel_is_stored_per_region_and_defaults_to_four() {
     sync::set_region_receive(e.data_dir(), &r, false).unwrap();
     sync::set_region_receive(e.data_dir(), &r, true).unwrap();
     assert_eq!(sync::region_receive_parallel(e.data_dir(), &r).unwrap(), 1, "off and on keeps it");
+    sync::set_region_receive_streams(e.data_dir(), &r, 6).unwrap();
+    assert_eq!(sync::region_receive_streams(e.data_dir(), &r).unwrap(), 6);
     let text = std::fs::read_to_string(e.data_dir().join("placement")).unwrap();
-    assert!(text.contains(&format!("receive {r} 1")), "{text}");
+    assert!(text.contains(&format!("receive {r} 1 6")), "{text}");
+    assert_eq!(sync::region_receive_parallel(e.data_dir(), &r).unwrap(), 1, "both survive a re-read");
 }

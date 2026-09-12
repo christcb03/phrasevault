@@ -212,7 +212,7 @@ fn over_the_wire_pulls_are_ranged_resumable_cancellable_and_verified() {
 
     // Two ranges for a file just over one chunk; the chunk hashes match.
     let big_item = item("Shows/big.mkv", &h_big, big.len() as u64);
-    let chunks = pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never).unwrap().expect("not cancelled");
+    let chunks = pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never, 3).unwrap().expect("not cancelled");
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0], *blake3::hash(&big[..SWARM_CHUNK as usize]).as_bytes());
     let part = partial_path(&big_item);
@@ -220,31 +220,31 @@ fn over_the_wire_pulls_are_ranged_resumable_cancellable_and_verified() {
 
     // Resume: a partial holding exactly the first chunk is kept, not refetched.
     std::fs::write(&part, &big[..SWARM_CHUNK as usize]).unwrap();
-    let chunks = pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never).unwrap().unwrap();
+    let chunks = pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never, 3).unwrap().unwrap();
     assert_eq!(chunks.len(), 2);
     assert_eq!(std::fs::read(&part).unwrap(), big);
     // A partial that is not chunk-aligned is truncated to the last boundary first.
     std::fs::write(&part, &big[..SWARM_CHUNK as usize + 5]).unwrap();
-    assert!(pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never).unwrap().is_some());
+    assert!(pull_into_partial(&big_item, None, std::slice::from_ref(&src), &never, 3).unwrap().is_some());
     assert_eq!(std::fs::read(&part).unwrap(), big);
     let _ = std::fs::remove_file(&part);
 
     // Cancel: the pass stops between ranges and keeps what landed.
     let stop = AtomicBool::new(true);
-    assert!(pull_into_partial(&big_item, None, std::slice::from_ref(&src), &stop).unwrap().is_none());
+    assert!(pull_into_partial(&big_item, None, std::slice::from_ref(&src), &stop, 3).unwrap().is_none());
 
     // Wrong bytes: the holder's file changed under its row — the served
     // bytes do not hash to the row's hash, so they are refused and dropped.
     let _ = std::fs::remove_file(&part);
     std::fs::write(files.join("Shows/small.mkv"), b"tampered!!!").unwrap();
     let small_item = item("Shows/small.mkv", &h_small, 11);
-    let err = pull_into_partial(&small_item, None, std::slice::from_ref(&src), &never).unwrap_err();
+    let err = pull_into_partial(&small_item, None, std::slice::from_ref(&src), &never, 2).unwrap_err();
     assert!(err.contains("refused"), "{err}");
     assert!(!partial_path(&small_item).exists());
 
     // Nobody holds it: a clear error, and the partial (empty) is left for next time.
     let ghost = item("Shows/ghost.mkv", &"00".repeat(32), 10);
-    let err = pull_into_partial(&ghost, None, std::slice::from_ref(&src), &never).unwrap_err();
+    let err = pull_into_partial(&ghost, None, std::slice::from_ref(&src), &never, 2).unwrap_err();
     assert!(err.contains("no announced endpoint") || err.contains("not_found") || err.contains("holds"), "{err}");
 }
 
@@ -267,6 +267,7 @@ fn several_files_pull_at_once() {
     e.set_region_drain(&rs, true).unwrap();
     sync::set_region_receive(e.data_dir(), &rl, true).unwrap();
     sync::set_region_receive_parallel(e.data_dir(), &rl, 3).unwrap();
+    sync::set_region_receive_streams(e.data_dir(), &rl, 2).unwrap();
     let never = AtomicBool::new(false);
     let rep = receive_pass_on(&e, &Rules::default(), false, 0, &never).unwrap();
     assert_eq!(rep.received.len(), 6, "{rep:?}");
@@ -293,7 +294,7 @@ fn several_files_pull_at_once() {
         replaces: false,
     };
     let dead = vec![ReplicaSource { transport: "tcp".into(), target: "127.0.0.1:9".into(), pin: String::new() }];
-    let r = pull_into_partial(&it, None, &dead, &never);
+    let r = pull_into_partial(&it, None, &dead, &never, 3);
     assert!(r.is_err(), "{r:?}");
     assert!(!partial_path(&it).exists(), "an empty partial is not left behind");
 }

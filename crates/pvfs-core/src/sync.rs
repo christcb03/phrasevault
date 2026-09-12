@@ -749,6 +749,8 @@ pub struct Placement {
     pub receive: Vec<NodeId>,
     /// D143 — how many files a receiving region pulls at once (absent = the default).
     pub receive_parallel: Vec<(NodeId, u32)>,
+    /// D143 — how many ranges of one file are in flight at once (absent = the default).
+    pub receive_streams: Vec<(NodeId, u32)>,
     /// D133 — days a region's `.pvfs-trash` is kept before `resolve` purges
     /// it (doc 26 §7.4's trash-age part). Absent = `TRASH_KEEP_DAYS_DEFAULT`.
     pub retention: Vec<(NodeId, u64)>,
@@ -799,14 +801,16 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
         } else if let Some(id) = line.strip_prefix("central-tree ") {
             out.central_tree.push(id.to_string());
         } else if let Some(rest) = line.strip_prefix("receive ") {
-            // D143 — `receive <region> [parallel]`
-            match rest.split_once(' ') {
-                Some((id, n)) => {
-                    let n = n.trim().parse::<u32>().map_err(|_| bad("placement", &format!("corrupt placement line: {line:?}")))?;
-                    out.receive.push(id.to_string());
-                    out.receive_parallel.push((id.to_string(), n));
-                }
-                None => out.receive.push(rest.to_string()),
+            // D143 — `receive <region> [files [streams]]`
+            let mut parts = rest.split_whitespace();
+            let id = parts.next().unwrap_or_default().to_string();
+            out.receive.push(id.clone());
+            let corrupt = || bad("placement", &format!("corrupt placement line: {line:?}"));
+            if let Some(n) = parts.next() {
+                out.receive_parallel.push((id.clone(), n.parse::<u32>().map_err(|_| corrupt())?));
+            }
+            if let Some(n) = parts.next() {
+                out.receive_streams.push((id, n.parse::<u32>().map_err(|_| corrupt())?));
             }
         } else if let Some(rest) = line.strip_prefix("retention ") {
             match rest.split_once(' ').and_then(|(id, d)| d.parse::<u64>().ok().map(|d| (id, d))) {
@@ -891,9 +895,13 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
         text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
     for r in &p.receive {
-        match p.receive_parallel.iter().find(|(id, _)| id == r) {
-            Some((_, n)) => text.push_str(&format!("receive {r} {n}\n")),
-            None => text.push_str(&format!("receive {r}\n")),
+        let files = p.receive_parallel.iter().find(|(id, _)| id == r).map(|(_, n)| *n);
+        let streams = p.receive_streams.iter().find(|(id, _)| id == r).map(|(_, n)| *n);
+        match (files, streams) {
+            (Some(f), Some(s)) => text.push_str(&format!("receive {r} {f} {s}\n")),
+            (Some(f), None) => text.push_str(&format!("receive {r} {f}\n")),
+            (None, Some(s)) => text.push_str(&format!("receive {r} {RECEIVE_PARALLEL_DEFAULT} {s}\n")),
+            (None, None) => text.push_str(&format!("receive {r}\n")),
         }
     }
     for (r, days) in &p.retention {
@@ -917,10 +925,31 @@ pub fn receiving_regions(data_dir: &Path) -> Result<Vec<NodeId>> {
     Ok(load_placement_full(data_dir)?.receive)
 }
 
-/// D143 — the default number of files a receiving region pulls at once:
-/// what cloudplow's rclone ran with (`transfers: 4`), and what the WAN
-/// gave it ~24 MiB/s against one stream's ~8.
-pub const RECEIVE_PARALLEL_DEFAULT: u32 = 4;
+/// D143 — the defaults: two files at once, four ranges of each in flight.
+/// One WAN stream gave ~8 MB/s; cloudplow's rclone ran four transfers and
+/// its log shows ~24 MiB/s. Ranges within a file are what make ONE 30 GB
+/// movie use the whole link (Chris: "multiplex file parts like the swarm
+/// is supposed to do anyway"); files at once cover the small ones.
+pub const RECEIVE_PARALLEL_DEFAULT: u32 = 2;
+pub const RECEIVE_STREAMS_DEFAULT: u32 = 4;
+
+/// D143 — set how many ranges of one file a receiving region keeps in flight (≥ 1).
+pub fn set_region_receive_streams(data_dir: &Path, id: &NodeId, n: u32) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.receive_streams.retain(|(r, _)| r != id);
+    p.receive_streams.push((id.clone(), n.max(1)));
+    save_placement(data_dir, &p)
+}
+
+/// D143 — how many ranges of one file a receiving region keeps in flight.
+pub fn region_receive_streams(data_dir: &Path, id: &NodeId) -> Result<u32> {
+    Ok(load_placement_full(data_dir)?
+        .receive_streams
+        .iter()
+        .find(|(r, _)| r == id)
+        .map(|(_, n)| *n)
+        .unwrap_or(RECEIVE_STREAMS_DEFAULT))
+}
 
 /// D143 — set how many files a receiving region pulls at once (≥ 1).
 pub fn set_region_receive_parallel(data_dir: &Path, id: &NodeId, n: u32) -> Result<()> {
