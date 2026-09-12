@@ -1443,13 +1443,20 @@ impl Engine {
         let tx = self.conn.transaction().map_err(map_db("install snapshot"))?;
         tx.execute("DELETE FROM region_entries WHERE region_id = ?1", params![region])
             .map_err(map_db("install snapshot: clear"))?;
-        for r in &rows {
-            tx.execute(
-                "INSERT INTO region_entries
-                   (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
-                    content_hash, quality, seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
+        // D141 — one prepared statement for the whole snapshot. Parsing the
+        // INSERT 30 000 times held the owner's index for seconds on every
+        // head bump, and every routed write behind it hit SQLITE_BUSY.
+        {
+            let mut ins = tx
+                .prepare_cached(
+                    "INSERT INTO region_entries
+                       (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
+                        content_hash, quality, seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(map_db("install snapshot: prepare"))?;
+            for r in &rows {
+                ins.execute(params![
                     region,
                     r.rel_path,
                     r.kind,
@@ -1459,9 +1466,9 @@ impl Engine {
                     r.content_hash,
                     r.quality,
                     now
-                ],
-            )
-            .map_err(map_db("install snapshot: row"))?;
+                ])
+                .map_err(map_db("install snapshot: row"))?;
+            }
         }
         tx.execute(
             "INSERT INTO region_fetched (region_id, seq, manifest_hash, entries, fetched_at, source)
