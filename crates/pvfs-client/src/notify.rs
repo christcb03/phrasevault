@@ -50,6 +50,10 @@ impl Notify {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub last_heartbeat_ms: u64,
+    /// Job errors already reported, `pin/job` → the error text, so a
+    /// persisting error is said once and a changed one again.
+    #[serde(default)]
+    pub reported_job_errors: BTreeMap<String, String>,
 }
 
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
@@ -187,17 +191,51 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
             e.detail = Some(format!("{} → rc {}: {}", a.verb, a.rc, a.output.trim()));
             out.push(e);
         }
-        if r.last.reachable {
-            for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
-                let before = p.and_then(|p| p.last.jobs.iter().find(|pj| pj.name == j.name)).and_then(|pj| pj.last_error.clone());
-                if before.is_none() {
-                    let mut e = base("job_error", pin, r);
-                    e.detail = Some(format!("{}: {}", j.name, j.last_error.clone().unwrap_or_default()));
-                    out.push(e);
-                }
+        // Job errors are handled by `job_errors` (they need memory across
+        // polls: a restart's "connection refused" clears itself in a minute
+        // and must not wake anyone).
+    }
+    out
+}
+
+/// A job's error is reported when it has been there for TWO consecutive
+/// polls (four minutes — a daemon restart's transient never lasts that
+/// long), once, and again only if the text changes; the memory clears when
+/// the error does.
+pub fn job_errors(state: &mut State, prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) -> Vec<Event> {
+    let (up, down) = counts(next);
+    let mut out = Vec::new();
+    let mut live: BTreeMap<String, String> = BTreeMap::new();
+    for (pin, r) in &next.peers {
+        if !r.last.reachable {
+            continue;
+        }
+        let p = prev.and_then(|p| p.peers.get(pin));
+        for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
+            let err = j.last_error.clone().unwrap_or_default();
+            let key = format!("{}/{}", short(pin), j.name);
+            let before = p.and_then(|p| p.last.jobs.iter().find(|pj| pj.name == j.name)).and_then(|pj| pj.last_error.clone());
+            if before.as_deref() != Some(err.as_str()) {
+                continue; // first sighting, or a different error: wait one more poll
             }
+            live.insert(key.clone(), err.clone());
+            if state.reported_job_errors.get(&key) == Some(&err) {
+                continue; // already said
+            }
+            out.push(Event {
+                event: "job_error".into(),
+                at_ms: now_ms,
+                peer: Some(short(pin)),
+                addr: Some(r.addr.clone()),
+                since_ms: None,
+                detail: Some(format!("{}: {err}", j.name)),
+                up,
+                down,
+            });
+            state.reported_job_errors.insert(key, err);
         }
     }
+    state.reported_job_errors.retain(|k, _| live.contains_key(k));
     out
 }
 
@@ -362,6 +400,7 @@ pub fn emit(data_dir: &Path, prev: Option<&FleetHealth>, next: &FleetHealth, now
     let Some(n) = load(data_dir)? else { return Ok(Vec::new()) };
     let mut state = load_state(data_dir);
     let mut events = transitions(prev, next, now_ms);
+    events.extend(job_errors(&mut state, prev, next, now_ms));
     if let Some(h) = heartbeat(&mut state, next, now_ms) {
         events.push(h);
     }

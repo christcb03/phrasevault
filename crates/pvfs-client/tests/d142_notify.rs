@@ -63,15 +63,23 @@ fn a_supervise_action_and_a_new_job_error_are_each_said_once() {
 
     let mut with_err = up();
     with_err.jobs.push(JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: Some("boom".into()) });
+    let mut st = notify::State::default();
     let mut r2 = r1.clone();
     r2.observe(&a, "10.0.0.9:7433", None, 4_000, with_err.clone());
-    let ev = notify::transitions(Some(&r1), &r2, 4_000);
-    assert_eq!(ev.len(), 1);
+    assert!(notify::job_errors(&mut st, Some(&r1), &r2, 4_000).is_empty(), "first sighting: a restart's transient, wait");
+    let mut r3 = r2.clone();
+    r3.observe(&a, "10.0.0.9:7433", None, 5_000, with_err.clone());
+    let ev = notify::job_errors(&mut st, Some(&r2), &r3, 5_000);
+    assert_eq!(ev.len(), 1, "the second consecutive poll with the same error says it");
     assert_eq!(ev[0].event, "job_error");
     assert_eq!(ev[0].detail.as_deref(), Some("receive: boom"));
-    let mut r3 = r2.clone();
-    r3.observe(&a, "10.0.0.9:7433", None, 5_000, with_err);
-    assert!(notify::transitions(Some(&r2), &r3, 5_000).is_empty(), "a persisting error is said once");
+    let mut r4 = r3.clone();
+    r4.observe(&a, "10.0.0.9:7433", None, 6_000, with_err);
+    assert!(notify::job_errors(&mut st, Some(&r3), &r4, 6_000).is_empty(), "a persisting error is said once");
+    let mut r5 = r4.clone();
+    r5.observe(&a, "10.0.0.9:7433", None, 7_000, up());
+    assert!(notify::job_errors(&mut st, Some(&r4), &r5, 7_000).is_empty());
+    assert!(st.reported_job_errors.is_empty(), "cleared with the error, so it can be said again later");
 }
 
 #[test]
