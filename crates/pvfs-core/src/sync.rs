@@ -747,6 +747,8 @@ pub struct Placement {
     /// holds (doc 26 §7.3, the library side). Local: only the box that owns
     /// the disk decides where its bytes go.
     pub receive: Vec<NodeId>,
+    /// D143 — how many files a receiving region pulls at once (absent = the default).
+    pub receive_parallel: Vec<(NodeId, u32)>,
     /// D133 — days a region's `.pvfs-trash` is kept before `resolve` purges
     /// it (doc 26 §7.4's trash-age part). Absent = `TRASH_KEEP_DAYS_DEFAULT`.
     pub retention: Vec<(NodeId, u64)>,
@@ -796,8 +798,16 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
             }
         } else if let Some(id) = line.strip_prefix("central-tree ") {
             out.central_tree.push(id.to_string());
-        } else if let Some(id) = line.strip_prefix("receive ") {
-            out.receive.push(id.to_string());
+        } else if let Some(rest) = line.strip_prefix("receive ") {
+            // D143 — `receive <region> [parallel]`
+            match rest.split_once(' ') {
+                Some((id, n)) => {
+                    let n = n.trim().parse::<u32>().map_err(|_| bad("placement", &format!("corrupt placement line: {line:?}")))?;
+                    out.receive.push(id.to_string());
+                    out.receive_parallel.push((id.to_string(), n));
+                }
+                None => out.receive.push(rest.to_string()),
+            }
         } else if let Some(rest) = line.strip_prefix("retention ") {
             match rest.split_once(' ').and_then(|(id, d)| d.parse::<u64>().ok().map(|d| (id, d))) {
                 Some((id, days)) => out.retention.push((id.to_string(), days)),
@@ -881,7 +891,10 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
         text.push_str(&format!("central-keep {r} {}\n", d.display()));
     }
     for r in &p.receive {
-        text.push_str(&format!("receive {r}\n"));
+        match p.receive_parallel.iter().find(|(id, _)| id == r) {
+            Some((_, n)) => text.push_str(&format!("receive {r} {n}\n")),
+            None => text.push_str(&format!("receive {r}\n")),
+        }
     }
     for (r, days) in &p.retention {
         text.push_str(&format!("retention {r} {days}\n"));
@@ -902,6 +915,29 @@ pub fn set_region_receive(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> 
 /// D133 — the regions this box declared receiving.
 pub fn receiving_regions(data_dir: &Path) -> Result<Vec<NodeId>> {
     Ok(load_placement_full(data_dir)?.receive)
+}
+
+/// D143 — the default number of files a receiving region pulls at once:
+/// what cloudplow's rclone ran with (`transfers: 4`), and what the WAN
+/// gave it ~24 MiB/s against one stream's ~8.
+pub const RECEIVE_PARALLEL_DEFAULT: u32 = 4;
+
+/// D143 — set how many files a receiving region pulls at once (≥ 1).
+pub fn set_region_receive_parallel(data_dir: &Path, id: &NodeId, n: u32) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.receive_parallel.retain(|(r, _)| r != id);
+    p.receive_parallel.push((id.clone(), n.max(1)));
+    save_placement(data_dir, &p)
+}
+
+/// D143 — how many files a receiving region pulls at once.
+pub fn region_receive_parallel(data_dir: &Path, id: &NodeId) -> Result<u32> {
+    Ok(load_placement_full(data_dir)?
+        .receive_parallel
+        .iter()
+        .find(|(r, _)| r == id)
+        .map(|(_, n)| *n)
+        .unwrap_or(RECEIVE_PARALLEL_DEFAULT))
 }
 
 /// D133 — set a region's trash retention in days on this box.

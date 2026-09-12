@@ -247,3 +247,53 @@ fn over_the_wire_pulls_are_ranged_resumable_cancellable_and_verified() {
     let err = pull_into_partial(&ghost, None, std::slice::from_ref(&src), &never).unwrap_err();
     assert!(err.contains("no announced endpoint") || err.contains("not_found") || err.contains("holds"), "{err}");
 }
+
+/// D143 — six files, three workers: every one lands, verified, with its
+/// sidecar; nothing is pulled twice; and a refused dial leaves no partial.
+#[test]
+fn several_files_pull_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let lib = tmp.path().join("lib");
+    let files: Vec<(String, Vec<u8>)> = (0..6)
+        .map(|i| (format!("TV/Show/Season 1/ep{i}.mkv"), vec![i as u8 + 1; 300_000 + i * 7_777]))
+        .collect();
+    for (rel, bytes) in &files {
+        write(&staging, rel, bytes);
+    }
+    let (mut e, _mn) = Engine::init(tmp.path().join("forest").as_path()).unwrap();
+    let rs = region(&mut e, "Staging", &staging);
+    let rl = region(&mut e, "Library", &lib);
+    e.set_region_drain(&rs, true).unwrap();
+    sync::set_region_receive(e.data_dir(), &rl, true).unwrap();
+    sync::set_region_receive_parallel(e.data_dir(), &rl, 3).unwrap();
+    let never = AtomicBool::new(false);
+    let rep = receive_pass_on(&e, &Rules::default(), false, 0, &never).unwrap();
+    assert_eq!(rep.received.len(), 6, "{rep:?}");
+    assert!(rep.failed.is_empty() && !rep.cancelled, "{rep:?}");
+    for (rel, bytes) in &files {
+        let got = lib.join(rel);
+        assert_eq!(std::fs::read(&got).unwrap(), *bytes, "{rel}");
+        let h = blake3::hash(bytes).to_hex().to_string();
+        assert_eq!(sync::sidecar_whole_hash(&got, bytes.len() as u64).as_deref(), Some(h.as_str()), "{rel}: sidecar");
+    }
+    assert!(walk(&lib.join(".pvfs-incoming")).is_empty(), "no partials left");
+    let again = receive_pass_on(&e, &Rules::default(), false, 0, &never).unwrap();
+    assert!(again.received.is_empty(), "{again:?}");
+
+    // a source nobody answers: the pull fails and leaves no empty partial behind
+    let it = ReceiveItem {
+        rel_path: "TV/Show/Season 1/ghost.mkv".into(),
+        hash: "cd".repeat(32),
+        size_bytes: 12_345,
+        mtime_ms: 0,
+        from_region: rs.clone(),
+        dest_region: rl.clone(),
+        dest_root: lib.clone(),
+        replaces: false,
+    };
+    let dead = vec![ReplicaSource { transport: "tcp".into(), target: "127.0.0.1:9".into(), pin: String::new() }];
+    let r = pull_into_partial(&it, None, &dead, &never);
+    assert!(r.is_err(), "{r:?}");
+    assert!(!partial_path(&it).exists(), "an empty partial is not left behind");
+}

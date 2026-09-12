@@ -1305,6 +1305,9 @@ enum RegionCmd {
         target: String,
         /// on | off
         state: Option<String>,
+        /// D143: how many files to pull at once (default 4; 1 = one at a time)
+        #[arg(long)]
+        parallel: Option<u32>,
     },
     /// D133: how many days a draining region's trash is kept before
     /// `resolve` purges it (default 7). Local to this box. Prompts when
@@ -6277,7 +6280,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     engine.close()
                 }
-                RegionCmd::Receive { target, state } => {
+                RegionCmd::Receive { target, state, parallel } => {
                     let (engine, id) = engine_and_node(ctx, &target)?;
                     if !engine.is_catalogue_region(&id)? {
                         return Err(PvfsError::BadInput {
@@ -6303,6 +6306,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         }
                     };
                     pvfs_core::sync::set_region_receive(engine.data_dir(), &id, on)?;
+                    if let Some(n) = parallel {
+                        pvfs_core::sync::set_region_receive_parallel(engine.data_dir(), &id, n)?;
+                        println!("pulling {} file(s) at once", n.max(1));
+                    }
                     if json {
                         println!("{{\"region\":\"{id}\",\"receives\":{on}}}");
                     } else {

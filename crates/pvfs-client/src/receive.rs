@@ -73,11 +73,12 @@ pub fn receive_pass_on(
         return Ok(report);
     }
     let sources = announced_sources(engine);
+    // D143 — everything that needs the engine is decided here, single-threaded:
+    // which items still need pulling, and where a local copy would be. The
+    // pulls themselves are network and disk work, and run several at once.
+    let mut queue: std::collections::VecDeque<(ReceiveItem, Option<PathBuf>)> = std::collections::VecDeque::new();
+    let mut parallel = 1u32;
     for it in items {
-        if cancel.load(Ordering::SeqCst) {
-            report.cancelled = true;
-            break;
-        }
         // Already placed by an earlier pass (or the job, racing a one-shot)
         // and not yet catalogued by this box's watch: the plan still names
         // it, and the right move is to wait, not to pull it again or call
@@ -100,23 +101,43 @@ pub fn receive_pass_on(
             .flatten()
             .filter(|lb| lb.size == it.size_bytes)
             .map(|lb| lb.path);
-        match pull_into_partial(&it, local.as_deref(), &sources, cancel) {
-            Ok(Some(chunks)) => match place(&it, &chunks) {
-                Ok(()) => {
-                    report.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
-                    if it.replaces {
-                        report.replaced.push(it.rel_path.clone());
-                    }
-                }
-                Err(e) => report.failed.push((it.rel_path.clone(), e)),
-            },
-            Ok(None) => {
-                report.cancelled = true;
-                break;
-            }
-            Err(e) => report.failed.push((it.rel_path.clone(), e)),
-        }
+        parallel = parallel.max(sync::region_receive_parallel(engine.data_dir(), &it.dest_region).unwrap_or(1));
+        queue.push_back((it, local));
     }
+    if queue.is_empty() {
+        return Ok(report);
+    }
+    let workers = (parallel.max(1) as usize).min(queue.len());
+    let queue = std::sync::Mutex::new(queue);
+    let out = std::sync::Mutex::new(&mut report);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                if cancel.load(Ordering::SeqCst) {
+                    out.lock().unwrap().cancelled = true;
+                    break;
+                }
+                let Some((it, local)) = queue.lock().unwrap().pop_front() else { break };
+                match pull_into_partial(&it, local.as_deref(), &sources, cancel) {
+                    Ok(Some(chunks)) => match place(&it, &chunks) {
+                        Ok(()) => {
+                            let mut r = out.lock().unwrap();
+                            r.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
+                            if it.replaces {
+                                r.replaced.push(it.rel_path.clone());
+                            }
+                        }
+                        Err(e) => out.lock().unwrap().failed.push((it.rel_path.clone(), e)),
+                    },
+                    Ok(None) => {
+                        out.lock().unwrap().cancelled = true;
+                        break;
+                    }
+                    Err(e) => out.lock().unwrap().failed.push((it.rel_path.clone(), e)),
+                }
+            });
+        }
+    });
     Ok(report)
 }
 
@@ -233,7 +254,14 @@ pub fn pull_into_partial(
         }
     }
     if off < it.size_bytes {
-        return Err(last); // the partial stays for the next pass
+        // The partial stays for the next pass — unless nothing ever landed in
+        // it: an empty file left by a refused dial is only confusing (D142,
+        // "why so many parts with 0 size").
+        if off == 0 {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+        }
+        return Err(last);
     }
     drop(file);
     let got = whole.finalize().to_hex().to_string();
