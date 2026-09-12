@@ -52,6 +52,7 @@ pub mod catalogue;
 pub mod fetch;
 pub mod follow;
 pub mod health;
+pub mod notify;
 pub mod receive;
 pub mod supervise;
 pub mod regions;
