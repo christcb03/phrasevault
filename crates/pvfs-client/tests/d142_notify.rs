@@ -119,13 +119,13 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     assert_eq!(notify::summary(&n, sup), "The owner restarted PVFS on the NAS (started 42).");
     assert_eq!(notify::severity(sup), "info", "a restart that worked is news, not a task");
     let mut st = notify::State::default();
-    let hb = notify::heartbeat(&mut st, &r4, 1_789_000_000_000).unwrap();
+    let hb = notify::heartbeat(&mut st, &r0, 1_789_000_000_000).unwrap();
     assert_eq!(notify::summary(&n, &hb), "All good: 1 boxes up, nothing to do.");
     assert_eq!(notify::severity(&hb), "info");
     // an "overdue" notice from the stall detector is not an error anyone can act on
     let mut overdue = up();
     overdue.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 34 min (interval is 300s) — overdue, which is not the same as stuck".into()) });
-    let mut o1 = r4.clone();
+    let mut o1 = r0.clone();
     o1.observe(&a, "10.0.0.9:7433", None, 401_000, overdue.clone());
     let mut o2 = o1.clone();
     o2.observe(&a, "10.0.0.9:7433", None, 402_000, overdue);

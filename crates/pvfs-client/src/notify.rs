@@ -292,12 +292,14 @@ fn minutes(ms: u64) -> String {
 
 /// `critical` wakes a person, `warning` is worth a look, `info` is news.
 pub fn severity(ev: &Event) -> &'static str {
+    let restart_worked = ev.detail.as_deref().is_some_and(|d| d.contains("rc 0"));
     match ev.event.as_str() {
         "peer_down" => "critical",
         // a restart that worked needs nobody; one that failed needs a hand
-        "supervise" => if ev.detail.as_deref().is_some_and(|d| d.contains("rc 0")) { "info" } else { "critical" },
+        "supervise" if restart_worked => "info",
+        "supervise" => "critical",
         "job_error" => "warning",
-        "heartbeat" => if ev.down > 0 { "warning" } else { "info" },
+        "heartbeat" if ev.down > 0 => "warning",
         _ => "info",
     }
 }
