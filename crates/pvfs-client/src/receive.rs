@@ -73,11 +73,12 @@ pub fn receive_pass_on(
         return Ok(report);
     }
     let sources = announced_sources(engine);
+    // D144 — everything that needs the engine is decided here, single-threaded:
+    // which items still need pulling, and where a local copy would be. The
+    // pulls themselves are network and disk work, and run several at once.
+    let mut queue: std::collections::VecDeque<(ReceiveItem, Option<PathBuf>, u32)> = std::collections::VecDeque::new();
+    let mut parallel = 1u32;
     for it in items {
-        if cancel.load(Ordering::SeqCst) {
-            report.cancelled = true;
-            break;
-        }
         // Already placed by an earlier pass (or the job, racing a one-shot)
         // and not yet catalogued by this box's watch: the plan still names
         // it, and the right move is to wait, not to pull it again or call
@@ -100,23 +101,44 @@ pub fn receive_pass_on(
             .flatten()
             .filter(|lb| lb.size == it.size_bytes)
             .map(|lb| lb.path);
-        match pull_into_partial(&it, local.as_deref(), &sources, cancel) {
-            Ok(Some(chunks)) => match place(&it, &chunks) {
-                Ok(()) => {
-                    report.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
-                    if it.replaces {
-                        report.replaced.push(it.rel_path.clone());
-                    }
-                }
-                Err(e) => report.failed.push((it.rel_path.clone(), e)),
-            },
-            Ok(None) => {
-                report.cancelled = true;
-                break;
-            }
-            Err(e) => report.failed.push((it.rel_path.clone(), e)),
-        }
+        parallel = parallel.max(sync::region_receive_parallel(engine.data_dir(), &it.dest_region).unwrap_or(1));
+        let streams = sync::region_receive_streams(engine.data_dir(), &it.dest_region).unwrap_or(1);
+        queue.push_back((it, local, streams));
     }
+    if queue.is_empty() {
+        return Ok(report);
+    }
+    let workers = (parallel.max(1) as usize).min(queue.len());
+    let queue = std::sync::Mutex::new(queue);
+    let out = std::sync::Mutex::new(&mut report);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                if cancel.load(Ordering::SeqCst) {
+                    out.lock().unwrap().cancelled = true;
+                    break;
+                }
+                let Some((it, local, streams)) = queue.lock().unwrap().pop_front() else { break };
+                match pull_into_partial(&it, local.as_deref(), &sources, cancel, streams) {
+                    Ok(Some(chunks)) => match place(&it, &chunks) {
+                        Ok(()) => {
+                            let mut r = out.lock().unwrap();
+                            r.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
+                            if it.replaces {
+                                r.replaced.push(it.rel_path.clone());
+                            }
+                        }
+                        Err(e) => out.lock().unwrap().failed.push((it.rel_path.clone(), e)),
+                    },
+                    Ok(None) => {
+                        out.lock().unwrap().cancelled = true;
+                        break;
+                    }
+                    Err(e) => out.lock().unwrap().failed.push((it.rel_path.clone(), e)),
+                }
+            });
+        }
+    });
     Ok(report)
 }
 
@@ -153,6 +175,7 @@ pub fn pull_into_partial(
     local: Option<&Path>,
     sources: &[ReplicaSource],
     cancel: &AtomicBool,
+    streams: u32,
 ) -> Result<Option<Vec<[u8; 32]>>, String> {
     let part = partial_path(it);
     std::fs::create_dir_all(part.parent().unwrap()).map_err(|e| format!("incoming dir: {e}"))?;
@@ -192,48 +215,116 @@ pub fn pull_into_partial(
         }
         file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     }
+    // D144 — the remaining ranges, several in flight at once. Workers fetch
+    // ranges in index order from a shared counter, each over its own
+    // connection; the writer (this thread) appends them IN ORDER, so the
+    // partial on disk stays contiguous — which is what makes the resume
+    // above, the incremental hash and "cancel between ranges" all still
+    // true. Memory is bounded by the channel: a worker that is ahead waits.
+    let total_chunks = it.size_bytes.div_ceil(SWARM_CHUNK);
+    let first = have / SWARM_CHUNK;
     let mut off = have;
     let mut last = String::from("no announced endpoint holds these bytes");
-    'sources: for src in sources {
-        if off >= it.size_bytes {
-            break;
-        }
-        let mut client = match crate::follow::dial_source(src) {
-            Ok(c) => c,
-            Err(e) => {
-                last = format!("{}: {e}", src.target);
-                continue;
+    if first < total_chunks {
+        let workers = (streams.max(1) as usize).min((total_chunks - first) as usize);
+        let next = std::sync::atomic::AtomicU64::new(first);
+        let failed = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Result<Vec<u8>, String>)>(workers * 2);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let next = &next;
+                let failed = &failed;
+                s.spawn(move || {
+                    let mut client: Option<crate::Client> = None;
+                    loop {
+                        if cancel.load(Ordering::SeqCst) || failed.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        if i >= total_chunks {
+                            break;
+                        }
+                        let off = i * SWARM_CHUNK;
+                        let len = (it.size_bytes - off).min(SWARM_CHUNK);
+                        let mut got: Result<Vec<u8>, String> = Err("no announced endpoint holds these bytes".into());
+                        'sources: for src in sources {
+                            if client.is_none() {
+                                match crate::follow::dial_source(src) {
+                                    Ok(c) => client = Some(c),
+                                    Err(e) => {
+                                        got = Err(format!("{}: {e}", src.target));
+                                        continue 'sources;
+                                    }
+                                }
+                            }
+                            let c = client.as_mut().expect("dialed");
+                            let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+                            match c.cat_hash_range(&it.hash, off, len, &mut buf) {
+                                Ok(n) if n == len && buf.len() as u64 == len => {
+                                    got = Ok(buf);
+                                    break 'sources;
+                                }
+                                Ok(n) => got = Err(format!("{}: short range, {n} of {len} bytes at {off}", src.target)),
+                                Err(crate::ClientError::Server { code, .. }) if code == "not_found" => {
+                                    got = Err(format!("{}: not_found", src.target))
+                                }
+                                Err(e) => got = Err(format!("{}: {e}", src.target)),
+                            }
+                            client = None; // this source did not serve it; the next one gets a fresh dial
+                        }
+                        let bad = got.is_err();
+                        if bad {
+                            failed.store(true, Ordering::SeqCst);
+                        }
+                        if tx.send((i, got)).is_err() || bad {
+                            break;
+                        }
+                    }
+                });
             }
-        };
-        while off < it.size_bytes {
-            if cancel.load(Ordering::SeqCst) {
-                return Ok(None);
-            }
-            let len = (it.size_bytes - off).min(SWARM_CHUNK);
-            let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
-            match client.cat_hash_range(&it.hash, off, len, &mut buf) {
-                Ok(n) if n == len && buf.len() as u64 == len => {
-                    file.write_all(&buf).map_err(|e| format!("write partial: {e}"))?;
+            drop(tx);
+            // The writer: whatever arrives, appended only when it is next.
+            let mut pending: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+            let mut want = first;
+            let mut write_err: Option<String> = None;
+            for (i, res) in rx {
+                match res {
+                    Ok(buf) => {
+                        pending.insert(i, buf);
+                    }
+                    Err(e) => last = e,
+                }
+                while write_err.is_none() {
+                    let Some(buf) = pending.remove(&want) else { break };
+                    if let Err(e) = file.write_all(&buf) {
+                        write_err = Some(format!("write partial: {e}"));
+                        failed.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     whole.update(&buf);
                     chunks.push(*blake3::hash(&buf).as_bytes());
-                    off += len;
-                }
-                Ok(n) => {
-                    last = format!("{}: short range, {n} of {len} bytes at {off}", src.target);
-                    continue 'sources;
-                }
-                Err(crate::ClientError::Server { code, .. }) if code == "not_found" => {
-                    continue 'sources;
-                }
-                Err(e) => {
-                    last = format!("{}: {e}", src.target);
-                    continue 'sources;
+                    off += buf.len() as u64;
+                    want += 1;
                 }
             }
+            if let Some(e) = write_err {
+                last = e;
+            }
+        });
+        if cancel.load(Ordering::SeqCst) && off < it.size_bytes {
+            return Ok(None);
         }
     }
     if off < it.size_bytes {
-        return Err(last); // the partial stays for the next pass
+        // The partial stays for the next pass — unless nothing ever landed in
+        // it: an empty file left by a refused dial is only confusing (D142,
+        // "why so many parts with 0 size").
+        if off == 0 {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+        }
+        return Err(last);
     }
     drop(file);
     let got = whole.finalize().to_hex().to_string();
