@@ -601,6 +601,38 @@ pub fn move_to_trash(root: &Path, file: &Path) -> Result<PathBuf> {
     }
 }
 
+/// D145 — [`move_to_trash`] for a file and its sidecar together, so a drain
+/// leaves nothing of the file behind (doc 29 §10.5: one orphan `.manifest`
+/// per moved file on feederbox). The sidecar is best-effort — derived data;
+/// the file in the trash is the part that matters.
+pub fn move_to_trash_with_sidecar(root: &Path, file: &Path) -> Result<PathBuf> {
+    let dest = move_to_trash(root, file)?;
+    for side in [manifest_sidecar_path(file), legacy_manifest_sidecar_path(file)] {
+        if side.is_file() {
+            let _ = move_to_trash(root, &side);
+        }
+    }
+    Ok(dest)
+}
+
+/// D145 — the last `SWARM_CHUNK`-aligned range of a file and its blake3, as
+/// `(offset, len, hash)`: what a drain compares with the holder's copy before
+/// letting its own go. At most 8 MiB, and it is the part a truncated or
+/// replaced file gets wrong. An error when the file is not `size` bytes.
+pub fn tail_chunk(path: &Path, size: u64) -> std::io::Result<(u64, u64, [u8; 32])> {
+    use std::io::{Read, Seek, SeekFrom};
+    let off = if size == 0 { 0 } else { ((size - 1) / SWARM_CHUNK) * SWARM_CHUNK };
+    let len = size - off;
+    let mut f = std::fs::File::open(path)?;
+    if f.metadata()?.len() != size {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "size differs from the row"));
+    }
+    f.seek(SeekFrom::Start(off))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf)?;
+    Ok((off, len, *blake3::hash(&buf).as_bytes()))
+}
+
 #[derive(Debug, Default)]
 pub struct TrashPurge {
     pub removed: u64,

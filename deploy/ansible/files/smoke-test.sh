@@ -1018,25 +1018,38 @@ import json,sys
 c=json.load(sys.stdin); assert [e["path"] for e in c]==["c.mkv"], c
 ' && ok "view conflicts names the one conflicting path" || fail "view conflicts"
 
-say "D127: resolution — a draining region's losing copy drains away (doc 26 phase 4)"
+say "D127/D145: resolution — a staging copy drains only against the library's own bytes (doc 26 §7.3)"
 $PVFS --json region drain "$CAT2" on | qgrep '"drains":true' && ok "region drain on" || fail "region drain on"
 $PVFS --json region ls | qgrep "\"region\":\"$CAT2\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\",\"drains\":true" \
   && ok "region ls shows the flag" || fail "region ls drains"
-# Make the LIBRARY copy of c.mkv the ladder's winner (much larger, newer), so
-# the draining region's copy is the loser.
+# Make the LIBRARY copy of c.mkv much larger and newer. Before D145 the ladder
+# picked it and the staging copy was trashed — how an arr's smaller upgrade was
+# lost on 2026-09-12. Now a disagreement keeps the staging copy; only sub/b.mkv,
+# whose bytes the library already holds, is redundant.
 head -c 20000 /dev/zero | tr '\0' 'x' > "$CATLIB/c.mkv"; $PVFS scan "$CAT" >/dev/null
-# Two things drain from catlib2: c.mkv (the ladder's loser) and sub/b.mkv,
-# whose bytes the library already holds (redundant).
+SIDE_B=""; [ -f "$CATLIB2/sub/.b.mkv.manifest" ] && SIDE_B=1
 $PVFS --json view resolve --dry-run | python3 -c '
 import json,sys
-r=json.load(sys.stdin); assert r["dry_run"] and sorted(t["path"] for t in r["trashed"])==["c.mkv","sub/b.mkv"], r
-' && ok "dry run names the losing copy and the redundant one" || fail "resolve dry run"
+r=json.load(sys.stdin)
+assert r["dry_run"] and [t["path"] for t in r["trashed"]]==["sub/b.mkv"] and r["kept_winners"]==["c.mkv"], r
+assert r["unconfirmed"]==[], r
+' && ok "dry run: the redundant copy would go, the disagreeing one stays" || fail "resolve dry run"
 [ -f "$CATLIB2/c.mkv" ] && [ -f "$CATLIB2/sub/b.mkv" ] && ok "and moved nothing" || fail "dry run moved a file"
-$PVFS view resolve >/dev/null && [ ! -f "$CATLIB2/c.mkv" ] && [ ! -f "$CATLIB2/sub/b.mkv" ] \
-  && ls "$CATLIB2"/.pvfs-trash/*/c.mkv "$CATLIB2"/.pvfs-trash/*/sub/b.mkv >/dev/null 2>&1 \
-  && ok "both went to the draining region's trash" || fail "resolve"
+$PVFS view resolve >/dev/null && [ -f "$CATLIB2/c.mkv" ] && [ ! -f "$CATLIB2/sub/b.mkv" ] \
+  && ls "$CATLIB2"/.pvfs-trash/*/sub/b.mkv >/dev/null 2>&1 \
+  && ok "the redundant copy went to the draining region's trash; the disagreeing one stayed" || fail "resolve"
+if [ -n "$SIDE_B" ]; then
+  [ ! -e "$CATLIB2/sub/.b.mkv.manifest" ] && ls "$CATLIB2"/.pvfs-trash/*/sub/.b.mkv.manifest >/dev/null 2>&1 \
+    && ok "its sidecar went to the trash with it (D145)" || fail "the sidecar stayed in the staging root"
+else
+  ok "no sidecar beside sub/b.mkv to carry (scan wrote none)"
+fi
 [ -f "$CATLIB/c.mkv" ] && [ -f "$CATLIB/sub/b.mkv" ] && ok "the library copies never moved" || fail "library copy moved"
 $PVFS scan "$CAT2" >/dev/null
+$PVFS --json view conflicts | python3 -c 'import json,sys; assert [e["path"] for e in json.load(sys.stdin)]==["c.mkv"]' \
+  && ok "the disagreement stays until the receiving side replaces the library copy" || fail "view conflicts after resolve"
+# Later sections expect the view as it was: the staging c.mkv leaves by hand.
+rm "$CATLIB2/c.mkv"; $PVFS scan "$CAT2" >/dev/null
 $PVFS --json view conflicts | python3 -c 'import json,sys; assert json.load(sys.stdin)==[]' \
   && ok "the view is clean after the region's rescan" || fail "view still conflicted"
 $PVFS --json region ls | qgrep "\"region\":\"$CAT2\",\"marked_at\":[0-9]*,\"kind\":\"catalogue\",\"drains\":true" >/dev/null; $PVFS --json region drain "$CAT2" off | qgrep '"drains":false' && ok "region drain off" || fail "region drain off"
@@ -1101,17 +1114,20 @@ rows={r["region"]:r for r in json.load(sys.stdin)}
 assert rows[sys.argv[1]]["receives"] is True and rows[sys.argv[1]]["retention_days"]==7, rows[sys.argv[1]]
 assert rows[sys.argv[2]]["drains"] is True and rows[sys.argv[2]]["receives"] is False, rows[sys.argv[2]]
 ' "$CAT" "$CAT2" && ok "region ls shows receives + the 7-day default retention" || fail "region ls receive columns"
-printf 'staged-only-bytes' > "$CATLIB2/staged.mkv"; $PVFS scan "$CAT2" >/dev/null
+printf 'staged-only-bytes' > "$CATLIB2/staged.mkv"; mkdir -p "$CATLIB2/also/deeper"; $PVFS scan "$CAT2" >/dev/null
 $PVFS --json view receive --dry-run | python3 -c '
 import json,sys
 r=json.load(sys.stdin); assert r["dry_run"] and [x["path"] for x in r["received"]]==["staged.mkv"], r
-' && ok "dry run names the staging-only file" || fail "view receive dry run"
+assert r["folders"]==["also","also/deeper"], r
+' && ok "dry run names the staging-only file and the folders only staging has" || fail "view receive dry run"
+[ ! -d "$CATLIB/also" ] && ok "and made no folder" || fail "dry run made a folder"
 [ ! -e "$CATLIB/staged.mkv" ] && ok "and placed nothing" || fail "dry run placed a file"
 $PVFS --json view receive | python3 -c '
 import json,sys
 r=json.load(sys.stdin); assert not r["dry_run"] and [x["path"] for x in r["received"]]==["staged.mkv"] and r["failed"]==[], r
 ' && ok "view receive pulled it (this box's own copy, no dial)" || fail "view receive"
 [ "$(cat "$CATLIB/staged.mkv")" = "staged-only-bytes" ] && ok "the bytes landed in the receiving region" || fail "received bytes"
+[ -d "$CATLIB/also/deeper" ] && ok "the folders only staging had were made in the receiving region (D145)" || fail "received folders"
 ls "$CATLIB"/.staged.mkv.manifest >/dev/null 2>&1 && ok "with a sidecar" || fail "no sidecar beside the received file"
 [ ! -d "$CATLIB/.pvfs-incoming" ] || [ -z "$(ls -A "$CATLIB/.pvfs-incoming")" ] && ok "no partial left behind" || fail "partial left in .pvfs-incoming"
 $PVFS scan "$CAT" >/dev/null
@@ -1120,13 +1136,16 @@ import json,sys
 v={e["path"]:e for e in json.load(sys.stdin)}; e=v["staged.mkv"]
 assert e["state"]=="admitted" and e["copies"]==2, e
 ' && ok "the view admits it with two agreeing copies" || fail "view after receive"
-$PVFS --json view receive | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["received"]==[], r' \
+$PVFS --json view receive | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["received"]==[] and r["folders"]==[], r' \
   && ok "a second pass has nothing to do" || fail "second receive pass"
 $PVFS --json view resolve | python3 -c '
 import json,sys
 r=json.load(sys.stdin); assert [t["path"] for t in r["trashed"]]==["staged.mkv"] and r["purged"]==0, r
-' && ok "resolve trashed the staging copy; the 7-day retention kept it" || fail "resolve after receive"
+assert r["folders_removed"]==["also/deeper"] and r["unconfirmed"]==[], r
+' && ok "resolve trashed the staging copy, confirmed against the library's bytes; the 7-day retention kept it" || fail "resolve after receive"
 [ ! -e "$CATLIB2/staged.mkv" ] && ls "$CATLIB2"/.pvfs-trash/*/staged.mkv >/dev/null 2>&1 && ok "it sits in the staging region's trash" || fail "staging copy not in trash"
+[ ! -d "$CATLIB2/also/deeper" ] && [ -d "$CATLIB2/also" ] && [ -d "$CATLIB/also/deeper" ] \
+  && ok "the emptied staging folder the library holds is gone; the top level stays (D145)" || fail "staging folders after resolve"
 $PVFS --json region retention "$CAT2" 0 | qgrep '"retention_days":0' && ok "region retention 0" || fail "region retention"
 $PVFS --json view resolve | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["purged"]>=1, r' \
   && ok "resolve purged the trash past retention" || fail "purge"

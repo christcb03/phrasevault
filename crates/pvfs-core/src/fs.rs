@@ -417,14 +417,39 @@ pub struct CatalogueStatus {
 /// whose copy was trashed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolveReport {
-    /// Losing or redundant copies moved to their draining region's trash.
+    /// Redundant copies moved to their draining region's trash — since D145
+    /// only ever a copy whose exact bytes a library region holds, confirmed.
     pub trashed: Vec<(String, NodeId)>,
-    /// Conflicts where the draining copy WON the ladder: it stays, and the
-    /// library's loser is not this box's to touch.
+    /// Disagreements where this box's draining copy stands. Since D145 it
+    /// always does against a library copy: it is the arr's latest import, and
+    /// the receiving side replaces the library's copy with it.
     pub kept_winners: Vec<String>,
     /// Conflicts nothing here may act on (library only, or a kind clash).
     pub reported: Vec<String>,
+    /// D145 — redundant copies kept because the library's copy could not be
+    /// confirmed now (gone, changed since its scan, or its box unreachable).
+    pub unconfirmed: Vec<String>,
+    /// D145 — this box's emptied staging folders removed because a library
+    /// region holds the same folder (a dry run lists only those already empty).
+    pub folders_removed: Vec<String>,
     pub cancelled: bool,
+}
+
+/// D145 — what a drain asks of the box holding a library copy before it lets
+/// its own copy go: do you hold these bytes, and does their last chunk read
+/// back as ours? Answered by reading when the library region is bound on this
+/// box, otherwise by the caller's check over the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainCheck {
+    pub rel_path: String,
+    /// The library region whose row names the twin.
+    pub region: NodeId,
+    pub hash: String,
+    pub size: u64,
+    /// The last `SWARM_CHUNK`-aligned range of the file and its blake3.
+    pub tail_offset: u64,
+    pub tail_len: u64,
+    pub tail_hash: [u8; 32],
 }
 
 /// D126 — how the merged view admits a path (doc 26 §6): exactly one
@@ -1864,38 +1889,57 @@ impl Engine {
         let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
         match &entry.state {
             ViewState::Admitted => hashed.first().copied(),
-            ViewState::ConflictHashes(_) => {
-                let cand = |c: &ViewCopy| crate::media::Candidate {
-                    label: format!("{}@{}", entry.rel_path, &c.region[..c.region.len().min(8)]),
-                    quality: c
-                        .quality
-                        .as_deref()
-                        .and_then(|q| crate::media::MediaQuality::decode(q).ok())
-                        .unwrap_or_default(),
-                    size_bytes: c.size_bytes,
-                    mtime_ms: c.mtime_ms,
-                    integrity_ok: true,
-                };
-                let mut best = *hashed.first()?;
-                for c in hashed.iter().skip(1) {
-                    let (best_wins, _) = crate::media::choose(&cand(best), &cand(c), rules);
-                    if !best_wins {
-                        best = c;
-                    }
-                }
-                Some(best)
-            }
+            ViewState::ConflictHashes(_) => Self::ladder_best(&entry.rel_path, &hashed, rules),
             ViewState::Unhashed | ViewState::ConflictKind => None,
         }
     }
 
-    /// D127 — resolve what this box may (doc 26 §7.3): for every path whose
-    /// copies include one in a **draining region this box owns**, trash that
-    /// copy when the library already has the bytes (agreeing hashes) or the
-    /// ladder picked a library copy over it. A draining copy that wins stays;
-    /// two draining copies with no library copy stay (nothing to drain into);
-    /// nothing on a library region is ever touched. The region's next scan
-    /// drops the row and publishes a new head, and the view resolves itself.
+    /// The D76 ladder over `copies`, the first as the incumbent.
+    fn ladder_best<'a>(rel_path: &str, copies: &[&'a ViewCopy], rules: &crate::media::Rules) -> Option<&'a ViewCopy> {
+        let cand = |c: &ViewCopy| crate::media::Candidate {
+            label: format!("{}@{}", rel_path, &c.region[..c.region.len().min(8)]),
+            quality: c
+                .quality
+                .as_deref()
+                .and_then(|q| crate::media::MediaQuality::decode(q).ok())
+                .unwrap_or_default(),
+            size_bytes: c.size_bytes,
+            mtime_ms: c.mtime_ms,
+            integrity_ok: true,
+        };
+        let mut best = *copies.first()?;
+        for c in copies.iter().skip(1) {
+            let (best_wins, _) = crate::media::choose(&cand(best), &cand(c), rules);
+            if !best_wins {
+                best = c;
+            }
+        }
+        Some(best)
+    }
+
+    /// D145 — the copy the drain moves toward the library. Against a library
+    /// copy of OTHER bytes the draining copy wins: it is what the arr imported
+    /// last (an upgrade, or a replacement it chose), and the arr's own records
+    /// point at it. The ladder decides only among copies of one kind — the
+    /// draining copies here, or the library copies alone through
+    /// [`Self::served_copy`]. On 2026-09-12 the ladder, with no quality
+    /// measured, preferred by size a library copy the arr had deleted minutes
+    /// earlier, and the upgrade went to the trash.
+    pub fn drain_winner<'a>(
+        entry: &'a ViewEntry,
+        rules: &crate::media::Rules,
+        draining: &dyn Fn(&str) -> bool,
+    ) -> Option<&'a ViewCopy> {
+        if matches!(entry.state, ViewState::ConflictHashes(_)) {
+            let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
+            let staged: Vec<&ViewCopy> = hashed.iter().copied().filter(|c| draining(&c.region)).collect();
+            if !staged.is_empty() && staged.len() < hashed.len() {
+                return Self::ladder_best(&entry.rel_path, &staged, rules);
+            }
+        }
+        Self::served_copy(entry, rules)
+    }
+
     /// D133 — this box's receiving regions with their local roots, most free
     /// bytes first (the destination rule that never fills a disk).
     pub fn receiving_roots(&self) -> Result<Vec<(NodeId, std::path::PathBuf)>> {
@@ -1933,17 +1977,7 @@ impl Engine {
         if dests.is_empty() {
             return Ok((items, skips));
         }
-        let drains: HashMap<NodeId, bool> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT node_id, drains FROM regions WHERE kind = 'catalogue'")
-                .map_err(map_db("region drains"))?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
-                .map_err(map_db("region drains"))?;
-            rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-                .map_err(map_db("region drains"))?
-        };
+        let drains = self.catalogue_drains()?;
         let draining = |region: &str| drains.get(region).copied().unwrap_or(false);
         for entry in self.view_paths()? {
             if entry.kind == "dir" {
@@ -1967,15 +2001,20 @@ impl Engine {
                     }
                 }
                 ViewState::ConflictHashes(_) => {
-                    let Some(winner) = Self::served_copy(&entry, rules) else { continue };
+                    let Some(winner) = Self::drain_winner(&entry, rules, &draining) else { continue };
                     if !draining(&winner.region) {
-                        continue; // the library holds the winner; D127 drains the loser
+                        continue; // library copies only: the ladder serves one, nothing moves
+                    }
+                    // D145 — a library region already holds the winner's
+                    // bytes: nothing to pull; `resolve` drains the staging copy.
+                    if hashed.iter().any(|c| !draining(&c.region) && c.content_hash == winner.content_hash) {
+                        continue;
                     }
                     let mine_here = hashed.iter().any(|c| dests.iter().any(|(r, _)| *r == c.region));
                     if !mine_here && library_has_it {
                         skips.push(ReceiveSkip {
                             rel_path: entry.rel_path.clone(),
-                            why: "the losing library copy is on another box".into(),
+                            why: "the library copy it would replace is not in a receiving region here".into(),
                         });
                         continue;
                     }
@@ -2030,11 +2069,71 @@ impl Engine {
         Ok(out)
     }
 
+    /// D145 — folders only staging has, made in this box's receiving region
+    /// with the most free space, before any file lands: the drain removes a
+    /// staging folder only once the library holds it, and an arr recreates a
+    /// show's folder that disappears from under it. Returns the relative paths
+    /// made (or, dry-run, that would be).
+    pub fn receive_folders(&self, dry_run: bool) -> Result<Vec<String>> {
+        let dests = self.receiving_roots()?;
+        let Some((_, root)) = dests.first() else {
+            return Ok(Vec::new());
+        };
+        let drains = self.catalogue_drains()?;
+        let draining = |region: &str| drains.get(region).copied().unwrap_or(false);
+        let mut made = Vec::new();
+        for entry in self.view_paths()? {
+            if entry.kind != "dir" || !matches!(entry.state, ViewState::Admitted) {
+                continue;
+            }
+            let staged = entry.sources.iter().any(|c| draining(&c.region));
+            let held = entry.sources.iter().any(|c| !draining(&c.region));
+            if !staged || held || !Self::safe_rel_path(&entry.rel_path) {
+                continue;
+            }
+            let dir = root.join(&entry.rel_path);
+            if dir.exists() {
+                continue; // made by an earlier pass; the watch has not catalogued it yet
+            }
+            if dry_run || std::fs::create_dir_all(&dir).is_ok() {
+                made.push(entry.rel_path);
+            }
+        }
+        Ok(made)
+    }
+
+    /// D127 — which catalogue regions drain, as the log says.
+    fn catalogue_drains(&self) -> Result<HashMap<NodeId, bool>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id, drains FROM regions WHERE kind = 'catalogue'")
+            .map_err(map_db("region drains"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
+            .map_err(map_db("region drains"))?;
+        let drains = rows
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(map_db("region drains"))?;
+        Ok(drains)
+    }
+
+    /// D127, amended by D145 — resolve what this box may (doc 26 §7.3). A copy
+    /// in a **draining region this box owns** goes to that region's trash,
+    /// sidecar and all, only when a library region holds the SAME bytes and
+    /// that copy reads back now: on this box by reading its last chunk, on
+    /// another box by `confirm` (the caller's check over the wire). A row
+    /// alone is never enough — rows are a scan old, and an arr deletes
+    /// through the union faster than a holder rescans (2026-09-12). A draining
+    /// copy whose bytes no library copy has stays: it is new, or the arr's
+    /// replacement of a library copy, and the receiving side moves it either
+    /// way. Nothing on a library region is ever touched. Then the folders: a
+    /// staging folder goes once it is empty and a library region holds it,
+    /// deepest first; a region's top level (the arrs' root folders) stays.
     pub fn resolve_conflicts(
         &mut self,
-        rules: &crate::media::Rules,
         dry_run: bool,
         cancel: &std::sync::atomic::AtomicBool,
+        confirm: &mut dyn FnMut(&DrainCheck) -> bool,
     ) -> Result<ResolveReport> {
         let mut report = ResolveReport::default();
         // The catalogue regions THIS box owns: a local binding on their root.
@@ -2047,19 +2146,10 @@ impl Engine {
         if mine.is_empty() {
             return Ok(report);
         }
-        let drains: HashMap<NodeId, bool> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT node_id, drains FROM regions WHERE kind = 'catalogue'")
-                .map_err(map_db("region drains"))?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
-                .map_err(map_db("region drains"))?;
-            rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-                .map_err(map_db("region drains"))?
-        };
+        let drains = self.catalogue_drains()?;
         let draining = |region: &str| drains.get(region).copied().unwrap_or(false);
-        for entry in self.view_paths()? {
+        let entries = self.view_paths()?;
+        for entry in &entries {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 report.cancelled = true;
                 break;
@@ -2067,56 +2157,96 @@ impl Engine {
             if entry.kind == "dir" {
                 continue;
             }
+            if matches!(entry.state, ViewState::ConflictKind) {
+                report.reported.push(entry.rel_path.clone());
+                continue;
+            }
             let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
-            let library_has_it = hashed.iter().any(|c| !draining(&c.region));
-            let trash = |c: &ViewCopy, report: &mut ResolveReport| -> Result<()> {
+            let library: Vec<&ViewCopy> = hashed.iter().copied().filter(|c| !draining(&c.region)).collect();
+            let staged_here: Vec<&ViewCopy> =
+                hashed.iter().copied().filter(|c| draining(&c.region) && mine.contains_key(&c.region)).collect();
+            let conflict = matches!(entry.state, ViewState::ConflictHashes(_));
+            if staged_here.is_empty() {
+                if conflict {
+                    report.reported.push(entry.rel_path.clone());
+                }
+                continue;
+            }
+            let mut acted = false;
+            for c in staged_here {
                 let root = &mine[&c.region];
                 let file = root.join(&entry.rel_path);
-                // D133 — the row outlives the file between a resolve and the
-                // next scan (the watch's, or a manual one): a copy already
-                // gone is nothing to do, not an error that ends the pass.
-                if !file.exists() {
-                    return Ok(());
+                // D133 — the row outlives the file until the next scan: a copy
+                // already gone is nothing to do.
+                if !file.is_file() {
+                    acted = true;
+                    continue;
                 }
-                if !dry_run {
-                    crate::sync::move_to_trash(root, &file)?;
-                }
-                report.trashed.push((entry.rel_path.clone(), c.region.clone()));
-                Ok(())
-            };
-            match &entry.state {
-                ViewState::Admitted if hashed.len() >= 2 && library_has_it => {
-                    for c in &hashed {
-                        if mine.contains_key(&c.region) && draining(&c.region) {
-                            trash(c, &mut report)?;
-                        }
-                    }
-                }
-                ViewState::ConflictHashes(_) => {
-                    let Some(winner) = Self::served_copy(&entry, rules) else {
-                        continue;
-                    };
-                    let winner = winner.clone();
-                    let mut acted = false;
-                    for c in &hashed {
-                        if c.region == winner.region || !mine.contains_key(&c.region) || !draining(&c.region) {
-                            continue;
-                        }
-                        if !draining(&winner.region) {
-                            trash(c, &mut report)?;
-                            acted = true;
-                        }
-                    }
-                    if draining(&winner.region) && mine.contains_key(&winner.region) {
+                let twins: Vec<&ViewCopy> =
+                    library.iter().copied().filter(|l| l.content_hash == c.content_hash).collect();
+                if twins.is_empty() {
+                    // New (only staging has it), or the arr's replacement of a
+                    // library copy: the receiving side moves it either way.
+                    if !library.is_empty() {
                         report.kept_winners.push(entry.rel_path.clone());
                         acted = true;
                     }
-                    if !acted {
-                        report.reported.push(entry.rel_path.clone());
-                    }
+                    continue;
                 }
-                ViewState::ConflictKind => report.reported.push(entry.rel_path.clone()),
-                _ => {}
+                acted = true;
+                // Our own copy no longer matches its row: the next scan re-hashes it.
+                let Ok((tail_offset, tail_len, tail_hash)) = crate::sync::tail_chunk(&file, c.size_bytes) else {
+                    report.unconfirmed.push(entry.rel_path.clone());
+                    continue;
+                };
+                let held = twins.iter().any(|t| match mine.get(&t.region) {
+                    Some(troot) => crate::sync::tail_chunk(&troot.join(&entry.rel_path), t.size_bytes)
+                        .is_ok_and(|got| got == (tail_offset, tail_len, tail_hash)),
+                    None => confirm(&DrainCheck {
+                        rel_path: entry.rel_path.clone(),
+                        region: t.region.clone(),
+                        hash: c.content_hash.clone().unwrap_or_default(),
+                        size: c.size_bytes,
+                        tail_offset,
+                        tail_len,
+                        tail_hash,
+                    }),
+                });
+                if !held {
+                    report.unconfirmed.push(entry.rel_path.clone());
+                    continue;
+                }
+                if !dry_run {
+                    crate::sync::move_to_trash_with_sidecar(root, &file)?;
+                }
+                report.trashed.push((entry.rel_path.clone(), c.region.clone()));
+            }
+            if conflict && !acted {
+                report.reported.push(entry.rel_path.clone());
+            }
+        }
+        if report.cancelled {
+            return Ok(report);
+        }
+        // Folders, deepest first: a child's path sorts after its parent's.
+        for entry in entries.iter().rev() {
+            if entry.kind != "dir" || !matches!(entry.state, ViewState::Admitted) || !entry.rel_path.contains('/') {
+                continue;
+            }
+            if !entry.sources.iter().any(|s| !draining(&s.region)) {
+                continue; // the library lacks it: the receiving side makes it first
+            }
+            for c in entry.sources.iter().filter(|c| draining(&c.region)) {
+                let Some(root) = mine.get(&c.region) else { continue };
+                let dir = root.join(&entry.rel_path);
+                let empty = std::fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(false);
+                if !empty {
+                    continue;
+                }
+                if !dry_run && std::fs::remove_dir(&dir).is_err() {
+                    continue;
+                }
+                report.folders_removed.push(entry.rel_path.clone());
             }
         }
         Ok(report)

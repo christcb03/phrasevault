@@ -666,6 +666,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             );
             match r {
                 Ok(rep) => {
+                    if !rep.folders.is_empty() {
+                        eprintln!("pvfsd: receive made {} folders only staging had (D145)", rep.folders.len());
+                    }
                     for (p, h, _) in &rep.received {
                         eprintln!("pvfsd: received {p} ({}) into the library (doc 26 §7.3)", &h[..8]);
                     }
@@ -684,7 +687,10 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             st.set_state("resolve", "running");
             let r = (|| -> Result<(pvfs_core::ResolveReport, u64), PvfsError> {
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = engine.resolve_conflicts(&pvfs_core::media::Rules::default(), false, &cancel)?;
+                // D145 — the holder confirms the bytes before a staging copy goes.
+                let sources = pvfs_client::receive::announced_sources(&engine);
+                let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
+                let r = engine.resolve_conflicts(false, &cancel, &mut confirm)?;
                 // D133 — then free what retention allows.
                 let purged: u64 = engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum();
                 engine.close()?;
@@ -693,7 +699,17 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             match r {
                 Ok((rep, purged)) => {
                     if !rep.trashed.is_empty() {
-                        eprintln!("pvfsd: resolve trashed {} losing copies", rep.trashed.len());
+                        eprintln!("pvfsd: resolve trashed {} staging copies the library holds (confirmed)", rep.trashed.len());
+                    }
+                    if !rep.unconfirmed.is_empty() {
+                        eprintln!(
+                            "pvfsd: resolve kept {} staging copies the library could not confirm yet: {}",
+                            rep.unconfirmed.len(),
+                            rep.unconfirmed.join(", ")
+                        );
+                    }
+                    if !rep.folders_removed.is_empty() {
+                        eprintln!("pvfsd: resolve removed {} emptied folders the library holds", rep.folders_removed.len());
                     }
                     if purged > 0 {
                         eprintln!("pvfsd: resolve purged {purged} trash buckets past retention");

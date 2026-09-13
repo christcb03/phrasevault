@@ -63,8 +63,14 @@ fn none_flag() -> AtomicBool {
     AtomicBool::new(false)
 }
 
+/// Every region in these tests is bound on this one box, so a drain confirms
+/// by reading; the over-the-wire check is never asked.
+fn remote_never(_: &pvfs_core::DrainCheck) -> bool {
+    false
+}
+
 #[test]
-fn a_draining_regions_copies_drain_away_and_a_librarys_never_move() {
+fn a_draining_copy_goes_only_against_the_librarys_own_bytes_and_a_librarys_never_move() {
     let tmp = tempfile::tempdir().unwrap();
     let staging = tmp.path().join("staging");
     let library = tmp.path().join("library");
@@ -82,47 +88,45 @@ fn a_draining_regions_copies_drain_away_and_a_librarys_never_move() {
     e.set_region_drain(&rs, true).unwrap();
     assert!(e.region_drains(&rs).unwrap() && !e.region_drains(&rl).unwrap());
 
-    // Dry run: says what would move, moves nothing.
-    let dry = e.resolve_conflicts(&Rules::default(), true, &none_flag()).unwrap();
-    assert_eq!(
-        dry.trashed,
-        vec![("Lose/l.mkv".to_string(), rs.clone()), ("Same/s.mkv".to_string(), rs.clone())]
-    );
-    assert_eq!(dry.kept_winners, vec!["Win/w.mkv".to_string()]);
+    // Dry run: says what would move, moves nothing. D145: only the redundant
+    // copy would go; BOTH disagreements keep the staging copy, whichever copy
+    // the ladder would serve — the staging copy is the arr's latest import.
+    let dry = e.resolve_conflicts(true, &none_flag(), &mut remote_never).unwrap();
+    assert_eq!(dry.trashed, vec![("Same/s.mkv".to_string(), rs.clone())]);
+    assert_eq!(dry.kept_winners, vec!["Lose/l.mkv".to_string(), "Win/w.mkv".to_string()]);
     assert!(staging.join("Lose/l.mkv").exists() && staging.join("Same/s.mkv").exists());
 
-    // The real pass: the redundant and the losing copies go to the STAGING
-    // region's trash; its winner stays; the library is untouched; the
-    // one-sided file stays (nothing to drain into).
-    let rep = e.resolve_conflicts(&Rules::default(), false, &none_flag()).unwrap();
-    assert_eq!(rep.trashed.len(), 2);
+    // The real pass: the redundant copy goes to the STAGING region's trash;
+    // the disagreeing copies and the one-sided file stay; the library is
+    // untouched.
+    let rep = e.resolve_conflicts(false, &none_flag(), &mut remote_never).unwrap();
+    assert_eq!(rep.trashed.len(), 1);
     assert!(!staging.join("Same/s.mkv").exists() && in_trash(&staging, "Same/s.mkv"));
-    assert!(!staging.join("Lose/l.mkv").exists() && in_trash(&staging, "Lose/l.mkv"));
-    assert!(staging.join("Win/w.mkv").exists() && staging.join("Only/o.mkv").exists());
+    for rel in ["Lose/l.mkv", "Win/w.mkv", "Only/o.mkv"] {
+        assert!(staging.join(rel).exists(), "staging copy {rel} must stay");
+    }
     for rel in ["Same/s.mkv", "Lose/l.mkv", "Win/w.mkv"] {
         assert!(library.join(rel).exists(), "library copy {rel} must never move");
     }
     assert!(!in_trash(&library, "Same/s.mkv"));
 
-    // The staging region's next scan drops the rows and publishes a new head;
-    // the view resolves itself except for the conflict it may not touch.
+    // The staging region's next scan drops the row and publishes a new head;
+    // the disagreements stay until the receiving side replaces the library's
+    // copies (d133_receive_plan, d145_drain_confirms).
     let seq_before = e.region_snapshots(&rs).unwrap().last().unwrap().seq;
     e.scan_routed(Some(&rs), None, 0).unwrap();
     assert_eq!(e.region_snapshots(&rs).unwrap().last().unwrap().seq, seq_before + 1);
     let same = e.merged_view("Same").unwrap().remove(0);
     assert_eq!((same.state.clone(), same.copies, same.sources.len()), (ViewState::Admitted, 1, 1));
-    let lose = e.merged_view("Lose").unwrap().remove(0);
-    assert_eq!((lose.state.clone(), lose.copies), (ViewState::Admitted, 1));
     assert_eq!(
         e.view_conflicts().unwrap().iter().map(|v| v.rel_path.as_str()).collect::<Vec<_>>(),
-        vec!["Win/w.mkv"],
-        "the conflict the draining copy WON stays a conflict — the library's loser is not ours to touch"
+        vec!["Lose/l.mkv", "Win/w.mkv"],
     );
 
     // Idempotent.
-    let again = e.resolve_conflicts(&Rules::default(), false, &none_flag()).unwrap();
+    let again = e.resolve_conflicts(false, &none_flag(), &mut remote_never).unwrap();
     assert!(again.trashed.is_empty());
-    assert_eq!(again.kept_winners, vec!["Win/w.mkv".to_string()]);
+    assert_eq!(again.kept_winners, vec!["Lose/l.mkv".to_string(), "Win/w.mkv".to_string()]);
 }
 
 #[test]
@@ -135,7 +139,7 @@ fn library_regions_conflicts_move_nothing_and_are_reported() {
     let (mut e, _mn) = Engine::init(tmp.path().join("forest").as_path()).unwrap();
     region(&mut e, "A", &a);
     region(&mut e, "B", &b);
-    let rep = e.resolve_conflicts(&Rules::default(), false, &none_flag()).unwrap();
+    let rep = e.resolve_conflicts(false, &none_flag(), &mut remote_never).unwrap();
     assert!(rep.trashed.is_empty(), "bytes on a non-draining region are never touched (§7.2)");
     assert_eq!(rep.reported, vec!["x.mkv".to_string()]);
     assert!(a.join("x.mkv").exists() && b.join("x.mkv").exists());

@@ -339,7 +339,17 @@ the fetch-and-verify of a 27,000-row manifest is a few megabytes.
    holder has a region.
 3. **Quality re-measurement** on the new model (§3).
 4. ~~§7 and §8 have not run anywhere~~ — rehearsed in D139 (§9).
-5. **A drain leaves the sidecar behind** (D138): after `resolve` trashes a
-   losing staging copy its `.<name>.manifest` stays in the staging root, and
-   `.pvfs-trash` lives there too. On feederbox that is one orphan dotfile
-   per moved file. PVFS follow-up: the drain takes the sidecar with the file.
+5. ~~**A drain leaves the sidecar behind** (D138)~~ — fixed in D145: the
+   sidecar goes to the trash with its file; a staging folder goes once it is
+   empty and the library holds it (a region's top level stays); the
+   receiving side makes the folders only staging has, so the arrs do not
+   recreate them. On 2026-09-12 the backlog was cleared by hand: 22 sidecars
+   (byte-identical on the NAS) to the staging trash, 199 folders made on
+   `Data/Media`, 217 emptied folders removed from `/mnt/local/Media`.
+6. ~~**The drain trusted a catalogue row**~~ — fixed in D145. On the first
+   day `resolve` trashed Sonarr's upgrade of an episode: the NAS's rows
+   still listed the copy Sonarr had deleted through the union four minutes
+   earlier, and the ladder (no quality measured) preferred it for size. A
+   staging copy now goes only when a library region holds the same bytes
+   and the holder serves their last chunk back matching; a disagreement
+   keeps the staging copy and the receiving side replaces the library's.

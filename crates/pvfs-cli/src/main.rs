@@ -6076,11 +6076,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
         Cmd::View(ViewCmd::Resolve { dry_run }) => {
             let mut engine = Engine::open(&ctx?)?;
-            let rep = engine.resolve_conflicts(
-                &pvfs_core::media::Rules::default(),
-                dry_run,
-                &std::sync::atomic::AtomicBool::new(false),
-            )?;
+            // D145 — a staging copy goes only once the library's box serves
+            // the same bytes back; a dry run asks too (it only reads).
+            let sources = pvfs_client::receive::announced_sources(&engine);
+            let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
+            let rep = engine.resolve_conflicts(dry_run, &std::sync::atomic::AtomicBool::new(false), &mut confirm)?;
             // D133 — then free what retention allows (never on a dry run).
             let purged: u64 = if dry_run { 0 } else { engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum() };
             if json {
@@ -6090,6 +6090,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "dry_run": dry_run,
                         "trashed": rep.trashed.iter().map(|(p, r)| serde_json::json!({"path": p, "region": r})).collect::<Vec<_>>(),
                         "kept_winners": rep.kept_winners,
+                        "unconfirmed": rep.unconfirmed,
+                        "folders_removed": rep.folders_removed,
                         "reported": rep.reported,
                         "purged": purged,
                     })
@@ -6100,15 +6102,26 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
                 let verb = if dry_run { "would trash" } else { "trashed" };
                 for (p, r) in &rep.trashed {
-                    println!("{verb}\t{p}\t(draining region {})", &r[..r.len().min(12)]);
+                    println!("{verb}\t{p}\t(the library holds these bytes, confirmed; draining region {})", &r[..r.len().min(12)]);
+                }
+                for p in &rep.unconfirmed {
+                    println!("kept\t{p}\t(the library's copy could not be confirmed now; asked again next pass)");
                 }
                 for p in &rep.kept_winners {
-                    println!("kept\t{p}\t(the draining copy wins; the library's loser is not this box's)");
+                    println!("kept\t{p}\t(differs from the library's copy: this one wins, and the receiving side replaces that one)");
+                }
+                for p in &rep.folders_removed {
+                    println!("{}\t{p}/\t(empty here; the library holds it)", if dry_run { "would remove" } else { "removed" });
                 }
                 for p in &rep.reported {
                     println!("report\t{p}\t(nothing here may act on it)");
                 }
-                if rep.trashed.is_empty() && rep.kept_winners.is_empty() && rep.reported.is_empty() {
+                if rep.trashed.is_empty()
+                    && rep.unconfirmed.is_empty()
+                    && rep.kept_winners.is_empty()
+                    && rep.folders_removed.is_empty()
+                    && rep.reported.is_empty()
+                {
                     println!("nothing to resolve");
                 }
             }
@@ -6129,6 +6142,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     "{}",
                     serde_json::json!({
                         "dry_run": dry_run,
+                        "folders": rep.folders,
                         "received": rep.received.iter().map(|(p, h, r)| serde_json::json!({"path": p, "hash": h, "region": r})).collect::<Vec<_>>(),
                         "replaced": rep.replaced,
                         "skipped_no_space": rep.skipped_no_space,
@@ -6137,6 +6151,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     })
                 );
             } else {
+                for p in &rep.folders {
+                    println!("{}\t{p}/\t(only staging had it)", if dry_run { "would make" } else { "made" });
+                }
                 let verb = if dry_run { "would receive" } else { "received" };
                 for (p, _, r) in &rep.received {
                     println!("{verb}\t{p}\t(into {}{})", &r[..r.len().min(12)], if rep.replaced.contains(p) { ", replacing the library copy" } else { "" });
@@ -6150,7 +6167,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 for (p, w) in &rep.reported {
                     println!("report\t{p}\t{w}");
                 }
-                if rep.received.is_empty() && rep.skipped_no_space.is_empty() && rep.failed.is_empty() && rep.reported.is_empty() {
+                if rep.folders.is_empty()
+                    && rep.received.is_empty()
+                    && rep.skipped_no_space.is_empty()
+                    && rep.failed.is_empty()
+                    && rep.reported.is_empty()
+                {
                     println!("nothing to receive");
                 }
             }
