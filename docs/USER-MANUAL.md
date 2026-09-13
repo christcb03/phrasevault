@@ -541,6 +541,36 @@ export), with a 5-minute safety interval and a catch-up pass at daemon start beh
 it — so the §7.10 pipeline converges in seconds end to end with zero cron entries.
 Jobs dial with the box's client identity: enroll it first (§7.9).
 
+#### Watching the fleet (D131, D135, D142, D146)
+
+`pvfs serve status [--json]` answers for one box. Each job row carries its
+state, `last_ok` (the last success) and `last_error` — cleared by the next
+success, so a present error means the last run failed. The states: `running`,
+`idle`, `backoff` (a transient failure; the job retries by itself), `error`
+(the thread exited; the supervisor restarts it), `disabled`, `stalled` (a
+pass in flight far past its own typical length — evidence), `overdue` (no
+pass finished lately — for the pass-based jobs usually just a long pass).
+`follow` is continuous: its `last_ok` is refreshed every few seconds while it
+is current with its source, so an `overdue` follow really has not been able
+to confirm for 15 minutes (D146).
+
+On the owner, the `health` job (`pvfs serve enable health`) polls every
+announced peer every two minutes:
+
+```bash
+pvfs fleet health            # every peer: up, or down since when; job errors; free space
+pvfs fleet health --now      # poll first
+pvfs fleet supervise <pin> --ssh user@<holder> --key ~/.ssh/pvfs-supervise   # restart a silent holder
+pvfs fleet notify http://<ha>:8123/api/webhook/pvfs-fleet --format ha --label '<holder-ip>=the NAS'
+pvfs fleet notify --test     # one test event
+pvfs fleet notify --off
+```
+
+Formats: `ha`, `slack`, `discord`, `ntfy`, `json`. Events are transitions
+only — a peer down or back, a restart sent, a job error that has persisted
+two polls — plus a daily heartbeat, each carrying one plain sentence. Doc 30
+is the whole story, with a Home Assistant build as the worked example.
+
 ---
 
 ### 7.12 External-ingest sessions — downloads land as they arrive (doc 23)

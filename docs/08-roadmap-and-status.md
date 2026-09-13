@@ -6,18 +6,21 @@ The single place to see what's built, what's next, and the known loose ends. Pha
 docs 02–23; this is the index + the honest "what's not done yet."
 
 > **This document stopped tracking reality around D29 (2026-07-22).** The tree
-> is at D117 as of 2026-09-08 — roughly ninety milestones and a whole fleet
-> deployment later — and none of D71–D117 is reflected below. Treat everything
-> here as history unless it agrees with `CHANGELOG.md`, which IS current.
+> is at D146 as of 2026-09-13 — more than a hundred milestones and a whole
+> fleet deployment later — and none of D71–D146 is reflected below. Treat
+> everything here as history unless it agrees with `CHANGELOG.md`, which IS
+> current.
 >
-> The live state, for anyone reading this first:
+> The live state, for anyone reading this first (banner refreshed 2026-09-13):
 >
 > | | |
 > |---|---|
-> | fleet | owner (VM 310) / ingest (feederbox) / holder (QNAP), all on one build, verified by `pvfs --version` AND `pvfsd --version` (D110) |
-> | projection schema | **15** (`scan_unheld`, D112) — not the 2 discussed in item 10 below |
-> | wire proto | 4, degrading to 3 |
-> | forest health (2026-09-08) | `missing` 0, islands 0, duplicates 0, every live-linked node reachable |
+> | fleet | owner (VM 310) / ingest (feederbox) / holder (QNAP) on the **new model** (doc 26) since the 2026-09-12 cutover (doc 29, forest alias `media2`); all three on `v1.4-312`, verified by `pvfs --version` AND `pvfsd --version` (D110) |
+> | projection schema | **18** |
+> | wire proto | **8**, degrading to 3 |
+> | the mover | the holder's `receive` job pulls several files at once, several ranges each (D144); feederbox's `resolve` drains staging only after the library holds the same bytes (D145) |
+> | monitoring | the owner's `health` job observes every peer (D131), supervises the NAS (D135) and notifies Home Assistant on transitions (D142); `follow` reports honestly since D146 — the whole picture is **doc 30** |
+> | the old forest | kept on disk as the cutover's rollback (doc 29 §8) until its conditions are met |
 > | re-genesis | runbook written **and rehearsed** — doc 25, including its §11 close-out |
 >
 > Rewriting this file's history would lose the record of how decisions were

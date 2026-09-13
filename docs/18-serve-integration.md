@@ -216,3 +216,13 @@ the normal state of a healthy long pass. The blunt check reported `stalled`
 until D100 and was wrong all three times it fired. Distinguishing "advancing
 slowly" from "wedged" needs a progress signal out of `scan_routed` and
 `tier_pass` that does not exist yet.
+
+**`follow` is continuous, so it stamps itself (D146).** A tail never completes
+a pass, so its row is stamped on every long-poll that proves it current —
+events folded (`CaughtUp`), or an empty reply whose source tip is not ahead of
+its own (`UpToDate`, every 5 s on a quiet log). Before D146 only the first
+counted, a quiet log froze `last_ok`, and every replica read `overdue` for
+good while its tip matched the owner's. Now `last_ok` on `follow` means *last
+confirmed current with the source*, and `overdue` means it has not been able
+to say so for 15 minutes. How the fleet's health is observed, acted on and
+reported — with a worked Home Assistant build — is doc 30.
