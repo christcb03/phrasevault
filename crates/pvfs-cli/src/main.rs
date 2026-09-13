@@ -5995,6 +5995,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let never = std::sync::atomic::AtomicBool::new(false);
                 pvfs_client::follow::run(&data_dir, 25_000, &never, |ev| match ev {
                     pvfs_client::follow::FollowEvent::Connected { .. } => {}
+                    pvfs_client::follow::FollowEvent::UpToDate { .. } => {}
                     pvfs_client::follow::FollowEvent::CaughtUp { tip } => {
                         eprintln!("follow: caught up to seq {tip}")
                     }
