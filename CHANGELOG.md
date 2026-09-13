@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The drain asks before it discards, and never against the arr's choice
+  (D145).** On the new model's first production day feederbox's `resolve`
+  trashed Sonarr's upgrade of an episode: the NAS's catalogue still listed
+  the copy Sonarr had just deleted through the union, and the ladder, with no
+  quality measured, preferred it for being larger. A staging copy now goes
+  only when a library region holds the same bytes AND the holder serves
+  their last chunk back matching — read on this box, or over the wire by
+  content hash; otherwise it is kept and asked about again next pass. A
+  staging copy that differs from the library's is the arr's latest import and
+  wins: the receiving side replaces the library copy (to the library's
+  trash). The sidecar goes to the trash with its file; the receiving side
+  makes the folders only staging has; a staging folder goes once it is empty
+  and the library holds it, a region's top level excepted.
 - **The merge no longer combines two boxes' DIFFERENT files (D119).** A
   duplicate group is CONTESTED when more than one member holds live bytes and
   those holders disagree about size — two versions of one path, an upgrade in

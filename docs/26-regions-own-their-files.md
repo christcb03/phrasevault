@@ -193,7 +193,7 @@ and fetchable. What to do about the *space* it takes is a retention policy
 
 | | agreeing hashes | disagreeing hashes |
 |---|---|---|
-| **draining** region involved | one copy is redundant → the drained one goes | ladder picks the winner → it goes to the library region; the loser drains away. Self-resolving: there is an action |
+| **draining** region involved | one copy is redundant → the drained one goes, once the library's copy is confirmed (D145) | the draining copy wins (D145 — it is the arr's latest import) → it replaces the library's copy, and drains only after that, against identical bytes. Self-resolving: there is an action |
 | **non-draining** only | redundancy → serve nearest, or swarm across all | ladder picks the SERVED copy; both stay; conflict reported (7.5) |
 
 The draining case is the easy one precisely because there is something to
@@ -209,6 +209,19 @@ soft, dated, kept for the region's retention — because one path holds one
 file. D133 also settles the trash-age part of 7.4: `pvfs region retention
 <region> <days>` (default 7), applied by `resolve`. The rest of 7.4 stays
 open.*
+
+*D145 (2026-09-12) amends both cells of the draining row, after the drain
+lost an arr upgrade on the first production day. The ladder, with no quality
+measured, preferred a larger library copy that the arr had deleted minutes
+earlier, and the row that still listed it was taken as proof the library held
+something. Now a draining copy goes only against a library copy of the SAME
+bytes that its box serves back — the last chunk, by content hash — at that
+moment. On a disagreement the draining copy wins, and the receiving side
+replaces the library's copy (to the library's trash, as above). The ladder
+still picks the served copy (7.1) and decides between copies of one kind.
+Folders drain like files: the receiving side makes the folders only staging
+has; a staging folder goes once it is empty and held by the library, a
+region's top level excepted. The sidecar goes with its file.*
 
 **7.4 Retention — OPEN.** Per region: "keep newest N versions", "keep all",
 "keep the ladder winner only". Explicit, declared, never inferred.

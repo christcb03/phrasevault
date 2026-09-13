@@ -123,7 +123,7 @@ fn a_box_receives_its_own_staging_files_replaces_a_loser_and_drains_them() {
 
     // The staging side drains: resolve trashes the redundant copies, and a
     // retention of 0 lets the purge free them at once.
-    let res = e.resolve_conflicts(&Rules::default(), false, &never).unwrap();
+    let res = e.resolve_conflicts(false, &never, &mut |_: &pvfs_core::DrainCheck| false).unwrap();
     assert_eq!(res.trashed.len(), 2, "{res:?}");
     assert!(!staging.join("Movies/New (2024)/new.mkv").exists());
     assert!(staging.join(".pvfs-trash").exists());

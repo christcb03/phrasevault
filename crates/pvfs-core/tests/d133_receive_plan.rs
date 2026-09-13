@@ -71,8 +71,9 @@ fn the_plan_follows_the_table() {
     let tmp = tempfile::tempdir().unwrap();
     let staging = tmp.path().join("staging");
     let lib = tmp.path().join("lib");
-    // staging-only file; an agreeing pair; a conflict staging wins (bigger);
-    // a conflict the library wins; an unsafe path is never planned.
+    // staging-only file; an agreeing pair; a conflict the ladder gives staging
+    // (bigger); a conflict the ladder gives the library (bigger) — which,
+    // since D145, staging wins too.
     write(&staging, "Movies/New (2024)/new.mkv", b"new-bytes");
     write(&staging, "Movies/Same (2001)/same.mkv", b"same");
     write(&lib, "Movies/Same (2001)/same.mkv", b"same");
@@ -118,8 +119,15 @@ fn the_plan_follows_the_table() {
     assert!(up.replaces);
     assert_eq!(up.dest_region, rl);
     assert!(!by_path.contains_key("Movies/Same (2001)/same.mkv"), "an agreeing pair needs nothing");
-    assert!(!by_path.contains_key("Movies/Old (2003)/old.mkv"), "the library's winner stays; D127 drains the loser");
-    assert_eq!(items.len(), 2, "{items:?}");
+    // D145 — the ladder would serve the library's bigger copy, but the drain
+    // does not ask the ladder against the arr's latest import: staging wins.
+    let old = by_path
+        .get("Movies/Old (2003)/old.mkv")
+        .expect("a staging copy replaces a library copy it disagrees with, bigger or not");
+    assert!(old.replaces);
+    assert_eq!(old.from_region, rs);
+    assert_eq!(old.hash, blake3::hash(b"tiny").to_hex().to_string());
+    assert_eq!(items.len(), 3, "{items:?}");
     assert!(skips.is_empty(), "{skips:?}");
 
     // The view agrees with the plan's reading of the conflicts.

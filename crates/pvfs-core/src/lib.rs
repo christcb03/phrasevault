@@ -52,6 +52,7 @@ pub use fs::{
     BindKind,
     BindSpec,
     CatalogueStatus,
+    DrainCheck,
     HashPolicy,
     LocalBytes,
     NodeStat,

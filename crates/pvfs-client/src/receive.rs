@@ -31,6 +31,9 @@ pub struct ReceiveReport {
     pub failed: Vec<(String, String)>,
     /// What the plan would not act on, and why.
     pub reported: Vec<(String, String)>,
+    /// D145 — folders only staging had, made in the receiving region before
+    /// any file (or, dry-run, that would be).
+    pub folders: Vec<String>,
     pub cancelled: bool,
     pub dry_run: bool,
 }
@@ -58,6 +61,9 @@ pub fn receive_pass_on(
     cancel: &AtomicBool,
 ) -> Result<ReceiveReport, PvfsError> {
     let mut report = ReceiveReport { dry_run, ..Default::default() };
+    // D145 — folders only staging has, first: the drain removes a staging
+    // folder only once the library holds it.
+    report.folders = engine.receive_folders(dry_run)?;
     let (items, skips) = engine.receive_plan(rules)?;
     report.reported = skips.into_iter().map(|s| (s.rel_path, s.why)).collect();
     if dry_run {

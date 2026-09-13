@@ -49,6 +49,7 @@ pub use pvfs_proto::{
 
 pub mod advertise;
 pub mod catalogue;
+pub mod drain;
 pub mod fetch;
 pub mod follow;
 pub mod health;
