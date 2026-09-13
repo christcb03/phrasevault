@@ -21,6 +21,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 | **P7** | Region logs + the streaming FUSE mount ([doc 20](docs/20-f4-regions-and-streaming.md)) | Implemented, released 1.4.0 |
 | **P8–P9** | Attachment kinds ([doc 21](docs/21-attachment-policies.md)); the swarm data plane + serve-while-fetching ([doc 22](docs/22-swarm-data-plane.md)) | Implemented, released 1.4.0 |
 | **P10** | External-ingest sessions & the BT bridge ([doc 23](docs/23-ingest-sessions-and-the-bt-bridge.md)) | Implemented, unreleased on main |
+| **Regions** | Regions own their files — catalogue regions, the merged view, resolution, `receive`, fleet health and supervision ([doc 26](docs/26-regions-own-their-files.md)); moving the owner ([doc 28](docs/28-moving-the-owner.md)); the cutover ([doc 29](docs/29-cutover-to-the-new-model.md)); monitoring ([doc 30](docs/30-monitoring-the-fleet.md)) | Implemented, unreleased on main; running the production fleet since 2026-09-12 |
 | **Compaction** | Verifiable snapshots ([doc 11](docs/11-compaction-and-verifiable-snapshots.md)) | Deferred by decision (trigger metric in the doc) |
 
 Build locally with `cargo test --workspace`, or on a remote Linux host — see **[Install guide](docs/INSTALL.md)**.
@@ -65,6 +66,12 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [20-f4-regions-and-streaming.md](docs/20-f4-regions-and-streaming.md) | Region logs + the streaming FUSE mount (1.4) |
 | [21–22](docs/21-attachment-policies.md) | Attachment kinds; the swarm data plane + serve-while-fetching (1.4) |
 | [23-ingest-sessions-and-the-bt-bridge.md](docs/23-ingest-sessions-and-the-bt-bridge.md) | External-ingest sessions & the BT bridge (unreleased) |
+| [24–25](docs/24-fleet-review-and-re-genesis.md) | The fleet review and re-genesis; the re-genesis runbook (rehearsed) |
+| [26-regions-own-their-files.md](docs/26-regions-own-their-files.md) | **The region model** — catalogue regions, the merged view, resolution, receive, fleet health (running the production fleet) |
+| [27-d102-external-review-response.md](docs/27-d102-external-review-response.md) | Response to the D102 external review |
+| [28-moving-the-owner.md](docs/28-moving-the-owner.md) | Moving the forest owner (`pvfs forest promote`) |
+| [29-cutover-to-the-new-model.md](docs/29-cutover-to-the-new-model.md) | The cutover runbook to the new model — executed 2026-09-12 |
+| [**30-monitoring-the-fleet.md**](docs/30-monitoring-the-fleet.md) | **Monitoring** — job states, fleet health, supervision, notifications, and a worked Home Assistant build |
 
 ## Core ideas
 

@@ -5,6 +5,20 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **`follow` says it is current on a quiet log; dial errors say what failed
+  (D146).** The follow job stamped its status row only when events landed, so
+  on a quiet log `last_ok` froze at the last event and the stall detector
+  reported a caught-up follower `overdue` indefinitely — on both production
+  replicas, whose log tips matched the owner's. An empty long-poll whose
+  returned source tip is not ahead of the replica's is now
+  `FollowEvent::UpToDate`: the row is stamped and nothing is nudged, so
+  `last_ok` on `follow` means *last confirmed current* and an `overdue`
+  follow is a real signal. `dial_source` wrapped every failure as `invalid
+  input for follow`, and the health probe and `receive` dial through it; an
+  I/O failure is now `PvfsError::Io` naming the target (`I/O error during
+  dial <target>: …`), a refusal `Forbidden`. Monitoring as a whole — what
+  the fleet exposes and a worked Home Assistant build — is the new doc 30.
+
 - **The drain asks before it discards, and never against the arr's choice
   (D145).** On the new model's first production day feederbox's `resolve`
   trashed Sonarr's upgrade of an episode: the NAS's catalogue still listed
