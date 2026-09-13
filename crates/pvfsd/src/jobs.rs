@@ -334,6 +334,9 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                         // fresh content — the consuming passes should run now
                         cb_state.nudge_content();
                     }
+                    // D146 — current with the source on a quiet log: stamp the
+                    // row (it is healthy) but nudge nothing (nothing is new).
+                    FollowEvent::UpToDate { .. } => cb_state.mark_ok("follow"),
                     FollowEvent::Retrying { reason } => cb_state.mark_retry("follow", &reason),
                 });
                 match r {

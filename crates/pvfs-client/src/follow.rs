@@ -24,6 +24,12 @@ pub enum FollowEvent<'a> {
     Connected { target: &'a str },
     /// New events ingested and folded; the store is at `tip`.
     CaughtUp { tip: u64 },
+    /// D146 — connected and current: a long-poll came back empty with the
+    /// source's tip at or behind ours (`tip`). `CaughtUp` only fires when
+    /// events land, so on a quiet log this is the follower's only proof of
+    /// health — without it the status row froze at the last event and the
+    /// stall detector called a caught-up follower "overdue" forever.
+    UpToDate { tip: u64 },
     /// A transient failure; the loop retries after backoff.
     Retrying { reason: String },
 }
@@ -35,9 +41,22 @@ pub fn dial_source(src: &ReplicaSource) -> Result<Client, PvfsError> {
     let key = identity::device_key(&mn, "", 0)?;
     let pubkey = crypto::pubkey_bytes(&key);
     let sign = |d: &[u8; 32]| crypto::sign_digest(&key, d).unwrap_or_default();
-    let dial_err = |e: crate::ClientError| PvfsError::BadInput {
-        field: "follow".into(),
-        reason: e.to_string(),
+    // D146 — say what failed: a dial that cannot connect is an I/O error
+    // naming the target, not "invalid input for follow" (which the health
+    // probe and `receive` both borrowed, since they dial through here too).
+    let dial_err = |e: crate::ClientError| match e {
+        crate::ClientError::Io(source) => PvfsError::Io {
+            op: format!("dial {}", src.target),
+            source,
+        },
+        crate::ClientError::Server { code, message } if code == "forbidden" => PvfsError::Forbidden {
+            action: format!("dial {}", src.target),
+            reason: message,
+        },
+        other => PvfsError::BadInput {
+            field: format!("dial {}", src.target),
+            reason: other.to_string(),
+        },
     };
     match src.transport.as_str() {
         "tcp" => Client::connect_tcp_signed(&src.target, &src.pin, &pubkey, sign).map_err(dial_err),
@@ -111,7 +130,7 @@ pub fn run(
                     break; // back off + retry
                 }
             };
-            let (_tip, events) = match client.log_wait(from, 512, poll_ms, "") {
+            let (source_tip, events) = match client.log_wait(from, 512, poll_ms, "") {
                 Ok(r) => r,
                 Err(e) => {
                     notify(FollowEvent::Retrying {
@@ -126,6 +145,10 @@ pub fn run(
                 // advanced. Sweep the generations; fold only if rows landed.
                 let scope = (!dial.region.is_empty()).then_some(dial.region.as_str());
                 match crate::regions::sync_generations(&mut client, data_dir, scope) {
+                    // D146 — nothing new and the source is not ahead of us:
+                    // current. Said on every quiet tick (the poll window), so
+                    // "last ok" means "last confirmed current with the source".
+                    Ok(0) if source_tip < from => notify(FollowEvent::UpToDate { tip: from - 1 }),
                     Ok(0) => {}
                     Ok(_) => {
                         let _ = Engine::open(data_dir).and_then(|e| e.close());

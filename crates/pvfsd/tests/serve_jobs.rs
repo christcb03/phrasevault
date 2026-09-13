@@ -264,8 +264,60 @@ fn follow_job_keeps_a_replica_fresh() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
+    // D146 — a quiet log is a healthy log. With nothing more authored, the
+    // row must keep being stamped (each empty long-poll that finds the
+    // source not ahead is "current"), so `last_ok` advances and the stall
+    // detector never calls a caught-up follower overdue. Before D146 the row
+    // froze at the last event: production showed `follow` overdue on both
+    // replicas permanently while their tips matched the owner's.
+    let first = jobs
+        .snapshot()
+        .into_iter()
+        .find(|r| r.name == "follow")
+        .and_then(|r| r.last_ok_ms)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let row = jobs
+            .snapshot()
+            .into_iter()
+            .find(|r| r.name == "follow")
+            .unwrap();
+        if row.last_ok_ms.is_some_and(|t| t > first) {
+            assert_eq!(row.state, "running", "{row:?}");
+            assert!(row.last_error.is_none(), "{row:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a quiet follower's row froze: {row:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     shutdown.store(true, Ordering::SeqCst);
     runner.join().unwrap();
+}
+
+/// D146 — a dial that cannot connect says so and names the target. The
+/// health probe and `receive` dial through the same function, and their
+/// errors read "invalid input for follow", which sent a person looking for
+/// bad input that did not exist.
+#[test]
+fn a_failed_dial_names_the_target() {
+    test_config_dir();
+    let src = ReplicaSource {
+        transport: "tcp".into(),
+        target: "127.0.0.1:1".into(),
+        pin: "00".repeat(32),
+        region: String::new(),
+    };
+    let msg = match pvfs_client::follow::dial_source(&src) {
+        Ok(_) => panic!("nothing listens on port 1"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("dial 127.0.0.1:1"), "{msg}");
+    assert!(!msg.contains("invalid input"), "{msg}");
 }
 
 /// P5.2's "done means": content on the owner reaches a consumer's export
