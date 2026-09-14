@@ -338,7 +338,38 @@ pub fn write_manifest_sidecar(
         text.push_str(&hex::encode(h));
         text.push('\n');
     }
-    crate::storage::atomic_overwrite(&manifest_sidecar_path(file), text.as_bytes())
+    let side = manifest_sidecar_path(file);
+    crate::storage::atomic_overwrite(&side, text.as_bytes())?;
+    // D150 — never leave a sidecar dated before its file, or the reader takes
+    // it for stale at once: a file dated in the future (clock skew, a copy that
+    // kept its source's time — mediabox has 161) would be re-hashed on every
+    // pass, forever. Best-effort, like the cache itself.
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified());
+    if let (Ok(fm), Ok(sm)) = (modified(file), modified(&side)) {
+        if fm > sm {
+            if let Ok(f) = std::fs::File::options().write(true).open(&side) {
+                let _ = f.set_modified(fm);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// D150 — whether the sidecar at `sidecar` can still describe `file`: it was
+/// written no earlier than the file's bytes last changed (mtime).
+///
+/// The exact-size check (D91) lets through a SAME-size replacement — an
+/// in-place tag edit (`mkvpropedit`), or another encode that happens to match
+/// to the byte — and the catalog then carries the old file's hash. Every
+/// writer lays a sidecar down after the bytes are final (receive after its
+/// rename, the scan after hashing) and `write_manifest_sidecar` never leaves
+/// one dated before its file, so a sidecar older than its file means the file
+/// changed since. mtime, not ctime: a `chown -R` over the library changes
+/// every ctime, and would turn this into a re-hash of all of it. What it
+/// cannot see is a same-size replacement that brought an OLDER mtime with it.
+fn sidecar_is_fresh(file: &Path, sidecar: &Path) -> bool {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified());
+    matches!((modified(file), modified(sidecar)), (Ok(f), Ok(s)) if s >= f)
 }
 
 /// A parsed sidecar: the whole-file hash when the writer knew it (v2 only), and
@@ -354,9 +385,14 @@ struct Sidecar {
 /// Read the sidecar, preferring the D91 dotfile and falling back to the v1
 /// name so a library written before the rename keeps its hashes.
 fn read_manifest_sidecar(file: &Path) -> Option<Sidecar> {
-    let text = std::fs::read_to_string(manifest_sidecar_path(file))
-        .or_else(|_| std::fs::read_to_string(legacy_manifest_sidecar_path(file)))
-        .ok()?;
+    let (path, text) = [manifest_sidecar_path(file), legacy_manifest_sidecar_path(file)]
+        .into_iter()
+        .find_map(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t)))?;
+    // D150 — one check here covers every reader: the scan, receive's "already
+    // there", the backfill, the manifest a serve hands out.
+    if !sidecar_is_fresh(file, &path) {
+        return None;
+    }
     let mut lines = text.lines();
     let v2 = match lines.next()? {
         h if h == MANIFEST_HEADER => true,

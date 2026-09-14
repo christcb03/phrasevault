@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A manifest older than its file is not trusted (D150).** D91's exact-size
+  check refused a sidecar when a replacement changed the size, which an arr
+  upgrade nearly always does; a SAME-size replacement — an in-place tag edit
+  (`mkvpropedit`), another encode matching to the byte — went through, and the
+  scan recorded the old file's hash. `read_manifest_sidecar`, which every
+  reader passes (the scan, receive's "already there", the backfill,
+  `manifest_of`), now returns nothing when the sidecar is older than its
+  file's mtime, so the file is hashed from its bytes. `write_manifest_sidecar`
+  never leaves a sidecar dated before its file, so one dated in the future is
+  not re-hashed on every pass. mtime, not ctime: a `chown -R` would otherwise
+  re-hash a whole library. On the production NAS 33 of 26,182 sidecars were
+  older than their files, all already refused by size.
+
 - **A manifest whose file is gone goes to the trash (D149).** PVFS took a
   sidecar along only when it moved the file itself (a drain, a retraction);
   one whose file Sonarr renamed, or rclone's upload temp name that then became
