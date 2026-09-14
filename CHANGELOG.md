@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every trash is purged by its retention, and every box reports it
+  (D148).** A replaced library copy goes to the library's `.pvfs-trash`, and
+  nothing purged it: D133 purged only draining regions. On the production NAS
+  an 18 GB bucket sat 19 days past a 7-day retention. `purge_region_trash`
+  purges every catalogue region a box holds locally by that region's
+  retention; `receive` now calls it after each pass (and `resolve`, as
+  before). Each pass records, per region, the bytes kept, the buckets, the
+  oldest bucket's day and what it freed; `serve status` carries it as
+  `trash` (defaulted, no proto bump), the owner's health record keeps it per
+  peer, and `pvfs serve status` / `pvfs fleet health` print it — so a purge
+  that stops working shows up as an aging bucket instead of a full disk.
+
 - **`follow` says it is current on a quiet log; dial errors say what failed
   (D146).** The follow job stamped its status row only when events landed, so
   on a quiet log `last_ok` froze at the last event and the stall detector

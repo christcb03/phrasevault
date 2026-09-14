@@ -2069,6 +2069,26 @@ impl Engine {
         Ok(out)
     }
 
+    /// D148 — purge the trash of EVERY catalogue region this box holds
+    /// locally (draining, receiving, or neither) by that region's retention,
+    /// and say what each keeps. D133 purged only draining regions, so the
+    /// library copies `receive` replaces piled up on the holder with nothing
+    /// to remove them (D127: "retention on non-draining regions — later").
+    pub fn purge_region_trash(&self) -> Result<Vec<crate::sync::RegionTrash>> {
+        let mut out = Vec::new();
+        for b in self.local_bindings()? {
+            if !self.is_catalogue_region(&b.folder_id)? {
+                continue;
+            }
+            let root = uri_to_path(&b.source_uri)?;
+            let days = crate::sync::region_retention_days(&self.data_dir, &b.folder_id)?;
+            let purge = crate::sync::purge_trash(&root, days, 0)?;
+            let kept = crate::sync::trash_stats(&root);
+            out.push(crate::sync::RegionTrash { region: b.folder_id.clone(), retention_days: days, purge, kept });
+        }
+        Ok(out)
+    }
+
     /// D145 — folders only staging has, made in this box's receiving region
     /// with the most free space, before any file lands: the drain removes a
     /// staging folder only once the library holds it, and an arr recreates a

@@ -99,6 +99,8 @@ pub struct ServeStatusReply {
     pub conflicts: u64,
     pub stale: u64,
     pub capacity: Option<pvfs_proto::CapacityWire>,
+    /// D148 — each region's trash as its last purge pass left it.
+    pub trash: Vec<pvfs_proto::TrashWire>,
 }
 
 /// Identity + root of the forest behind the socket.
@@ -306,12 +308,14 @@ impl Client {
                 conflicts,
                 stale,
                 capacity,
+                trash,
             } => Ok(ServeStatusReply {
                 runner,
                 jobs,
                 conflicts,
                 stale,
                 capacity,
+                trash,
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }

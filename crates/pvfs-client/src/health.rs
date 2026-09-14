@@ -46,6 +46,9 @@ pub struct PeerHealth {
     pub stale: u64,
     /// D131: `(free, total)` bytes of the filesystem under its sync store.
     pub capacity: Option<(u64, u64)>,
+    /// D148: each region's trash on that box, as its last purge pass left it.
+    #[serde(default)]
+    pub trash: Vec<pvfs_proto::TrashWire>,
     pub error: Option<String>,
 }
 
@@ -195,6 +198,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.conflicts = s.conflicts;
             h.stale = s.stale;
             h.capacity = s.capacity.map(|c| (c.free_bytes, c.total_bytes));
+            h.trash = s.trash;
         }
         Err(e) => h.error = Some(format!("serve status: {e}")),
     }

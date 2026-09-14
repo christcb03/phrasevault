@@ -123,6 +123,10 @@ pub enum ServerMsg {
         /// — on a holder, the library's disk. Absent on older daemons.
         #[serde(default)]
         capacity: Option<CapacityWire>,
+        /// D148: each local catalogue region's trash as its last purge pass
+        /// left it. Absent on older daemons, so defaulted rather than a proto bump.
+        #[serde(default)]
+        trash: Vec<TrashWire>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -225,6 +229,20 @@ pub struct ServeJobWire {
 pub struct CapacityWire {
     pub free_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// D148 — one catalogue region's trash on a box, as its last purge pass left
+/// it: what is kept, the oldest bucket (days since the epoch — the bucket's
+/// own name), the retention it is purged by, and what that pass freed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashWire {
+    pub region: String,
+    pub bytes: u64,
+    pub buckets: u32,
+    pub oldest_day: Option<u64>,
+    pub retention_days: u64,
+    pub freed_bytes: u64,
+    pub measured_ms: u64,
 }
 
 /// One shipped log row, verbatim (F2 log shipping, doc 17 §5): the replica

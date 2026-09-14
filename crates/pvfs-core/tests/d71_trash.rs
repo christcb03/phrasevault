@@ -80,3 +80,16 @@ fn space_pressure_purges_even_recent_buckets() {
     let rep = purge_trash(root.path(), 14, u64::MAX).unwrap();
     assert_eq!(rep.removed, 1, "under pressure, recency does not protect it");
 }
+
+/// D148 — the stats say what the trash keeps: bytes, buckets, the oldest day.
+#[test]
+fn trash_stats_say_what_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(pvfs_core::sync::trash_stats(root.path()), pvfs_core::sync::TrashStats::default(), "no trash, nothing kept");
+    let f = root.path().join("ep.mkv");
+    fs::write(&f, b"12345").unwrap();
+    move_to_trash(root.path(), &f).unwrap();
+    let s = pvfs_core::sync::trash_stats(root.path());
+    assert_eq!((s.buckets, s.bytes), (1, 5), "{s:?}");
+    assert!(s.oldest_day.is_some(), "{s:?}");
+}
