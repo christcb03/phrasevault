@@ -247,6 +247,11 @@ pub struct ScanStats {
     /// carries the first few, with reasons, so the report can say WHICH.
     pub needs_attention: u64,
     pub quarantined: Vec<(String, String)>,
+    /// D149 — manifest sidecars moved to the trash because the file beside
+    /// them was gone: renamed or deleted by something other than PVFS (Sonarr
+    /// adding an episode title, rclone renaming its upload temp). PVFS takes a
+    /// sidecar along when IT moves a file (D145); nothing else ever did.
+    pub orphan_sidecars: u64,
 }
 
 #[derive(Debug)]
@@ -2412,15 +2417,17 @@ impl Engine {
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         let mut visited = HashSet::new();
-        walk_disk(
-            &root,
-            Vec::new(),
-            &mut visited,
-            &mut files,
-            &mut dirs,
-            &mut stats,
-            &WalkCtx { binding: b, settle_ms },
-        )?;
+        let ctx = WalkCtx {
+            binding: b,
+            settle_ms,
+            orphans: std::cell::RefCell::new(Vec::new()),
+        };
+        walk_disk(&root, Vec::new(), &mut visited, &mut files, &mut dirs, &mut stats, &ctx)?;
+        // D149 — a sidecar whose file something else renamed or deleted. To
+        // the trash (PVFS never deletes; the region's retention does), once it
+        // has been alone longer than anything PVFS itself would leave it so.
+        // Before the catalogue branch, so every kind of binding does it.
+        stats.orphan_sidecars = trash_orphan_sidecars(&root, ctx.orphans.into_inner(), now_ms());
 
         // D125 — a catalogue region's binding catalogues; it does not ingest.
         // Rows, not nodes: nothing below this point runs for it, and nothing
@@ -4745,6 +4752,10 @@ struct WalkCtx<'a> {
     /// 0 = index whatever is on disk now (a one-shot scan, `--import`);
     /// non-zero = the watcher's "has it stopped being written" window.
     settle_ms: u64,
+    /// D149 — sidecars found with no file beside them, with their own mtime.
+    /// Collected by the walk and acted on by `scan_binding` after it: the walk
+    /// only looks.
+    orphans: std::cell::RefCell<Vec<(PathBuf, u64)>>,
 }
 
 fn walk_disk(
@@ -4761,8 +4772,15 @@ fn walk_disk(
         return Ok(()); // symlinked dir cycle
     }
     let uri = path_to_uri(dir)?;
-    for entry in LocalBackend.list(&uri)? {
+    let entries = LocalBackend.list(&uri)?;
+    // D149 — a sidecar is an orphan when the file it names is not in this same
+    // listing, so the names are needed before the loop reaches it.
+    let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for entry in &entries {
         if entry.name.starts_with('.') {
+            if !entry.is_dir && sidecar_is_orphan(&entry.name, &names) {
+                ctx.orphans.borrow_mut().push((dir.join(&entry.name), entry.mtime_ms));
+            }
             // D81 — our OWN bookkeeping is not something the operator chose not
             // to index, and counting it as `skipped` would put a permanent +1
             // on every scan report of every root. Dotfiles they put there are
@@ -4778,6 +4796,9 @@ fn walk_disk(
         // ourselves write next to them". Not counted as `skipped`, for the same
         // reason the dotfile arm above does not count ours (D81).
         if !entry.is_dir && crate::sync::is_sidecar_name(&entry.name) {
+            if sidecar_is_orphan(&entry.name, &names) {
+                ctx.orphans.borrow_mut().push((dir.join(&entry.name), entry.mtime_ms));
+            }
             continue;
         }
         let child = dir.join(&entry.name);
@@ -4860,6 +4881,43 @@ fn walk_disk(
         });
     }
     Ok(())
+}
+
+/// D149 — how long a sidecar must have been alone before a scan moves it.
+/// `receive` writes a sidecar AFTER its rename and the watch writes one only
+/// for a file it is looking at, so PVFS never leaves one without its file for
+/// more than an instant; the hour is the belt, for writers we do not know.
+pub const ORPHAN_SIDECAR_GRACE_MS: u64 = 60 * 60 * 1_000;
+
+/// D149 — whether `name` is a sidecar whose file is not in `names` (the same
+/// directory's listing). `.X.manifest` belongs to `X` (D91) — or to `.X`, the
+/// v1 name for a dotfile's sidecar; v1's `X.manifest` belongs to `X`. A bare
+/// `.manifest` is nobody's sidecar and is left alone.
+fn sidecar_is_orphan(name: &str, names: &HashSet<&str>) -> bool {
+    let Some(stem) = name.strip_suffix(".manifest") else {
+        return false;
+    };
+    if stem.is_empty() || stem == "." {
+        return false;
+    }
+    let own = stem.strip_prefix('.').unwrap_or(stem);
+    !names.contains(own) && !names.contains(stem)
+}
+
+/// D149 — move each orphan older than the grace to `root`'s trash; how many
+/// went. Best-effort, as `move_to_trash_with_sidecar` treats sidecars: a root
+/// this box cannot write keeps them, and the next pass tries again.
+fn trash_orphan_sidecars(root: &std::path::Path, found: Vec<(PathBuf, u64)>, now: u64) -> u64 {
+    let mut moved = 0;
+    for (path, mtime_ms) in found {
+        if mtime_ms.saturating_add(ORPHAN_SIDECAR_GRACE_MS) > now {
+            continue;
+        }
+        if crate::sync::move_to_trash(root, &path).is_ok() {
+            moved += 1;
+        }
+    }
+    moved
 }
 
 /// Whether the running user can read (and, for dirs, also traverse) `path`.

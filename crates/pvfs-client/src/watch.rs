@@ -20,7 +20,7 @@ const SETTLE_RECHECK: Duration = Duration::from_secs(20);
 /// Progress callbacks: stdout lines in the CLI, status rows in pvfsd.
 pub enum WatchEvent {
     /// A scan pass ingested changes:
-    /// (folder_id, added, changed, removed, unlinked).
+    /// (folder_id, added, changed, removed, unlinked, orphan_sidecars).
     ///
     /// D111 — `unlinked` is the fifth field because D105 made a scan able to
     /// take a file OUT OF THE TREE, not merely retire its location, and this
@@ -29,7 +29,12 @@ pub enum WatchEvent {
     /// nobody can see: `removed` counts retired locations, and a node dropped
     /// from the tree looks identical to a location going away on a box that
     /// still holds a copy elsewhere.
-    Ingested(String, u64, u64, u64, u64),
+    ///
+    /// D149 — the sixth is manifests moved to the trash because the file they
+    /// describe was gone (renamed or deleted by something else). Besides
+    /// writing sidecars it is the only thing a pass changes on disk, so it is
+    /// reported the same way, and a pass that did only that is not `Quiet`.
+    Ingested(String, u64, u64, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
     /// A scan pass has BEGUN (D81) — what lets the daemon tell a wedged
@@ -115,6 +120,7 @@ pub fn run(
                         r.stats.changed,
                         r.stats.removed,
                         r.stats.unlinked,
+                        r.stats.orphan_sidecars,
                     ));
                 }
             }
@@ -193,7 +199,11 @@ pub fn run(
                         }
                         let mut said_something = false;
                         for r in reports.iter().filter(|r| {
-                            r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked
+                            r.stats.added
+                                + r.stats.changed
+                                + r.stats.removed
+                                + r.stats.unlinked
+                                + r.stats.orphan_sidecars
                                 > 0
                         }) {
                             said_something = true;
@@ -203,6 +213,7 @@ pub fn run(
                                 r.stats.changed,
                                 r.stats.removed,
                                 r.stats.unlinked,
+                                r.stats.orphan_sidecars,
                             ));
                         }
                         // The pass ran cleanly either way — say so, so progress
