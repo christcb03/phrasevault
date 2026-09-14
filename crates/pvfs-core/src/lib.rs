@@ -66,6 +66,7 @@ pub use fs::{
     ScanReport,
     ScanStats,
     ScanWriter,
+    ORPHAN_SIDECAR_GRACE_MS,
     UNLINK_GRACE_MS,
     VerifyOutcome,
     ViewCopy,

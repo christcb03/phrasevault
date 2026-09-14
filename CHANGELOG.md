@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A manifest whose file is gone goes to the trash (D149).** PVFS took a
+  sidecar along only when it moved the file itself (a drain, a retraction);
+  one whose file Sonarr renamed, or rclone's upload temp name that then became
+  the real file, stayed forever — two of ~34,700 on the production fleet. The
+  scan's walk already lists every directory, so it now notes a `.X.manifest`
+  (or v1 `X.manifest`) with no `X` beside it, and `scan_binding` moves each
+  one older than `ORPHAN_SIDECAR_GRACE_MS` (an hour) to the root's
+  `.pvfs-trash`, where the retention purge (D148) removes it. Counted as
+  `ScanStats.orphan_sidecars`; `pvfs scan` prints it and the watch logs it
+  (`WatchEvent::Ingested` gains a sixth field).
+
 - **Every trash is purged by its retention, and every box reports it
   (D148).** A replaced library copy goes to the library's `.pvfs-trash`, and
   nothing purged it: D133 purged only draining regions. On the production NAS

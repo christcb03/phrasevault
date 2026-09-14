@@ -5660,13 +5660,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         debounce_ms,
                         &never,
                         |ev| match ev {
-                            pvfs_client::watch::WatchEvent::Ingested(f, a, c, r, u) => {
+                            pvfs_client::watch::WatchEvent::Ingested(f, a, c, r, u, o) => {
                                 if !json && a + c + r + u > 0 {
                                     // D111 — `-{r}` is retired LOCATIONS; `~{u}`
                                     // is nodes taken out of the tree (D105).
                                     // Reporting only the first reads as "the
                                     // file moved" for something that left.
                                     println!("ingested {f}: +{a} !{c} -{r} ~{u}");
+                                }
+                                // D149 — manifests whose file had gone.
+                                if !json && o > 0 {
+                                    println!("trashed {o} orphaned manifest(s) in {f}");
                                 }
                             }
                             // A quiet pass is progress for the daemon's stall
@@ -7658,7 +7662,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"pending_unlink\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"pending_unlink\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{},\"orphan_sidecars\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
@@ -7668,7 +7672,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             r.stats.pending_unlink,
                             r.stats.skipped,
                             r.stats.unreadable,
-                            r.stats.empty_dirs
+                            r.stats.empty_dirs,
+                            r.stats.orphan_sidecars
                         )
                     })
                     .collect();
@@ -7676,7 +7681,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else {
                 for r in &reports {
                     println!(
-                        "{}: +{} added, {} unchanged, {} changed, -{} removed, -{} unlinked, {} awaiting unlink, {} skipped, {} unreadable, {} empty folders",
+                        "{}: +{} added, {} unchanged, {} changed, -{} removed, -{} unlinked, {} awaiting unlink, {} skipped, {} unreadable, {} empty folders, {} orphaned manifests trashed",
                         r.folder_id,
                         r.stats.added,
                         r.stats.unchanged,
@@ -7686,7 +7691,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         r.stats.pending_unlink,
                         r.stats.skipped,
                         r.stats.unreadable,
-                        r.stats.empty_dirs
+                        r.stats.empty_dirs,
+                        r.stats.orphan_sidecars
                     );
                 }
                 let changed: u64 = reports.iter().map(|r| r.stats.changed).sum();

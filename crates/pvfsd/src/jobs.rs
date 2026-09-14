@@ -394,7 +394,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 let cb = Arc::clone(&st);
                 let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| match ev {
                     WatchEvent::PassStarted => cb.mark_pass_start("watch"),
-                    WatchEvent::Ingested(ref folder, a, c, rm, un) => {
+                    WatchEvent::Ingested(ref folder, a, c, rm, un, orphans) => {
                         cb.mark_pass_end("watch");
                         cb.mark_ok("watch");
                         // D111 — SAY WHAT THE PASS DID. This job is how the
@@ -409,6 +409,13 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                             eprintln!(
                                 "pvfsd: watch ingested {folder}: \
                                  +{a} changed {c} removed {rm} unlinked {un}"
+                            );
+                        }
+                        // D149 — the one thing a pass moves on disk.
+                        if orphans > 0 {
+                            eprintln!(
+                                "pvfsd: watch moved {orphans} orphaned manifest(s) \
+                                 to the trash in {folder}"
                             );
                         }
                         if a + c + rm > 0 {
