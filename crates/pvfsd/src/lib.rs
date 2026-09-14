@@ -581,6 +581,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
+                        trash: j.trash_snapshot(),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
@@ -588,6 +589,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
+                        trash: Vec::new(),
                     },
                 }
             }

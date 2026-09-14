@@ -6089,7 +6089,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
             let rep = engine.resolve_conflicts(dry_run, &std::sync::atomic::AtomicBool::new(false), &mut confirm)?;
             // D133 — then free what retention allows (never on a dry run).
-            let purged: u64 = if dry_run { 0 } else { engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum() };
+            let purged: u64 = if dry_run { 0 } else { engine.purge_region_trash()?.iter().map(|t| t.purge.removed).sum() };
             if json {
                 println!(
                     "{}",
@@ -6730,6 +6730,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     if let Some((free, total)) = r.last.capacity {
                         notes.push(format!("{} free of {}", fmt_bytes(free), fmt_bytes(total)));
+                    }
+                    let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
+                    for t in r.last.trash.iter().filter(|t| t.bytes > 0) {
+                        notes.push(format!(
+                            "trash {} {}{}",
+                            &t.region[..t.region.len().min(8)],
+                            fmt_bytes(t.bytes),
+                            t.oldest_day.map(|d| format!(" (oldest {} d, kept {} d)", today.saturating_sub(d), t.retention_days)).unwrap_or_default()
+                        ));
                     }
                     if notes.is_empty() {
                         notes.push("jobs clean".into());
@@ -8906,7 +8915,8 @@ fn serve_status_print(
     })
     .map_err(remote_err)?;
     let st = client.serve_status_full().map_err(remote_err)?;
-    let (runner, jobs, conflicts, stale, capacity) = (st.runner, st.jobs, st.conflicts, st.stale, st.capacity);
+    let (runner, jobs, conflicts, stale, capacity, trash) = (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash);
+    let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
             .iter()
@@ -8925,12 +8935,13 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
                 .map(|c| format!("{{\"free_bytes\":{},\"total_bytes\":{}}}", c.free_bytes, c.total_bytes))
                 .unwrap_or_else(|| "null".into()),
+            serde_json::to_string(&trash).unwrap_or_else(|_| "[]".into()),
         );
     } else {
         println!("runner: {runner}");
@@ -8942,6 +8953,16 @@ fn serve_status_print(
         }
         if let Some(c) = capacity {
             println!("capacity: {} free of {}  (the sync store's filesystem; D131)", fmt_bytes(c.free_bytes), fmt_bytes(c.total_bytes));
+        }
+        for t in &trash {
+            println!(
+                "trash {}: {} in {} day bucket(s){}; kept {} days  (D148)",
+                &t.region[..t.region.len().min(8)],
+                fmt_bytes(t.bytes),
+                t.buckets,
+                t.oldest_day.map(|d| format!(", oldest {} days old", today.saturating_sub(d))).unwrap_or_default(),
+                t.retention_days
+            );
         }
         for j in &jobs {
             let mut line = format!("{:<8} {}", j.name, j.state);

@@ -85,3 +85,35 @@ fn the_compatibility_floor_is_not_above_what_we_speak() {
          fleet-wide event and should be a deliberate edit, not a surprise."
     );
 }
+
+/// D148 — an older daemon's `serve status` reply has no `trash`; it still
+/// decodes (empty), and a new reply round-trips.
+#[test]
+fn an_older_serve_jobs_reply_without_trash_decodes() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[],"conflicts":0,"stale":0}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { trash, capacity, .. } => {
+            assert!(trash.is_empty());
+            assert!(capacity.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    let new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: vec![],
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: vec![pvfs_proto::TrashWire {
+            region: "fe38175f".into(),
+            bytes: 5,
+            buckets: 1,
+            oldest_day: Some(20691),
+            retention_days: 7,
+            freed_bytes: 0,
+            measured_ms: 1,
+        }],
+    };
+    let s = serde_json::to_string(&new).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}

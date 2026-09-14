@@ -680,6 +680,41 @@ pub fn purge_trash(root: &Path, keep_days: u64, min_free_bytes: u64) -> Result<T
     Ok(report)
 }
 
+/// D148 — what a root's trash holds: bytes, bucket count, the oldest bucket's
+/// day. Walks the trash (a few hundred files at most), so it belongs in a job's
+/// pass, never in a status probe (D136).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TrashStats {
+    pub bytes: u64,
+    pub buckets: u32,
+    pub oldest_day: Option<u64>,
+}
+
+pub fn trash_stats(root: &Path) -> TrashStats {
+    let mut s = TrashStats::default();
+    let Ok(rd) = std::fs::read_dir(trash_root(root)) else {
+        return s;
+    };
+    for e in rd.flatten() {
+        let Some(day) = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        s.buckets += 1;
+        s.bytes += dir_bytes(&e.path());
+        s.oldest_day = Some(s.oldest_day.map_or(day, |d| d.min(day)));
+    }
+    s
+}
+
+/// D148 — one region's trash after a purge pass: what went, what is kept.
+#[derive(Debug)]
+pub struct RegionTrash {
+    pub region: String,
+    pub retention_days: u64,
+    pub purge: TrashPurge,
+    pub kept: TrashStats,
+}
+
 fn dir_bytes(dir: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {

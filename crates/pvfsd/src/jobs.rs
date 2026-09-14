@@ -94,6 +94,9 @@ pub struct JobsState {
     /// the memory bounds the noise, it must not become a permanent blindfold.
     tier_unfetchable: Mutex<std::collections::HashSet<String>>,
     tier_passes: std::sync::atomic::AtomicU64,
+    /// D148 — each region's trash as the last purge pass left it, so `serve
+    /// status` reports it without walking a disk (D136).
+    trash: Mutex<Vec<pvfs_proto::TrashWire>>,
 }
 
 impl JobsState {
@@ -113,6 +116,7 @@ impl JobsState {
             pass_dur: Mutex::new(std::collections::HashMap::new()),
             tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
             tier_passes: std::sync::atomic::AtomicU64::new(0),
+            trash: Mutex::new(Vec::new()),
         };
         s.reload()?;
         Ok(s)
@@ -120,6 +124,33 @@ impl JobsState {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// D148 — keep what a purge pass found, per region (replacing that
+    /// region's previous entry).
+    fn record_trash(&self, found: &[pvfs_core::sync::RegionTrash]) {
+        let now = now_ms();
+        let mut t = self.trash.lock().unwrap();
+        for r in found {
+            let w = pvfs_proto::TrashWire {
+                region: r.region.clone(),
+                bytes: r.kept.bytes,
+                buckets: r.kept.buckets,
+                oldest_day: r.kept.oldest_day,
+                retention_days: r.retention_days,
+                freed_bytes: r.purge.freed_bytes,
+                measured_ms: now,
+            };
+            match t.iter_mut().find(|x| x.region == w.region) {
+                Some(x) => *x = w,
+                None => t.push(w),
+            }
+        }
+    }
+
+    /// D148 — the trash as the last purge passes left it (`serve status`).
+    pub fn trash_snapshot(&self) -> Vec<pvfs_proto::TrashWire> {
+        self.trash.lock().unwrap().clone()
     }
 
     /// Re-read the config (SIGHUP). Run history (`last_ok`/`last_error`)
@@ -667,6 +698,23 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 pvfs_client::receive::MIN_FREE_BYTES,
                 &cancel,
             );
+            // D148 — then the library copies this box's receive replaced (its
+            // regions' trash) are purged by each region's retention: D133
+            // purged only draining regions, so they piled up on the holder.
+            match pvfs_core::Engine::open(st.data_dir()).and_then(|e| {
+                let t = e.purge_region_trash();
+                e.close()?;
+                t
+            }) {
+                Ok(t) => {
+                    let n: u64 = t.iter().map(|x| x.purge.removed).sum();
+                    if n > 0 {
+                        eprintln!("pvfsd: receive purged {n} trash buckets past retention");
+                    }
+                    st.record_trash(&t);
+                }
+                Err(e) => eprintln!("pvfsd: receive: trash purge: {e}"),
+            }
             match r {
                 Ok(rep) => {
                     if !rep.folders.is_empty() {
@@ -694,8 +742,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 let sources = pvfs_client::receive::announced_sources(&engine);
                 let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
                 let r = engine.resolve_conflicts(false, &cancel, &mut confirm)?;
-                // D133 — then free what retention allows.
-                let purged: u64 = engine.purge_draining_trash()?.iter().map(|(_, p)| p.removed).sum();
+                // D133 — then free what retention allows; D148 — every local
+                // region's trash, and what each keeps is recorded for status.
+                let trash = engine.purge_region_trash()?;
+                let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
+                st.record_trash(&trash);
                 engine.close()?;
                 Ok((r, purged))
             })();
