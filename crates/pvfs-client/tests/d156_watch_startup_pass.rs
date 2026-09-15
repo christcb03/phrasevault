@@ -1,27 +1,30 @@
-//! D154 — a stopped pass is not reported as ingested.
+//! D156 — the watch's startup pass reports the way every other pass does.
 //!
-//! The watch sent `Ingested` for every report of a pass, stopped or not, and
-//! the daemon logged `watch ingested … +8520` for a mediabox pass that had
-//! committed nothing, one second before it shut down. A stopped pass is now
-//! `Stopped`: never `Ingested`, and never `Quiet`, which means a completed
-//! pass.
+//! `watch::run` makes one pass before it starts watching, and that pass had
+//! its own copy of the report-to-event loop: `Ingested` for every report,
+//! never `Quiet`, and so never D156's `NeedsAttention`. The lab found it: the
+//! first pass after the D156 roll skipped a file with a real EIO and said
+//! nothing about it, while every later pass did. Both now go through
+//! `pass_events`, whose unit tests cover the quarantine. This test pins the
+//! startup pass to it: a clean startup pass is `Quiet`, as a clean pass
+//! anywhere else is, where the old copy said `Ingested` of nothing.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pvfs_client::watch::{self, WatchEvent};
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
 
 #[test]
-fn a_stopped_pass_is_stopped_not_ingested_and_not_quiet() {
+fn the_startup_pass_reports_like_every_other_pass() {
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("lib");
     std::fs::create_dir_all(&lib).unwrap();
-    for i in 0..3u8 {
-        std::fs::write(lib.join(format!("e{i}.mkv")), vec![i; 64]).unwrap();
-    }
+    // Written just now, so inside the watch's settle window: the pass has
+    // nothing to take, and completes with nothing to say.
+    std::fs::write(lib.join("e0.mkv"), b"fresh").unwrap();
     let data = dir.path().join("forest");
-    let region = {
+    {
         let (mut e, _mn) = Engine::init(&data).unwrap();
         let root = e.identity.root_node_id.clone();
         let region = e
@@ -49,35 +52,26 @@ fn a_stopped_pass_is_stopped_not_ingested_and_not_quiet() {
         )
         .unwrap();
         e.close().unwrap();
-        region
-    };
+    }
 
-    // The stop is already raised when the watch starts, as when SIGTERM lands
-    // during its first pass. The files were written just now, so they are
-    // inside the watch's settle window and the pass has none to take; the
-    // stop ends it before its sweep and its head.
-    let stop = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(AtomicBool::new(false));
     let mut seen: Vec<String> = Vec::new();
     watch::run(&data, 3600, 2000, &stop, |ev| {
         seen.push(match ev {
-            WatchEvent::Ingested(f, ..) => format!("ingested {f}"),
-            WatchEvent::Stopped(f, a, c, _) => format!("stopped {f} +{a} !{c}"),
+            WatchEvent::Ingested(..) => "ingested".into(),
+            WatchEvent::Stopped(..) => "stopped".into(),
             WatchEvent::Quiet => "quiet".into(),
             WatchEvent::PassStarted => "started".into(),
             WatchEvent::ScanError(e) => format!("error {e}"),
-            WatchEvent::Watching(..) => "watching".into(),
             WatchEvent::NeedsAttention(n, _) => format!("attention {n}"),
+            WatchEvent::Watching(..) => {
+                // The startup pass is over, which is all this test is about.
+                stop.store(true, Ordering::SeqCst);
+                "watching".into()
+            }
         })
     })
     .unwrap();
 
-    assert!(seen.contains(&format!("stopped {region} +0 !0")), "{seen:?}");
-    assert!(
-        !seen.iter().any(|s| s.starts_with("ingested") || s == "quiet"),
-        "a stopped pass is neither an ingest nor a completed quiet pass: {seen:?}"
-    );
-
-    // And nothing was published for it.
-    let e = Engine::open(&data).unwrap();
-    assert!(e.region_snapshots(&region).unwrap().is_empty(), "{seen:?}");
+    assert_eq!(seen, vec!["started", "quiet", "watching"], "{seen:?}");
 }
