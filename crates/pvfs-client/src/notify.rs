@@ -12,7 +12,7 @@
 //! ten-second timeout. A failure to notify is logged and never fails the
 //! health pass. `PVFS_NOTIFY_CMD` replaces the command for tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,12 @@ const STATE_FILE: &str = "notify-state.json";
 /// One heartbeat a day: enough for "the owner has gone quiet" to mean
 /// something, not enough to be noise.
 pub const HEARTBEAT_EVERY_MS: u64 = 24 * 3600 * 1000;
+/// How long a job's error must have been there, with the same text, before
+/// it is said (D151). Health passes are two minutes apart, so this is the
+/// third pass, about four minutes after the first sighting; the second pass
+/// never reports. 3½ rather than 4 because `now` is stamped after the
+/// probes finish, so the third pass can land a few seconds under 240 s.
+pub const JOB_ERROR_AFTER_MS: u64 = 210_000;
 pub const FORMATS: [&str; 5] = ["ha", "json", "slack", "discord", "ntfy"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +60,18 @@ pub struct State {
     /// persisting error is said once and a changed one again.
     #[serde(default)]
     pub reported_job_errors: BTreeMap<String, String>,
+    /// D151 — every job error present now, `pin/job` → its text and when that
+    /// text was first seen: the clock `job_errors` waits on. Persisted, so a
+    /// restart neither resets it nor advances it.
+    #[serde(default)]
+    pub job_errors_seen: BTreeMap<String, Seen>,
+}
+
+/// A job's error and when this text of it was first seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    pub error: String,
+    pub first_seen_ms: u64,
 }
 
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
@@ -192,25 +210,32 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
             out.push(e);
         }
         // Job errors are handled by `job_errors` (they need memory across
-        // polls: a restart's "connection refused" clears itself in a minute
-        // and must not wake anyone).
+        // passes and restarts: a restart's "connection refused" clears itself
+        // in a minute and must not wake anyone).
     }
     out
 }
 
-/// A job's error is reported when it has been there for TWO consecutive
-/// polls (four minutes — a daemon restart's transient never lasts that
-/// long), once, and again only if the text changes; the memory clears when
-/// the error does.
-pub fn job_errors(state: &mut State, prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) -> Vec<Event> {
+/// A job's error is reported once it has been there, with the same text,
+/// for `JOB_ERROR_AFTER_MS` — timed from when it was first seen, not by
+/// counting records: every daemon start polls at once, so a burst of
+/// restarts writes several records seconds apart, and on 2026-09-13 that
+/// reported the peers' momentary "connection refused" (D151). Said once,
+/// and again only when the text changes, after that text's own wait; the
+/// memory clears when the error does. A peer that did not answer this
+/// pass keeps its memory: its jobs are unknown, not clear.
+pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Event> {
     let (up, down) = counts(next);
     let mut out = Vec::new();
-    let mut live: BTreeMap<String, String> = BTreeMap::new();
+    let mut live: BTreeSet<String> = BTreeSet::new();
     for (pin, r) in &next.peers {
         if !r.last.reachable {
+            let mine = format!("{}/", short(pin));
+            live.extend(
+                state.job_errors_seen.keys().chain(state.reported_job_errors.keys()).filter(|k| k.starts_with(&mine)).cloned(),
+            );
             continue;
         }
-        let p = prev.and_then(|p| p.peers.get(pin));
         for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
             let err = j.last_error.clone().unwrap_or_default();
             // The stall detector's "overdue … not the same as stuck" is a
@@ -220,11 +245,15 @@ pub fn job_errors(state: &mut State, prev: Option<&FleetHealth>, next: &FleetHea
                 continue;
             }
             let key = format!("{}/{}", short(pin), j.name);
-            let before = p.and_then(|p| p.last.jobs.iter().find(|pj| pj.name == j.name)).and_then(|pj| pj.last_error.clone());
-            if before.as_deref() != Some(err.as_str()) {
-                continue; // first sighting, or a different error: wait one more poll
+            live.insert(key.clone());
+            let seen = state.job_errors_seen.entry(key.clone()).or_insert_with(|| Seen { error: err.clone(), first_seen_ms: now_ms });
+            if seen.error != err {
+                // a different error: it waits its own time
+                *seen = Seen { error: err.clone(), first_seen_ms: now_ms };
             }
-            live.insert(key.clone(), err.clone());
+            if now_ms.saturating_sub(seen.first_seen_ms) < JOB_ERROR_AFTER_MS {
+                continue; // not there long enough yet
+            }
             if state.reported_job_errors.get(&key) == Some(&err) {
                 continue; // already said
             }
@@ -241,7 +270,8 @@ pub fn job_errors(state: &mut State, prev: Option<&FleetHealth>, next: &FleetHea
             state.reported_job_errors.insert(key, err);
         }
     }
-    state.reported_job_errors.retain(|k, _| live.contains_key(k));
+    state.job_errors_seen.retain(|k, _| live.contains(k));
+    state.reported_job_errors.retain(|k, _| live.contains(k));
     out
 }
 
@@ -413,7 +443,7 @@ pub fn emit(data_dir: &Path, prev: Option<&FleetHealth>, next: &FleetHealth, now
     let Some(n) = load(data_dir)? else { return Ok(Vec::new()) };
     let mut state = load_state(data_dir);
     let mut events = transitions(prev, next, now_ms);
-    events.extend(job_errors(&mut state, prev, next, now_ms));
+    events.extend(job_errors(&mut state, next, now_ms));
     if let Some(h) = heartbeat(&mut state, next, now_ms) {
         events.push(h);
     }

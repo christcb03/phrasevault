@@ -119,7 +119,7 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `peer_down` | a peer missed two polls (once, with since-when) | critical |
 | `supervise` | a `start` was sent — ok, or failed | info / critical |
 | `peer_up` | a peer answers again (with how long it was down) | info |
-| `job_error` | a job's error has persisted **two** polls (once, until it changes); the stall detector's `overdue` notice is filtered | warning |
+| `job_error` | a job's error has been there, with the same text, for about **four minutes** — the third poll, timed from when it was first seen, so the owner's own restarts in a row never count (D151); once, until it changes, and a changed text waits its own four minutes; the stall detector's `overdue` notice is filtered | warning |
 | `heartbeat` | every 24 h: "All good: N boxes up, nothing to do." or what is down | info / warning |
 | `test` | `--test` | info |
 
