@@ -20,6 +20,21 @@ file tracks Layer 0, the file-system engine.
   file's sidecar to match it), so one whose 2038 file was renamed is not kept
   forever.
 
+- **A job's error is reported after about four minutes, not after two
+  records (D151).** The owner reported a peer job's error once the same text
+  was in two consecutive health records — meant as four minutes, so a
+  restart's transient never woke anyone. But every daemon start polls at
+  once, so a few restarts in a row wrote records seconds apart: on
+  2026-09-13 a play's four restarts in 21 s sent two `job_error`s for the
+  peers' momentary "connection refused". `notify-state.json` now remembers
+  when each job's error was first seen (`State.job_errors_seen`), and
+  `job_errors` says it once it has been there `JOB_ERROR_AFTER_MS` (3½ min:
+  the third two-minute pass) — still once, and again only when the text
+  changes, after the new text's own wait. The clock survives restarts and
+  is not advanced by them. A peer that misses a pass keeps its memory
+  (unknown is not clear), so an error already said is no longer said again
+  after a blip. `job_errors` no longer takes `prev`.
+
 - **A manifest records its file's mtime, and is trusted only on an exact match
   (D150).** D91's exact-size check refused a sidecar when a replacement
   changed the size, which an arr upgrade nearly always does; a SAME-size

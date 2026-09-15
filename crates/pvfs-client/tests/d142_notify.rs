@@ -63,22 +63,26 @@ fn a_supervise_action_and_a_new_job_error_are_each_said_once() {
 
     let mut with_err = up();
     with_err.jobs.push(JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: Some("boom".into()) });
+    // D151 — timed from the first sighting, two-minute passes (d151_job_error_debounce).
     let mut st = notify::State::default();
     let mut r2 = r1.clone();
     r2.observe(&a, "10.0.0.9:7433", None, 4_000, with_err.clone());
-    assert!(notify::job_errors(&mut st, Some(&r1), &r2, 4_000).is_empty(), "first sighting: a restart's transient, wait");
-    let mut r3 = r2.clone();
-    r3.observe(&a, "10.0.0.9:7433", None, 5_000, with_err.clone());
-    let ev = notify::job_errors(&mut st, Some(&r2), &r3, 5_000);
-    assert_eq!(ev.len(), 1, "the second consecutive poll with the same error says it");
+    assert!(notify::job_errors(&mut st, &r2, 4_000).is_empty(), "first sighting: a restart's transient, wait");
+    let mut r2b = r2.clone();
+    r2b.observe(&a, "10.0.0.9:7433", None, 124_000, with_err.clone());
+    assert!(notify::job_errors(&mut st, &r2b, 124_000).is_empty(), "two minutes: still waiting");
+    let mut r3 = r2b.clone();
+    r3.observe(&a, "10.0.0.9:7433", None, 244_000, with_err.clone());
+    let ev = notify::job_errors(&mut st, &r3, 244_000);
+    assert_eq!(ev.len(), 1, "four minutes with the same error says it");
     assert_eq!(ev[0].event, "job_error");
     assert_eq!(ev[0].detail.as_deref(), Some("receive: boom"));
     let mut r4 = r3.clone();
-    r4.observe(&a, "10.0.0.9:7433", None, 6_000, with_err);
-    assert!(notify::job_errors(&mut st, Some(&r3), &r4, 6_000).is_empty(), "a persisting error is said once");
+    r4.observe(&a, "10.0.0.9:7433", None, 364_000, with_err);
+    assert!(notify::job_errors(&mut st, &r4, 364_000).is_empty(), "a persisting error is said once");
     let mut r5 = r4.clone();
-    r5.observe(&a, "10.0.0.9:7433", None, 7_000, up());
-    assert!(notify::job_errors(&mut st, Some(&r4), &r5, 7_000).is_empty());
+    r5.observe(&a, "10.0.0.9:7433", None, 484_000, up());
+    assert!(notify::job_errors(&mut st, &r5, 484_000).is_empty());
     assert!(st.reported_job_errors.is_empty(), "cleared with the error, so it can be said again later");
 }
 
@@ -128,8 +132,9 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     let mut o1 = r0.clone();
     o1.observe(&a, "10.0.0.9:7433", None, 401_000, overdue.clone());
     let mut o2 = o1.clone();
-    o2.observe(&a, "10.0.0.9:7433", None, 402_000, overdue);
-    assert!(notify::job_errors(&mut st, Some(&o1), &o2, 402_000).is_empty(), "overdue is filtered");
+    o2.observe(&a, "10.0.0.9:7433", None, 641_000, overdue);
+    assert!(notify::job_errors(&mut st, &o1, 401_000).is_empty());
+    assert!(notify::job_errors(&mut st, &o2, 641_000).is_empty(), "overdue is filtered, however long it lasts");
     let mut r4 = r3.clone();
     r4.observe(&a, "10.0.0.9:7433", None, 400_000, up());
     let back = &notify::transitions(Some(&r3), &r4, 400_000)[0];

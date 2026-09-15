@@ -568,7 +568,7 @@ pvfs fleet notify --off
 
 Formats: `ha`, `slack`, `discord`, `ntfy`, `json`. Events are transitions
 only — a peer down or back, a restart sent, a job error that has persisted
-two polls — plus a daily heartbeat, each carrying one plain sentence. Doc 30
+about four minutes — plus a daily heartbeat, each carrying one plain sentence. Doc 30
 is the whole story, with a Home Assistant build as the worked example.
 
 ---
