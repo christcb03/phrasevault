@@ -179,6 +179,39 @@ pub struct BackfillReport {
     pub own_bookkeeping: u64,
 }
 
+/// What `upgrade_sidecars` did — or, with `dry_run`, would do (D150).
+#[derive(Debug, Default, Clone)]
+pub struct UpgradeReport {
+    pub dry_run: bool,
+    /// Catalogued files looked at, in this box's local catalogue regions.
+    pub files: u64,
+    /// Already v3 and describing their file exactly.
+    pub already_current: u64,
+    /// v2 manifests the catalogue vouches for, rewritten as v3 without
+    /// reading the file.
+    pub stamped: u64,
+    /// Files nothing vouched for, re-read (or to re-read), and their bytes.
+    pub reread: u64,
+    pub reread_bytes: u64,
+    /// Of the re-read: the bytes are what the catalogue says.
+    pub verified: u64,
+    /// Of the re-read: the bytes are NOT what the catalogue says — a stale hash
+    /// caught. `(path, catalogue hash, true hash)`; the row is handed back to
+    /// the scan.
+    pub corrected: Vec<(String, String, String)>,
+    /// Of the re-read: the file changed since the catalogue last saw it; the
+    /// next scan re-derives its row from the fresh manifest anyway.
+    pub scan_will_update: u64,
+    /// Changed while it was being read; left for the next pass.
+    pub changed_while_reading: u64,
+    /// No manifest beside the file — nothing to upgrade.
+    pub no_manifest: u64,
+    /// Catalogued, but not on disk.
+    pub missing: u64,
+    /// Could not be read or written, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
 /// What the identity match found (D113).
 ///
 /// `None` and `Ambiguous` are DIFFERENT answers and the caller must not
@@ -3857,11 +3890,16 @@ impl Engine {
             eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
             return Ok((w, Vec::new()));
         }
+        // D150 — the file as it was BEFORE the read: the manifest records this
+        // (size, mtime), and nothing is written if the file moved meanwhile.
+        let seen = std::fs::metadata(path)
+            .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
+            .ok();
         let (content_hash, chunks) = crate::sync::hash_with_manifest(path)?;
         // Leave the note for the next forest. Best-effort: a read-only store
         // still indexes, it just cannot record.
-        if !chunks.is_empty() {
-            let _ = crate::sync::write_manifest_sidecar(path, Some(&content_hash), &chunks);
+        if let (false, Some(seen)) = (chunks.is_empty(), seen) {
+            let _ = crate::sync::write_manifest_sidecar_seen(path, Some(&content_hash), &chunks, seen);
         }
         Ok((content_hash, chunks))
     }
@@ -4133,6 +4171,131 @@ impl Engine {
             }
         }
         Ok(report)
+    }
+
+    /// D150 — bring every manifest beside a catalogued file on this box to v3,
+    /// with the catalogue as the authority (Chris, 2026-09-14: *"if the hash is
+    /// in the forest can we use that to compare to the manifest hash … and
+    /// update all the manifests to include the time stamp of the matching
+    /// file"*).
+    ///
+    /// A region row's hash was checked against real bytes — receive verifies
+    /// in transit, a scan reads the file — and the row keeps it only while the
+    /// file's size and mtime are unchanged. So a v2 manifest the row vouches
+    /// for is STAMPED with its file's mtime without reading the file. One the
+    /// row cannot vouch for is RE-READ: the production NAS's 33 are why — when
+    /// their files' mtime moved, the pre-D150 scan took the row's hash FROM the
+    /// manifest, so "manifest = catalogue" proved nothing there. A re-read that
+    /// disagrees with the row is a stale hash caught: a fresh manifest is
+    /// written and the row's mtime cleared, so the next scan re-derives it
+    /// through the normal path and republishes the region.
+    pub fn upgrade_sidecars(&mut self, dry_run: bool) -> Result<UpgradeReport> {
+        let mut r = UpgradeReport {
+            dry_run,
+            ..Default::default()
+        };
+        for b in self.local_bindings()? {
+            if !self.is_catalogue_region(&b.folder_id)? {
+                continue;
+            }
+            let root = crate::storage::uri_to_path(&b.source_uri)?;
+            let rows: Vec<(String, u64, u64, Option<String>)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT rel_path, size_bytes, mtime_ms, content_hash FROM region_entries
+                          WHERE region_id = ?1 AND kind = 'file'",
+                    )
+                    .map_err(map_db("upgrade rows"))?;
+                let it = stmt
+                    .query_map(params![b.folder_id], |x| {
+                        Ok((
+                            x.get::<_, String>(0)?,
+                            x.get::<_, i64>(1)? as u64,
+                            x.get::<_, i64>(2)? as u64,
+                            x.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .map_err(map_db("upgrade rows"))?;
+                it.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(map_db("upgrade rows"))?
+            };
+            for (rel, row_size, row_mtime, row_hash) in rows {
+                if self.cancelled() {
+                    return Ok(r);
+                }
+                r.files += 1;
+                let path = root.join(&rel);
+                let Ok(md) = std::fs::metadata(&path) else {
+                    r.missing += 1;
+                    continue;
+                };
+                let seen = (md.len(), crate::storage::mtime_ms(&md));
+                let Some(facts) = crate::sync::manifest_facts(&path) else {
+                    r.no_manifest += 1;
+                    continue;
+                };
+                if facts.version == 3 && facts.trusted {
+                    r.already_current += 1;
+                    continue;
+                }
+                let row_is_this_file = (row_size, row_mtime) == seen;
+                let vouched = facts.version == 2
+                    && facts.not_older
+                    && facts.recorded_size == Some(seen.0)
+                    && row_is_this_file
+                    && row_hash.is_some()
+                    && facts.whole == row_hash;
+                if vouched {
+                    if !dry_run {
+                        let w = facts.whole.as_deref();
+                        if let Err(e) = crate::sync::write_manifest_sidecar_seen(&path, w, &facts.chunks, seen) {
+                            r.failed.push((rel, e.to_string()));
+                            continue;
+                        }
+                    }
+                    r.stamped += 1;
+                    continue;
+                }
+                r.reread += 1;
+                r.reread_bytes += seen.0;
+                if dry_run {
+                    continue;
+                }
+                let (whole, chunks) = match crate::sync::hash_with_manifest(&path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        r.failed.push((rel, e.to_string()));
+                        continue;
+                    }
+                };
+                let after = std::fs::metadata(&path)
+                    .map(|m| (m.len(), crate::storage::mtime_ms(&m)))
+                    .ok();
+                if after != Some(seen) {
+                    r.changed_while_reading += 1;
+                    continue;
+                }
+                if let Err(e) = crate::sync::write_manifest_sidecar_seen(&path, Some(&whole), &chunks, seen) {
+                    r.failed.push((rel, e.to_string()));
+                    continue;
+                }
+                if !row_is_this_file {
+                    r.scan_will_update += 1;
+                } else if row_hash.as_deref() == Some(whole.as_str()) {
+                    r.verified += 1;
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE region_entries SET mtime_ms = 0 WHERE region_id = ?1 AND rel_path = ?2",
+                            params![b.folder_id, rel],
+                        )
+                        .map_err(map_db("hand the row back to the scan"))?;
+                    r.corrected.push((rel, row_hash.unwrap_or_else(|| "-".into()), whole));
+                }
+            }
+        }
+        Ok(r)
     }
 
     pub fn readable_path(&self, id: &NodeId) -> Result<Option<std::path::PathBuf>> {

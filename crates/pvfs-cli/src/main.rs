@@ -193,6 +193,22 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Bring every manifest beside a catalogued file on this box up to v3 —
+    /// stamped with its file's mtime — using the catalogue as the authority
+    /// (D150).
+    ///
+    /// Looks first and says what it would stamp without reading and how much
+    /// it would have to re-read, then asks. A re-read that disagrees with the
+    /// catalogue is a stale hash caught: listed by path, and handed back to
+    /// the scan to correct.
+    SidecarUpgrade {
+        /// Only look: report what would be done, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Go ahead without asking (scripts).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Files the catalogue holds MORE THAN ONCE at the same place (D113).
     ///
     /// Same parent, same name, same size — the identity rule the scan itself
@@ -3804,6 +3820,44 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         r.size_mismatch
                     );
                 }
+            }
+            engine.close()
+        }
+        Cmd::SidecarUpgrade { dry_run, yes } => {
+            let mut engine = Engine::open(&ctx?)?;
+            // Always look first: what would be stamped, and how much would
+            // have to be READ, before anything is written.
+            let plan = engine.upgrade_sidecars(true)?;
+            print_sidecar_upgrade(&plan, json);
+            let go = if dry_run || plan.stamped + plan.reread == 0 {
+                false
+            } else if yes {
+                true
+            } else {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return Err(PvfsError::BadInput {
+                        field: "sidecar-upgrade".into(),
+                        reason: "not a terminal — pass --yes to go ahead, or --dry-run to only look"
+                            .into(),
+                    });
+                }
+                let ans = prompt_line(
+                    &format!(
+                        "stamp {} manifest(s) and re-read {} file(s), {:.1} GiB — go ahead? (y/N)",
+                        plan.stamped,
+                        plan.reread,
+                        plan.reread_bytes as f64 / (1u64 << 30) as f64
+                    ),
+                    Some("N"),
+                )?;
+                matches!(ans.trim(), "y" | "Y" | "yes" | "Yes")
+            };
+            if go {
+                let done = engine.upgrade_sidecars(false)?;
+                print_sidecar_upgrade(&done, json);
+            } else if !dry_run && plan.stamped + plan.reread > 0 {
+                eprintln!("nothing changed");
             }
             engine.close()
         }
@@ -8983,6 +9037,78 @@ fn serve_status_print(
 
 /// Prompt for a missing value (Chris's rule: bare commands ask, flags are
 /// for scripts). Non-interactive runs must pass the argument instead.
+/// D150 — `pvfs sidecar-upgrade`'s report: the look and the result alike.
+fn print_sidecar_upgrade(r: &pvfs_core::UpgradeReport, json: bool) {
+    let gib = r.reread_bytes as f64 / (1u64 << 30) as f64;
+    if json {
+        let corrected: Vec<String> = r
+            .corrected
+            .iter()
+            .map(|(p, old, new)| {
+                format!(
+                    "{{\"path\":\"{}\",\"catalogue\":\"{}\",\"bytes\":\"{}\"}}",
+                    json_escape(p),
+                    json_escape(old),
+                    json_escape(new)
+                )
+            })
+            .collect();
+        let failed: Vec<String> = r
+            .failed
+            .iter()
+            .map(|(p, e)| format!("{{\"path\":\"{}\",\"error\":\"{}\"}}", json_escape(p), json_escape(e)))
+            .collect();
+        println!(
+            "{{\"dry_run\":{},\"files\":{},\"already_current\":{},\"stamped\":{},\"reread\":{},\
+              \"reread_bytes\":{},\"verified\":{},\"corrected\":[{}],\"scan_will_update\":{},\
+              \"changed_while_reading\":{},\"no_manifest\":{},\"missing\":{},\"failed\":[{}]}}",
+            r.dry_run,
+            r.files,
+            r.already_current,
+            r.stamped,
+            r.reread,
+            r.reread_bytes,
+            r.verified,
+            corrected.join(","),
+            r.scan_will_update,
+            r.changed_while_reading,
+            r.no_manifest,
+            r.missing,
+            failed.join(",")
+        );
+        return;
+    }
+    if r.dry_run {
+        println!("LOOKED — nothing was written");
+        println!("catalogued files looked at      : {}", r.files);
+        println!("already stamped (v3)            : {}", r.already_current);
+        println!("would stamp, without reading    : {}", r.stamped);
+        println!("would re-read                   : {} ({gib:.1} GiB)", r.reread);
+    } else {
+        println!("DONE");
+        println!("catalogued files looked at      : {}", r.files);
+        println!("already stamped (v3)            : {}", r.already_current);
+        println!("stamped, without reading        : {}", r.stamped);
+        println!("re-read                         : {} ({gib:.1} GiB)", r.reread);
+        println!("  bytes matched the catalogue   : {}", r.verified);
+        println!("  STALE HASH CAUGHT             : {}", r.corrected.len());
+        println!("  changed since the last scan   : {}", r.scan_will_update);
+        println!("  changed while being read      : {}", r.changed_while_reading);
+    }
+    println!("no manifest (nothing to do)     : {}", r.no_manifest);
+    println!("catalogued but not on disk      : {}", r.missing);
+    for (p, old, new) in &r.corrected {
+        eprintln!(
+            "stale: {p} — the catalogue said {}…, the bytes are {}…; handed back to the scan",
+            &old[..old.len().min(16)],
+            &new[..new.len().min(16)]
+        );
+    }
+    for (p, e) in &r.failed {
+        eprintln!("failed: {p}: {e}");
+    }
+}
+
 fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {

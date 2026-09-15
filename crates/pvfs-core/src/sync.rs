@@ -164,6 +164,9 @@ pub fn parse_sync_uri(uri: &str) -> Option<&str> {
 pub const SWARM_CHUNK: u64 = 8 * 1024 * 1024;
 const MANIFEST_HEADER_V1: &str = "pvfs-manifest 1";
 const MANIFEST_HEADER: &str = "pvfs-manifest 2";
+/// D150 — v3 records the file's mtime (ms) after its size: the manifest names
+/// exactly which file it describes, so trusting it needs no clock.
+const MANIFEST_HEADER_V3: &str = "pvfs-manifest 3";
 /// Written in the whole-hash slot when the writer did not know it (v2 always
 /// has the slot, so the format stays fixed-position and trivial to parse).
 const NO_WHOLE_HASH: &str = "-";
@@ -318,10 +321,38 @@ pub fn write_manifest_sidecar(
     whole: Option<&str>,
     hashes: &[[u8; 32]],
 ) -> Result<()> {
+    // The file as it is NOW — right for a caller whose hash cannot be of other
+    // bytes (receive, after its own rename; the backfill, whose hash the
+    // catalogue vouches for). A caller that READ the bytes to hash them uses
+    // [`write_manifest_sidecar_seen`] with what it saw before the read.
+    let Ok(md) = std::fs::metadata(file) else {
+        return Ok(());
+    };
+    write_manifest_sidecar_seen(file, whole, hashes, (md.len(), crate::storage::mtime_ms(&md)))
+}
+
+/// D150 — write the v3 manifest for bytes whose `(size, mtime_ms)` were
+/// `seen` before they were hashed; nothing is written if the file is not
+/// still that file. A manifest must never pair a new mtime with the old
+/// bytes' hash.
+///
+/// v3 records the file's mtime after its size, so the manifest names exactly
+/// which file it describes and trusting it needs no clock — the NAS ran 142 s
+/// slow, and receive stamps a file with its SOURCE's mtime.
+pub fn write_manifest_sidecar_seen(
+    file: &Path,
+    whole: Option<&str>,
+    hashes: &[[u8; 32]],
+    seen: (u64, u64),
+) -> Result<()> {
     // Never write a sidecar for a sidecar. The cache is best-effort, so a
     // forest that already adopted `.manifest` nodes still serves them — it
     // recomputes instead of laying down another level.
     if is_sidecar_path(file) {
+        return Ok(());
+    }
+    let md = std::fs::metadata(file).map_err(|e| PvfsError::io("stat for sidecar", e))?;
+    if (md.len(), crate::storage::mtime_ms(&md)) != seen {
         return Ok(());
     }
     // The EXACT byte size, not just enough to infer the chunk count. Chunk
@@ -329,9 +360,9 @@ pub fn write_manifest_sidecar(
     // from a replacement a few MB different — which is exactly what an arr
     // writes when it upgrades an encode at the same path. Trusting a stale hash
     // is silently wrong in the catalog; re-hashing is merely slow.
-    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let (size, mtime) = seen;
     let mut text = format!(
-        "{MANIFEST_HEADER}\n{SWARM_CHUNK}\n{}\n{size}\n",
+        "{MANIFEST_HEADER_V3}\n{SWARM_CHUNK}\n{}\n{size}\n{mtime}\n",
         whole.unwrap_or(NO_WHOLE_HASH)
     );
     for h in hashes {
@@ -372,57 +403,121 @@ fn sidecar_is_fresh(file: &Path, sidecar: &Path) -> bool {
     matches!((modified(file), modified(sidecar)), (Ok(f), Ok(s)) if s >= f)
 }
 
-/// A parsed sidecar: the whole-file hash when the writer knew it (v2 only), and
+/// A parsed sidecar: the whole-file hash when the writer knew it (v2+), and
 /// the per-chunk hashes.
 struct Sidecar {
+    /// 1, 2 or 3 — which generation wrote it.
+    version: u8,
     whole: Option<String>,
-    /// The file size the writer saw. v2 only; `None` for a v1 sidecar, which is
+    /// The file size the writer saw. v2+; `None` for a v1 sidecar, which is
     /// why v1 can never seed a re-import.
     recorded_size: Option<u64>,
+    /// D150 — the file's mtime (ms) the writer saw. v3 only.
+    recorded_mtime: Option<u64>,
     chunks: Vec<[u8; 32]>,
 }
 
 /// Read the sidecar, preferring the D91 dotfile and falling back to the v1
-/// name so a library written before the rename keeps its hashes.
+/// name so a library written before the rename keeps its hashes — and only if
+/// it still describes `file`. One check here covers every reader: the scan,
+/// receive's "already there", the backfill, the manifest a serve hands out.
 fn read_manifest_sidecar(file: &Path) -> Option<Sidecar> {
+    let (path, sc) = read_manifest_unjudged(file)?;
+    describes(file, &path, &sc).then_some(sc)
+}
+
+/// D150 — whether a sidecar still describes `file`. v3: its recorded size AND
+/// mtime are the file's now — exact, and no clock is compared. v2 and v1
+/// record no mtime, so they keep the first D150 rule (not older than the
+/// file) until `sidecar-upgrade` stamps them.
+fn describes(file: &Path, path: &Path, sc: &Sidecar) -> bool {
+    match sc.recorded_mtime {
+        Some(m) => std::fs::metadata(file)
+            .map(|md| crate::storage::mtime_ms(&md) == m && sc.recorded_size == Some(md.len()))
+            .unwrap_or(false),
+        None => sidecar_is_fresh(file, path),
+    }
+}
+
+/// The sidecar beside `file` as written, before any judgement of whether it
+/// still describes the file, and the path it was read from.
+fn read_manifest_unjudged(file: &Path) -> Option<(PathBuf, Sidecar)> {
     let (path, text) = [manifest_sidecar_path(file), legacy_manifest_sidecar_path(file)]
         .into_iter()
         .find_map(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t)))?;
-    // D150 — one check here covers every reader: the scan, receive's "already
-    // there", the backfill, the manifest a serve hands out.
-    if !sidecar_is_fresh(file, &path) {
-        return None;
-    }
     let mut lines = text.lines();
-    let v2 = match lines.next()? {
-        h if h == MANIFEST_HEADER => true,
-        h if h == MANIFEST_HEADER_V1 => false,
+    let version = match lines.next()? {
+        h if h == MANIFEST_HEADER_V3 => 3,
+        h if h == MANIFEST_HEADER => 2,
+        h if h == MANIFEST_HEADER_V1 => 1,
         _ => return None,
     };
     if lines.next()?.parse::<u64>().ok()? != SWARM_CHUNK {
         return None; // chunk size changed — recompute
     }
-    // v2 carries the whole-file hash in a fixed slot; v1 has no such line and
-    // its chunk hashes start immediately.
-    let (whole, recorded_size) = if v2 {
+    // v2+ carry the whole-file hash and the size in fixed slots, v3 the file's
+    // mtime after them; v1 has none of these and its chunk hashes start here.
+    let (whole, recorded_size, recorded_mtime) = if version >= 2 {
         let w = match lines.next()? {
             NO_WHOLE_HASH => None,
             h if h.len() == 64 && hex::decode(h).is_ok() => Some(h.to_string()),
             _ => return None,
         };
-        (w, Some(lines.next()?.parse::<u64>().ok()?))
+        let size = lines.next()?.parse::<u64>().ok()?;
+        let mtime = if version == 3 {
+            Some(lines.next()?.parse::<u64>().ok()?)
+        } else {
+            None
+        };
+        (w, Some(size), mtime)
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mut chunks = Vec::new();
     for l in lines.filter(|l| !l.trim().is_empty()) {
         let bytes = hex::decode(l.trim()).ok()?;
         chunks.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
     }
-    Some(Sidecar {
-        whole,
-        recorded_size,
-        chunks,
+    Some((
+        path,
+        Sidecar {
+            version,
+            whole,
+            recorded_size,
+            recorded_mtime,
+            chunks,
+        },
+    ))
+}
+
+/// D150 — what `sidecar-upgrade` needs to know about the manifest beside a
+/// file: its generation, what it records, and how the readers judge it.
+#[derive(Debug, Clone)]
+pub struct ManifestFacts {
+    pub version: u8,
+    pub whole: Option<String>,
+    pub recorded_size: Option<u64>,
+    pub recorded_mtime: Option<u64>,
+    pub chunks: Vec<[u8; 32]>,
+    /// The manifest file is not older than its file (the first D150 rule).
+    pub not_older: bool,
+    /// The readers would trust it as it stands.
+    pub trusted: bool,
+}
+
+/// D150 — [`ManifestFacts`] for the manifest beside `file`; `None` if there
+/// is none, or it cannot be parsed.
+pub fn manifest_facts(file: &Path) -> Option<ManifestFacts> {
+    let (path, sc) = read_manifest_unjudged(file)?;
+    let trusted = describes(file, &path, &sc);
+    Some(ManifestFacts {
+        version: sc.version,
+        not_older: sidecar_is_fresh(file, &path),
+        trusted,
+        whole: sc.whole,
+        recorded_size: sc.recorded_size,
+        recorded_mtime: sc.recorded_mtime,
+        chunks: sc.chunks,
     })
 }
 
@@ -498,9 +593,14 @@ pub fn manifest_for(path: &Path) -> Result<Vec<[u8; 32]>> {
 ///
 /// Best-effort: a read-only store still answers, just without the cache.
 pub fn manifest_for_caching(path: &Path) -> Result<Vec<[u8; 32]>> {
+    // D150 — what the file was BEFORE the read, so a file that changes while
+    // it is being hashed is not stamped with a hash of other bytes.
+    let seen = std::fs::metadata(path)
+        .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
+        .ok();
     let (computed, m) = manifest_of(path)?;
-    if let Some(whole) = computed {
-        let _ = write_manifest_sidecar(path, Some(&whole), &m);
+    if let (Some(whole), Some(seen)) = (computed, seen) {
+        let _ = write_manifest_sidecar_seen(path, Some(&whole), &m, seen);
     }
     Ok(m)
 }
