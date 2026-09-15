@@ -28,6 +28,19 @@ file tracks Layer 0, the file-system engine.
   would have retired every tracked location the walk had held back. D156's
   seam, `Engine::on_catalogue_read`, is called before this read too.
 
+- **A failed watch pass reaches the journal (D157).** pvfsd's watch job took
+  a failed pass (`WatchEvent::ScanError`) into its status row (`backoff`,
+  `last_error`) and wrote nothing to the journal. In D156's lab rehearsal a
+  pass failed on every retry with an EIO, and `journalctl` showed nothing;
+  only `pvfs serve status` did. It now logs `pvfsd: watch pass failed:
+  <error>; retrying`, once when a run of failures starts and again only when
+  the text changes, as D151's notifier does for job errors. So a pass
+  retrying in backoff (5 s doubling to 300 s) does not flood the journal.
+  The first completed pass after a run logs `pvfsd: watch recovered: a pass
+  completed after N failed pass(es) over <time>`. A stopped pass (D154) ends
+  nothing. The row, and so `serve status`, the HA page and the notifier, is
+  unchanged.
+
 - **One unreadable file does not stop a catalogue pass (D156).**
   `scan_region_catalogue` hashed each file with `?`, so one file's read error
   ended the pass. A file that failed every time stopped every pass at the
