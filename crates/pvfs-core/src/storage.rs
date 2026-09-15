@@ -263,7 +263,9 @@ fn changed_ms(md: &fs::Metadata) -> u64 {
     m
 }
 
-fn mtime_ms(md: &fs::Metadata) -> u64 {
+/// A file's mtime in ms since the epoch — the unit catalogue rows record, and
+/// (D150) the one a v3 manifest records, so the two compare exactly.
+pub(crate) fn mtime_ms(md: &fs::Metadata) -> u64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
