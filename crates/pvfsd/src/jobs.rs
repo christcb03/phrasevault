@@ -97,6 +97,18 @@ pub struct JobsState {
     /// D148 — each region's trash as the last purge pass left it, so `serve
     /// status` reports it without walking a disk (D136).
     trash: Mutex<Vec<pvfs_proto::TrashWire>>,
+    /// D157 — the watch's current run of failed passes, as the journal has
+    /// heard it; `None` while passes complete. In memory only: a daemon
+    /// restart is in the journal itself, so its first failure is said again.
+    watch_failing: Mutex<Option<FailingRun>>,
+}
+
+/// D157 — a run of failed watch passes: what the journal was last told, how
+/// many passes have failed since the last one completed, and since when.
+struct FailingRun {
+    logged: String,
+    failed: u64,
+    since_ms: u64,
 }
 
 impl JobsState {
@@ -117,6 +129,7 @@ impl JobsState {
             tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
             tier_passes: std::sync::atomic::AtomicU64::new(0),
             trash: Mutex::new(Vec::new()),
+            watch_failing: Mutex::new(None),
         };
         s.reload()?;
         Ok(s)
@@ -302,6 +315,34 @@ impl JobsState {
         });
     }
 
+    /// D157 — a watch pass failed: the journal line it earns, if any. The
+    /// first failure of a run is said, and after that only a changed text
+    /// (D151's rule for the notifier's job errors), so a pass retrying in
+    /// backoff (5 s doubling to 300 s) does not repeat itself.
+    fn watch_failed(&self, err: &str) -> Option<String> {
+        let mut run = self.watch_failing.lock().unwrap();
+        let first = run.is_none();
+        let r = run.get_or_insert_with(|| FailingRun { logged: String::new(), failed: 0, since_ms: now_ms() });
+        r.failed += 1;
+        if !first && r.logged == err {
+            return None;
+        }
+        r.logged = err.to_string();
+        Some(format!("pvfsd: watch pass failed: {err}; retrying"))
+    }
+
+    /// D157 — a watch pass completed: the line that ends a run of failures,
+    /// if one was open. Only a completed pass ends one; a stopped pass
+    /// (D154) says nothing about whether the fault is gone.
+    fn watch_recovered(&self) -> Option<String> {
+        let r = self.watch_failing.lock().unwrap().take()?;
+        Some(format!(
+            "pvfsd: watch recovered: a pass completed after {} failed pass(es) over {}",
+            r.failed,
+            failing_span(now_ms().saturating_sub(r.since_ms))
+        ))
+    }
+
     /// A fatal failure: the thread exited; the supervisor retries later.
     fn mark_fatal(&self, name: &str, reason: &str) {
         self.with_row(name, |r| {
@@ -409,7 +450,9 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
                 let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| {
-                    watch_event(&cb, ev)
+                    for line in watch_event(&cb, ev) {
+                        eprintln!("{line}");
+                    }
                 });
                 match r {
                     Ok(()) => st.set_state(
@@ -430,13 +473,17 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
 }
 
 /// The watch job's reading of one watcher event — out of the thread's
-/// closure so a test can drive it (D156).
-fn watch_event(cb: &JobsState, ev: WatchEvent) {
+/// closure so a test can drive it (D156). It updates the job's row and
+/// returns the journal lines the event earns, which the thread prints; D157
+/// returns them rather than printing them so a test can read them too.
+fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
+    let mut log = Vec::new();
     match ev {
         WatchEvent::PassStarted => cb.mark_pass_start("watch"),
         WatchEvent::Ingested(ref folder, a, c, rm, un, orphans) => {
             cb.mark_pass_end("watch");
             cb.mark_ok("watch");
+            log.extend(cb.watch_recovered());
             // D111 — SAY WHAT THE PASS DID. This job is how the fleet
             // actually scans, and it reported its numbers to nobody: the
             // counts went into the status row's liveness bookkeeping and were
@@ -445,17 +492,17 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) {
             // many did that unlink?" could only be answered by diffing the
             // forest before and after.
             if a + c + rm + un > 0 {
-                eprintln!(
+                log.push(format!(
                     "pvfsd: watch ingested {folder}: \
                      +{a} changed {c} removed {rm} unlinked {un}"
-                );
+                ));
             }
             // D149 — the one thing a pass moves on disk.
             if orphans > 0 {
-                eprintln!(
+                log.push(format!(
                     "pvfsd: watch moved {orphans} orphaned manifest(s) \
                      to the trash in {folder}"
-                );
+                ));
             }
             if a + c + rm > 0 {
                 // local ingest = new content: views, placed subtrees, the
@@ -470,15 +517,15 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) {
         // pass, and it used to be stamped here for a pass that kept nothing.
         WatchEvent::Stopped(ref folder, a, c, orphans) => {
             cb.mark_pass_abandoned("watch");
-            eprintln!(
+            log.push(format!(
                 "pvfsd: watch stopped mid-pass in {folder}: \
                  kept +{a} changed {c}; the next pass carries on"
-            );
+            ));
             if orphans > 0 {
-                eprintln!(
+                log.push(format!(
                     "pvfsd: watch moved {orphans} orphaned manifest(s) \
                      to the trash in {folder}"
-                );
+                ));
             }
             if a + c > 0 {
                 cb.nudge_content();
@@ -489,10 +536,15 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) {
         WatchEvent::Quiet => {
             cb.mark_pass_end("watch");
             cb.mark_ok("watch");
+            log.extend(cb.watch_recovered());
         }
+        // D157 — and say so in the journal. This set the row and nothing
+        // else, so D156's lab pass that failed on every retry (EIO,
+        // 2026-09-15) left `journalctl` empty; only `serve status` knew.
         WatchEvent::ScanError(e) => {
             cb.mark_pass_end("watch");
             cb.mark_retry("watch", &e);
+            log.extend(cb.watch_failed(&e));
         }
         WatchEvent::Watching(..) => cb.set_state("watch", "running"),
         // D156 — files the pass skipped that need a human: a log region's
@@ -502,14 +554,26 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) {
         // phone. The pass's verdict came first, so this note outlasts it.
         WatchEvent::NeedsAttention(n, named) => {
             for (what, why) in &named {
-                eprintln!("pvfsd: watch skipped {what}: {why}");
+                log.push(format!("pvfsd: watch skipped {what}: {why}"));
             }
-            eprintln!(
+            log.push(format!(
                 "pvfsd: watch: {n} file(s) need attention \
                  (skipped this pass; every pass tries them again)"
-            );
+            ));
             cb.mark_attention("watch", attention_note(n, &named));
         }
+    }
+    log
+}
+
+/// D157 — how long a run of failed passes lasted, in the unit a reader wants:
+/// seconds under two minutes, minutes under two hours, then hours and minutes.
+fn failing_span(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=119 => format!("{s} s"),
+        120..=7199 => format!("{} min", s / 60),
+        _ => format!("{} h {} min", s / 3600, s / 60 % 60),
     }
 }
 
@@ -1218,5 +1282,66 @@ mod tests {
         }
         assert_eq!(st.row("watch").unwrap().last_error, None, "a clean pass clears it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D157 — a failed pass reaches the journal. The first failure of a run is
+    /// said; a retry in backoff with the same text is not; a changed text is;
+    /// a stopped pass ends nothing (no verdict, D154); the first completed
+    /// pass says the run is over, once, before its own lines. The next failure
+    /// starts a new run.
+    #[test]
+    fn a_failing_watch_pass_is_said_once_per_text_and_its_recovery_once() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d157-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let eio = "I/O error during read for hash: Input/output error (os error 5)";
+        let refused = "catalog route: Connection refused (os error 111)";
+        // one pass: begun, then ended by `ev`; the journal lines it earned
+        let pass = |ev: WatchEvent| {
+            assert!(watch_event(&st, WatchEvent::PassStarted).is_empty());
+            watch_event(&st, ev)
+        };
+        let failed = |e: &str| format!("pvfsd: watch pass failed: {e}; retrying");
+        let recovered = "pvfsd: watch recovered: a pass completed after";
+
+        assert_eq!(pass(WatchEvent::ScanError(eio.into())), [failed(eio)], "the first failure is said");
+        let r = st.row("watch").unwrap();
+        assert_eq!(r.state, "backoff");
+        assert_eq!(r.last_error.as_deref(), Some(eio), "the row is as before");
+        for _ in 0..3 {
+            assert!(pass(WatchEvent::ScanError(eio.into())).is_empty(), "a retry with the same text is not");
+        }
+        assert_eq!(
+            pass(WatchEvent::Stopped("f".into(), 0, 0, 0)),
+            ["pvfsd: watch stopped mid-pass in f: kept +0 changed 0; the next pass carries on"],
+            "a stopped pass is no recovery"
+        );
+        assert!(pass(WatchEvent::ScanError(eio.into())).is_empty(), "so the run goes on");
+        assert_eq!(pass(WatchEvent::ScanError(refused.into())), [failed(refused)], "a changed text is said");
+        assert!(pass(WatchEvent::ScanError(refused.into())).is_empty());
+
+        let back = pass(WatchEvent::Quiet);
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].starts_with(&format!("{recovered} 7 failed pass(es) over ")), "{back:?}");
+        let r = st.row("watch").unwrap();
+        assert_eq!((r.state.as_str(), r.last_error), ("running", None));
+        assert!(pass(WatchEvent::Quiet).is_empty(), "the recovery is said once");
+
+        assert_eq!(pass(WatchEvent::ScanError(eio.into())), [failed(eio)], "a new run is said again");
+        let back = pass(WatchEvent::Ingested("f".into(), 2, 0, 0, 0, 0));
+        assert_eq!(back.len(), 2, "{back:?}");
+        assert!(back[0].starts_with(&format!("{recovered} 1 failed pass(es) over ")), "{back:?}");
+        assert_eq!(back[1], "pvfsd: watch ingested f: +2 changed 0 removed 0 unlinked 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_span_reads_at_a_glance() {
+        assert_eq!(failing_span(0), "0 s");
+        assert_eq!(failing_span(119_999), "119 s");
+        assert_eq!(failing_span(120_000), "2 min");
+        assert_eq!(failing_span(7_199_999), "119 min");
+        assert_eq!(failing_span(7_200_000), "2 h 0 min");
+        assert_eq!(failing_span(26_100_000), "7 h 15 min");
     }
 }
