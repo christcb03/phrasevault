@@ -4915,7 +4915,9 @@ struct WalkCtx<'a> {
     /// 0 = index whatever is on disk now (a one-shot scan, `--import`);
     /// non-zero = the watcher's "has it stopped being written" window.
     settle_ms: u64,
-    /// D149 — sidecars found with no file beside them, with their own mtime.
+    /// D149 — sidecars found with no file beside them, with the time their
+    /// grace runs from: their own mtime, or their `changed_ms` when that mtime
+    /// is from the far future (D152, `storage::age_from`).
     /// Collected by the walk and acted on by `scan_binding` after it: the walk
     /// only looks.
     orphans: std::cell::RefCell<Vec<(PathBuf, u64)>>,
@@ -4939,10 +4941,14 @@ fn walk_disk(
     // D149 — a sidecar is an orphan when the file it names is not in this same
     // listing, so the names are needed before the loop reaches it.
     let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    let now = now_ms();
     for entry in &entries {
         if entry.name.starts_with('.') {
             if !entry.is_dir && sidecar_is_orphan(&entry.name, &names) {
-                ctx.orphans.borrow_mut().push((dir.join(&entry.name), entry.mtime_ms));
+                ctx.orphans.borrow_mut().push((
+                    dir.join(&entry.name),
+                    crate::storage::age_from(entry.mtime_ms, entry.changed_ms, now),
+                ));
             }
             // D81 — our OWN bookkeeping is not something the operator chose not
             // to index, and counting it as `skipped` would put a permanent +1
@@ -4960,7 +4966,10 @@ fn walk_disk(
         // reason the dotfile arm above does not count ours (D81).
         if !entry.is_dir && crate::sync::is_sidecar_name(&entry.name) {
             if sidecar_is_orphan(&entry.name, &names) {
-                ctx.orphans.borrow_mut().push((dir.join(&entry.name), entry.mtime_ms));
+                ctx.orphans.borrow_mut().push((
+                    dir.join(&entry.name),
+                    crate::storage::age_from(entry.mtime_ms, entry.changed_ms, now),
+                ));
             }
             continue;
         }
@@ -5030,6 +5039,11 @@ fn walk_disk(
         // `changed_ms` is `max(mtime, ctime)`, and ctime cannot be back-dated
         // from userspace — so this now asks the filesystem when the bytes last
         // moved HERE, which is the question the window was always meant to ask.
+        //
+        // D152 — and a stamp from the far future is left out of that max
+        // (`storage::settle_time`). mediabox's 164 files dated 2038 and 2097
+        // were otherwise "still settling" on every pass until then: never
+        // hashed, never catalogued, and a watch recheck every 20 s for them.
         if ctx.settle_ms > 0 && entry.changed_ms.saturating_add(ctx.settle_ms) > now_ms() {
             stats.settling += 1;
             continue;
@@ -5072,8 +5086,8 @@ fn sidecar_is_orphan(name: &str, names: &HashSet<&str>) -> bool {
 /// this box cannot write keeps them, and the next pass tries again.
 fn trash_orphan_sidecars(root: &std::path::Path, found: Vec<(PathBuf, u64)>, now: u64) -> u64 {
     let mut moved = 0;
-    for (path, mtime_ms) in found {
-        if mtime_ms.saturating_add(ORPHAN_SIDECAR_GRACE_MS) > now {
+    for (path, since_ms) in found {
+        if since_ms.saturating_add(ORPHAN_SIDECAR_GRACE_MS) > now {
             continue;
         }
         if crate::sync::move_to_trash(root, &path).is_ok() {

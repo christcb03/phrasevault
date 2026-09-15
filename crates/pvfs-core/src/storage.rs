@@ -24,7 +24,8 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_ms: u64,
-    /// When this entry last changed on THIS filesystem: `max(mtime, ctime)`.
+    /// When this entry last changed on THIS filesystem: `max(mtime, ctime)`,
+    /// leaving out a stamp from the far future (D152).
     ///
     /// D112 — the settle window needs a "has it stopped moving" signal, and
     /// mtime is not one when the writer back-dates it. See [`changed_ms`].
@@ -251,16 +252,69 @@ pub fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
 /// back-dated from userspace (`utimes` moves mtime and atime, never ctime), so
 /// it marks when the bytes really last moved here. Taking the max keeps mtime's
 /// behaviour wherever mtime is the later of the two.
+///
+/// D152 — except a stamp from the far future, which is left out: see
+/// [`settle_time`].
 fn changed_ms(md: &fs::Metadata) -> u64 {
-    let m = mtime_ms(md);
     #[cfg(unix)]
-    let m = {
+    let ctime = {
         use std::os::unix::fs::MetadataExt;
         let secs = md.ctime().max(0) as u64;
         let nanos = md.ctime_nsec().max(0) as u64;
-        m.max(secs.saturating_mul(1_000).saturating_add(nanos / 1_000_000))
+        secs.saturating_mul(1_000).saturating_add(nanos / 1_000_000)
     };
-    m
+    #[cfg(not(unix))]
+    let ctime = 0;
+    settle_time(mtime_ms(md), ctime, crate::engine::now_ms())
+}
+
+/// D152 — how far ahead of this box's clock a stamp may be and still count as
+/// a clock. The widest skew measured on the fleet is the NAS, 142 s slow
+/// (D150); an hour is well past that, and bounds what a merely-early stamp
+/// costs: the watch's 20 s recheck until the clock passes it.
+pub const FUTURE_SKEW_MS: u64 = 60 * 60 * 1_000;
+
+/// Whether `t` is further ahead of `now` than any clock on the fleet is.
+fn is_far_future(t: u64, now: u64) -> bool {
+    t > now.saturating_add(FUTURE_SKEW_MS)
+}
+
+/// D152 — the settle signal from a file's mtime and ctime as of `now_ms`: the
+/// later of the two, leaving out either that is further ahead than
+/// [`FUTURE_SKEW_MS`]; 0 when neither is left.
+///
+/// Measured on mediabox 2026-09-14: 164 files stamped 2038-01-18 (2³¹−1) or
+/// 2097-12-31 by some other tool, their ctimes months old. `max(mtime, ctime)`
+/// made each one "still settling" on every pass until that date, so none was
+/// ever hashed or catalogued, and the watch re-ran every 20 s for them.
+///
+/// A far-future mtime is a `utimes` value set after the file's last write —
+/// every write stamps both times with the current one — and that call set the
+/// ctime too, so the ctime says when the file last moved here. When nothing
+/// sane is left (the clock was wrong at both, or there is no ctime) the file is
+/// settled: a write in progress always carries the current time. Neither
+/// touches the case the window is for: a file being written is judged as
+/// before, and rclone's back-dated mtime (D112) is in the past, where the ctime
+/// still wins the max.
+fn settle_time(mtime_ms: u64, ctime_ms: u64, now_ms: u64) -> u64 {
+    [mtime_ms, ctime_ms]
+        .into_iter()
+        .filter(|&t| !is_far_future(t, now_ms))
+        .max()
+        .unwrap_or(0)
+}
+
+/// D152 — the moment an age is measured from: `mtime_ms`, unless that is from
+/// the far future, then `changed_ms` (which has already left it out). D149's
+/// orphan grace times a sidecar from its mtime, and D150 dates a future-dated
+/// file's sidecar to match the file, so without this a sidecar whose 2038 file
+/// was renamed would never be an hour old.
+pub(crate) fn age_from(mtime_ms: u64, changed_ms: u64, now_ms: u64) -> u64 {
+    if is_far_future(mtime_ms, now_ms) {
+        changed_ms
+    } else {
+        mtime_ms
+    }
 }
 
 /// A file's mtime in ms since the epoch — the unit catalogue rows record, and
@@ -455,5 +509,61 @@ mod tests {
         assert_eq!(s, "world");
 
         assert_eq!(b.hash(&file_uri).unwrap(), blake3::hash(b"hello world").to_hex().to_string());
+    }
+
+    const DAY: u64 = 86_400_000;
+    /// 2026-09-15 00:08 UTC, when the lab rehearsal planted its file.
+    const NOW: u64 = 1_789_430_913_707;
+    /// 2³¹−1 seconds: the stamp on 161 of mediabox's files.
+    const Y2038: u64 = 2_147_483_647_000;
+
+    #[test]
+    fn d152_settle_time_leaves_out_a_stamp_from_the_far_future() {
+        // An ordinary file: both stamps are the same moment.
+        assert_eq!(settle_time(NOW - 9_000, NOW - 9_000, NOW), NOW - 9_000);
+        // D112: rclone back-dated the mtime; the ctime says when it landed.
+        assert_eq!(settle_time(NOW - 2 * DAY, NOW - 5_000, NOW), NOW - 5_000);
+        // Just ahead of this clock is skew (the NAS runs 142 s slow): honoured,
+        // so the file settles once the clock passes it.
+        assert_eq!(settle_time(NOW + 142_000, NOW - 9_000, NOW), NOW + 142_000);
+        assert_eq!(settle_time(NOW + FUTURE_SKEW_MS, 0, NOW), NOW + FUTURE_SKEW_MS);
+        // mediabox: 2038, stamped months ago — judged by the ctime.
+        assert_eq!(settle_time(Y2038, NOW - 90 * DAY, NOW), NOW - 90 * DAY);
+        assert_eq!(settle_time(NOW + FUTURE_SKEW_MS + 1, NOW - DAY, NOW), NOW - DAY);
+        // Nothing sane left: settled, not deferred until 2038.
+        assert_eq!(settle_time(Y2038, Y2038, NOW), 0, "the clock was wrong at both");
+        assert_eq!(settle_time(Y2038, 0, NOW), 0, "a filesystem with no ctime");
+    }
+
+    #[test]
+    fn d152_an_age_runs_from_mtime_unless_it_is_from_the_far_future() {
+        // D149's orphan grace, unchanged for an ordinary sidecar — its tests
+        // age one by setting the mtime back, which leaves the ctime at now.
+        assert_eq!(age_from(NOW - 2 * 3_600_000, NOW, NOW), NOW - 2 * 3_600_000);
+        // D150 dated this sidecar to its 2038 file: timed from changed_ms.
+        assert_eq!(age_from(Y2038, NOW - 2 * 3_600_000, NOW), NOW - 2 * 3_600_000);
+    }
+
+    #[test]
+    fn d152_a_listing_settles_a_far_future_file_by_its_ctime() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s11e01.mkv");
+        std::fs::write(&f, b"x").unwrap();
+        let before = crate::engine::now_ms();
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_millis(Y2038))
+            .unwrap();
+        let e = LocalBackend.list(&path_to_uri(dir.path()).unwrap()).unwrap().remove(0);
+        assert_eq!(e.mtime_ms, Y2038, "the listing still reports the mtime as it is");
+        // The kernel's file clock is coarse, hence the second of slack.
+        #[cfg(unix)]
+        assert!(
+            e.changed_ms >= before.saturating_sub(1_000) && e.changed_ms <= crate::engine::now_ms(),
+            "settled by the ctime the stamp itself set, not by 2038: {}",
+            e.changed_ms
+        );
     }
 }
