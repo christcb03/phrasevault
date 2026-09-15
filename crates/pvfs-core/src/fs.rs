@@ -2742,7 +2742,13 @@ impl Engine {
             let Some(path) = crate::storage::local_path_of(&uri, own_pin.as_deref()) else {
                 continue;
             };
-            if path.exists() {
+            // D160 — gone only when the disk says it is not there. `exists()`
+            // was false on ANY stat error, so a directory that stopped being
+            // searchable (skipped by the walk as `unreadable`) had every
+            // location beneath it retired, and added back once it could be
+            // searched again: a remove/add pair per file for a chmod. D81's
+            // "an error is not absence", as D156 applied it to the catalogue.
+            if !gone_from_disk(&path) {
                 continue; // filtered out, not deleted — leave it alone
             }
             // soft-remove the location if still active
@@ -5061,6 +5067,9 @@ fn read_fault(e: &PvfsError) -> ReadFault {
 /// being searchable (skipped by the walk as `unreadable`), read as deleted and
 /// lost its row — D81's "an error is not absence", on the catalogue side. It
 /// matters more now that a pass carries on past a file it could not read.
+///
+/// D160 — the log side's deletions (`scan_binding` step 3) ask it too, for the
+/// same reason: they retired each tracked location whose stat failed.
 fn gone_from_disk(p: &std::path::Path) -> bool {
     match std::fs::metadata(p) {
         Ok(_) => false,

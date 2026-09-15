@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A log region's deletions ask the disk whether a file is gone (D160).**
+  The deletion step of a log-region pass (`scan_binding` step 3) retired
+  each tracked location the walk had not listed if `Path::exists` was
+  false. That is false on any stat error. A directory that stopped being
+  searchable is skipped by the walk as `unreadable`, so the next complete
+  pass retired every location beneath it. The pass after the directory
+  became searchable again added them back, which cost a remove/add pair in
+  the log for each file. Step 3 now asks D156's `gone_from_disk`, as the
+  catalogue sweep does: only ENOENT and ENOTDIR mean gone. Any other stat
+  error leaves the location, its node and its `scan_state` row alone. The
+  root marker still covers an unmount.
+
 - **One unreadable new file does not stop a log-region pass (D158).**
   `ingest_file` hashed a brand-new file with `?`. The read's error is `Io`,
   which `is_transient` calls transient, so one file's read error ended the
