@@ -5,6 +5,42 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One unreadable file does not stop a catalogue pass (D156).**
+  `scan_region_catalogue` hashed each file with `?`, so one file's read error
+  ended the pass. A file that failed every time stopped every pass at the
+  same place. The sweep and the head wait for a complete pass (D154), so
+  that region would never have published again. A failed read is now
+  classified by its errno (`catalogue_read_fault`), because `is_transient`
+  calls every I/O error transient:
+  - A file gone since the walk (ENOENT, ENOTDIR) is left to the sweep. The
+    NAS's old forest logged two renamed episodes that way.
+  - A fault of the file itself (EACCES, EIO, ENODATA, EBADMSG, EUCLEAN, …)
+    is quarantined. It is skipped, counted in `needs_attention` and named in
+    `quarantined`, and its prior row stays as the last read left it. The pass
+    carries on, sweeps and publishes: a quarantine does not hold back the
+    head.
+  - Anything else (ENOTCONN, ESTALE, EMFILE, any errno not named) fails the
+    pass as before. The pass now commits the rows it holds first.
+
+  Because a pass can now reach the sweep after meeting errors, two guards
+  come with it. The root marker is verified again before the sweep, so a
+  volume unmounted mid-pass fails the pass instead of sweeping every row the
+  pass had not reached. And the sweep takes a row only when `metadata()` says
+  NotFound, where `Path::exists` took it on any stat error. That also stops a
+  directory that became unsearchable from having every row beneath it swept.
+
+  `needs_attention` is now reported, for log regions too. It has been
+  counted since D71 W4, and nothing reported it:
+  - `WatchEvent::NeedsAttention` comes after the pass's verdict.
+  - pvfsd logs `pvfsd: watch skipped <uri>: <reason>` and keeps a one-line
+    note in the watch job's `last_error` until a clean pass clears it. From
+    there it shows in `serve status` and among the HA page's problems, and
+    reaches the notifier's `job_error` once (D151).
+  - `pvfs serve watch` and `pvfs scan` print it, and `pvfs scan --json`
+    carries `needs_attention`.
+
+  Test seam: `Engine::on_catalogue_read`.
+
 - **A catalogue pass keeps what it did (D154).** `scan_region_catalogue`
   hashed every file first and committed every row in one transaction at the
   end, so a stop (D86) during the hashing committed nothing. mediabox's two

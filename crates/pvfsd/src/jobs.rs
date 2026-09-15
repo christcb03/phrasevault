@@ -285,6 +285,15 @@ impl JobsState {
         });
     }
 
+    /// D156 — a pass completed but skipped files that need a human: say so in
+    /// `last_error`, leaving `state` and `last_ok` alone (the pass DID
+    /// complete, and the stall detector must not hear otherwise). It arrives
+    /// after the pass's verdict, whose `mark_ok` cleared the last note, so the
+    /// note stands exactly as long as passes keep meeting the file.
+    fn mark_attention(&self, name: &str, note: String) {
+        self.with_row(name, |r| r.last_error = Some(note));
+    }
+
     /// A transient failure: the job retries by itself.
     fn mark_retry(&self, name: &str, reason: &str) {
         self.with_row(name, |r| {
@@ -399,71 +408,8 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 st.set_state("watch", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
-                let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| match ev {
-                    WatchEvent::PassStarted => cb.mark_pass_start("watch"),
-                    WatchEvent::Ingested(ref folder, a, c, rm, un, orphans) => {
-                        cb.mark_pass_end("watch");
-                        cb.mark_ok("watch");
-                        // D111 — SAY WHAT THE PASS DID. This job is how the
-                        // fleet actually scans, and it reported its numbers to
-                        // nobody: the counts went into the status row's
-                        // liveness bookkeeping and were then dropped. So the
-                        // one place a scan can now take files out of the tree
-                        // (D105) was the one place with no record of it, and
-                        // "how many did that unlink?" could only be answered
-                        // by diffing the forest before and after.
-                        if a + c + rm + un > 0 {
-                            eprintln!(
-                                "pvfsd: watch ingested {folder}: \
-                                 +{a} changed {c} removed {rm} unlinked {un}"
-                            );
-                        }
-                        // D149 — the one thing a pass moves on disk.
-                        if orphans > 0 {
-                            eprintln!(
-                                "pvfsd: watch moved {orphans} orphaned manifest(s) \
-                                 to the trash in {folder}"
-                            );
-                        }
-                        if a + c + rm > 0 {
-                            // local ingest = new content: views, placed
-                            // subtrees, the mover — all should wake
-                            cb.nudge_content();
-                            cb.nudge_tier();
-                        }
-                    }
-                    // D154 — a pass told to stop is not an ingest. What it
-                    // counts is real (a catalogue commits as it goes, a log
-                    // region file by file), so say it, but give no verdict,
-                    // the D83 rule: `last_ok` stamps a COMPLETED pass, and it
-                    // used to be stamped here for a pass that kept nothing.
-                    WatchEvent::Stopped(ref folder, a, c, orphans) => {
-                        cb.mark_pass_abandoned("watch");
-                        eprintln!(
-                            "pvfsd: watch stopped mid-pass in {folder}: \
-                             kept +{a} changed {c}; the next pass carries on"
-                        );
-                        if orphans > 0 {
-                            eprintln!(
-                                "pvfsd: watch moved {orphans} orphaned manifest(s) \
-                                 to the trash in {folder}"
-                            );
-                        }
-                        if a + c > 0 {
-                            cb.nudge_content();
-                            cb.nudge_tier();
-                        }
-                    }
-                    // D81 — a clean pass with nothing to do is progress.
-                    WatchEvent::Quiet => {
-                        cb.mark_pass_end("watch");
-                        cb.mark_ok("watch");
-                    }
-                    WatchEvent::ScanError(e) => {
-                        cb.mark_pass_end("watch");
-                        cb.mark_retry("watch", &e);
-                    }
-                    WatchEvent::Watching(..) => cb.set_state("watch", "running"),
+                let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| {
+                    watch_event(&cb, ev)
                 });
                 match r {
                     Ok(()) => st.set_state(
@@ -481,6 +427,100 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
         other => unreachable!("no continuous body for job {other}"),
     };
     Managed { stop, handle }
+}
+
+/// The watch job's reading of one watcher event — out of the thread's
+/// closure so a test can drive it (D156).
+fn watch_event(cb: &JobsState, ev: WatchEvent) {
+    match ev {
+        WatchEvent::PassStarted => cb.mark_pass_start("watch"),
+        WatchEvent::Ingested(ref folder, a, c, rm, un, orphans) => {
+            cb.mark_pass_end("watch");
+            cb.mark_ok("watch");
+            // D111 — SAY WHAT THE PASS DID. This job is how the fleet
+            // actually scans, and it reported its numbers to nobody: the
+            // counts went into the status row's liveness bookkeeping and were
+            // then dropped. So the one place a scan can now take files out of
+            // the tree (D105) was the one place with no record of it, and "how
+            // many did that unlink?" could only be answered by diffing the
+            // forest before and after.
+            if a + c + rm + un > 0 {
+                eprintln!(
+                    "pvfsd: watch ingested {folder}: \
+                     +{a} changed {c} removed {rm} unlinked {un}"
+                );
+            }
+            // D149 — the one thing a pass moves on disk.
+            if orphans > 0 {
+                eprintln!(
+                    "pvfsd: watch moved {orphans} orphaned manifest(s) \
+                     to the trash in {folder}"
+                );
+            }
+            if a + c + rm > 0 {
+                // local ingest = new content: views, placed subtrees, the
+                // mover — all should wake
+                cb.nudge_content();
+                cb.nudge_tier();
+            }
+        }
+        // D154 — a pass told to stop is not an ingest. What it counts is real
+        // (a catalogue commits as it goes, a log region file by file), so say
+        // it, but give no verdict, the D83 rule: `last_ok` stamps a COMPLETED
+        // pass, and it used to be stamped here for a pass that kept nothing.
+        WatchEvent::Stopped(ref folder, a, c, orphans) => {
+            cb.mark_pass_abandoned("watch");
+            eprintln!(
+                "pvfsd: watch stopped mid-pass in {folder}: \
+                 kept +{a} changed {c}; the next pass carries on"
+            );
+            if orphans > 0 {
+                eprintln!(
+                    "pvfsd: watch moved {orphans} orphaned manifest(s) \
+                     to the trash in {folder}"
+                );
+            }
+            if a + c > 0 {
+                cb.nudge_content();
+                cb.nudge_tier();
+            }
+        }
+        // D81 — a clean pass with nothing to do is progress.
+        WatchEvent::Quiet => {
+            cb.mark_pass_end("watch");
+            cb.mark_ok("watch");
+        }
+        WatchEvent::ScanError(e) => {
+            cb.mark_pass_end("watch");
+            cb.mark_retry("watch", &e);
+        }
+        WatchEvent::Watching(..) => cb.set_state("watch", "running"),
+        // D156 — files the pass skipped that need a human: a log region's
+        // refusal (D71 W4), a catalogue region's file it could not read.
+        // Named in the journal, and held in the row's `last_error`, which is
+        // what reaches `serve status`, the HA page and, once (D151), the
+        // phone. The pass's verdict came first, so this note outlasts it.
+        WatchEvent::NeedsAttention(n, named) => {
+            for (what, why) in &named {
+                eprintln!("pvfsd: watch skipped {what}: {why}");
+            }
+            eprintln!(
+                "pvfsd: watch: {n} file(s) need attention \
+                 (skipped this pass; every pass tries them again)"
+            );
+            cb.mark_attention("watch", attention_note(n, &named));
+        }
+    }
+}
+
+/// The one line a quarantine leaves in the watch job's `last_error`: the count
+/// and the first reason BEFORE the path, since the HA page keeps only the
+/// first 160 characters.
+fn attention_note(n: u64, named: &[(String, String)]) -> String {
+    match named.first() {
+        Some((what, why)) => format!("{n} file(s) skipped, need attention: {why}: {what}"),
+        None => format!("{n} file(s) skipped, need attention"),
+    }
 }
 
 /// One sync pass: fetch missing bytes for every `sync`-placed subtree.
@@ -1134,5 +1174,49 @@ pub fn run(
     }
     for m in draining {
         let _ = m.handle.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D156 — a quarantine's note outlasts the verdict of the pass that met
+    /// it (`mark_ok` comes first), a stopped pass leaves it standing (no
+    /// verdict, D154), and the next clean pass clears it.
+    #[test]
+    fn a_quarantine_note_outlasts_its_pass_and_a_clean_pass_clears_it() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d156-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let named = vec![(
+            "file:///lib/e3.mkv".to_string(),
+            "I/O error during read for hash: Input/output error (os error 5)".to_string(),
+        )];
+        for ev in [WatchEvent::PassStarted, WatchEvent::Quiet, WatchEvent::NeedsAttention(1, named)] {
+            watch_event(&st, ev);
+        }
+        let r = st.row("watch").unwrap();
+        assert!(r.last_ok_ms.is_some(), "the pass completed, so it is stamped");
+        assert_eq!(r.state, "running");
+        assert_eq!(
+            r.last_error.as_deref(),
+            Some(
+                "1 file(s) skipped, need attention: I/O error during read for hash: \
+                 Input/output error (os error 5): file:///lib/e3.mkv"
+            ),
+            "the reason before the path"
+        );
+
+        for ev in [WatchEvent::PassStarted, WatchEvent::Stopped("f".into(), 0, 0, 0)] {
+            watch_event(&st, ev);
+        }
+        assert!(st.row("watch").unwrap().last_error.is_some(), "a stopped pass gives no verdict");
+
+        for ev in [WatchEvent::PassStarted, WatchEvent::Quiet] {
+            watch_event(&st, ev);
+        }
+        assert_eq!(st.row("watch").unwrap().last_error, None, "a clean pass clears it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

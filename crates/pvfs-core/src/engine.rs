@@ -259,7 +259,14 @@ pub struct Engine {
     /// D154 test seam (`interrupt_catalogue_at`): the file at which the next
     /// catalogue pass is interrupted, and whether as a kill.
     pub(crate) catalogue_interrupt: Option<(u64, bool)>,
+    /// D156 test seam (`on_catalogue_read`): called with each file a catalogue
+    /// pass is about to hash, just before the read.
+    pub(crate) catalogue_read_hook: Option<CatalogueReadHook>,
 }
+
+/// D156 — the catalogue-read test seam's hook (`Engine::on_catalogue_read`).
+#[doc(hidden)]
+pub type CatalogueReadHook = Box<dyn FnMut(&std::path::Path) -> Option<std::io::Error> + Send>;
 
 impl Engine {
     /// Give this engine a flag that asks a long pass to stop early.
@@ -291,6 +298,17 @@ impl Engine {
     #[doc(hidden)]
     pub fn interrupt_catalogue_at(&mut self, at: u64, crash: bool) {
         self.catalogue_interrupt = Some((at, crash));
+    }
+
+    /// D156 test seam: `hook` is called with each file a catalogue pass is
+    /// about to hash (one its row cannot vouch for), just before the read.
+    /// Whatever it does to the disk is what the read then meets (delete the
+    /// file, chmod it, empty the whole root), and an error it returns stands
+    /// in for the read's own. It stays until replaced (`None` removes it), so
+    /// a file can fail every pass, as one on a bad sector does.
+    #[doc(hidden)]
+    pub fn on_catalogue_read(&mut self, hook: Option<CatalogueReadHook>) {
+        self.catalogue_read_hook = hook;
     }
 
     /// Raise the stop flag, as SIGTERM does — the one `set_cancel` gave, or a
@@ -664,6 +682,7 @@ impl Engine {
             cancel: None,
             catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
             catalogue_interrupt: None,
+            catalogue_read_hook: None,
             identity: ForestIdentity {
                 instance_id,
                 forest_id,
@@ -701,6 +720,7 @@ impl Engine {
             cancel: None,
             catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
             catalogue_interrupt: None,
+            catalogue_read_hook: None,
         };
         if let Err(e) = engine.ensure_device_active() {
             // A projection torn by concurrent folders can pass every position
@@ -816,6 +836,7 @@ impl Engine {
             cancel: None,
             catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
             catalogue_interrupt: None,
+            catalogue_read_hook: None,
         })
     }
 
@@ -844,6 +865,7 @@ impl Engine {
             cancel: None,
             catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
             catalogue_interrupt: None,
+            catalogue_read_hook: None,
         })
     }
 
@@ -979,6 +1001,7 @@ impl Engine {
             cancel: None,
             catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
             catalogue_interrupt: None,
+            catalogue_read_hook: None,
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();

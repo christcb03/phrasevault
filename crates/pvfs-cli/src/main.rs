@@ -5738,6 +5738,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                     }
                                 }
                             }
+                            // D156 — files the pass skipped that need a human.
+                            pvfs_client::watch::WatchEvent::NeedsAttention(n, named) => {
+                                if !json {
+                                    println!("needs attention: {n} file(s) skipped this pass");
+                                    for (what, why) in named {
+                                        println!("  {what}: {why}");
+                                    }
+                                }
+                            }
                             // A quiet pass is progress for the daemon's stall
                             // detector, not news for a human watching a terminal.
                             pvfs_client::watch::WatchEvent::PassStarted
@@ -7727,7 +7736,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .iter()
                     .map(|r| {
                         format!(
-                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"pending_unlink\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{},\"orphan_sidecars\":{}}}",
+                            "{{\"folder_id\":\"{}\",\"added\":{},\"unchanged\":{},\"changed\":{},\"removed\":{},\"unlinked\":{},\"pending_unlink\":{},\"skipped\":{},\"unreadable\":{},\"empty_dirs\":{},\"orphan_sidecars\":{},\"needs_attention\":{}}}",
                             r.folder_id,
                             r.stats.added,
                             r.stats.unchanged,
@@ -7738,7 +7747,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             r.stats.skipped,
                             r.stats.unreadable,
                             r.stats.empty_dirs,
-                            r.stats.orphan_sidecars
+                            r.stats.orphan_sidecars,
+                            r.stats.needs_attention
                         )
                     })
                     .collect();
@@ -7767,6 +7777,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let unreadable: u64 = reports.iter().map(|r| r.stats.unreadable).sum();
                 if unreadable > 0 {
                     eprintln!("note: {unreadable} path(s) skipped — not readable by your user");
+                }
+                // D156 — files the pass skipped that need a human: a log
+                // region's refusal (D71 W4), a catalogue region's file it
+                // could not read. Counted since D71 W4, printed by nothing.
+                let attention: u64 = reports.iter().map(|r| r.stats.needs_attention).sum();
+                if attention > 0 {
+                    eprintln!("note: {attention} file(s) skipped — they need attention:");
+                    for (what, why) in reports.iter().flat_map(|r| r.stats.quarantined.iter()) {
+                        eprintln!("  {what}: {why}");
+                    }
                 }
                 // D112 — say WHY nothing was unlinked, rather than leaving a
                 // zero that reads as "nothing was gone".

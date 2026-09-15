@@ -18,6 +18,7 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 const SETTLE_RECHECK: Duration = Duration::from_secs(20);
 
 /// Progress callbacks: stdout lines in the CLI, status rows in pvfsd.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchEvent {
     /// A scan pass ingested changes:
     /// (folder_id, added, changed, removed, unlinked, orphan_sidecars).
@@ -45,6 +46,13 @@ pub enum WatchEvent {
     /// logged `watch ingested … +8520` for a mediabox pass that had committed
     /// nothing, one second before it shut down.
     Stopped(String, u64, u64, u64),
+    /// D156 — files the pass skipped because they need a human: (how many,
+    /// the first few as (file, reason)). A log region quarantines what the
+    /// catalog refuses (D71 W4); a catalogue region, a file it could not read.
+    /// Both counted these, and nothing reported them. At most one per pass,
+    /// sent AFTER the pass's `Ingested`/`Stopped`/`Quiet`, so a driver that
+    /// clears its error on a completed pass sets it again straight after.
+    NeedsAttention(u64, Vec<(String, String)>),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
     /// A scan pass has BEGUN (D81) — what lets the daemon tell a wedged
@@ -200,26 +208,8 @@ pub fn run(
                         if reports.iter().any(|r| r.stats.settling > 0) {
                             retry_at = Some(Instant::now() + SETTLE_RECHECK);
                         }
-                        let mut said_something = false;
-                        for r in reports.iter().filter(|r| {
-                            // D154 — a stopped pass is said even when it kept
-                            // nothing: it must not fall through to `Quiet`,
-                            // which means a pass completed.
-                            r.stats.cancelled
-                                || r.stats.added
-                                    + r.stats.changed
-                                    + r.stats.removed
-                                    + r.stats.unlinked
-                                    + r.stats.orphan_sidecars
-                                    > 0
-                        }) {
-                            said_something = true;
-                            notify_cb(pass_event(r));
-                        }
-                        // The pass ran cleanly either way — say so, so progress
-                        // does not depend on the library happening to change.
-                        if !said_something {
-                            notify_cb(WatchEvent::Quiet);
+                        for ev in pass_events(&reports) {
+                            notify_cb(ev);
                         }
                     }
                     Err(e) => {
@@ -269,8 +259,10 @@ pub fn run(
 ///   pass is simply redone. Nobody is asked for anything.
 /// * **Permanent** — the catalog refuses a file for a reason retrying cannot
 ///   change. That ONE file is quarantined with its reason, the rest of the pass
-///   continues (one bad file never stops the line), and the report says a human
-///   is needed. Retrying that forever would be a loop, not a repair.
+///   continues (one bad file never stops the line), and the pass says a human
+///   is needed (`WatchEvent::NeedsAttention`; until D156 nothing did). Retrying
+///   that forever would be a loop, not a repair. A catalogue region's file it
+///   could not read is quarantined the same way (D156).
 fn scan_pass(
     engine: &mut Engine,
     route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
@@ -304,6 +296,43 @@ fn scan_pass(
     }
 }
 
+/// Everything one pass says, in order (D156): each binding's `Ingested` or
+/// `Stopped` (D154), or `Quiet` when none has news; then, if any binding
+/// skipped files that need a human, ONE `NeedsAttention` for the whole pass.
+fn pass_events(reports: &[pvfs_core::ScanReport]) -> Vec<WatchEvent> {
+    let mut out: Vec<WatchEvent> = reports
+        .iter()
+        .filter(|r| {
+            // D154 — a stopped pass is said even when it kept nothing: it
+            // must not fall through to `Quiet`, which means a pass completed.
+            r.stats.cancelled
+                || r.stats.added
+                    + r.stats.changed
+                    + r.stats.removed
+                    + r.stats.unlinked
+                    + r.stats.orphan_sidecars
+                    > 0
+        })
+        .map(pass_event)
+        .collect();
+    // The pass ran cleanly either way — say so, so progress does not depend
+    // on the library happening to change. A quarantine is not news of that
+    // kind: a pass whose only news is one still completed, quietly.
+    if out.is_empty() {
+        out.push(WatchEvent::Quiet);
+    }
+    let total: u64 = reports.iter().map(|r| r.stats.needs_attention).sum();
+    if total > 0 {
+        let named = reports
+            .iter()
+            .flat_map(|r| r.stats.quarantined.iter().cloned())
+            .take(8)
+            .collect();
+        out.push(WatchEvent::NeedsAttention(total, named));
+    }
+    out
+}
+
 /// What one binding's pass reports (D154): a pass told to stop is `Stopped`,
 /// never `Ingested`.
 fn pass_event(r: &pvfs_core::ScanReport) -> WatchEvent {
@@ -319,5 +348,76 @@ fn pass_event(r: &pvfs_core::ScanReport) -> WatchEvent {
             s.unlinked,
             s.orphan_sidecars,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pvfs_core::fs::ScanStats;
+    use pvfs_core::ScanReport;
+
+    fn report(folder: &str, stats: ScanStats) -> ScanReport {
+        ScanReport { folder_id: folder.to_string(), stats }
+    }
+
+    fn skipped(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("file:///lib/e{i}.mkv"),
+                    "I/O error during read for hash: Input/output error (os error 5)".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_pass_asks_for_nobody() {
+        assert_eq!(pass_events(&[report("a", ScanStats::default())]), vec![WatchEvent::Quiet]);
+    }
+
+    /// D156 — a pass whose only news is a quarantine is still a completed,
+    /// quiet pass, and names the file after saying so.
+    #[test]
+    fn a_quarantine_follows_the_verdict_and_the_pass_stays_quiet() {
+        let s = ScanStats { needs_attention: 1, quarantined: skipped(1), ..Default::default() };
+        assert_eq!(
+            pass_events(&[report("a", s)]),
+            vec![WatchEvent::Quiet, WatchEvent::NeedsAttention(1, skipped(1))]
+        );
+    }
+
+    /// One `NeedsAttention` for the whole pass, after every binding's verdict,
+    /// naming the first eight across them and counting all.
+    #[test]
+    fn attention_is_one_event_for_the_pass_after_every_verdict() {
+        let a = ScanStats { added: 2, needs_attention: 1, quarantined: skipped(1), ..Default::default() };
+        let b = ScanStats { needs_attention: 12, quarantined: skipped(8), ..Default::default() };
+        let c = ScanStats { removed: 1, ..Default::default() };
+        let ev = pass_events(&[report("a", a), report("b", b), report("c", c)]);
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert_eq!(ev[0], WatchEvent::Ingested("a".into(), 2, 0, 0, 0, 0));
+        assert_eq!(ev[1], WatchEvent::Ingested("c".into(), 0, 0, 1, 0, 0));
+        let WatchEvent::NeedsAttention(n, named) = &ev[2] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!((*n, named.len()), (13, 8));
+    }
+
+    /// A stopped pass still names what it skipped before the stop, after its
+    /// `Stopped` and with no `Quiet` (D154).
+    #[test]
+    fn a_stopped_pass_still_names_what_it_skipped() {
+        let s = ScanStats {
+            cancelled: true,
+            needs_attention: 1,
+            quarantined: skipped(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            pass_events(&[report("a", s)]),
+            vec![WatchEvent::Stopped("a".into(), 0, 0, 0), WatchEvent::NeedsAttention(1, skipped(1))]
+        );
     }
 }

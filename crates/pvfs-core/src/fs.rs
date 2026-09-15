@@ -286,6 +286,11 @@ pub struct ScanStats {
     /// (authorization, bad input). The pass skipped it and carried on — one bad
     /// file must never stop the line — but it needs a human. `quarantined`
     /// carries the first few, with reasons, so the report can say WHICH.
+    ///
+    /// D156 — a catalogue region counts here a file it could not READ for a
+    /// reason that is the file's own (EACCES, EIO, …; `catalogue_read_fault`):
+    /// skipped, its prior row kept, tried again every pass. The watch reports
+    /// both kinds (`WatchEvent::NeedsAttention`); until D156 nothing did.
     pub needs_attention: u64,
     pub quarantined: Vec<(String, String)>,
     /// D149 — manifest sidecars moved to the trash because the file beside
@@ -1232,6 +1237,12 @@ impl Engine {
     /// the forest as the region's catalogue, and a fetch (D129) would install
     /// it as the truth, so a stopped pass publishes nothing. This box's rows
     /// may run ahead of its head, never the other way round.
+    ///
+    /// D156 — one file's failed read is not the pass's failure. A file gone
+    /// since the walk is left to the sweep; a file whose own trouble it is
+    /// (EACCES, EIO, …; `catalogue_read_fault`) is quarantined and keeps its
+    /// prior row; anything that may be the volume's fails the pass as before.
+    /// A pass with a quarantine is complete: it sweeps and publishes.
     fn scan_region_catalogue(
         &mut self,
         b: &Binding,
@@ -1311,10 +1322,52 @@ impl Engine {
                     // overruns the unit's stop timeout and is SIGKILLed,
                     // losing the batch a clean stop would have committed.
                     HashPolicy::OnAdd => {
-                        match self.hash_reusing_sidecar_until(&f.path, f.size, self.cancel_flag())? {
-                            Some((h, _)) => Some(h),
+                        let injected =
+                            self.catalogue_read_hook.as_mut().and_then(|h| h(f.path.as_path()));
+                        let read = match injected {
+                            Some(e) => Err(PvfsError::io("read for hash", e)),
+                            None => self.hash_reusing_sidecar_until(&f.path, f.size, self.cancel_flag()),
+                        };
+                        match read {
+                            Ok(Some((h, _))) => Some(h),
                             // Abandoned mid-read: this file counts for nothing.
-                            None => return self.stop_catalogue_pass(region, pass, &mut pending, stats),
+                            Ok(None) => return self.stop_catalogue_pass(region, pass, &mut pending, stats),
+                            // D156 — one file's failed read no longer ends the
+                            // pass. A file that failed every time stopped every
+                            // pass at the same place, and since the sweep and
+                            // the head wait for a complete pass (D154), the
+                            // region never published again.
+                            Err(e) => match catalogue_read_fault(&e) {
+                                // Renamed or deleted since the walk: not in
+                                // `produced`, so the sweep asks the disk.
+                                ReadFault::Gone => {
+                                    eprintln!(
+                                        "catalogue: {} went away before it could be read; the sweep decides",
+                                        f.path.display()
+                                    );
+                                    continue;
+                                }
+                                // Its own trouble: quarantined, as D71 W4 does
+                                // for log regions. No row is written, so its
+                                // prior row, if any, stays as the last read
+                                // left it. Every pass tries it again.
+                                ReadFault::File => {
+                                    stats.needs_attention += 1;
+                                    if stats.quarantined.len() < 8 {
+                                        let uri = path_to_uri(&f.path)
+                                            .unwrap_or_else(|_| f.path.display().to_string());
+                                        stats.quarantined.push((uri, e.to_string()));
+                                    }
+                                    continue;
+                                }
+                                // Perhaps the volume's: fail the pass, as every
+                                // read error used to, keeping what it holds
+                                // (hashed, and correct) as a stop does.
+                                ReadFault::Pass => {
+                                    self.commit_catalogue_rows(region, pass, &mut pending)?;
+                                    return Err(e);
+                                }
+                            },
                         }
                     }
                     HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
@@ -1340,8 +1393,17 @@ impl Engine {
         }
         self.commit_catalogue_rows(region, pass, &mut pending)?;
 
+        // D156 — the volume is still the one the pass began on. Now that a
+        // pass carries on past a file it could not read, an unmount mid-pass
+        // no longer ends it: every later file is merely "gone" (ENOENT), and
+        // the sweep below would take every row the pass had not reached, then
+        // publish that. The root marker is D81's test for exactly this; asked
+        // again here, a bare mountpoint fails the pass before either.
+        crate::sync::verify_root_marker(root)?;
+
         // The pass is complete. Rows it did not produce are gone from disk — or
-        // merely unseen (settling, unreadable). Only the first is a deletion.
+        // merely unseen (settling, unreadable, quarantined). Only the first is
+        // a deletion, and only the disk's own "not there" says so (D156).
         let gone: Vec<String> = {
             let mut stmt = self
                 .conn
@@ -1353,7 +1415,7 @@ impl Engine {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(map_db("region entries"))?;
             all.into_iter()
-                .filter(|rel| !produced.contains(rel.as_str()) && !root.join(rel).exists())
+                .filter(|rel| !produced.contains(rel.as_str()) && gone_from_disk(&root.join(rel)))
                 .collect()
         };
 
@@ -4887,6 +4949,72 @@ pub(crate) fn is_transient(e: &PvfsError) -> bool {
         e,
         PvfsError::Forbidden { .. } | PvfsError::BadInput { .. } | PvfsError::Identity { .. }
     )
+}
+
+/// D156 — what one file's failed read means to a catalogue pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadFault {
+    /// Deleted or renamed since the walk. Not a fault at all: the file stays
+    /// out of the pass, and the sweep decides by the disk.
+    Gone,
+    /// The file's own trouble (its permissions, a bad sector, a corrupt
+    /// inode): quarantine it and carry on.
+    File,
+    /// Anything else, which may be the whole volume's or the process's (a
+    /// dead mount, no file descriptors left): the pass fails, as before.
+    Pass,
+}
+
+/// D156 — classify a catalogue read's error by what it says about the file.
+///
+/// `is_transient` answers for the CATALOG (an owner, a database, a socket)
+/// and calls every I/O error transient, so under it alone EIO, EACCES and
+/// ENOENT would all still fail the pass. This read is local file I/O and
+/// nothing else, so the errno says whose trouble it is. Default-deny: only the
+/// errors named here are one file's, and any other fails the pass as every
+/// read error used to — ENOTCONN and ESTALE (a dead FUSE or NFS mount),
+/// EMFILE, ENOMEM, EINTR, and whatever nobody thought of.
+fn catalogue_read_fault(e: &PvfsError) -> ReadFault {
+    let PvfsError::Io { source, .. } = e else {
+        return if is_transient(e) { ReadFault::Pass } else { ReadFault::File };
+    };
+    use std::io::ErrorKind;
+    match source.kind() {
+        ErrorKind::NotFound | ErrorKind::NotADirectory => return ReadFault::Gone,
+        ErrorKind::PermissionDenied | ErrorKind::IsADirectory => return ReadFault::File,
+        _ => {}
+    }
+    use nix::errno::Errno;
+    let Some(code) = source.raw_os_error() else {
+        return ReadFault::Pass;
+    };
+    match Errno::from_raw(code) {
+        // What a filesystem answers for a bad or corrupt FILE.
+        Errno::EIO
+        | Errno::ENODATA
+        | Errno::EBADMSG
+        | Errno::ELOOP
+        | Errno::ENAMETOOLONG
+        | Errno::EFBIG
+        | Errno::EOVERFLOW => ReadFault::File,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Errno::EUCLEAN => ReadFault::File,
+        _ => ReadFault::Pass,
+    }
+}
+
+/// D156 — has `p` gone from the disk? Only when the disk says it is not there.
+///
+/// The catalogue sweep used `!Path::exists`, which is true on ANY stat error:
+/// a file whose inode cannot be read, or one under a directory that stopped
+/// being searchable (skipped by the walk as `unreadable`), read as deleted and
+/// lost its row — D81's "an error is not absence", on the catalogue side. It
+/// matters more now that a pass carries on past a file it could not read.
+fn gone_from_disk(p: &std::path::Path) -> bool {
+    match std::fs::metadata(p) {
+        Ok(_) => false,
+        Err(e) => matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory),
+    }
 }
 
 // ---- local bindings (D71 W4, doc 04 §3) -------------------------------------

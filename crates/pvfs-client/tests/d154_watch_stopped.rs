@@ -66,6 +66,7 @@ fn a_stopped_pass_is_stopped_not_ingested_and_not_quiet() {
             WatchEvent::PassStarted => "started".into(),
             WatchEvent::ScanError(e) => format!("error {e}"),
             WatchEvent::Watching(..) => "watching".into(),
+            WatchEvent::NeedsAttention(n, _) => format!("attention {n}"),
         })
     })
     .unwrap();

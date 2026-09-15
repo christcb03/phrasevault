@@ -296,7 +296,11 @@ catalogue publishes seq+1 and ONE `SubRegionHead`, an unchanged pass publishes
 nothing. Sidecar reuse carried over unchanged. Since D154 the rows commit in
 batches as the pass goes (1,000 rows or 30 s), and the stale-row sweep and the
 head are for a complete pass only: a stopped pass keeps its rows and publishes
-nothing, so a box's rows can run ahead of its head, never behind it.
+nothing, so a box's rows can run ahead of its head, never behind it. Since
+D156 a file the pass cannot read is quarantined: it is skipped and named, and
+its prior row is kept. The pass still completes and publishes. A file gone
+since the walk is left to the sweep. The sweep takes a row only on the disk's
+own NotFound, and only after the root marker has been checked again.
 
 **Phase 2 — region ownership. BUILT, smaller than planned (D125 items 6–8).**
 No declaration record: a region's owner IS an admin (`a`) grant on its root,
