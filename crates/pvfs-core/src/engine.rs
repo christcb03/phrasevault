@@ -260,7 +260,8 @@ pub struct Engine {
     /// catalogue pass is interrupted, and whether as a kill.
     pub(crate) catalogue_interrupt: Option<(u64, bool)>,
     /// D156 test seam (`on_catalogue_read`): called with each file a catalogue
-    /// pass is about to hash, just before the read.
+    /// pass is about to hash, just before the read — and since D158 with each
+    /// new file a log pass is about to hash.
     pub(crate) catalogue_read_hook: Option<CatalogueReadHook>,
 }
 
@@ -306,6 +307,9 @@ impl Engine {
     /// file, chmod it, empty the whole root), and an error it returns stands
     /// in for the read's own. It stays until replaced (`None` removes it), so
     /// a file can fail every pass, as one on a bad sector does.
+    ///
+    /// D158 — a log pass calls it too, with each NEW file it is about to hash
+    /// (`ingest_file`; the only file a log pass reads). The name is D156's.
     #[doc(hidden)]
     pub fn on_catalogue_read(&mut self, hook: Option<CatalogueReadHook>) {
         self.catalogue_read_hook = hook;

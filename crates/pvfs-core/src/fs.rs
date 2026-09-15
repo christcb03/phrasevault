@@ -288,9 +288,12 @@ pub struct ScanStats {
     /// carries the first few, with reasons, so the report can say WHICH.
     ///
     /// D156 — a catalogue region counts here a file it could not READ for a
-    /// reason that is the file's own (EACCES, EIO, …; `catalogue_read_fault`):
+    /// reason that is the file's own (EACCES, EIO, …; `read_fault`):
     /// skipped, its prior row kept, tried again every pass. The watch reports
     /// both kinds (`WatchEvent::NeedsAttention`); until D156 nothing did.
+    ///
+    /// D158 — so does a log region, for a NEW file it could not read the same
+    /// way: no node, no location, tried again every pass.
     pub needs_attention: u64,
     pub quarantined: Vec<(String, String)>,
     /// D149 — manifest sidecars moved to the trash because the file beside
@@ -1240,7 +1243,7 @@ impl Engine {
     ///
     /// D156 — one file's failed read is not the pass's failure. A file gone
     /// since the walk is left to the sweep; a file whose own trouble it is
-    /// (EACCES, EIO, …; `catalogue_read_fault`) is quarantined and keeps its
+    /// (EACCES, EIO, …; `read_fault`) is quarantined and keeps its
     /// prior row; anything that may be the volume's fails the pass as before.
     /// A pass with a quarantine is complete: it sweeps and publishes.
     fn scan_region_catalogue(
@@ -1337,7 +1340,7 @@ impl Engine {
                             // pass at the same place, and since the sweep and
                             // the head wait for a complete pass (D154), the
                             // region never published again.
-                            Err(e) => match catalogue_read_fault(&e) {
+                            Err(e) => match read_fault(&e) {
                                 // Renamed or deleted since the walk: not in
                                 // `produced`, so the sweep asks the disk.
                                 ReadFault::Gone => {
@@ -2674,6 +2677,14 @@ impl Engine {
             }
         }
 
+        // D158 — the volume is still the one the pass began on. A new file
+        // gone before its read (ENOENT) no longer ends the pass, so an unmount
+        // mid-pass now reaches the deletions below, where every tracked
+        // location the walk held back (settling, unreadable) would stat as gone
+        // and be retired. The root marker, asked again, fails the pass first,
+        // as D156 does before the catalogue sweep.
+        crate::sync::verify_root_marker(&root)?;
+
         // 3. deletions: tracked URIs under this binding that vanished from disk
         //
         // D81 — TWO prefixes, not one. This box's own locations are recorded
@@ -3378,7 +3389,44 @@ impl Engine {
         let (content_hash, chunks) = match b.hash_policy {
             HashPolicy::OnAdd => {
                 let p = crate::storage::uri_to_path(uri)?;
-                self.hash_reusing_sidecar(&p, f.size)?
+                let injected = self.catalogue_read_hook.as_mut().and_then(|h| h(p.as_path()));
+                let read = match injected {
+                    Some(e) => Err(PvfsError::io("read for hash", e)),
+                    None => self.hash_reusing_sidecar(&p, f.size),
+                };
+                // D158 — one new file's failed read is not the pass's failure.
+                // Classified HERE, at the read, and nowhere else in this
+                // function: its other errors are the writes' (this engine's
+                // database, or the owner's through a routed writer), which only
+                // `is_transient` may judge. A classifier for a local read would
+                // call a writer's ENOENT "gone" and drop the file unsaid.
+                match read {
+                    Ok(v) => v,
+                    Err(e) => match read_fault(&e) {
+                        // Renamed or deleted since the walk. Nothing is
+                        // written, and the next pass's walk will not list it.
+                        ReadFault::Gone => {
+                            eprintln!(
+                                "scan: {} went away before it could be read; the next pass decides",
+                                p.display()
+                            );
+                            return Ok(());
+                        }
+                        // Its own trouble: quarantined, as `scan_binding` does
+                        // a file the catalog refuses (D71 W4). Nothing is
+                        // written, so every pass reads it again, and a repaired
+                        // file is added by itself.
+                        ReadFault::File => {
+                            stats.needs_attention += 1;
+                            if stats.quarantined.len() < 8 {
+                                stats.quarantined.push((uri.to_string(), e.to_string()));
+                            }
+                            return Ok(());
+                        }
+                        // Perhaps the volume's: the pass fails, as before.
+                        ReadFault::Pass => return Err(e),
+                    },
+                }
             }
             _ => (String::new(), Vec::new()),
         };
@@ -4951,7 +4999,8 @@ pub(crate) fn is_transient(e: &PvfsError) -> bool {
     )
 }
 
-/// D156 — what one file's failed read means to a catalogue pass.
+/// D156 — what one file's failed read means to a pass: a catalogue pass's
+/// (D156), or a log pass's hash of a new file (D158).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadFault {
     /// Deleted or renamed since the walk. Not a fault at all: the file stays
@@ -4965,7 +5014,9 @@ enum ReadFault {
     Pass,
 }
 
-/// D156 — classify a catalogue read's error by what it says about the file.
+/// D156 — classify a scan's read of a file by what its error says about the
+/// file. The catalogue pass's read (D156), and since D158 the log pass's hash
+/// of a new file, which renamed this from `catalogue_read_fault`.
 ///
 /// `is_transient` answers for the CATALOG (an owner, a database, a socket)
 /// and calls every I/O error transient, so under it alone EIO, EACCES and
@@ -4974,7 +5025,7 @@ enum ReadFault {
 /// errors named here are one file's, and any other fails the pass as every
 /// read error used to — ENOTCONN and ESTALE (a dead FUSE or NFS mount),
 /// EMFILE, ENOMEM, EINTR, and whatever nobody thought of.
-fn catalogue_read_fault(e: &PvfsError) -> ReadFault {
+fn read_fault(e: &PvfsError) -> ReadFault {
     let PvfsError::Io { source, .. } = e else {
         return if is_transient(e) { ReadFault::Pass } else { ReadFault::File };
     };
