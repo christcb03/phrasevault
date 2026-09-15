@@ -5,18 +5,31 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
-- **A manifest older than its file is not trusted (D150).** D91's exact-size
-  check refused a sidecar when a replacement changed the size, which an arr
-  upgrade nearly always does; a SAME-size replacement — an in-place tag edit
-  (`mkvpropedit`), another encode matching to the byte — went through, and the
-  scan recorded the old file's hash. `read_manifest_sidecar`, which every
-  reader passes (the scan, receive's "already there", the backfill,
-  `manifest_of`), now returns nothing when the sidecar is older than its
-  file's mtime, so the file is hashed from its bytes. `write_manifest_sidecar`
-  never leaves a sidecar dated before its file, so one dated in the future is
-  not re-hashed on every pass. mtime, not ctime: a `chown -R` would otherwise
-  re-hash a whole library. On the production NAS 33 of 26,182 sidecars were
-  older than their files, all already refused by size.
+- **A manifest records its file's mtime, and is trusted only on an exact match
+  (D150).** D91's exact-size check refused a sidecar when a replacement
+  changed the size, which an arr upgrade nearly always does; a SAME-size
+  replacement — an in-place tag edit (`mkvpropedit`), another encode matching
+  to the byte — went through, and the scan recorded the old file's hash.
+  Manifests are now **v3**: after the size they record the file's mtime (ms,
+  the catalogue's unit), and `read_manifest_sidecar` — the one path every
+  reader takes (the scan, receive's "already there", the backfill,
+  `manifest_of`) — trusts a v3 manifest only when its recorded size AND mtime
+  are the file's now. No clock is compared (the production NAS ran 142 s
+  slow, and receive stamps a file with its source's mtime), and a replacement
+  is caught even when it brings an OLDER mtime. Hash paths record the
+  (size, mtime) seen BEFORE the read and write nothing if the file moved
+  meanwhile (`write_manifest_sidecar_seen`). v2/v1 manifests keep an interim
+  rule — not older than their file — until **`pvfs sidecar-upgrade`** brings
+  them up: per box, against the local catalogue region rows, it STAMPS a v2
+  manifest the row vouches for (same size, mtime and hash) without reading
+  the file, and RE-READS the rest; a re-read that disagrees with the row is a
+  stale hash caught, listed by path, and its row handed back to the scan. It
+  looks first and asks (`--dry-run`, `--yes` for scripts). On the production
+  NAS 33 of 26,182 manifests were older than their files — all the SAME size
+  and carrying the catalogue's hash (1 by clock skew, 32 re-stamped in the
+  migration); the upgrade re-reads exactly those. (An earlier draft of this
+  entry said "all already refused by size" — a misread of the manifest's
+  line order.)
 
 - **A manifest whose file is gone goes to the trash (D149).** PVFS took a
   sidecar along only when it moved the file itself (a drain, a retraction);
