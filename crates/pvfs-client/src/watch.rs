@@ -130,9 +130,14 @@ pub fn run(
         // initial reconciliation
         notify_cb(WatchEvent::PassStarted);
         match scan_pass(&mut engine, &mut route) {
+            // D156 — the same events as every later pass. This had its own
+            // copy (`Ingested` per report, never `Quiet`), so the first pass
+            // after each daemon start never said `NeedsAttention`: the lab's
+            // first pass after the roll skipped a file with a real EIO and
+            // told nobody.
             Ok(reports) => {
-                for r in &reports {
-                    notify_cb(pass_event(r));
+                for ev in pass_events(&reports) {
+                    notify_cb(ev);
                 }
             }
             Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
