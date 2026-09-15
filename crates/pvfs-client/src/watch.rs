@@ -35,6 +35,16 @@ pub enum WatchEvent {
     /// writing sidecars it is the only thing a pass changes on disk, so it is
     /// reported the same way, and a pass that did only that is not `Quiet`.
     Ingested(String, u64, u64, u64, u64, u64),
+    /// D154 — a scan pass was told to stop (D86) before it finished:
+    /// (folder_id, added, changed, orphan_sidecars).
+    ///
+    /// What it counts was really recorded (a log region ingests file by
+    /// file, and a catalogue region now commits its rows as it goes), but it
+    /// is NOT a completed pass: nothing was swept, and a catalogue region's
+    /// head was not published. It used to be sent as `Ingested`, so the daemon
+    /// logged `watch ingested … +8520` for a mediabox pass that had committed
+    /// nothing, one second before it shut down.
+    Stopped(String, u64, u64, u64),
     /// A scan pass failed; the loop keeps watching.
     ScanError(String),
     /// A scan pass has BEGUN (D81) — what lets the daemon tell a wedged
@@ -114,14 +124,7 @@ pub fn run(
         match scan_pass(&mut engine, &mut route) {
             Ok(reports) => {
                 for r in &reports {
-                    notify_cb(WatchEvent::Ingested(
-                        r.folder_id.clone(),
-                        r.stats.added,
-                        r.stats.changed,
-                        r.stats.removed,
-                        r.stats.unlinked,
-                        r.stats.orphan_sidecars,
-                    ));
+                    notify_cb(pass_event(r));
                 }
             }
             Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
@@ -199,22 +202,19 @@ pub fn run(
                         }
                         let mut said_something = false;
                         for r in reports.iter().filter(|r| {
-                            r.stats.added
-                                + r.stats.changed
-                                + r.stats.removed
-                                + r.stats.unlinked
-                                + r.stats.orphan_sidecars
-                                > 0
+                            // D154 — a stopped pass is said even when it kept
+                            // nothing: it must not fall through to `Quiet`,
+                            // which means a pass completed.
+                            r.stats.cancelled
+                                || r.stats.added
+                                    + r.stats.changed
+                                    + r.stats.removed
+                                    + r.stats.unlinked
+                                    + r.stats.orphan_sidecars
+                                    > 0
                         }) {
                             said_something = true;
-                            notify_cb(WatchEvent::Ingested(
-                                r.folder_id.clone(),
-                                r.stats.added,
-                                r.stats.changed,
-                                r.stats.removed,
-                                r.stats.unlinked,
-                                r.stats.orphan_sidecars,
-                            ));
+                            notify_cb(pass_event(r));
                         }
                         // The pass ran cleanly either way — say so, so progress
                         // does not depend on the library happening to change.
@@ -301,5 +301,23 @@ fn scan_pass(
             Ok(reports)
         }
         None => engine.scan_routed(None, None, pvfs_core::WATCH_SETTLE_MS),
+    }
+}
+
+/// What one binding's pass reports (D154): a pass told to stop is `Stopped`,
+/// never `Ingested`.
+fn pass_event(r: &pvfs_core::ScanReport) -> WatchEvent {
+    let s = &r.stats;
+    if s.cancelled {
+        WatchEvent::Stopped(r.folder_id.clone(), s.added, s.changed, s.orphan_sidecars)
+    } else {
+        WatchEvent::Ingested(
+            r.folder_id.clone(),
+            s.added,
+            s.changed,
+            s.removed,
+            s.unlinked,
+            s.orphan_sidecars,
+        )
     }
 }

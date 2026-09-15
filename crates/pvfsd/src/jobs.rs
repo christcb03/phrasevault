@@ -269,6 +269,13 @@ impl JobsState {
         }
     }
 
+    /// A pass was stopped before it finished (D154): no longer in flight, and
+    /// nothing learned about how long this job's passes take. A truncated pass
+    /// is not a typical one, and the stall detector judges by those (D81).
+    fn mark_pass_abandoned(&self, name: &str) {
+        self.pass_started.lock().unwrap().remove(name);
+    }
+
     /// A successful pass: running, stamped, error cleared.
     fn mark_ok(&self, name: &str) {
         self.with_row(name, |r| {
@@ -421,6 +428,28 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                         if a + c + rm > 0 {
                             // local ingest = new content: views, placed
                             // subtrees, the mover — all should wake
+                            cb.nudge_content();
+                            cb.nudge_tier();
+                        }
+                    }
+                    // D154 — a pass told to stop is not an ingest. What it
+                    // counts is real (a catalogue commits as it goes, a log
+                    // region file by file), so say it, but give no verdict,
+                    // the D83 rule: `last_ok` stamps a COMPLETED pass, and it
+                    // used to be stamped here for a pass that kept nothing.
+                    WatchEvent::Stopped(ref folder, a, c, orphans) => {
+                        cb.mark_pass_abandoned("watch");
+                        eprintln!(
+                            "pvfsd: watch stopped mid-pass in {folder}: \
+                             kept +{a} changed {c}; the next pass carries on"
+                        );
+                        if orphans > 0 {
+                            eprintln!(
+                                "pvfsd: watch moved {orphans} orphaned manifest(s) \
+                                 to the trash in {folder}"
+                            );
+                        }
+                        if a + c > 0 {
                             cb.nudge_content();
                             cb.nudge_tier();
                         }

@@ -5,6 +5,30 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A catalogue pass keeps what it did (D154).** `scan_region_catalogue`
+  hashed every file first and committed every row in one transaction at the
+  end, so a stop (D86) during the hashing committed nothing. mediabox's two
+  regions had no rows from their creation (D147, 2026-09-13) onward: a first
+  pass there takes hours, and two daemon restarts each threw one away whole
+  (its hashing survived as sidecars, its rows did not). Rows now commit in
+  batches of `CATALOGUE_BATCH_ROWS` (1,000) or every `CATALOGUE_BATCH_MS`
+  (30 s), whichever comes first. A stop commits what the pass holds, a kill
+  loses one batch at most, and the next pass takes every committed file's
+  hash from its row. The stale-row sweep and the head stay at the end of a
+  COMPLETE pass: a stopped pass (also one stopped after its last file)
+  sweeps nothing and publishes nothing, so a fetch never installs a partial
+  catalogue, and this box's rows can run ahead of its head but never behind
+  it. `region ls`'s `entries` therefore rises during a first pass; `head`
+  > 0 is what says one has completed. The catalogue's hash now honours a stop
+  mid-file (`hash_reusing_sidecar_until`, as D86 gave ingest), so a stop no
+  longer waits out a film and the unit's stop timeout. The watch reports a
+  stopped pass as `WatchEvent::Stopped`, not `Ingested`. It used to log
+  `watch ingested … +8520` for a pass that had committed nothing, a second
+  before shutdown. It sends no `Quiet` for a stopped pass, and the daemon
+  gives it no verdict: `pvfsd: watch stopped mid-pass in <folder>: kept +A
+  changed C`. Test seams: `Engine::set_catalogue_batch`,
+  `Engine::interrupt_catalogue_at`.
+
 - **A file dated in the future is judged by its ctime (D152).** The settle
   window defers a file while `max(mtime, ctime)` is under 15 s old (D71 W6,
   D112), so a file some other tool stamped 2038-01-18 (2³¹−1) was "still

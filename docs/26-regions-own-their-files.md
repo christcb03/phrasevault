@@ -293,7 +293,10 @@ event. The manifest is canonical bytes (`pvfs-region-manifest 1`, region,
 seq, one tab-separated line per row in bytewise path order), hashed with
 blake3, written to `regions/<id>/manifest.<seq>`; a pass that changed the
 catalogue publishes seq+1 and ONE `SubRegionHead`, an unchanged pass publishes
-nothing. Sidecar reuse carried over unchanged.
+nothing. Sidecar reuse carried over unchanged. Since D154 the rows commit in
+batches as the pass goes (1,000 rows or 30 s), and the stale-row sweep and the
+head are for a complete pass only: a stopped pass keeps its rows and publishes
+nothing, so a box's rows can run ahead of its head, never behind it.
 
 **Phase 2 — region ownership. BUILT, smaller than planned (D125 items 6–8).**
 No declaration record: a region's owner IS an admin (`a`) grant on its root,
