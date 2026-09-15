@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A file dated in the future is judged by its ctime (D152).** The settle
+  window defers a file while `max(mtime, ctime)` is under 15 s old (D71 W6,
+  D112), so a file some other tool stamped 2038-01-18 (2³¹−1) was "still
+  settling" on every pass until 2038: never hashed, never catalogued, and the
+  watch re-ran every 20 s for it. mediabox holds 164 such files (337.8 GiB,
+  stamped 2038 and 2097, their ctimes months old). `storage::changed_ms` now
+  leaves out a stamp more than `FUTURE_SKEW_MS` (an hour) ahead of the clock,
+  so such a file settles by its ctime (the `utimes` that set the stamp set it,
+  after the last write), or at once when no sane stamp is left. A file being
+  written carries the current time and is judged as before; D112's back-dated
+  mtime is in the past and untouched. D149's orphan grace times a sidecar from
+  its `changed_ms` when its mtime is from the far future (D150 dates such a
+  file's sidecar to match it), so one whose 2038 file was renamed is not kept
+  forever.
+
 - **A manifest older than its file is not trusted (D150).** D91's exact-size
   check refused a sidecar when a replacement changed the size, which an arr
   upgrade nearly always does; a SAME-size replacement — an in-place tag edit
