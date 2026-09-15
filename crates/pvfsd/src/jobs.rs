@@ -97,16 +97,65 @@ pub struct JobsState {
     /// D148 — each region's trash as the last purge pass left it, so `serve
     /// status` reports it without walking a disk (D136).
     trash: Mutex<Vec<pvfs_proto::TrashWire>>,
-    /// D157 — the watch's current run of failed passes, as the journal has
-    /// heard it; `None` while passes complete. In memory only: a daemon
+    /// D157, D159 — each fault's current run of failures, as the journal has
+    /// heard it; absent while the job works. In memory only: a daemon
     /// restart is in the journal itself, so its first failure is said again.
-    watch_failing: Mutex<Option<FailingRun>>,
+    /// It outlives a job's thread, which is what keeps a restart that fails
+    /// the same way quiet.
+    failing: Mutex<HashMap<Fault, FailingRun>>,
 }
 
-/// D157 — a run of failed watch passes: what the journal was last told, how
-/// many passes have failed since the last one completed, and since when.
+/// D157, D159 — a continuous job's failures, as the journal hears of them.
+/// Each is its own run, because each ends on its own evidence: a failed pass
+/// or session at the next one that completes, an exit once the restarted
+/// thread is through its setup. A run per job would let the watch's startup
+/// pass, which completes before the setup step that fails, end an exit's run,
+/// and every restart would say `recovered` and `exited` again.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Fault {
+    /// A watch pass failed (`WatchEvent::ScanError`); `watch::run` retries it
+    /// in backoff, 5 s doubling to 300 s.
+    WatchPass,
+    /// A follow session failed (`FollowEvent::Retrying`); `follow::run`
+    /// retries it every 2 s.
+    FollowSession,
+    /// The job's thread exited with an error; the supervisor restarts it
+    /// after `FATAL_RETRY`.
+    Exit(&'static str),
+}
+
+impl Fault {
+    fn failed_line(self, err: &str) -> String {
+        match self {
+            Fault::WatchPass => format!("pvfsd: watch pass failed: {err}; retrying"),
+            Fault::FollowSession => format!("pvfsd: follow failed: {err}; retrying"),
+            Fault::Exit(job) => format!(
+                "pvfsd: {job} exited: {err}; restarting it in {} s",
+                FATAL_RETRY.as_secs()
+            ),
+        }
+    }
+
+    fn recovered_line(self, failed: u64, span: &str) -> String {
+        match self {
+            Fault::WatchPass => format!(
+                "pvfsd: watch recovered: a pass completed after {failed} failed pass(es) over {span}"
+            ),
+            Fault::FollowSession => format!(
+                "pvfsd: follow recovered: current with its source after {failed} \
+                 failed attempt(s) over {span}"
+            ),
+            Fault::Exit(job) => format!(
+                "pvfsd: {job} recovered: running again after {failed} exit(s) over {span}"
+            ),
+        }
+    }
+}
+
+/// D157 — a run of one fault: what the journal was last told (`None` before
+/// the first line), how many have failed since the run began, and since when.
 struct FailingRun {
-    logged: String,
+    logged: Option<String>,
     failed: u64,
     since_ms: u64,
 }
@@ -129,7 +178,7 @@ impl JobsState {
             tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
             tier_passes: std::sync::atomic::AtomicU64::new(0),
             trash: Mutex::new(Vec::new()),
-            watch_failing: Mutex::new(None),
+            failing: Mutex::new(HashMap::new()),
         };
         s.reload()?;
         Ok(s)
@@ -315,32 +364,30 @@ impl JobsState {
         });
     }
 
-    /// D157 — a watch pass failed: the journal line it earns, if any. The
+    /// D157, D159 — `fault` happened: the journal line it earns, if any. The
     /// first failure of a run is said, and after that only a changed text
-    /// (D151's rule for the notifier's job errors), so a pass retrying in
-    /// backoff (5 s doubling to 300 s) does not repeat itself.
-    fn watch_failed(&self, err: &str) -> Option<String> {
-        let mut run = self.watch_failing.lock().unwrap();
-        let first = run.is_none();
-        let r = run.get_or_insert_with(|| FailingRun { logged: String::new(), failed: 0, since_ms: now_ms() });
+    /// (D151's rule for the notifier's job errors), so a job retrying the same
+    /// fault (a watch pass in backoff, a follower every 2 s, a thread the
+    /// supervisor restarts every 60 s) does not repeat itself.
+    fn failed(&self, fault: Fault, err: &str) -> Option<String> {
+        let mut runs = self.failing.lock().unwrap();
+        let r = runs
+            .entry(fault)
+            .or_insert_with(|| FailingRun { logged: None, failed: 0, since_ms: now_ms() });
         r.failed += 1;
-        if !first && r.logged == err {
+        if r.logged.as_deref() == Some(err) {
             return None;
         }
-        r.logged = err.to_string();
-        Some(format!("pvfsd: watch pass failed: {err}; retrying"))
+        r.logged = Some(err.to_string());
+        Some(fault.failed_line(err))
     }
 
-    /// D157 — a watch pass completed: the line that ends a run of failures,
-    /// if one was open. Only a completed pass ends one; a stopped pass
-    /// (D154) says nothing about whether the fault is gone.
-    fn watch_recovered(&self) -> Option<String> {
-        let r = self.watch_failing.lock().unwrap().take()?;
-        Some(format!(
-            "pvfsd: watch recovered: a pass completed after {} failed pass(es) over {}",
-            r.failed,
-            failing_span(now_ms().saturating_sub(r.since_ms))
-        ))
+    /// D157, D159 — the evidence that ends `fault`'s run, if one is open: the
+    /// line that says so. Which evidence counts is the caller's (see
+    /// `Fault`); a stopped pass (D154) or a bare connect is none.
+    fn recovered(&self, fault: Fault) -> Option<String> {
+        let r = self.failing.lock().unwrap().remove(&fault)?;
+        Some(fault.recovered_line(r.failed, &failing_span(now_ms().saturating_sub(r.since_ms))))
     }
 
     /// A fatal failure: the thread exited; the supervisor retries later.
@@ -414,31 +461,14 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
             std::thread::spawn(move || {
                 st.set_state("follow", "running");
                 let data_dir = st.data_dir().clone();
-                let cb_state = Arc::clone(&st);
-                let r = follow::run(&data_dir, FOLLOW_POLL_MS, &flag, |ev| match ev {
-                    FollowEvent::Connected { .. } => cb_state.set_state("follow", "running"),
-                    FollowEvent::CaughtUp { .. } => {
-                        cb_state.mark_ok("follow");
-                        // fresh content — the consuming passes should run now
-                        cb_state.nudge_content();
+                let cb = Arc::clone(&st);
+                let r = follow::run(&data_dir, FOLLOW_POLL_MS, &flag, |ev| {
+                    for line in follow_event(&cb, ev) {
+                        eprintln!("{line}");
                     }
-                    // D146 — current with the source on a quiet log: stamp the
-                    // row (it is healthy) but nudge nothing (nothing is new).
-                    FollowEvent::UpToDate { .. } => cb_state.mark_ok("follow"),
-                    FollowEvent::Retrying { reason } => cb_state.mark_retry("follow", &reason),
                 });
-                match r {
-                    // stopped on request — back to the config-described state
-                    Ok(()) => st.set_state(
-                        "follow",
-                        if st.row("follow").is_some_and(|r| r.enabled) {
-                            "idle"
-                        } else {
-                            "disabled"
-                        },
-                    ),
-                    // not a replica / no identity: the supervisor retries later
-                    Err(e) => st.mark_fatal("follow", &e.to_string()),
+                if let Some(line) = job_exited(&st, "follow", r) {
+                    eprintln!("{line}");
                 }
             })
         }
@@ -454,22 +484,70 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                         eprintln!("{line}");
                     }
                 });
-                match r {
-                    Ok(()) => st.set_state(
-                        "watch",
-                        if st.row("watch").is_some_and(|r| r.enabled) {
-                            "idle"
-                        } else {
-                            "disabled"
-                        },
-                    ),
-                    Err(e) => st.mark_fatal("watch", &e.to_string()),
+                if let Some(line) = job_exited(&st, "watch", r) {
+                    eprintln!("{line}");
                 }
             })
         }
         other => unreachable!("no continuous body for job {other}"),
     };
     Managed { stop, handle }
+}
+
+/// D159 — a continuous job's thread has ended: the journal line that earns,
+/// if any. Stopped on request (`Ok`), the row goes back to what the config
+/// says, and nothing is said. An error (a follower that is not a replica, a
+/// watch that cannot take `serve.lock` or register its watches) sets the row
+/// to `error`, the supervisor's cue to restart it after `FATAL_RETRY`, and
+/// is said once per run and text, as a failed pass is (D157). That restart
+/// failing the same way every 60 s used to reach only the row.
+fn job_exited(st: &JobsState, job: &'static str, r: Result<(), PvfsError>) -> Option<String> {
+    match r {
+        Ok(()) => {
+            st.set_state(job, if st.row(job).is_some_and(|r| r.enabled) { "idle" } else { "disabled" });
+            None
+        }
+        Err(e) => {
+            let e = e.to_string();
+            st.mark_fatal(job, &e);
+            st.failed(Fault::Exit(job), &e)
+        }
+    }
+}
+
+/// D159 — the follow job's reading of one follower event, out of the
+/// thread's closure as `watch_event` is (D156), so a test can drive it. It
+/// updates the job's row and returns the journal lines the event earns.
+fn follow_event(cb: &JobsState, ev: FollowEvent<'_>) -> Vec<String> {
+    // Any event means `follow::run` is through its setup: `ReplicaSource::
+    // load`, its only error exit, comes before the first one. So an open run
+    // of exits is over, and is said to be before this event's own line.
+    let mut log: Vec<String> = cb.recovered(Fault::Exit("follow")).into_iter().collect();
+    match ev {
+        // A socket is not a session: the next request can still fail, so a
+        // connect ends no run.
+        FollowEvent::Connected { .. } => cb.set_state("follow", "running"),
+        FollowEvent::CaughtUp { .. } => {
+            cb.mark_ok("follow");
+            log.extend(cb.recovered(Fault::FollowSession));
+            // fresh content — the consuming passes should run now
+            cb.nudge_content();
+        }
+        // D146 — current with the source on a quiet log: stamp the row (it is
+        // healthy) but nudge nothing (nothing is new).
+        FollowEvent::UpToDate { .. } => {
+            cb.mark_ok("follow");
+            log.extend(cb.recovered(Fault::FollowSession));
+        }
+        // D159 — and say so in the journal, as a failed watch pass does
+        // (D157). The follower retries every 2 s with no backoff, so a source
+        // down for an hour is one line here, not 1,800.
+        FollowEvent::Retrying { reason } => {
+            cb.mark_retry("follow", &reason);
+            log.extend(cb.failed(Fault::FollowSession, &reason));
+        }
+    }
+    log
 }
 
 /// The watch job's reading of one watcher event — out of the thread's
@@ -483,7 +561,7 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
         WatchEvent::Ingested(ref folder, a, c, rm, un, orphans) => {
             cb.mark_pass_end("watch");
             cb.mark_ok("watch");
-            log.extend(cb.watch_recovered());
+            log.extend(cb.recovered(Fault::WatchPass));
             // D111 — SAY WHAT THE PASS DID. This job is how the fleet
             // actually scans, and it reported its numbers to nobody: the
             // counts went into the status row's liveness bookkeeping and were
@@ -536,7 +614,7 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
         WatchEvent::Quiet => {
             cb.mark_pass_end("watch");
             cb.mark_ok("watch");
-            log.extend(cb.watch_recovered());
+            log.extend(cb.recovered(Fault::WatchPass));
         }
         // D157 — and say so in the journal. This set the row and nothing
         // else, so D156's lab pass that failed on every retry (EIO,
@@ -544,9 +622,15 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
         WatchEvent::ScanError(e) => {
             cb.mark_pass_end("watch");
             cb.mark_retry("watch", &e);
-            log.extend(cb.watch_failed(&e));
+            log.extend(cb.failed(Fault::WatchPass, &e));
         }
-        WatchEvent::Watching(..) => cb.set_state("watch", "running"),
+        // D159 — every watch registered: `watch::run` is through its setup,
+        // where its error exits are, so an open run of exits is over. Not a
+        // pass's verdict: a failed pass's run goes on.
+        WatchEvent::Watching(..) => {
+            cb.set_state("watch", "running");
+            log.extend(cb.recovered(Fault::Exit("watch")));
+        }
         // D156 — files the pass skipped that need a human: a log region's
         // refusal (D71 W4), a catalogue region's file it could not read.
         // Named in the journal, and held in the row's `last_error`, which is
@@ -1343,5 +1427,135 @@ mod tests {
         assert_eq!(failing_span(7_199_999), "119 min");
         assert_eq!(failing_span(7_200_000), "2 h 0 min");
         assert_eq!(failing_span(26_100_000), "7 h 15 min");
+    }
+
+    /// D159 — a failed follow session reaches the journal on D157's rule. The
+    /// follower retries every 2 s, so saying the same text once is the point.
+    /// A connect is no recovery; being current with the source is.
+    #[test]
+    fn a_failing_follow_session_is_said_once_per_text_and_its_recovery_once() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d159-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let refused = "I/O error during dial 192.168.1.119:7701: Connection refused (os error 111)";
+        let lost = "connection lost (I/O error: Connection reset by peer (os error 104))";
+        let retrying = |r: &str| follow_event(&st, FollowEvent::Retrying { reason: r.into() });
+        let failed = |r: &str| format!("pvfsd: follow failed: {r}; retrying");
+        let recovered = "pvfsd: follow recovered: current with its source after";
+
+        assert_eq!(retrying(refused), [failed(refused)], "the first failure is said");
+        let r = st.row("follow").unwrap();
+        assert_eq!(r.state, "backoff");
+        assert_eq!(r.last_error.as_deref(), Some(refused), "the row is as before");
+        for _ in 0..3 {
+            assert!(retrying(refused).is_empty(), "a retry with the same text is not");
+        }
+        let connected = FollowEvent::Connected { target: "192.168.1.119:7701" };
+        assert!(follow_event(&st, connected).is_empty(), "a connect is no recovery");
+        assert_eq!(retrying(lost), [failed(lost)], "a changed text is said");
+        assert!(retrying(lost).is_empty());
+
+        let back = follow_event(&st, FollowEvent::UpToDate { tip: 41 });
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].starts_with(&format!("{recovered} 6 failed attempt(s) over ")), "{back:?}");
+        let r = st.row("follow").unwrap();
+        assert_eq!((r.state.as_str(), r.last_error), ("running", None));
+        assert!(follow_event(&st, FollowEvent::UpToDate { tip: 41 }).is_empty(), "the recovery is said once");
+
+        assert_eq!(retrying(refused), [failed(refused)], "a new run is said again");
+        let back = follow_event(&st, FollowEvent::CaughtUp { tip: 42 });
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].starts_with(&format!("{recovered} 1 failed attempt(s) over ")), "{back:?}");
+        assert!(st.take_nudge("sync"), "fresh content still nudges");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D159 — a watch whose setup fails is said once, not at every 60 s
+    /// restart, and so is its return. The exit is its own run: the startup
+    /// pass, which completes before the setup step that fails, does not end
+    /// it, or every restart would say `recovered` and `exited` again. A
+    /// failed pass and an exit are each said once, and each ends on its own
+    /// evidence.
+    #[test]
+    fn a_watch_that_keeps_exiting_is_said_once_and_its_return_once() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d159-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let refused = "catalog route: Connection refused (os error 111)";
+        let limit = || PvfsError::BadInput {
+            field: "watcher".into(),
+            reason: "/srv/sim-plex2: OS file watch limit reached. (os error 28)".into(),
+        };
+        let pass_failed = format!("pvfsd: watch pass failed: {refused}; retrying");
+        let exited = format!("pvfsd: watch exited: {}; restarting it in 60 s", limit());
+        // one life of the watch's thread: its events, then how it ended; the
+        // journal lines it earned
+        let life = |evs: Vec<WatchEvent>, end: Result<(), PvfsError>| -> Vec<String> {
+            let mut log: Vec<String> = evs.into_iter().flat_map(|ev| watch_event(&st, ev)).collect();
+            log.extend(job_exited(&st, "watch", end));
+            log
+        };
+        let failing_start = || vec![WatchEvent::PassStarted, WatchEvent::ScanError(refused.into())];
+        let clean_start = || vec![WatchEvent::PassStarted, WatchEvent::Quiet];
+
+        // the owner is down and the watch limit is reached
+        assert_eq!(life(failing_start(), Err(limit())), [pass_failed.clone(), exited.clone()]);
+        let r = st.row("watch").unwrap();
+        assert_eq!(r.state, "error", "the supervisor's cue");
+        assert_eq!(r.last_error, Some(limit().to_string()), "the row is as before");
+        assert!(life(failing_start(), Err(limit())).is_empty(), "the restart that fails the same way is not said");
+
+        // the owner is back: the pass's run ends, the exit's goes on
+        let back = life(clean_start(), Err(limit()));
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(
+            back[0].starts_with("pvfsd: watch recovered: a pass completed after 2 failed pass(es) over "),
+            "{back:?}"
+        );
+
+        // the limit is raised: the restarted watch gets through its setup
+        let mut evs = clean_start();
+        evs.push(WatchEvent::Watching(1, 0));
+        let back: Vec<String> = evs.into_iter().flat_map(|ev| watch_event(&st, ev)).collect();
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].starts_with("pvfsd: watch recovered: running again after 3 exit(s) over "), "{back:?}");
+        assert!(watch_event(&st, WatchEvent::Watching(1, 0)).is_empty(), "the return is said once");
+        assert_eq!(job_exited(&st, "watch", Ok(())), None, "a stop on request is not said");
+        assert_eq!(st.row("watch").unwrap().state, "disabled", "the row goes back to the config's state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D159 — a follower that cannot start is said once, and its return is
+    /// said at the restarted follower's first event, whatever that is, before
+    /// the event's own line: `ReplicaSource::load`, its only error exit, comes
+    /// before every event. Each job's exits are their own run.
+    #[test]
+    fn a_follow_exit_is_over_at_the_next_followers_first_event() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d159-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let not_replica = || PvfsError::BadInput {
+            field: "replica".into(),
+            reason: "this forest is not a replica".into(),
+        };
+        let exited = |job: &str| format!("pvfsd: {job} exited: {}; restarting it in 60 s", not_replica());
+
+        assert_eq!(job_exited(&st, "follow", Err(not_replica())), Some(exited("follow")));
+        assert_eq!(st.row("follow").unwrap().state, "error");
+        assert_eq!(job_exited(&st, "follow", Err(not_replica())), None, "the same restart is not said");
+        assert_eq!(
+            job_exited(&st, "watch", Err(not_replica())),
+            Some(exited("watch")),
+            "another job's exit is its own run"
+        );
+
+        let refused = "I/O error during dial 192.168.1.119:7701: Connection refused (os error 111)";
+        let back = follow_event(&st, FollowEvent::Retrying { reason: refused.into() });
+        assert_eq!(back.len(), 2, "{back:?}");
+        assert!(back[0].starts_with("pvfsd: follow recovered: running again after 2 exit(s) over "), "{back:?}");
+        assert_eq!(back[1], format!("pvfsd: follow failed: {refused}; retrying"), "the event's own line second");
+        assert!(follow_event(&st, FollowEvent::Connected { target: "x" }).is_empty(), "the return is said once");
+        assert_eq!(job_exited(&st, "watch", Err(not_replica())), None, "the follower's return ends no other run");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

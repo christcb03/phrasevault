@@ -17,6 +17,27 @@ file tracks Layer 0, the file-system engine.
   error leaves the location, its node and its `scan_state` row alone. The
   root marker still covers an unmount.
 
+- **Follow's failed sessions and a continuous job's exits reach the journal
+  (D159).** D157 gave a failed watch pass a journal line. Two paths still
+  reached only the status row, and now each logs too:
+  - The follow job's `FollowEvent::Retrying` (a dial refused, a connection
+    lost, a busy store), which the follower retries every 2 s, logs `pvfsd:
+    follow failed: <reason>; retrying`. The first `CaughtUp` or `UpToDate`
+    after a run logs `pvfsd: follow recovered: current with its source after
+    N failed attempt(s) over <time>`.
+  - A `follow` or `watch` thread that exits with an error (not a replica,
+    `serve.lock` held, a watch it cannot register) logs `pvfsd: <job>
+    exited: <error>; restarting it in 60 s`. The supervisor restarts it after
+    60 s. Once a restarted thread is through its setup (watch: its watches
+    registered; follow: its first event), it logs `pvfsd: <job> recovered:
+    running again after N exit(s) over <time>`.
+
+  Both follow D157's rule: a line when a run starts, and again only when the
+  text changes. D157's memory is generalised to one run per fault (a watch
+  pass, a follow session, an exit) rather than per job. A watch's startup
+  pass completes before the setup that can fail, so a run per job would log
+  `recovered` and `exited` at every restart. The status rows are unchanged.
+
 - **One unreadable new file does not stop a log-region pass (D158).**
   `ingest_file` hashed a brand-new file with `?`. The read's error is `Io`,
   which `is_transient` calls transient, so one file's read error ended the
