@@ -5727,6 +5727,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                     println!("trashed {o} orphaned manifest(s) in {f}");
                                 }
                             }
+                            // D154 — this driver's stop flag is never raised,
+                            // so it never sees one; but a stopped pass is not
+                            // an ingest wherever it is reported.
+                            pvfs_client::watch::WatchEvent::Stopped(f, a, c, o) => {
+                                if !json {
+                                    println!("stopped mid-pass in {f}: kept +{a} !{c}");
+                                    if o > 0 {
+                                        println!("trashed {o} orphaned manifest(s) in {f}");
+                                    }
+                                }
+                            }
                             // A quiet pass is progress for the daemon's stall
                             // detector, not news for a human watching a terminal.
                             pvfs_client::watch::WatchEvent::PassStarted

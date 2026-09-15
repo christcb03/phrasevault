@@ -253,6 +253,12 @@ pub struct Engine {
     /// granularity for a stop: on the NAS holder that meant SIGTERM was ignored
     /// for hours and the box could not be rolled at all.
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// D154 — a catalogue pass commits its rows every this many rows or this
+    /// many milliseconds, whichever comes first (`set_catalogue_batch`).
+    pub(crate) catalogue_batch: (usize, u64),
+    /// D154 test seam (`interrupt_catalogue_at`): the file at which the next
+    /// catalogue pass is interrupted, and whether as a kill.
+    pub(crate) catalogue_interrupt: Option<(u64, bool)>,
 }
 
 impl Engine {
@@ -264,6 +270,35 @@ impl Engine {
     /// safe to honour a stop in the middle rather than only between passes.
     pub fn set_cancel(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.cancel = Some(flag);
+    }
+
+    /// D154 — how many catalogue rows a pass holds, and for how long, before
+    /// committing them. A stop commits what is held and a kill loses it, so
+    /// this is the most a crash can cost a pass. Production keeps the
+    /// defaults (`CATALOGUE_BATCH_ROWS`, `CATALOGUE_BATCH_MS`); tests shrink
+    /// them to watch batches land.
+    pub fn set_catalogue_batch(&mut self, rows: usize, ms: u64) {
+        self.catalogue_batch = (rows.max(1), ms);
+    }
+
+    /// D154 test seam: interrupt the next catalogue pass as it reaches file
+    /// `at` (0-based, in walk order), once. `crash = false` raises the stop
+    /// flag right there, as SIGTERM does, so the stop lands inside that
+    /// file's read if it has to be read. `crash = true` is a kill: the pass
+    /// errors out before the file and commits nothing it was still holding.
+    /// A real stop races the pass it stops; this makes one land mid-pass in a
+    /// test, every time.
+    #[doc(hidden)]
+    pub fn interrupt_catalogue_at(&mut self, at: u64, crash: bool) {
+        self.catalogue_interrupt = Some((at, crash));
+    }
+
+    /// Raise the stop flag, as SIGTERM does — the one `set_cancel` gave, or a
+    /// new one if none was (the D154 seam's stop).
+    pub(crate) fn raise_cancel(&mut self) {
+        self.cancel
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Has a stop been asked for?
@@ -627,6 +662,8 @@ impl Engine {
             _writer_lock: take_writer_lock(data_dir),
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
             identity: ForestIdentity {
                 instance_id,
                 forest_id,
@@ -662,6 +699,8 @@ impl Engine {
             _writer_lock: lock,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
         };
         if let Err(e) = engine.ensure_device_active() {
             // A projection torn by concurrent folders can pass every position
@@ -775,6 +814,8 @@ impl Engine {
             _writer_lock: None,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
         })
     }
 
@@ -801,6 +842,8 @@ impl Engine {
             _writer_lock: lock,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
         })
     }
 
@@ -934,6 +977,8 @@ impl Engine {
             _writer_lock: _writer_lock_held,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
         };
         if !engine.device_known(&device_pub)? {
             let t = now_ms();

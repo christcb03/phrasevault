@@ -52,6 +52,8 @@ pub use fs::{
     BindKind,
     BindSpec,
     CatalogueStatus,
+    CATALOGUE_BATCH_MS,
+    CATALOGUE_BATCH_ROWS,
     DrainCheck,
     HashPolicy,
     LocalBytes,

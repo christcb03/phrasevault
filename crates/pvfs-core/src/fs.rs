@@ -31,6 +31,14 @@ const TMP_URI_PREFIX: &str = "pvfs-tmp:///";
 /// genuinely races an import — passes a non-zero window.
 pub const WATCH_SETTLE_MS: u64 = 15_000;
 
+/// D154 — a catalogue pass commits its rows every `CATALOGUE_BATCH_ROWS` rows
+/// or every `CATALOGUE_BATCH_MS`, whichever comes first, so a pass that is
+/// stopped or killed keeps what it did. The clock is the bound that matters
+/// while hashing (one film is minutes of reading); the count, while a pass
+/// takes its hashes from rows and sidecars thousands a minute.
+pub const CATALOGUE_BATCH_ROWS: usize = 1_000;
+pub const CATALOGUE_BATCH_MS: u64 = 30_000;
+
 /// How long a file must be held NOWHERE before a scan takes it out of the tree
 /// (D112).
 ///
@@ -1207,6 +1215,23 @@ impl Engine {
     /// (D112), so a file still being written is simply absent from `files`;
     /// its last settled row is KEPT, because the stale sweep re-checks the
     /// disk before deleting and "still copying" is not "gone".
+    ///
+    /// D154 — the rows are committed AS THE PASS GOES, in batches
+    /// (`CATALOGUE_BATCH_ROWS` rows or `CATALOGUE_BATCH_MS`, whichever comes
+    /// first). They used to wait for the end: every hash first, then one
+    /// transaction, on the reasoning that "a pass abandoned here has cost
+    /// nothing but time". On mediabox that time was a whole first pass, hours
+    /// per region, and every daemon restart abandoned it, so two regions went
+    /// two days with no rows at all. Now a stop commits what the pass holds, a
+    /// kill loses one batch at most, and the next pass takes every committed
+    /// file's hash from its row.
+    ///
+    /// What stays at the END, for a COMPLETE pass only: the stale-row sweep,
+    /// which needs every path the pass produced ("not seen yet" is not
+    /// "gone"), and the head. A manifest of a partial pass would be attested to
+    /// the forest as the region's catalogue, and a fetch (D129) would install
+    /// it as the truth, so a stopped pass publishes nothing. This box's rows
+    /// may run ahead of its head, never the other way round.
     fn scan_region_catalogue(
         &mut self,
         b: &Binding,
@@ -1225,17 +1250,29 @@ impl Engine {
             .filter(|d| !dirs_with_files.contains(d.as_slice()))
             .count() as u64;
 
+        let (batch_rows, batch_ms) = self.catalogue_batch;
+        let batch_every = std::time::Duration::from_millis(batch_ms);
+        let interrupt = self.catalogue_interrupt.take();
         // (rel_path, kind, size, mtime, changed, hash). Directories carry no
         // times: theirs change whenever an entry does, which the file rows
         // already say, and two identical libraries must hash identically.
-        let mut rows: Vec<CatalogueRow> =
+        let mut pending: Vec<CatalogueRow> =
             dirs.iter().map(|d| (d.join("/"), "dir", 0, 0, 0, None)).collect();
-        // Hashes first, outside any transaction: this is the slow part, and a
-        // pass abandoned here has cost nothing but time.
-        for f in files {
+        let mut produced: HashSet<String> = pending.iter().map(|r| r.0.clone()).collect();
+        let mut last_commit = std::time::Instant::now();
+        for (i, f) in files.iter().enumerate() {
             if self.cancelled() {
-                stats.cancelled = true;
-                return Ok(stats);
+                return self.stop_catalogue_pass(region, pass, &mut pending, stats);
+            }
+            if let Some((_, crash)) = interrupt.filter(|&(at, _)| at == i as u64) {
+                if crash {
+                    // The seam's kill: whatever is pending dies with the pass.
+                    return Err(PvfsError::io(
+                        "catalogue pass",
+                        std::io::Error::other("killed (test seam)"),
+                    ));
+                }
+                self.raise_cancel();
             }
             let mut rel = f.rel_dirs.join("/");
             if !rel.is_empty() {
@@ -1269,7 +1306,17 @@ impl Engine {
             let hash = match known {
                 Some(h) => Some(h),
                 None => match b.hash_policy {
-                    HashPolicy::OnAdd => Some(self.hash_reusing_sidecar(&f.path, f.size)?.0),
+                    // D154 — the stop lands inside the read, not after it. A
+                    // film can be tens of GB, and a stop that waits for one
+                    // overruns the unit's stop timeout and is SIGKILLed,
+                    // losing the batch a clean stop would have committed.
+                    HashPolicy::OnAdd => {
+                        match self.hash_reusing_sidecar_until(&f.path, f.size, self.cancel_flag())? {
+                            Some((h, _)) => Some(h),
+                            // Abandoned mid-read: this file counts for nothing.
+                            None => return self.stop_catalogue_pass(region, pass, &mut pending, stats),
+                        }
+                    }
                     HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
                 },
             };
@@ -1278,12 +1325,23 @@ impl Engine {
                 Some(_) if same => stats.unchanged += 1,
                 Some(_) => stats.changed += 1,
             }
-            rows.push((rel, "file", f.size, f.mtime_ms, f.changed_ms, hash));
+            produced.insert(rel.clone());
+            pending.push((rel, "file", f.size, f.mtime_ms, f.changed_ms, hash));
+            if pending.len() >= batch_rows || last_commit.elapsed() >= batch_every {
+                self.commit_catalogue_rows(region, pass, &mut pending)?;
+                last_commit = std::time::Instant::now();
+            }
         }
+        // Asked to stop after the last file (or before a pass that had none
+        // to take — the watch's settle window can leave it every one): still
+        // a stopped pass, so no sweep and no head.
+        if self.cancelled() {
+            return self.stop_catalogue_pass(region, pass, &mut pending, stats);
+        }
+        self.commit_catalogue_rows(region, pass, &mut pending)?;
 
-        // Rows this pass did not produce are gone from disk — or merely unseen
-        // (settling, unreadable). Only the first is a deletion.
-        let produced: HashSet<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        // The pass is complete. Rows it did not produce are gone from disk — or
+        // merely unseen (settling, unreadable). Only the first is a deletion.
         let gone: Vec<String> = {
             let mut stmt = self
                 .conn
@@ -1299,8 +1357,55 @@ impl Engine {
                 .collect()
         };
 
+        if !gone.is_empty() {
+            let tx = self.conn.transaction().map_err(map_db("begin catalogue sweep"))?;
+            for rel in &gone {
+                tx.execute(
+                    "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
+                    params![region, rel],
+                )
+                .map_err(map_db("delete region entry"))?;
+                stats.removed += 1;
+            }
+            tx.commit().map_err(map_db("commit catalogue sweep"))?;
+        }
+        // Item 4 — a changed catalogue publishes its head; an unchanged one
+        // publishes nothing.
+        self.publish_region_snapshot(&b.folder_id, writer)?;
+        Ok(stats)
+    }
+
+    /// D154 — end a catalogue pass that was told to stop. It commits what it
+    /// holds (already hashed; the commit takes milliseconds) and neither
+    /// sweeps nor publishes. So every file it counts has a row, which is
+    /// `ScanStats.cancelled`'s "everything counted here really happened", and
+    /// the head still names the last COMPLETE pass.
+    fn stop_catalogue_pass(
+        &mut self,
+        region: &str,
+        pass: i64,
+        pending: &mut Vec<CatalogueRow>,
+        mut stats: ScanStats,
+    ) -> Result<ScanStats> {
+        self.commit_catalogue_rows(region, pass, pending)?;
+        stats.cancelled = true;
+        Ok(stats)
+    }
+
+    /// D154 — one batch of a catalogue pass's rows, in one transaction, after
+    /// which `pending` is empty. The same upsert every pass has always made,
+    /// in pieces.
+    fn commit_catalogue_rows(
+        &mut self,
+        region: &str,
+        pass: i64,
+        pending: &mut Vec<CatalogueRow>,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
         let tx = self.conn.transaction().map_err(map_db("begin catalogue"))?;
-        for (rel, kind, size, mtime, changed, hash) in &rows {
+        for (rel, kind, size, mtime, changed, hash) in pending.iter() {
             tx.execute(
                 "INSERT INTO region_entries
                    (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
@@ -1323,19 +1428,9 @@ impl Engine {
             )
             .map_err(map_db("upsert region entry"))?;
         }
-        for rel in &gone {
-            tx.execute(
-                "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
-                params![region, rel],
-            )
-            .map_err(map_db("delete region entry"))?;
-            stats.removed += 1;
-        }
         tx.commit().map_err(map_db("commit catalogue"))?;
-        // Item 4 — a changed catalogue publishes its head; an unchanged one
-        // publishes nothing.
-        self.publish_region_snapshot(&b.folder_id, writer)?;
-        Ok(stats)
+        pending.clear();
+        Ok(())
     }
 
     /// A catalogue region's rows in manifest order — bytewise by path, which
@@ -3881,27 +3976,45 @@ impl Engine {
     /// unreadable`. On the production library that is 40 TB of re-reading for
     /// a record already on disk.
     fn hash_reusing_sidecar(&self, path: &std::path::Path, size: u64) -> Result<(String, Vec<[u8; 32]>)> {
+        Ok(self
+            .hash_reusing_sidecar_until(path, size, None)?
+            .expect("no stop flag, so never abandoned"))
+    }
+
+    /// As [`Engine::hash_reusing_sidecar`], but a read of the bytes is
+    /// abandoned when `cancel` is set, returning `None` and writing no
+    /// sidecar: D86's `hash_with_manifest_until`, for the catalogue pass
+    /// (D154). A sidecar is still taken whatever the flag says; it costs
+    /// nothing.
+    fn hash_reusing_sidecar_until(
+        &self,
+        path: &std::path::Path,
+        size: u64,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
         if let Some(known) = crate::sync::sidecar_hashes(path, size) {
             eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
-            return Ok(known);
+            return Ok(Some(known));
         }
         if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
             // Whole hash only still saves the whole read, which is the cost.
             eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
-            return Ok((w, Vec::new()));
+            return Ok(Some((w, Vec::new())));
         }
         // D150 — the file as it was BEFORE the read: the manifest records this
         // (size, mtime), and nothing is written if the file moved meanwhile.
         let seen = std::fs::metadata(path)
             .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
             .ok();
-        let (content_hash, chunks) = crate::sync::hash_with_manifest(path)?;
+        let Some((content_hash, chunks)) = crate::sync::hash_with_manifest_until(path, cancel)? else {
+            return Ok(None);
+        };
         // Leave the note for the next forest. Best-effort: a read-only store
         // still indexes, it just cannot record.
         if let (false, Some(seen)) = (chunks.is_empty(), seen) {
             let _ = crate::sync::write_manifest_sidecar_seen(path, Some(&content_hash), &chunks, seen);
         }
-        Ok((content_hash, chunks))
+        Ok(Some((content_hash, chunks)))
     }
 
     fn fill_hash_if_needed(
