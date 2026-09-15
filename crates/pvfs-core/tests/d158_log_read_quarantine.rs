@@ -71,13 +71,17 @@ fn pass(e: &mut Engine, region: &str) -> ScanStats {
     e.scan_routed(Some(&region.to_string()), None, 0).unwrap().remove(0).stats
 }
 
-/// The file nodes the passes have made, by name.
+/// The files the catalog holds here, by name: file nodes with a live
+/// location. A deletion retires the location; the node itself stays until
+/// D112's grace (`UNLINK_GRACE_MS`) runs out, so the location is what says a
+/// file has gone.
 fn files(e: &Engine, region: &str) -> Vec<String> {
     let mut v: Vec<String> = e
         .children(&region.to_string())
         .unwrap()
         .into_iter()
         .filter(|c| c.node.node_type == TYPE_FILE)
+        .filter(|c| !e.locations(&c.node.id).unwrap().is_empty())
         .map(|c| c.label)
         .collect();
     v.sort();
