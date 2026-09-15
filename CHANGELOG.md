@@ -5,6 +5,29 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One unreadable new file does not stop a log-region pass (D158).**
+  `ingest_file` hashed a brand-new file with `?`. The read's error is `Io`,
+  which `is_transient` calls transient, so one file's read error ended the
+  pass. A file that failed every time stopped every pass at the same place,
+  before the pass's deletions. D156's classifier, renamed `read_fault`, now
+  judges that read and only that read:
+  - A file gone since the walk (ENOENT, ENOTDIR) is skipped, with a journal
+    line. The next pass's walk will not list it.
+  - A fault of the file itself (EACCES, EIO, …) is quarantined the way D71
+    W4 quarantines a file the catalog refuses. It is skipped, counted in
+    `needs_attention` and named in `quarantined`. Nothing is written for it,
+    so every pass tries it again. D156's reporting already carries it
+    (`WatchEvent::NeedsAttention`, pvfsd's note, `pvfs scan`).
+  - Anything else (ENOTCONN, ESTALE, EMFILE, any errno not named) fails the
+    pass as before.
+
+  `ingest_file`'s other errors come from the writes: this engine's database,
+  or the owner's through a routed writer. `is_transient` judges them as
+  before, whatever their errno. The root marker is verified again before the
+  pass's deletions. A volume unmounted mid-pass now fails the pass, where it
+  would have retired every tracked location the walk had held back. D156's
+  seam, `Engine::on_catalogue_read`, is called before this read too.
+
 - **A failed watch pass reaches the journal (D157).** pvfsd's watch job took
   a failed pass (`WatchEvent::ScanError`) into its status row (`backoff`,
   `last_error`) and wrote nothing to the journal. In D156's lab rehearsal a
@@ -17,13 +40,14 @@ file tracks Layer 0, the file-system engine.
   completed after N failed pass(es) over <time>`. A stopped pass (D154) ends
   nothing. The row, and so `serve status`, the HA page and the notifier, is
   unchanged.
+
 - **One unreadable file does not stop a catalogue pass (D156).**
   `scan_region_catalogue` hashed each file with `?`, so one file's read error
   ended the pass. A file that failed every time stopped every pass at the
   same place. The sweep and the head wait for a complete pass (D154), so
   that region would never have published again. A failed read is now
-  classified by its errno (`catalogue_read_fault`), because `is_transient`
-  calls every I/O error transient:
+  classified by its errno (`catalogue_read_fault`, `read_fault` since
+  D158), because `is_transient` calls every I/O error transient:
   - A file gone since the walk (ENOENT, ENOTDIR) is left to the sweep. The
     NAS's old forest logged two renamed episodes that way.
   - A fault of the file itself (EACCES, EIO, ENODATA, EBADMSG, EUCLEAN, …)
