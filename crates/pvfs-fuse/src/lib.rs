@@ -755,6 +755,10 @@ impl PvfsFs {
                     let tomb = Tomb { dead, at: std::time::Instant::now(), held: held.clone() };
                     tombs.lock().unwrap().insert(to.clone(), tomb);
                 }
+                if moved_hashes.is_none() {
+                    // a delete remembered under the old name is one under the new
+                    overlay::rekey(&mut tombs.lock().unwrap(), &from, &to);
+                }
                 let mut o = overlay.lock().unwrap();
                 if moved_hashes.is_none() {
                     o.rename_made_dirs(&from, &to);

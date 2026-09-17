@@ -67,6 +67,16 @@ pub fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
 }
 
+/// Every key that is `from` or under it, re-rooted at `to`.
+pub fn rekey<T>(map: &mut HashMap<String, T>, from: &str, to: &str) {
+    let moved: Vec<(String, String)> = map.keys().filter_map(|d| rebase(d, from, to).map(|n| (d.clone(), n))).collect();
+    for (old, new) in moved {
+        if let Some(v) = map.remove(&old) {
+            map.insert(new, v);
+        }
+    }
+}
+
 /// `path` is `dir`, or under it.
 fn within(path: &str, dir: &str) -> bool {
     path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
@@ -160,10 +170,30 @@ impl Overlay {
         Engine::view_entry_of_copies(rel, &copies)
     }
 
+    /// Where move `i`'s target is NOW: taken on through every later move (a
+    /// file renamed inside a folder that was then renamed itself).
+    fn final_to(&self, i: usize) -> String {
+        let mut at = self.moves[i].to.clone();
+        for k in &self.moves[i + 1..] {
+            let on = match &k.hashes {
+                None => rebase(&at, &k.from, &k.to),
+                Some(_) => (at == k.from).then(|| k.to.clone()),
+            };
+            if let Some(on) = on {
+                at = on;
+            }
+        }
+        at
+    }
+
     /// `rel` is a folder this mount vouches for: made here, or on the way
     /// to something renamed here.
     pub fn remembers_dir(&self, rel: &str) -> bool {
-        self.made_dirs.contains_key(rel) || self.moves.iter().any(|m| m.to != rel && within(&m.to, rel))
+        self.made_dirs.contains_key(rel)
+            || (0..self.moves.len()).any(|i| {
+                let to = self.final_to(i);
+                to != rel && within(&to, rel)
+            })
     }
 
     /// The remembered folders directly inside `dir`.
@@ -174,11 +204,12 @@ impl Overlay {
             .filter(|d| parent_of(d) == dir && !d.is_empty())
             .cloned()
             .collect();
-        for m in &self.moves {
+        for i in 0..self.moves.len() {
+            let to = self.final_to(i);
             let rest = if dir.is_empty() {
-                Some(m.to.as_str())
+                Some(to.as_str())
             } else {
-                m.to.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
+                to.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
             };
             if let Some((first, _)) = rest.and_then(|r| r.split_once('/')) {
                 let child = if dir.is_empty() { first.to_string() } else { format!("{dir}/{first}") };
@@ -195,18 +226,13 @@ impl Overlay {
         self.gone_dirs.keys().any(|g| within(rel, g))
     }
 
-    /// A folder renamed here takes the folders remembered under it along.
+    /// A folder renamed here takes what is remembered under it along: the
+    /// folders made there, and the folders removed there — a season folder
+    /// removed from `Show`, and `Show` then renamed, must not come back as
+    /// `Show Renamed/Season 02` out of the rows the catalogue still lists.
     pub fn rename_made_dirs(&mut self, from: &str, to: &str) {
-        let moved: Vec<(String, String)> = self
-            .made_dirs
-            .keys()
-            .filter_map(|d| rebase(d, from, to).map(|n| (d.clone(), n)))
-            .collect();
-        for (old, new) in moved {
-            if let Some(at) = self.made_dirs.remove(&old) {
-                self.made_dirs.insert(new, at);
-            }
-        }
+        rekey(&mut self.made_dirs, from, to);
+        rekey(&mut self.gone_dirs, from, to);
     }
 
     /// Forget what the catalogue has caught up with — or what is too old to
@@ -381,6 +407,23 @@ mod tests {
         let moved_in = file("b", &[("r1", "h")]);
         let e = Overlay::merge("b", vec![replaced, moved_in]).expect("merged");
         assert_eq!(e.sources.len(), 2);
+    }
+
+    #[test]
+    fn a_folder_renamed_after_a_move_inside_it_leaves_no_ghost_of_its_old_name() {
+        // the lab pair, through mergerfs: a file moved into a new season
+        // folder, the old season removed, then the show renamed
+        let mut o = Overlay::default();
+        o.made_dirs.insert("Show (2020)/s3".into(), Instant::now());
+        o.moves.push(mv("Show (2020)/s2/E01.mkv", "Show (2020)/s3/E01.mkv", Some(&["h"])));
+        o.gone_dirs.insert("Show (2020)/s2".into(), GoneDir { at: Instant::now(), held: HashMap::new() });
+        o.rename_made_dirs("Show (2020)", "Show Renamed (2020)");
+        o.moves.push(mv("Show (2020)", "Show Renamed (2020)", None));
+        assert_eq!(o.remembered_dirs_in(""), ["Show Renamed (2020)"], "the old name is not vouched for");
+        assert!(!o.remembers_dir("Show (2020)") && !o.remembers_dir("Show (2020)/s3"));
+        assert!(o.remembers_dir("Show Renamed (2020)/s3"));
+        assert!(o.is_gone("Show Renamed (2020)/s2") && !o.is_gone("Show (2020)/s2"));
+        assert_eq!(paths(&o, file("Show (2020)/s2/E01.mkv", &[("r", "h")])), ["Show Renamed (2020)/s3/E01.mkv"]);
     }
 
     #[test]
