@@ -74,13 +74,15 @@ pub fn client_identity_mnemonic() -> Result<Mnemonic> {
         }
         std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
         let mn = generate_mnemonic()?;
+        // pid + a process-wide counter: unique across processes and across
+        // threads of one. A timestamp was not — sixteen callers released
+        // together on GitHub's runner drew the same nanosecond, and the
+        // second `create_new` failed "File exists" (2026-09-16, 10:11 PM EDT).
+        static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mine = dir.join(format!(
             ".identity.phrase.{}.{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
