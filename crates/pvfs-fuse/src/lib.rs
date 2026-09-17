@@ -689,6 +689,7 @@ impl PvfsFs {
         // name is not dragged along; a folder takes everything under it.
         let moved_hashes: Option<HashSet<String>> =
             (!is_dir).then(|| copies.iter().filter_map(|c| c.1.as_ref().map(|(h, _)| h.clone())).collect());
+        let moved_regions: HashSet<String> = copies.iter().map(|c| c.0.clone()).collect();
         let overlay = Arc::clone(&self.overlay);
         if copies.is_empty() {
             if !is_dir {
@@ -764,6 +765,9 @@ impl PvfsFs {
                     o.rename_made_dirs(&from, &to);
                 }
                 o.made_dirs.remove(&to);
+                // the holders made the folders on the way to `to`: a folder
+                // made here is real on their disks now
+                o.moved_into(&to, &moved_regions);
                 o.moves.push(Move { from: from.clone(), to: to.clone(), hashes: moved_hashes, at: std::time::Instant::now(), held });
                 o.ino_moves.push((from, to));
                 o.dirty = true;
@@ -835,11 +839,7 @@ impl PvfsFs {
         if self.view_entry_of(&rel).is_some() {
             return reply.error(libc::EEXIST);
         }
-        {
-            let mut o = self.overlay.lock().unwrap();
-            o.gone_dirs.remove(&rel);
-            o.made_dirs.insert(rel.clone(), std::time::Instant::now());
-        }
+        self.overlay.lock().unwrap().made(&rel);
         self.view_cache.clear();
         let attr = self.view_attr(&overlay::remembered_dir(&rel));
         reply.entry(&TTL, &attr, 0)
@@ -868,8 +868,17 @@ impl PvfsFs {
             Ok(_) => return reply.error(libc::ENOTEMPTY),
             Err(_) => return reply.error(libc::EIO),
         }
+        // Every region the view shows the folder in — and, for a folder made
+        // here, every region whose holder made it real when something was
+        // renamed into it (the catalogue does not say so yet).
+        let mut regions: Vec<String> = entry.sources.iter().map(|c| c.region.clone()).collect();
+        for r in self.overlay.lock().unwrap().made_regions(&rel) {
+            if !regions.contains(&r) {
+                regions.push(r);
+            }
+        }
         let mut elsewhere: Vec<String> = Vec::new();
-        for region in entry.sources.iter().map(|c| c.region.clone()) {
+        for region in regions.iter().cloned() {
             match self.engine.remove_region_dir(&region, &rel) {
                 Ok(pvfs_core::DirRemovedHere::Removed | pvfs_core::DirRemovedHere::Gone) => {}
                 Ok(pvfs_core::DirRemovedHere::NotHere) => elsewhere.push(region),
@@ -881,8 +890,8 @@ impl PvfsFs {
             }
         }
         let overlay = Arc::clone(&self.overlay);
-        let held = if entry.sources.is_empty() { HashMap::new() } else { overlay::held_seqs(&self.engine) };
-        let listed = !entry.sources.is_empty();
+        let held = if regions.is_empty() { HashMap::new() } else { overlay::held_seqs(&self.engine) };
+        let listed = !regions.is_empty();
         let forget = move |rel: String| {
             let mut o = overlay.lock().unwrap();
             o.made_dirs.remove(&rel);

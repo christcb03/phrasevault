@@ -31,6 +31,18 @@ pub struct Move {
     pub held: HashMap<String, u64>,
 }
 
+/// A folder made through this mount: when — and the regions whose holders
+/// have it FOR REAL by now, because something was renamed into it (the
+/// holder makes the folders on the way to a rename's target). The catalogue
+/// will say so with its next head; until then only this does, and an `rmdir`
+/// has to reach those boxes (the lab fleet: a season folder made here, filled,
+/// emptied and removed within the minute stayed on the store's disk).
+#[derive(Clone, Debug)]
+pub struct MadeDir {
+    pub at: Instant,
+    pub regions: HashSet<String>,
+}
+
 /// A folder removed through this mount: when, and the seqs held then.
 #[derive(Clone, Debug)]
 pub struct GoneDir {
@@ -44,7 +56,7 @@ pub struct Overlay {
     pub moves: Vec<Move>,
     /// Folders made through this mount that no catalogue lists (mergerfs
     /// clones a path onto our branch before a rename into a new folder).
-    pub made_dirs: HashMap<String, Instant>,
+    pub made_dirs: HashMap<String, MadeDir>,
     pub gone_dirs: HashMap<String, GoneDir>,
     /// Renames the inode table has not followed yet — a remote rename
     /// finishes on its own thread, and the table is the session thread's.
@@ -221,6 +233,27 @@ impl Overlay {
         out
     }
 
+    /// A folder was made here (`mkdir`).
+    pub fn made(&mut self, rel: &str) {
+        self.gone_dirs.remove(rel);
+        self.made_dirs.insert(rel.to_string(), MadeDir { at: Instant::now(), regions: HashSet::new() });
+    }
+
+    /// Something of `regions` was renamed to `to`: every folder made here on
+    /// the way to it exists on those regions' holders now.
+    pub fn moved_into(&mut self, to: &str, regions: &HashSet<String>) {
+        for (d, m) in self.made_dirs.iter_mut() {
+            if d != to && within(to, d) {
+                m.regions.extend(regions.iter().cloned());
+            }
+        }
+    }
+
+    /// The regions whose holders have the made folder `rel` for real.
+    pub fn made_regions(&self, rel: &str) -> HashSet<String> {
+        self.made_dirs.get(rel).map(|m| m.regions.clone()).unwrap_or_default()
+    }
+
     /// `rel` is a folder removed through this mount, or under one.
     pub fn is_gone(&self, rel: &str) -> bool {
         self.gone_dirs.keys().any(|g| within(rel, g))
@@ -276,7 +309,7 @@ impl Overlay {
         self.moves = kept;
         let before = self.made_dirs.len() + self.gone_dirs.len();
         // A made folder the catalogue now lists is simply a folder.
-        self.made_dirs.retain(|d, at| at.elapsed() <= PENDING_TTL && !listed(d));
+        self.made_dirs.retain(|d, m| m.at.elapsed() <= PENDING_TTL && !listed(d));
         // A removed folder: gone from the catalogue — or listed by a head
         // published since, which means it is back. "Listed" as the VIEW sees
         // it: a folder removed inside a folder renamed a moment ago is still
@@ -414,7 +447,7 @@ mod tests {
         // the lab pair, through mergerfs: a file moved into a new season
         // folder, the old season removed, then the show renamed
         let mut o = Overlay::default();
-        o.made_dirs.insert("Show (2020)/s3".into(), Instant::now());
+        o.made("Show (2020)/s3");
         o.moves.push(mv("Show (2020)/s2/E01.mkv", "Show (2020)/s3/E01.mkv", Some(&["h"])));
         o.gone_dirs.insert("Show (2020)/s2".into(), GoneDir { at: Instant::now(), held: HashMap::new() });
         o.rename_made_dirs("Show (2020)", "Show Renamed (2020)");
@@ -429,8 +462,13 @@ mod tests {
     #[test]
     fn made_and_gone_folders() {
         let mut o = Overlay::default();
-        o.made_dirs.insert("tv/New/Season 01".into(), Instant::now());
-        o.made_dirs.insert("tv/New".into(), Instant::now());
+        o.made("tv/New/Season 01");
+        o.made("tv/New");
+        // a file of region r renamed into the season: both made folders are real on r's holder now
+        o.moved_into("tv/New/Season 01/e1.mkv", &["r".to_string()].into_iter().collect());
+        assert_eq!(o.made_regions("tv/New/Season 01"), ["r".to_string()].into_iter().collect());
+        assert_eq!(o.made_regions("tv/New"), ["r".to_string()].into_iter().collect());
+        assert!(o.made_regions("tv").is_empty());
         assert_eq!(o.remembered_dirs_in("tv"), ["tv/New"]);
         o.rename_made_dirs("tv/New", "tv/Newer");
         assert!(o.remembers_dir("tv/Newer/Season 01"));
