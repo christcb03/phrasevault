@@ -122,10 +122,22 @@ fn daemon_without_runner_reports_off_and_gates_anon() {
 /// One process-wide config dir: tests run on threads, and the client
 /// identity is resolved through env — two tests racing `XDG_CONFIG_HOME`
 /// to different dirs would flake. Same dir → same identity, no race.
+///
+/// D163: the identity is made HERE, inside the once, not left to the first
+/// test to ask for it. The once released two tests together, both found no
+/// phrase, and both wrote one — `File::create` truncated the first's, so
+/// one test authorized a key the file no longer held and its follow job
+/// dialed as a stranger ("forbidden"), or the writes overlapped (a 25-word
+/// file). `client_identity_mnemonic` is first-writer-wins now; this says
+/// what the tests rely on.
 fn test_config_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
-    std::env::set_var("XDG_CONFIG_HOME", d.path());
+    let d = DIR.get_or_init(|| {
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", d.path());
+        identity::client_identity_mnemonic().unwrap();
+        d
+    });
     d.path()
 }
 
