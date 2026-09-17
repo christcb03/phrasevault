@@ -5244,33 +5244,28 @@ fn walk_disk(
     let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     let now = now_ms();
     for entry in &entries {
-        if entry.name.starts_with('.') {
-            if !entry.is_dir && sidecar_is_orphan(&entry.name, &names) {
-                ctx.orphans.borrow_mut().push((
-                    dir.join(&entry.name),
-                    crate::storage::age_from(entry.mtime_ms, entry.changed_ms, now),
-                ));
-            }
-            // D81 — our OWN bookkeeping is not something the operator chose not
-            // to index, and counting it as `skipped` would put a permanent +1
-            // on every scan report of every root. Dotfiles they put there are
-            // still counted, because that is a fact about their directory.
-            if entry.name != crate::sync::ROOT_MARKER {
-                stats.skipped += 1;
-            }
-            continue;
-        }
-        // Our chunk-manifest sidecar, which is bookkeeping and not content.
+        // D166 — a name with a dot in front is the operator's content like any
+        // other (`.plexmatch` is how Plex is told which show a folder holds),
+        // with two exceptions: PVFS's own bookkeeping, and the litter an OS
+        // or a NAS leaves behind. Until D166 every dot-name was skipped here.
+        //
         // Unconditional, and BEFORE the extension filter: an empty `extensions`
         // list means "every file the operator has", not "also the files we
-        // ourselves write next to them". Not counted as `skipped`, for the same
-        // reason the dotfile arm above does not count ours (D81).
-        if !entry.is_dir && crate::sync::is_sidecar_name(&entry.name) {
-            if sidecar_is_orphan(&entry.name, &names) {
+        // ourselves write next to them".
+        let own = crate::sync::is_own_name(&entry.name, entry.is_dir);
+        if own || crate::sync::is_litter_name(&entry.name) {
+            if own && !entry.is_dir && sidecar_is_orphan(&entry.name, &names) {
                 ctx.orphans.borrow_mut().push((
                     dir.join(&entry.name),
                     crate::storage::age_from(entry.mtime_ms, entry.changed_ms, now),
                 ));
+            }
+            // The count is what it was (D81): a dot-name that is not indexed
+            // is a fact about their directory and counts as `skipped` — except
+            // the root marker, which would put a permanent +1 on every scan of
+            // every root — and a V1 sidecar, which has no dot, never counted.
+            if entry.name.starts_with('.') && entry.name != crate::sync::ROOT_MARKER {
+                stats.skipped += 1;
             }
             continue;
         }

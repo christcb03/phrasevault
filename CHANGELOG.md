@@ -5,6 +5,29 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The operator's dotfiles are content (D166).** `walk_disk` skipped every
+  name that starts with a dot. That was how PVFS's own bookkeeping stayed out
+  of the catalogue (doc 24 §2: "make the sidecar a dotfile so no walker has
+  to know anything") — and it took the operator's dot-names with it: 153
+  `.plexmatch` files on the fleet, the file that tells Plex which show a
+  folder holds, and a `.htaccess`. Found when the merged view was compared
+  with the rclone union it replaces (PVOS D164 §6); harmless to Sonarr and
+  Radarr, not to Plex once it reads through PVFS. Now a dot-name is content
+  like any other, with two exceptions, both in `pvfs_core::sync`:
+  `is_own_name` — a forest's `.pvfs`, anything `.pvfs-*` (the markers, the
+  trash, `.pvfs-incoming`), a sidecar (`.X.manifest`, V1's `X.manifest`;
+  files only), and a dot-named file still being written (`.<id>.tmp`,
+  `.<id>.swarmpart`, `.<id>.progress`, `.X.partial`); and `is_litter_name` —
+  what an OS or a NAS leaves in every folder it touches (`.DS_Store`, `._*`,
+  `.AppleDouble`, `.Trash-*`, the QNAP indexer's `.@__thumb` — 346 folders and
+  792 MB of thumbnails on one fleet disk — `.fuse_hidden*`, `.nfs*`, …).
+  Litter is dot-names only, so nothing catalogued before stops being
+  catalogued, and `skipped` counts what it counted. A dotfile's sidecar is
+  `..plexmatch.manifest` — ours, so the D87 chain cannot start. The walker
+  is now the ONE place that knows our names, the test holds every function
+  that makes one to it, and **new bookkeeping takes the `.pvfs-` prefix**.
+  `pvfs-core/tests/d166_operator_dotfiles.rs`.
+
 - **The view mount reads through by the piece, keeps what is consumed, and
   is bounded (D165).** A file the mount did not hold got a whole-file,
   sequential fetch from byte 0 at `open`, one thread per file, that nothing
