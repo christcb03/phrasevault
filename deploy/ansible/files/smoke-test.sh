@@ -1101,7 +1101,9 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   # catlib2's older copy of the same path is in ITS trash since the D127
   # resolve section, so the region is named — restoring both would hand
   # the later resolve checks a redundant copy back.
-  $PVFS trash restore sub/b.mkv 2>&1 | qgrep 'pass --region' && ok "D169: two regions have it in their trash: a script is told to name one" || fail "D169: restore without --region"
+  # (captured first: the command fails by design, and this script runs with pipefail)
+  RESTORE_OUT="$($PVFS trash restore sub/b.mkv 2>&1 || true)"
+  printf '%s' "$RESTORE_OUT" | qgrep 'pass --region' && ok "D169: two regions have it in their trash: a script is told to name one" || fail "D169: restore without --region: $RESTORE_OUT"
   $PVFS trash restore sub/b.mkv --region "$(printf '%s' "$CAT" | cut -c1-12)" | qgrep '^restored' && ok "D169: and pvfs trash restore --region puts it back" || fail "D169: restore"
   $PVFS umount "$DATA/view-mnt" >/dev/null 2>&1 || fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true
   wait "$VPID" 2>/dev/null || true
