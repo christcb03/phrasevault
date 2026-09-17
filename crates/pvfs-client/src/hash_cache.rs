@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -504,7 +504,7 @@ impl std::io::Write for PieceSink<'_> {
 fn worker(cache: Arc<CacheInner>, fetch: Arc<HashFetch>) {
     let sources = cache.sources();
     let mut run = Run {
-        cur: 0,
+        cur: cache.hint.load(Ordering::Relaxed),
         bad: HashSet::new(),
         served: HashSet::new(),
         file: None,
@@ -606,6 +606,7 @@ fn fetch_run(
                     cache.checkin(&src.target, client);
                     run.served.insert(src.target.clone());
                     cache.fetched.fetch_add(len, Ordering::Relaxed);
+                    cache.hint.store(idx, Ordering::Relaxed);
                     return Ok(());
                 }
                 Ok(_) => {
@@ -741,6 +742,10 @@ struct CacheInner {
     probes: AtomicU64,
     completed: AtomicU64,
     fetched: AtomicU64,
+    /// The box that served last. A scan walks a library directory by
+    /// directory, so the next file is most likely on the same box: asking it
+    /// first saves a `not_found` round trip per file over the WAN.
+    hint: AtomicUsize,
 }
 
 impl CacheInner {
@@ -891,6 +896,7 @@ impl HashCache {
             probes: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             fetched: AtomicU64::new(0),
+            hint: AtomicUsize::new(0),
         });
         for (path, _, partial, _, _) in inner.entries() {
             if partial {
