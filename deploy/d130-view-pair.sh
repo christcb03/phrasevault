@@ -9,9 +9,13 @@
 # the store; a remount with a small --cache-max evicts it.
 #   owner : presubuntu (192.168.0.184) — forest, `own-shelf` catalogued here
 #   edge  : pvos-test  (192.168.0.138) — replica, `edge-shelf` catalogued there
-# Binaries: ~/.local/bin on both boxes, installed by the pipeline. Run from
+# Binaries: ~/.local/bin on both boxes, installed by the pipeline — or a
+# session's own build, without touching that machine-global install:
+#   PVFS_LAB_BIN=/opt/pvfs-<session>/src/target/release deploy/d130-view-pair.sh
+# Run from
 # the Mac; nothing here touches production.
 OWNER=chris@192.168.0.184; EDGE=chris@192.168.0.138; OWNER_IP=192.168.0.184; EDGE_IP=192.168.0.138
+LABBIN=${PVFS_LAB_BIN:-'$HOME/.local/bin'}   # expanded on the lab box, not here
 PASS=0; FAIL=0
 say()  { printf '\n== %s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$*"; }
@@ -19,7 +23,7 @@ fail() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$*"; }
 gate() { if [ "$FAIL" -gt 0 ]; then echo; echo "ABORT at: $1 ($PASS ok, $FAIL failed)"; exit 1; fi; }
 has()  { printf '%s' "$1" | grep -q "$2"; }
 val()  { printf '%s' "$1" | sed -n "s/^$2=//p" | tail -1; }
-RH='B=$HOME/.local/bin; FT=$HOME/fleet-test; O=$FT/d130-owner; R=$FT/d130-replica; D=$O/.pvfs; RD=$R/.pvfs
+RH='B='"$LABBIN"'; FT=$HOME/fleet-test; O=$FT/d130-owner; R=$FT/d130-replica; D=$O/.pvfs; RD=$R/.pvfs
 jget(){ python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 stopd(){ p=$(cat "$1" 2>/dev/null) || return 0; kill "$p" 2>/dev/null; for _ in $(seq 1 100); do kill -0 "$p" 2>/dev/null || return 0; sleep 0.2; done; echo "STILL_RUNNING $p"; }
 # region ls as "held/head/stale" for one region
@@ -33,15 +37,15 @@ vpaths(){ "$B/pvfs" --json --data-dir "$1" view ls "$2" 2>/dev/null | python3 -c
 '
 
 say "0: preflight — the D130 build on both boxes, a clean slate"
-VA=$(ssh "$OWNER" '"$HOME/.local/bin/pvfs" --version' 2>&1); VB=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --version' 2>&1)
+VA=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --version" 2>&1); VB=$(ssh "$EDGE" "\"$LABBIN/pvfs\" --version" 2>&1)
 [ "$VA" = "$VB" ] && ok "both boxes run the same build ($VA)" || fail "builds differ: A=$VA B=$VB"
 for h in "$OWNER" "$EDGE"; do
-  ssh "$h" '"$HOME/.local/bin/pvfs" mount --help >/dev/null 2>&1' && ok "$h has pvfs mount" || fail "$h: not a D130 build"
+  ssh "$h" "\"$LABBIN/pvfs\" mount --help >/dev/null 2>&1" && ok "$h has pvfs mount" || fail "$h: not a D130 build"
   ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d130" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d130-*; mkdir -p "$HOME/fleet-test"' \
     && ok "$h: clean slate" || fail "$h: clean slate"
 done
-AKEY=$(ssh "$OWNER" '"$HOME/.local/bin/pvfs" --json whoami' | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
-EDGEKEY=$(ssh "$EDGE" '"$HOME/.local/bin/pvfs" --json whoami' | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
+AKEY=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --json whoami" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
+EDGEKEY=$(ssh "$EDGE" "\"$LABBIN/pvfs\" --json whoami" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
 [ "${#AKEY}" -eq 66 ] && [ "${#EDGEKEY}" -eq 66 ] && ok "client identities" || fail "identities: A=$AKEY B=$EDGEKEY"
 ssh "$EDGE" 'L=$HOME/fleet-test/d130-edge-lib; mkdir -p "$L/season" "$L/unused"; printf xx > "$L/x.mkv"; printf yyyy > "$L/season/y.mkv"; head -c 629145600 /dev/urandom > "$L/big.mkv"; md5sum < "$L/big.mkv" | cut -d" " -f1 > "$HOME/fleet-test/d130-big.md5"' \
   && ok "edge library staged (x.mkv, season/y.mkv, unused/, and a 600 MiB big.mkv)" || fail "edge library"
@@ -283,5 +287,5 @@ has "$B_OUT" B1=ok && ok "remounted with --cache-max 100M" || fail "remount: $B_
 has "$B_OUT" B2=ok && ok "the mount serves on" || fail "a.mkv after remount"
 
 say "G: stop the lab daemons and the mount (dirs kept under ~/fleet-test/d130-* for inspection)"
-ssh "$OWNER" 'B=$HOME/.local/bin; V=$HOME/fleet-test/d130-view; "$B/pvfs" umount "$V" >/dev/null 2>&1 || fusermount3 -u "$V" 2>/dev/null; kill "$(cat $HOME/fleet-test/d130-view.pid)" 2>/dev/null; kill "$(cat $HOME/fleet-test/d130-owner.pid)" 2>/dev/null; true' && ok "owner's mount and daemon stopped"
+ssh "$OWNER" 'B='"$LABBIN"'; V=$HOME/fleet-test/d130-view; "$B/pvfs" umount "$V" >/dev/null 2>&1 || fusermount3 -u "$V" 2>/dev/null; kill "$(cat $HOME/fleet-test/d130-view.pid)" 2>/dev/null; kill "$(cat $HOME/fleet-test/d130-owner.pid)" 2>/dev/null; true' && ok "owner's mount and daemon stopped"
 echo; echo "view pair: $PASS ok, $FAIL failed"; [ "$FAIL" -eq 0 ]
