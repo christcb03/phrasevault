@@ -322,9 +322,10 @@ v6 (`pending_moves`, `purged_nodes`) — the usual one-time rebuild.
 - *D130 (doc 26 phase 6): the same crate mounts the MERGED VIEW with
   `pvfs mount --view <dir>` — paths instead of nodes, bytes by content hash
   (own disk, the hash store, a read-through). The node mount above is
-  unchanged. The read-through is whole-file today; it becomes ranged,
-  stoppable and bounded in D165 (PVOS D164 §3) before the mount serves the
-  arrs' union.*
+  unchanged. Since D165 the read-through fetches the pieces a read asks
+  for, completes a file only for a reader that consumes it, stops when the
+  handle closes, waits off the session thread, and keeps at most
+  `--cache-max` (500 GB) for `--cache-age` (1 day) — doc 26 phase 6.*
 
 ## 4. Phases + turnkey checklist
 

@@ -382,8 +382,18 @@ readahead on sequential reads, completion in the background once a
 reader has consumed 64 MiB), stoppable (the last handle closes → a grace,
 then stop), capped (K = 4 streams) and bounded (a size cap and an age,
 least recently read first) — PVFS D165, designed in PVOS
-`docs/milestones/D164-presentation-layer-plan.md` §3.* The original spec
-follows.
+`docs/milestones/D164-presentation-layer-plan.md` §3.* **D165, BUILT
+(2026-09-17):** `pvfs_client::hash_cache` is that read-through — pieces by
+demand over a sparse `.partial`, readahead for a sequential reader,
+completion once a reader has consumed 64 MiB, the whole hashed as a stream
+and only a match kept (files up to 64 MiB verified before their last piece
+is served), a probe's fetch ended by its last close and a completing one
+after a 60 s grace unless three quarters through, 4 requests at once with a
+waiting read first, pooled connections, a read's wait moved off fuser's
+session thread, and the store bounded by `--cache-max` (500 GB) and
+`--cache-age` (1 day), least recently read first. Still single-source per
+request: several holders serving pieces of one file is now a change to the
+worker alone. The original spec follows.
 The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.

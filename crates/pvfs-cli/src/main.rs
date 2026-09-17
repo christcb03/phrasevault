@@ -344,6 +344,14 @@ enum Cmd {
         /// by hash — instead of a node. `pvfs mount --view <dir>`.
         #[arg(long)]
         view: bool,
+        /// D165, with --view: the most the read-through cache may hold —
+        /// `500G`, `1.5T`, or bytes. The least recently read goes first.
+        #[arg(long, default_value = "500G")]
+        cache_max: String,
+        /// D165, with --view: how long a file nobody reads stays cached —
+        /// `1d`, `12h`, `90m`.
+        #[arg(long, default_value = "1d")]
+        cache_age: String,
     },
     /// Unmount a pvfs mount (fusermount -u)
     #[cfg(target_os = "linux")]
@@ -1896,6 +1904,52 @@ fn parse_expires(s: &str) -> Result<u64, PvfsError> {
     n.checked_mul(ms_per)
         .and_then(|d| now.checked_add(d))
         .ok_or_else(|| bad(format!("{s:?} — duration overflows")))
+}
+
+/// Parse a size (`--cache-max`): bytes, or `<N>(K|M|G|T)` in the decimal
+/// units disks are sold in — `500G` is 500,000,000,000; `1.5T` works.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_size(s: &str) -> Result<u64, PvfsError> {
+    let bad = || PvfsError::BadInput {
+        field: "size".into(),
+        reason: format!("{s:?} — use bytes or <N>(K|M|G|T), e.g. 500G"),
+    };
+    let t = s.trim().trim_end_matches(['B', 'b']);
+    let (num, mult) = match t.chars().last().map(|c| c.to_ascii_uppercase()) {
+        Some('K') => (&t[..t.len() - 1], 1e3),
+        Some('M') => (&t[..t.len() - 1], 1e6),
+        Some('G') => (&t[..t.len() - 1], 1e9),
+        Some('T') => (&t[..t.len() - 1], 1e12),
+        _ => (t, 1.0),
+    };
+    let n: f64 = num.trim().parse().map_err(|_| bad())?;
+    if !n.is_finite() || n <= 0.0 {
+        return Err(bad());
+    }
+    Ok((n * mult) as u64)
+}
+
+/// Parse an age (`--cache-age`): `<N>(s|m|h|d|w)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_age(s: &str) -> Result<std::time::Duration, PvfsError> {
+    let bad = || PvfsError::BadInput {
+        field: "age".into(),
+        reason: format!("{s:?} — use <N>(s|m|h|d|w), e.g. 1d"),
+    };
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: u64 = num.parse().map_err(|_| bad())?;
+    let secs: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Err(bad()),
+    };
+    n.checked_mul(secs)
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(bad)
 }
 
 /// Human note for a grant expiry: `""` for never, ` [expired]` once past, else
@@ -6090,7 +6144,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             dir,
             allow_other,
             view,
+            cache_max,
+            cache_age,
         } => {
+            let cache = pvfs_client::hash_cache::CacheOpts {
+                max_bytes: parse_size(&cache_max)?,
+                max_age: parse_age(&cache_age)?,
+                ..Default::default()
+            };
             // With --view the one positional is the mount directory.
             let (data_dir, id, dir) = if view {
                 if dir.is_some() {
@@ -6133,7 +6194,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
             }
             if view {
-                pvfs_fuse::mount_view(&data_dir, &dir, allow_other)?;
+                eprintln!(
+                    "  read-through cache: files held elsewhere are fetched by the piece a read asks for, kept up to {cache_max} and {cache_age} unread (D165)"
+                );
+                pvfs_fuse::mount_view_with(&data_dir, &dir, allow_other, cache)?;
             } else {
                 pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
             }
@@ -9318,6 +9382,23 @@ mod tests {
                 matches!(parse_expires(bad), Err(PvfsError::BadInput { .. })),
                 "{bad:?} must be refused"
             );
+        }
+    }
+
+    // D165: `pvfs mount --view --cache-max 500G --cache-age 1d`.
+    #[test]
+    fn parse_cache_size_and_age() {
+        assert_eq!(parse_size("500G").unwrap(), 500_000_000_000);
+        assert_eq!(parse_size("500GB").unwrap(), 500_000_000_000);
+        assert_eq!(parse_size("1.5t").unwrap(), 1_500_000_000_000);
+        assert_eq!(parse_size("250000").unwrap(), 250_000);
+        assert_eq!(parse_age("1d").unwrap(), std::time::Duration::from_secs(86_400));
+        assert_eq!(parse_age("90m").unwrap(), std::time::Duration::from_secs(5_400));
+        for bad in ["", "G", "-5G", "0", "five", "1x"] {
+            assert!(matches!(parse_size(bad), Err(PvfsError::BadInput { .. })), "size {bad:?}");
+        }
+        for bad in ["", "d", "0d", "1", "1y", "99999999999999999999w"] {
+            assert!(matches!(parse_age(bad), Err(PvfsError::BadInput { .. })), "age {bad:?}");
         }
     }
 
