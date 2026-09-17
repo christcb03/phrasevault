@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The view's lookups come from an index (D171).** Krusader took 24–36 s to
+  open `Movies` through feederbox's mount: the listing itself was 0.5 s, and
+  then every one of its 2,452 `stat`s took 13 ms. `region_entries` is keyed
+  `(region_id, rel_path)`, and the view asks by **path across every region**
+  — `EXPLAIN QUERY PLAN` said `SCAN e`: all 72k rows on the box, per lookup;
+  and again by **hash** on every `open` (`local_path_for_hash`). Every `stat`
+  an arr or Plex makes paid it too, on fuser's one session thread. Two
+  indexes — `idx_region_entries_path (rel_path, region_id)` and
+  `idx_region_entries_hash (content_hash)` — and a listing that is a RANGE
+  over the first (`"dir/" ≤ path < "dir0"`) instead of `substr(…) = ?` over
+  every row. Schema v18 → v19, migrated **in place** (CREATE INDEX): the rows
+  come from disks and fetched manifests, not the log, so a replay could not
+  bring them back. `tests/d171_view_index.rs` holds the three queries to
+  their indexes by their query plans, so a rewording that scans again fails
+  there and not as a slow `ls` on a full library.
 - **A delete through the view is a trip to the holder's trash (D169).** The
   view mount's namespace was read-only (D130), and an arr importing an
   upgrade removes the existing file first: Sonarr moves it to its recycle

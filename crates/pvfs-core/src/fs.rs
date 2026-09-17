@@ -436,6 +436,34 @@ pub struct LocalBytes {
     pub region: NodeId,
 }
 
+/// D171 — the three questions a view mount asks of `region_entries`, as the
+/// text SQLite plans: `tests/d171_view_index.rs` holds each to an index, so
+/// a rewording that sends one back to scanning every row fails there rather
+/// than as a slow `ls` on a full library.
+#[doc(hidden)]
+pub const VIEW_ENTRY_SQL: &str = "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.rel_path = ?1
+                  ORDER BY e.region_id";
+#[doc(hidden)]
+pub const MERGED_VIEW_SQL: &str = "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.rel_path >= ?1 AND e.rel_path < ?2
+                  ORDER BY e.rel_path, e.region_id";
+/// The root's listing has no prefix to range over: every row, as before.
+const MERGED_VIEW_ROOT_SQL: &str = "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
+                        e.content_hash, e.quality
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue'
+                  ORDER BY e.rel_path, e.region_id";
+#[doc(hidden)]
+pub const LOCAL_PATH_FOR_HASH_SQL: &str = "SELECT e.region_id, e.rel_path, e.size_bytes
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.kind = 'file' AND e.content_hash = ?1
+                  ORDER BY e.region_id, e.rel_path";
+
 /// D169 — what [`Engine::trash_region_path`] did with this box's copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrashedHere {
@@ -1933,19 +1961,18 @@ impl Engine {
     pub fn merged_view(&self, dir: &str) -> Result<Vec<ViewEntry>> {
         let dir = dir.trim_matches('/');
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        // D171 — a RANGE over the path index, not `substr(rel_path, …) = ?`
+        // over every row: everything under `dir/` sorts from "dir/" up to
+        // (not including) "dir0", `0` being the byte after `/`. Paths compare
+        // bytewise (BINARY), which is also the manifest's order.
+        let upper = if dir.is_empty() { String::new() } else { format!("{dir}0") };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
-                        e.content_hash, e.quality
-                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
-                  WHERE r.kind = 'catalogue'
-                    AND substr(e.rel_path, 1, length(?1)) = ?1
-                  ORDER BY e.rel_path, e.region_id",
-            )
+            .prepare(if dir.is_empty() { MERGED_VIEW_ROOT_SQL } else { MERGED_VIEW_SQL })
             .map_err(map_db("merged view"))?;
+        let bounds: Vec<&dyn rusqlite::ToSql> = if dir.is_empty() { Vec::new() } else { vec![&prefix, &upper] };
         let rows = stmt
-            .query_map(params![prefix], |r| {
+            .query_map(bounds.as_slice(), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1980,11 +2007,7 @@ impl Engine {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT e.region_id, e.rel_path, e.kind, e.size_bytes, e.mtime_ms,
-                        e.content_hash, e.quality
-                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
-                  WHERE r.kind = 'catalogue' AND e.rel_path = ?1
-                  ORDER BY e.region_id",
+                VIEW_ENTRY_SQL,
             )
             .map_err(map_db("view entry"))?;
         let rows = stmt
@@ -2018,10 +2041,7 @@ impl Engine {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT e.region_id, e.rel_path, e.size_bytes
-                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
-                  WHERE r.kind = 'catalogue' AND e.kind = 'file' AND e.content_hash = ?1
-                  ORDER BY e.region_id, e.rel_path",
+                LOCAL_PATH_FOR_HASH_SQL,
             )
             .map_err(map_db("local path for hash"))?;
         let rows = stmt
