@@ -351,11 +351,25 @@ impl PvfsFs {
             .collect();
         self.view_cache
             .insert(dir.to_string(), (std::time::Instant::now(), list.clone()));
+        // A tombstone has done its work once the catalogue no longer lists
+        // the path: drop it, so that a file which comes BACK — restored from
+        // the trash, same hash — is not hidden by the memory of its delete.
+        {
+            let listed: HashSet<&str> = list.iter().map(|e| e.rel_path.as_str()).collect();
+            let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+            self.tombstones.lock().unwrap().retain(|path, _| {
+                let here = path.strip_prefix(&prefix).is_some_and(|rest| !rest.contains('/'));
+                !here || listed.contains(path.as_str())
+            });
+        }
         Ok(list.into_iter().filter_map(|e| self.without_the_deleted(e)).collect())
     }
 
     fn view_entry_of(&mut self, rel: &str) -> Option<pvfs_core::ViewEntry> {
-        let e = self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown)?;
+        let Some(e) = self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown) else {
+            self.tombstones.lock().unwrap().remove(rel); // the catalogue has caught up
+            return None;
+        };
         self.without_the_deleted(e)
     }
 

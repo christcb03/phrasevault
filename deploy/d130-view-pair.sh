@@ -237,6 +237,62 @@ has "$P_OUT" KEPT=ok && [ "$(val "$P_OUT" PART_AFTER)" = "0" ] && ok "the file i
 [ "$(val "$P_OUT" AGAIN_MD5)" = "$BIGMD5" ] && ok "a second full read comes from the store ($(val "$P_OUT" AGAIN_S)s)" || fail "second read md5"
 gate pieces
 
+say "E3 (D169): a delete through the owner's mount is a trip to the EDGE's trash; restored there, it comes back"
+ZHEAD=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+rstat "\$D" "$EDGESHELF" | cut -d/ -f2
+EOS
+)
+X_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+rm "\$V/z.mkv" 2>"\$FT/d169-rm.err" && echo X1=ok
+[ -e "\$V/z.mkv" ] || echo X2=ok
+echo "TOP3=\$(ls "\$V" | tr '\n' ' ')"
+mv "\$V/a.mkv" "\$V/renamed.mkv" 2>/dev/null || echo X3=ok
+[ "\$(cat "\$V/a.mkv")" = "aaa" ] && echo X4=ok
+EOS
+)
+has "$X_OUT" X1=ok && ok "rm of z.mkv (only the edge holds it) through the owner's mount succeeded" || fail "rm through the mount: $X_OUT $(ssh "$OWNER" 'cat $HOME/fleet-test/d169-rm.err; tail -2 $HOME/fleet-test/d130-view.log')"
+has "$X_OUT" X2=ok && [ "$(val "$X_OUT" TOP3)" = "a.mkv big.mkv empty season sub unused x.mkv " ] && ok "and it is gone from the mount at once" || fail "still listed: $(val "$X_OUT" TOP3)"
+has "$X_OUT" X3=ok && has "$X_OUT" X4=ok && ok "rename is still refused; a.mkv is where it was" || fail "rename: $X_OUT"
+Y_OUT=$(ssh "$EDGE" "bash -s" <<EOS
+$RH
+L=\$FT/d130-edge-lib
+[ -e "\$L/z.mkv" ] || echo Y1=ok
+"\$B/pvfs" --data-dir "\$RD" trash ls 2>/dev/null | grep -q "z.mkv" && echo Y2=ok
+"\$B/pvfs" --data-dir "\$RD" trash ls 2>/dev/null | sed -n '1,3p' | sed 's/^/LS=/'
+grep -c "trashed z.mkv" "\$FT/d130-edge.log" | sed 's/^/LOGGED=/'
+EOS
+)
+has "$Y_OUT" Y1=ok && has "$Y_OUT" Y2=ok && ok "the edge moved ITS z.mkv into its trash, and \`pvfs trash ls\` there shows it" || fail "edge trash: $Y_OUT"
+[ "$(val "$Y_OUT" LOGGED)" = "1" ] && ok "the edge's daemon logged who asked" || fail "edge log: $(val "$Y_OUT" LOGGED)"
+W_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+for _ in \$(seq 1 90); do h=\$(rstat "\$D" "$EDGESHELF" | cut -d/ -f1); [ "\$h" -gt "$ZHEAD" ] 2>/dev/null && { echo W1=ok; break; }; ls "\$V" >/dev/null; sleep 2; done
+echo "TOP4=\$(vpaths "\$D" "")"
+ls "\$V" >/dev/null
+EOS
+)
+has "$W_OUT" W1=ok && ok "the edge published a head without z.mkv and the owner fetched it" || fail "no new head: $W_OUT"
+[ "$(val "$W_OUT" TOP4)" = "a.mkv,big.mkv,empty,season,sub,unused,x.mkv" ] && ok "the owner's catalogue agrees: z.mkv is gone" || fail "owner top4: $(val "$W_OUT" TOP4)"
+R_OUT=$(ssh "$EDGE" "bash -s" <<EOS
+$RH
+"\$B/pvfs" --data-dir "\$RD" trash restore z.mkv 2>&1 | head -1 | sed 's/^/RESTORE=/'
+[ "\$(cat "\$FT/d130-edge-lib/z.mkv")" = "zzz" ] && echo R1=ok
+EOS
+)
+has "$R_OUT" R1=ok && ok "restored on the edge: $(val "$R_OUT" RESTORE)" || fail "restore: $R_OUT"
+B_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+for _ in \$(seq 1 120); do [ "\$(cat "\$V/z.mkv" 2>/dev/null)" = "zzz" ] && { echo B1=ok; break; }; sleep 2; done
+EOS
+)
+has "$B_OUT" B1=ok && ok "and z.mkv is back in the owner's mount, readable — the delete's tombstone did not outlive it" || fail "z.mkv never came back: $B_OUT"
+gate delete
+
 say "F: the edge goes down — the fetched copy still reads, an unfetched one fails within the bound, ls stays instant"
 STOP=$(ssh "$EDGE" "bash -s" <<EOS
 $RH
