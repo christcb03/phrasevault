@@ -116,3 +116,44 @@ fn the_trash_is_listed_and_a_file_or_a_folder_goes_back_never_over_another() {
         assert!(sync::restore_from_trash(&lib, bad, None).is_err(), "{bad:?}");
     }
 }
+
+/// D170 — one delete through the view trashes the same file in every region
+/// that held it; a restore brings every IDENTICAL copy back, and leaves a
+/// different file at that path (an older encode `resolve` retired) alone.
+#[test]
+fn a_restore_brings_back_every_identical_copy_and_leaves_a_different_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (lib, ext, old) = (tmp.path().join("lib"), tmp.path().join("ext"), tmp.path().join("old"));
+    for r in [&lib, &ext, &old] {
+        std::fs::create_dir_all(r).unwrap();
+    }
+    let ep1 = "TV/Show/Season 01/e1.mkv";
+    let ep2 = "TV/Show/Season 01/e2.mkv";
+    // e1: the same bytes in lib (today) and ext (two days ago — drained then); another file in old
+    trashed(&lib, 20_712, ep1, b"the episode");
+    trashed(&ext, 20_710, ep1, b"the episode");
+    trashed(&old, 20_711, ep1, b"an older encode of it");
+    // e2: only lib has it — nothing is read, nothing is asked
+    trashed(&lib, 20_712, ep2, b"two");
+    // a path deleted while it was a CONFLICT: two different files, the same day — both were that delete
+    trashed(&lib, 20_712, "Movies/F/f.mkv", b"version a");
+    trashed(&ext, 20_712, "Movies/F/f.mkv", b"version b");
+
+    let roots = [lib.as_path(), ext.as_path(), old.as_path()];
+    let done = sync::restore_identical(&roots, "TV/Show", None).unwrap();
+    assert_eq!(done.per_root[0].restored, vec![ep1.to_string(), ep2.to_string()]);
+    assert_eq!(done.per_root[1].restored, vec![ep1.to_string()], "the identical copy, though trashed on another day");
+    assert!(done.per_root[2].restored.is_empty());
+    assert_eq!(done.different, vec![(2, ep1.to_string())], "the older encode is left, and named");
+    assert_eq!(std::fs::read(ext.join(ep1)).unwrap(), b"the episode");
+    assert!(!old.join(ep1).exists());
+    assert_eq!(sync::list_trash(&old).len(), 1, "still in its trash");
+
+    let done = sync::restore_identical(&roots, "Movies/F/f.mkv", None).unwrap();
+    assert_eq!(std::fs::read(lib.join("Movies/F/f.mkv")).unwrap(), b"version a");
+    assert_eq!(std::fs::read(ext.join("Movies/F/f.mkv")).unwrap(), b"version b");
+    assert!(done.different.is_empty());
+
+    assert!(sync::restore_identical(&roots, "TV/Nothing", None).is_err());
+    assert!(sync::restore_identical(&roots, "../x", None).is_err());
+}

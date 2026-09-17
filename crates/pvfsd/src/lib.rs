@@ -697,6 +697,10 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             do_claim_write_lease(daemon, principal, roots, conn)
         }
         ClientMsg::TrashPath { region, rel_path, hash } => do_trash_path(daemon, principal, &region, &rel_path, &hash),
+        ClientMsg::RenamePath { region, from, to, dir, hash, size } => {
+            do_rename_path(daemon, principal, &region, &from, &to, dir, hash, size)
+        }
+        ClientMsg::RemoveDir { region, rel_path } => do_remove_dir(daemon, principal, &region, &rel_path),
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
@@ -796,6 +800,73 @@ fn do_trash_path(daemon: &Daemon, principal: &Principal, region: &str, rel_path:
         Ok(pvfs_core::TrashedHere::Gone) => ServerMsg::Trashed { moved: false },
         Ok(pvfs_core::TrashedHere::Changed) => err("conflict", "the file here is not the one that was seen (its hash or size changed); nothing was moved"),
         Ok(pvfs_core::TrashedHere::NotHere) => err("not_found", "this box does not catalogue that region from its own disk"),
+        Err(pve) => err_from(pve),
+    }
+}
+
+/// D170 — the write gate every change that came through a view shares: a
+/// 64-hex region, and `w` on it (default deny). `Err` is the reply.
+fn view_write_gate(daemon: &Daemon, principal: &Principal, region: &str, what: &str) -> Result<(), ServerMsg> {
+    if region.len() != 64 || !region.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(err("bad_input", "a region is named by its 64-hex node id"));
+    }
+    match daemon.reader().effective_rights(principal, &region.to_string()) {
+        Ok(r) if r & acl::ACL_W != 0 => Ok(()),
+        Ok(_) => Err(err("forbidden", &format!("{what} requires write rights on its region"))),
+        Err(pvfs_core::PvfsError::NotFound { .. }) => Err(err("not_found", "this instance has no such region")),
+        Err(pve) => Err(err_from(pve)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_rename_path(
+    daemon: &Daemon,
+    principal: &Principal,
+    region: &str,
+    from: &str,
+    to: &str,
+    dir: bool,
+    hash: Option<String>,
+    size: u64,
+) -> ServerMsg {
+    if let Err(reply) = view_write_gate(daemon, principal, region, "renaming") {
+        return reply;
+    }
+    let expect = match (dir, hash) {
+        (true, _) => pvfs_core::RenameExpect::Dir,
+        (false, Some(hash)) => pvfs_core::RenameExpect::File { hash, size },
+        (false, None) => return err("bad_input", "a file is renamed by the hash it was seen with"),
+    };
+    // The WRITER: the rows follow the rename at once (bytes are found by
+    // hash → row → path), and a reader is a read-only view. Passes run on
+    // their own connections, so this lock is never held for one.
+    let renamed = daemon.engine.lock().unwrap().rename_region_path(&region.to_string(), from, to, &expect);
+    match renamed {
+        Ok(pvfs_core::RenamedHere::Moved) => {
+            eprintln!("pvfsd: renamed {from} → {to} in {} for {}", &region[..8], principal.display());
+            ServerMsg::Renamed { moved: true }
+        }
+        Ok(pvfs_core::RenamedHere::AlreadyDone | pvfs_core::RenamedHere::Gone) => ServerMsg::Renamed { moved: false },
+        Ok(pvfs_core::RenamedHere::Changed) => err("conflict", "what is here is not what was seen (its hash, size or kind changed); nothing was renamed"),
+        Ok(pvfs_core::RenamedHere::InTheWay) => err("exists", "something is already at the new path here; nothing was renamed"),
+        Ok(pvfs_core::RenamedHere::NotHere) => err("not_found", "this box does not catalogue that region from its own disk"),
+        Err(pve) => err_from(pve),
+    }
+}
+
+fn do_remove_dir(daemon: &Daemon, principal: &Principal, region: &str, rel_path: &str) -> ServerMsg {
+    if let Err(reply) = view_write_gate(daemon, principal, region, "removing a folder") {
+        return reply;
+    }
+    let removed = daemon.engine.lock().unwrap().remove_region_dir(&region.to_string(), rel_path);
+    match removed {
+        Ok(pvfs_core::DirRemovedHere::Removed) => {
+            eprintln!("pvfsd: removed folder {rel_path} of {} for {}", &region[..8], principal.display());
+            ServerMsg::DirRemoved { removed: true }
+        }
+        Ok(pvfs_core::DirRemovedHere::Gone) => ServerMsg::DirRemoved { removed: false },
+        Ok(pvfs_core::DirRemovedHere::NotEmpty) => err("not_empty", "the folder here still holds files; nothing was removed"),
+        Ok(pvfs_core::DirRemovedHere::NotHere) => err("not_found", "this box does not catalogue that region from its own disk"),
         Err(pve) => err_from(pve),
     }
 }

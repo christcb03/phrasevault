@@ -4,10 +4,14 @@
 //! store, else a verified read-through fetch (F5.2) — and reads are served
 //! straight from the resolved file with kernel-native offsets.
 //!
-//! Deliberately read-only: the catalog's write model belongs to the CLI and
-//! daemon. Writes/xattrs/mtimes: refused/synthetic (doc 20 §3).
+//! Deliberately read-only for BYTES: the catalog's write model belongs to the
+//! CLI and daemon. Writes/xattrs/mtimes: refused/synthetic (doc 20 §3). The
+//! namespace is another matter — an arr upgrades, renames and tidies what it
+//! did not just create: D71 W2 (the node mount), D169 and D170 (the view).
 
-use std::collections::{HashMap, HashSet};
+mod overlay;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -18,7 +22,8 @@ use fuser::{ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 use pvfs_client::fetch::{Fetcher, SwarmProgress};
-use pvfs_client::hash_cache::{CacheOpts, HashCache, HashFetch, Opened};
+use overlay::{GoneDir, Move, Overlay};
+use pvfs_client::hash_cache::{CacheOpts, HashCache, HashFetch, Opened, RenameCopy};
 use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, ReplicaSource, TYPE_FILE};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -77,6 +82,11 @@ pub struct PvfsFs {
     /// same path within the second (against a still-listed read-only file
     /// that create is an open-for-write, and `EROFS`).
     tombstones: Tombstones,
+    /// D170 — the renames, made folders and removed folders done through
+    /// THIS mount that the catalogue has not caught up with, and when the
+    /// catalogue was last asked whether it has.
+    overlay: Arc<std::sync::Mutex<Overlay>>,
+    overlay_pruned: std::time::Instant,
 }
 
 type Tombstones = Arc<std::sync::Mutex<HashMap<String, Tomb>>>;
@@ -149,6 +159,8 @@ impl PvfsFs {
             hash_pins: HashMap::new(),
             view_sources: None,
             tombstones: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            overlay: Arc::new(std::sync::Mutex::new(Overlay::default())),
+            overlay_pruned: std::time::Instant::now(),
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
@@ -357,12 +369,47 @@ impl PvfsFs {
                 return Ok(list.clone().into_iter().filter_map(|e| self.without_the_deleted(e)).collect());
             }
         }
-        let list: Vec<pvfs_core::ViewEntry> = self
-            .engine
-            .merged_view(dir)?
-            .into_iter()
-            .filter(Self::view_shown)
-            .collect();
+        let ov = Arc::clone(&self.overlay);
+        let o = ov.lock().unwrap();
+        let list: Vec<pvfs_core::ViewEntry> = if o.is_empty() {
+            self.engine.merged_view(dir)?.into_iter().filter(Self::view_shown).collect()
+        } else {
+            // D170 — rows the catalogue still lists at a path renamed through
+            // this mount show at the new one: list `dir`, the folders `dir`
+            // was before the pending moves, and the folders files moved out
+            // of; keep what lands in `dir`.
+            let mut dirs = o.origins(dir);
+            for m in &o.moves {
+                let p = overlay::parent_of(&m.from).to_string();
+                if !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+            let mut landed: BTreeMap<String, Vec<pvfs_core::ViewEntry>> = BTreeMap::new();
+            for d in dirs {
+                for e in self.engine.merged_view(&d)? {
+                    for piece in o.place(e) {
+                        if overlay::parent_of(&piece.rel_path) == dir {
+                            landed.entry(piece.rel_path.clone()).or_default().push(piece);
+                        }
+                    }
+                }
+            }
+            let mut list: Vec<pvfs_core::ViewEntry> = landed
+                .into_iter()
+                .filter_map(|(rel, pieces)| Overlay::merge(&rel, pieces))
+                .filter(Self::view_shown)
+                .collect();
+            for d in o.remembered_dirs_in(dir) {
+                if !list.iter().any(|e| e.rel_path == d) {
+                    list.push(overlay::remembered_dir(&d));
+                }
+            }
+            list.retain(|e| !o.is_gone(&e.rel_path));
+            list.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            list
+        };
+        drop(o);
         self.view_cache
             .insert(dir.to_string(), (std::time::Instant::now(), list.clone()));
         // A tombstone has done its work once the catalogue no longer lists
@@ -380,11 +427,70 @@ impl PvfsFs {
     }
 
     fn view_entry_of(&mut self, rel: &str) -> Option<pvfs_core::ViewEntry> {
-        let Some(e) = self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown) else {
+        let ov = Arc::clone(&self.overlay);
+        let o = ov.lock().unwrap();
+        let found = if o.is_empty() {
+            self.engine.view_entry(rel).ok().flatten()
+        } else if o.is_gone(rel) {
+            return None; // a folder removed through this mount (D170)
+        } else {
+            let mut pieces = Vec::new();
+            for q in o.origins(rel) {
+                if let Some(e) = self.engine.view_entry(&q).ok().flatten() {
+                    pieces.extend(o.place(e).into_iter().filter(|p| p.rel_path == rel));
+                }
+            }
+            Overlay::merge(rel, pieces)
+        };
+        let Some(e) = found.filter(Self::view_shown) else {
             self.tombstones.lock().unwrap().remove(rel); // the catalogue has caught up
-            return None;
+            return o.remembers_dir(rel).then(|| overlay::remembered_dir(rel));
         };
         self.without_the_deleted(e)
+    }
+
+    /// D170 — bring the session thread's tables up to date with what the
+    /// overlay learned on other threads (a remote rename finishes on its
+    /// own), and ask the catalogue — at most every two seconds — whether it
+    /// has caught up with what is remembered.
+    fn sync_overlay(&mut self) {
+        let ov = Arc::clone(&self.overlay);
+        let mut o = ov.lock().unwrap();
+        if o.is_empty() && o.ino_moves.is_empty() && !o.dirty {
+            return;
+        }
+        if self.overlay_pruned.elapsed() > Duration::from_secs(2) {
+            o.prune(&self.engine);
+            self.overlay_pruned = std::time::Instant::now();
+        }
+        let ino_moves = std::mem::take(&mut o.ino_moves);
+        let dirty = std::mem::take(&mut o.dirty);
+        drop(o);
+        for (from, to) in &ino_moves {
+            self.move_inodes(from, to);
+        }
+        if dirty || !ino_moves.is_empty() {
+            self.view_cache.clear();
+        }
+    }
+
+    /// The kernel's inode for a renamed path is still the file: the table
+    /// follows the rename, a folder's whole subtree with it.
+    fn move_inodes(&mut self, from: &str, to: &str) {
+        let moved: Vec<(String, String, u64)> = self
+            .path_to_ino
+            .iter()
+            .filter_map(|(p, i)| overlay::rebase(p, from, to).map(|n| (p.clone(), n, *i)))
+            .collect();
+        for (old, new, ino) in moved {
+            self.path_to_ino.remove(&old);
+            if let Some(replaced) = self.path_to_ino.insert(new.clone(), ino) {
+                if replaced != ino {
+                    self.ino_to_path.remove(&replaced);
+                }
+            }
+            self.ino_to_path.insert(ino, new);
+        }
     }
 
     /// D169 — an entry minus the copies a delete through this mount already
@@ -418,7 +524,9 @@ impl PvfsFs {
             return Some(e);
         }
         e.sources.retain(|c| !is_dead(c));
-        (!e.sources.is_empty()).then_some(e).filter(Self::view_shown)
+        // judged again on what remains: a file renamed onto this path (D170)
+        // is one admitted copy, not a conflict with the file it replaced
+        Engine::view_entry_of_copies(&e.rel_path, &e.sources).filter(Self::view_shown)
     }
 
     /// D169 — `unlink` in the view: every copy the view shows at the path
@@ -497,6 +605,308 @@ impl PvfsFs {
                 }
                 Err(e) => {
                     eprintln!("mount: delete of {rel} failed: {e}");
+                    reply.error(libc::EIO);
+                }
+            }
+        });
+    }
+
+    /// D170 — `rename` in the view: every copy the view shows at `from` is
+    /// renamed by the box that holds it, on its own disk (ours here and now;
+    /// the others off the session thread); a file already at `to` goes to
+    /// the trash first, as `unlink` sends it. Then this mount REMEMBERS the
+    /// move until the catalogue agrees — a verified move stats the target
+    /// within the second, and the catalogue takes the holder's pass and our
+    /// fetch.
+    #[allow(clippy::too_many_arguments)]
+    fn view_rename(&mut self, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, flags: u32, reply: ReplyEmpty) {
+        let (Some(from_dir), Some(to_dir)) =
+            (self.ino_to_path.get(&parent).cloned(), self.ino_to_path.get(&newparent).cloned())
+        else {
+            return reply.error(libc::ENOENT);
+        };
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(libc::EINVAL);
+        };
+        let (from, to) = (Self::view_join(&from_dir, name), Self::view_join(&to_dir, newname));
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return reply.error(libc::EINVAL);
+        }
+        let Some(entry) = self.view_entry_of(&from) else {
+            return reply.error(libc::ENOENT);
+        };
+        if from == to {
+            return reply.ok();
+        }
+        let is_dir = entry.kind == "dir";
+        if is_dir && overlay::rebase(&to, &from, &from).is_some() {
+            return reply.error(libc::EINVAL); // into itself
+        }
+        if pvfs_core::sync::is_own_name(newname, is_dir) || pvfs_core::sync::is_litter_name(newname) {
+            eprintln!("mount: rename of {from} refused — `{newname}` is a name the catalogue passes over");
+            return reply.error(libc::EPERM);
+        }
+        // What is at `to`.
+        let mut replaced: Vec<(String, String)> = Vec::new();
+        if let Some(target) = self.view_entry_of(&to) {
+            if flags & libc::RENAME_NOREPLACE != 0 {
+                return reply.error(libc::EEXIST);
+            }
+            match (is_dir, target.kind == "dir") {
+                (true, false) => return reply.error(libc::ENOTDIR),
+                (false, true) => return reply.error(libc::EISDIR),
+                (true, true) => {
+                    // Only a folder nobody holds (made here, still empty) is replaced.
+                    let empty = self.view_list(&to).map(|l| l.is_empty()).unwrap_or(false);
+                    if !target.sources.is_empty() || !empty {
+                        return reply.error(libc::ENOTEMPTY);
+                    }
+                }
+                (false, false) => {
+                    replaced = target
+                        .sources
+                        .iter()
+                        .filter(|c| c.kind == "file")
+                        .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), h)))
+                        .collect();
+                    if replaced.is_empty() {
+                        return reply.error(libc::EIO);
+                    }
+                }
+            }
+        }
+        let copies: Vec<RenameCopy> = if is_dir {
+            entry.sources.iter().filter(|c| c.kind == "dir").map(|c| (c.region.clone(), None)).collect()
+        } else {
+            entry
+                .sources
+                .iter()
+                .filter(|c| c.kind == "file")
+                .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), Some((h, c.size_bytes)))))
+                .collect()
+        };
+        // A file move carries the hashes that moved, so a NEW file at the old
+        // name is not dragged along; a folder takes everything under it.
+        let moved_hashes: Option<HashSet<String>> =
+            (!is_dir).then(|| copies.iter().filter_map(|c| c.1.as_ref().map(|(h, _)| h.clone())).collect());
+        let overlay = Arc::clone(&self.overlay);
+        if copies.is_empty() {
+            if !is_dir {
+                return reply.error(libc::EIO);
+            }
+            // A folder only this mount remembers: nobody to ask.
+            let mut o = overlay.lock().unwrap();
+            o.rename_made_dirs(&from, &to);
+            o.ino_moves.push((from, to));
+            o.dirty = true;
+            return reply.ok();
+        }
+        let expect = |c: &RenameCopy| match &c.1 {
+            Some((hash, size)) => pvfs_core::RenameExpect::File { hash: hash.clone(), size: *size },
+            None => pvfs_core::RenameExpect::Dir,
+        };
+
+        // 1. What is in the way goes to the trash (ours now).
+        let mut dead: HashSet<String> = HashSet::new();
+        let mut replaced_elsewhere: Vec<(String, String)> = Vec::new();
+        for (region, hash) in replaced {
+            match self.engine.trash_region_path(&region, &to, &hash) {
+                Ok(pvfs_core::TrashedHere::Trashed(_) | pvfs_core::TrashedHere::Gone) => {
+                    dead.insert(hash);
+                }
+                Ok(pvfs_core::TrashedHere::NotHere) => replaced_elsewhere.push((region, hash)),
+                Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
+                    eprintln!("mount: rename onto {to} refused — this box's copy there is not the file the view showed");
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
+        // 2. Our own copies.
+        let mut done_here: Vec<RenameCopy> = Vec::new();
+        let mut elsewhere: Vec<RenameCopy> = Vec::new();
+        let mut moved_any = false;
+        for c in copies {
+            match self.engine.rename_region_path(&c.0, &from, &to, &expect(&c)) {
+                Ok(pvfs_core::RenamedHere::Moved) => {
+                    moved_any = true;
+                    done_here.push(c);
+                }
+                Ok(pvfs_core::RenamedHere::AlreadyDone) => moved_any = true,
+                Ok(pvfs_core::RenamedHere::Gone) => {}
+                Ok(pvfs_core::RenamedHere::NotHere) => elsewhere.push(c),
+                other => {
+                    eprintln!("mount: rename of {from} refused here: {other:?}");
+                    for d in &done_here {
+                        let _ = self.engine.rename_region_path(&d.0, &to, &from, &expect(d));
+                    }
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
+        let held = overlay::held_seqs(&self.engine);
+        let tombs = Arc::clone(&self.tombstones);
+        let remember = {
+            let (from, to) = (from.clone(), to.clone());
+            move |mut dead: HashSet<String>| {
+                if let Some(moved) = &moved_hashes {
+                    dead.retain(|h| !moved.contains(h)); // its twin: the same bytes, showing either is right
+                }
+                if !dead.is_empty() {
+                    let tomb = Tomb { dead, at: std::time::Instant::now(), held: held.clone() };
+                    tombs.lock().unwrap().insert(to.clone(), tomb);
+                }
+                let mut o = overlay.lock().unwrap();
+                if moved_hashes.is_none() {
+                    o.rename_made_dirs(&from, &to);
+                }
+                o.made_dirs.remove(&to);
+                o.moves.push(Move { from: from.clone(), to: to.clone(), hashes: moved_hashes, at: std::time::Instant::now(), held });
+                o.ino_moves.push((from, to));
+                o.dirty = true;
+            }
+        };
+        if elsewhere.is_empty() && replaced_elsewhere.is_empty() {
+            if !moved_any {
+                return reply.error(libc::ENOENT); // the catalogue lists it; no disk has it
+            }
+            remember(dead);
+            return reply.ok();
+        }
+        // 3. The rest, on the boxes that hold them — off the session thread (D165).
+        let sources = self.view_sources.clone();
+        let data_dir = self.data_dir.clone();
+        std::thread::spawn(move || {
+            let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
+            let put_back_here = |done_here: &[RenameCopy]| {
+                if done_here.is_empty() {
+                    return;
+                }
+                if let Ok(engine) = Engine::open(&data_dir) {
+                    for d in done_here {
+                        let _ = engine.rename_region_path(&d.0, &to, &from, &expect(d));
+                    }
+                }
+            };
+            if let Err(e) = pvfs_client::hash_cache::trash_elsewhere(&sources, &to, &replaced_elsewhere) {
+                eprintln!("mount: rename of {from} failed — what is at {to} could not be trashed: {e}");
+                put_back_here(&done_here);
+                return reply.error(libc::EIO);
+            }
+            dead.extend(replaced_elsewhere.into_iter().map(|(_, h)| h));
+            match pvfs_client::hash_cache::rename_elsewhere(&sources, &from, &to, &elsewhere) {
+                Ok(()) => {
+                    eprintln!("mount: rename of {from} → {to} — {} copy(ies) renamed on their boxes", elsewhere.len());
+                    remember(dead);
+                    reply.ok();
+                }
+                Err((why, done)) => {
+                    eprintln!("mount: rename of {from} failed: {why}");
+                    if done > 0 {
+                        if let Err((e, _)) = pvfs_client::hash_cache::rename_elsewhere(&sources, &to, &from, &elsewhere[..done]) {
+                            eprintln!("mount: and {done} copy(ies) already renamed could not be put back: {e}");
+                        }
+                    }
+                    put_back_here(&done_here);
+                    reply.error(libc::EIO);
+                }
+            }
+        });
+    }
+
+    /// D170 — `mkdir` in the view: a folder this mount remembers, and nobody
+    /// holds. mergerfs clones a rename's target path onto the source's
+    /// branch first, and an arr's new season folder exists on `/mnt/local`
+    /// only; the holder makes the real folder when a file is renamed into it.
+    fn view_mkdir(&mut self, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let Some(parent_path) = self.ino_to_path.get(&parent).cloned() else {
+            return reply.error(libc::ENOENT);
+        };
+        let Some(name) = name.to_str() else {
+            return reply.error(libc::EINVAL);
+        };
+        if pvfs_core::sync::is_own_name(name, true) || pvfs_core::sync::is_litter_name(name) {
+            return reply.error(libc::EPERM);
+        }
+        let rel = Self::view_join(&parent_path, name);
+        if self.view_entry_of(&rel).is_some() {
+            return reply.error(libc::EEXIST);
+        }
+        {
+            let mut o = self.overlay.lock().unwrap();
+            o.gone_dirs.remove(&rel);
+            o.made_dirs.insert(rel.clone(), std::time::Instant::now());
+        }
+        self.view_cache.clear();
+        let attr = self.view_attr(&overlay::remembered_dir(&rel));
+        reply.entry(&TTL, &attr, 0)
+    }
+
+    /// D170 — `rmdir` in the view: a folder the view shows as empty is
+    /// removed on every box that has it (what the view hides — PVFS's own
+    /// names, litter — goes to that box's trash); then hidden here until the
+    /// catalogue agrees.
+    fn view_rmdir(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent_path) = self.ino_to_path.get(&parent).cloned() else {
+            return reply.error(libc::ENOENT);
+        };
+        let Some(name) = name.to_str() else {
+            return reply.error(libc::ENOENT);
+        };
+        let rel = Self::view_join(&parent_path, name);
+        let Some(entry) = self.view_entry_of(&rel) else {
+            return reply.error(libc::ENOENT);
+        };
+        if entry.kind != "dir" {
+            return reply.error(libc::ENOTDIR);
+        }
+        match self.view_list(&rel) {
+            Ok(l) if l.is_empty() => {}
+            Ok(_) => return reply.error(libc::ENOTEMPTY),
+            Err(_) => return reply.error(libc::EIO),
+        }
+        let mut elsewhere: Vec<String> = Vec::new();
+        for region in entry.sources.iter().map(|c| c.region.clone()) {
+            match self.engine.remove_region_dir(&region, &rel) {
+                Ok(pvfs_core::DirRemovedHere::Removed | pvfs_core::DirRemovedHere::Gone) => {}
+                Ok(pvfs_core::DirRemovedHere::NotHere) => elsewhere.push(region),
+                Ok(pvfs_core::DirRemovedHere::NotEmpty) => return reply.error(libc::ENOTEMPTY),
+                Err(e) => {
+                    eprintln!("mount: rmdir of {rel} failed here: {e}");
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
+        let overlay = Arc::clone(&self.overlay);
+        let held = if entry.sources.is_empty() { HashMap::new() } else { overlay::held_seqs(&self.engine) };
+        let listed = !entry.sources.is_empty();
+        let forget = move |rel: String| {
+            let mut o = overlay.lock().unwrap();
+            o.made_dirs.remove(&rel);
+            if listed {
+                o.gone_dirs.insert(rel, GoneDir { at: std::time::Instant::now(), held });
+            }
+            o.dirty = true;
+        };
+        if elsewhere.is_empty() {
+            forget(rel);
+            return reply.ok();
+        }
+        let sources = self.view_sources.clone();
+        let data_dir = self.data_dir.clone();
+        std::thread::spawn(move || {
+            let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
+            match pvfs_client::hash_cache::rmdir_elsewhere(&sources, &rel, &elsewhere) {
+                Ok(()) => {
+                    eprintln!("mount: rmdir of {rel} — removed on the box(es) that held it");
+                    forget(rel);
+                    reply.ok();
+                }
+                Err(e) if e.contains(": not_empty: ") => {
+                    eprintln!("mount: rmdir of {rel} refused: {e}");
+                    reply.error(libc::ENOTEMPTY);
+                }
+                Err(e) => {
+                    eprintln!("mount: rmdir of {rel} failed: {e}");
                     reply.error(libc::EIO);
                 }
             }
@@ -608,6 +1018,7 @@ fn enoent<E>(_e: E) -> i32 {
 impl Filesystem for PvfsFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         if self.view {
+            self.sync_overlay();
             let Some(parent_path) = self.ino_to_path.get(&parent).cloned() else {
                 return reply.error(libc::ENOENT);
             };
@@ -644,6 +1055,7 @@ impl Filesystem for PvfsFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         if self.view {
+            self.sync_overlay();
             if ino == 1 {
                 let attr = self.plain_attr(1, FileType::Directory, 0, 0, 0o555);
                 return reply.attr(&TTL, &attr);
@@ -677,6 +1089,7 @@ impl Filesystem for PvfsFs {
         mut reply: ReplyDirectory,
     ) {
         if self.view {
+            self.sync_overlay();
             let Some(dir) = self.ino_to_path.get(&ino).cloned() else {
                 return reply.error(libc::ENOENT);
             };
@@ -736,6 +1149,7 @@ impl Filesystem for PvfsFs {
             return reply.error(libc::EROFS);
         }
         if self.view {
+            self.sync_overlay();
             let Some(rel) = self.ino_to_path.get(&ino).cloned() else {
                 return reply.error(libc::ENOENT);
             };
@@ -967,8 +1381,49 @@ impl Filesystem for PvfsFs {
         );
     }
 
+    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        if self.view {
+            self.sync_overlay();
+            return self.view_mkdir(parent, name, reply); // D170
+        }
+        reply.error(libc::ENOSYS)
+    }
+
+    /// D170 — the view's modes, owners and times are constants: a change to
+    /// them is accepted and ignored, as the rclone mount this replaces did
+    /// (an arr's "set permissions", mergerfs's path clone). A size change is
+    /// a write, and writes do not come through the view.
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        if !self.view {
+            return reply.error(libc::ENOSYS);
+        }
+        if size.is_some() {
+            return reply.error(libc::EROFS);
+        }
+        self.getattr(_req, ino, reply)
+    }
+
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if self.view {
+            self.sync_overlay();
             return self.view_unlink(parent, name, reply); // D169
         }
         match self.retire(parent, name, false) {
@@ -978,6 +1433,10 @@ impl Filesystem for PvfsFs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.view {
+            self.sync_overlay();
+            return self.view_rmdir(parent, name, reply); // D170
+        }
         match self.retire(parent, name, true) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1018,11 +1477,12 @@ impl Filesystem for PvfsFs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         if self.view {
-            return reply.error(libc::EROFS);
+            self.sync_overlay();
+            return self.view_rename(parent, name, newparent, newname, flags, reply); // D170
         }
         let (Some(from), Some(to)) = (
             self.ino_to_node.get(&parent).cloned(),
@@ -1433,10 +1893,8 @@ impl PvfsFs {
     /// automated deletion through the trash.
     fn retire(&mut self, parent: u64, name: &OsStr, want_dir: bool) -> Result<(), i32> {
         if self.view {
-            // D130: the view's namespace is read-only — except `unlink` of a
-            // file, which never reaches here (D169, `view_unlink`). An
-            // emptied folder is its holder's to remove; a rename is a move on
-            // the holder: each its own question.
+            // The view's handlers never reach here: `view_unlink` (D169),
+            // `view_rmdir` and `view_rename` (D170).
             return Err(libc::EROFS);
         }
         let parent_node = self

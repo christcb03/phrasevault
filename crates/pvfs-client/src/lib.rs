@@ -505,6 +505,51 @@ impl Client {
         }
     }
 
+    /// D170 — ask this box to rename `from` to `to` inside catalogue region
+    /// `region`, on its own disk: a folder (`file` = `None`), or the file
+    /// with that (hash, size). `Ok(false)` = nothing was left to do.
+    /// `not_found` = this box does not hold that region (ask another),
+    /// `conflict` = it changed, `exists` = something is at `to`,
+    /// `forbidden` = no write rights on the region.
+    pub fn rename_path(&mut self, region: &str, from: &str, to: &str, file: Option<(&str, u64)>) -> Result<bool> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::RenamePath {
+                region: region.into(),
+                from: from.into(),
+                to: to.into(),
+                dir: file.is_none(),
+                hash: file.map(|(h, _)| h.to_string()),
+                size: file.map(|(_, s)| s).unwrap_or(0),
+            },
+        )?;
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::Renamed { moved }) => Ok(moved),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("Renamed", &other)),
+            None => Err(ClientError::Protocol("connection closed before Renamed".into())),
+        }
+    }
+
+    /// D170 — ask this box to remove its folder `rel_path` of catalogue
+    /// region `region`. `Ok(false)` = it was not on this box's disk.
+    /// `not_found` / `forbidden` as [`Client::rename_path`]; `not_empty`.
+    pub fn remove_dir(&mut self, region: &str, rel_path: &str) -> Result<bool> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::RemoveDir {
+                region: region.into(),
+                rel_path: rel_path.into(),
+            },
+        )?;
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::DirRemoved { removed }) => Ok(removed),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("DirRemoved", &other)),
+            None => Err(ClientError::Protocol("connection closed before DirRemoved".into())),
+        }
+    }
+
     fn cat_with(&mut self, msg: ClientMsg, out: &mut dyn std::io::Write) -> Result<u64> {
         write_msg(&mut self.stream, &msg)?;
         // Server responds: CatStart (JSON) → binary data frames → CatDone (JSON).

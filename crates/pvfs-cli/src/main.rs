@@ -6285,42 +6285,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             reason: format!("nothing in this box's trash at {path:?} — `pvfs trash ls` shows what there is"),
                         });
                     }
-                    // More than one region on this box has the path in its
-                    // trash: at a terminal, ask which (or all); a script is
-                    // told to say. Restoring them all unasked would bring
-                    // back OLDER trash too — the smoke suite's first D169 run
-                    // resurrected a copy `resolve` had trashed long before.
-                    if has.len() > 1 {
-                        use std::io::IsTerminal;
-                        let which: Vec<String> = has
-                            .iter()
-                            .map(|l| format!("{} ({}, {})", &l.region[..12.min(l.region.len())], l.label, l.root.display()))
-                            .collect();
-                        if !std::io::stdin().is_terminal() {
-                            return Err(PvfsError::BadInput {
-                                field: "region".into(),
-                                reason: format!(
-                                    "more than one region on this box has {path:?} in its trash — pass --region <id prefix>: {}",
-                                    which.join("; ")
-                                ),
-                            });
-                        }
-                        for w in &which {
-                            eprintln!("  {w}");
-                        }
-                        let want = prompt_line("More than one region has that path — which (id prefix, or `all`)", Some("all"))?;
-                        if want != "all" {
-                            has.retain(|l| l.region.starts_with(&want));
-                            if has.is_empty() {
-                                return Err(PvfsError::BadInput {
-                                    field: "region".into(),
-                                    reason: format!("no region here starts with {want:?}"),
-                                });
-                            }
-                        }
-                    }
-                    for list in &has {
-                        let done = pvfs_core::sync::restore_from_trash(&list.root, &path, from)?;
+                    // D170 — more than one region on this box may have the
+                    // path in its trash. One delete through the view trashes
+                    // the same file in every region that held it, so all of
+                    // those come back; a region whose trashed file there is a
+                    // DIFFERENT file is left alone and named (`--region`
+                    // restores exactly one). Nothing here is a question.
+                    let roots: Vec<&std::path::Path> = has.iter().map(|l| l.root.as_path()).collect();
+                    let done = pvfs_core::sync::restore_identical(&roots, &path, from)?;
+                    for (list, done) in has.iter().zip(&done.per_root) {
                         for p in &done.restored {
                             println!("restored\t{}", list.root.join(p).display());
                         }
@@ -6335,6 +6308,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 if list.drains { "; this region DRAINS, so a file the library still holds will be drained again" } else { "" }
                             );
                         }
+                    }
+                    for (i, p) in &done.different {
+                        let l = &has[*i];
+                        println!(
+                            "left in the trash\t{p}\t({}: a different file from the one restored — `--region {}` restores it)",
+                            l.root.display(),
+                            &l.region[..12.min(l.region.len())]
+                        );
                     }
                     Ok(())
                 }
