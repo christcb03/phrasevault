@@ -371,8 +371,19 @@ endpoint that serves it, into the hash store, served from the growing file
 and verified whole before it is kept; a box that serves other bytes is
 refused and named. Sequential and single-source: the parallel chunked pull
 by hash — doc 22's swarm over N regions — is the next milestone. The
-namespace is read-only. D82's unit gained `pvfs_mount_view`. The original
-spec follows.
+namespace is read-only. D82's unit gained `pvfs_mount_view`. *2026-09-16
+(PVOS D164 §1c–§1d): a media scan reads 40 KB of every file — Sonarr's
+ffprobe, traced: the head and the last KB — and this read-through answers
+each with a whole-file fetch that the tail read then waits on (EIO at the
+read's 120 s), with no cap on concurrent fetches, no stop when the handle
+closes and no eviction. Before the mount joins the arrs' union the
+read-through becomes ranged (1 MiB pieces, driven by the read that asked,
+readahead on sequential reads, completion in the background once a
+reader has consumed 64 MiB), stoppable (the last handle closes → a grace,
+then stop), capped (K = 4 streams) and bounded (a size cap and an age,
+least recently read first) — PVFS D165, designed in PVOS
+`docs/milestones/D164-presentation-layer-plan.md` §3.* The original spec
+follows.
 The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.
