@@ -910,6 +910,128 @@ pub struct RegionTrash {
     pub kept: TrashStats,
 }
 
+/// D167 — one file in a root's trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashEntry {
+    /// The bucket it is in: the day it was trashed, in days since the epoch.
+    pub day: u64,
+    /// Where it was, relative to the root (forward slashes).
+    pub rel_path: String,
+    pub size_bytes: u64,
+}
+
+/// D167 — every file in `root`'s trash, newest day first, then by path.
+/// Sidecars are not listed: they travel with their file.
+pub fn list_trash(root: &Path) -> Vec<TrashEntry> {
+    let mut out = Vec::new();
+    let Ok(buckets) = std::fs::read_dir(trash_root(root)) else {
+        return out;
+    };
+    for b in buckets.flatten() {
+        let Some(day) = b.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let base = b.path();
+        let mut stack = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let Ok(kind) = e.file_type() else { continue };
+                if kind.is_dir() {
+                    stack.push(e.path());
+                    continue;
+                }
+                if is_sidecar_name(&e.file_name().to_string_lossy()) {
+                    continue;
+                }
+                let path = e.path();
+                let Ok(rel) = path.strip_prefix(&base) else { continue };
+                out.push(TrashEntry {
+                    day,
+                    rel_path: rel.to_string_lossy().replace('\\', "/"),
+                    size_bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.day.cmp(&a.day).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    out
+}
+
+/// D167 — what a restore did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TrashRestore {
+    /// Put back where they were (relative paths).
+    pub restored: Vec<String>,
+    /// Left in the trash: something is at that path already.
+    pub in_the_way: Vec<String>,
+}
+
+/// D167 — put `rel` back where it was under `root`: a file, or a folder (every
+/// file under it), each with the sidecar that was trashed beside it. From
+/// bucket `day` when given, else each file from the newest bucket that holds
+/// it. **Never over something that is there** — that path is reported and its
+/// file stays in the trash. An error when the trash holds nothing at `rel`.
+pub fn restore_from_trash(root: &Path, rel: &str, day: Option<u64>) -> Result<TrashRestore> {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() || rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return Err(bad("trash", "name a path as `pvfs trash ls` shows it, relative to the region's root"));
+    }
+    let inside = format!("{rel}/");
+    let mut newest: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for e in list_trash(root) {
+        if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && day.is_none_or(|d| d == e.day) {
+            let d = newest.entry(e.rel_path).or_insert(e.day);
+            *d = (*d).max(e.day);
+        }
+    }
+    if newest.is_empty() {
+        return Err(bad(
+            "trash",
+            &match day {
+                Some(d) => format!("nothing in the trash at {rel} from day {d}"),
+                None => format!("nothing in the trash at {rel}"),
+            },
+        ));
+    }
+    let mut out = TrashRestore::default();
+    for (path, d) in newest {
+        let from = trash_root(root).join(d.to_string()).join(&path);
+        let to = root.join(&path);
+        if to.symlink_metadata().is_ok() {
+            out.in_the_way.push(path);
+            continue;
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create restore dir", e))?;
+        }
+        if std::fs::rename(&from, &to).is_err() {
+            std::fs::copy(&from, &to).map_err(|e| PvfsError::io("copy from trash", e))?;
+            std::fs::remove_file(&from).map_err(|e| PvfsError::io("remove after restore copy", e))?;
+        }
+        // Derived data, best-effort — as it was on the way in (D145).
+        for (side_from, side_to) in [
+            (manifest_sidecar_path(&from), manifest_sidecar_path(&to)),
+            (legacy_manifest_sidecar_path(&from), legacy_manifest_sidecar_path(&to)),
+        ] {
+            if side_from.is_file() && side_to.symlink_metadata().is_err() {
+                let _ = std::fs::rename(&side_from, &side_to);
+            }
+        }
+        // Tidy the folders the restore emptied, up to (not including) the trash itself.
+        let stop = trash_root(root);
+        let mut dir = from.parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if d == stop || std::fs::remove_dir(&d).is_err() {
+                break;
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        out.restored.push(path);
+    }
+    Ok(out)
+}
+
 fn dir_bytes(dir: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {
