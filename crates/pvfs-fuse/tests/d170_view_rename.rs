@@ -204,8 +204,11 @@ fn an_arr_renames_files_and_folders_through_the_mount_and_sees_it_at_once() {
     assert!(std::fs::rename(m("Far/far.mkv"), m("Far/far2.mkv")).is_err(), "its holder cannot be asked");
     assert_eq!(names(&m("Far")), vec!["far.mkv"], "and nothing is hidden or shown for it");
 
-    // ---- modes and times are accepted and ignored; bytes still do not come through
+    // ---- the bits say what the namespace takes (an arr reads 0444 as ReadOnly and chmods before
+    // every move); modes and times are accepted and ignored; bytes still do not come through
     let ep = m("TV/Show/Season 01/Show - S01E01.mkv");
+    assert_eq!(std::fs::metadata(&ep).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::metadata(m("TV/Show")).unwrap().permissions().mode() & 0o777, 0o755);
     std::fs::set_permissions(&ep, std::fs::Permissions::from_mode(0o664)).expect("chmod is accepted");
     assert!(std::process::Command::new("touch").arg("-c").arg(&ep).status().unwrap().success(), "and so is touch");
     assert!(std::fs::OpenOptions::new().write(true).open(&ep).is_err(), "a write-open is refused");

@@ -360,6 +360,63 @@ has "$H_OUT" H1=ok && [ "$(val "$H_OUT" HEAD)" -gt "$MHEAD" ] && ok "the edge pu
 [ "$(val "$H_OUT" TOP6)" = "Show (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && has "$H_OUT" H2=ok && ok "and the mount shows the same thing it showed from memory — and reads it" || fail "after the head: $H_OUT"
 gate rename
 
+say "E5 (D170): the same through a REAL mergerfs union — feederbox's options, <local>=RW : <the view>=NC"
+U_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view; U=\$FT/d130-union; LB=\$FT/d130-union-local
+command -v mergerfs >/dev/null || { echo NO_MERGERFS=1; exit 0; }
+# the arr's union: the show's folder exists on the local branch too (an import landed there once)
+mkdir -p "\$U" "\$LB/Show (2020)"
+mergerfs -o category.create=ff,async_read=true,cache.files=partial -o category.action=epall,category.search=ff \
+  -o dropcacheonclose=true,minfreespace=0,fsname=d130union -o xattr=nosys,statfs=base,statfs_ignore=nc,noatime \
+  -o func.readdir=seq "\$LB=RW:\$V=NC" "\$U" 2>"\$FT/d170-union.err" && echo U0=ok
+echo "MERGERFS=\$(mergerfs --version | head -1)"
+S="\$U/Show (2020)"
+# 1. "Rename files": a verified move of a file that is on the view's branch only
+mv "\$S/s2/E01.mkv" "\$S/s2/Show - S02E01.mkv" 2>>"\$FT/d170-union.err" && [ "\$(stat -c %s "\$S/s2/Show - S02E01.mkv")" = "4" ] && [ ! -e "\$S/s2/E01.mkv" ] && echo U1=ok
+[ "\$(cat "\$S/s2/Show - S02E01.mkv")" = "e1e1" ] && echo U2=ok
+# 2. into a season folder the arr just made: it lands on the LOCAL branch, so mergerfs clones the path onto ours first
+mkdir "\$S/s3" 2>>"\$FT/d170-union.err" && [ -d "\$LB/Show (2020)/s3" ] && echo U3=ok
+mv "\$S/s2/Show - S02E01.mkv" "\$S/s3/Show - S03E01.mkv" 2>>"\$FT/d170-union.err" && [ "\$(stat -c %s "\$S/s3/Show - S03E01.mkv")" = "4" ] && echo U4=ok
+[ -e "\$LB/Show (2020)/s3/Show - S03E01.mkv" ] && echo U4_ON_LOCAL=1   # it must NOT have been copied to local
+# 3. "delete empty folders"
+rmdir "\$S/s2" 2>>"\$FT/d170-union.err" && [ ! -e "\$S/s2" ] && echo U5=ok
+# 4. the series folder renamed: it exists on BOTH branches, mergerfs renames on each
+mv "\$S" "\$U/Show Renamed (2020)" 2>>"\$FT/d170-union.err" && [ -d "\$LB/Show Renamed (2020)" ] && [ ! -e "\$S" ] && echo U6=ok
+[ "\$(cat "\$U/Show Renamed (2020)/s3/Show - S03E01.mkv")" = "e1e1" ] && echo U7=ok
+# 5. an upgrade: the old file deleted (D169), the new one created at the same path — on the local branch
+rm "\$U/Z - renamed.mkv" 2>>"\$FT/d170-union.err" && [ ! -e "\$U/Z - renamed.mkv" ] && echo U8=ok
+printf 'upgraded' > "\$U/Z - renamed.mkv" 2>>"\$FT/d170-union.err" && [ "\$(cat "\$U/Z - renamed.mkv")" = "upgraded" ] && [ -f "\$LB/Z - renamed.mkv" ] && echo U9=ok
+# 6. "set permissions" on a library file
+chmod 664 "\$U/x.mkv" 2>>"\$FT/d170-union.err" && echo U10=ok
+echo "UTOP=\$(LC_ALL=C ls "\$U" | tr '\n' ',')"
+fusermount3 -u "\$U" 2>/dev/null || fusermount -u "\$U" 2>/dev/null; echo U11=ok
+EOS
+)
+if has "$U_OUT" NO_MERGERFS=1; then
+  ok "mergerfs is not on the owner — the union rehearsal is skipped (not a failure)"
+else
+  uerr() { ssh "$OWNER" 'cat $HOME/fleet-test/d170-union.err; tail -4 $HOME/fleet-test/d130-view.log'; }
+  has "$U_OUT" U0=ok && ok "a union of a local folder (RW) and the view (NC), with feederbox's options ($(val "$U_OUT" MERGERFS))" || fail "mergerfs mount: $(uerr)"
+  has "$U_OUT" U1=ok && has "$U_OUT" U2=ok && ok "through the union: a verified move in place, and it reads" || fail "union rename: $U_OUT $(uerr)"
+  has "$U_OUT" U3=ok && has "$U_OUT" U4=ok && ! has "$U_OUT" U4_ON_LOCAL=1 && ok "a new season folder lands on local; the rename into it stays on the view's branch (the path clone → our mkdir)" || fail "union rename into a new folder: $U_OUT $(uerr)"
+  has "$U_OUT" U5=ok && ok "the emptied season folder is removed" || fail "union rmdir: $U_OUT $(uerr)"
+  has "$U_OUT" U6=ok && has "$U_OUT" U7=ok && ok "the series folder, present on BOTH branches, renames on both — and the episode reads under the new name" || fail "union folder rename: $U_OUT $(uerr)"
+  has "$U_OUT" U8=ok && has "$U_OUT" U9=ok && ok "an upgrade: the old file deleted through the union, the new one created at the same path (on local)" || fail "union upgrade: $U_OUT $(uerr)"
+  has "$U_OUT" U10=ok && ok "chmod of a library file through the union" || fail "union chmod: $U_OUT $(uerr)"
+  [ "$(val "$U_OUT" UTOP)" = "Show Renamed (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && ok "the union lists exactly what was done" || fail "union listing: $(val "$U_OUT" UTOP)"
+  J_OUT=$(ssh "$EDGE" "bash -s" <<EOS
+$RH
+L=\$FT/d130-edge-lib
+[ "\$(cat "\$L/Show Renamed (2020)/s3/Show - S03E01.mkv")" = "e1e1" ] && [ ! -e "\$L/Show (2020)" ] && [ ! -e "\$L/Show Renamed (2020)/s2" ] && echo J1=ok
+[ ! -e "\$L/Z - renamed.mkv" ] && "\$B/pvfs" --data-dir "\$RD" trash ls 2>/dev/null | grep -q "Z - renamed.mkv" && echo J2=ok
+EOS
+)
+  has "$J_OUT" J1=ok && ok "the edge's disk: the episode is at Show Renamed (2020)/s3, the old folders are gone" || fail "edge disk after the union: $J_OUT"
+  has "$J_OUT" J2=ok && ok "and the upgraded-away file is in the edge's trash" || fail "edge trash after the union: $J_OUT"
+fi
+gate union
+
 say "F: the edge goes down — the fetched copy still reads, an unfetched one fails within the bound, ls stays instant"
 STOP=$(ssh "$EDGE" "bash -s" <<EOS
 $RH

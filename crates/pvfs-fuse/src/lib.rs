@@ -921,13 +921,18 @@ impl PvfsFs {
 
     fn view_attr(&mut self, e: &pvfs_core::ViewEntry) -> FileAttr {
         let ino = self.view_ino(&e.rel_path);
+        // D170 — 0755 / 0644, not 0555 / 0444: the namespace takes renames and
+        // deletes now, and the bits should say so. An arr (.NET) reads a file
+        // without its owner's write bit as ReadOnly and chmods it before every
+        // move; a file manager greys the operations out. Bytes still do not
+        // come through: a write-open is refused whatever the mode says.
         let (kind, size, mtime, perm) = if e.kind == "dir" {
-            (FileType::Directory, 0, e.mtime_ms, 0o555)
+            (FileType::Directory, 0, e.mtime_ms, 0o755)
         } else {
             let (size, mtime) = Self::view_served(e)
                 .map(|(_, s, m)| (s, m))
                 .unwrap_or((e.size_bytes, e.mtime_ms));
-            (FileType::RegularFile, size, mtime, 0o444)
+            (FileType::RegularFile, size, mtime, 0o644)
         };
         self.plain_attr(ino, kind, size, mtime, perm)
     }
@@ -1057,7 +1062,7 @@ impl Filesystem for PvfsFs {
         if self.view {
             self.sync_overlay();
             if ino == 1 {
-                let attr = self.plain_attr(1, FileType::Directory, 0, 0, 0o555);
+                let attr = self.plain_attr(1, FileType::Directory, 0, 0, 0o755);
                 return reply.attr(&TTL, &attr);
             }
             let Some(rel) = self.ino_to_path.get(&ino).cloned() else {

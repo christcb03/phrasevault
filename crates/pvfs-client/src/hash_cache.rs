@@ -735,6 +735,10 @@ pub fn announced_sources(data_dir: &Path) -> Vec<ReplicaSource> {
         .collect()
 }
 
+/// Which announced box last answered for a region (other than "not mine").
+static HOLDER_HINT: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Ask the fleet, box by box, to do `ask` for each of `items` on the box
 /// that holds its region: `not_found` = "not mine", try the next; any other
 /// refusal ends it. `Err` carries why, and how many items were done.
@@ -749,7 +753,15 @@ fn ask_holders<T>(
         let r = region(item);
         let mut why = format!("no box that holds region {} answered", &r[..r.len().min(8)]);
         let mut done = false;
-        for src in sources {
+        // The box that answered for this region last time is asked first: an
+        // arr renaming a season is a hundred requests for one region, and
+        // every box asked in vain is a dial — a second, from feederbox.
+        let hinted = HOLDER_HINT.lock().unwrap().get(r).cloned();
+        let mut order: Vec<&ReplicaSource> = sources.iter().collect();
+        if let Some(h) = &hinted {
+            order.sort_by_key(|s| &s.target != h);
+        }
+        for src in order {
             if !open.contains_key(&src.target) {
                 match crate::follow::dial_source(src) {
                     Ok(c) => {
@@ -764,6 +776,7 @@ fn ask_holders<T>(
             let client = open.get_mut(&src.target).expect("dialed above");
             match ask(client, item) {
                 Ok(()) => {
+                    HOLDER_HINT.lock().unwrap().insert(r.to_string(), src.target.clone());
                     done = true;
                     break;
                 }
