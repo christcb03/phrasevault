@@ -150,6 +150,12 @@ fn the_view_mount_lists_the_union_and_serves_admitted_bytes() {
     assert!(std::fs::read(&far_file).is_err(), "no holder anywhere: the read fails");
     assert!(started.elapsed() < Duration::from_secs(150), "and fails within the read bound");
     assert_eq!(names(mnt.path()), vec!["Movies"], "the mount is still answering");
-    assert!(std::fs::remove_file(&same).is_err(), "the view is read-only, namespace included");
+    // The view is read-only, namespace included — but for `unlink` of a file,
+    // since D169 (an arr's upgrade removes the old file first): that has its
+    // own test, `d169_view_unlink.rs`. Everything else is still refused.
+    assert!(std::fs::rename(&same, same.with_file_name("renamed.mkv")).is_err(), "rename is refused");
+    assert!(std::fs::write(same.with_file_name("new.mkv"), b"x").is_err(), "and so is a write");
+    assert!(std::fs::remove_dir(mnt.path().join("Movies/Empty (2004)")).is_err(), "and removing a folder");
+    assert_eq!(std::fs::read(&same).unwrap(), b"identical bytes");
     drop(session);
 }
