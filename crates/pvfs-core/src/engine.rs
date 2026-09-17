@@ -359,6 +359,35 @@ pub(crate) fn bad(field: &str, reason: &str) -> PvfsError {
     }
 }
 
+/// D162 — where SQLite puts its scratch files, under the data dir.
+pub const SCRATCH_DIR: &str = "sqlite-tmp";
+
+/// D162 — SQLite's scratch files go beside the database, not in the system
+/// temp directory. A sort too big for the page cache (the merged view's
+/// `ORDER BY rel_path` over every catalogue region) spills to a temp file,
+/// which SQLite otherwise puts in `/var/tmp` or `/tmp`. On the QNAP that is
+/// a 64 MB RAM disk with about 25 MB free: once mediabox-local's 28,480 rows
+/// landed (2026-09-16), the NAS's receive job failed "database or disk is
+/// full" on and off. `<data_dir>/sqlite-tmp` sits on the catalogue's own
+/// disk, so the scratch can grow with it. The setting is SQLite's
+/// process-wide `temp_store_directory`, made once, by the first connection
+/// a process opens on a data dir, before any other can be busy. An
+/// operator's `SQLITE_TMPDIR` wins: with it set, nothing changes. A
+/// directory that cannot be made, or goes away later, leaves SQLite's own
+/// choice, as before.
+fn scratch_beside(conn: &Connection, data_dir: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("SQLITE_TMPDIR").is_some() {
+            return;
+        }
+        let dir = data_dir.join(SCRATCH_DIR);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = conn.pragma_update(None, "temp_store_directory", dir.to_string_lossy().as_ref());
+        }
+    });
+}
+
 /// Open the same databases **read-only** for a metadata read view (doc 07 §6).
 /// WAL lets these run concurrently with the single writer connection; the -shm
 /// coordination file already exists because the writer is open (same process).
@@ -369,6 +398,7 @@ fn open_connection_read_only(data_dir: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(map_db("open index.db read-only"))?;
+    scratch_beside(&conn, data_dir);
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(map_db("busy timeout"))?;
     let log_path = data_dir.join(LOG_FILE).to_string_lossy().into_owned();
@@ -405,6 +435,7 @@ fn take_writer_lock(data_dir: &Path) -> Option<nix::fcntl::Flock<std::fs::File>>
 
 pub(crate) fn open_connection(data_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(data_dir.join(INDEX_FILE)).map_err(map_db("open index.db"))?;
+    scratch_beside(&conn, data_dir);
     // D141 — 15 s, not 5: a job that opened its own Engine in the daemon's
     // process (catalogue) installs a 30 000-row snapshot in one transaction,
     // and the daemon's own writer must be able to wait that out rather than

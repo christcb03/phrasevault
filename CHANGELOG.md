@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **SQLite's scratch files go beside the database (D162).** A sort too big
+  for the page cache spills to a temp file, which SQLite put in `/var/tmp` or
+  `/tmp`. On the QNAP that is a 64 MB RAM disk with about 25 MB free, and on
+  2026-09-16, once mediabox-local's first pass landed and the merged view
+  grew from about 43,000 rows to 71,000, the NAS's receive job failed
+  "database error during view conflicts: database or disk is full" on and
+  off. The first engine a process opens (either `open_connection`) now sets
+  SQLite's process-wide `temp_store_directory` to `<data_dir>/sqlite-tmp`, on
+  the catalogue's own disk. An operator's `SQLITE_TMPDIR` is left alone, and
+  a directory that cannot be made leaves SQLite's own choice.
+
 - **An alert that reached the phone says when it has cleared (D161).** The
   owner's notifier had no event for a job error going away: `job_errors`
   dropped its memory on the first clean pass, silently, and the same text
