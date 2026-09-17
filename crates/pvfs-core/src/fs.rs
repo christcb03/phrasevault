@@ -2911,8 +2911,6 @@ impl Engine {
         Ok(out)
     }
 
-    /// The admission rule (doc 26 §6), over rows sorted by path then region.
-    #[allow(clippy::type_complexity)]
     /// D170 — the view's judgement of `copies` as the rows at `rel_path`: what
     /// a mount shows for a path whose rows the catalogue still lists somewhere
     /// else (a rename it has not caught up with), or for part of an entry.
@@ -2939,6 +2937,8 @@ impl Engine {
         Some(e)
     }
 
+    /// The admission rule (doc 26 §6), over rows sorted by path then region.
+    #[allow(clippy::type_complexity)]
     fn merge_rows(
         rows: impl IntoIterator<Item = (String, String, String, u64, u64, Option<String>, Option<String>)>,
     ) -> Vec<ViewEntry> {
