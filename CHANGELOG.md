@@ -19,7 +19,10 @@ file tracks Layer 0, the file-system engine.
   it into place; the link fails for the second, which reads the first's.
   Nobody reads a phrase mid-write and nobody keeps one the file does not
   hold. `pvfs-core/tests/d163_identity_race.rs`; `serve_jobs.rs` makes the
-  identity inside its once.
+  identity inside its once. *Follow-up the same night:* the private file
+  was named by pid and nanosecond, and on GitHub's runner two of the
+  test's sixteen callers drew the same nanosecond, so one `create_new`
+  failed "File exists". A process-wide counter names it now.
 
 - **SQLite's scratch files go beside the database (D162).** A sort too big
   for the page cache spills to a temp file, which SQLite put in `/var/tmp` or
