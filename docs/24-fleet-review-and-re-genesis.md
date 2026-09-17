@@ -80,6 +80,18 @@ generalized. **A per-walker name check is the same shape of mistake as the one
 that already existed and did not save us.** The real fix is to make the sidecar
 a dotfile so no walker has to know anything.
 
+*D166 (2026-09-17) — the convention's cost, and what replaces it.* "Every
+dot-name is ours to skip" also skipped the operator's: 153 `.plexmatch` files
+on the fleet were in no catalogue, so the merged view did not show them —
+found when the view was compared with the rclone union it replaces. A dot no
+longer hides a name. The lesson above still holds, so the knowledge lives in
+exactly ONE place — `sync::is_own_name` (with `is_litter_name` beside it for
+`.DS_Store` and its kind) — `walk_disk` is its only caller, a test holds every
+function that makes one of our names to it, and **new bookkeeping takes the
+`.pvfs-` prefix**, which the rule covers without being told. The table above
+gained rows since it was written: `.pvfs-central`, `.pvfs-trash/`,
+`.pvfs-incoming/`, `.{id}.tmp`, `.{id}.progress`, `.pvfs-secure-*.tmp`.
+
 ### What is fixed in this branch
 
 A shared `is_sidecar_name`/`is_sidecar_path` in `sync.rs`; an unconditional guard

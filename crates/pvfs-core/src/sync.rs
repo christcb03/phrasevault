@@ -207,6 +207,65 @@ pub fn is_sidecar_name(name: &str) -> bool {
     name.ends_with(".manifest")
 }
 
+/// D166 — whether `name`, found in a library folder, is PVFS's OWN rather than
+/// the operator's: a forest's `.pvfs`, the markers and working directories
+/// (`.pvfs-root`, `.pvfs-central`, `.pvfs-trash`, `.pvfs-incoming`), a
+/// chunk-manifest sidecar (`.X.manifest`, and V1's `X.manifest` — files only:
+/// a directory someone named `x.manifest` is theirs), and a dot-named file
+/// still being written (`.<id>.tmp`, `.<id>.swarmpart`, `.<id>.progress`,
+/// `.X.partial`).
+///
+/// Doc 24 §2 made everything PVFS writes into a content tree a dot-name "so no
+/// walker has to know anything"; D166 ends that — a dot alone no longer hides
+/// a name — so THIS is the one place that knows, and
+/// `d166_operator_dotfiles.rs` holds every writer to it. **New bookkeeping
+/// takes the `.pvfs-` prefix** and needs no entry here.
+///
+/// Everything else with a dot in front is content. Until D166 the walker
+/// skipped every dot-name, which kept our sidecars out of the catalogue and
+/// took the operator's `.plexmatch` files with them — 153 on the fleet, the
+/// file that tells Plex which show a folder is.
+pub fn is_own_name(name: &str, is_dir: bool) -> bool {
+    name == ".pvfs"
+        || name.starts_with(".pvfs-")
+        || (!is_dir && is_sidecar_name(name))
+        || (!is_dir
+            && name.starts_with('.')
+            && [".tmp", ".swarmpart", ".progress", ".partial"].iter().any(|s| name.ends_with(s)))
+}
+
+/// D166 — dot-named litter an OS or a NAS leaves in every folder it touches.
+/// Nothing reads it and nobody placed it: macOS's `.DS_Store` and `._*`
+/// resource forks, a desktop's `.Trash-1000`, the QNAP indexer's `.@__thumb`
+/// (346 of them on one fleet disk, 792 MB of thumbnails), and the names a
+/// filesystem gives a file that was unlinked while open. Dot-names only, so
+/// nothing the walker catalogued before D166 stops being catalogued.
+pub fn is_litter_name(name: &str) -> bool {
+    const LITTER: &[&str] = &[
+        ".DS_Store",
+        ".AppleDouble",
+        ".AppleDB",
+        ".AppleDesktop",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".Trashes",
+        ".DocumentRevisions-V100",
+        ".VolumeIcon.icns",
+        ".apdisk",
+        ".localized",
+        ".directory",
+        ".@__thumb",
+        ".@__qini",
+        ".streams",
+    ];
+    LITTER.contains(&name)
+        || name.starts_with("._")
+        || name.starts_with(".Trash-")
+        || name.starts_with(".fuse_hidden")
+        || name.starts_with(".nfs")
+}
+
 /// Whether `path`'s own file name is a sidecar.
 pub fn is_sidecar_path(path: &Path) -> bool {
     path.file_name()
