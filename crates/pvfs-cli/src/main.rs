@@ -1290,8 +1290,8 @@ enum TrashCmd {
         /// same path was trashed on more than one; default: the newest
         #[arg(long)]
         from: Option<u64>,
-        /// Only this region (an id prefix); default: every region on this
-        /// box whose trash has the path
+        /// Which region (an id prefix) when more than one on this box has
+        /// the path in its trash; asked at a terminal, required in a script
         #[arg(long)]
         region: Option<String>,
     },
@@ -6285,10 +6285,40 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             reason: format!("nothing in this box's trash at {path:?} — `pvfs trash ls` shows what there is"),
                         });
                     }
-                    // D169 — a delete through the view trashes EVERY copy of a
-                    // path, so its undo puts every one back: each region here
-                    // that has it, unless `--region` names one. (It asked
-                    // "which region?" before, which a script cannot answer.)
+                    // More than one region on this box has the path in its
+                    // trash: at a terminal, ask which (or all); a script is
+                    // told to say. Restoring them all unasked would bring
+                    // back OLDER trash too — the smoke suite's first D169 run
+                    // resurrected a copy `resolve` had trashed long before.
+                    if has.len() > 1 {
+                        use std::io::IsTerminal;
+                        let which: Vec<String> = has
+                            .iter()
+                            .map(|l| format!("{} ({}, {})", &l.region[..12.min(l.region.len())], l.label, l.root.display()))
+                            .collect();
+                        if !std::io::stdin().is_terminal() {
+                            return Err(PvfsError::BadInput {
+                                field: "region".into(),
+                                reason: format!(
+                                    "more than one region on this box has {path:?} in its trash — pass --region <id prefix>: {}",
+                                    which.join("; ")
+                                ),
+                            });
+                        }
+                        for w in &which {
+                            eprintln!("  {w}");
+                        }
+                        let want = prompt_line("More than one region has that path — which (id prefix, or `all`)", Some("all"))?;
+                        if want != "all" {
+                            has.retain(|l| l.region.starts_with(&want));
+                            if has.is_empty() {
+                                return Err(PvfsError::BadInput {
+                                    field: "region".into(),
+                                    reason: format!("no region here starts with {want:?}"),
+                                });
+                            }
+                        }
+                    }
                     for list in &has {
                         let done = pvfs_core::sync::restore_from_trash(&list.root, &path, from)?;
                         for p in &done.restored {

@@ -1098,7 +1098,11 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   rm "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && ok "D169: a delete through the view succeeds" || fail "D169: rm through the view: $(tail -2 "$DATA/view-mount.log")"
   [ -e "$DATA/view-mnt/sub/b.mkv" ] && fail "D169: still listed after the delete" || ok "D169: and the path is gone from the mount at once"
   $PVFS trash ls | qgrep 'sub/b.mkv' && ok "D169: it is in its region's trash (pvfs trash ls)" || fail "D169: not in the trash: $($PVFS trash ls 2>&1 | tail -3)"
-  $PVFS trash restore sub/b.mkv | qgrep '^restored' && ok "D169: and pvfs trash restore puts it back" || fail "D169: restore"
+  # catlib2's older copy of the same path is in ITS trash since the D127
+  # resolve section, so the region is named — restoring both would hand
+  # the later resolve checks a redundant copy back.
+  $PVFS trash restore sub/b.mkv 2>&1 | qgrep 'pass --region' && ok "D169: two regions have it in their trash: a script is told to name one" || fail "D169: restore without --region"
+  $PVFS trash restore sub/b.mkv --region "$(printf '%s' "$CAT" | cut -c1-12)" | qgrep '^restored' && ok "D169: and pvfs trash restore --region puts it back" || fail "D169: restore"
   $PVFS umount "$DATA/view-mnt" >/dev/null 2>&1 || fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true
   wait "$VPID" 2>/dev/null || true
   VPID=""

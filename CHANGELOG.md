@@ -29,10 +29,11 @@ file tracks Layer 0, the file-system engine.
   in the mount — hidden at once, by the hashes that were trashed, because
   the arr creates the new file at the same path within the second and the
   catalogue takes a pass and a fetch to agree; a new file there (another
-  hash) shows. `rename` and `rmdir` stay `EROFS`. And because the delete
-  takes every copy, `pvfs trash restore <path>` now puts back every region's
-  copy on the box it runs on unless `--region` names one (D167 asked "which
-  region?", which a script cannot answer — the smoke suite found that).
+  hash) shows. `rename` and `rmdir` stay `EROFS`. `pvfs trash restore`,
+  when more than one region on the box has the path: asks at a terminal
+  (an id prefix, or `all`), and tells a script to pass `--region` naming
+  them — D167's prompt gave a script an unreadable error (the smoke suite
+  found it).
   `pvfs-core/tests/d169_trash_region_path.rs`,
   `pvfsd/tests/d169_trash_path.rs`, `pvfs-fuse/tests/d169_view_unlink.rs`.
 
