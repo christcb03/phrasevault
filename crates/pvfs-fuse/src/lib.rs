@@ -79,10 +79,24 @@ pub struct PvfsFs {
     tombstones: Tombstones,
 }
 
-type Tombstones = Arc<std::sync::Mutex<HashMap<String, (HashSet<String>, std::time::Instant)>>>;
+type Tombstones = Arc<std::sync::Mutex<HashMap<String, Tomb>>>;
 
-/// A tombstone outlives any honest catalogue lag; past this it is dropped.
-const TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
+/// One path deleted through this mount: the hashes that went to the trash,
+/// when, and — per region — the catalogue seq this box held at that moment.
+#[derive(Clone)]
+struct Tomb {
+    dead: HashSet<String>,
+    at: std::time::Instant,
+    held: HashMap<String, u64>,
+}
+
+/// How long a tombstone hides a path the catalogue still lists. It only has
+/// to cover the holder's next pass and our fetch of it (a minute or two); the
+/// arr's replacement lands on the union's local branch within seconds and
+/// shadows this branch anyway. It was an hour, and the lab showed the cost:
+/// a file restored from the trash seconds after its delete — before any new
+/// head — stayed hidden on the box that had deleted it.
+const TOMBSTONE_TTL: Duration = Duration::from_secs(600);
 
 /// One handle on a read-through: its fetch, and the file it reads from,
 /// opened once (the partial becomes the kept file by rename — one inode).
@@ -381,15 +395,29 @@ impl PvfsFs {
             return Some(e);
         }
         let mut tombs = self.tombstones.lock().unwrap();
-        let Some((dead, at)) = tombs.get(&e.rel_path).cloned() else {
+        let Some(tomb) = tombs.get(&e.rel_path).cloned() else {
             return Some(e);
         };
-        let lingering = e.sources.iter().any(|c| c.content_hash.as_ref().is_some_and(|h| dead.contains(h)));
-        if !lingering || at.elapsed() > TOMBSTONE_TTL {
-            tombs.remove(&e.rel_path); // the catalogue has caught up (or it is too old to trust)
+        let is_dead = |c: &pvfs_core::ViewCopy| c.content_hash.as_ref().is_some_and(|h| tomb.dead.contains(h));
+        let lingering: Vec<&pvfs_core::ViewCopy> = e.sources.iter().filter(|c| is_dead(c)).collect();
+        // A holder that has PUBLISHED since the delete and still lists the
+        // file has the file: it was restored (or the delete never reached
+        // it). What this box held at the delete is the mark to beat.
+        let republished = !lingering.is_empty() && {
+            let now: HashMap<String, u64> = self
+                .engine
+                .catalogue_status()
+                .map(|s| s.into_iter().filter_map(|r| r.held_seq.map(|q| (r.region, q))).collect())
+                .unwrap_or_default();
+            lingering
+                .iter()
+                .any(|c| now.get(&c.region).copied().unwrap_or(0) > tomb.held.get(&c.region).copied().unwrap_or(u64::MAX))
+        };
+        if lingering.is_empty() || republished || tomb.at.elapsed() > TOMBSTONE_TTL {
+            tombs.remove(&e.rel_path); // the catalogue has caught up, the file is back, or it is too old to trust
             return Some(e);
         }
-        e.sources.retain(|c| !c.content_hash.as_ref().is_some_and(|h| dead.contains(h)));
+        e.sources.retain(|c| !is_dead(c));
         (!e.sources.is_empty()).then_some(e).filter(Self::view_shown)
     }
 
@@ -439,8 +467,18 @@ impl PvfsFs {
             }
         }
         let tombs = Arc::clone(&self.tombstones);
+        let held: HashMap<String, u64> = self
+            .engine
+            .catalogue_status()
+            .map(|s| s.into_iter().filter_map(|r| r.held_seq.map(|q| (r.region, q))).collect())
+            .unwrap_or_default();
         let bury = move |rel: String, dead: HashSet<String>| {
-            tombs.lock().unwrap().insert(rel, (dead, std::time::Instant::now()));
+            let tomb = Tomb {
+                dead,
+                at: std::time::Instant::now(),
+                held,
+            };
+            tombs.lock().unwrap().insert(rel, tomb);
         };
         if elsewhere.is_empty() {
             bury(rel, dead);

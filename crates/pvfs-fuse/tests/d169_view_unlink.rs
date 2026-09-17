@@ -139,5 +139,21 @@ fn a_delete_through_the_mount_is_a_trip_to_the_trash_and_the_path_is_gone_at_onc
     assert!(std::fs::remove_dir(&season).is_err());
     assert!(std::fs::write(season.join("new.mkv"), b"x").is_err());
     assert_eq!(std::fs::read(season.join("Show - s01e02.mkv")).unwrap(), b"its neighbour");
+
+    // ---- restored from the trash, it comes back — the tombstone must not
+    // outlive the delete. Nobody lists the folder in between, so the mount
+    // never SEES the path gone; what tells it is that the region has
+    // published again (twice: without the file, then with it) and lists it.
+    let mut scanner = Engine::open(&data_dir).unwrap();
+    scanner.scan_routed(Some(&r), None, 0).unwrap();
+    assert!(scanner.view_entry("TV/Show/Season 01/Show - s01e01.mkv").unwrap().is_none(), "the pass dropped the row");
+    let back = sync::restore_from_trash(&lib, "TV/Show/Season 01/Show - s01e01.mkv", None).unwrap();
+    assert_eq!(back.restored.len(), 1);
+    scanner.scan_routed(Some(&r), None, 0).unwrap();
+    assert!(scanner.view_entry("TV/Show/Season 01/Show - s01e01.mkv").unwrap().is_some(), "and the next one has it again, same hash");
+    scanner.close().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(6)); // the mount's 5 s listing cache
+    assert_eq!(names(&season), vec!["Show - s01e01.mkv", "Show - s01e02.mkv"], "a restored file is not hidden by the memory of its delete");
+    assert_eq!(std::fs::read(season.join("Show - s01e01.mkv")).unwrap(), b"the copy an upgrade replaces");
     drop(session);
 }

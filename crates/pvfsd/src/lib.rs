@@ -790,7 +790,7 @@ fn do_trash_path(daemon: &Daemon, principal: &Principal, region: &str, rel_path:
     }
     match e.trash_region_path(&region.to_string(), rel_path, hash) {
         Ok(pvfs_core::TrashedHere::Trashed(to)) => {
-            eprintln!("pvfsd: trashed {rel_path} of {} for {principal:?} — it is at {}", &region[..8], to.display());
+            eprintln!("pvfsd: trashed {rel_path} of {} for {} — it is at {}", &region[..8], principal.display(), to.display());
             ServerMsg::Trashed { moved: true }
         }
         Ok(pvfs_core::TrashedHere::Gone) => ServerMsg::Trashed { moved: false },
