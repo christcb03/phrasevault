@@ -75,7 +75,7 @@ fn a_v15_cache_migrates_to_v16_without_replaying() {
     let v: String = c
         .query_row("SELECT v FROM projection_meta WHERE k='schema_version'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, "18");
+    assert_eq!(v, pvfs_core::projection::SCHEMA_VERSION.to_string(), "all the way up the ladder");
     let sentinel: i64 = c
         .query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id='d125-sentinel'", [], |r| r.get(0))
         .unwrap();

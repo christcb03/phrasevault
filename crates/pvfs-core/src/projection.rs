@@ -35,7 +35,13 @@ use crate::log_store;
 // only ever touch this device's own. No new event, no wire change: the
 // attribution was always in the signed log, just never folded. Same
 // drop-and-replay upgrade, which back-fills it for free.
-pub const SCHEMA_VERSION: u32 = 18;
+// v19 (D171): `idx_region_entries_path` and `idx_region_entries_hash` — the
+// view mount looks a path (and, to open a file, a hash) up across EVERY
+// catalogue region, and the table's key leads with the region: each `stat`
+// was a scan of every row on the box (72k on feederbox, 13 ms; 30 s to list
+// Movies with attributes). Migrated in place (CREATE INDEX, no replay) — the
+// rows are not in the log, so a replay could not bring them back.
+pub const SCHEMA_VERSION: u32 = 19;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -297,6 +303,10 @@ CREATE TABLE IF NOT EXISTS region_entries (
   seen_at      INTEGER NOT NULL,
   PRIMARY KEY (region_id, rel_path)
 );
+-- D171 — the merged view asks by PATH across every region, and by HASH to
+-- find this box's own bytes; the key above serves neither.
+CREATE INDEX IF NOT EXISTS idx_region_entries_path ON region_entries(rel_path, region_id);
+CREATE INDEX IF NOT EXISTS idx_region_entries_hash ON region_entries(content_hash) WHERE content_hash IS NOT NULL;
 -- D125 — each published head of a catalogue region: the seq and manifest
 -- hash that went into the top log as a SubRegionHead. commit_region_heads
 -- reads the latest row here instead of opening a log file.
@@ -3027,6 +3037,7 @@ fn migrate_projection(
             15 => migrate_v15_to_v16(conn).map(|_| "regions.kind; region_entries; region_snapshots"),
             16 => migrate_v16_to_v17(conn).map(|_| "regions.drains"),
             17 => migrate_v17_to_v18(conn).map(|_| "region_fetched"),
+            18 => migrate_v18_to_v19(conn).map(|_| "idx_region_entries_path; idx_region_entries_hash"),
             _ => return None, // no registered step — rebuild
         };
         match step {
@@ -3189,6 +3200,17 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
             .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
+}
+
+fn migrate_v18_to_v19(conn: &mut Connection) -> Result<()> {
+    // D171 — two indexes, nothing re-read. In place is the ONLY door worth
+    // taking here: `region_entries` is derived from disks and fetched
+    // manifests, not from the log, so a replay would come back without it.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_region_entries_path ON region_entries(rel_path, region_id);
+         CREATE INDEX IF NOT EXISTS idx_region_entries_hash ON region_entries(content_hash) WHERE content_hash IS NOT NULL;",
+    )
+    .map_err(map_db("migrate v18→v19: region_entries indexes"))
 }
 
 fn migrate_v17_to_v18(conn: &mut Connection) -> Result<()> {
