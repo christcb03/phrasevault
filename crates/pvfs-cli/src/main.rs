@@ -1290,7 +1290,8 @@ enum TrashCmd {
         /// same path was trashed on more than one; default: the newest
         #[arg(long)]
         from: Option<u64>,
-        /// Which region, by id prefix, when more than one has the path
+        /// Only this region (an id prefix); default: every region on this
+        /// box whose trash has the path
         #[arg(long)]
         region: Option<String>,
     },
@@ -6278,39 +6279,32 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     };
                     let mut has = trash_filter(&lists, Some(&path), from, region.as_deref());
                     has.retain(|l| !l.entries.is_empty());
-                    let list = match has.len() {
-                        0 => {
-                            return Err(PvfsError::BadInput {
-                                field: "trash".into(),
-                                reason: format!("nothing in this box's trash at {path:?} — `pvfs trash ls` shows what there is"),
-                            })
-                        }
-                        1 => has.remove(0),
-                        _ => {
-                            for l in &has {
-                                eprintln!("  {}  {}  {}", &l.region[..12.min(l.region.len())], l.label, l.root.display());
-                            }
-                            let want = prompt_line("More than one region has that path — which (id prefix)", None)?;
-                            has.into_iter().find(|l| l.region.starts_with(&want)).ok_or_else(|| PvfsError::BadInput {
-                                field: "region".into(),
-                                reason: format!("no region here starts with {want:?}"),
-                            })?
-                        }
-                    };
-                    let done = pvfs_core::sync::restore_from_trash(&list.root, &path, from)?;
-                    for p in &done.restored {
-                        println!("restored\t{}", list.root.join(p).display());
+                    if has.is_empty() {
+                        return Err(PvfsError::BadInput {
+                            field: "trash".into(),
+                            reason: format!("nothing in this box's trash at {path:?} — `pvfs trash ls` shows what there is"),
+                        });
                     }
-                    for p in &done.in_the_way {
-                        println!("kept in the trash\t{p}\t(a file is already at {})", list.root.join(p).display());
-                    }
-                    if !done.restored.is_empty() {
-                        eprintln!(
-                            "{} file(s) back in {} — the region's next pass catalogues them{}",
-                            done.restored.len(),
-                            list.root.display(),
-                            if list.drains { "; this region DRAINS, so a file the library still holds will be drained again" } else { "" }
-                        );
+                    // D169 — a delete through the view trashes EVERY copy of a
+                    // path, so its undo puts every one back: each region here
+                    // that has it, unless `--region` names one. (It asked
+                    // "which region?" before, which a script cannot answer.)
+                    for list in &has {
+                        let done = pvfs_core::sync::restore_from_trash(&list.root, &path, from)?;
+                        for p in &done.restored {
+                            println!("restored\t{}", list.root.join(p).display());
+                        }
+                        for p in &done.in_the_way {
+                            println!("kept in the trash\t{p}\t(a file is already at {})", list.root.join(p).display());
+                        }
+                        if !done.restored.is_empty() {
+                            eprintln!(
+                                "{} file(s) back in {} — the region's next pass catalogues them{}",
+                                done.restored.len(),
+                                list.root.display(),
+                                if list.drains { "; this region DRAINS, so a file the library still holds will be drained again" } else { "" }
+                            );
+                        }
                     }
                     Ok(())
                 }
