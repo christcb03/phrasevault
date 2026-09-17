@@ -252,9 +252,20 @@ impl Overlay {
         // A made folder the catalogue now lists is simply a folder.
         self.made_dirs.retain(|d, at| at.elapsed() <= PENDING_TTL && !listed(d));
         // A removed folder: gone from the catalogue — or listed by a head
-        // published since, which means it is back.
-        self.gone_dirs
-            .retain(|d, g| g.at.elapsed() <= PENDING_TTL && listed(d) && !republished(&g.held));
+        // published since, which means it is back. "Listed" as the VIEW sees
+        // it: a folder removed inside a folder renamed a moment ago is still
+        // in the catalogue under its old name (the lab pair: `rmdir` of
+        // `Show (2020)/s1` came straight back, listed from `show/s1`).
+        let mut gone = std::mem::take(&mut self.gone_dirs);
+        gone.retain(|d, g| {
+            let shown = self.origins(d).iter().any(|q| match engine.view_entry(q) {
+                Ok(Some(e)) => self.place(e).iter().any(|p| &p.rel_path == d),
+                Ok(None) => false,
+                Err(_) => true,
+            });
+            g.at.elapsed() <= PENDING_TTL && shown && !republished(&g.held)
+        });
+        self.gone_dirs = gone;
         if before != self.made_dirs.len() + self.gone_dirs.len() {
             self.dirty = true;
         }
