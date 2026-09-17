@@ -120,6 +120,7 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `supervise` | a `start` was sent — ok, or failed | info / critical |
 | `peer_up` | a peer answers again (with how long it was down) | info |
 | `job_error` | a job's error has been there, with the same text, for about **four minutes** — the third poll, timed from when it was first seen, so the owner's own restarts in a row never count (D151); once, until it changes, and a changed text waits its own four minutes; the stall detector's `overdue` notice is filtered | warning |
+| `job_error_cleared` | a `job_error` that WAS sent has been gone for the same ~four minutes (D161): once per episode, naming the text last sent and how long it lasted (`since_ms` → `until_ms`); back inside the wait it is one episode and nothing is said; an error that cleared before it was sent is never cleared | info |
 | `heartbeat` | every 24 h: "All good: N boxes up, nothing to do." or what is down | info / warning |
 | `test` | `--test` | info |
 
@@ -166,7 +167,7 @@ flowchart LR
   N -->|POST webhook pvfs-fleet| A["automation<br/>PVFS fleet event"]
   C -->|POST webhook pvfs-status| T["template entities<br/>sensor.pvfs_*"]
   V -->|POST webhook pve-vm-memory| M["template entities<br/>sensor.&lt;vm&gt;_memory_used"]
-  A -->|critical / warning / heartbeat| TG["phone (Telegram)"]
+  A -->|critical / warning / heartbeat / clears| TG["phone (Telegram)"]
   A -->|every event| E["event pvfs_fleet_event<br/>→ last 15 on the page"]
   T --> D["dashboard /pvfs-forest"]
   M --> D
@@ -181,8 +182,10 @@ One automation on webhook `pvfs-fleet` (`local_only: true`, POST only):
    time) — every event, sent or not, for the page's "Recent fleet events".
 2. **Send** only what someone can act on: `critical`, `warning`, the daily
    heartbeat and the test — titled 🔴 / 🟠 / 🟢, the body the `summary`
-   sentence and nothing else. A restart that worked and a box coming back are
-   info: logged, not sent.
+   sentence and nothing else — **and the clear of anything that was sent**
+   (D161): `peer_up` (it only ever follows a `peer_down`, which is critical)
+   and `job_error_cleared`, titled ✅. A restart that worked is info: logged,
+   not sent.
 
 A second automation runs hourly and pages if the first has not triggered for
 **26 hours**: the heartbeat is daily, so its absence means the owner itself is

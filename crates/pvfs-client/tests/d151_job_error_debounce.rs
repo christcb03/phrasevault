@@ -151,6 +151,10 @@ fn a_changed_error_waits_its_own_time_then_is_said_once() {
     assert_eq!(said(&mut st, &mut rec, 6 * MIN, job(Some("b"))), 1);
 }
 
+/// D161 changed this on purpose: a sent error's memory clears when its clear
+/// is said — gone for `JOB_ERROR_AFTER_MS` — not on the first clean pass. So
+/// the same text back two minutes later is the same episode (not said again),
+/// and only after the clear is it a new one, waited for and said again.
 #[test]
 fn the_memory_clears_with_the_error_so_the_same_text_is_said_again_later() {
     let mut st = State::default();
@@ -158,9 +162,14 @@ fn the_memory_clears_with_the_error_so_the_same_text_is_said_again_later() {
     said(&mut st, &mut rec, 0, job(Some("boom")));
     assert_eq!(said(&mut st, &mut rec, 4 * MIN, job(Some("boom"))), 1);
     assert_eq!(said(&mut st, &mut rec, 6 * MIN, job(None)), 0);
+    assert_eq!(st.reported_job_errors.len(), 1, "kept until the clear is said: {st:?}");
+    assert_eq!(said(&mut st, &mut rec, 8 * MIN, job(Some("boom"))), 0, "back inside the wait: one episode");
+    assert_eq!(said(&mut st, &mut rec, 12 * MIN, job(Some("boom"))), 0, "and not said twice");
+    assert_eq!(said(&mut st, &mut rec, 14 * MIN, job(None)), 0);
+    assert_eq!(said(&mut st, &mut rec, 18 * MIN, job(None)), 1, "gone four minutes: the clear");
     assert!(st.reported_job_errors.is_empty() && st.job_errors_seen.is_empty(), "{st:?}");
-    assert_eq!(said(&mut st, &mut rec, 8 * MIN, job(Some("boom"))), 0, "back again: a fresh wait");
-    assert_eq!(said(&mut st, &mut rec, 12 * MIN, job(Some("boom"))), 1, "and said again");
+    assert_eq!(said(&mut st, &mut rec, 20 * MIN, job(Some("boom"))), 0, "back again: a fresh wait");
+    assert_eq!(said(&mut st, &mut rec, 24 * MIN, job(Some("boom"))), 1, "and said again");
 }
 
 #[test]
