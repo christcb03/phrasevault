@@ -309,6 +309,20 @@ pub struct ScanReport {
     pub stats: ScanStats,
 }
 
+/// D167 — one bound folder's trash, as `pvfs trash ls` shows it.
+#[derive(Debug, Clone)]
+pub struct RegionTrashList {
+    pub region: NodeId,
+    pub label: String,
+    pub root: std::path::PathBuf,
+    /// Buckets older than this many days are purged (D148).
+    pub retention_days: u64,
+    /// A draining region: a restored file is drained again if the library
+    /// still holds it.
+    pub drains: bool,
+    pub entries: Vec<crate::sync::TrashEntry>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingChange {
     pub file_id: NodeId,
@@ -2283,6 +2297,29 @@ impl Engine {
             let purge = crate::sync::purge_trash(&root, days, 0)?;
             let kept = crate::sync::trash_stats(&root);
             out.push(crate::sync::RegionTrash { region: b.folder_id.clone(), retention_days: days, purge, kept });
+        }
+        Ok(out)
+    }
+
+    /// D167 — what is in the trash of every folder this box has bound: the
+    /// trash is on this box's disk, so this is per box by nature. One entry
+    /// per root (a root bound twice is listed once), trash or no trash.
+    pub fn region_trash_lists(&self) -> Result<Vec<RegionTrashList>> {
+        let mut out: Vec<RegionTrashList> = Vec::new();
+        for b in self.local_bindings()? {
+            let root = uri_to_path(&b.source_uri)?;
+            if out.iter().any(|r| r.root == root) {
+                continue;
+            }
+            let catalogue = self.is_catalogue_region(&b.folder_id)?;
+            out.push(RegionTrashList {
+                label: self.get_node(&b.folder_id)?.map(|n| n.label).unwrap_or_default(),
+                retention_days: crate::sync::region_retention_days(&self.data_dir, &b.folder_id)?,
+                drains: catalogue && self.region_drains(&b.folder_id)?,
+                entries: crate::sync::list_trash(&root),
+                region: b.folder_id,
+                root,
+            });
         }
         Ok(out)
     }

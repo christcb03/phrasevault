@@ -324,6 +324,11 @@ enum Cmd {
     /// bytes (doc 26 phase 3)
     #[command(subcommand)]
     View(ViewCmd),
+    /// D167: what automated deletions moved aside on THIS box (each region's
+    /// `.pvfs-trash`), and putting it back. The trash is on the disk of the
+    /// box that holds the region — run this there.
+    #[command(subcommand)]
+    Trash(TrashCmd),
     /// Mount a tree read-only as a real filesystem (P7.3, doc 20 §3):
     /// directories from the catalog, file reads resolve live — local bytes,
     /// the sync store, else verified read-through. Blocks until unmounted.
@@ -1266,6 +1271,28 @@ enum ServeCmd {
         reconcile_secs: u64,
         #[arg(long, default_value_t = 2000)]
         debounce_ms: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashCmd {
+    /// Every trashed file on this box: the day it was trashed, the days
+    /// until it is purged, its size, its path as it was in the library.
+    /// PATH narrows to a file or a folder.
+    Ls { path: Option<String> },
+    /// Put a file — or a folder: every file under it — back where it was,
+    /// with its sidecar. Never over a file that is there. Bare, at a
+    /// terminal, it lists what there is and asks.
+    Restore {
+        /// As `pvfs trash ls` shows it, relative to the region's root
+        path: Option<String>,
+        /// The day (as `ls` shows it, the number) to restore from when the
+        /// same path was trashed on more than one; default: the newest
+        #[arg(long)]
+        from: Option<u64>,
+        /// Which region, by id prefix, when more than one has the path
+        #[arg(long)]
+        region: Option<String>,
     },
 }
 
@@ -6223,6 +6250,72 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 })
             }
         }
+        Cmd::Trash(cmd) => {
+            let engine = Engine::open(&ctx?)?;
+            let lists = engine.region_trash_lists()?;
+            engine.close()?;
+            let today = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() / 86_400)
+                .unwrap_or(0);
+            match cmd {
+                TrashCmd::Ls { path } => {
+                    let shown = trash_filter(&lists, path.as_deref(), None, None);
+                    if json {
+                        println!("{}", trash_json(&shown, today));
+                    } else {
+                        print_trash(&shown, today);
+                    }
+                    Ok(())
+                }
+                TrashCmd::Restore { path, from, region } => {
+                    let path = match path {
+                        Some(p) => p,
+                        None => {
+                            print_trash(&trash_filter(&lists, None, None, region.as_deref()), today);
+                            prompt_line("Path to restore (as listed; a folder restores everything under it)", None)?
+                        }
+                    };
+                    let mut has = trash_filter(&lists, Some(&path), from, region.as_deref());
+                    has.retain(|l| !l.entries.is_empty());
+                    let list = match has.len() {
+                        0 => {
+                            return Err(PvfsError::BadInput {
+                                field: "trash".into(),
+                                reason: format!("nothing in this box's trash at {path:?} — `pvfs trash ls` shows what there is"),
+                            })
+                        }
+                        1 => has.remove(0),
+                        _ => {
+                            for l in &has {
+                                eprintln!("  {}  {}  {}", &l.region[..12.min(l.region.len())], l.label, l.root.display());
+                            }
+                            let want = prompt_line("More than one region has that path — which (id prefix)", None)?;
+                            has.into_iter().find(|l| l.region.starts_with(&want)).ok_or_else(|| PvfsError::BadInput {
+                                field: "region".into(),
+                                reason: format!("no region here starts with {want:?}"),
+                            })?
+                        }
+                    };
+                    let done = pvfs_core::sync::restore_from_trash(&list.root, &path, from)?;
+                    for p in &done.restored {
+                        println!("restored\t{}", list.root.join(p).display());
+                    }
+                    for p in &done.in_the_way {
+                        println!("kept in the trash\t{p}\t(a file is already at {})", list.root.join(p).display());
+                    }
+                    if !done.restored.is_empty() {
+                        eprintln!(
+                            "{} file(s) back in {} — the region's next pass catalogues them{}",
+                            done.restored.len(),
+                            list.root.display(),
+                            if list.drains { "; this region DRAINS, so a file the library still holds will be drained again" } else { "" }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        }
         Cmd::View(ViewCmd::Resolve { dry_run }) => {
             let mut engine = Engine::open(&ctx?)?;
             // D145 — a staging copy goes only once the library's box serves
@@ -9289,6 +9382,106 @@ fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
 
 /// Raw bytes plus a human read — the raw number stays greppable, the unit
 /// makes 1.4 TiB legible where 1539000000000 is not.
+/// D167 — the lists narrowed to a path (a file, or everything under a
+/// folder), a day, a region id prefix.
+fn trash_filter(
+    lists: &[pvfs_core::RegionTrashList],
+    path: Option<&str>,
+    day: Option<u64>,
+    region: Option<&str>,
+) -> Vec<pvfs_core::RegionTrashList> {
+    let path = path.map(|p| p.trim_matches('/').to_string()).filter(|p| !p.is_empty());
+    lists
+        .iter()
+        .filter(|l| region.is_none_or(|r| l.region.starts_with(r)))
+        .map(|l| {
+            let mut l = l.clone();
+            l.entries.retain(|e| {
+                day.is_none_or(|d| d == e.day)
+                    && path.as_ref().is_none_or(|p| e.rel_path == *p || e.rel_path.starts_with(&format!("{p}/")))
+            });
+            l
+        })
+        .collect()
+}
+
+/// Days until a bucket is purged: `purge_trash` takes it once it is
+/// `retention_days` old.
+fn trash_days_left(day: u64, retention_days: u64, today: u64) -> u64 {
+    (day + retention_days).saturating_sub(today)
+}
+
+fn print_trash(lists: &[pvfs_core::RegionTrashList], today: u64) {
+    let mut files = 0usize;
+    for l in lists {
+        let bytes: u64 = l.entries.iter().map(|e| e.size_bytes).sum();
+        println!(
+            "{}  {}  {}  — {} file(s), {}; kept {} day(s){}",
+            &l.region[..12.min(l.region.len())],
+            if l.label.is_empty() { "-" } else { &l.label },
+            l.root.display(),
+            l.entries.len(),
+            fmt_bytes(bytes),
+            l.retention_days,
+            if l.drains { "; drains" } else { "" }
+        );
+        for e in &l.entries {
+            let left = trash_days_left(e.day, l.retention_days, today);
+            println!(
+                "  {} ({})\t{}\t{}\t{}",
+                day_to_date(e.day),
+                e.day,
+                if left == 0 { "purged at the next pass".to_string() } else { format!("purged in {left} d") },
+                fmt_bytes(e.size_bytes),
+                e.rel_path
+            );
+        }
+        files += l.entries.len();
+    }
+    if files == 0 {
+        eprintln!("(nothing in the trash on this box{})", if lists.is_empty() { " — no folder is bound here" } else { "" });
+    }
+}
+
+fn trash_json(lists: &[pvfs_core::RegionTrashList], today: u64) -> serde_json::Value {
+    serde_json::Value::Array(
+        lists
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "region": l.region,
+                    "label": l.label,
+                    "root": l.root.display().to_string(),
+                    "retention_days": l.retention_days,
+                    "drains": l.drains,
+                    "entries": l.entries.iter().map(|e| serde_json::json!({
+                        "day": e.day,
+                        "date": day_to_date(e.day),
+                        "days_left": trash_days_left(e.day, l.retention_days, today),
+                        "size_bytes": e.size_bytes,
+                        "path": e.rel_path,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Days since 1970-01-01 → `YYYY-MM-DD` (UTC; the civil-from-days algorithm),
+/// so an operator reading a trash bucket does not have to do it in their head.
+fn day_to_date(days: u64) -> String {
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 fn fmt_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if b < 1024 {
@@ -9383,6 +9576,19 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    // D167: a trash bucket's day number, as a date.
+    #[test]
+    fn a_trash_day_reads_as_a_date() {
+        assert_eq!(day_to_date(0), "1970-01-01");
+        assert_eq!(day_to_date(19_782), "2024-02-29");
+        assert_eq!(day_to_date(20_710), "2026-09-14");
+        assert_eq!(day_to_date(20_819), "2027-01-01");
+        // kept 7 days: a bucket goes once it is 7 days old (`purge_trash`)
+        assert_eq!(trash_days_left(20_710, 7, 20_713), 4);
+        assert_eq!(trash_days_left(20_710, 7, 20_717), 0);
+        assert_eq!(trash_days_left(20_710, 0, 20_710), 0);
     }
 
     // D165: `pvfs mount --view --cache-max 500G --cache-age 1d`.

@@ -210,6 +210,18 @@ file. D133 also settles the trash-age part of 7.4: `pvfs region retention
 <region> <days>` (default 7), applied by `resolve`. The rest of 7.4 stays
 open.*
 
+*D167 (2026-09-17): the trash can be read and undone.* `pvfs trash ls [PATH]`
+lists, for every folder bound on the box it runs on, each trashed file — the
+day, the days until the purge takes it, its size, its path as it was — and
+`pvfs trash restore <PATH> [--from DAY] [--region ID]` puts a file, or every
+file under a folder, back where it was with its sidecar; never over a file
+that is there, the newest day unless told otherwise; bare at a terminal it
+lists and asks. The trash is on the disk of the box that holds the region, so
+both are run there. A restored file is content at the region's next pass —
+and in a draining region it is drained again if the library still holds it.
+The trash is deliberately not in the merged view (`.pvfs-*` is ours, D166):
+four boxes' trash would land in one folder, in conflict with itself.
+
 *D145 (2026-09-12) amends both cells of the draining row, after the drain
 lost an arr upgrade on the first production day. The ladder, with no quality
 measured, preferred a larger library copy that the arr had deleted minutes

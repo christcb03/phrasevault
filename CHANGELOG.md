@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **`pvfs trash ls` and `pvfs trash restore` (D167).** Every automated
+  deletion moves the file aside (`<root>/.pvfs-trash/<day>/<its path>`,
+  sidecar beside it) — "recoverable by moving it back", by hand, and
+  browsable only because rclone showed the folder. Nothing listed it and
+  nothing put a file back. `pvfs trash ls [PATH] [--json]`: per bound folder
+  on this box, each trashed file with the day (as a date), the days until
+  the purge takes it, its size and its path as it was. `pvfs trash restore
+  <PATH> [--from DAY] [--region ID]`: a file, or every file under a folder,
+  back where it was with its sidecar — never over a file that is there (it
+  is reported and stays in the trash), the newest day unless `--from` names
+  one; bare at a terminal it lists and asks. A restored file is catalogued
+  at the region's next pass; in a draining region the command says it will
+  be drained again. Core: `sync::list_trash`, `sync::restore_from_trash`,
+  `Engine::region_trash_lists`. `pvfs-core/tests/d167_trash.rs`.
+
 - **The operator's dotfiles are content (D166).** `walk_disk` skipped every
   name that starts with a dot. That was how PVFS's own bookkeeping stayed out
   of the catalogue (doc 24 §2: "make the sidecar a dotfile so no walker has

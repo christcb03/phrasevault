@@ -62,6 +62,7 @@ pub use fs::{
     ReceiveItem,
     ReceiveSkip,
     RegionEntry,
+    RegionTrashList,
     RegionSnapshot,
     ResolveAction,
     ResolveReport,
