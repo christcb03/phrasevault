@@ -317,6 +317,10 @@ mv "\$V/show" "\$V/Show (2020)" 2>>"\$FT/d170.err" && echo M4=ok
 [ "\$(cat "\$V/Show (2020)/s1/e1.mkv")" = "e1e1" ] && echo M6=ok
 mkdir "\$V/Show (2020)/s2" 2>>"\$FT/d170.err" && mv "\$V/Show (2020)/s1/e1.mkv" "\$V/Show (2020)/s2/E01.mkv" 2>>"\$FT/d170.err" && echo M7=ok
 [ "\$(stat -c %s "\$V/Show (2020)/s2/E01.mkv" 2>/dev/null)" = "4" ] && [ ! -e "\$V/Show (2020)/s1/e1.mkv" ] && echo M8=ok
+# a folder MADE here becomes real on the edge when a file is renamed into it; emptied and removed
+# within the minute — before any head says the edge has it — the rmdir must still reach the edge
+mkdir "\$V/Show (2020)/s9" 2>>"\$FT/d170.err" && mv "\$V/Show (2020)/s2/E01.mkv" "\$V/Show (2020)/s9/E01.mkv" 2>>"\$FT/d170.err" \
+  && mv "\$V/Show (2020)/s9/E01.mkv" "\$V/Show (2020)/s2/E01.mkv" 2>>"\$FT/d170.err" && rmdir "\$V/Show (2020)/s9" 2>>"\$FT/d170.err" && echo M8B=ok
 rmdir "\$V/Show (2020)/s1" 2>>"\$FT/d170.err" && echo M9=ok
 rmdir "\$V/unused" 2>>"\$FT/d170.err" && echo M10=ok
 rmdir "\$V/sub" 2>/dev/null || echo M11=ok
@@ -330,6 +334,7 @@ has "$M_OUT" M1=ok && has "$M_OUT" M2=ok && has "$M_OUT" M3=ok && ok "a verified
 has "$M_OUT" M4=ok && has "$M_OUT" M5=ok && ok "a folder renamed with what is under it, listed at the new path at once" || fail "folder rename: $M_OUT $(merr)"
 has "$M_OUT" M6=ok && ok "a never-read file reads through at its NEW path (the edge finds its bytes: its rows followed the rename)" || fail "read after rename: $M_OUT $(merr)"
 has "$M_OUT" M7=ok && has "$M_OUT" M8=ok && ok "mkdir, then a verified move into the new folder (mergerfs's path clone)" || fail "mkdir+rename: $M_OUT $(merr)"
+has "$M_OUT" M8B=ok && ok "a folder made here, filled, emptied and removed within the minute" || fail "made/filled/emptied/removed: $M_OUT $(merr)"
 has "$M_OUT" M9=ok && has "$M_OUT" M10=ok && has "$M_OUT" M11=ok && ok "emptied folders are removed; one with a file in it stays" || fail "rmdir: $M_OUT $(merr)"
 has "$M_OUT" M12=ok && ok "chmod is accepted" || fail "chmod: $M_OUT $(merr)"
 [ "$(val "$M_OUT" TOP5)" = "Show (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && [ "$(val "$M_OUT" SHOW5)" = "s2," ] && ok "the mount lists exactly what was done" || fail "listing: $(val "$M_OUT" TOP5) / $(val "$M_OUT" SHOW5)"
@@ -339,12 +344,14 @@ L=\$FT/d130-edge-lib
 [ "\$(cat "\$L/Z - renamed.mkv")" = "zzz" ] && [ ! -e "\$L/z.mkv" ] && echo G1=ok
 [ "\$(cat "\$L/Show (2020)/s2/E01.mkv")" = "e1e1" ] && echo G2=ok
 [ ! -e "\$L/show" ] && [ ! -e "\$L/Show (2020)/s1" ] && [ ! -e "\$L/unused" ] && echo G3=ok
+[ ! -e "\$L/Show (2020)/s9" ] && echo G4=ok
 grep -c "pvfsd: renamed " "\$FT/d130-edge.log" | sed 's/^/RENAMED=/'
 grep -c "pvfsd: removed folder " "\$FT/d130-edge.log" | sed 's/^/REMOVED=/'
 EOS
 )
 has "$G_OUT" G1=ok && has "$G_OUT" G2=ok && has "$G_OUT" G3=ok && ok "the edge's disk agrees, file for file" || fail "edge disk: $G_OUT"
-[ "$(val "$G_OUT" RENAMED)" = "3" ] && [ "$(val "$G_OUT" REMOVED)" = "2" ] && ok "and its daemon logged who asked: 3 renames, 2 folders" || fail "edge log: $G_OUT"
+has "$G_OUT" G4=ok && ok "and the folder that was made, filled, emptied and removed is gone from the edge's disk — the rmdir reached it" || fail "s9 is still on the edge's disk: $G_OUT"
+[ "$(val "$G_OUT" RENAMED)" = "5" ] && [ "$(val "$G_OUT" REMOVED)" = "3" ] && ok "and its daemon logged who asked: 5 renames, 3 folders" || fail "edge log: $G_OUT"
 H_OUT=$(ssh "$OWNER" "bash -s" <<EOS
 $RH
 V=\$FT/d130-view

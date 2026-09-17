@@ -50,7 +50,11 @@ file tracks Layer 0, the file-system engine.
   rclone mount did; a truncate, a create and a write-open are still refused —
   new bytes arrive through `/mnt/local` and `receive`. D169's delete learned
   the same no-row rule (a file renamed a moment ago and then deleted answered
-  "gone" and stayed on disk).
+  "gone" and stayed on disk). A folder **made** through the mount remembers
+  which regions' holders have it for real by now — a rename into it makes the
+  holder create it — so an `rmdir` before the next head still reaches them
+  (the lab fleet: a season folder made, filled, emptied and removed within
+  the minute stayed on the store's disk).
 - **`pvfs trash restore` brings back every identical copy (D170).** One
   delete through the view trashes the same file in every region that held
   it, so a restore brings every one of those back — matched by **hash** (the
