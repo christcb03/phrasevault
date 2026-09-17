@@ -65,6 +65,16 @@ pub struct State {
     /// restart neither resets it nor advances it.
     #[serde(default)]
     pub job_errors_seen: BTreeMap<String, Seen>,
+    /// D161 — when each SENT error was first seen, `pin/job` → ms: the "after
+    /// N minutes" of its clear. Set at the first send of an episode; a
+    /// changed text does not move it.
+    #[serde(default)]
+    pub reported_since_ms: BTreeMap<String, u64>,
+    /// D161 — a sent error its job no longer reports, `pin/job` → the first
+    /// pass it was gone. Said cleared once gone for `JOB_ERROR_AFTER_MS`;
+    /// forgotten if the error comes back first (one episode, not two).
+    #[serde(default)]
+    pub job_errors_gone: BTreeMap<String, u64>,
 }
 
 /// A job's error and when this text of it was first seen.
@@ -75,7 +85,7 @@ pub struct Seen {
 }
 
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
-/// `supervise`, `job_error`, `heartbeat`, `test`.
+/// `supervise`, `job_error`, `job_error_cleared`, `heartbeat`, `test`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub event: String,
@@ -86,6 +96,11 @@ pub struct Event {
     pub detail: Option<String>,
     pub up: u32,
     pub down: u32,
+    /// D161 — `job_error_cleared` only: the first pass the error was gone, so
+    /// "after N minutes" is how long it lasted, not how long the clear waited.
+    /// Absent from every other event's payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
 }
 
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -185,6 +200,7 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
         detail: None,
         up,
         down,
+        until_ms: None,
     };
     for (pin, r) in &next.peers {
         let p = prev.and_then(|p| p.peers.get(pin));
@@ -221,21 +237,27 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
 /// counting records: every daemon start polls at once, so a burst of
 /// restarts writes several records seconds apart, and on 2026-09-13 that
 /// reported the peers' momentary "connection refused" (D151). Said once,
-/// and again only when the text changes, after that text's own wait; the
-/// memory clears when the error does. A peer that did not answer this
-/// pass keeps its memory: its jobs are unknown, not clear.
+/// and again only when the text changes, after that text's own wait. A
+/// peer that did not answer this pass keeps its memory: its jobs are
+/// unknown, not clear.
+///
+/// D161 — a SENT error that goes away is said cleared once it has been gone
+/// for the same `JOB_ERROR_AFTER_MS`, and only then forgotten. Back before
+/// that, it is one episode: nothing is said either way. An error that goes
+/// away before it was ever sent is forgotten at once, silently, as before.
 pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Event> {
     let (up, down) = counts(next);
     let mut out = Vec::new();
     let mut live: BTreeSet<String> = BTreeSet::new();
     for (pin, r) in &next.peers {
+        let mine = format!("{}/", short(pin));
         if !r.last.reachable {
-            let mine = format!("{}/", short(pin));
             live.extend(
                 state.job_errors_seen.keys().chain(state.reported_job_errors.keys()).filter(|k| k.starts_with(&mine)).cloned(),
             );
             continue;
         }
+        let mut present: BTreeSet<String> = BTreeSet::new();
         for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
             let err = j.last_error.clone().unwrap_or_default();
             // The stall detector's "overdue … not the same as stuck" is a
@@ -246,6 +268,9 @@ pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Eve
             }
             let key = format!("{}/{}", short(pin), j.name);
             live.insert(key.clone());
+            present.insert(key.clone());
+            // back before its clear was said: the same episode
+            state.job_errors_gone.remove(&key);
             let seen = state.job_errors_seen.entry(key.clone()).or_insert_with(|| Seen { error: err.clone(), first_seen_ms: now_ms });
             if seen.error != err {
                 // a different error: it waits its own time
@@ -266,12 +291,41 @@ pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Eve
                 detail: Some(format!("{}: {err}", j.name)),
                 up,
                 down,
+                until_ms: None,
             });
+            let first_seen_ms = seen.first_seen_ms;
+            state.reported_since_ms.entry(key.clone()).or_insert(first_seen_ms);
             state.reported_job_errors.insert(key, err);
+        }
+        // D161 — the sent errors this peer no longer reports.
+        let sent: Vec<String> =
+            state.reported_job_errors.keys().filter(|k| k.starts_with(&mine) && !present.contains(*k)).cloned().collect();
+        for key in sent {
+            let gone_ms = *state.job_errors_gone.entry(key.clone()).or_insert(now_ms);
+            if now_ms.saturating_sub(gone_ms) < JOB_ERROR_AFTER_MS {
+                live.insert(key); // not gone long enough to say so
+                continue;
+            }
+            let err = state.reported_job_errors.get(&key).cloned().unwrap_or_default();
+            let job = key.split_once('/').map_or("a job", |(_, j)| j);
+            out.push(Event {
+                event: "job_error_cleared".into(),
+                at_ms: now_ms,
+                peer: Some(short(pin)),
+                addr: Some(r.addr.clone()),
+                since_ms: state.reported_since_ms.get(&key).copied(),
+                detail: Some(format!("{job}: {err}")),
+                up,
+                down,
+                until_ms: Some(gone_ms),
+            });
+            // not in `live`: every memory of this episode goes below
         }
     }
     state.job_errors_seen.retain(|k, _| live.contains(k));
     state.reported_job_errors.retain(|k, _| live.contains(k));
+    state.reported_since_ms.retain(|k, _| live.contains(k));
+    state.job_errors_gone.retain(|k, _| live.contains(k));
     out
 }
 
@@ -299,6 +353,7 @@ pub fn heartbeat(state: &mut State, next: &FleetHealth, now_ms: u64) -> Option<E
         detail: Some(peers.join("; ")),
         up,
         down,
+        until_ms: None,
     })
 }
 
@@ -312,6 +367,7 @@ pub fn test_event(now_ms: u64) -> Event {
         detail: Some("pvfs fleet notify --test".into()),
         up: 0,
         down: 0,
+        until_ms: None,
     }
 }
 
@@ -359,6 +415,14 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
         "job_error" => {
             let (job, err) = ev.detail.as_deref().and_then(|d| d.split_once(": ")).unwrap_or(("a job", ""));
             format!("On {who}, the {job} job reports an error: {err}")
+        }
+        "job_error_cleared" => {
+            let (job, err) = ev.detail.as_deref().and_then(|d| d.split_once(": ")).unwrap_or(("a job", ""));
+            let lasted = match (ev.since_ms, ev.until_ms) {
+                (Some(s), Some(u)) => format!(", after {}", minutes(u.saturating_sub(s))),
+                _ => String::new(),
+            };
+            format!("On {who}, the {job} job's error has cleared{lasted}. It had reported: {err}")
         }
         "heartbeat" => {
             if ev.down == 0 {

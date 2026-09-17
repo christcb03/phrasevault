@@ -82,8 +82,13 @@ fn a_supervise_action_and_a_new_job_error_are_each_said_once() {
     assert!(notify::job_errors(&mut st, &r4, 364_000).is_empty(), "a persisting error is said once");
     let mut r5 = r4.clone();
     r5.observe(&a, "10.0.0.9:7433", None, 484_000, up());
-    assert!(notify::job_errors(&mut st, &r5, 484_000).is_empty());
-    assert!(st.reported_job_errors.is_empty(), "cleared with the error, so it can be said again later");
+    assert!(notify::job_errors(&mut st, &r5, 484_000).is_empty(), "D161: gone one pass is not yet cleared");
+    let mut r6 = r5.clone();
+    r6.observe(&a, "10.0.0.9:7433", None, 724_000, up());
+    let ev = notify::job_errors(&mut st, &r6, 724_000);
+    assert_eq!(ev.len(), 1, "D161: gone four minutes, the clear is said");
+    assert_eq!(ev[0].event, "job_error_cleared");
+    assert!(st.reported_job_errors.is_empty(), "cleared with the clear, so it can be said again later");
 }
 
 #[test]

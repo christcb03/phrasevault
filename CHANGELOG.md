@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **An alert that reached the phone says when it has cleared (D161).** The
+  owner's notifier had no event for a job error going away: `job_errors`
+  dropped its memory on the first clean pass, silently, and the same text
+  back a minute later was a new alert. A sent job error that is gone for
+  `JOB_ERROR_AFTER_MS` (210 s, the wait an error has before it is said) now
+  sends `job_error_cleared` (info), with `detail` = the text last sent,
+  `since_ms` = the episode's first sighting and a new `until_ms` = its first
+  clean pass, and the summary "On the NAS, the receive job's error has
+  cleared, after 12 minutes. It had reported: …". Back inside the wait it is
+  one episode: nothing is said either way. An error that cleared before it
+  was sent is still never mentioned. `notify-state.json` gains
+  `reported_since_ms` and `job_errors_gone` (both default, so an old file
+  loads); `until_ms` is omitted from every other event's payload. Home
+  Assistant's automation sends it, and `peer_up`, titled ✅ (PVOS D161).
+
 - **A log region's deletions ask the disk whether a file is gone (D160).**
   The deletion step of a log-region pass (`scan_binding` step 3) retired
   each tracked location the walk had not listed if `Path::exists` was
