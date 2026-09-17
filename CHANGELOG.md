@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One box, one client identity, however many ask at once (D163).**
+  `client_identity_mnemonic` made the phrase with a check, a `File::create`
+  and a write. Two callers that found no file — the CLI beside a daemon job
+  on a box's first start; two tests of one binary — each wrote a phrase, the
+  second `create` truncated the first's, and a write could land on top of
+  the other's (a 25-word file). The loser kept a phrase the file no longer
+  held, so its next dial was a stranger's: "forbidden: log replication
+  requires admin rights on the forest root" from a box that had authorized
+  the file's phrase (GitHub CI, `serve_jobs`, twice on 2026-09-16; the
+  tests were the two callers, not the fleet — every box made its phrase at
+  enrollment). Now each writer fills a private file (0600, fsync) and links
+  it into place; the link fails for the second, which reads the first's.
+  Nobody reads a phrase mid-write and nobody keeps one the file does not
+  hold. `pvfs-core/tests/d163_identity_race.rs`; `serve_jobs.rs` makes the
+  identity inside its once.
+
 - **SQLite's scratch files go beside the database (D162).** A sort too big
   for the page cache spills to a temp file, which SQLite put in `/var/tmp` or
   `/tmp`. On the QNAP that is a 64 MB RAM disk with about 25 MB free, and on

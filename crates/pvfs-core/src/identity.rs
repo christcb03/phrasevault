@@ -52,29 +52,59 @@ pub fn config_dir() -> Result<std::path::PathBuf> {
 /// network connection authenticates as. Forest device keys never dial
 /// (doc 18 §4); this is the key that does. Moved here from the CLI so the
 /// daemon's background jobs (P5) share one identity with the CLI.
+///
+/// D163: creation is first-writer-wins. Two callers that find no file (the
+/// CLI beside a daemon job on a box's first start; two tests of one binary)
+/// each write a whole phrase to a private file and link it into place. The
+/// link fails for whoever came second, who then reads the first's. Nobody
+/// reads a phrase mid-write, and nobody keeps a phrase the file does not
+/// hold. Before D163 `File::create` truncated whichever phrase was there and
+/// the loser's write could land on top of the winner's — a 25-word file, and
+/// a dial as a stranger (GitHub CI, `serve_jobs`, 2026-09-16).
 pub fn client_identity_mnemonic() -> Result<Mnemonic> {
     let path = config_dir()?.join("identity.phrase");
-    if path.exists() {
-        let phrase =
-            std::fs::read_to_string(&path).map_err(|e| PvfsError::io("read identity", e))?;
-        return parse_mnemonic(phrase.trim());
-    }
     let dir = path.parent().unwrap();
-    std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
-    let mn = generate_mnemonic()?;
-    let f = std::fs::File::create(&path).map_err(|e| PvfsError::io("create identity", e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| PvfsError::io("chmod identity", e))?;
+    // The loop runs again only when another writer landed first, and then
+    // the read succeeds; the bound is for a file that keeps disappearing.
+    for _ in 0..8 {
+        match std::fs::read_to_string(&path) {
+            Ok(phrase) => return parse_mnemonic(phrase.trim()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PvfsError::io("read identity", e)),
+        }
+        std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
+        let mn = generate_mnemonic()?;
+        let mine = dir.join(format!(
+            ".identity.phrase.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&mine).map_err(|e| PvfsError::io("create identity", e))?;
+        let written = f
+            .write_all(format!("{mn}\n").as_bytes())
+            .and_then(|()| f.sync_all());
+        drop(f);
+        let placed = written.and_then(|()| std::fs::hard_link(&mine, &path));
+        let _ = std::fs::remove_file(&mine);
+        match placed {
+            Ok(()) => return Ok(mn),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(PvfsError::io("write identity", e)),
+        }
     }
-    {
-        let mut f = &f;
-        f.write_all(format!("{mn}\n").as_bytes())
-            .map_err(|e| PvfsError::io("write identity", e))?;
-    }
-    Ok(mn)
+    Err(PvfsError::Identity {
+        detail: format!("{} keeps disappearing while it is made", path.display()),
+    })
 }
 
 /// Parse a user-supplied mnemonic phrase.
