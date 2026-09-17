@@ -41,7 +41,9 @@ VA=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --version" 2>&1); VB=$(ssh "$EDGE" "\"$LABBI
 [ "$VA" = "$VB" ] && ok "both boxes run the same build ($VA)" || fail "builds differ: A=$VA B=$VB"
 for h in "$OWNER" "$EDGE"; do
   ssh "$h" "\"$LABBIN/pvfs\" mount --help >/dev/null 2>&1" && ok "$h has pvfs mount" || fail "$h: not a D130 build"
-  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d130" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d130-*; mkdir -p "$HOME/fleet-test"' \
+  # an aborted run leaves its mounts up (the gate exits before the teardown): a view mount
+  # that outlives its data dir goes on listing the LAST run's files to this one
+  ssh "$h" 'for m in d130-union d130-view; do fusermount3 -uz "$HOME/fleet-test/$m" 2>/dev/null; done; pkill -f "mount --view $HOME/fleet-test/d130" 2>/dev/null; pkill -f "pvfsd --mount $HOME/fleet-test/d130" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d130-*; mkdir -p "$HOME/fleet-test"' \
     && ok "$h: clean slate" || fail "$h: clean slate"
 done
 AKEY=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --json whoami" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
@@ -249,13 +251,13 @@ V=\$FT/d130-view
 rm "\$V/z.mkv" 2>"\$FT/d169-rm.err" && echo X1=ok
 [ -e "\$V/z.mkv" ] || echo X2=ok
 echo "TOP3=\$(ls "\$V" | tr '\n' ' ')"
-mv "\$V/a.mkv" "\$V/renamed.mkv" 2>/dev/null || echo X3=ok
+( : > "\$V/new.mkv" ) 2>/dev/null || echo X3=ok
 [ "\$(cat "\$V/a.mkv")" = "aaa" ] && echo X4=ok
 EOS
 )
 has "$X_OUT" X1=ok && ok "rm of z.mkv (only the edge holds it) through the owner's mount succeeded" || fail "rm through the mount: $X_OUT $(ssh "$OWNER" 'cat $HOME/fleet-test/d169-rm.err; tail -2 $HOME/fleet-test/d130-view.log')"
 has "$X_OUT" X2=ok && [ "$(val "$X_OUT" TOP3)" = "a.mkv big.mkv empty season sub unused x.mkv " ] && ok "and it is gone from the mount at once" || fail "still listed: $(val "$X_OUT" TOP3)"
-has "$X_OUT" X3=ok && has "$X_OUT" X4=ok && ok "rename is still refused; a.mkv is where it was" || fail "rename: $X_OUT"
+has "$X_OUT" X3=ok && has "$X_OUT" X4=ok && ok "a write is still refused; a.mkv reads" || fail "write: $X_OUT"
 Y_OUT=$(ssh "$EDGE" "bash -s" <<EOS
 $RH
 L=\$FT/d130-edge-lib
@@ -292,6 +294,130 @@ EOS
 )
 has "$B_OUT" B1=ok && ok "and z.mkv is back in the owner's mount, readable — the delete's tombstone did not outlive it" || fail "z.mkv never came back: $B_OUT"
 gate delete
+
+say "E4 (D170): renames and folders through the owner's mount, done on the EDGE's disk — seen at once, and still right after the head"
+ssh "$EDGE" 'L=$HOME/fleet-test/d130-edge-lib; mkdir -p "$L/show/s1"; printf e1e1 > "$L/show/s1/e1.mkv"' && ok "show/s1/e1.mkv added on the edge"
+N_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+for _ in \$(seq 1 120); do [ "\$(vpaths "\$D" show/s1)" = "show/s1/e1.mkv" ] && { echo N1=ok; break; }; ls "\$V" >/dev/null; sleep 2; done
+echo "HEAD=\$(rstat "\$D" "$EDGESHELF" | cut -d/ -f2)"
+EOS
+)
+has "$N_OUT" N1=ok && ok "the owner's catalogue lists it (never read: its bytes are only on the edge)" || fail "show never arrived: $N_OUT"
+MHEAD=$(val "$N_OUT" HEAD)
+M_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+mv "\$V/z.mkv" "\$V/Z - renamed.mkv" 2>"\$FT/d170.err" && echo M1=ok
+[ "\$(stat -c %s "\$V/Z - renamed.mkv" 2>/dev/null)" = "3" ] && [ ! -e "\$V/z.mkv" ] && echo M2=ok
+[ "\$(cat "\$V/Z - renamed.mkv")" = "zzz" ] && echo M3=ok
+mv "\$V/show" "\$V/Show (2020)" 2>>"\$FT/d170.err" && echo M4=ok
+[ "\$(ls "\$V/Show (2020)/s1" | tr '\n' ' ')" = "e1.mkv " ] && [ ! -e "\$V/show" ] && echo M5=ok
+[ "\$(cat "\$V/Show (2020)/s1/e1.mkv")" = "e1e1" ] && echo M6=ok
+mkdir "\$V/Show (2020)/s2" 2>>"\$FT/d170.err" && mv "\$V/Show (2020)/s1/e1.mkv" "\$V/Show (2020)/s2/E01.mkv" 2>>"\$FT/d170.err" && echo M7=ok
+[ "\$(stat -c %s "\$V/Show (2020)/s2/E01.mkv" 2>/dev/null)" = "4" ] && [ ! -e "\$V/Show (2020)/s1/e1.mkv" ] && echo M8=ok
+rmdir "\$V/Show (2020)/s1" 2>>"\$FT/d170.err" && echo M9=ok
+rmdir "\$V/unused" 2>>"\$FT/d170.err" && echo M10=ok
+rmdir "\$V/sub" 2>/dev/null || echo M11=ok
+chmod 664 "\$V/Z - renamed.mkv" 2>>"\$FT/d170.err" && echo M12=ok
+echo "TOP5=\$(LC_ALL=C ls "\$V" | tr '\n' ',')"
+echo "SHOW5=\$(LC_ALL=C ls "\$V/Show (2020)" | tr '\n' ',')"
+EOS
+)
+merr() { ssh "$OWNER" 'cat $HOME/fleet-test/d170.err; tail -3 $HOME/fleet-test/d130-view.log'; }
+has "$M_OUT" M1=ok && has "$M_OUT" M2=ok && has "$M_OUT" M3=ok && ok "a verified move of z.mkv (the edge's): the new name is there with its size AT ONCE, reads, and the old one is gone" || fail "file rename: $M_OUT $(merr)"
+has "$M_OUT" M4=ok && has "$M_OUT" M5=ok && ok "a folder renamed with what is under it, listed at the new path at once" || fail "folder rename: $M_OUT $(merr)"
+has "$M_OUT" M6=ok && ok "a never-read file reads through at its NEW path (the edge finds its bytes: its rows followed the rename)" || fail "read after rename: $M_OUT $(merr)"
+has "$M_OUT" M7=ok && has "$M_OUT" M8=ok && ok "mkdir, then a verified move into the new folder (mergerfs's path clone)" || fail "mkdir+rename: $M_OUT $(merr)"
+has "$M_OUT" M9=ok && has "$M_OUT" M10=ok && has "$M_OUT" M11=ok && ok "emptied folders are removed; one with a file in it stays" || fail "rmdir: $M_OUT $(merr)"
+has "$M_OUT" M12=ok && ok "chmod is accepted" || fail "chmod: $M_OUT $(merr)"
+[ "$(val "$M_OUT" TOP5)" = "Show (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && [ "$(val "$M_OUT" SHOW5)" = "s2," ] && ok "the mount lists exactly what was done" || fail "listing: $(val "$M_OUT" TOP5) / $(val "$M_OUT" SHOW5)"
+G_OUT=$(ssh "$EDGE" "bash -s" <<EOS
+$RH
+L=\$FT/d130-edge-lib
+[ "\$(cat "\$L/Z - renamed.mkv")" = "zzz" ] && [ ! -e "\$L/z.mkv" ] && echo G1=ok
+[ "\$(cat "\$L/Show (2020)/s2/E01.mkv")" = "e1e1" ] && echo G2=ok
+[ ! -e "\$L/show" ] && [ ! -e "\$L/Show (2020)/s1" ] && [ ! -e "\$L/unused" ] && echo G3=ok
+grep -c "pvfsd: renamed " "\$FT/d130-edge.log" | sed 's/^/RENAMED=/'
+grep -c "pvfsd: removed folder " "\$FT/d130-edge.log" | sed 's/^/REMOVED=/'
+EOS
+)
+has "$G_OUT" G1=ok && has "$G_OUT" G2=ok && has "$G_OUT" G3=ok && ok "the edge's disk agrees, file for file" || fail "edge disk: $G_OUT"
+[ "$(val "$G_OUT" RENAMED)" = "3" ] && [ "$(val "$G_OUT" REMOVED)" = "2" ] && ok "and its daemon logged who asked: 3 renames, 2 folders" || fail "edge log: $G_OUT"
+H_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+for _ in \$(seq 1 120); do
+  [ "\$(vpaths "\$D" "")" = "Show (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv" ] && [ "\$(vpaths "\$D" "Show (2020)/s2")" = "Show (2020)/s2/E01.mkv" ] && { echo H1=ok; break; }
+  ls "\$V" >/dev/null; sleep 2
+done
+echo "HEAD=\$(rstat "\$D" "$EDGESHELF" | cut -d/ -f2)"
+sleep 6
+echo "TOP6=\$(LC_ALL=C ls "\$V" | tr '\n' ',')"
+[ "\$(cat "\$V/Show (2020)/s2/E01.mkv")" = "e1e1" ] && [ "\$(cat "\$V/Z - renamed.mkv")" = "zzz" ] && echo H2=ok
+EOS
+)
+has "$H_OUT" H1=ok && [ "$(val "$H_OUT" HEAD)" -gt "$MHEAD" ] && ok "the edge published what it did (head $MHEAD → $(val "$H_OUT" HEAD)) and the owner's catalogue says the same" || fail "catalogue never agreed: $H_OUT"
+[ "$(val "$H_OUT" TOP6)" = "Show (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && has "$H_OUT" H2=ok && ok "and the mount shows the same thing it showed from memory — and reads it" || fail "after the head: $H_OUT"
+gate rename
+
+say "E5 (D170): the same through a REAL mergerfs union — feederbox's options, <local>=RW : <the view>=NC"
+U_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view; U=\$FT/d130-union; LB=\$FT/d130-union-local
+command -v mergerfs >/dev/null || { echo NO_MERGERFS=1; exit 0; }
+# the arr's union: the show's folder exists on the local branch too (an import landed there once)
+mkdir -p "\$U" "\$LB/Show (2020)"
+mergerfs -o category.create=ff,async_read=true,cache.files=partial -o category.action=epall,category.search=ff \
+  -o dropcacheonclose=true,minfreespace=0,fsname=d130union -o xattr=nosys,statfs=base,statfs_ignore=nc,noatime \
+  -o func.readdir=seq "\$LB=RW:\$V=NC" "\$U" 2>"\$FT/d170-union.err" && echo U0=ok
+echo "MERGERFS=\$(mergerfs --version | head -1)"
+S="\$U/Show (2020)"
+# 1. "Rename files": a verified move of a file that is on the view's branch only
+mv "\$S/s2/E01.mkv" "\$S/s2/Show - S02E01.mkv" 2>>"\$FT/d170-union.err" && [ "\$(stat -c %s "\$S/s2/Show - S02E01.mkv")" = "4" ] && [ ! -e "\$S/s2/E01.mkv" ] && echo U1=ok
+[ "\$(cat "\$S/s2/Show - S02E01.mkv")" = "e1e1" ] && echo U2=ok
+# 2. into a season folder the arr just made: it lands on the LOCAL branch, so mergerfs clones the path onto ours first
+mkdir "\$S/s3" 2>>"\$FT/d170-union.err" && [ -d "\$LB/Show (2020)/s3" ] && echo U3=ok
+mv "\$S/s2/Show - S02E01.mkv" "\$S/s3/Show - S03E01.mkv" 2>>"\$FT/d170-union.err" && [ "\$(stat -c %s "\$S/s3/Show - S03E01.mkv")" = "4" ] && echo U4=ok
+[ -e "\$LB/Show (2020)/s3/Show - S03E01.mkv" ] && echo U4_ON_LOCAL=1   # it must NOT have been copied to local
+# 3. "delete empty folders"
+rmdir "\$S/s2" 2>>"\$FT/d170-union.err" && [ ! -e "\$S/s2" ] && echo U5=ok
+# 4. the series folder renamed: it exists on BOTH branches, mergerfs renames on each
+mv "\$S" "\$U/Show Renamed (2020)" 2>>"\$FT/d170-union.err" && [ -d "\$LB/Show Renamed (2020)" ] && [ ! -e "\$S" ] && echo U6=ok
+[ "\$(cat "\$U/Show Renamed (2020)/s3/Show - S03E01.mkv")" = "e1e1" ] && echo U7=ok
+# 5. an upgrade: the old file deleted (D169), the new one created at the same path — on the local branch
+rm "\$U/Z - renamed.mkv" 2>>"\$FT/d170-union.err" && [ ! -e "\$U/Z - renamed.mkv" ] && echo U8=ok
+printf 'upgraded' > "\$U/Z - renamed.mkv" 2>>"\$FT/d170-union.err" && [ "\$(cat "\$U/Z - renamed.mkv")" = "upgraded" ] && [ -f "\$LB/Z - renamed.mkv" ] && echo U9=ok
+# 6. "set permissions" on a library file
+chmod 664 "\$U/x.mkv" 2>>"\$FT/d170-union.err" && echo U10=ok
+echo "UTOP=\$(LC_ALL=C ls "\$U" | tr '\n' ',')"
+fusermount3 -u "\$U" 2>/dev/null || fusermount -u "\$U" 2>/dev/null; echo U11=ok
+EOS
+)
+if has "$U_OUT" NO_MERGERFS=1; then
+  ok "mergerfs is not on the owner — the union rehearsal is skipped (not a failure)"
+else
+  uerr() { ssh "$OWNER" 'cat $HOME/fleet-test/d170-union.err; tail -4 $HOME/fleet-test/d130-view.log'; }
+  has "$U_OUT" U0=ok && ok "a union of a local folder (RW) and the view (NC), with feederbox's options ($(val "$U_OUT" MERGERFS))" || fail "mergerfs mount: $(uerr)"
+  has "$U_OUT" U1=ok && has "$U_OUT" U2=ok && ok "through the union: a verified move in place, and it reads" || fail "union rename: $U_OUT $(uerr)"
+  has "$U_OUT" U3=ok && has "$U_OUT" U4=ok && ! has "$U_OUT" U4_ON_LOCAL=1 && ok "a new season folder lands on local; the rename into it stays on the view's branch (the path clone → our mkdir)" || fail "union rename into a new folder: $U_OUT $(uerr)"
+  has "$U_OUT" U5=ok && ok "the emptied season folder is removed" || fail "union rmdir: $U_OUT $(uerr)"
+  has "$U_OUT" U6=ok && has "$U_OUT" U7=ok && ok "the series folder, present on BOTH branches, renames on both — and the episode reads under the new name" || fail "union folder rename: $U_OUT $(uerr)"
+  has "$U_OUT" U8=ok && has "$U_OUT" U9=ok && ok "an upgrade: the old file deleted through the union, the new one created at the same path (on local)" || fail "union upgrade: $U_OUT $(uerr)"
+  has "$U_OUT" U10=ok && ok "chmod of a library file through the union" || fail "union chmod: $U_OUT $(uerr)"
+  [ "$(val "$U_OUT" UTOP)" = "Show Renamed (2020),Z - renamed.mkv,a.mkv,big.mkv,empty,season,sub,x.mkv," ] && ok "the union lists exactly what was done" || fail "union listing: $(val "$U_OUT" UTOP)"
+  J_OUT=$(ssh "$EDGE" "bash -s" <<EOS
+$RH
+L=\$FT/d130-edge-lib
+[ "\$(cat "\$L/Show Renamed (2020)/s3/Show - S03E01.mkv")" = "e1e1" ] && [ ! -e "\$L/Show (2020)" ] && [ ! -e "\$L/Show Renamed (2020)/s2" ] && echo J1=ok
+[ ! -e "\$L/Z - renamed.mkv" ] && "\$B/pvfs" --data-dir "\$RD" trash ls 2>/dev/null | grep -q "Z - renamed.mkv" && echo J2=ok
+EOS
+)
+  has "$J_OUT" J1=ok && ok "the edge's disk: the episode is at Show Renamed (2020)/s3, the old folders are gone" || fail "edge disk after the union: $J_OUT"
+  has "$J_OUT" J2=ok && ok "and the upgraded-away file is in the edge's trash" || fail "edge trash after the union: $J_OUT"
+fi
+gate union
 
 say "F: the edge goes down — the fetched copy still reads, an unfetched one fails within the bound, ls stays instant"
 STOP=$(ssh "$EDGE" "bash -s" <<EOS

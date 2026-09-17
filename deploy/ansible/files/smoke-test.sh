@@ -1090,20 +1090,33 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   [ "$(ls "$DATA/view-mnt" | tr '\n' ' ')" = "also c.mkv empty sub " ] && ok "the union is listed: also/ c.mkv empty/ sub/" \
     || fail "view mount ls: $(ls "$DATA/view-mnt" | tr '\n' ' ')"
   [ "$(stat -c %s "$DATA/view-mnt/c.mkv")" = "20000" ] && ok "c.mkv shows the served copy's size" || fail "c.mkv size"
-  mv "$DATA/view-mnt/c.mkv" "$DATA/view-mnt/renamed.mkv" 2>/dev/null && fail "the view must refuse a rename" || ok "the view refuses a rename"
   ( : > "$DATA/view-mnt/new.mkv" ) 2>/dev/null && fail "the view must refuse a write" || ok "the view refuses a write"
+  # D170 — what an arr does to a file it did not just create: a verified
+  # move (the new name is there and reads at once; the old one is gone), a
+  # folder made and removed, a chmod. The box that holds the file does it.
+  mv "$DATA/view-mnt/sub/b.mkv" "$DATA/view-mnt/sub/B - renamed.mkv" 2>/dev/null \
+    && [ "$(cat "$DATA/view-mnt/sub/B - renamed.mkv" 2>/dev/null)" = "catcat" ] && [ ! -e "$DATA/view-mnt/sub/b.mkv" ] \
+    && ok "D170: a rename through the view — the new name reads at once, the old one is gone" \
+    || fail "D170: rename through the view: $(tail -2 "$DATA/view-mount.log")"
+  [ -f "$CATLIB/sub/B - renamed.mkv" ] && [ ! -e "$CATLIB/sub/b.mkv" ] && ok "D170: the file moved on its holder's disk" || fail "D170: the disk does not agree"
+  mkdir "$DATA/view-mnt/sub/Season 02" 2>/dev/null && mv "$DATA/view-mnt/sub/B - renamed.mkv" "$DATA/view-mnt/sub/Season 02/b.mkv" 2>/dev/null \
+    && [ -f "$CATLIB/sub/Season 02/b.mkv" ] && ok "D170: renamed into a folder made through the view (mergerfs's path clone)" \
+    || fail "D170: mkdir + rename into it: $(tail -2 "$DATA/view-mount.log")"
+  mv "$DATA/view-mnt/sub/Season 02/b.mkv" "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && rmdir "$DATA/view-mnt/sub/Season 02" 2>/dev/null \
+    && [ ! -e "$CATLIB/sub/Season 02" ] && [ "$(cat "$DATA/view-mnt/sub/b.mkv" 2>/dev/null)" = "catcat" ] \
+    && ok "D170: renamed back, and the emptied folder removed — on disk too" || fail "D170: rename back / rmdir: $(tail -2 "$DATA/view-mount.log")"
+  rmdir "$DATA/view-mnt/sub" 2>/dev/null && fail "D170: a folder with a file in it must stay" || ok "D170: a folder with a file in it stays"
+  chmod 664 "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && ok "D170: a chmod is accepted (and ignored, as the rclone mount did)" || fail "D170: chmod refused"
   # D169 — the one namespace op the view takes: a delete (an arr's upgrade
   # removes the old file first) is a trip to the region's trash, and the
   # path is gone from the mount at once; `pvfs trash restore` undoes it.
   rm "$DATA/view-mnt/sub/b.mkv" 2>/dev/null && ok "D169: a delete through the view succeeds" || fail "D169: rm through the view: $(tail -2 "$DATA/view-mount.log")"
   [ -e "$DATA/view-mnt/sub/b.mkv" ] && fail "D169: still listed after the delete" || ok "D169: and the path is gone from the mount at once"
   $PVFS trash ls | qgrep 'sub/b.mkv' && ok "D169: it is in its region's trash (pvfs trash ls)" || fail "D169: not in the trash: $($PVFS trash ls 2>&1 | tail -3)"
-  # catlib2's older copy of the same path is in ITS trash since the D127
-  # resolve section, so the region is named — restoring both would hand
-  # the later resolve checks a redundant copy back.
-  # (captured first: the command fails by design, and this script runs with pipefail)
-  RESTORE_OUT="$($PVFS trash restore sub/b.mkv 2>&1 || true)"
-  printf '%s' "$RESTORE_OUT" | qgrep 'pass --region' && ok "D169: two regions have it in their trash: a script is told to name one" || fail "D169: restore without --region: $RESTORE_OUT"
+  # catlib2's copy of the same path — the same bytes — is in ITS trash since
+  # the D127 resolve section. D170: a restore brings back every IDENTICAL
+  # copy, which here would hand the later resolve checks that redundant copy
+  # again; so this one names its region (the rule itself: d167_trash.rs).
   $PVFS trash restore sub/b.mkv --region "$(printf '%s' "$CAT" | cut -c1-12)" | qgrep '^restored' && ok "D169: and pvfs trash restore --region puts it back" || fail "D169: restore"
   $PVFS umount "$DATA/view-mnt" >/dev/null 2>&1 || fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true
   wait "$VPID" 2>/dev/null || true

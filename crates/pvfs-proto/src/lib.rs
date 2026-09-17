@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 ///   8 → 9: D169 `TrashPath` — a delete that came through a view mount asks
 ///          the box that holds the file to move it to its region's trash.
 ///          Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 9;
+///   9 → 10: D170 `RenamePath` and `RemoveDir` — a rename and an `rmdir`
+///          that came through a view mount, done by the box that holds the
+///          files. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 10;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -101,6 +104,13 @@ pub enum ServerMsg {
     /// this box catalogues the region and holds nothing at that path (already
     /// gone: not an error).
     Trashed { moved: bool },
+    /// D170: the answer to `ClientMsg::RenamePath` — `moved` is false when
+    /// there was nothing left to do (already renamed, or nothing at either
+    /// path: not an error).
+    Renamed { moved: bool },
+    /// D170: the answer to `ClientMsg::RemoveDir` — `removed` is false when
+    /// the folder was not on this box's disk (not an error).
+    DirRemoved { removed: bool },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
     /// P9 (doc 22): the chunk manifest for a file this holder can read —
@@ -435,6 +445,29 @@ pub enum ClientMsg {
         rel_path: String,
         hash: String,
     },
+    /// D170: a rename that came through a view mount. Move THIS box's copy
+    /// of `from` to `to` inside catalogue region `region`, on its own disk —
+    /// a folder (`dir`) with everything under it; a file only when it is
+    /// still the one the caller saw (`hash`, `size`). **Write-gated** on the
+    /// region. `not_found` = this box does not catalogue that region from
+    /// its own disk (ask the next box); `conflict` = what is there changed;
+    /// `exists` = something is already at `to`.
+    RenamePath {
+        region: String,
+        from: String,
+        to: String,
+        #[serde(default)]
+        dir: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        size: u64,
+    },
+    /// D170: an `rmdir` that came through a view mount. Remove THIS box's
+    /// folder `rel_path` of catalogue region `region` when it holds nothing
+    /// of the operator's (PVFS's own names and litter go to the trash).
+    /// **Write-gated** on the region. `not_found` as above; `not_empty`.
+    RemoveDir { region: String, rel_path: String },
     /// P9 (doc 22): the file's chunk manifest — BLAKE3 per 8 MiB chunk,
     /// computed from the holder's bytes (sidecar-cached). UNSIGNED and
     /// advisory: it steers parallel pulls and resume; the catalog hash

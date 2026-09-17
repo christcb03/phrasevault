@@ -1032,6 +1032,90 @@ pub fn restore_from_trash(root: &Path, rel: &str, day: Option<u64>) -> Result<Tr
     Ok(out)
 }
 
+/// D170 — what [`restore_identical`] did across several roots.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RestoreIdentical {
+    /// One per root, in the order given.
+    pub per_root: Vec<TrashRestore>,
+    /// Left in the trash on purpose: (root index, path) — that root's
+    /// trashed file at the path is a DIFFERENT file from the one restored.
+    pub different: Vec<(usize, String)>,
+}
+
+/// The hash of a file in the trash: its sidecar's (it travelled with the
+/// file), else the bytes' own — a read, which a restore can afford.
+fn trashed_hash(file: &Path) -> Option<String> {
+    let size = std::fs::metadata(file).ok()?.len();
+    if let Some(h) = sidecar_whole_hash(file, size) {
+        return Some(h);
+    }
+    let mut f = std::fs::File::open(file).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut f, &mut hasher).ok()?;
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// D170 — restore `rel` on a box where MORE THAN ONE region may have it in
+/// its trash. One delete through the view trashes the same file in every
+/// region that held it, so a restore brings every one of those back: for
+/// each path, the newest trashed file across `roots`, and every other root's
+/// copy **with the same hash**. A root whose trashed file at that path is a
+/// different file (an older encode `resolve` retired, say) is left alone and
+/// reported — restoring everything unasked resurrected exactly that (D169).
+/// A path only one root has is restored without reading anything.
+pub fn restore_identical(roots: &[&Path], rel: &str, day: Option<u64>) -> Result<RestoreIdentical> {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() || rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return Err(bad("trash", "name a path as `pvfs trash ls` shows it, relative to the region's root"));
+    }
+    let inside = format!("{rel}/");
+    // path → (root index → the newest day that root has it from)
+    let mut found: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, u64>> =
+        std::collections::BTreeMap::new();
+    for (i, root) in roots.iter().enumerate() {
+        for e in list_trash(root) {
+            if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && day.is_none_or(|d| d == e.day) {
+                let d = found.entry(e.rel_path).or_default().entry(i).or_insert(e.day);
+                *d = (*d).max(e.day);
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(bad(
+            "trash",
+            &match day {
+                Some(d) => format!("nothing in the trash at {rel} from day {d}"),
+                None => format!("nothing in the trash at {rel}"),
+            },
+        ));
+    }
+    let mut out = RestoreIdentical { per_root: vec![TrashRestore::default(); roots.len()], different: Vec::new() };
+    for (path, holders) in found {
+        let chosen: Vec<(usize, u64)> = if holders.len() == 1 {
+            holders.into_iter().collect()
+        } else {
+            let newest = holders.values().copied().max().unwrap_or(0);
+            let hashed: Vec<(usize, u64, Option<String>)> = holders
+                .iter()
+                .map(|(&i, &d)| (i, d, trashed_hash(&trash_root(roots[i]).join(d.to_string()).join(&path))))
+                .collect();
+            let wanted: std::collections::HashSet<&String> =
+                hashed.iter().filter(|(_, d, _)| *d == newest).filter_map(|(_, _, h)| h.as_ref()).collect();
+            let (yes, no): (Vec<_>, Vec<_>) = hashed
+                .iter()
+                .partition(|(_, d, h)| *d == newest || h.as_ref().is_some_and(|h| wanted.contains(h)));
+            out.different.extend(no.into_iter().map(|(i, _, _)| (*i, path.clone())));
+            yes.into_iter().map(|(i, d, _)| (*i, *d)).collect()
+        };
+        for (i, d) in chosen {
+            let done = restore_from_trash(roots[i], &path, Some(d))?;
+            out.per_root[i].restored.extend(done.restored);
+            out.per_root[i].in_the_way.extend(done.in_the_way);
+        }
+    }
+    Ok(out)
+}
+
 fn dir_bytes(dir: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {

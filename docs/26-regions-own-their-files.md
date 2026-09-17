@@ -412,8 +412,17 @@ import (found ninety minutes after the arrs' union switched to the view).
 The delete goes to the box that holds the file, which moves its copy into
 the region's trash (`TrashPath`, proto 9, write-gated on the region; every
 copy the view shows at the path; only if it is still the file that was
-seen), and the mount hides the path at once. `rename`, `rmdir` and every
-byte write are still refused. The original spec follows.
+seen), and the mount hides the path at once. **D170 (2026-09-17): and the
+rest of what an arr does to a file it did not just create** — `rename` (a
+file, or a folder with everything under it), `mkdir` (mergerfs clones a
+rename's target path onto this branch first), `rmdir`, and
+`chmod`/`chown`/`touch` accepted and ignored. Same shape: the box that holds
+the files does it on its own disk (`RenamePath` / `RemoveDir`, proto 10,
+write-gated), its rows follow at once so the bytes stay findable by hash,
+and the mount remembers its own changes until the catalogue agrees
+(`overlay.rs`). Byte writes — create, write-open, truncate — are still
+refused: new bytes arrive through `/mnt/local` and `receive`. The original
+spec follows.
 The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.

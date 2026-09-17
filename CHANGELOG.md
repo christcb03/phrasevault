@@ -20,6 +20,44 @@ file tracks Layer 0, the file-system engine.
   bring them back. `tests/d171_view_index.rs` holds the three queries to
   their indexes by their query plans, so a rewording that scans again fails
   there and not as a slow `ls` on a full library.
+- **Renames and folders through the view (D170).** D169 closed the one hole
+  that was failing in front of us; an arr does more to a library than delete.
+  "Rename files" is a verified move — `rename`, then the target must exist
+  with the source's size, within the second; a changed series path is one
+  `rename` of a folder; a rename into a season folder the arr just made finds
+  that folder on `/mnt/local` only, so mergerfs first clones the path onto
+  our branch (`mkdir`); "delete empty folders" is `rmdir`. All of it was
+  `EROFS`/`ENOSYS` in the view, though the node mount has had it since D71 W2
+  because Chris asked for exactly this. Now the box that **holds** the files
+  does it on its own disk: `Engine::rename_region_path` (a file only if it is
+  still the one that was seen — hash and size; a folder with everything
+  under it; nothing may be renamed to a name the catalogue passes over) and
+  `Engine::remove_region_dir` (only when nothing of the operator's is left;
+  PVFS's own names and litter go to the trash); `RenamePath` / `RemoveDir`
+  on the wire (proto 9 → 10, additive, **write-gated** on the region). The
+  holder's **rows follow the rename at once** — bytes are found by hash → row
+  → path, so a row left at the old name was a file nobody could open until a
+  pass had run — and a file's sidecar moves with it (one is written if it had
+  none), so the next pass does not read a 40 GB film to learn a hash it knew.
+  The mount **remembers** what it did until the catalogue agrees
+  (`pvfs-fuse/src/overlay.rs`): rows a fetched snapshot still lists at the old
+  path show at the new one, a folder made here exists here, a folder removed
+  here is gone here; moves compose (A→B→C, a file inside a renamed folder),
+  the inode table follows, and it all lapses when every region touched has
+  published since and nothing is left at the old path — or after ten minutes.
+  A file renamed **onto** another replaces it softly (the target goes to the
+  trash first). `chmod`/`chown`/`touch` are accepted and ignored, as the
+  rclone mount did; a truncate, a create and a write-open are still refused —
+  new bytes arrive through `/mnt/local` and `receive`. D169's delete learned
+  the same no-row rule (a file renamed a moment ago and then deleted answered
+  "gone" and stayed on disk).
+- **`pvfs trash restore` brings back every identical copy (D170).** One
+  delete through the view trashes the same file in every region that held
+  it, so a restore brings every one of those back — matched by **hash** (the
+  trashed sidecar's; else the bytes are read) — and leaves alone, and names,
+  a region whose trashed file at that path is a *different* file
+  (`sync::restore_identical`). D169's "which region?" prompt is gone:
+  nothing about it was a question. `--region` still restores exactly one.
 - **A delete through the view is a trip to the holder's trash (D169).** The
   view mount's namespace was read-only (D130), and an arr importing an
   upgrade removes the existing file first: Sonarr moves it to its recycle

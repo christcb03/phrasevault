@@ -1,8 +1,9 @@
 //! D169 — `unlink` through the view mount: a file in a region this box
 //! catalogues goes to that region's trash and is gone from the mount AT ONCE
 //! (before any pass has told the catalogue); a file whose holder cannot be
-//! asked is an error that hides nothing; `rename` is still refused. The
-//! other-box path is `pvfsd/tests/d169_trash_path.rs` and the lab pair.
+//! asked is an error that hides nothing; a write is still refused (renames
+//! and folders: D170, `d170_view_rename.rs`). The other-box path is
+//! `pvfsd/tests/d169_trash_path.rs` and the lab pair.
 
 use pvfs_client::hash_cache::CacheOpts;
 use pvfs_core::acl::Principal;
@@ -134,8 +135,7 @@ fn a_delete_through_the_mount_is_a_trip_to_the_trash_and_the_path_is_gone_at_onc
     assert!(std::fs::remove_file(mnt.path().join("Movies/far.mkv")).is_err());
     assert_eq!(names(&mnt.path().join("Movies")), vec!["far.mkv"]);
 
-    // ---- everything else about the namespace is as read-only as it was
-    assert!(std::fs::rename(season.join("Show - s01e02.mkv"), season.join("renamed.mkv")).is_err());
+    // ---- bytes still do not come through the view, and a folder with a file in it stays
     assert!(std::fs::remove_dir(&season).is_err());
     assert!(std::fs::write(season.join("new.mkv"), b"x").is_err());
     assert_eq!(std::fs::read(season.join("Show - s01e02.mkv")).unwrap(), b"its neighbour");

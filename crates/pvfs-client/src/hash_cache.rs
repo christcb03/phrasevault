@@ -735,18 +735,33 @@ pub fn announced_sources(data_dir: &Path) -> Vec<ReplicaSource> {
         .collect()
 }
 
-/// D169 — a delete that came through the view, for the copies OTHER boxes
-/// hold: ask the fleet, box by box, to move `rel_path` in each `(region,
-/// hash)` to that region's trash. A box that does not hold the region says
-/// `not_found` and the next is asked; a copy already gone is not an error;
-/// `conflict` (the file changed) and `forbidden` (no write rights) are. An
-/// error leaves whatever was already trashed in the trash — a retry finishes.
-pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(String, String)]) -> Result<(), String> {
+/// Which announced box last answered for a region (other than "not mine").
+static HOLDER_HINT: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Ask the fleet, box by box, to do `ask` for each of `items` on the box
+/// that holds its region: `not_found` = "not mine", try the next; any other
+/// refusal ends it. `Err` carries why, and how many items were done.
+fn ask_holders<T>(
+    sources: &[ReplicaSource],
+    items: &[T],
+    region: impl Fn(&T) -> &str,
+    mut ask: impl FnMut(&mut crate::Client, &T) -> std::result::Result<(), ClientError>,
+) -> Result<(), (String, usize)> {
     let mut open: HashMap<String, crate::Client> = HashMap::new();
-    for (region, hash) in copies {
-        let mut why = format!("no box that holds region {} answered", &region[..region.len().min(8)]);
+    for (n, item) in items.iter().enumerate() {
+        let r = region(item);
+        let mut why = format!("no box that holds region {} answered", &r[..r.len().min(8)]);
         let mut done = false;
-        for src in sources {
+        // The box that answered for this region last time is asked first: an
+        // arr renaming a season is a hundred requests for one region, and
+        // every box asked in vain is a dial — a second, from feederbox.
+        let hinted = HOLDER_HINT.lock().unwrap().get(r).cloned();
+        let mut order: Vec<&ReplicaSource> = sources.iter().collect();
+        if let Some(h) = &hinted {
+            order.sort_by_key(|s| &s.target != h);
+        }
+        for src in order {
             if !open.contains_key(&src.target) {
                 match crate::follow::dial_source(src) {
                     Ok(c) => {
@@ -759,14 +774,15 @@ pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(Str
                 }
             }
             let client = open.get_mut(&src.target).expect("dialed above");
-            match client.trash_path(region, rel_path, hash) {
-                Ok(_) => {
+            match ask(client, item) {
+                Ok(()) => {
+                    HOLDER_HINT.lock().unwrap().insert(r.to_string(), src.target.clone());
                     done = true;
                     break;
                 }
                 Err(ClientError::Server { code, .. }) if code == "not_found" => continue,
                 Err(ClientError::Server { code, message }) => {
-                    return Err(format!("{}: {code}: {message}", src.target));
+                    return Err((format!("{}: {code}: {message}", src.target), n));
                 }
                 Err(e) => {
                     open.remove(&src.target);
@@ -775,10 +791,52 @@ pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(Str
             }
         }
         if !done {
-            return Err(why);
+            return Err((why, n));
         }
     }
     Ok(())
+}
+
+/// D169 — a delete that came through the view, for the copies OTHER boxes
+/// hold: ask the fleet, box by box, to move `rel_path` in each `(region,
+/// hash)` to that region's trash. A box that does not hold the region says
+/// `not_found` and the next is asked; a copy already gone is not an error;
+/// `conflict` (the file changed) and `forbidden` (no write rights) are. An
+/// error leaves whatever was already trashed in the trash — a retry finishes.
+pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(String, String)]) -> Result<(), String> {
+    ask_holders(sources, copies, |(region, _)| region.as_str(), |client, (region, hash)| {
+        client.trash_path(region, rel_path, hash).map(|_| ())
+    })
+    .map_err(|(why, _)| why)
+}
+
+/// D170 — one copy a view rename moves: its region, and for a file the
+/// (hash, size) the view showed (`None` = a folder).
+pub type RenameCopy = (String, Option<(String, u64)>);
+
+/// D170 — a rename through a view mount, for the copies other boxes hold:
+/// each is renamed on the box that catalogues its region. `Err` carries why
+/// and how many copies had been renamed, so the caller can put them back.
+pub fn rename_elsewhere(
+    sources: &[ReplicaSource],
+    from: &str,
+    to: &str,
+    copies: &[RenameCopy],
+) -> Result<(), (String, usize)> {
+    ask_holders(sources, copies, |(region, _)| region.as_str(), |client, (region, file)| {
+        client
+            .rename_path(region, from, to, file.as_ref().map(|(h, s)| (h.as_str(), *s)))
+            .map(|_| ())
+    })
+}
+
+/// D170 — an `rmdir` through a view mount, for the regions other boxes
+/// hold. `Err` is why; `not_empty` reads "…: not_empty: …".
+pub fn rmdir_elsewhere(sources: &[ReplicaSource], rel_path: &str, regions: &[String]) -> Result<(), String> {
+    ask_holders(sources, regions, |r| r.as_str(), |client, region| {
+        client.remove_dir(region, rel_path).map(|_| ())
+    })
+    .map_err(|(why, _)| why)
 }
 
 /// What [`HashCache::open`] found.

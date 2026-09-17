@@ -480,6 +480,48 @@ pub enum TrashedHere {
     NotHere,
 }
 
+/// D170 — what the caller of [`Engine::rename_region_path`] saw at `from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameExpect {
+    /// A file, with the hash and size the view showed.
+    File { hash: String, size: u64 },
+    /// A folder; everything under it moves with it.
+    Dir,
+}
+
+/// D170 — what [`Engine::rename_region_path`] did on this box's disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenamedHere {
+    /// Renamed, a file's sidecar with it.
+    Moved,
+    /// `from` is gone and `to` is there, as expected: somebody did it first
+    /// (the union's local branch IS this box's staging region, and mergerfs
+    /// renames on it before it asks the view). Not an error.
+    AlreadyDone,
+    /// This box catalogues the region and has nothing at either path.
+    Gone,
+    /// What is at `from` is not what the caller saw: refused, nothing moved.
+    Changed,
+    /// Something is already at `to`: refused, nothing moved.
+    InTheWay,
+    /// This box does not catalogue that region from its own disk: ask
+    /// another.
+    NotHere,
+}
+
+/// D170 — what [`Engine::remove_region_dir`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirRemovedHere {
+    /// Removed; anything of PVFS's own or litter left in it went to the trash.
+    Removed,
+    /// Not on this box's disk: nothing to do, and not an error.
+    Gone,
+    /// It holds something of the operator's: refused, nothing touched.
+    NotEmpty,
+    /// This box does not catalogue that region from its own disk.
+    NotHere,
+}
+
 /// D133 — one file the receiving side will pull (doc 26 §7.3): the copy the
 /// view describes, and where on this box it lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2092,14 +2134,58 @@ impl Engine {
     /// be `expect_hash` and the file's size the row's. The box's own watcher
     /// sees the move; its next pass drops the row and publishes the head.
     pub fn trash_region_path(&self, region: &NodeId, rel_path: &str, expect_hash: &str) -> Result<TrashedHere> {
+        Self::check_region_rel(rel_path)?;
+        let Some(roots) = self.own_region_roots(region)? else {
+            return Ok(TrashedHere::NotHere);
+        };
+        let size = match self.region_row(region, rel_path)? {
+            // D170 — no row is not "gone" while the file is on disk: a file
+            // renamed here a moment ago has no row until the next pass, and
+            // its sidecar (every rename leaves one) says which file it is.
+            None => None,
+            Some((kind, _, _)) if kind != "file" => {
+                return Err(PvfsError::BadInput {
+                    field: "rel_path".into(),
+                    reason: format!("{rel_path} is a folder here; only a file is trashed"),
+                })
+            }
+            Some((_, _, hash)) if hash.as_deref() != Some(expect_hash) => return Ok(TrashedHere::Changed),
+            Some((_, size, _)) => Some(size),
+        };
+        for root in roots {
+            let file = root.join(rel_path);
+            match std::fs::symlink_metadata(&file) {
+                Ok(m) if m.is_file()
+                    && match size {
+                        Some(size) => m.len() == size,
+                        None => crate::sync::sidecar_whole_hash(&file, m.len()).as_deref() == Some(expect_hash),
+                    } =>
+                {
+                    return crate::sync::move_to_trash_with_sidecar(&root, &file).map(TrashedHere::Trashed);
+                }
+                Ok(_) => return Ok(TrashedHere::Changed),
+                Err(_) => continue,
+            }
+        }
+        Ok(TrashedHere::Gone)
+    }
+
+    /// A path inside a region, as a request names it: relative, no `.`/`..`.
+    fn check_region_rel(rel_path: &str) -> Result<()> {
         if rel_path.is_empty() || rel_path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
             return Err(PvfsError::BadInput {
                 field: "rel_path".into(),
                 reason: "a path relative to the region's root, with no `.` or `..` in it".into(),
             });
         }
+        Ok(())
+    }
+
+    /// The roots THIS box catalogues `region` from; `None` when it does not
+    /// (not a catalogue region, not catalogued here, no binding of ours).
+    fn own_region_roots(&self, region: &NodeId) -> Result<Option<Vec<std::path::PathBuf>>> {
         if !self.is_catalogue_region(region)? || !self.catalogues_here(region)? {
-            return Ok(TrashedHere::NotHere);
+            return Ok(None);
         }
         let mine: Vec<Binding> = if self.replica {
             load_local_bindings(&self.data_dir)?
@@ -2113,46 +2199,243 @@ impl Engine {
                 .filter(|b| b.bound_by == me)
                 .collect()
         };
-        if mine.is_empty() {
-            return Ok(TrashedHere::NotHere);
-        }
-        let row: Option<(String, i64, Option<String>)> = self
-            .conn
+        let roots: Vec<std::path::PathBuf> = mine
+            .iter()
+            .filter_map(|b| {
+                self.resolve_uri(&b.source_uri)
+                    .and_then(|u| crate::storage::uri_to_path(&u))
+                    .ok()
+            })
+            .collect();
+        Ok((!roots.is_empty()).then_some(roots))
+    }
+
+    /// This box's row for `rel_path` in `region`: (kind, size, hash).
+    fn region_row(&self, region: &NodeId, rel_path: &str) -> Result<Option<(String, u64, Option<String>)>> {
+        self.conn
             .query_row(
                 "SELECT kind, size_bytes, content_hash FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
                 params![region, rel_path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
             )
             .optional()
-            .map_err(map_db("trash region path"))?;
-        let size = match row {
-            None => return Ok(TrashedHere::Gone),
-            Some((kind, _, _)) if kind != "file" => {
+            .map_err(map_db("region row"))
+    }
+
+    /// D170 — a rename that came through the view: move THIS box's copy of
+    /// `from` to `to` inside catalogue region `region`, on its own disk — one
+    /// `rename(2)`, a folder's subtree with it. Only what the caller saw: a
+    /// file must have `size` bytes and the row's hash must be `hash`; with
+    /// no row yet (renamed here a moment ago, no pass since) its sidecar
+    /// must say so. A file's sidecars move with it under their new names,
+    /// and one is written if it had none: the next pass finds a NEW path,
+    /// and a new path's hash comes from its sidecar or from reading the
+    /// file — tens of GB, for a rename. The watcher sees the move; its next
+    /// pass publishes the head.
+    pub fn rename_region_path(&self, region: &NodeId, from: &str, to: &str, expect: &RenameExpect) -> Result<RenamedHere> {
+        Self::check_region_rel(from)?;
+        Self::check_region_rel(to)?;
+        let is_dir = matches!(expect, RenameExpect::Dir);
+        if is_dir && to.strip_prefix(from).is_some_and(|rest| rest.starts_with('/')) {
+            return Err(PvfsError::BadInput {
+                field: "to".into(),
+                reason: "a folder cannot be moved into itself".into(),
+            });
+        }
+        // Nothing may be renamed to a name the catalogue does not see: the
+        // file would leave the view and the library with it.
+        let parts: Vec<&str> = to.split('/').collect();
+        for (i, c) in parts.iter().enumerate() {
+            let dir = is_dir || i + 1 < parts.len();
+            if crate::sync::is_own_name(c, dir) || crate::sync::is_litter_name(c) {
                 return Err(PvfsError::BadInput {
-                    field: "rel_path".into(),
-                    reason: format!("{rel_path} is a folder here; only a file is trashed"),
-                })
-            }
-            Some((_, _, hash)) if hash.as_deref() != Some(expect_hash) => return Ok(TrashedHere::Changed),
-            Some((_, size, _)) => size as u64,
-        };
-        for b in mine {
-            let Ok(root) = self
-                .resolve_uri(&b.source_uri)
-                .and_then(|u| crate::storage::uri_to_path(&u))
-            else {
-                continue;
-            };
-            let file = root.join(rel_path);
-            match std::fs::symlink_metadata(&file) {
-                Ok(m) if m.is_file() && m.len() == size => {
-                    return crate::sync::move_to_trash_with_sidecar(&root, &file).map(TrashedHere::Trashed);
-                }
-                Ok(_) => return Ok(TrashedHere::Changed),
-                Err(_) => continue,
+                    field: "to".into(),
+                    reason: format!("`{c}` is a name PVFS keeps for itself or passes over; nothing is renamed to it"),
+                });
             }
         }
-        Ok(TrashedHere::Gone)
+        let Some(roots) = self.own_region_roots(region)? else {
+            return Ok(RenamedHere::NotHere);
+        };
+        if from == to {
+            return Ok(RenamedHere::AlreadyDone);
+        }
+        let row = self.region_row(region, from)?;
+        for root in roots {
+            let (src, dst) = (root.join(from), root.join(to));
+            let Ok(m) = std::fs::symlink_metadata(&src) else {
+                let done = std::fs::symlink_metadata(&dst).is_ok_and(|d| match expect {
+                    RenameExpect::File { size, .. } => d.is_file() && d.len() == *size,
+                    RenameExpect::Dir => d.is_dir(),
+                });
+                if done {
+                    return Ok(RenamedHere::AlreadyDone);
+                }
+                continue;
+            };
+            match expect {
+                RenameExpect::File { hash, size } => {
+                    let known = match &row {
+                        Some((kind, _, h)) => kind == "file" && h.as_deref() == Some(hash.as_str()),
+                        None => crate::sync::sidecar_whole_hash(&src, m.len()).as_deref() == Some(hash.as_str()),
+                    };
+                    if !m.is_file() || m.len() != *size || !known {
+                        return Ok(RenamedHere::Changed);
+                    }
+                }
+                RenameExpect::Dir => {
+                    if !m.is_dir() {
+                        return Ok(RenamedHere::Changed);
+                    }
+                }
+            }
+            if std::fs::symlink_metadata(&dst).is_ok() {
+                return Ok(RenamedHere::InTheWay);
+            }
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create rename dir", e))?;
+            }
+            let sides = [
+                (crate::sync::manifest_sidecar_path(&src), crate::sync::manifest_sidecar_path(&dst)),
+                (crate::sync::legacy_manifest_sidecar_path(&src), crate::sync::legacy_manifest_sidecar_path(&dst)),
+            ];
+            std::fs::rename(&src, &dst).map_err(|e| PvfsError::io("rename in region", e))?;
+            if let RenameExpect::File { hash, .. } = expect {
+                let mut carried = false;
+                for (a, b) in sides {
+                    if a.is_file() && std::fs::symlink_metadata(&b).is_err() {
+                        carried |= std::fs::rename(&a, &b).is_ok();
+                    }
+                }
+                if !carried {
+                    // The catalogue vouched for this hash a moment ago (the
+                    // row, above) — what the backfill writes (D91).
+                    let _ = crate::sync::write_manifest_sidecar(&dst, Some(hash), &[]);
+                }
+            }
+            // The rows follow the file NOW, not at the next pass: bytes are
+            // found by hash → row → path (`local_path_for_hash`, and `CatHash`
+            // for every other box), so a row left at the old path is a file
+            // nobody can open until a pass has run. Best-effort — the disk is
+            // the truth and the pass repairs a row this could not write (a
+            // read-only view, a busy database).
+            if let Err(e) = self.rows_follow_rename(region, from, to, is_dir) {
+                eprintln!("pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+            }
+            return Ok(RenamedHere::Moved);
+        }
+        Ok(RenamedHere::Gone)
+    }
+
+    /// The catalogue rows of a rename just made on disk: the path itself, a
+    /// folder's subtree with it, and a `dir` row for every folder the rename
+    /// had to make on the way to `to`.
+    fn rows_follow_rename(&self, region: &NodeId, from: &str, to: &str, is_dir: bool) -> Result<()> {
+        crate::projection::retry_busy(|| {
+            if is_dir {
+                self.conn
+                    .execute(
+                        "UPDATE OR REPLACE region_entries
+                            SET rel_path = ?3 || substr(rel_path, length(?2) + 1)
+                          WHERE region_id = ?1
+                            AND (rel_path = ?2 OR (rel_path >= ?2 || '/' AND rel_path < ?2 || '0'))",
+                        params![region, from, to],
+                    )
+                    .map_err(map_db("rows follow a folder rename"))
+            } else {
+                self.conn
+                    .execute(
+                        "UPDATE OR REPLACE region_entries SET rel_path = ?3 WHERE region_id = ?1 AND rel_path = ?2",
+                        params![region, from, to],
+                    )
+                    .map_err(map_db("rows follow a rename"))
+            }
+        })?;
+        let mut parent = to;
+        while let Some((up, _)) = parent.rsplit_once('/') {
+            crate::projection::retry_busy(|| {
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO region_entries
+                           (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms, content_hash, quality, seen_at)
+                         VALUES (?1, ?2, 'dir', 0, 0, 0, NULL, NULL, ?3)",
+                        params![region, up, now_ms() as i64],
+                    )
+                    .map_err(map_db("row for a folder a rename made"))
+            })?;
+            parent = up;
+        }
+        Ok(())
+    }
+
+    /// D170 — an `rmdir` that came through the view: remove THIS box's folder
+    /// `rel_path` of catalogue region `region` when it holds nothing of the
+    /// operator's. The view does not show PVFS's own names or litter (D166),
+    /// so a folder the arr sees as empty may still hold a `.@__thumb` or an
+    /// orphaned sidecar: those go to the region's trash — moved, as every
+    /// removal here is — and then the folder goes.
+    pub fn remove_region_dir(&self, region: &NodeId, rel_path: &str) -> Result<DirRemovedHere> {
+        Self::check_region_rel(rel_path)?;
+        let Some(roots) = self.own_region_roots(region)? else {
+            return Ok(DirRemovedHere::NotHere);
+        };
+        let mut removed = false;
+        for root in roots {
+            let dir = root.join(rel_path);
+            match std::fs::symlink_metadata(&dir) {
+                Err(_) => continue,
+                Ok(m) if !m.is_dir() => {
+                    return Err(PvfsError::BadInput {
+                        field: "rel_path".into(),
+                        reason: format!("{rel_path} is a file here; only a folder is removed"),
+                    })
+                }
+                Ok(_) => {}
+            }
+            let mut leftovers = Vec::new();
+            for ent in std::fs::read_dir(&dir).map_err(|e| PvfsError::io("read folder", e))? {
+                let ent = ent.map_err(|e| PvfsError::io("read folder", e))?;
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
+                if !(crate::sync::is_own_name(&name, is_dir) || crate::sync::is_litter_name(&name)) {
+                    return Ok(DirRemovedHere::NotEmpty);
+                }
+                leftovers.push(ent.path());
+            }
+            for p in leftovers {
+                Self::trash_tree(&root, &p)?;
+            }
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => {
+                    removed = true;
+                    // its row goes with it (best-effort, as a rename's rows)
+                    let _ = crate::projection::retry_busy(|| {
+                        self.conn
+                            .execute(
+                                "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2 AND kind = 'dir'",
+                                params![region, rel_path],
+                            )
+                            .map_err(map_db("row of a removed folder"))
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(DirRemovedHere::NotEmpty),
+                Err(e) => return Err(PvfsError::io("remove folder", e)),
+            }
+        }
+        Ok(if removed { DirRemovedHere::Removed } else { DirRemovedHere::Gone })
+    }
+
+    /// Every file under `path` into `root`'s trash, then the emptied folders.
+    fn trash_tree(root: &std::path::Path, path: &std::path::Path) -> Result<()> {
+        let md = std::fs::symlink_metadata(path).map_err(|e| PvfsError::io("stat leftover", e))?;
+        if !md.is_dir() {
+            return crate::sync::move_to_trash(root, path).map(|_| ());
+        }
+        for ent in std::fs::read_dir(path).map_err(|e| PvfsError::io("read leftover", e))? {
+            let ent = ent.map_err(|e| PvfsError::io("read leftover", e))?;
+            Self::trash_tree(root, &ent.path())?;
+        }
+        std::fs::remove_dir(path).map_err(|e| PvfsError::io("remove leftover folder", e))
     }
 
     /// D129 — the catalogue regions whose fetched snapshot the log has since
@@ -2646,6 +2929,32 @@ impl Engine {
         let mut out = Self::merge_rows(rows);
         self.mark_stale(&mut out)?;
         Ok(out)
+    }
+
+    /// D170 — the view's judgement of `copies` as the rows at `rel_path`: what
+    /// a mount shows for a path whose rows the catalogue still lists somewhere
+    /// else (a rename it has not caught up with), or for part of an entry.
+    pub fn view_entry_of_copies(rel_path: &str, copies: &[ViewCopy]) -> Option<ViewEntry> {
+        let mut rows: Vec<_> = copies
+            .iter()
+            .map(|c| {
+                (
+                    c.region.clone(),
+                    rel_path.to_string(),
+                    c.kind.clone(),
+                    c.size_bytes,
+                    c.mtime_ms,
+                    c.content_hash.clone(),
+                    c.quality.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut e = Self::merge_rows(rows).pop()?;
+        for c in &mut e.sources {
+            c.stale = copies.iter().any(|o| o.region == c.region && o.stale);
+        }
+        Some(e)
     }
 
     /// The admission rule (doc 26 §6), over rows sorted by path then region.
