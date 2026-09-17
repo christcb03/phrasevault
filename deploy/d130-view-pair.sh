@@ -41,7 +41,9 @@ VA=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --version" 2>&1); VB=$(ssh "$EDGE" "\"$LABBI
 [ "$VA" = "$VB" ] && ok "both boxes run the same build ($VA)" || fail "builds differ: A=$VA B=$VB"
 for h in "$OWNER" "$EDGE"; do
   ssh "$h" "\"$LABBIN/pvfs\" mount --help >/dev/null 2>&1" && ok "$h has pvfs mount" || fail "$h: not a D130 build"
-  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d130" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d130-*; mkdir -p "$HOME/fleet-test"' \
+  # an aborted run leaves its mounts up (the gate exits before the teardown): a view mount
+  # that outlives its data dir goes on listing the LAST run's files to this one
+  ssh "$h" 'for m in d130-union d130-view; do fusermount3 -uz "$HOME/fleet-test/$m" 2>/dev/null; done; pkill -f "mount --view $HOME/fleet-test/d130" 2>/dev/null; pkill -f "pvfsd --mount $HOME/fleet-test/d130" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d130-*; mkdir -p "$HOME/fleet-test"' \
     && ok "$h: clean slate" || fail "$h: clean slate"
 done
 AKEY=$(ssh "$OWNER" "\"$LABBIN/pvfs\" --json whoami" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
