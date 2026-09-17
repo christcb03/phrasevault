@@ -5,6 +5,34 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The view mount reads through by the piece, keeps what is consumed, and
+  is bounded (D165).** A file the mount did not hold got a whole-file,
+  sequential fetch from byte 0 at `open`, one thread per file, that nothing
+  stopped and nothing evicted; `read` waited up to 120 s for its range *on
+  fuser's one session thread*, so one read waiting on the WAN froze `ls`,
+  `stat` and every other read. A media scan reads 40 KB of each file —
+  Sonarr's ffprobe, traced: 38.5 KB of head and the last 1.1 KB — so every
+  probe cost a whole file, and the tail read ended in EIO. New
+  `pvfs_client::hash_cache`: the file is a map of 1 MiB pieces over a
+  sparse `.partial`; a read registers the pieces it covers and the worker
+  asks a holder for exactly the missing run (`CatHash` was ranged all
+  along). Readahead only once a reader is sequential (1 → 8 MiB). A reader
+  that has consumed 64 MiB in a row is a consumer: the file is completed in
+  the background in 32 MiB bursts, hashed as a stream (it used to be read
+  whole into memory), and only a match is kept — a mismatch is refused, the
+  box named and skipped, the next asked; files up to 64 MiB are verified
+  before their last piece is served. The last handle closing ends a probe's
+  fetch at once and a completing one after 60 s, unless it is three quarters
+  through. At most 4 requests on the network, a waiting read before a
+  background burst; connections pooled per holder. A read that must wait
+  does so off the session thread. The store is bounded: `pvfs mount --view
+  --cache-max 500G --cache-age 1d` (those are the defaults), least recently
+  read first — an entry's mtime is its last open — never an open file or a
+  live fetch; leftover partials are swept at mount start. A request no box
+  will serve fails the reads that were waiting and keeps the pieces.
+  `pvfs-client/src/hash_cache.rs` (unit tests), `pvfsd/tests/
+  d165_hash_cache.rs`, `pvfs-fuse/tests/d165_view_read_through.rs`.
+
 - **One box, one client identity, however many ask at once (D163).**
   `client_identity_mnemonic` made the phrase with a check, a `File::create`
   and a write. Two callers that found no file — the CLI beside a daemon job

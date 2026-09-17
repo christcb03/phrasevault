@@ -15,3 +15,5 @@ libc = "0.2"
 [dev-dependencies]
 tempfile.workspace = true
 blake3.workspace = true
+# D165: the read-through test needs a real box to read through FROM.
+pvfsd = { path = "../pvfsd" }

@@ -52,6 +52,7 @@ pub mod catalogue;
 pub mod drain;
 pub mod fetch;
 pub mod follow;
+pub mod hash_cache;
 pub mod health;
 pub mod notify;
 pub mod receive;

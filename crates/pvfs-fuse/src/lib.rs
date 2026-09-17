@@ -18,7 +18,8 @@ use fuser::{ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 use pvfs_client::fetch::{Fetcher, SwarmProgress};
-use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, TYPE_FILE};
+use pvfs_client::hash_cache::{CacheOpts, HashCache, HashFetch, Opened};
+use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, ReplicaSource, TYPE_FILE};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -61,9 +62,23 @@ pub struct PvfsFs {
     /// Directory listings, cached briefly: a library scan issues thousands
     /// of lookups and the view is a query, not a table.
     view_cache: HashMap<String, (std::time::Instant, Vec<pvfs_core::ViewEntry>)>,
-    /// Read-throughs in flight, by content hash.
-    active_hash: HashMap<String, Arc<SwarmProgress>>,
+    /// D165 — the view's read-through cache (pieces by demand, kept a while,
+    /// bounded), and the handles on it: a read-through's fetch, or the hash
+    /// of a kept file, so the cache knows when the application is done.
+    hash_cache: Option<HashCache>,
+    hash_streams: HashMap<u64, HashStream>,
+    hash_pins: HashMap<u64, String>,
 }
+
+/// One handle on a read-through: its fetch, and the file it reads from,
+/// opened once (the partial becomes the kept file by rename — one inode).
+struct HashStream {
+    fetch: Arc<HashFetch>,
+    file: Option<std::fs::File>,
+}
+
+/// How long a read waits for its pieces before it is an I/O error.
+const READ_WAIT: Duration = Duration::from_secs(120);
 
 /// One in-flight proxy handle: the connection is reused across reads.
 struct ProxyRead {
@@ -101,7 +116,9 @@ impl PvfsFs {
             ino_to_path: HashMap::new(),
             path_to_ino: HashMap::new(),
             view_cache: HashMap::new(),
-            active_hash: HashMap::new(),
+            hash_cache: None,
+            hash_streams: HashMap::new(),
+            hash_pins: HashMap::new(),
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
@@ -250,6 +267,17 @@ impl PvfsFs {
     /// entry per relative path across every catalogue region this box
     /// knows; bytes from its own disk, the hash store, or a read-through.
     pub fn new_view(data_dir: &Path) -> Result<PvfsFs, PvfsError> {
+        PvfsFs::new_view_with(data_dir, CacheOpts::default(), None)
+    }
+
+    /// [`PvfsFs::new_view`] with the read-through cache's knobs (D165), and
+    /// — for tests and the lab — the boxes to ask instead of the fleet's
+    /// announced endpoints.
+    pub fn new_view_with(
+        data_dir: &Path,
+        cache: CacheOpts,
+        sources: Option<Vec<ReplicaSource>>,
+    ) -> Result<PvfsFs, PvfsError> {
         // A node mount of the forest root, then switched: the shared fields
         // (engine, fetcher, pins, routes) are built the same way.
         let root = Engine::open(data_dir)?.identity.root_node_id.clone();
@@ -259,6 +287,12 @@ impl PvfsFs {
         fs.node_to_ino.clear();
         fs.ino_to_path.insert(1, String::new());
         fs.path_to_ino.insert(String::new(), 1);
+        let cache = match sources {
+            Some(s) => HashCache::with_sources(data_dir, cache, s),
+            None => HashCache::new(data_dir, cache),
+        };
+        cache.start_janitor();
+        fs.hash_cache = Some(cache);
         Ok(fs)
     }
 
@@ -354,49 +388,52 @@ impl PvfsFs {
     }
 
     /// D130 §3.2 — open a view file: this box's own disk, the hash store,
-    /// else a read-through served from the growing file.
+    /// else a read-through. D165: the read-through fetches the pieces a
+    /// read asks for, not the file — `open` starts nothing.
     fn view_open(&mut self, rel: &str) -> Result<u64, i32> {
         let entry = self.view_entry_of(rel).ok_or(libc::ENOENT)?;
         if entry.kind == "dir" {
             return Err(libc::EISDIR);
         }
         let (hash, size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
-        let local = self
-            .engine
-            .local_path_for_hash(&hash)
-            .ok()
-            .flatten()
-            .map(|lb| lb.path)
-            .or_else(|| pvfs_core::sync::hash_store_lookup(&self.data_dir, &hash).ok().flatten());
-        if let Some(path) = local {
-            let f = std::fs::File::open(&path).map_err(|_| libc::EIO)?;
-            let fh = self.next_fh;
+        let fh = self.next_fh;
+        if let Some(lb) = self.engine.local_path_for_hash(&hash).ok().flatten() {
+            let f = std::fs::File::open(&lb.path).map_err(|_| libc::EIO)?;
             self.next_fh += 1;
             self.handles.insert(fh, f);
             return Ok(fh);
         }
-        if self.active_hash.get(&hash).is_some_and(|p| p.failed()) {
-            self.active_hash.remove(&hash);
-        }
-        let progress = match self.active_hash.get(&hash) {
-            Some(p) => Arc::clone(p),
-            None => {
-                eprintln!("mount: reading {rel} through by hash {} (doc 26 phase 6)", &hash[..8]);
-                let p: Arc<SwarmProgress> = Arc::new(SwarmProgress::default());
-                let bg = Arc::clone(&p);
-                let dir = self.data_dir.clone();
-                let h = hash.clone();
-                std::thread::spawn(move || {
-                    pvfs_client::fetch::fetch_by_hash(&dir, &h, size, &bg);
-                });
-                self.active_hash.insert(hash.clone(), Arc::clone(&p));
-                p
+        let cache = self.hash_cache.as_ref().ok_or(libc::EIO)?;
+        match cache.open(&hash, size).map_err(|_| libc::EIO)? {
+            Opened::Local(path) => {
+                let f = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        cache.close_local(&hash);
+                        return Err(libc::EIO);
+                    }
+                };
+                self.handles.insert(fh, f);
+                self.hash_pins.insert(fh, hash);
             }
-        };
-        let fh = self.next_fh;
+            Opened::Stream(fetch) => {
+                self.hash_streams.insert(fh, HashStream { fetch, file: None });
+            }
+        }
         self.next_fh += 1;
-        self.streaming.insert(fh, progress);
         Ok(fh)
+    }
+}
+
+fn reply_read_at(f: &std::fs::File, offset: u64, size: u32, reply: ReplyData) {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; size as usize];
+    match f.read_at(&mut buf, offset) {
+        Ok(n) => {
+            buf.truncate(n);
+            reply.data(&buf);
+        }
+        Err(_) => reply.error(libc::EIO),
     }
 }
 
@@ -667,6 +704,39 @@ impl Filesystem for PvfsFs {
             }
             return reply.error(libc::EIO);
         }
+        // D165 — a view read-through: bytes that are here are answered now.
+        // A read that has to wait for the network does so OFF this thread
+        // (fuser's session is one thread; a reply may be sent from any), so
+        // `ls`, `stat` and every other read go on being answered meanwhile.
+        if let Some(hs) = self.hash_streams.get_mut(&fh) {
+            let (off, len) = (offset as u64, size as u64);
+            if off >= hs.fetch.size() {
+                return reply.data(&[]);
+            }
+            match hs.fetch.poll_range(off, len) {
+                Some(Ok(path)) => {
+                    if hs.file.is_none() {
+                        hs.file = std::fs::File::open(&path).ok();
+                    }
+                    return match hs.file.as_ref() {
+                        Some(f) => reply_read_at(f, off, size, reply),
+                        None => reply.error(libc::EIO),
+                    };
+                }
+                Some(Err(_)) => return reply.error(libc::EIO),
+                None => {
+                    let fetch = Arc::clone(&hs.fetch);
+                    std::thread::spawn(move || match fetch.wait_range(off, len, READ_WAIT) {
+                        Ok(path) => match std::fs::File::open(&path) {
+                            Ok(f) => reply_read_at(&f, off, size, reply),
+                            Err(_) => reply.error(libc::EIO),
+                        },
+                        Err(_) => reply.error(libc::EIO),
+                    });
+                    return;
+                }
+            }
+        }
         // streaming handle: wait for the covering chunks, then serve from
         // wherever the fetch says the verified bytes are right now
         if let Some(progress) = self.streaming.get(&fh) {
@@ -931,6 +1001,14 @@ impl Filesystem for PvfsFs {
         self.handles.remove(&fh);
         self.streaming.remove(&fh);
         self.proxy.remove(&fh);
+        // D165 — "the application says it is done": a probe's fetch ends,
+        // a completing one starts its grace, a kept file loses its pin.
+        if let Some(hs) = self.hash_streams.remove(&fh) {
+            hs.fetch.handle_closed();
+        }
+        if let (Some(hash), Some(cache)) = (self.hash_pins.remove(&fh), self.hash_cache.as_ref()) {
+            cache.close_local(&hash);
+        }
         reply.ok();
     }
 }
@@ -1276,11 +1354,21 @@ pub fn spawn_mount(
 /// D130 — mount the merged view of the forest at `data_dir` read-only at
 /// `mountpoint` (doc 26 phase 6), blocking until unmounted.
 pub fn mount_view(data_dir: &Path, mountpoint: &Path, allow_other: bool) -> Result<(), PvfsError> {
-    let fs = PvfsFs::new_view(data_dir)?;
+    mount_view_with(data_dir, mountpoint, allow_other, CacheOpts::default())
+}
+
+/// [`mount_view`] with the read-through cache's knobs (D165).
+pub fn mount_view_with(
+    data_dir: &Path,
+    mountpoint: &Path,
+    allow_other: bool,
+    cache: CacheOpts,
+) -> Result<(), PvfsError> {
+    let fs = PvfsFs::new_view_with(data_dir, cache.clone(), None)?;
     match fuser::mount2(fs, mountpoint, &opts(true, allow_other)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let fs = PvfsFs::new_view(data_dir)?;
+            let fs = PvfsFs::new_view_with(data_dir, cache, None)?;
             if allow_other {
                 return fuser::mount2(fs, mountpoint, &opts(false, true)).map_err(allow_other_denied);
             }
@@ -1296,11 +1384,21 @@ pub fn spawn_view_mount(
     data_dir: &Path,
     mountpoint: &Path,
 ) -> Result<fuser::BackgroundSession, PvfsError> {
-    let fs = PvfsFs::new_view(data_dir)?;
+    spawn_view_mount_with(data_dir, mountpoint, CacheOpts::default(), None)
+}
+
+/// [`spawn_view_mount`] with the cache's knobs and the boxes to ask (D165).
+pub fn spawn_view_mount_with(
+    data_dir: &Path,
+    mountpoint: &Path,
+    cache: CacheOpts,
+    sources: Option<Vec<ReplicaSource>>,
+) -> Result<fuser::BackgroundSession, PvfsError> {
+    let fs = PvfsFs::new_view_with(data_dir, cache.clone(), sources.clone())?;
     match fuser::spawn_mount2(fs, mountpoint, &opts(true, false)) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let fs = PvfsFs::new_view(data_dir)?;
+            let fs = PvfsFs::new_view_with(data_dir, cache, sources)?;
             fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }
