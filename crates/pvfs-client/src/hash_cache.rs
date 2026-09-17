@@ -712,6 +712,75 @@ fn touch(path: &Path) {
     }
 }
 
+/// The fleet's other boxes, as the forest at `data_dir` knows them: every
+/// announced endpoint minus this box, in pin order (D130's rule).
+pub fn announced_sources(data_dir: &Path) -> Vec<ReplicaSource> {
+    let Ok(engine) = Engine::open(data_dir) else {
+        return Vec::new();
+    };
+    let own = pvfs_core::storage::host_pin(data_dir);
+    let mut eps: Vec<(String, String)> = crate::fetch::catalog_endpoints(&engine)
+        .into_iter()
+        .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
+        .collect();
+    let _ = engine.close();
+    eps.sort();
+    eps.into_iter()
+        .map(|(pin, addr)| ReplicaSource {
+            transport: "tcp".into(),
+            target: addr,
+            pin,
+            region: String::new(),
+        })
+        .collect()
+}
+
+/// D169 — a delete that came through the view, for the copies OTHER boxes
+/// hold: ask the fleet, box by box, to move `rel_path` in each `(region,
+/// hash)` to that region's trash. A box that does not hold the region says
+/// `not_found` and the next is asked; a copy already gone is not an error;
+/// `conflict` (the file changed) and `forbidden` (no write rights) are. An
+/// error leaves whatever was already trashed in the trash — a retry finishes.
+pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(String, String)]) -> Result<(), String> {
+    let mut open: HashMap<String, crate::Client> = HashMap::new();
+    for (region, hash) in copies {
+        let mut why = format!("no box that holds region {} answered", &region[..region.len().min(8)]);
+        let mut done = false;
+        for src in sources {
+            if !open.contains_key(&src.target) {
+                match crate::follow::dial_source(src) {
+                    Ok(c) => {
+                        open.insert(src.target.clone(), c);
+                    }
+                    Err(e) => {
+                        why = format!("{}: {e}", src.target);
+                        continue;
+                    }
+                }
+            }
+            let client = open.get_mut(&src.target).expect("dialed above");
+            match client.trash_path(region, rel_path, hash) {
+                Ok(_) => {
+                    done = true;
+                    break;
+                }
+                Err(ClientError::Server { code, .. }) if code == "not_found" => continue,
+                Err(ClientError::Server { code, message }) => {
+                    return Err(format!("{}: {code}: {message}", src.target));
+                }
+                Err(e) => {
+                    open.remove(&src.target);
+                    why = format!("{}: {e}", src.target);
+                }
+            }
+        }
+        if !done {
+            return Err(why);
+        }
+    }
+    Ok(())
+}
+
 /// What [`HashCache::open`] found.
 pub enum Opened {
     /// A whole, verified file in the store: read it like any local file,
@@ -752,27 +821,10 @@ impl CacheInner {
     /// The boxes to ask: the given list, else the fleet's announced
     /// endpoints minus this box, in pin order (D130's rule).
     fn sources(&self) -> Vec<ReplicaSource> {
-        if let Some(s) = &self.explicit {
-            return s.clone();
+        match &self.explicit {
+            Some(s) => s.clone(),
+            None => announced_sources(&self.data_dir),
         }
-        let Ok(engine) = Engine::open(&self.data_dir) else {
-            return Vec::new();
-        };
-        let own = pvfs_core::storage::host_pin(&self.data_dir);
-        let mut eps: Vec<(String, String)> = crate::fetch::catalog_endpoints(&engine)
-            .into_iter()
-            .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
-            .collect();
-        let _ = engine.close();
-        eps.sort();
-        eps.into_iter()
-            .map(|(pin, addr)| ReplicaSource {
-                transport: "tcp".into(),
-                target: addr,
-                pin,
-                region: String::new(),
-            })
-            .collect()
     }
 
     fn checkout(&self, target: &str) -> Option<crate::Client> {

@@ -7,7 +7,7 @@
 //! Deliberately read-only: the catalog's write model belongs to the CLI and
 //! daemon. Writes/xattrs/mtimes: refused/synthetic (doc 20 §3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -68,7 +68,21 @@ pub struct PvfsFs {
     hash_cache: Option<HashCache>,
     hash_streams: HashMap<u64, HashStream>,
     hash_pins: HashMap<u64, String>,
+    /// D169 — the boxes a view delete asks (tests, the lab); `None` = the
+    /// fleet's announced endpoints.
+    view_sources: Option<Vec<ReplicaSource>>,
+    /// D169 — paths deleted through THIS mount, with the hashes that were
+    /// trashed: hidden at once, because the catalogue takes the holder's
+    /// pass and our fetch to agree, and an arr creates the new file at the
+    /// same path within the second (against a still-listed read-only file
+    /// that create is an open-for-write, and `EROFS`).
+    tombstones: Tombstones,
 }
+
+type Tombstones = Arc<std::sync::Mutex<HashMap<String, (HashSet<String>, std::time::Instant)>>>;
+
+/// A tombstone outlives any honest catalogue lag; past this it is dropped.
+const TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
 
 /// One handle on a read-through: its fetch, and the file it reads from,
 /// opened once (the partial becomes the kept file by rename — one inode).
@@ -119,6 +133,8 @@ impl PvfsFs {
             hash_cache: None,
             hash_streams: HashMap::new(),
             hash_pins: HashMap::new(),
+            view_sources: None,
+            tombstones: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         fs.ino_to_node.insert(1, target.clone());
         fs.node_to_ino.insert(target.clone(), 1);
@@ -287,6 +303,7 @@ impl PvfsFs {
         fs.node_to_ino.clear();
         fs.ino_to_path.insert(1, String::new());
         fs.path_to_ino.insert(String::new(), 1);
+        fs.view_sources = sources.clone();
         let cache = match sources {
             Some(s) => HashCache::with_sources(data_dir, cache, s),
             None => HashCache::new(data_dir, cache),
@@ -321,7 +338,9 @@ impl PvfsFs {
     fn view_list(&mut self, dir: &str) -> Result<Vec<pvfs_core::ViewEntry>, PvfsError> {
         if let Some((at, list)) = self.view_cache.get(dir) {
             if at.elapsed() < VIEW_TTL {
-                return Ok(list.clone());
+                // the cache holds what the catalogue says; a delete through
+                // this mount hides its path at once (D169)
+                return Ok(list.clone().into_iter().filter_map(|e| self.without_the_deleted(e)).collect());
             }
         }
         let list: Vec<pvfs_core::ViewEntry> = self
@@ -332,11 +351,118 @@ impl PvfsFs {
             .collect();
         self.view_cache
             .insert(dir.to_string(), (std::time::Instant::now(), list.clone()));
-        Ok(list)
+        // A tombstone has done its work once the catalogue no longer lists
+        // the path: drop it, so that a file which comes BACK — restored from
+        // the trash, same hash — is not hidden by the memory of its delete.
+        {
+            let listed: HashSet<&str> = list.iter().map(|e| e.rel_path.as_str()).collect();
+            let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+            self.tombstones.lock().unwrap().retain(|path, _| {
+                let here = path.strip_prefix(&prefix).is_some_and(|rest| !rest.contains('/'));
+                !here || listed.contains(path.as_str())
+            });
+        }
+        Ok(list.into_iter().filter_map(|e| self.without_the_deleted(e)).collect())
     }
 
     fn view_entry_of(&mut self, rel: &str) -> Option<pvfs_core::ViewEntry> {
-        self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown)
+        let Some(e) = self.engine.view_entry(rel).ok().flatten().filter(Self::view_shown) else {
+            self.tombstones.lock().unwrap().remove(rel); // the catalogue has caught up
+            return None;
+        };
+        self.without_the_deleted(e)
+    }
+
+    /// D169 — an entry minus the copies a delete through this mount already
+    /// sent to the trash: gone when none is left, and otherwise judged on
+    /// what remains (a new file at the path — another hash — shows).
+    fn without_the_deleted(&self, mut e: pvfs_core::ViewEntry) -> Option<pvfs_core::ViewEntry> {
+        if e.kind == "dir" {
+            return Some(e);
+        }
+        let mut tombs = self.tombstones.lock().unwrap();
+        let Some((dead, at)) = tombs.get(&e.rel_path).cloned() else {
+            return Some(e);
+        };
+        let lingering = e.sources.iter().any(|c| c.content_hash.as_ref().is_some_and(|h| dead.contains(h)));
+        if !lingering || at.elapsed() > TOMBSTONE_TTL {
+            tombs.remove(&e.rel_path); // the catalogue has caught up (or it is too old to trust)
+            return Some(e);
+        }
+        e.sources.retain(|c| !c.content_hash.as_ref().is_some_and(|h| dead.contains(h)));
+        (!e.sources.is_empty()).then_some(e).filter(Self::view_shown)
+    }
+
+    /// D169 — `unlink` in the view: every copy the view shows at the path
+    /// goes to ITS region's trash, on the box that holds it — soft, kept for
+    /// the region's retention, restorable (`pvfs trash restore`). Ours here
+    /// and now; the others are asked off the session thread (D165).
+    fn view_unlink(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent_path) = self.ino_to_path.get(&parent).cloned() else {
+            return reply.error(libc::ENOENT);
+        };
+        let Some(name) = name.to_str() else {
+            return reply.error(libc::ENOENT);
+        };
+        let rel = Self::view_join(&parent_path, name);
+        let Some(entry) = self.view_entry_of(&rel) else {
+            return reply.error(libc::ENOENT);
+        };
+        if entry.kind == "dir" {
+            return reply.error(libc::EISDIR);
+        }
+        let copies: Vec<(String, String)> = entry
+            .sources
+            .iter()
+            .filter(|c| c.kind == "file")
+            .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), h)))
+            .collect();
+        if copies.is_empty() {
+            return reply.error(libc::EIO);
+        }
+        let mut dead: HashSet<String> = HashSet::new();
+        let mut elsewhere: Vec<(String, String)> = Vec::new();
+        for (region, hash) in copies {
+            match self.engine.trash_region_path(&region, &rel, &hash) {
+                Ok(pvfs_core::TrashedHere::Trashed(to)) => {
+                    eprintln!("mount: delete of {rel} — this box's copy is in the trash at {}", to.display());
+                    dead.insert(hash);
+                }
+                Ok(pvfs_core::TrashedHere::Gone) => {
+                    dead.insert(hash);
+                }
+                Ok(pvfs_core::TrashedHere::NotHere) => elsewhere.push((region, hash)),
+                Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
+                    eprintln!("mount: delete of {rel} refused — this box's copy is not the file the view showed");
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
+        let tombs = Arc::clone(&self.tombstones);
+        let bury = move |rel: String, dead: HashSet<String>| {
+            tombs.lock().unwrap().insert(rel, (dead, std::time::Instant::now()));
+        };
+        if elsewhere.is_empty() {
+            bury(rel, dead);
+            return reply.ok();
+        }
+        let sources = self.view_sources.clone();
+        let data_dir = self.data_dir.clone();
+        std::thread::spawn(move || {
+            let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
+            match pvfs_client::hash_cache::trash_elsewhere(&sources, &rel, &elsewhere) {
+                Ok(()) => {
+                    eprintln!("mount: delete of {rel} — {} copy(ies) moved to their boxes' trash", elsewhere.len());
+                    dead.extend(elsewhere.into_iter().map(|(_, h)| h));
+                    bury(rel, dead);
+                    reply.ok();
+                }
+                Err(e) => {
+                    eprintln!("mount: delete of {rel} failed: {e}");
+                    reply.error(libc::EIO);
+                }
+            }
+        });
     }
 
     /// The copy a file entry serves: hash, size, mtime.
@@ -804,6 +930,9 @@ impl Filesystem for PvfsFs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.view {
+            return self.view_unlink(parent, name, reply); // D169
+        }
         match self.retire(parent, name, false) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1266,7 +1395,11 @@ impl PvfsFs {
     /// automated deletion through the trash.
     fn retire(&mut self, parent: u64, name: &OsStr, want_dir: bool) -> Result<(), i32> {
         if self.view {
-            return Err(libc::EROFS); // D130: the view is read-only, namespace included
+            // D130: the view's namespace is read-only — except `unlink` of a
+            // file, which never reaches here (D169, `view_unlink`). An
+            // emptied folder is its holder's to remove; a rename is a move on
+            // the holder: each its own question.
+            return Err(libc::EROFS);
         }
         let parent_node = self
             .ino_to_node

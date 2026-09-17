@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 ///          head through the forest owner. Additive; compatible-with stays.
 ///   5 → 6: D124 `Purge` and `SetQuality` — the two CLI commands that did not
 ///          route on a replica. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 8;
+///   8 → 9: D169 `TrashPath` — a delete that came through a view mount asks
+///          the box that holds the file to move it to its region's trash.
+///          Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 9;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -94,6 +97,10 @@ pub enum ServerMsg {
     /// `ClientMsg::RegionManifest`): `total` is the file's length, `bytes`
     /// the hex of the page at the requested offset.
     RegionManifest { total: u64, bytes: String },
+    /// D169: the answer to `ClientMsg::TrashPath` — `moved` is false when
+    /// this box catalogues the region and holds nothing at that path (already
+    /// gone: not an error).
+    Trashed { moved: bool },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
     /// P9 (doc 22): the chunk manifest for a file this holder can read —
@@ -416,6 +423,17 @@ pub enum ClientMsg {
         offset: u64,
         #[serde(default, skip_serializing_if = "is_zero")]
         len: u64,
+    },
+    /// D169: a delete that came through a view mount. Move THIS box's copy
+    /// of `rel_path` in catalogue region `region` into that region's trash
+    /// (soft: kept for the region's retention, restorable) — only when it is
+    /// still the file the caller saw (`hash`). **Write-gated** on the region.
+    /// `not_found` when this box does not catalogue that region from its own
+    /// disk (ask the next box); `conflict` when the file here has changed.
+    TrashPath {
+        region: String,
+        rel_path: String,
+        hash: String,
     },
     /// P9 (doc 22): the file's chunk manifest — BLAKE3 per 8 MiB chunk,
     /// computed from the holder's bytes (sidecar-cached). UNSIGNED and
