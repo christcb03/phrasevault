@@ -436,6 +436,22 @@ pub struct LocalBytes {
     pub region: NodeId,
 }
 
+/// D169 — what [`Engine::trash_region_path`] did with this box's copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrashedHere {
+    /// Moved into the region's trash, its sidecar with it: where it went.
+    Trashed(std::path::PathBuf),
+    /// This box catalogues the region and holds nothing at that path (the
+    /// row and the file are both gone): nothing to do, and not an error.
+    Gone,
+    /// The file here is not the one the caller saw (another hash, or a size
+    /// the row does not have): refused, nothing moved.
+    Changed,
+    /// This box does not catalogue that region from its own disk: ask
+    /// another.
+    NotHere,
+}
+
 /// D133 — one file the receiving side will pull (doc 26 §7.3): the copy the
 /// view describes, and where on this box it lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2045,6 +2061,78 @@ impl Engine {
             }
         }
         Ok(None)
+    }
+
+    /// D169 — a delete that came through the view: move THIS box's copy of
+    /// `rel_path` in catalogue region `region` into that region's trash, its
+    /// sidecar with it — the soft delete every automated deletion is (D145),
+    /// kept for the region's retention and restorable (`pvfs trash restore`,
+    /// D167). Only a file, only in a region this box catalogues from its own
+    /// disk, and only when it is the file the caller saw: the row's hash must
+    /// be `expect_hash` and the file's size the row's. The box's own watcher
+    /// sees the move; its next pass drops the row and publishes the head.
+    pub fn trash_region_path(&self, region: &NodeId, rel_path: &str, expect_hash: &str) -> Result<TrashedHere> {
+        if rel_path.is_empty() || rel_path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+            return Err(PvfsError::BadInput {
+                field: "rel_path".into(),
+                reason: "a path relative to the region's root, with no `.` or `..` in it".into(),
+            });
+        }
+        if !self.is_catalogue_region(region)? || !self.catalogues_here(region)? {
+            return Ok(TrashedHere::NotHere);
+        }
+        let mine: Vec<Binding> = if self.replica {
+            load_local_bindings(&self.data_dir)?
+                .into_iter()
+                .filter(|b| &b.folder_id == region)
+                .collect()
+        } else {
+            let me = self.device.pubkey();
+            self.bindings_for(region)?
+                .into_iter()
+                .filter(|b| b.bound_by == me)
+                .collect()
+        };
+        if mine.is_empty() {
+            return Ok(TrashedHere::NotHere);
+        }
+        let row: Option<(String, i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT kind, size_bytes, content_hash FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
+                params![region, rel_path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(map_db("trash region path"))?;
+        let size = match row {
+            None => return Ok(TrashedHere::Gone),
+            Some((kind, _, _)) if kind != "file" => {
+                return Err(PvfsError::BadInput {
+                    field: "rel_path".into(),
+                    reason: format!("{rel_path} is a folder here; only a file is trashed"),
+                })
+            }
+            Some((_, _, hash)) if hash.as_deref() != Some(expect_hash) => return Ok(TrashedHere::Changed),
+            Some((_, size, _)) => size as u64,
+        };
+        for b in mine {
+            let Ok(root) = self
+                .resolve_uri(&b.source_uri)
+                .and_then(|u| crate::storage::uri_to_path(&u))
+            else {
+                continue;
+            };
+            let file = root.join(rel_path);
+            match std::fs::symlink_metadata(&file) {
+                Ok(m) if m.is_file() && m.len() == size => {
+                    return crate::sync::move_to_trash_with_sidecar(&root, &file).map(TrashedHere::Trashed);
+                }
+                Ok(_) => return Ok(TrashedHere::Changed),
+                Err(_) => continue,
+            }
+        }
+        Ok(TrashedHere::Gone)
     }
 
     /// D129 — the catalogue regions whose fetched snapshot the log has since

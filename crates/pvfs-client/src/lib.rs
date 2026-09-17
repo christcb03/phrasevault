@@ -483,6 +483,28 @@ impl Client {
         )
     }
 
+    /// D169: ask this box to move ITS copy of `rel_path` in `region` to that
+    /// region's trash, if it is still the file with `hash`. `Ok(true)` moved,
+    /// `Ok(false)` it was already gone here; `not_found` = this box does not
+    /// hold that region (ask another), `conflict` = the file changed,
+    /// `forbidden` = no write rights on the region.
+    pub fn trash_path(&mut self, region: &str, rel_path: &str, hash: &str) -> Result<bool> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::TrashPath {
+                region: region.into(),
+                rel_path: rel_path.into(),
+                hash: hash.into(),
+            },
+        )?;
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::Trashed { moved }) => Ok(moved),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("Trashed", &other)),
+            None => Err(ClientError::Protocol("connection closed before Trashed".into())),
+        }
+    }
+
     fn cat_with(&mut self, msg: ClientMsg, out: &mut dyn std::io::Write) -> Result<u64> {
         write_msg(&mut self.stream, &msg)?;
         // Server responds: CatStart (JSON) → binary data frames → CatDone (JSON).

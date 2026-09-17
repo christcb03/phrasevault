@@ -5,6 +5,34 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A delete through the view is a trip to the holder's trash (D169).** The
+  view mount's namespace was read-only (D130), and an arr importing an
+  upgrade removes the existing file first: Sonarr moves it to its recycle
+  bin (another filesystem — a copy, then a delete of the original), Radarr
+  deletes it. Ninety minutes after the arrs' union became `/mnt/local` + the
+  view, Sonarr was logging "Unable to move … to the recycling bin" once a
+  minute for three queued upgrades (`EROFS`). The node mount's own comment
+  had called this "the gap that made the design a REGRESSION against the
+  rclone mounts it replaces" (D71 W2); the view never got the fix. Now
+  `unlink` in the view asks **the box that holds the file** to move its copy
+  into that region's trash — soft, kept for the region's retention,
+  restorable with `pvfs trash restore` (rclone's delete was for ever).
+  `Engine::trash_region_path` (only a file, only in a region this box
+  catalogues from its own disk, only when the row's hash and the file's
+  size are what the caller saw); `ClientMsg::TrashPath` → `ServerMsg::
+  Trashed` (**proto 8 → 9**, additive), write-gated on the region,
+  `not_found` when the box does not hold the region (ask the next),
+  `conflict` when the file changed; `hash_cache::trash_elsewhere` asks the
+  fleet box by box, off the mount's session thread. Every copy the view
+  shows at the path goes (a copy left on another disk would leave the path
+  there and the arr would refuse to write over it). The path is tombstoned
+  in the mount — hidden at once, by the hashes that were trashed, because
+  the arr creates the new file at the same path within the second and the
+  catalogue takes a pass and a fetch to agree; a new file there (another
+  hash) shows. `rename` and `rmdir` stay `EROFS`.
+  `pvfs-core/tests/d169_trash_region_path.rs`,
+  `pvfsd/tests/d169_trash_path.rs`, `pvfs-fuse/tests/d169_view_unlink.rs`.
+
 - **`pvfs trash ls` and `pvfs trash restore` (D167).** Every automated
   deletion moves the file aside (`<root>/.pvfs-trash/<day>/<its path>`,
   sidecar beside it) — "recoverable by moving it back", by hand, and

@@ -405,7 +405,15 @@ waiting read first, pooled connections, a read's wait moved off fuser's
 session thread, and the store bounded by `--cache-max` (500 GB) and
 `--cache-age` (1 day), least recently read first. Still single-source per
 request: several holders serving pieces of one file is now a change to the
-worker alone. The original spec follows.
+worker alone. **D169 (2026-09-17): the namespace is read-only but for one
+thing — `unlink` of a file.** An arr importing an upgrade removes the
+existing file first, and against a read-only view that was `EROFS` and no
+import (found ninety minutes after the arrs' union switched to the view).
+The delete goes to the box that holds the file, which moves its copy into
+the region's trash (`TrashPath`, proto 9, write-gated on the region; every
+copy the view shows at the path; only if it is still the file that was
+seen), and the mount hides the path at once. `rename`, `rmdir` and every
+byte write are still refused. The original spec follows.
 The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.

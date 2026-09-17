@@ -696,6 +696,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
         ClientMsg::ClaimWriteLease { roots } => {
             do_claim_write_lease(daemon, principal, roots, conn)
         }
+        ClientMsg::TrashPath { region, rel_path, hash } => do_trash_path(daemon, principal, &region, &rel_path, &hash),
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
@@ -774,6 +775,31 @@ const MANIFEST_PAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Anything this box cannot serve — an unknown or non-catalogue region, a
 /// seq it never published — is `region_not_held`, so a fetcher tries the
 /// next box rather than treating it as a fault.
+/// D169 — a delete that came through a view mount: this box's copy goes to
+/// its region's trash. Default deny: the caller needs WRITE on the region.
+fn do_trash_path(daemon: &Daemon, principal: &Principal, region: &str, rel_path: &str, hash: &str) -> ServerMsg {
+    if region.len() != 64 || !region.chars().all(|c| c.is_ascii_hexdigit()) {
+        return err("bad_input", "a region is named by its 64-hex node id");
+    }
+    let e = daemon.reader();
+    match e.effective_rights(principal, &region.to_string()) {
+        Ok(r) if r & acl::ACL_W != 0 => {}
+        Ok(_) => return err("forbidden", "trashing a file requires write rights on its region"),
+        Err(pvfs_core::PvfsError::NotFound { .. }) => return err("not_found", "this instance has no such region"),
+        Err(pve) => return err_from(pve),
+    }
+    match e.trash_region_path(&region.to_string(), rel_path, hash) {
+        Ok(pvfs_core::TrashedHere::Trashed(to)) => {
+            eprintln!("pvfsd: trashed {rel_path} of {} for {principal:?} — it is at {}", &region[..8], to.display());
+            ServerMsg::Trashed { moved: true }
+        }
+        Ok(pvfs_core::TrashedHere::Gone) => ServerMsg::Trashed { moved: false },
+        Ok(pvfs_core::TrashedHere::Changed) => err("conflict", "the file here is not the one that was seen (its hash or size changed); nothing was moved"),
+        Ok(pvfs_core::TrashedHere::NotHere) => err("not_found", "this box does not catalogue that region from its own disk"),
+        Err(pve) => err_from(pve),
+    }
+}
+
 fn do_region_manifest(
     daemon: &Daemon,
     principal: &Principal,
