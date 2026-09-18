@@ -336,6 +336,14 @@ impl Daemon {
         })
     }
 
+    /// D176 — the catalogue regions this box holds, with root and retention,
+    /// for the runner's trash step: through the READ POOL, like the receive
+    /// plan, so the step opens no engine and folds nothing. The purge itself
+    /// runs after the view is handed back.
+    pub fn trash_roots(&self) -> pvfs_core::Result<Vec<(String, PathBuf, u64)>> {
+        self.reader().trash_roots()
+    }
+
     /// D136 — hold the WRITER lock from outside, for the test that proves
     /// `serve status` never waits on it. Not for production callers.
     #[doc(hidden)]

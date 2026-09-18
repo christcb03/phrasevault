@@ -1,7 +1,7 @@
 # 30 — Monitoring the fleet: what PVFS tells you, and a worked Home Assistant build
 
-**Status: current (2026-09-13).** Pulls together what grew across PVOS
-milestones D83, D131, D135, D136, D142, D143 and D146. The PVFS side (§1) is
+**Status: current (2026-09-18).** Pulls together what grew across PVOS
+milestones D83, D131, D135, D136, D142, D143, D146, D148 and D176. The PVFS side (§1) is
 product; the Home Assistant side (§2) is one deployment of it, described as a
 worked example you can copy or translate to another system.
 
@@ -58,6 +58,28 @@ To prove "caught up" without trusting any status: compare
 `select max(seq) from events` in the owner's and the replica's `log.db`,
 opened read-only.
 
+**Beside the rows**, `serve status` carries four facts about the box, each
+defaulted so an older daemon's reply still decodes: `conflicts` (D127, paths
+in conflict in the merged view), `stale` (D129, catalogue regions held at a
+superseded head), `capacity` (D131, the store's free and total bytes) and
+**`trash`** (D148). `trash` has one entry per catalogue region the box holds:
+the bytes in its `.pvfs-trash`, the number of day buckets, the oldest
+bucket's day (days since the epoch), the region's retention, what the last
+purge freed, and when it was measured (`measured_ms`).
+
+Every daemon purges its own regions' trash by retention and measures it once
+at start and then every five minutes, whatever jobs it runs (D176). Before
+D176 only the `receive` and `resolve` passes did that, so a box running
+neither (mediabox) never purged its trash and never reported it. The probe
+never walks a disk (D136): the figure is the last step's.
+
+| `trash` | means | does NOT mean |
+|---|---|---|
+| a region with `measured_ms` minutes old | the step ran; bytes and buckets are what the purge kept | that anything was purged (`freed_bytes` says; usually 0) |
+| no entries | the box holds no catalogue region, or its daemon started less than a step ago | that the trash is empty: a daemon older than D176 reports only after a `receive`/`resolve` pass |
+| a bucket older than its retention + 1 day | the purge is not running, or it is failing: the journal says `pvfsd: trash purge failed: …` once per run | — |
+| `measured_ms` hours old | the step has stopped (a wedged daemon, or a purge stuck on a disk) | — |
+
 ### 1.2 The owner's view: the `health` job and `pvfs fleet health` (D131, D136)
 
 On the owner, `pvfs serve enable health` polls every announced peer every
@@ -71,7 +93,9 @@ peers: { <transport pin>: {
     last_attempt_ms, last_ok_ms,
     unreachable_since_ms, misses,      # DOWN after 2 consecutive misses
     last: { reachable, forest_ok, runner, jobs: [{name, state, last_ok_ms, last_error}],
-            conflicts, stale, capacity: [free, total], error },
+            conflicts, stale, capacity: [free, total],
+            trash: [{region, bytes, buckets, oldest_day, retention_days,
+                     freed_bytes, measured_ms}], error },   # §1.1
     actions: [...], attempts } }       # what supervision did (D135)
 ```
 
@@ -222,7 +246,9 @@ It POSTs one JSON snapshot to webhook `pvfs-status`:
 v, at, forest, forest_id
 state: ok | warning | critical        summary        problems[]        conflicts
 boxes.<label>: { label, addr, up, since, version, free_gb, total_gb,
-                 jobs: [{job, state, last_ok, error}] }
+                 jobs: [{job, state, last_ok, error}],
+                 trash: [{region, gb, oldest_days, retention_days}],
+                 trash_gb, trash_oldest_days }
 mover: { state: moving | waiting | stalled | idle | unknown,
          in_flight, active: [{title, file, size_gb, moved_gb, pct, replaces}],
          pct, moved_gb, size_gb, rate_mbs, left_files, left_gb, eta_h,
@@ -242,7 +268,8 @@ that turns on after 5 minutes without a snapshot — the entities cannot say
 "no snapshot has come" themselves.
 
 **The page** (`/pvfs-forest`, a sections view): the forest headline and
-problems; the boxes (daemon answering, build, free space); **jobs — last run**
+problems; the boxes (daemon answering, build, free space, trash and its
+oldest bucket's age); **jobs — last run**
 (✅ how long ago it last succeeded, ❌ the error, ⏳ the stall detector's
 notice); the mover (each file in flight with its %, the aggregate rate, the
 queue, what is left and when); **recently moved & deleted**; the catalogue;
@@ -266,6 +293,12 @@ the machines; and the recent fleet events.
   omits progress so the forest sensor does not churn.
 - **Say what is observed.** The page shows `overdue` as a state with the job's
   last success, not as a failure; after D146 an overdue `follow` is real.
+- **A standing test that cleanup works (D148).** A trash bucket older than
+  its region's retention plus a day is a problem on the page: *"mediabox's
+  trash in mediabox-local has a bucket 9 days old (kept 7): the purge is not
+  running."* It can only fire for a box that reports its trash, and until
+  D176 mediabox reported nothing, so every box that holds a region now
+  reports it, purged or not.
 
 ### 2.3 A sidebar on honest numbers: hypervisor memory
 

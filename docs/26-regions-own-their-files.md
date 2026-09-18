@@ -208,7 +208,10 @@ that replacement moves the library's losing copy to the library's trash —
 soft, dated, kept for the region's retention — because one path holds one
 file. D133 also settles the trash-age part of 7.4: `pvfs region retention
 <region> <days>` (default 7), applied by `resolve`. The rest of 7.4 stays
-open.*
+open.* *(Corrected 2026-09-18: D148 applied it to every catalogue region a
+box holds, but still only from `resolve` and `receive`, so a box running
+neither — mediabox — never purged. Since PVOS D176 every daemon applies it
+to its own regions every five minutes, whatever jobs it runs; doc 18 §1.)*
 
 *D167 (2026-09-17): the trash can be read and undone.* `pvfs trash ls [PATH]`
 lists, for every folder bound on the box it runs on, each trashed file — the

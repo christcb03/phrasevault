@@ -5,6 +5,25 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every box purges its trash, whatever jobs it runs (PVOS D176).** A
+  catalogue region's trash was purged by retention only inside the `receive`
+  and `resolve` job bodies — also the only thing that filled `serve
+  status`'s `trash` (D148). mediabox runs neither: its trash (9.7 GB on
+  2026-09-18, from deletes through the view since D169 and D149's orphaned
+  sidecars; both disks 98 % full) was never purged, and D148's page warning
+  (*a bucket older than retention + 1 day: the purge is not running*) could
+  never fire for a box that reported no trash. The job runner now has a
+  trash step beside its heads tick: once at start and every five minutes it
+  asks the daemon's read pool which catalogue regions this box holds
+  (`Engine::trash_roots`, no engine opened, nothing folded) and purges each
+  by its retention on its own thread (`sync::purge_region`), recording what
+  each keeps. A region that fails is said once per run (D157) and does not
+  cost the others theirs. `receive` and `resolve` purge exactly as before;
+  a lock keeps their purge and the step's from overlapping (two purges race
+  on `remove_dir_all`, and the loser would fail a `resolve` pass).
+  `PVFS_TRASH_EVERY_MS` shortens the interval for tests. No wire change.
+  `pvfsd/tests/d176_trash_everywhere.rs` runs a box with two catalogue
+  regions and no jobs, under a held fold lock and writer.
 - **The receive plan comes from the running daemon (PVOS D174).** The
   owner's dashboard collector (PVOS D143) asked the NAS for the mover's plan
   every minute by running `pvfs view receive --dry-run` inside the production

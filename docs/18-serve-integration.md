@@ -51,6 +51,15 @@ will and will not touch — and the difference is where the surprises live.
 - **reclaim** — trashes central-store bytes whose node has no live link anywhere.
   **Trash, not unlink**: after evict has taken the edge copy this is the only
   one, and an automated deletion that turns out to be wrong is unrecoverable.
+- **Not a job: the trash step (PVOS D176).** Every daemon purges the trash of
+  the catalogue regions its box holds, by each region's retention, and
+  records what each keeps for `serve status`: once at start and every five
+  minutes, whatever `serve.jobs` says, beside the region-heads tick. It asks
+  the read pool which regions are local (no engine opened) and does the disk
+  work on its own thread. `receive` and `resolve` also purge after their
+  passes (D133, D148), never at the same time as the step. Until D176 those
+  two were the only purge, so a box running neither (mediabox) kept its
+  trash forever.
 
 **The interaction that surprises people:** owner-side `tier` retires, and evict
 only acts on LIVE locations — so if tier retires first, **evict does nothing and
