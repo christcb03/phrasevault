@@ -1,7 +1,7 @@
 # 30 — Monitoring the fleet: what PVFS tells you, and a worked Home Assistant build
 
 **Status: current (2026-09-18).** Pulls together what grew across PVOS
-milestones D83, D131, D135, D136, D142, D143, D146, D148 and D176. The PVFS side (§1) is
+milestones D83, D131, D135, D136, D142, D143, D146, D148, D176 and D177. The PVFS side (§1) is
 product; the Home Assistant side (§2) is one deployment of it, described as a
 worked example you can copy or translate to another system.
 
@@ -78,7 +78,7 @@ never walks a disk (D136): the figure is the last step's.
 | a region with `measured_ms` minutes old | the step ran; bytes and buckets are what the purge kept | that anything was purged (`freed_bytes` says; usually 0) |
 | no entries | the box holds no catalogue region, or its daemon started less than a step ago | that the trash is empty: a daemon older than D176 reports only after a `receive`/`resolve` pass |
 | a bucket older than its retention + 1 day | the purge is not running, or it is failing: the journal says `pvfsd: trash purge failed: …` once per run | — |
-| `measured_ms` hours old | the step has stopped (a wedged daemon, or a purge stuck on a disk) | — |
+| `measured_ms` more than 30 minutes (six steps) old when the box answered | the step has stopped (a wedged daemon, a purge stuck on a disk, or it could not list the box's regions) or keeps failing for that region (`trash purge failed`); the page raises it (§2.2) | anything, on a daemon older than D176: it measures only at the end of a `receive`/`resolve` pass, and a `receive` pass can take hours |
 
 ### 1.2 The owner's view: the `health` job and `pvfs fleet health` (D131, D136)
 
@@ -98,6 +98,13 @@ peers: { <transport pin>: {
                      freed_bytes, measured_ms}], error },   # §1.1
     actions: [...], attempts } }       # what supervision did (D135)
 ```
+
+`version` is what the box announced (`pvfs fleet announce`, D72): the crate
+version, wire proto and schema, **not the build**. Two builds with the same
+proto and schema read the same (v1.4-391 and v1.4-393 are both
+`{"pvfs":"1.4.0","proto":11,"schema":19}`), and nothing else in the record
+carries a peer's build. `last` is the latest probe's answer, successful or
+not, taken at `last_attempt_ms`; `last_ok_ms` is the latest that succeeded.
 
 `pvfs fleet health` prints it (`--now` polls first; `--json` for scripts).
 Two misses before "down" is the hysteresis: a daemon restarting — a minute,
@@ -233,7 +240,7 @@ a systemd timer every minute, **read-only everywhere**:
 
 | reads | for |
 |---|---|
-| `fleet-health.json` | each peer: up/down, build, jobs with last run, free space |
+| `fleet-health.json` | each peer: up/down, announced version (§1.2: not its build), jobs with last run, free space, trash |
 | `pvfs serve status --json` | the owner's own jobs |
 | `pvfs region ls --json` | each catalogue region's head and entries |
 | `pvfs region entries <id> --json` (only when a head moves) | the file lists diffed into "moved / deleted" |
@@ -268,7 +275,7 @@ that turns on after 5 minutes without a snapshot — the entities cannot say
 "no snapshot has come" themselves.
 
 **The page** (`/pvfs-forest`, a sections view): the forest headline and
-problems; the boxes (daemon answering, build, free space, trash and its
+problems; the boxes (daemon answering, version, free space, trash and its
 oldest bucket's age); **jobs — last run**
 (✅ how long ago it last succeeded, ❌ the error, ⏳ the stall detector's
 notice); the mover (each file in flight with its %, the aggregate rate, the
@@ -299,6 +306,21 @@ the machines; and the recent fleet events.
   running."* It can only fire for a box that reports its trash, and until
   D176 mediabox reported nothing, so every box that holds a region now
   reports it, purged or not.
+- **A standing test that the purge keeps running (PVOS D177).** The bucket
+  test answers after eight days. Since D176 every daemon measures its trash
+  every five minutes, so a region measured more than 30 minutes (six steps)
+  before the owner's last probe of an answering box is a problem: *"Mediabox's
+  trash in mediabox-local, mediabox-local2 has not been measured for 47 min:
+  its trash step has stopped or is failing (its journal says which)."* One
+  line per box, naming only the stale regions: a hung step leaves them all,
+  a failing region only itself. It is measured against the probe
+  (`last_attempt_ms`), not the clock: a health job that stops polling is
+  already a problem, and must not become one more per box. A daemon older
+  than D176 measures only at the end of a `receive`/`resolve` pass, and the
+  record cannot say which build a peer runs (§1.2), so the collector exempts
+  the hosts in `PVFS_HA_TRASH_EXEMPT` (comma-separated; in PVOS,
+  `pvfs_status_trash_exempt` on the owner's row) until they are rolled.
+  Empty, every box is held to it.
 
 ### 2.3 A sidebar on honest numbers: hypervisor memory
 
