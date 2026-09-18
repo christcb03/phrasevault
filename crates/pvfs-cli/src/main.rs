@@ -6992,6 +6992,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     if let Some((free, total)) = r.last.capacity {
                         notes.push(format!("{} free of {}", fmt_bytes(free), fmt_bytes(total)));
                     }
+                    // PVOS D178 — each filesystem its regions' files are on
+                    for st in r.last.stores.iter().filter(|st| !st.regions.is_empty()) {
+                        let on: Vec<&str> = st.regions.iter().map(|x| &x[..x.len().min(8)]).collect();
+                        notes.push(format!("store {} {} free of {}", on.join("+"), fmt_bytes(st.free_bytes), fmt_bytes(st.total_bytes)));
+                    }
                     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
                     for t in r.last.trash.iter().filter(|t| t.bytes > 0) {
                         notes.push(format!(
@@ -9236,7 +9241,8 @@ fn serve_status_print(
 ) -> Result<(), PvfsError> {
     let mut client = daemon_member_client(state_dir, sock)?;
     let st = client.serve_status_full().map_err(remote_err)?;
-    let (runner, jobs, conflicts, stale, capacity, trash) = (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash);
+    let (runner, jobs, conflicts, stale, capacity, trash, stores) =
+        (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash, st.stores);
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -9256,13 +9262,14 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
                 .map(|c| format!("{{\"free_bytes\":{},\"total_bytes\":{}}}", c.free_bytes, c.total_bytes))
                 .unwrap_or_else(|| "null".into()),
             serde_json::to_string(&trash).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&stores).unwrap_or_else(|_| "[]".into()),
         );
     } else {
         println!("runner: {runner}");
@@ -9274,6 +9281,18 @@ fn serve_status_print(
         }
         if let Some(c) = capacity {
             println!("capacity: {} free of {}  (the sync store's filesystem; D131)", fmt_bytes(c.free_bytes), fmt_bytes(c.total_bytes));
+        }
+        // PVOS D178 — every filesystem this box stores on, when it is more
+        // than the data dir's (a holder's regions are usually elsewhere).
+        if stores.len() > 1 || stores.iter().any(|s| !s.regions.is_empty()) {
+            for s in &stores {
+                let on = if s.regions.is_empty() {
+                    "the data dir".to_string()
+                } else {
+                    s.regions.iter().map(|r| r[..r.len().min(8)].to_string()).collect::<Vec<_>>().join(", ")
+                };
+                println!("store {}: {} free of {}  ({on})", s.path, fmt_bytes(s.free_bytes), fmt_bytes(s.total_bytes));
+            }
         }
         for t in &trash {
             println!(

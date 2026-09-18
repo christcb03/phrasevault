@@ -146,8 +146,15 @@ pub enum ServerMsg {
         capacity: Option<CapacityWire>,
         /// D148: each local catalogue region's trash as its last purge pass
         /// left it. Absent on older daemons, so defaulted rather than a proto bump.
+        /// Boxed (PVOS D178) with `stores` below, to keep the variant small.
         #[serde(default)]
-        trash: Vec<TrashWire>,
+        trash: Box<Vec<TrashWire>>,
+        /// PVOS D178: every filesystem this box stores on — `capacity` is the
+        /// data dir's alone. Absent on older daemons, so defaulted rather
+        /// than a proto bump. Boxed: the variant must stay small, since
+        /// `ServerMsg` is the error half of many results (the JSON is the same).
+        #[serde(default)]
+        stores: Box<Vec<StoreWire>>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -281,6 +288,17 @@ pub struct ServeJobWire {
 /// D131 — free and total bytes of the filesystem under a box's sync store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWire {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// PVOS D178 — one filesystem a box stores on (its data dir's, or one its
+/// catalogue regions' files are on), with the regions on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreWire {
+    pub path: String,
+    #[serde(default)]
+    pub regions: Vec<String>,
     pub free_bytes: u64,
     pub total_bytes: u64,
 }

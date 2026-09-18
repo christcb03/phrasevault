@@ -291,6 +291,24 @@ impl Daemon {
         })
     }
 
+    /// PVOS D178: every filesystem this box stores on (the read pool: a
+    /// status answer never waits on the writer).
+    pub fn store_filesystems(&self) -> Vec<pvfs_proto::StoreWire> {
+        self.reader()
+            .store_filesystems()
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| pvfs_proto::StoreWire {
+                        path: s.path,
+                        regions: s.regions,
+                        free_bytes: s.free_bytes,
+                        total_bytes: s.total_bytes,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// D129: catalogue regions this box holds a superseded snapshot of.
     pub fn stale_catalogue_count(&self) -> u64 {
         self.reader()
@@ -619,7 +637,8 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
-                        trash: j.trash_snapshot(),
+                        trash: Box::new(j.trash_snapshot()),
+                        stores: Box::new(daemon.store_filesystems()),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
@@ -627,7 +646,8 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
-                        trash: Vec::new(),
+                        trash: Box::default(),
+                        stores: Box::new(daemon.store_filesystems()),
                     },
                 }
             }

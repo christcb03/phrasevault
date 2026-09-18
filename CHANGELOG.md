@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every filesystem a box stores on (PVOS D178).** `serve status` — and so
+  the health record a peer answers with — gains `stores`: the data dir's
+  filesystem first, then each filesystem under the roots of the catalogue
+  regions the box catalogues from its own disk, once per device, with the
+  regions on it (`Engine::store_filesystems`). `capacity` (D131) measured the
+  data dir's alone, and a holder's files are rarely there: the forest page
+  said mediabox had 339 GB free while both its stores were 98 % full, and it
+  gave the NAS one of its two volumes. Additive and defaulted (an older
+  daemon answers without `stores`); `pvfs serve status` and `pvfs fleet
+  health` print them. `ServeJobs`' `trash` and `stores` are boxed so
+  `ServerMsg` stays under clippy's `result_large_err` size — the JSON is
+  unchanged.
 - **Every box purges its trash, whatever jobs it runs (PVOS D176).** A
   catalogue region's trash was purged by retention only inside the `receive`
   and `resolve` job bodies — also the only thing that filled `serve
