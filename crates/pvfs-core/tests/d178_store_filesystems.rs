@@ -40,15 +40,22 @@ fn each_filesystem_once_the_data_dirs_first_with_the_regions_on_it() {
 
     let a = region(&mut e, "A", &tmp.path().join("a"));
     let b = region(&mut e, "B", &tmp.path().join("b"));
-    // A second filesystem, when the host has one to offer (tmpfs at /dev/shm on Linux).
-    let other = Path::new("/dev/shm");
-    let far = if other.is_dir() && std::fs::metadata(other).map(|m| !m.permissions().readonly()).unwrap_or(false) {
-        let d = tempfile::tempdir_in(other).unwrap();
-        let c = region(&mut e, "C", &d.path().join("c"));
-        Some((d, c))
-    } else {
-        None
+    // A second filesystem, when the host has one to offer: the first
+    // writable candidate on another device than the test's own tempdir (the
+    // pipeline's TMPDIR can itself be /dev/shm).
+    let here = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(tmp.path()).unwrap().dev()
     };
+    let other = ["/dev/shm", "/tmp", "/var/tmp"].into_iter().map(Path::new).find(|p| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).map(|m| m.dev() != here).unwrap_or(false) && tempfile::tempdir_in(p).is_ok()
+    });
+    let far = other.map(|o| {
+        let d = tempfile::tempdir_in(o).unwrap();
+        let c = region(&mut e, "C", &d.path().join("c"));
+        (d, c, o.to_path_buf())
+    });
     // A region marked but bound by nobody here is not a store of this box.
     let top = e.identity.root_node_id.clone();
     let foreign = e
@@ -67,10 +74,10 @@ fn each_filesystem_once_the_data_dirs_first_with_the_regions_on_it() {
     assert!(first.total_bytes > 0 && first.free_bytes <= first.total_bytes);
     assert!(stores.iter().all(|s| !s.regions.contains(&foreign)));
     match far {
-        Some((_keep, c)) => {
+        Some((_keep, c, o)) => {
             assert_eq!(stores.len(), 2, "{stores:?}");
             assert_eq!(stores[1].regions, vec![c]);
-            assert!(stores[1].path.starts_with("/dev/shm"));
+            assert!(stores[1].path.starts_with(&*o.to_string_lossy()), "{stores:?}");
         }
         None => assert_eq!(stores.len(), 1),
     }
