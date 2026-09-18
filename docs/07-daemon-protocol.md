@@ -65,7 +65,8 @@ Requests (current `ClientMsg` set): `Auth`/`Anonymous` (handshake, §2), then by
 `Info`, `Ls`, `Stat`, `Payload`, `Cat{node,offset,len}` (ranged; waits on chunk coverage for
 in-flight ingest partials, P10.1), `ChunkManifest` · writes: `PrepareWrite` / `Commit` (§5) ·
 secure: `SecureCreate` (via `WriteOp`), `SecurePut`, `SecureCat` · log shipping: `LogInfo`,
-`LogRead`, `LogWait` · serve: `ServeStatus` · ingest (P10, doc 23): `IngestBegin`/`IngestWrite`/
+`LogRead`, `LogWait` · serve: `ServeStatus`, `ReceivePlan` (proto 11, PVOS D174 — the receive plan
+from the read pool, member-gated) · ingest (P10, doc 23): `IngestBegin`/`IngestWrite`/
 `IngestVerified`/`IngestCommit`/`IngestAbort`/`IngestList`. Responses are typed results or a typed
 error reusing `PvfsError` codes.
 

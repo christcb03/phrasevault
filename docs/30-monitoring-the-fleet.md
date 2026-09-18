@@ -94,7 +94,7 @@ a shell:
 | `restart` | refuses `serving`/`busy`; kills a wedged one, then starts |
 | `version` | what the binaries report |
 | `install` | a tar of binaries on stdin, verified, swapped (keeps `prev/`) |
-| `progress` | read-only: the receiver's non-empty `.partial` files and the dry-run receive plan (PVOS D143) |
+| `progress` | read-only: the receiver's non-empty `.partial` files and the receive plan (PVOS D143), with each file's size, from the running daemon — `pvfs serve receive-plan`, which never opens the forest (PVOS D174; it was `view receive --dry-run`, a fold of the production forest once a minute) |
 
 `pvfs fleet supervise <pin> --ssh user@<holder> --key ~/.ssh/pvfs-supervise`
 registers the channel; the health job sends `start` after two missed polls,
