@@ -394,6 +394,12 @@ CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)      
 ///
 /// `rebuild_copies_every_table` pins the list against the schema, so the next
 /// table cannot be forgotten the way these three were.
+/// D173 — the tables a rebuild carries over from the live cache instead of
+/// taking from the replay: derived from disks and fetched manifests, not from
+/// the log, so a replay comes back without them. All three are also in
+/// [`MAIN_OBJECTS`] (the swap copies them back like everything else).
+pub const CARRIED_ACROSS_A_REBUILD: &[&str] = &["region_entries", "region_snapshots", "region_fetched"];
+
 pub const MAIN_OBJECTS: &[&str] = &[
     "nodes",
     "links",
@@ -3433,6 +3439,16 @@ pub fn full_rebuild(
         .map_err(map_db("attach rebuild db"))?;
     let swapped = (|| -> Result<()> {
         let tx = conn.transaction().map_err(map_db("swap projection"))?;
+        // D173 — what the log cannot give back goes across FIRST: a
+        // catalogue region's rows come from a box's own disk or a fetched
+        // manifest, and its snapshot record says which head it published.
+        // The replay leaves these tables empty in `fresh`; a swap that
+        // dropped them cost the NAS its catalogue and, worse, its head
+        // count (a publish from 1 against an attested 270 is refused).
+        for t in CARRIED_ACROSS_A_REBUILD {
+            tx.execute_batch(&format!("INSERT OR IGNORE INTO fresh.{t} SELECT * FROM main.{t};"))
+                .map_err(map_db("carry a catalogue table across the rebuild"))?;
+        }
         for t in MAIN_OBJECTS {
             tx.execute_batch(&format!("DROP TABLE IF EXISTS main.{t};"))
                 .map_err(map_db("swap: drop old table"))?;
@@ -3767,16 +3783,65 @@ pub fn startup_check(
     // fold-apply ("author not authorized") and bricked the owner, while a
     // cold rebuild of the very same log was perfect.
     if behind {
-        if let Err(e) = catch_up_tail(conn, data_dir, &identity) {
-            eprintln!(
-                "pvfs: incremental fold failed ({e}); discarding the projection \
-                 cache and replaying the full log"
-            );
-            return full_rebuild(conn, data_dir, "incremental fold failed");
+        // D173 — a fold lock held by ANOTHER pvfs process is not a torn
+        // cache, and the answer to it is to wait, then to give up — never to
+        // replay. The replay drops `region_entries` / `region_snapshots` /
+        // `region_fetched` (derived from disks and fetches, not the log; see
+        // `full_rebuild`, which now carries them across, and even so a
+        // needless replay of a big forest is minutes of a box answering from
+        // an old cache). The NAS did exactly this on 2026-09-17: a CLI held
+        // the lock for longer than the five-second budget, the daemon threw
+        // its projection away, and it could not publish a head for hours.
+        let started = std::time::Instant::now();
+        loop {
+            match catch_up_tail(conn, data_dir, &identity) {
+                Ok(()) => break,
+                Err(e @ PvfsError::Busy { .. }) => {
+                    if started.elapsed() >= startup_fold_wait() {
+                        eprintln!(
+                            "pvfs: another pvfs process has held this forest's fold lock for {:?}; \
+                             giving up this open rather than replaying a cache that is not torn ({e})",
+                            started.elapsed()
+                        );
+                        return Err(e);
+                    }
+                    eprintln!("pvfs: another pvfs process is folding this forest; trying again");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pvfs: incremental fold failed ({e}); discarding the projection \
+                         cache and replaying the full log"
+                    );
+                    return full_rebuild(conn, data_dir, "incremental fold failed");
+                }
+            }
         }
     }
     Ok(identity)
 }
+
+/// D173 — how long an open keeps trying for a fold lock another process
+/// holds before it gives up (each try is `FOLD_LOCK_WAIT`). A minute: a CLI
+/// folding a big forest on the NAS takes seconds, a daemon's own fold at
+/// start can take longer. `PVFS_STARTUP_FOLD_WAIT_MS` shortens it for tests.
+fn startup_fold_wait() -> std::time::Duration {
+    std::env::var("PVFS_STARTUP_FOLD_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(60))
+}
+
+/// D173 — test-only: hold this forest's fold lock the way another process
+/// would, for as long as the returned guard lives.
+#[doc(hidden)]
+pub fn hold_fold_lock_for_test(data_dir: &std::path::Path) -> Result<HeldFoldLock> {
+    lock_folds_within(data_dir, std::time::Duration::from_secs(5)).map(HeldFoldLock)
+}
+
+/// D173 — the guard [`hold_fold_lock_for_test`] hands out.
+#[doc(hidden)]
+pub struct HeldFoldLock(#[allow(dead_code)] FoldLock);
 
 /// The Step-4 tail fold, separated so `startup_check` can route ANY of its
 /// failures to `full_rebuild` (the projection is a cache; its fold must
