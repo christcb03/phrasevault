@@ -58,10 +58,15 @@ To prove "caught up" without trusting any status: compare
 `select max(seq) from events` in the owner's and the replica's `log.db`,
 opened read-only.
 
-**Beside the rows**, `serve status` carries four facts about the box, each
+**Beside the rows**, `serve status` carries five facts about the box, each
 defaulted so an older daemon's reply still decodes: `conflicts` (D127, paths
 in conflict in the merged view), `stale` (D129, catalogue regions held at a
-superseded head), `capacity` (D131, the store's free and total bytes) and
+superseded head), `capacity` (D131, the free and total bytes of the data
+dir's filesystem), **`stores`** (PVOS D178: every filesystem the box stores
+on — the data dir's first, then each one under the roots of the catalogue
+regions it catalogues from its own disk, once per device, with the regions
+on it; a holder's files are rarely on the data dir's disk, so `capacity`
+alone said mediabox had 339 GB free while both its stores were 98 % full) and
 **`trash`** (D148). `trash` has one entry per catalogue region the box holds:
 the bytes in its `.pvfs-trash`, the number of day buckets, the oldest
 bucket's day (days since the epoch), the region's retention, what the last
@@ -94,6 +99,7 @@ peers: { <transport pin>: {
     unreachable_since_ms, misses,      # DOWN after 2 consecutive misses
     last: { reachable, forest_ok, runner, jobs: [{name, state, last_ok_ms, last_error}],
             conflicts, stale, capacity: [free, total],
+            stores: [{path, regions, free_bytes, total_bytes}],   # D178
             trash: [{region, bytes, buckets, oldest_day, retention_days,
                      freed_bytes, measured_ms}], error },   # §1.1
     actions: [...], attempts } }       # what supervision did (D135)
@@ -253,6 +259,7 @@ It POSTs one JSON snapshot to webhook `pvfs-status`:
 v, at, forest, forest_id
 state: ok | warning | critical        summary        problems[]        conflicts
 boxes.<label>: { label, addr, up, since, version, free_gb, total_gb,
+                 stores: [{name, path, free_gb, total_gb, pct_free}],  # D178
                  jobs: [{job, state, last_ok, error}],
                  trash: [{region, gb, oldest_days, retention_days}],
                  trash_gb, trash_oldest_days }

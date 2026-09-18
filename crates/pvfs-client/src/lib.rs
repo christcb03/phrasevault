@@ -102,6 +102,8 @@ pub struct ServeStatusReply {
     pub capacity: Option<pvfs_proto::CapacityWire>,
     /// D148 — each region's trash as its last purge pass left it.
     pub trash: Vec<pvfs_proto::TrashWire>,
+    /// PVOS D178 — every filesystem the box stores on (empty from an older daemon).
+    pub stores: Vec<pvfs_proto::StoreWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -319,13 +321,15 @@ impl Client {
                 stale,
                 capacity,
                 trash,
+                stores,
             } => Ok(ServeStatusReply {
                 runner,
                 jobs,
                 conflicts,
                 stale,
                 capacity,
-                trash,
+                trash: *trash,
+                stores: *stores,
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }

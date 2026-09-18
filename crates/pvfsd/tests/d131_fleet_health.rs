@@ -45,6 +45,9 @@ fn a_probe_reads_health_and_the_record_needs_two_misses_to_call_down() {
     assert_eq!((h.conflicts, h.stale), (0, 0));
     let (free, total) = h.capacity.expect("capacity measured");
     assert!(total > 0 && free <= total);
+    // PVOS D178 — the stores list starts with the data dir's filesystem
+    assert!(!h.stores.is_empty() && h.stores[0].regions.is_empty(), "{:?}", h.stores);
+    assert_eq!((h.stores[0].free_bytes > 0, h.stores[0].total_bytes), (free > 0, total));
 
     let foreign = probe_peer(&src, &"ff".repeat(32));
     assert!(foreign.reachable && !foreign.forest_ok && !foreign.ok());

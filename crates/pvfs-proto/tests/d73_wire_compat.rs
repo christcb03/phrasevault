@@ -104,7 +104,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         conflicts: 0,
         stale: 0,
         capacity: None,
-        trash: vec![pvfs_proto::TrashWire {
+        trash: Box::new(vec![pvfs_proto::TrashWire {
             region: "fe38175f".into(),
             bytes: 5,
             buckets: 1,
@@ -112,7 +112,36 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             retention_days: 7,
             freed_bytes: 0,
             measured_ms: 1,
-        }],
+        }]),
+        stores: Box::default(),
+    };
+    let s = serde_json::to_string(&new).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+
+/// PVOS D178 — an older daemon's reply has no `stores`: it decodes (empty),
+/// and a new reply round-trips with them.
+#[test]
+fn an_older_serve_jobs_reply_without_stores_decodes() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[],"conflicts":0,"stale":0,"capacity":{"free_bytes":1,"total_bytes":2},"trash":[]}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { stores, capacity, .. } => {
+            assert!(stores.is_empty());
+            assert!(capacity.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    let new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: vec![],
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: Box::default(),
+        stores: Box::new(vec![
+            pvfs_proto::StoreWire { path: "/srv/pvfs/x/.pvfs/sync".into(), regions: vec![], free_bytes: 3, total_bytes: 4 },
+            pvfs_proto::StoreWire { path: "/mnt/local".into(), regions: vec!["c020473f".into()], free_bytes: 5, total_bytes: 6 },
+        ]),
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);

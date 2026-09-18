@@ -547,6 +547,18 @@ pub struct ReceiveSkip {
     pub why: String,
 }
 
+/// PVOS D178 — one filesystem this box stores on: its data dir's, or the one
+/// under the roots of the catalogue regions it catalogues from its own disk.
+/// `path` is the first root (or the data dir) that led to it; `regions` the
+/// regions whose files are on it (empty = the data dir's alone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreFs {
+    pub path: String,
+    pub regions: Vec<NodeId>,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// D129 — one catalogue region as this box sees it (doc 26 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogueStatus {
@@ -1841,6 +1853,60 @@ impl Engine {
             }
         }
         Ok(load_local_bindings(&self.data_dir)?.iter().any(|b| b.folder_id == *region))
+    }
+
+    /// PVOS D178 — every filesystem this box stores on, one entry each: the
+    /// data dir's first, then those under the roots of the catalogue regions
+    /// it catalogues from its own disk, deduplicated by device. `capacity`
+    /// (D131) is the data dir's alone, and a holder's files are elsewhere —
+    /// mediabox's regions sit on two 98 %-full disks while its data dir's
+    /// has 339 GB free, and the NAS's two regions on two volumes.
+    pub fn store_filesystems(&self) -> Result<Vec<StoreFs>> {
+        use std::os::unix::fs::MetadataExt;
+        fn measure(p: &std::path::Path) -> Option<(u64, u64, u64)> {
+            let dev = std::fs::metadata(p).ok()?.dev();
+            let st = nix::sys::statvfs::statvfs(p).ok()?;
+            let frag = st.fragment_size() as u64;
+            Some((dev, st.blocks_available() as u64 * frag, st.blocks() as u64 * frag))
+        }
+        let mut out: Vec<(u64, StoreFs)> = Vec::new();
+        let data = crate::sync::sync_store_dir(&self.data_dir)
+            .ok()
+            .filter(|d| d.exists())
+            .unwrap_or_else(|| self.data_dir.clone());
+        if let Some((dev, free, total)) = measure(&data) {
+            out.push((dev, StoreFs { path: data.display().to_string(), regions: Vec::new(), free_bytes: free, total_bytes: total }));
+        }
+        let regions: Vec<NodeId> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT node_id FROM regions WHERE kind = 'catalogue' ORDER BY node_id")
+                .map_err(map_db("store filesystems"))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(map_db("store filesystems"))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(map_db("store filesystems"))?;
+            rows
+        };
+        for region in regions {
+            let Some(roots) = self.own_region_roots(&region)? else { continue };
+            for root in roots {
+                let Some((dev, free, total)) = measure(&root) else { continue };
+                match out.iter_mut().find(|(d, _)| *d == dev) {
+                    Some((_, s)) => {
+                        if !s.regions.contains(&region) {
+                            s.regions.push(region.clone());
+                        }
+                    }
+                    None => out.push((
+                        dev,
+                        StoreFs { path: root.display().to_string(), regions: vec![region.clone()], free_bytes: free, total_bytes: total },
+                    )),
+                }
+            }
+        }
+        Ok(out.into_iter().map(|(_, s)| s).collect())
     }
 
     /// D129 — every catalogue region as this box sees it: the head the log
