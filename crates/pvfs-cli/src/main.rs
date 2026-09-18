@@ -1264,6 +1264,10 @@ enum ServeCmd {
     Exports,
     /// Ask the running daemon for live job-runner state
     Status,
+    /// Ask the running daemon for this box's receive plan — what its mover
+    /// has left to pull. Live state: never opens the forest (with no daemon
+    /// running, `pvfs view receive --dry-run` computes it here instead)
+    ReceivePlan,
     /// Run the watcher in the foreground (live indexing + reconciliation) —
     /// ad-hoc; as a daemon job use `pvfs serve enable watch` (punch E)
     Watch {
@@ -5864,6 +5868,23 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     })?;
                     serve_status_print(&data_dir, &sock, json)
                 }
+                // PVOS D174 — the owner's status collector asks this every
+                // minute. It must never fall back to opening the forest: a
+                // daemon that is not answering is usually one that is
+                // starting, and a CLI fold then is the worst moment (D173).
+                ServeCmd::ReceivePlan => {
+                    let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
+                        field: "serve".into(),
+                        reason: "no running daemon for this forest (the receive plan here is live state; \
+                                 `pvfs view receive --dry-run` computes it without one)"
+                            .into(),
+                    })?;
+                    let plan = daemon_member_client(&data_dir, &sock)?
+                        .receive_plan()
+                        .map_err(remote_err)?;
+                    print_receive_plan(&plan, json);
+                    Ok(())
+                }
             }
         }
         Cmd::Sync { target, to: Some(to) } => {
@@ -9150,11 +9171,11 @@ fn forest_state_dir(
 /// Fetch + print live job status from the local daemon, signed (punch F:
 /// ServeStatus is member-gated) — the forest device key when this box owns
 /// the forest, else the client identity (which must be enrolled).
-fn serve_status_print(
-    state_dir: &std::path::Path,
-    sock: &std::path::Path,
-    json: bool,
-) -> Result<(), PvfsError> {
+/// Connect to this forest's daemon as this box's member key (the forest's
+/// device key when this box has one, else the client identity) — what the
+/// member-gated live-state requests (`serve status`, `serve receive-plan`)
+/// need. Opens no engine.
+fn daemon_member_client(state_dir: &std::path::Path, sock: &std::path::Path) -> Result<Client, PvfsError> {
     let key = match identity::DeviceKeyCache::load(state_dir) {
         Ok(cache) => cache.signing_key,
         Err(_) => {
@@ -9163,10 +9184,57 @@ fn serve_status_print(
         }
     };
     let pubkey = crypto::pubkey_bytes(&key);
-    let mut client = Client::connect_signed(sock, &pubkey, |d| {
-        crypto::sign_digest(&key, d).unwrap_or_default()
-    })
-    .map_err(remote_err)?;
+    Client::connect_signed(sock, &pubkey, |d| crypto::sign_digest(&key, d).unwrap_or_default()).map_err(remote_err)
+}
+
+/// PVOS D174 — `serve receive-plan`'s output: the dry run's shape (so what
+/// read `view receive --dry-run --json` reads this unchanged), each file with
+/// its size and whether it replaces a library copy. A plan never fails or
+/// runs out of space — a pass does — so those two lists are always empty.
+fn print_receive_plan(plan: &pvfs_client::ReceivePlanReply, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": true,
+                "folders": plan.folders,
+                "received": plan.items.iter().map(|i| serde_json::json!({
+                    "path": i.path, "hash": i.hash, "region": i.region, "size": i.size, "replaces": i.replaces,
+                })).collect::<Vec<_>>(),
+                "replaced": plan.items.iter().filter(|i| i.replaces).map(|i| i.path.as_str()).collect::<Vec<_>>(),
+                "skipped_no_space": Vec::<String>::new(),
+                "failed": Vec::<String>::new(),
+                "reported": plan.reported.iter().map(|s| serde_json::json!({"path": s.path, "why": s.why})).collect::<Vec<_>>(),
+            })
+        );
+        return;
+    }
+    for p in &plan.folders {
+        println!("would make\t{p}/\t(only staging had it)");
+    }
+    for i in &plan.items {
+        println!(
+            "would receive\t{}\t({}, into {}{})",
+            i.path,
+            fmt_bytes(i.size),
+            &i.region[..i.region.len().min(12)],
+            if i.replaces { ", replacing the library copy" } else { "" }
+        );
+    }
+    for s in &plan.reported {
+        println!("report\t{}\t{}", s.path, s.why);
+    }
+    if plan.folders.is_empty() && plan.items.is_empty() && plan.reported.is_empty() {
+        println!("nothing to receive");
+    }
+}
+
+fn serve_status_print(
+    state_dir: &std::path::Path,
+    sock: &std::path::Path,
+    json: bool,
+) -> Result<(), PvfsError> {
+    let mut client = daemon_member_client(state_dir, sock)?;
     let st = client.serve_status_full().map_err(remote_err)?;
     let (runner, jobs, conflicts, stale, capacity, trash) = (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash);
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);

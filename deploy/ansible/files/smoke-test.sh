@@ -639,6 +639,12 @@ $PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | python3 -c '
 import json,sys
 c=json.load(sys.stdin)["capacity"]; assert c and c["total_bytes"]>0 and c["free_bytes"]<=c["total_bytes"], c
 ' && ok "live status carries the store's capacity (D131)" || fail "serve status capacity"
+# PVOS D174 — the receive plan, answered by the running daemon (this forest
+# has no receiving region: an empty plan, in the dry run's shape).
+$PVFS --json --data-dir "$DMOUNT/.pvfs" serve receive-plan | python3 -c '
+import json,sys
+p=json.load(sys.stdin); assert p["dry_run"] is True and p["received"]==[] and p["failed"]==[] and p["skipped_no_space"]==[], p
+' && ok "serve receive-plan answers from the running daemon (PVOS D174)" || fail "serve receive-plan"
 # the daemon started before the enable — SIGHUP folds the new config in
 kill -HUP "$DPID"
 STATUS_OK=""
@@ -1570,6 +1576,12 @@ kill "$WATCH" 2>/dev/null; wait "$WATCH" 2>/dev/null || true
 [ "$SHUT_RC" -eq 0 ] && ok "pvfsd exited 0 on SIGTERM (clean shutdown)" || fail "pvfsd exit $SHUT_RC on SIGTERM"
 [ -S "$SOCK" ] && fail "socket left behind after graceful shutdown" || ok "socket removed on graceful shutdown"
 DPID=""
+# PVOS D174 — with no daemon the plan is refused; it never falls back to
+# opening (and folding) the forest itself.
+assert_rc 2 "serve receive-plan with no daemon → 2" -- $PVFS --data-dir "$DMOUNT/.pvfs" serve receive-plan
+NODAEMON_OUT="$($PVFS --data-dir "$DMOUNT/.pvfs" serve receive-plan 2>&1 || true)"
+printf '%s\n' "$NODAEMON_OUT" | qgrep "no running daemon" \
+  && ok "…and says there is no running daemon" || fail "serve receive-plan no-daemon message: $NODAEMON_OUT"
 
 say "item 14: authorization audit (read-only)"
 # DMOUNT has tag grants/memberships, all under live authorities → audit is clean.

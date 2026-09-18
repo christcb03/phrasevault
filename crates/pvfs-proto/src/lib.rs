@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 ///   9 → 10: D170 `RenamePath` and `RemoveDir` — a rename and an `rmdir`
 ///          that came through a view mount, done by the box that holds the
 ///          files. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 10;
+///   10 → 11: PVOS D174 `ReceivePlan` — the receive plan, answered by the
+///          running daemon from its read pool, so a status collector never
+///          opens (and folds) the forest to ask. Additive; compatible-with
+///          stays.
+pub const PROTO_VERSION: u32 = 11;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -161,6 +165,39 @@ pub enum ServerMsg {
     },
     /// P10.0: the live ingest sessions (response to `ClientMsg::IngestList`).
     IngestSessions { sessions: Vec<IngestSessionWire> },
+    /// PVOS D174: this box's receive plan (response to
+    /// `ClientMsg::ReceivePlan`) — what `pvfs view receive --dry-run` would
+    /// print, computed by the running daemon: the folders only staging has,
+    /// the files this box's receiving regions will pull, and what the plan
+    /// will not act on.
+    ReceivePlan {
+        folders: Vec<String>,
+        items: Vec<ReceivePlanItemWire>,
+        #[serde(default)]
+        reported: Vec<ReceiveSkipWire>,
+    },
+}
+
+/// PVOS D174 — one file the receive plan will pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceivePlanItemWire {
+    /// Relative to the receiving region's root (the same path staging has).
+    pub path: String,
+    /// The content hash of the copy that is pulled.
+    pub hash: String,
+    pub size: u64,
+    /// The receiving region that takes it.
+    pub region: String,
+    /// The library copy already at `path` is replaced (it goes to the trash).
+    #[serde(default)]
+    pub replaces: bool,
+}
+
+/// PVOS D174 — a path the receive plan will not act on, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveSkipWire {
+    pub path: String,
+    pub why: String,
 }
 
 /// Phase-1 answer to `IngestBegin` (P10.0): the session layout plus the
@@ -539,6 +576,12 @@ pub enum ClientMsg {
     /// Live job-runner state (P5, doc 18 §2). Answered like `Info` — operational
     /// metadata, no catalog content.
     ServeStatus,
+    /// PVOS D174: this box's receive plan, as the running daemon sees it —
+    /// answered from the daemon's read pool: no second engine opens the
+    /// forest, nothing folds, the writer is not waited on. Member-gated like
+    /// `ServeStatus` (library paths are operational detail). Answered
+    /// `ServerMsg::ReceivePlan`.
+    ReceivePlan,
     /// P10.0 (doc 23 §3): open an external-ingest session — catalog the whole
     /// torrent now (unhashed pointer nodes), bytes arrive later. Phase 1 of a
     /// member write: answered `IngestPrepared`; the standard `Commit` lands it
