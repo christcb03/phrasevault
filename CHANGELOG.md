@@ -5,6 +5,23 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A projection replay must not cost a box its catalogue (D172).** Three
+  hours after the v1.4-385 roll the NAS's watch job reported `head seq 1
+  does not advance 0a16d644… (at 6)`. Another `pvfs` process had held its
+  fold lock for longer than the five-second budget, and `startup_check`'s
+  rule for a failed tail fold (D69: the cache is lying — replay) threw the
+  projection away. Since D125 the projection also holds what the log cannot
+  give back: `region_entries`, `region_snapshots`, `region_fetched`. The
+  replay emptied them; library-ext was re-walked and then published from 1
+  against an attested 6, the owner refused it, the watch backed off and the
+  library never got its re-walk — 0 rows, so a file the NAS holds could not
+  be found by hash, and every read-through of a library file not already
+  cached failed. Three rules now, each enough on its own: a publish counts
+  up from the head the LOG attests (and, with no record of its own, judges
+  "unchanged" against the attested hash); a busy fold lock is retried for a
+  minute and then fails the open — it is never a reason to replay; and a
+  replay carries the three catalogue tables across
+  (`CARRIED_ACROSS_A_REBUILD`).
 - **The view's lookups come from an index (D171).** Krusader took 24–36 s to
   open `Movies` through feederbox's mount: the listing itself was 0.5 s, and
   then every one of its 2,452 `stat`s took 13 ms. `region_entries` is keyed

@@ -1928,7 +1928,29 @@ impl Engine {
                 return Ok(None);
             }
         }
-        let seq = last_seq as u64 + 1;
+        // D172 — the head the LOG attests is the floor. This box's own record
+        // of what it published (`region_snapshots`) is derived state: a
+        // projection replay wiped it on the NAS (2026-09-17, 9:40 PM EDT),
+        // the next publish counted from 1 again, and the owner refused every
+        // head after that ("head seq 1 does not advance … (at 6)"). With the
+        // record gone, the attested head's hash says whether anything changed.
+        let attested: (i64, String) = self
+            .conn
+            .query_row(
+                "SELECT committed_seq, committed_head FROM regions WHERE node_id = ?1",
+                params![region],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("attested head"))?
+            .unwrap_or((0, String::new()));
+        if last_seq == 0 && attested.0 > 0 {
+            let again = Self::region_manifest_bytes(region, attested.0 as u64, &rows);
+            if blake3::hash(&again).to_hex().as_str() == attested.1 {
+                return Ok(None);
+            }
+        }
+        let seq = last_seq.max(attested.0) as u64 + 1;
         let bytes = Self::region_manifest_bytes(region, seq, &rows);
         let hash = blake3::hash(&bytes).to_hex().to_string();
         let dir = self.data_dir.join("regions").join(region);
