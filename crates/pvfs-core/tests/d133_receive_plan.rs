@@ -163,5 +163,30 @@ fn unsafe_paths_are_refused_and_the_fullest_disk_is_not_chosen() {
     let mut ids: Vec<&str> = roots.iter().map(|(r, _)| r.as_str()).collect();
     ids.sort();
     assert_eq!(roots[0].0, ids[0], "same free space: lowest region id first");
+
+    // D179 (PVOS) — and so while something else writes to that disk: two
+    // regions on one filesystem get ONE measurement, so the tie holds. It
+    // used to measure each region, and a busy disk (GitHub's runner) decided
+    // the order by what was written between the two measurements.
+    let lowest = ids[0].to_string();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (stop, dir) = (std::sync::Arc::clone(&stop), tmp.path().join("noise"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::thread::spawn(move || {
+            // Grow and shrink one file as fast as it goes: free space moves
+            // both ways, all the time.
+            let f = dir.join("n");
+            let block = vec![7u8; 1 << 20];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::write(&f, &block).unwrap();
+                std::fs::write(&f, b"").unwrap();
+            }
+        })
+    };
+    let flips = (0..2000).filter(|_| e.receiving_roots().unwrap()[0].0 != lowest).count();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(flips, 0, "{flips} of 2000 calls put the other region first while the disk was busy");
     e.close().unwrap();
 }

@@ -5,6 +5,16 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One free-space figure per disk when choosing where to receive (PVOS
+  D179).** GitHub CI failed twice on `d133_receive_plan`'s tie test while our
+  pipeline passed it: `receiving_roots()` measured free space once per region,
+  and two regions on one disk measured a moment apart need not agree while
+  anything writes there — the order of the two was decided by what was
+  written in between. It now measures each filesystem once (by device), so
+  regions sharing a disk tie by construction and the region id decides. The
+  test gained a writer that grows and shrinks a file on the same disk while
+  `receiving_roots()` runs 2,000 times: the old code put the wrong region
+  first 12 times on disk and 207 on tmpfs; the new code never.
 - **Every filesystem a box stores on (PVOS D178).** `serve status` — and so
   the health record a peer answers with — gains `stores`: the data dir's
   filesystem first, then each filesystem under the roots of the catalogue
