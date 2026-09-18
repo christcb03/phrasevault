@@ -56,6 +56,10 @@ const CATALOGUE_INTERVAL: Duration = Duration::from_secs(60);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(120);
 /// D133 — the mover's cadence on the new model, `tier`'s.
 const RECEIVE_INTERVAL: Duration = Duration::from_secs(300);
+/// D176 — the runner's trash step: `receive`'s and `resolve`'s cadence, so
+/// every box's trash in `serve status` is at most this old.
+/// `PVFS_TRASH_EVERY_MS` shortens it for tests.
+const TRASH_EVERY: Duration = Duration::from_secs(300);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -97,6 +101,10 @@ pub struct JobsState {
     /// D148 — each region's trash as the last purge pass left it, so `serve
     /// status` reports it without walking a disk (D136).
     trash: Mutex<Vec<pvfs_proto::TrashWire>>,
+    /// D176 — held by whoever is purging: the runner's trash step, `receive`,
+    /// `resolve`. Two purges walking one bucket race on `remove_dir_all`, and
+    /// the loser's error would fail a `resolve` pass over nothing.
+    purging: Mutex<()>,
     /// D157, D159 — each fault's current run of failures, as the journal has
     /// heard it; absent while the job works. In memory only: a daemon
     /// restart is in the journal itself, so its first failure is said again.
@@ -122,6 +130,9 @@ enum Fault {
     /// The job's thread exited with an error; the supervisor restarts it
     /// after `FATAL_RETRY`.
     Exit(&'static str),
+    /// D176 — the runner's trash step failed for a region (or could not
+    /// list them); the next step tries again.
+    Trash,
 }
 
 impl Fault {
@@ -133,6 +144,7 @@ impl Fault {
                 "pvfsd: {job} exited: {err}; restarting it in {} s",
                 FATAL_RETRY.as_secs()
             ),
+            Fault::Trash => format!("pvfsd: trash purge failed: {err}; the next step tries again"),
         }
     }
 
@@ -147,6 +159,9 @@ impl Fault {
             ),
             Fault::Exit(job) => format!(
                 "pvfsd: {job} recovered: running again after {failed} exit(s) over {span}"
+            ),
+            Fault::Trash => format!(
+                "pvfsd: trash purge recovered: a step completed after {failed} failed step(s) over {span}"
             ),
         }
     }
@@ -178,6 +193,7 @@ impl JobsState {
             tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
             tier_passes: std::sync::atomic::AtomicU64::new(0),
             trash: Mutex::new(Vec::new()),
+            purging: Mutex::new(()),
             failing: Mutex::new(HashMap::new()),
         };
         s.reload()?;
@@ -213,6 +229,12 @@ impl JobsState {
     /// D148 — the trash as the last purge passes left it (`serve status`).
     pub fn trash_snapshot(&self) -> Vec<pvfs_proto::TrashWire> {
         self.trash.lock().unwrap().clone()
+    }
+
+    /// D176 — one purge at a time on this box. A purge that panicked must
+    /// not stop every later one, so a poisoned lock is taken as it is.
+    fn one_purge(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.purging.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Re-read the config (SIGHUP). Run history (`last_ok`/`last_error`)
@@ -926,7 +948,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             // regions' trash) are purged by each region's retention: D133
             // purged only draining regions, so they piled up on the holder.
             match pvfs_core::Engine::open(st.data_dir()).and_then(|e| {
-                let t = e.purge_region_trash();
+                let t = {
+                    // D176 — never beside the runner's trash step
+                    let _one = st.one_purge();
+                    e.purge_region_trash()
+                };
                 e.close()?;
                 t
             }) {
@@ -967,8 +993,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
                 let r = engine.resolve_conflicts(false, &cancel, &mut confirm)?;
                 // D133 — then free what retention allows; D148 — every local
-                // region's trash, and what each keeps is recorded for status.
-                let trash = engine.purge_region_trash()?;
+                // region's trash, and what each keeps is recorded for status;
+                // D176 — never beside the runner's trash step.
+                let trash = {
+                    let _one = st.one_purge();
+                    engine.purge_region_trash()?
+                };
                 let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
                 st.record_trash(&trash);
                 engine.close()?;
@@ -1196,10 +1226,87 @@ fn interval(name: &str) -> Duration {
     }
 }
 
+/// D176 — how often the runner's trash step runs (`TRASH_EVERY`, or the
+/// test's `PVFS_TRASH_EVERY_MS`).
+fn trash_every() -> Duration {
+    std::env::var("PVFS_TRASH_EVERY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(TRASH_EVERY)
+}
+
+/// D176 — one run of the runner's trash step: purge each catalogue region
+/// this box holds (`roots`, from the daemon's read pool) by its retention,
+/// record what each keeps for `serve status`, and return the journal lines.
+///
+/// The purge used to live only in `receive` and `resolve`, so a box running
+/// neither — mediabox, whose disks are 98 % full — never purged its trash
+/// and never reported it, and D148's "the purge is not running" could not
+/// fire for it. A region that fails is said (once per run, D157) and the
+/// others are still purged and recorded. A step told to stop records what
+/// it did and gives no verdict (D154).
+fn trash_step(
+    st: &JobsState,
+    roots: Result<Vec<(String, PathBuf, u64)>, PvfsError>,
+    stop: &AtomicBool,
+) -> Vec<String> {
+    let mut log = Vec::new();
+    let roots = match roots {
+        Ok(r) => r,
+        Err(e) => {
+            log.extend(st.failed(Fault::Trash, &format!("listing this box's regions: {e}")));
+            return log;
+        }
+    };
+    let _one = st.one_purge();
+    let (mut found, mut failed, mut stopped) = (Vec::new(), Vec::new(), false);
+    for (region, root, days) in roots {
+        if stop.load(Ordering::SeqCst) {
+            stopped = true;
+            break;
+        }
+        let short = region.get(..8).unwrap_or(&region).to_string();
+        match pvfs_core::sync::purge_region(region, &root, days) {
+            Ok(t) => found.push(t),
+            Err(e) => failed.push(format!("{short}: {e}")),
+        }
+    }
+    st.record_trash(&found);
+    let removed: u64 = found.iter().map(|t| t.purge.removed).sum();
+    if removed > 0 {
+        let freed: u64 = found.iter().map(|t| t.purge.freed_bytes).sum();
+        log.push(format!(
+            "pvfsd: trash purged {removed} bucket(s) past retention ({} freed)",
+            size_text(freed)
+        ));
+    }
+    if stopped {
+        return log;
+    }
+    if failed.is_empty() {
+        log.extend(st.recovered(Fault::Trash));
+    } else {
+        log.extend(st.failed(Fault::Trash, &failed.join("; ")));
+    }
+    log
+}
+
+/// A byte count as a person reads it in the journal.
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1_000_000_000 => format!("{:.1} GB", b as f64 / 1e9),
+        b if b >= 1_000_000 => format!("{:.1} MB", b as f64 / 1e6),
+        b if b >= 1_000 => format!("{:.1} KB", b as f64 / 1e3),
+        b => format!("{b} bytes"),
+    }
+}
+
 /// The supervisor loop. Polls `reload` (SIGHUP) and `shutdown` (SIGTERM/INT);
 /// reconciles configured jobs against live threads each tick; a failed reload
 /// keeps the previous config and logs — a running fleet box must not lose its
-/// jobs to a half-edited file.
+/// jobs to a half-edited file. With a daemon it also keeps region heads
+/// attested and, D176, purges this box's trash, whatever jobs are enabled.
 pub fn run(
     state: Arc<JobsState>,
     shutdown: &AtomicBool,
@@ -1218,6 +1325,12 @@ pub fn run(
     // region-free forests never pay the transient open.
     const HEADS_EVERY: Duration = Duration::from_secs(60);
     let mut heads_at = Instant::now() + HEADS_EVERY;
+    // D176 — the trash step: once at start (a roll shows the trash at once),
+    // then every `trash_every`, on its own thread so a slow disk never holds
+    // up the runner; a step still going when the next is due is left to end.
+    let trash_every = trash_every();
+    let mut trash_at = Instant::now();
+    let mut trashing: Option<Managed> = None;
 
     while !shutdown.load(Ordering::SeqCst) {
         if Instant::now() >= heads_at {
@@ -1227,6 +1340,25 @@ pub fn run(
                 if let Some(d) = &daemon {
                     let _ = d.commit_region_heads();
                 }
+            }
+        }
+        if let Some(d) = &daemon {
+            let idle = trashing.as_ref().is_none_or(|m| m.handle.is_finished());
+            if idle && Instant::now() >= trash_at {
+                trash_at = Instant::now() + trash_every;
+                if let Some(m) = trashing.take() {
+                    let _ = m.handle.join();
+                }
+                let stop = Arc::new(AtomicBool::new(false));
+                let (st, d, flag) = (Arc::clone(&state), Arc::clone(d), Arc::clone(&stop));
+                let handle = std::thread::spawn(move || {
+                    // the read view is handed back before any disk work
+                    let roots = d.trash_roots();
+                    for line in trash_step(&st, roots, &flag) {
+                        eprintln!("{line}");
+                    }
+                });
+                trashing = Some(Managed { stop, handle });
             }
         }
         // punch A: `serve enable` takes effect within a tick — the runner
@@ -1316,6 +1448,10 @@ pub fn run(
     }
     for m in &draining {
         m.stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(m) = trashing {
+        m.stop.store(true, Ordering::SeqCst);
+        let _ = m.handle.join();
     }
     for (_, m) in running {
         let _ = m.handle.join();
@@ -1557,5 +1693,64 @@ mod tests {
         assert!(follow_event(&st, FollowEvent::Connected { target: "x" }).is_empty(), "the return is said once");
         assert_eq!(job_exited(&st, "watch", Err(not_replica())), None, "the follower's return ends no other run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D176 — the trash step purges and records every region it is given; a
+    /// region that fails is said once per run and does not cost the others
+    /// their purge or their record; its recovery is said; a stopped step
+    /// gives no verdict.
+    #[test]
+    fn the_trash_step_purges_every_region_and_says_a_failure_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = JobsState::load(tmp.path().join("forest")).unwrap();
+        let today = now_ms() / 86_400_000;
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        let bucket = |root: &std::path::Path, day: u64, bytes: usize| {
+            let d = root.join(".pvfs-trash").join(day.to_string()).join("TV/Show");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("ep.mkv"), vec![7u8; bytes]).unwrap();
+        };
+        bucket(&a, today - 10, 3_000);
+        bucket(&a, today, 2_000);
+        // b's trash is a FILE, so listing it fails — whoever runs the test
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join(".pvfs-trash"), b"not a directory").unwrap();
+        let (ra, rb) = ("a".repeat(64), "b".repeat(64));
+        let roots = || Ok(vec![(ra.clone(), a.clone(), 7), (rb.clone(), b.clone(), 7)]);
+        let never = AtomicBool::new(false);
+
+        let log = trash_step(&st, roots(), &never);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(log[0], "pvfsd: trash purged 1 bucket(s) past retention (3.0 KB freed)");
+        assert!(log[1].starts_with("pvfsd: trash purge failed: bbbbbbbb: "), "{log:?}");
+        assert!(log[1].ends_with("; the next step tries again"), "{log:?}");
+        assert!(!a.join(format!(".pvfs-trash/{}", today - 10)).exists(), "past retention: gone");
+        assert!(a.join(format!(".pvfs-trash/{today}")).exists(), "today's bucket is kept");
+        let t = st.trash_snapshot();
+        assert_eq!(t.len(), 1, "the failed region has no record: {t:?}");
+        assert_eq!((t[0].region.as_str(), t[0].bytes, t[0].buckets), (ra.as_str(), 2_000, 1));
+        assert_eq!((t[0].oldest_day, t[0].retention_days, t[0].freed_bytes), (Some(today), 7, 3_000));
+
+        assert!(trash_step(&st, roots(), &never).is_empty(), "the same failure is not said again");
+
+        std::fs::remove_file(b.join(".pvfs-trash")).unwrap();
+        let log = trash_step(&st, roots(), &never);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(
+            log[0].starts_with("pvfsd: trash purge recovered: a step completed after 2 failed step(s) over "),
+            "{log:?}"
+        );
+        let t = st.trash_snapshot();
+        assert_eq!(t.len(), 2, "{t:?}");
+        let tb = t.iter().find(|x| x.region == rb).unwrap();
+        assert_eq!((tb.bytes, tb.buckets, tb.oldest_day, tb.freed_bytes), (0, 0, None, 0), "an empty trash is reported too");
+
+        // A step told to stop purges nothing more and gives no verdict.
+        std::fs::write(b.join(".pvfs-trash"), b"broken again").unwrap();
+        let stopped = AtomicBool::new(true);
+        assert!(trash_step(&st, roots(), &stopped).is_empty());
+        let log = trash_step(&st, Err(PvfsError::BadInput { field: "x".into(), reason: "y".into() }), &never);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].starts_with("pvfsd: trash purge failed: listing this box's regions: "), "{log:?}");
     }
 }

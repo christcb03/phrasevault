@@ -2700,6 +2700,17 @@ impl Engine {
     /// library copies `receive` replaces piled up on the holder with nothing
     /// to remove them (D127: "retention on non-draining regions — later").
     pub fn purge_region_trash(&self) -> Result<Vec<crate::sync::RegionTrash>> {
+        self.trash_roots()?
+            .into_iter()
+            .map(|(region, root, days)| crate::sync::purge_region(region, &root, days))
+            .collect()
+    }
+
+    /// D176 — what [`Engine::purge_region_trash`] purges: every catalogue
+    /// region this box holds locally, with its root and its retention in
+    /// days. Only reads, so the daemon answers it from a read view and does
+    /// the disk work with no engine held.
+    pub fn trash_roots(&self) -> Result<Vec<(NodeId, PathBuf, u64)>> {
         let mut out = Vec::new();
         for b in self.local_bindings()? {
             if !self.is_catalogue_region(&b.folder_id)? {
@@ -2707,9 +2718,7 @@ impl Engine {
             }
             let root = uri_to_path(&b.source_uri)?;
             let days = crate::sync::region_retention_days(&self.data_dir, &b.folder_id)?;
-            let purge = crate::sync::purge_trash(&root, days, 0)?;
-            let kept = crate::sync::trash_stats(&root);
-            out.push(crate::sync::RegionTrash { region: b.folder_id.clone(), retention_days: days, purge, kept });
+            out.push((b.folder_id, root, days));
         }
         Ok(out)
     }

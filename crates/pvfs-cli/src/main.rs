@@ -1368,9 +1368,9 @@ enum RegionCmd {
         #[arg(long)]
         streams: Option<u32>,
     },
-    /// D133: how many days a draining region's trash is kept before
-    /// `resolve` purges it (default 7). Local to this box. Prompts when
-    /// omitted.
+    /// D133, D176: how many days a catalogue region's trash is kept before
+    /// this box's daemon purges it (default 7). Local to this box. Prompts
+    /// when omitted.
     Retention {
         target: String,
         days: Option<u64>,
@@ -6619,7 +6619,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let days = match days {
                         Some(d) => d,
                         None => prompt_line(
-                            "days to keep this region's trash before resolve purges it",
+                            "days to keep this region's trash before the daemon purges it",
                             Some(&pvfs_core::sync::TRASH_KEEP_DAYS_DEFAULT.to_string()),
                         )?
                         .trim()

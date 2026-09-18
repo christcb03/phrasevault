@@ -910,6 +910,14 @@ pub struct RegionTrash {
     pub kept: TrashStats,
 }
 
+/// D148, D176 — purge one region's trash at `root` by its retention, then
+/// say what is kept. Walks the trash: a job's work, never a status probe's.
+pub fn purge_region(region: String, root: &Path, retention_days: u64) -> Result<RegionTrash> {
+    let purge = purge_trash(root, retention_days, 0)?;
+    let kept = trash_stats(root);
+    Ok(RegionTrash { region, retention_days, purge, kept })
+}
+
 /// D167 — one file in a root's trash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashEntry {
