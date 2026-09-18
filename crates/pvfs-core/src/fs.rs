@@ -1928,7 +1928,7 @@ impl Engine {
                 return Ok(None);
             }
         }
-        // D172 — the head the LOG attests is the floor. This box's own record
+        // D173 — the head the LOG attests is the floor. This box's own record
         // of what it published (`region_snapshots`) is derived state: a
         // projection replay wiped it on the NAS (2026-09-17, 9:40 PM EDT),
         // the next publish counted from 1 again, and the owner refused every

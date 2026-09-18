@@ -5,7 +5,7 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
-- **A projection replay must not cost a box its catalogue (D172).** Three
+- **A projection replay must not cost a box its catalogue (D173).** Three
   hours after the v1.4-385 roll the NAS's watch job reported `head seq 1
   does not advance 0a16d644… (at 6)`. Another `pvfs` process had held its
   fold lock for longer than the five-second budget, and `startup_check`'s

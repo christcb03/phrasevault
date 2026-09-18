@@ -394,7 +394,7 @@ CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)      
 ///
 /// `rebuild_copies_every_table` pins the list against the schema, so the next
 /// table cannot be forgotten the way these three were.
-/// D172 — the tables a rebuild carries over from the live cache instead of
+/// D173 — the tables a rebuild carries over from the live cache instead of
 /// taking from the replay: derived from disks and fetched manifests, not from
 /// the log, so a replay comes back without them. All three are also in
 /// [`MAIN_OBJECTS`] (the swap copies them back like everything else).
@@ -3439,7 +3439,7 @@ pub fn full_rebuild(
         .map_err(map_db("attach rebuild db"))?;
     let swapped = (|| -> Result<()> {
         let tx = conn.transaction().map_err(map_db("swap projection"))?;
-        // D172 — what the log cannot give back goes across FIRST: a
+        // D173 — what the log cannot give back goes across FIRST: a
         // catalogue region's rows come from a box's own disk or a fetched
         // manifest, and its snapshot record says which head it published.
         // The replay leaves these tables empty in `fresh`; a swap that
@@ -3783,7 +3783,7 @@ pub fn startup_check(
     // fold-apply ("author not authorized") and bricked the owner, while a
     // cold rebuild of the very same log was perfect.
     if behind {
-        // D172 — a fold lock held by ANOTHER pvfs process is not a torn
+        // D173 — a fold lock held by ANOTHER pvfs process is not a torn
         // cache, and the answer to it is to wait, then to give up — never to
         // replay. The replay drops `region_entries` / `region_snapshots` /
         // `region_fetched` (derived from disks and fetches, not the log; see
@@ -3820,7 +3820,7 @@ pub fn startup_check(
     Ok(identity)
 }
 
-/// D172 — how long an open keeps trying for a fold lock another process
+/// D173 — how long an open keeps trying for a fold lock another process
 /// holds before it gives up (each try is `FOLD_LOCK_WAIT`). A minute: a CLI
 /// folding a big forest on the NAS takes seconds, a daemon's own fold at
 /// start can take longer. `PVFS_STARTUP_FOLD_WAIT_MS` shortens it for tests.
@@ -3832,14 +3832,14 @@ fn startup_fold_wait() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(60))
 }
 
-/// D172 — test-only: hold this forest's fold lock the way another process
+/// D173 — test-only: hold this forest's fold lock the way another process
 /// would, for as long as the returned guard lives.
 #[doc(hidden)]
 pub fn hold_fold_lock_for_test(data_dir: &std::path::Path) -> Result<HeldFoldLock> {
     lock_folds_within(data_dir, std::time::Duration::from_secs(5)).map(HeldFoldLock)
 }
 
-/// D172 — the guard [`hold_fold_lock_for_test`] hands out.
+/// D173 — the guard [`hold_fold_lock_for_test`] hands out.
 #[doc(hidden)]
 pub struct HeldFoldLock(#[allow(dead_code)] FoldLock);
 

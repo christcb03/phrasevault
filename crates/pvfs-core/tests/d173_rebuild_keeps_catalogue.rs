@@ -1,4 +1,4 @@
-//! D172 — what the NAS lost on 2026-09-17 at 9:40 PM EDT, and must not again:
+//! D173 — what the NAS lost on 2026-09-17 at 9:40 PM EDT, and must not again:
 //! a fold lock held by another process made the daemon replay its projection;
 //! the replay dropped the catalogue rows and the snapshot record (neither is
 //! in the log); the next publish counted from 1 and the owner refused it
@@ -70,7 +70,7 @@ fn a_rebuild_keeps_the_catalogue_and_the_next_head_still_advances() {
         projection::meta_set(&conn, "clean_shutdown", "0").unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO pending_changes (file_id, uri, old_size, old_mtime, new_size, new_mtime, detected_at)
-             VALUES ('d172-replayed', 'file:///d172', 0, 0, 0, 0, 0)",
+             VALUES ('d173-replayed', 'file:///d173', 0, 0, 0, 0, 0)",
             [],
         )
         .unwrap();
@@ -79,7 +79,7 @@ fn a_rebuild_keeps_the_catalogue_and_the_next_head_still_advances() {
     {
         let conn = rusqlite::Connection::open(data_dir.join("index.db")).unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id = 'd172-replayed'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id = 'd173-replayed'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "premise: the open really replayed (a log-derived table came back without the planted row)");
     }
@@ -132,14 +132,14 @@ fn a_fold_lock_held_by_another_process_does_not_cost_the_cache() {
         projection::applied_set(&conn, "", 0, "").unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO pending_changes (file_id, uri, old_size, old_mtime, new_size, new_mtime, detected_at)
-             VALUES ('d172-sentinel', 'file:///d172', 0, 0, 0, 0, 0)",
+             VALUES ('d173-sentinel', 'file:///d173', 0, 0, 0, 0, 0)",
             [],
         )
         .unwrap();
     }
     let alive = || -> bool {
         let conn = rusqlite::Connection::open(data_dir.join("index.db")).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id = 'd172-sentinel'", [], |r| r.get::<_, i64>(0))
+        conn.query_row("SELECT COUNT(*) FROM pending_changes WHERE file_id = 'd173-sentinel'", [], |r| r.get::<_, i64>(0))
             .unwrap()
             > 0
     };
