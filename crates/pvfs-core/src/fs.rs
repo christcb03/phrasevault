@@ -2636,10 +2636,24 @@ impl Engine {
     pub fn receiving_roots(&self) -> Result<Vec<(NodeId, std::path::PathBuf)>> {
         let declared = crate::sync::receiving_regions(&self.data_dir)?;
         let mut out: Vec<(NodeId, std::path::PathBuf, u64)> = Vec::new();
+        // D179 (PVOS) — one figure per FILESYSTEM. Two regions on one disk
+        // have one free space, but two measurements a moment apart need not
+        // agree while anything writes there; measured per region, the order
+        // of two such regions was whatever was written in between (GitHub
+        // CI's runner, 2026-09-18). Keyed by device, they tie, and the id
+        // decides.
+        let mut by_dev: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for b in self.local_bindings()? {
             if declared.contains(&b.folder_id) && self.is_catalogue_region(&b.folder_id)? {
                 let root = uri_to_path(&b.source_uri)?;
-                let free = crate::ingest::free_space_at(&root).unwrap_or(0);
+                let measure = || crate::ingest::free_space_at(&root).unwrap_or(0);
+                let free = match std::fs::metadata(&root) {
+                    Ok(m) => {
+                        use std::os::unix::fs::MetadataExt;
+                        *by_dev.entry(m.dev()).or_insert_with(measure)
+                    }
+                    Err(_) => measure(),
+                };
                 out.push((b.folder_id.clone(), root, free));
             }
         }
