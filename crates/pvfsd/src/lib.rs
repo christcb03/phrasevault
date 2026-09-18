@@ -306,6 +306,36 @@ impl Daemon {
             .unwrap_or(0)
     }
 
+    /// PVOS D174 — this box's receive plan, for `pvfs serve receive-plan`:
+    /// what `view receive --dry-run` computes, but through the READ POOL.
+    /// The dry run was a second process opening the forest — and folding
+    /// its log under the fold lock — once a minute for the owner's status
+    /// collector; on a replica that fold lands in the window between the
+    /// follow job's append and its own fold (D173). A read view does none of
+    /// `open`'s startup work, and the writer is not waited on (D136).
+    pub fn receive_plan(&self) -> pvfs_core::Result<ServerMsg> {
+        let e = self.reader();
+        let folders = e.receive_folders(true)?;
+        let (items, skips) = e.receive_plan(&pvfs_core::media::Rules::default())?;
+        Ok(ServerMsg::ReceivePlan {
+            folders,
+            items: items
+                .into_iter()
+                .map(|it| pvfs_proto::ReceivePlanItemWire {
+                    path: it.rel_path,
+                    hash: it.hash,
+                    size: it.size_bytes,
+                    region: it.dest_region,
+                    replaces: it.replaces,
+                })
+                .collect(),
+            reported: skips
+                .into_iter()
+                .map(|s| pvfs_proto::ReceiveSkipWire { path: s.rel_path, why: s.why })
+                .collect(),
+        })
+    }
+
     /// D136 — hold the WRITER lock from outside, for the test that proves
     /// `serve status` never waits on it. Not for production callers.
     #[doc(hidden)]
@@ -592,6 +622,19 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         trash: Vec::new(),
                     },
                 }
+            }
+        }
+        // PVOS D174: gated as `ServeStatus` is — library paths are
+        // operational detail, not public metadata.
+        ClientMsg::ReceivePlan => {
+            let member = match principal {
+                Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+                _ => false,
+            };
+            if !member {
+                err("forbidden", "the receive plan is member-gated (enroll this box)")
+            } else {
+                daemon.receive_plan().unwrap_or_else(err_from)
             }
         }
         ClientMsg::Ls { node } => match do_ls(daemon, principal, &node) {

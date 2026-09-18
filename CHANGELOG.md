@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The receive plan comes from the running daemon (PVOS D174).** The
+  owner's dashboard collector (PVOS D143) asked the NAS for the mover's plan
+  every minute by running `pvfs view receive --dry-run` inside the production
+  replica: a second process opening the forest and folding its log under the
+  fold lock, once a minute. On a replica that fold lands in the window
+  between the follow job's append and its own fold, and the daemon's next
+  open waits behind it — D173's standing candidate. New wire op
+  `ReceivePlan` (**proto 10 → 11**, additive; compatible-with stays 3),
+  answered from the daemon's read pool — no engine opened, nothing folded,
+  the writer not waited on — and member-gated like `ServeStatus`. New CLI
+  `pvfs serve receive-plan`: the dry run's JSON shape, each file with its
+  `size` and `replaces`; with no daemon it fails as `serve status` does and
+  never falls back to opening the forest. `view receive --dry-run` is
+  unchanged. `pvfsd/tests/d174_receive_plan.rs` asks for the plan with the
+  cache behind the log, the fold lock held and the writer held, and checks
+  that nothing folded.
 - **A projection replay must not cost a box its catalogue (D173).** Three
   hours after the v1.4-385 roll the NAS's watch job reported `head seq 1
   does not advance 0a16d644… (at 6)`. Another `pvfs` process had held its

@@ -104,6 +104,15 @@ pub struct ServeStatusReply {
     pub trash: Vec<pvfs_proto::TrashWire>,
 }
 
+/// PVOS D174 — what `ReceivePlan` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivePlanReply {
+    /// Folders only staging has, which the receiving side would make first.
+    pub folders: Vec<String>,
+    pub items: Vec<pvfs_proto::ReceivePlanItemWire>,
+    pub reported: Vec<pvfs_proto::ReceiveSkipWire>,
+}
+
 /// Identity + root of the forest behind the socket.
 #[derive(Debug, Clone)]
 pub struct ForestInfo {
@@ -319,6 +328,15 @@ impl Client {
                 trash,
             }),
             other => Err(unexpected("ServeJobs", &other)),
+        }
+    }
+
+    /// PVOS D174 — this box's receive plan, from the running daemon (its
+    /// read pool: nothing opens or folds the forest to answer).
+    pub fn receive_plan(&mut self) -> Result<ReceivePlanReply> {
+        match self.request(ClientMsg::ReceivePlan)? {
+            ServerMsg::ReceivePlan { folders, items, reported } => Ok(ReceivePlanReply { folders, items, reported }),
+            other => Err(unexpected("ReceivePlan", &other)),
         }
     }
 
