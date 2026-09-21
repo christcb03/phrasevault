@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A stream of writes under a region root no longer holds the watch off
+  (PVOS D180).** The watch started a pass only after 2 s with no inotify
+  event, and every event under the root counted, including writes to a
+  `.pvfs-` folder the walk never looks at. rclone copying into mediabox's
+  `/mnt/local/Media/.pvfs-d168-incoming/` held every pass off from about
+  10:50 to 11:25 AM EDT on 2026-09-21 (46 files placed and 13 trashed, none
+  taken until 11:25); the NAS's
+  `receive` writes its partials into `<library>/.pvfs-incoming/` for as long
+  as a pull runs, so its catalogue could lag an hour, the reconcile. Now the
+  handler drops an event whose every path is one the walk passes over
+  (`is_own_name`, `is_litter_name` — which also ends the extra pass each
+  pass's own sidecars set off), and the debounce has a ceiling: once the
+  first unanswered event is 30 s old a pass starts, whatever keeps coming.
+  `watch::run` takes `ceiling_ms`; pvfsd passes 30 s, `pvfs serve watch
+  --ceiling-ms` defaults to it.
 - **One free-space figure per disk when choosing where to receive (PVOS
   D179).** GitHub CI failed twice on `d133_receive_plan`'s tie test while our
   pipeline passed it: `receiving_roots()` measured free space once per region,

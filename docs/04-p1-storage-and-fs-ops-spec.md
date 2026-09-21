@@ -223,6 +223,22 @@ had decided.
   every `reconcile_interval` (default 1h), plus the temp-spool sweep at start.
 - Watcher events are debounced (default 2s) and fed through the same ingest
   path as scan steps 1–5.
+  - **The debounce has a ceiling (PVOS D180), default 30 s.** A pass starts
+    after 2 s with no new event, or once the first unanswered event is 30 s
+    old, however many keep coming. It counts from the first event taken
+    after a pass, so under a stream that never stops a pass starts every
+    30 s plus the pass's own length. Before D180 a copy into a region root
+    held every pass off until the hourly reconcile. `pvfs serve watch
+    --ceiling-ms`; never below the debounce.
+  - **Only what the walk can see is an event (PVOS D180).** An event whose
+    every path, below the watched root, has a name the walk passes over —
+    `sync::is_own_name` (`.pvfs-incoming`'s partials, `.pvfs-trash`, a
+    sidecar and its temp, the root marker) or `sync::is_litter_name` — is
+    dropped in the handler. For the last name, one that is ours only as a
+    file (a sidecar, a `.partial`) is dropped only when it is a file: the
+    event kind says, or `symlink_metadata`, and a path already gone counts.
+    An error, the rescan of an overflowing queue, the root itself and a path
+    under no root always count.
 - **Live-writer discipline** (since built): writer engines hold a shared
   flock on `<data_dir>/writer.lock`; a CLI open that finds a live writer
   catches up instead of crash-rebuilding. `serve.lock` is only the watcher's

@@ -47,6 +47,11 @@ const TIER_INTERVAL: Duration = Duration::from_secs(300);
 /// Passed to `watch::run` AND used as its stall baseline, so the two cannot
 /// drift apart again.
 pub const WATCH_RECONCILE: Duration = Duration::from_secs(3600);
+/// How long the watcher waits for changes to stop before a pass.
+const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
+/// D180 — and the longest it waits when they do not stop: a copy into a
+/// region root held mediabox's passes off for over half an hour.
+const WATCH_CEILING: Duration = Duration::from_secs(30);
 const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 /// D129 — a catalogue region's head moves at most once per watch pass on
 /// its box, so a minute keeps the fleet's view within a pass of live.
@@ -501,11 +506,18 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
                 st.set_state("watch", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
-                let r = watch::run(&data_dir, WATCH_RECONCILE.as_secs(), 2000, &flag, |ev| {
-                    for line in watch_event(&cb, ev) {
-                        eprintln!("{line}");
-                    }
-                });
+                let r = watch::run(
+                    &data_dir,
+                    WATCH_RECONCILE.as_secs(),
+                    WATCH_DEBOUNCE.as_millis() as u64,
+                    WATCH_CEILING.as_millis() as u64,
+                    &flag,
+                    |ev| {
+                        for line in watch_event(&cb, ev) {
+                            eprintln!("{line}");
+                        }
+                    },
+                );
                 if let Some(line) = job_exited(&st, "watch", r) {
                     eprintln!("{line}");
                 }
