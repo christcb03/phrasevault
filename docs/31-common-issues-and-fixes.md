@@ -13,6 +13,8 @@ whenever a fix is found, not only when it recurs.**
 | A catalogue stops updating while files are copied into a region | [§4](#4-a-catalogue-stops-updating-while-files-are-copied-into-its-region) |
 | Sonarr upgrades take minutes, and the old file lands in `Recycle` | [§5](#5-sonarr-upgrades-take-minutes-the-recycle-bin) |
 | sabnzbd or qBittorrent stall after a roll | [§6](#6-download-clients-stall-after-a-roll) |
+| A season's files numbered in another order than Sonarr's | [§7](#7-a-seasons-files-numbered-in-another-order-than-sonarrs) |
+| A show Sonarr numbers by segment (whole broadcasts beside segment files) | [§8](#8-a-show-sonarr-numbers-by-segment) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -58,7 +60,7 @@ The steps, with the fleet's scripts (PVOS
    untouched, `action = held`) any group whose copies differ in length —
    movies by more than 3 %, episodes by more than 10 %, a `sample` file
    aside — or whose file names disagree on both show and episode title.
-   On 2026-09-21 that caught 52 groups, among them:
+   On 2026-09-21 that caught 49 groups, among them:
    - another show's episodes misfiled in a show's folder under the same
      numbers (§2) — the plan would have trashed the real ones as "incomplete";
    - 7-minute segments against 21-minute broadcasts under one number
@@ -102,9 +104,10 @@ The steps, with the fleet's scripts (PVOS
    versions that now show unavailable ("Empty trash automatically" stays off).
 
 **Worked example (PVOS D168, 2026-09-21).** 1,582 groups in 37 shows and
-movies; 52 held; 1,533 copies trashed (NAS 733, NAS-ext 3, mediabox 797; the
-main list in 76 s); 428 files (1.3 TB) moved NAS → mediabox at the gigabit's
-~110 MB/s, planned to leave mediabox 830 GB and 501 GB free. The milestone doc: PVOS
+movies; 49 held (then decided one by one: §2, §3, §7, §8); 1,533 copies
+trashed (NAS 733, NAS-ext 3, mediabox 797; the main list in 76 s); 428 files
+(1.3 TB) moved NAS → mediabox at the gigabit's ~110 MB/s, 10:47 AM–3:30 PM EDT,
+every one verified by mediabox's hash before its NAS original went. The milestone doc: PVOS
 `docs/milestones/D168-duplicates.md`.
 
 ## 2. A show misfiled inside another show's folder
@@ -203,3 +206,42 @@ leave feederbox — and give Sonarr and Radarr a remote path mapping back to
 the union path (host `sabnzbd`, `/mnt/local/downloads/nzbs/sabnzbd/complete/`
 → `/mnt/unionfs/downloads/nzbs/sabnzbd/complete/`), so a usenet import stays a
 rename (done 2026-09-18; torrents import by copy anyway, to keep seeding).
+
+## 7. A season's files numbered in another order than Sonarr's
+
+**What it looks like.** Two different episodes under one number (a
+duplicate plan holds them: the names disagree on the title), or Sonarr shows
+an episode with a file whose title is another episode's. Sam & Max season 1
+on mediabox (2026-09-21): all 24 files carried an older order — the file
+`s01e14 - It's Dangly Deever Time` is Sonarr's s01e13, and Sonarr, which
+maps by the number in the name, had 16 of them on the wrong episodes.
+
+**Fix.** Match every file to Sonarr's episode list **by title** (`GET
+/api/v3/episode?seriesId=…`), rename the ones whose number differs through
+the view, then rescan the series. Where the renames form a cycle (5 → 7 → 8
+→ 6 → 5), rename everything to a temporary name first, then to its final
+name — never onto a name still in use. Do the renames in Python (or quote
+carefully): **in bash, `&` in a `${var/pattern/replacement}` replacement
+means "the matched text"**, and a show named "Sam & Max" came out mangled
+(nothing lost; renamed again). A real duplicate left afterwards (two copies of
+one title) is §1's rule; between two SD encodes of equal length, a modern
+HEVC file beats an old MPEG-4 one even at a lower bitrate — §1's ×1.5 undersells it.
+
+## 8. A show Sonarr numbers by segment
+
+**What it looks like.** Short files (3–10 min) and ~21-minute files under
+the same episode numbers — Animaniacs, which Sonarr numbers by segment (160
+"episodes" in season 1): the long files are whole broadcasts named after one
+of their segments.
+
+**Fix.** Segments that aired together share an air date in Sonarr's list.
+For each long file, find its broadcast's other segments and whether each has
+its own file (a segment-length file, or a multi-episode one like
+`s01e90-e91`): if every segment is covered, the broadcast is a duplicate —
+trash it; where an HD broadcast stands against a low-resolution segment file,
+keep the HD one (better quality) and trash the segment file; two copies of one
+broadcast — keep the better. On 2026-09-21: 32 groups, all duplicates by that
+test — 29 SD `.avi` broadcasts and 3 480p segment files trashed (6 GB).
+Probe every file first: only groups that differed had been probed, and a
+segment "with no file" was really one with a file nobody had measured.
+
