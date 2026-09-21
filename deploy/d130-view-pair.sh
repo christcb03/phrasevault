@@ -7,6 +7,8 @@
 # media analysis reads of it (38.5 KB of head, the last 1.1 KB) returns at
 # once and costs two pieces, not the file; a full read lands it verified in
 # the store; a remount with a small --cache-max evicts it.
+# D181 — stream mode: the same file read through with --cache-mode stream is
+# right, the partial never holds more than the window, and it is gone at close.
 #   owner : presubuntu (192.168.0.184) — forest, `own-shelf` catalogued here
 #   edge  : pvos-test  (192.168.0.138) — replica, `edge-shelf` catalogued there
 # Binaries: ~/.local/bin on both boxes, installed by the pipeline — or a
@@ -238,6 +240,59 @@ EOS
 has "$P_OUT" KEPT=ok && [ "$(val "$P_OUT" PART_AFTER)" = "0" ] && ok "the file is whole in the hash store, verified, and its partial is gone" || fail "not kept: $P_OUT $(ssh "$OWNER" 'tail -3 $HOME/fleet-test/d130-view.log')"
 [ "$(val "$P_OUT" AGAIN_MD5)" = "$BIGMD5" ] && ok "a second full read comes from the store ($(val "$P_OUT" AGAIN_S)s)" || fail "second read md5"
 gate pieces
+
+say "E2b (D181): stream mode — the same 600 MiB file read through and not kept; the partial holds a window, and goes at close"
+S_OUT=$(ssh "$OWNER" "bash -s" <<EOS
+$RH
+V=\$FT/d130-view
+"\$B/pvfs" umount "\$V" >/dev/null 2>&1 || fusermount3 -u "\$V" 2>/dev/null
+for _ in \$(seq 1 40); do mountpoint -q "\$V" || break; sleep 0.25; done
+# E2 kept big.mkv whole; set it aside (F2 wants it back) so stream mode must fetch
+KEPT=\$(find "\$D" -path '*/by-hash/*' -type f -size +100M ! -name '*.partial' | head -1)
+[ -n "\$KEPT" ] && mv "\$KEPT" "\$FT/d130-kept-big" && echo "KEPT_PATH=\$KEPT"
+nohup "\$B/pvfs" --data-dir "\$D" mount --view "\$V" --cache-mode stream >/dev/null 2>>"\$FT/d130-view.log" &
+echo \$! > "\$FT/d130-view.pid"
+for _ in \$(seq 1 40); do mountpoint -q "\$V" && break; sleep 0.25; done
+mountpoint -q "\$V" && echo S1=ok
+grep -q "stream mode" "\$FT/d130-view.log" && echo S2=ok
+python3 - "\$V/big.mkv" <<'PY'
+import os, sys, time
+p = sys.argv[1]; size = os.path.getsize(p)
+f = open(p, "rb", buffering=0)
+t = time.time(); f.seek(size - 1101); n = len(f.read(1101)); f.seek(0); n += len(f.read(38550))
+print("PROBE_S=%.3f" % (time.time() - t)); print("PROBE_N=%d" % n)
+f.close()
+PY
+# the full read, with the partial's allocated size sampled while it runs
+( m=0; while :; do P=\$(find "\$D" -path '*/by-hash/*' -name '*.partial' | head -1); [ -n "\$P" ] && k=\$(du -k "\$P" | cut -f1) && [ "\$k" -gt "\$m" ] && m=\$k && echo "\$m" > "\$FT/d130-stream-max"; sleep 0.2; done ) &
+SAMPLER=\$!
+t0=\$(date +%s.%N); GOT=\$(md5sum < "\$V/big.mkv" | cut -d' ' -f1); t1=\$(date +%s.%N)
+kill \$SAMPLER 2>/dev/null; wait \$SAMPLER 2>/dev/null
+echo "FULL_MD5=\$GOT"; echo "FULL_S=\$(python3 -c "print(round(\$t1-\$t0,1))")"
+echo "MAX_KB=\$(cat "\$FT/d130-stream-max" 2>/dev/null || echo 0)"
+for _ in \$(seq 1 20); do [ -z "\$(find "\$D" -path '*/by-hash/*' -name '*.partial')" ] && { echo GONE=ok; break; }; sleep 0.5; done
+echo "WHOLE=\$(find "\$D" -path '*/by-hash/*' -type f -size +100M ! -name '*.partial' | wc -l)"
+[ "\$(cat "\$V/a.mkv")" = "aaa" ] && echo S3=ok
+# back as E2 left it, for F: the kept file, the default mode
+"\$B/pvfs" umount "\$V" >/dev/null 2>&1 || fusermount3 -u "\$V" 2>/dev/null
+for _ in \$(seq 1 40); do mountpoint -q "\$V" || break; sleep 0.25; done
+[ -f "\$FT/d130-kept-big" ] && [ -n "\$KEPT" ] && mv "\$FT/d130-kept-big" "\$KEPT"
+nohup "\$B/pvfs" --data-dir "\$D" mount --view "\$V" >/dev/null 2>>"\$FT/d130-view.log" &
+echo \$! > "\$FT/d130-view.pid"
+for _ in \$(seq 1 40); do mountpoint -q "\$V" && break; sleep 0.25; done
+mountpoint -q "\$V" && echo S4=ok
+EOS
+)
+has "$S_OUT" KEPT_PATH= && ok "E2's kept copy set aside" || fail "no kept copy to set aside: $S_OUT"
+has "$S_OUT" S1=ok && has "$S_OUT" S2=ok && ok "remounted with --cache-mode stream (the mount says so)" || fail "stream mount: $S_OUT"
+[ "$(val "$S_OUT" PROBE_N)" = "39651" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)" "$(val "$S_OUT" PROBE_S)" && ok "tail + head probe in $(val "$S_OUT" PROBE_S)s" || fail "probe: $S_OUT"
+[ "$(val "$S_OUT" FULL_MD5)" = "$BIGMD5" ] && ok "a full read in stream mode matches the edge's md5 ($(val "$S_OUT" FULL_S)s)" || fail "stream md5: got $(val "$S_OUT" FULL_MD5) want $BIGMD5"
+[ "$(val "$S_OUT" MAX_KB)" -gt 0 ] && [ "$(val "$S_OUT" MAX_KB)" -lt 153600 ] && ok "the partial never held more than $(val "$S_OUT" MAX_KB) KB of the 614,400 (the window behind and ahead)" || fail "partial grew to $(val "$S_OUT" MAX_KB) KB"
+has "$S_OUT" GONE=ok && ok "the partial was deleted when the file closed" || fail "partial left behind: $S_OUT"
+[ "$(val "$S_OUT" WHOLE)" = "0" ] && ok "and nothing was kept whole" || fail "stream mode kept a whole file"
+has "$S_OUT" S3=ok && ok "the owner's own bytes read as before" || fail "a.mkv in stream mode"
+has "$S_OUT" S4=ok && ok "back in keep mode with E2's kept copy, for F" || fail "remount for F: $S_OUT"
+gate stream
 
 say "E3 (D169): a delete through the owner's mount is a trip to the EDGE's trash; restored there, it comes back"
 ZHEAD=$(ssh "$OWNER" "bash -s" <<EOS
