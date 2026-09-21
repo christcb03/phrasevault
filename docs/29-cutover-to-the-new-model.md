@@ -306,6 +306,12 @@ only after the new one has run a full week with a cloudplow cycle, a NAS
 reboot (the supervisor's first real `start`), and an arr import — and
 after §2's counts have been re-taken and are boring.
 
+*Done 2026-09-21 (PVOS D168's day): after nine days, many arr imports and no
+cloudplow (retired), Chris waived the NAS reboot and the old forest was
+deleted from the owner, feederbox and the NAS. The two old sync stores were
+checked first — every file matched today's catalogue by its old path and
+size, or had been superseded by an upgrade. §8's rollback no longer exists.*
+
 ## 9. Rehearsal
 
 **The whole sequence ran on 2026-09-11/12 (PVOS D139):** an old-model
