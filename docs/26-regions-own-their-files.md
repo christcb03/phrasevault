@@ -225,6 +225,21 @@ and in a draining region it is drained again if the library still holds it.
 The trash is deliberately not in the merged view (`.pvfs-*` is ours, D166):
 four boxes' trash would land in one folder, in conflict with itself.
 
+*PVOS D168 (2026-09-21): one region's copy to the trash.* `pvfs trash put
+<PATH> [--region ID] [--hash H]` moves ONE region's copy of a file to that
+region's trash — here when this box catalogues the region from its own disk,
+else on the box that answers for it (D169's `TrashPath`, write-gated, and
+only while the copy is still the file with that hash: the catalogue's unless
+`--hash` says). A delete through the view sends the same request for every
+copy at the path; `put` is for when two regions hold different bytes there
+and one of them is being kept — the duplicate cleanup's case. Bare at a
+terminal it asks for the path and, when more than one region has a file
+there, which; a script passes `--region`. `--from FILE` (`-` for stdin) takes
+a list, `region<TAB>path<TAB>hash` per line with full ids: every line is
+checked before anything moves, each is its own answer (`trashed`, `already
+gone`, `refused` and why), the list goes on past a refusal, and the exit
+status is 1 if any line was refused. `pvfs trash restore --region` undoes it.
+
 *D145 (2026-09-12) amends both cells of the draining row, after the drain
 lost an arr upgrade on the first production day. The ladder, with no quality
 measured, preferred a larger library copy that the arr had deleted minutes

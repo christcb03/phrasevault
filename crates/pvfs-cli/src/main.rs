@@ -1299,6 +1299,28 @@ enum TrashCmd {
         #[arg(long)]
         region: Option<String>,
     },
+    /// PVOS D168: move ONE region's copy of a file to that region's trash,
+    /// on the box that holds it — this box, or the one that answers for the
+    /// region (D169's trip, which a delete through the view makes for every
+    /// copy at once). Only while it is still the file with that hash.
+    /// Undo with `pvfs trash restore --region`. Bare, at a terminal, it asks
+    /// for the path, and for the region when more than one holds a file there.
+    Put {
+        /// Relative to the region's root, as the view shows it
+        path: Option<String>,
+        /// Which region's copy (an id prefix): asked at a terminal when more
+        /// than one region has a file at PATH, required in a script
+        #[arg(long)]
+        region: Option<String>,
+        /// Only if it is still this content hash (default: the catalogue's)
+        #[arg(long)]
+        hash: Option<String>,
+        /// A list instead of one PATH: `region<TAB>path<TAB>hash` per line,
+        /// full 64-hex ids, `#` comments; `-` reads stdin. One refusal is
+        /// that line's answer and the list goes on
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6272,6 +6294,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 })
             }
         }
+        Cmd::Trash(TrashCmd::Put { path, region, hash, from }) => trash_put(&ctx?, path, region, hash, from, json),
         Cmd::Trash(cmd) => {
             let engine = Engine::open(&ctx?)?;
             let lists = engine.region_trash_lists()?;
@@ -6340,6 +6363,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
+                TrashCmd::Put { .. } => unreachable!("handled above"),
             }
         }
         Cmd::View(ViewCmd::Resolve { dry_run }) => {
@@ -9495,6 +9519,161 @@ fn trash_filter(
             l
         })
         .collect()
+}
+
+/// PVOS D168 — `pvfs trash put`: one region's copy of a path (or each line of
+/// a `--from` list) to its region's trash — here when this box catalogues the
+/// region from its own disk, else on the box that answers for it.
+fn trash_put(
+    data_dir: &Path,
+    path: Option<String>,
+    region: Option<String>,
+    hash: Option<String>,
+    from: Option<String>,
+    json: bool,
+) -> Result<(), PvfsError> {
+    let bad = |reason: String| PvfsError::BadInput { field: "trash put".into(), reason };
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let engine = Engine::open(data_dir)?;
+    let items: Vec<(String, String, String)> = match from {
+        Some(_) if path.is_some() || region.is_some() || hash.is_some() => {
+            return Err(bad("--from takes region, path and hash from its lines — not with PATH, --region or --hash".into()))
+        }
+        Some(f) => {
+            let text = if f == "-" {
+                std::io::read_to_string(std::io::stdin()).map_err(|e| PvfsError::io("read the list from stdin", e))?
+            } else {
+                std::fs::read_to_string(&f).map_err(|e| PvfsError::io(&format!("read {f}"), e))?
+            };
+            let mut items = Vec::new();
+            // Every line is checked before anything moves: a list that is
+            // wrong at line 900 must not be half done.
+            for (n, line) in text.lines().enumerate() {
+                let line = line.trim_end_matches('\r');
+                if line.trim().is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let f: Vec<&str> = line.split('\t').collect();
+                let [r, p, h] = f[..] else {
+                    return Err(bad(format!("line {}: expected region<TAB>path<TAB>hash, got {} field(s)", n + 1, f.len())));
+                };
+                let p = p.trim_matches('/');
+                if !hex64(r) || !hex64(h) || p.is_empty() {
+                    return Err(bad(format!("line {}: the region and the hash are full 64-hex ids, and the path is not empty", n + 1)));
+                }
+                items.push((r.to_ascii_lowercase(), p.to_string(), h.to_ascii_lowercase()));
+            }
+            if items.is_empty() {
+                return Err(bad(format!("{f}: no lines to do")));
+            }
+            items
+        }
+        None => {
+            let path = match path {
+                Some(p) => p,
+                None => prompt_line("Path to put in the trash (relative to its region's root, as the view shows it)", None)?,
+            };
+            let rel = path.trim_matches('/').to_string();
+            let entry = engine.view_entry(&rel)?.ok_or_else(|| bad(format!("the catalogue has nothing at {rel:?}")))?;
+            let copies: Vec<&pvfs_core::ViewCopy> =
+                entry.sources.iter().filter(|c| c.kind == "file" && c.content_hash.is_some()).collect();
+            if copies.is_empty() {
+                return Err(bad(format!("{rel:?} is not a catalogued (hashed) file")));
+            }
+            let pick = |prefix: &str| -> Result<&pvfs_core::ViewCopy, PvfsError> {
+                let hits: Vec<_> = copies.iter().filter(|c| c.region.starts_with(prefix)).collect();
+                match hits[..] {
+                    [one] => Ok(*one),
+                    [] => Err(bad(format!("no region starting {prefix:?} has a file at {rel:?}"))),
+                    _ => Err(bad(format!("{prefix:?} names more than one region — give more of the id"))),
+                }
+            };
+            let chosen = match (&region, copies.len()) {
+                (Some(r), _) => pick(r)?,
+                (None, 1) => copies[0],
+                (None, _) => {
+                    eprintln!("{} regions have a file at {rel}:", copies.len());
+                    for c in &copies {
+                        eprintln!(
+                            "  {}  {}  hash {}",
+                            &c.region[..12.min(c.region.len())],
+                            fmt_bytes(c.size_bytes),
+                            &c.content_hash.as_deref().unwrap_or("")[..12]
+                        );
+                    }
+                    pick(&prompt_line("Which region's copy (an id prefix; --region in a script)", None)?)?
+                }
+            };
+            let h = hash.map(|h| h.to_ascii_lowercase()).or_else(|| chosen.content_hash.clone()).unwrap_or_default();
+            if !hex64(&h) {
+                return Err(bad("--hash is a full 64-hex content hash".into()));
+            }
+            vec![(chosen.region.clone(), rel, h)]
+        }
+    };
+
+    // This box's own regions first — the move is a rename on its disk, as
+    // the view mount's delete does it — then the box that holds each other.
+    let mut answers: Vec<Option<Result<bool, String>>> = vec![None; items.len()];
+    let (mut away, mut away_at) = (Vec::new(), Vec::new());
+    for (i, (r, p, h)) in items.iter().enumerate() {
+        answers[i] = match engine.trash_region_path(r, p, h) {
+            Ok(pvfs_core::TrashedHere::Trashed(_)) => Some(Ok(true)),
+            Ok(pvfs_core::TrashedHere::Gone) => Some(Ok(false)),
+            Ok(pvfs_core::TrashedHere::Changed) => Some(Err("this box's copy is not the file with that hash: left alone".into())),
+            Ok(pvfs_core::TrashedHere::NotHere) => {
+                away.push(items[i].clone());
+                away_at.push(i);
+                None
+            }
+            Err(e) => Some(Err(e.to_string())),
+        };
+    }
+    if !away.is_empty() {
+        let sources = pvfs_client::receive::announced_sources(&engine);
+        for (i, a) in away_at.into_iter().zip(pvfs_client::hash_cache::trash_each(&sources, &away)) {
+            answers[i] = Some(a);
+        }
+    }
+    engine.close()?;
+
+    let (mut trashed, mut gone, mut refused) = (0usize, 0usize, 0usize);
+    let mut out = Vec::new();
+    for ((r, p, h), a) in items.iter().zip(answers) {
+        let a = a.unwrap_or_else(|| Err("not asked".into()));
+        let (word, why) = match &a {
+            Ok(true) => ("trashed", None),
+            Ok(false) => ("already gone", None),
+            Err(e) => ("refused", Some(e.clone())),
+        };
+        match a {
+            Ok(true) => trashed += 1,
+            Ok(false) => gone += 1,
+            Err(_) => refused += 1,
+        }
+        if json {
+            out.push(serde_json::json!({"region": r, "path": p, "hash": h, "result": word, "why": why}));
+        } else {
+            match why {
+                Some(w) => println!("{word}\t{p}\t{}\t{w}", &r[..12]),
+                None => println!("{word}\t{p}\t{}", &r[..12]),
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"items": out, "trashed": trashed, "already_gone": gone, "refused": refused})
+        );
+    } else {
+        eprintln!(
+            "{trashed} trashed, {gone} already gone, {refused} refused — `pvfs trash ls` on the holder lists them; `pvfs trash restore --region` puts one back"
+        );
+    }
+    if refused > 0 {
+        return Err(bad(format!("{refused} of {} refused (each line says why)", items.len())));
+    }
+    Ok(())
 }
 
 /// Days until a bucket is purged: `purge_trash` takes it once it is

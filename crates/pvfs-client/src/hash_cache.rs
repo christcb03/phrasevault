@@ -739,9 +739,57 @@ pub fn announced_sources(data_dir: &Path) -> Vec<ReplicaSource> {
 static HOLDER_HINT: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Ask the fleet, box by box, to do `ask` for each of `items` on the box
-/// that holds its region: `not_found` = "not mine", try the next; any other
-/// refusal ends it. `Err` carries why, and how many items were done.
+/// Ask the fleet, box by box, to do `ask` on the box that holds region `r`,
+/// over the connections in `open` (dialed as needed, kept for the next
+/// item): `not_found` = "not mine", try the next; any other refusal is the
+/// answer. `Err` carries why.
+fn ask_holder<T>(
+    open: &mut HashMap<String, crate::Client>,
+    sources: &[ReplicaSource],
+    r: &str,
+    mut ask: impl FnMut(&mut crate::Client) -> std::result::Result<T, ClientError>,
+) -> Result<T, String> {
+    let mut why = format!("no box that holds region {} answered", &r[..r.len().min(8)]);
+    // The box that answered for this region last time is asked first: an
+    // arr renaming a season is a hundred requests for one region, and
+    // every box asked in vain is a dial — a second, from feederbox.
+    let hinted = HOLDER_HINT.lock().unwrap().get(r).cloned();
+    let mut order: Vec<&ReplicaSource> = sources.iter().collect();
+    if let Some(h) = &hinted {
+        order.sort_by_key(|s| &s.target != h);
+    }
+    for src in order {
+        if !open.contains_key(&src.target) {
+            match crate::follow::dial_source(src) {
+                Ok(c) => {
+                    open.insert(src.target.clone(), c);
+                }
+                Err(e) => {
+                    why = format!("{}: {e}", src.target);
+                    continue;
+                }
+            }
+        }
+        let client = open.get_mut(&src.target).expect("dialed above");
+        match ask(client) {
+            Ok(v) => {
+                HOLDER_HINT.lock().unwrap().insert(r.to_string(), src.target.clone());
+                return Ok(v);
+            }
+            Err(ClientError::Server { code, .. }) if code == "not_found" => continue,
+            Err(ClientError::Server { code, message }) => return Err(format!("{}: {code}: {message}", src.target)),
+            Err(e) => {
+                open.remove(&src.target);
+                why = format!("{}: {e}", src.target);
+            }
+        }
+    }
+    Err(why)
+}
+
+/// Ask the fleet to do `ask` for each of `items` on the box that holds its
+/// region ([`ask_holder`]); the first refusal ends it. `Err` carries why, and
+/// how many items were done.
 fn ask_holders<T>(
     sources: &[ReplicaSource],
     items: &[T],
@@ -750,49 +798,7 @@ fn ask_holders<T>(
 ) -> Result<(), (String, usize)> {
     let mut open: HashMap<String, crate::Client> = HashMap::new();
     for (n, item) in items.iter().enumerate() {
-        let r = region(item);
-        let mut why = format!("no box that holds region {} answered", &r[..r.len().min(8)]);
-        let mut done = false;
-        // The box that answered for this region last time is asked first: an
-        // arr renaming a season is a hundred requests for one region, and
-        // every box asked in vain is a dial — a second, from feederbox.
-        let hinted = HOLDER_HINT.lock().unwrap().get(r).cloned();
-        let mut order: Vec<&ReplicaSource> = sources.iter().collect();
-        if let Some(h) = &hinted {
-            order.sort_by_key(|s| &s.target != h);
-        }
-        for src in order {
-            if !open.contains_key(&src.target) {
-                match crate::follow::dial_source(src) {
-                    Ok(c) => {
-                        open.insert(src.target.clone(), c);
-                    }
-                    Err(e) => {
-                        why = format!("{}: {e}", src.target);
-                        continue;
-                    }
-                }
-            }
-            let client = open.get_mut(&src.target).expect("dialed above");
-            match ask(client, item) {
-                Ok(()) => {
-                    HOLDER_HINT.lock().unwrap().insert(r.to_string(), src.target.clone());
-                    done = true;
-                    break;
-                }
-                Err(ClientError::Server { code, .. }) if code == "not_found" => continue,
-                Err(ClientError::Server { code, message }) => {
-                    return Err((format!("{}: {code}: {message}", src.target), n));
-                }
-                Err(e) => {
-                    open.remove(&src.target);
-                    why = format!("{}: {e}", src.target);
-                }
-            }
-        }
-        if !done {
-            return Err((why, n));
-        }
+        ask_holder(&mut open, sources, region(item), |client| ask(client, item)).map_err(|why| (why, n))?;
     }
     Ok(())
 }
@@ -808,6 +814,21 @@ pub fn trash_elsewhere(sources: &[ReplicaSource], rel_path: &str, copies: &[(Str
         client.trash_path(region, rel_path, hash).map(|_| ())
     })
     .map_err(|(why, _)| why)
+}
+
+/// PVOS D168 — `pvfs trash put`: each `(region, rel_path, hash)` to its
+/// region's trash on the box that holds it, over one connection per box for
+/// the whole list. Unlike a delete through the view (every copy, all or
+/// nothing), each item is ONE region's copy and its own answer: `Ok(true)`
+/// trashed, `Ok(false)` already gone, `Err` why that box refused (the file
+/// changed, no write rights) or that nobody holds the region — and the list
+/// goes on.
+pub fn trash_each(sources: &[ReplicaSource], items: &[(String, String, String)]) -> Vec<Result<bool, String>> {
+    let mut open: HashMap<String, crate::Client> = HashMap::new();
+    items
+        .iter()
+        .map(|(region, rel_path, hash)| ask_holder(&mut open, sources, region, |c| c.trash_path(region, rel_path, hash)))
+        .collect()
 }
 
 /// D170 — one copy a view rename moves: its region, and for a file the
