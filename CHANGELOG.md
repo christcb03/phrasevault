@@ -5,6 +5,13 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Doc 31, common issues and fixes (PVOS D168).** An operations page: what
+  each issue looks like, why, and the fix, with the fleet as the worked
+  example — first the duplicate cleanup (plan, the holds a folder-and-number
+  key needs, canary, `trash put --from`, freeing the space, verified moves,
+  the arrs' rescan), then a show misfiled in another's folder, two editions
+  of a film (Plex's `{edition-…}`), the watch starved by writes under a
+  region root, the arrs' recycle bin and download clients on the union.
 - **`pvfs trash put`: one region's copy to its trash (PVOS D168).** The
   duplicate cleanup keeps the better of two copies, and where two regions
   hold different bytes at the same path a delete through the view — which
