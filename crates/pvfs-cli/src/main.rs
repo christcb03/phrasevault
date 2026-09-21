@@ -2089,6 +2089,192 @@ fn view_json(e: &pvfs_core::ViewEntry, drains: &std::collections::HashMap<String
     })
 }
 
+// ---- D181: a running mount's account of itself (PVOS D181 §8) -------------
+
+/// Where a running `pvfs mount --view` says what it is: one JSON file per
+/// mount point under `<data dir>/mounts/`, written at start, rewritten when
+/// it goes stale, removed at a clean exit. The roll reads it through
+/// `pvfs versions` (would the running mount survive the build being
+/// installed?), and the fleet's idle-refresh timer compares its build with
+/// the installed one.
+fn mount_status_path(data_dir: &Path, mountpoint: &Path) -> PathBuf {
+    let name = mountpoint.to_string_lossy().trim_matches('/').replace('/', "-");
+    data_dir
+        .join("mounts")
+        .join(format!("{}.json", if name.is_empty() { "root" } else { name.as_str() }))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_mount_status(
+    path: &Path,
+    mountpoint: &Path,
+    cache_mode: pvfs_client::hash_cache::CacheMode,
+    started_ms: u64,
+    stale: Option<&str>,
+) {
+    let v = serde_json::json!({
+        "pid": std::process::id(),
+        "build": env!("PVFS_BUILD"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "mount_compat": pvfs_core::MOUNT_COMPAT,
+        "proto": pvfs_client::PROTO_VERSION,
+        "schema": pvfs_core::projection::SCHEMA_VERSION,
+        "mountpoint": mountpoint.to_string_lossy(),
+        "cache_mode": cache_mode.to_string(),
+        "started_ms": started_ms,
+        "stale": stale,
+    });
+    let Some(dir) = path.parent() else { return };
+    let tmp = path.with_extension("json.tmp");
+    // A status file is advice for the roll: failing to write one must not
+    // stop the mount, but it is said.
+    let wrote = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::write(&tmp, v.to_string()))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if let Err(e) = wrote {
+        eprintln!("mount: cannot write its status file {}: {e}", path.display());
+    }
+}
+
+/// D181 guardrail 2 — once a minute, is the catalogue on disk newer than this
+/// mount reads? An older engine already refuses a newer schema outright, so
+/// nothing can be corrupted; the point is that it is SAID — in the journal
+/// and in the status file, which the refresh timer and the dashboard read.
+fn watch_catalogue_schema(
+    data_dir: PathBuf,
+    status: PathBuf,
+    mountpoint: PathBuf,
+    cache_mode: pvfs_client::hash_cache::CacheMode,
+    started_ms: u64,
+) {
+    std::thread::spawn(move || {
+        let mut said = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let Some(on_disk) = pvfs_core::projection::on_disk_schema_version(&data_dir) else { continue };
+            if on_disk > pvfs_core::projection::SCHEMA_VERSION && !said {
+                let why = format!(
+                    "the catalogue is projection schema v{on_disk}; this mount (build {}) reads v{} — restart it",
+                    env!("PVFS_BUILD"),
+                    pvfs_core::projection::SCHEMA_VERSION
+                );
+                eprintln!("mount: {why} (D181)");
+                write_mount_status(&status, &mountpoint, cache_mode, started_ms, Some(&why));
+                said = true;
+            }
+        }
+    });
+}
+
+/// A mount as its status file describes it.
+#[derive(Debug, Clone, Default)]
+struct MountSeen {
+    mountpoint: String,
+    pid: u32,
+    alive: bool,
+    build: String,
+    mount_compat: u32,
+    proto: u32,
+    schema: u32,
+    started_ms: u64,
+    stale: Option<String>,
+}
+
+/// Every mount the status files under `<data dir>/mounts/` describe, with
+/// whether its process is still there.
+fn running_mounts(data_dir: &Path) -> Vec<MountSeen> {
+    let Ok(dir) = std::fs::read_dir(data_dir.join("mounts")) else { return Vec::new() };
+    let mut out: Vec<MountSeen> = dir
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| {
+            let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            let pid = n("pid") as u32;
+            MountSeen {
+                mountpoint: v.get("mountpoint").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                pid,
+                // the pid is alive AND is still a `pvfs … mount` (pids are reused)
+                alive: std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|c| String::from_utf8_lossy(&c).contains("mount"))
+                    .unwrap_or(false),
+                build: v.get("build").and_then(|x| x.as_str()).unwrap_or("unknown").to_string(),
+                mount_compat: n("mount_compat") as u32,
+                proto: n("proto") as u32,
+                schema: n("schema") as u32,
+                started_ms: n("started_ms"),
+                stale: v.get("stale").and_then(|x| x.as_str()).map(str::to_string),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+    out
+}
+
+/// D181 guardrail 1 — would a RUNNING mount `m` keep working once THIS build
+/// is installed and the daemon restarted under it? Empty = yes; otherwise
+/// the reasons it would not.
+fn mount_survives(m: &MountSeen, plan: &pvfs_core::projection::ProjectionPlan) -> Vec<String> {
+    use pvfs_core::projection::ProjectionPlan;
+    let mut why = Vec::new();
+    if m.mount_compat != pvfs_core::MOUNT_COMPAT {
+        why.push(format!(
+            "its mount compatibility is {}, this build's is {}",
+            m.mount_compat,
+            pvfs_core::MOUNT_COMPAT
+        ));
+    }
+    if m.proto < pvfs_client::PROTO_COMPATIBLE_WITH {
+        why.push(format!(
+            "it speaks wire protocol {}, and this build answers {} and later",
+            m.proto,
+            pvfs_client::PROTO_COMPATIBLE_WITH
+        ));
+    }
+    match plan {
+        ProjectionPlan::Rebuild { from, why: w } => why.push(format!(
+            "the catalogue would be rebuilt from the log (v{from}: {w}), emptying under the mount"
+        )),
+        ProjectionPlan::Newer { found } => why.push(format!(
+            "the catalogue is v{found}, newer than this build — it would refuse to open it"
+        )),
+        _ => {}
+    }
+    if let Some(s) = &m.stale {
+        why.push(s.clone());
+    }
+    why
+}
+
+fn plan_json(plan: &pvfs_core::projection::ProjectionPlan) -> serde_json::Value {
+    use pvfs_core::projection::ProjectionPlan;
+    match plan {
+        ProjectionPlan::NoForest => serde_json::json!({ "action": "no_forest" }),
+        ProjectionPlan::Current { version } => serde_json::json!({ "action": "current", "version": version }),
+        ProjectionPlan::InPlace { from, steps } => serde_json::json!({ "action": "in_place", "from": from, "steps": steps }),
+        ProjectionPlan::Rebuild { from, why } => serde_json::json!({ "action": "rebuild", "from": from, "why": why }),
+        ProjectionPlan::Newer { found } => serde_json::json!({ "action": "newer", "found": found }),
+    }
+}
+
+fn plan_text(plan: &pvfs_core::projection::ProjectionPlan) -> String {
+    use pvfs_core::projection::ProjectionPlan;
+    match plan {
+        ProjectionPlan::NoForest => "(no forest here)".into(),
+        ProjectionPlan::Current { version } => format!("nothing to do — the catalogue is already v{version}"),
+        ProjectionPlan::InPlace { from, steps } => format!("migrates in place from v{from} ({})", steps.join("; ")),
+        ProjectionPlan::Rebuild { from, why } => format!("REBUILDS the catalogue from the log (v{from}: {why})"),
+        ProjectionPlan::Newer { found } => format!("refuses — the catalogue is v{found}, newer than this build"),
+    }
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -6287,7 +6473,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "  read-through, stream mode: files held elsewhere are fetched by the piece a read asks for and kept only while open — dropped behind the readers and at close (D181)"
                     ),
                 }
-                pvfs_fuse::mount_view_with(&data_dir, &dir, allow_other, cache)?;
+                let status = mount_status_path(&data_dir, &dir);
+                let started_ms = now_ms();
+                write_mount_status(&status, &dir, cache_mode, started_ms, None);
+                watch_catalogue_schema(data_dir.clone(), status.clone(), dir.clone(), cache_mode, started_ms);
+                let mounted = pvfs_fuse::mount_view_with(&data_dir, &dir, allow_other, cache);
+                let _ = std::fs::remove_file(&status);
+                mounted?;
             } else {
                 pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
             }
@@ -8053,33 +8245,41 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 .unwrap_or((0, String::new()));
             let behind = unknown_n > 0;
 
+            // D181 (PVOS §8, guardrail 1): what installing THIS build would do
+            // to this box's catalogue, and whether each mount running now (an
+            // older build, perhaps) would keep working under it — the question
+            // a roll asks before it leaves the mount up under Plex.
+            let plan = ctx
+                .as_ref()
+                .map(|d| pvfs_core::projection::projection_plan(d))
+                .unwrap_or(pvfs_core::projection::ProjectionPlan::NoForest);
+            let mounts = ctx.as_ref().map(|d| running_mounts(d)).unwrap_or_default();
             if json {
-                println!(
-                    "{{\"pvfs\":\"{}\",\"proto\":{},\"proto_compatible_with\":{},\
-                     \"schema\":{},\"projection_schema\":{},\
-                     \"unknown_events\":{},\"unknown_kinds\":{},\"behind\":{}}}",
-                    env!("CARGO_PKG_VERSION"),
-                    pvfs_client::PROTO_VERSION,
-                    pvfs_client::PROTO_COMPATIBLE_WITH,
-                    pvfs_core::projection::SCHEMA_VERSION,
-                    match on_disk {
-                        Some(v) => v.to_string(),
-                        None => "null".into(),
-                    },
-                    unknown_n,
-                    if unknown_kinds.is_empty() {
-                        "[]".to_string()
-                    } else {
-                        let items: Vec<String> = unknown_kinds
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|k| !k.is_empty())
-                            .map(|k| format!("\"{k}\""))
-                            .collect();
-                        format!("[{}]", items.join(","))
-                    },
-                    behind
-                );
+                let kinds: Vec<&str> = unknown_kinds.split(',').map(str::trim).filter(|k| !k.is_empty()).collect();
+                let v = serde_json::json!({
+                    "pvfs": env!("CARGO_PKG_VERSION"),
+                    "build": env!("PVFS_BUILD"),
+                    "proto": pvfs_client::PROTO_VERSION,
+                    "proto_compatible_with": pvfs_client::PROTO_COMPATIBLE_WITH,
+                    "schema": pvfs_core::projection::SCHEMA_VERSION,
+                    "mount_compat": pvfs_core::MOUNT_COMPAT,
+                    "projection_schema": on_disk,
+                    "projection_plan": plan_json(&plan),
+                    "unknown_events": unknown_n,
+                    "unknown_kinds": kinds,
+                    "behind": behind,
+                    "mounts": mounts.iter().map(|m| {
+                        let why = m.alive.then(|| mount_survives(m, &plan));
+                        serde_json::json!({
+                            "mountpoint": m.mountpoint, "pid": m.pid, "alive": m.alive,
+                            "build": m.build, "mount_compat": m.mount_compat, "proto": m.proto,
+                            "schema": m.schema, "started_ms": m.started_ms, "stale": m.stale,
+                            "survives": why.as_ref().map(|w| w.is_empty()),
+                            "why_not": why.unwrap_or_default(),
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                println!("{v}");
             } else {
                 println!("pvfs             : {}", env!("CARGO_PKG_VERSION"));
                 println!(
@@ -8114,6 +8314,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "NOT UNDERSTOOD   : {unknown_n} event(s) of kind(s) {unknown_kinds} — \
                          this box is older than its forest; upgrade it to fold them"
                     );
+                }
+                println!("build            : {} (mount compat {})", env!("PVFS_BUILD"), pvfs_core::MOUNT_COMPAT);
+                println!("opening it here  : {}", plan_text(&plan));
+                for m in &mounts {
+                    let verdict = if !m.alive {
+                        "not running (a status file left behind)".to_string()
+                    } else {
+                        let why = mount_survives(m, &plan);
+                        if why.is_empty() {
+                            "keeps working under this build".to_string()
+                        } else {
+                            format!("would NOT keep working under this build — {}", why.join("; "))
+                        }
+                    };
+                    println!("running mount    : {} — build {} (pid {}) — {verdict}", m.mountpoint, m.build, m.pid);
                 }
             }
             Ok(())
@@ -9879,6 +10094,42 @@ mod tests {
         assert_eq!(trash_days_left(20_710, 7, 20_713), 4);
         assert_eq!(trash_days_left(20_710, 7, 20_717), 0);
         assert_eq!(trash_days_left(20_710, 0, 20_710), 0);
+    }
+
+    // D181 guardrail 1: a running mount survives a build only if nothing it
+    // relies on moves under it.
+    #[test]
+    fn a_running_mount_survives_a_build_only_when_nothing_it_relies_on_moves() {
+        use pvfs_core::projection::ProjectionPlan;
+        let same = MountSeen {
+            alive: true,
+            mount_compat: pvfs_core::MOUNT_COMPAT,
+            proto: pvfs_client::PROTO_VERSION,
+            schema: pvfs_core::projection::SCHEMA_VERSION,
+            ..Default::default()
+        };
+        let current = ProjectionPlan::Current { version: pvfs_core::projection::SCHEMA_VERSION };
+        let in_place = ProjectionPlan::InPlace { from: 18, steps: vec!["x"] };
+        assert!(mount_survives(&same, &current).is_empty());
+        assert!(mount_survives(&same, &in_place).is_empty(), "an additive migration runs under it");
+        let rebuild = ProjectionPlan::Rebuild { from: 1, why: "no in-place step from v1".into() };
+        assert!(mount_survives(&same, &rebuild)[0].contains("rebuilt"));
+        assert!(mount_survives(&same, &ProjectionPlan::Newer { found: 99 })[0].contains("newer"));
+        let old_compat = MountSeen { mount_compat: pvfs_core::MOUNT_COMPAT + 1, ..same.clone() };
+        assert!(mount_survives(&old_compat, &current)[0].contains("compatibility"));
+        if pvfs_client::PROTO_COMPATIBLE_WITH > 0 {
+            let old_proto = MountSeen { proto: pvfs_client::PROTO_COMPATIBLE_WITH - 1, ..same.clone() };
+            assert!(mount_survives(&old_proto, &current)[0].contains("wire protocol"));
+        }
+        let stale = MountSeen { stale: Some("the catalogue is v20".into()), ..same };
+        assert_eq!(mount_survives(&stale, &current), vec!["the catalogue is v20".to_string()]);
+    }
+
+    #[test]
+    fn a_mount_status_file_is_named_after_its_mount_point() {
+        let d = Path::new("/srv/pvfs/x/.pvfs");
+        assert_eq!(mount_status_path(d, Path::new("/mnt/pvfs/Media")), d.join("mounts/mnt-pvfs-Media.json"));
+        assert_eq!(mount_status_path(d, Path::new("/")), d.join("mounts/root.json"));
     }
 
     // D165: `pvfs mount --view --cache-max 500G --cache-age 1d`.

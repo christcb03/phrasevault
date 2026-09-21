@@ -2973,24 +2973,11 @@ pub fn on_disk_schema_version(data_dir: &std::path::Path) -> Option<u32> {
 
 // ---- projection migrations (D71) --------------------------------------------
 
-/// Bring the cache forward one schema version at a time WITHOUT dropping it.
-///
-/// Most schema changes are additive: a new column whose value comes from event
-/// kinds already in the log. Dropping all of `MAIN_OBJECTS` and replaying every
-/// event to fill one column costs the entire log — on the D69 fleet owner that
-/// is 59,365 events, and on the production media library it is minutes during
-/// which that box is unavailable. A migration turns the common case into an
-/// `ALTER` plus a targeted pass.
-///
-/// **A migration is only ever an optimisation.** Any failure, and any version
-/// with no registered step, falls back to [`full_rebuild`], which is always
-/// correct. So a migration is free to refuse — and MUST refuse rather than
-/// guess. Returns a description of what it did, or `None` to mean "rebuild".
-fn migrate_projection(
-    conn: &mut Connection,
-    data_dir: &std::path::Path,
-    from: u32,
-) -> Option<String> {
+/// Why moving a v`from` projection forward must REPLAY the log instead of
+/// migrating in place — `None` when the cheap door (D71) is open. Shared by
+/// [`migrate_projection`] and [`projection_plan`], so the plan a roll reads
+/// is the decision the open will make.
+fn rebuild_reason(conn: &Connection, from: u32) -> Option<String> {
     // Region logs are attached and detached during replay; a migration reads
     // only the top log, so a forest with live region logs is refused outright
     // rather than half-migrated. (The media fleet has none — the fast path is
@@ -3003,7 +2990,7 @@ fn migrate_projection(
         )
         .unwrap_or(1);
     if has_regions != 0 {
-        return None;
+        return Some("a region log is attached (a migration reads only the top log)".into());
     }
 
     // A box that folded an event as `Unknown` and has SINCE gained the code to
@@ -3023,31 +3010,124 @@ fn migrate_projection(
                 .filter(|k| !k.is_empty())
                 .any(crate::event::is_known_kind)
         {
-            return None; // slow door: replay, and learn what we ignored
+            // slow door: replay, and learn what we ignored
+            return Some(format!("it folded {n} event(s) of kinds this build now reads ({kinds})"));
         }
+    }
+
+    (from..SCHEMA_VERSION)
+        .find(|v| migration_step(*v).is_none())
+        .map(|v| format!("no in-place step from v{v}"))
+}
+
+type MigrationStep = (fn(&mut Connection) -> Result<()>, &'static str);
+
+/// The in-place ladder (D71): the step from schema `v` to `v + 1`, if there
+/// is one. A schema bump with no step here is a rebuild, and says so.
+fn migration_step(v: u32) -> Option<MigrationStep> {
+    Some(match v {
+        7 => (migrate_v7_to_v8, "folder_bindings.bound_by from FolderBound"),
+        8 => (migrate_v8_to_v9, "idx_nodes_label"),
+        9 => (migrate_v9_to_v10, "links.label"),
+        10 => (migrate_v10_to_v11, "idx_links_label"),
+        11 => (migrate_v11_to_v12, "media_quality"),
+        12 => (migrate_v12_to_v13, "folder_bindings keyed (folder_id, source_uri)"),
+        13 => (migrate_v13_to_v14, "fetch_unfetchable"),
+        14 => (migrate_v14_to_v15, "scan_unheld"),
+        15 => (migrate_v15_to_v16, "regions.kind; region_entries; region_snapshots"),
+        16 => (migrate_v16_to_v17, "regions.drains"),
+        17 => (migrate_v17_to_v18, "region_fetched"),
+        18 => (migrate_v18_to_v19, "idx_region_entries_path; idx_region_entries_hash"),
+        _ => return None,
+    })
+}
+
+/// D181 — what opening this forest under THIS build would do to its
+/// projection, decided without doing it: the question a roll asks before it
+/// leaves a running mount of an older build in place (PVOS D181 §8,
+/// guardrail 1). A rebuild empties and refills the catalogue for minutes
+/// under anything reading it. This judges the schema move only; damage or a
+/// disagreement with the log, which the open would also rebuild for, is not
+/// predicted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionPlan {
+    /// No forest here, or no projection yet.
+    NoForest,
+    /// Already this build's schema: nothing to do.
+    Current { version: u32 },
+    /// The cheap door: an in-place migration, milliseconds.
+    InPlace { from: u32, steps: Vec<&'static str> },
+    /// The slow door: the projection is dropped and the log replayed.
+    Rebuild { from: u32, why: String },
+    /// Written by a newer build: this one would refuse to open it.
+    Newer { found: u32 },
+}
+
+/// See [`ProjectionPlan`]. Reads the projection raw and read-only.
+pub fn projection_plan(data_dir: &std::path::Path) -> ProjectionPlan {
+    let path = data_dir.join("index.db");
+    if !path.is_file() {
+        return ProjectionPlan::NoForest;
+    }
+    let Ok(conn) = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return ProjectionPlan::NoForest;
+    };
+    let Some(from) = conn
+        .query_row("SELECT v FROM projection_meta WHERE k = 'schema_version'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
+        return ProjectionPlan::Rebuild {
+            from: 0,
+            why: "the projection has no readable schema version".into(),
+        };
+    };
+    if from == SCHEMA_VERSION {
+        return ProjectionPlan::Current { version: from };
+    }
+    if from > SCHEMA_VERSION {
+        return ProjectionPlan::Newer { found: from };
+    }
+    match rebuild_reason(&conn, from) {
+        Some(why) => ProjectionPlan::Rebuild { from, why },
+        None => ProjectionPlan::InPlace {
+            from,
+            steps: (from..SCHEMA_VERSION).filter_map(migration_step).map(|(_, what)| what).collect(),
+        },
+    }
+}
+
+/// Bring the cache forward one schema version at a time WITHOUT dropping it.
+///
+/// Most schema changes are additive: a new column whose value comes from event
+/// kinds already in the log. Dropping all of `MAIN_OBJECTS` and replaying every
+/// event to fill one column costs the entire log — on the D69 fleet owner that
+/// is 59,365 events, and on the production media library it is minutes during
+/// which that box is unavailable. A migration turns the common case into an
+/// `ALTER` plus a targeted pass.
+///
+/// **A migration is only ever an optimisation.** Any failure, and any version
+/// with no registered step, falls back to [`full_rebuild`], which is always
+/// correct. So a migration is free to refuse — and MUST refuse rather than
+/// guess. Returns a description of what it did, or `None` to mean "rebuild".
+fn migrate_projection(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    from: u32,
+) -> Option<String> {
+    if rebuild_reason(conn, from).is_some() {
+        return None;
     }
 
     let _folds = lock_folds(data_dir).ok()?;
     let mut done: Vec<&'static str> = Vec::new();
     let mut v = from;
     while v < SCHEMA_VERSION {
-        let step = match v {
-            7 => migrate_v7_to_v8(conn).map(|_| "folder_bindings.bound_by from FolderBound"),
-            8 => migrate_v8_to_v9(conn).map(|_| "idx_nodes_label"),
-            9 => migrate_v9_to_v10(conn).map(|_| "links.label"),
-            10 => migrate_v10_to_v11(conn).map(|_| "idx_links_label"),
-            11 => migrate_v11_to_v12(conn).map(|_| "media_quality"),
-            12 => migrate_v12_to_v13(conn).map(|_| "folder_bindings keyed (folder_id, source_uri)"),
-            13 => migrate_v13_to_v14(conn).map(|_| "fetch_unfetchable"),
-            14 => migrate_v14_to_v15(conn).map(|_| "scan_unheld"),
-            15 => migrate_v15_to_v16(conn).map(|_| "regions.kind; region_entries; region_snapshots"),
-            16 => migrate_v16_to_v17(conn).map(|_| "regions.drains"),
-            17 => migrate_v17_to_v18(conn).map(|_| "region_fetched"),
-            18 => migrate_v18_to_v19(conn).map(|_| "idx_region_entries_path; idx_region_entries_hash"),
-            _ => return None, // no registered step — rebuild
+        let Some((step, what)) = migration_step(v) else {
+            return None; // no registered step — rebuild
         };
-        match step {
-            Ok(what) => done.push(what),
+        match step(conn) {
+            Ok(()) => done.push(what),
             Err(_) => return None, // anything unexpected → rebuild, never guess
         }
         v += 1;

@@ -11,6 +11,21 @@
 //! - Identity: generated BIP39 mnemonic → BIP32 hardened HD keys with
 //!   per-device signing keys and device certificates in the log.
 
+/// D181 — the view mount's compatibility level. On a box that restarts its
+/// mount only when nothing is open through it (PVOS D181 §8: mediabox, under
+/// Plex), a roll leaves the running mount on the OLDER build until an idle
+/// minute. That is safe only while this number is unchanged between the two
+/// builds. Bump it with any change a RUNNING older mount cannot follow:
+///
+/// * a request a mount sends other boxes (`CatHash`, `TrashPath`,
+///   `RenamePath`, `RmdirPath`, …) changed so the older form fails, or
+/// * a projection change an older mount's catalogue reads cannot run on that
+///   the migration ladder applies IN PLACE (a dropped or renamed column).
+///
+/// A schema move that rebuilds, or a schema newer than the mount reads, needs
+/// no bump: `projection::projection_plan` sees those for itself.
+pub const MOUNT_COMPAT: u32 = 1;
+
 pub mod acl;
 pub mod crypto;
 pub mod encoding;

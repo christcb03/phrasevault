@@ -1124,10 +1124,28 @@ if [ -e /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   # copy, which here would hand the later resolve checks that redundant copy
   # again; so this one names its region (the rule itself: d167_trash.rs).
   $PVFS trash restore sub/b.mkv --region "$(printf '%s' "$CAT" | cut -c1-12)" | qgrep '^restored' && ok "D169: and pvfs trash restore --region puts it back" || fail "D169: restore"
+  # D181 (PVOS §8, guardrail 1) — a running mount says what it is, and
+  # `pvfs versions` answers whether it survives this build: here, the same
+  # build over its own catalogue, so it does.
+  VJ="$($PVFS --json versions 2>/dev/null)"
+  printf '%s' "$VJ" | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+ms = [m for m in v["mounts"] if m["mountpoint"].endswith("/view-mnt")]
+assert v["mount_compat"] >= 1 and v["build"], v
+assert v["projection_plan"]["action"] == "current", v["projection_plan"]
+assert len(ms) == 1 and ms[0]["alive"] and ms[0]["build"] == v["build"], ms
+assert ms[0]["survives"] is True and ms[0]["why_not"] == [], ms' \
+    && ok "D181: pvfs versions lists the running mount — same build, survives it, catalogue current" \
+    || fail "D181: versions: $VJ"
+  $PVFS versions | qgrep "running mount .*view-mnt .*keeps working under this build" \
+    && ok "D181: and says so in words" || fail "D181: versions text: $($PVFS versions 2>&1 | tail -3)"
   $PVFS umount "$DATA/view-mnt" >/dev/null 2>&1 || fusermount3 -u "$DATA/view-mnt" 2>/dev/null || true
   wait "$VPID" 2>/dev/null || true
   VPID=""
   ok "view mount unmounted cleanly"
+  $PVFS --json versions | python3 -c 'import json,sys; assert json.load(sys.stdin)["mounts"] == []' \
+    && ok "D181: a cleanly stopped mount leaves no status file behind" || fail "D181: status file left: $(ls "$DATA"/*/.pvfs/mounts "$DATA"/.pvfs/mounts 2>/dev/null)"
 else
   ok "fuse unavailable here — view mount checks skipped (not a failure)"
 fi
