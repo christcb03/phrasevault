@@ -1275,6 +1275,10 @@ enum ServeCmd {
         reconcile_secs: u64,
         #[arg(long, default_value_t = 2000)]
         debounce_ms: u64,
+        /// The longest changes that never stop hold a pass off (PVOS D180):
+        /// a pass starts this long after the first, however many keep coming
+        #[arg(long, default_value_t = 30_000)]
+        ceiling_ms: u64,
     },
 }
 
@@ -5784,6 +5788,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 ServeCmd::Watch {
                     reconcile_secs,
                     debounce_ms,
+                    ceiling_ms,
                 } => {
                     // Long-running from here on: re-ignore SIGPIPE (main gave
                     // it the default disposition for the one-shot filter
@@ -5798,6 +5803,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         &data_dir,
                         reconcile_secs,
                         debounce_ms,
+                        ceiling_ms,
                         &never,
                         |ev| match ev {
                             pvfs_client::watch::WatchEvent::Ingested(f, a, c, r, u, o) => {
