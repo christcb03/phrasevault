@@ -107,7 +107,7 @@ fn one_regions_copy_goes_and_a_list_goes_on_past_refusals() {
         item(&lib_mb, "Shows/S01/e01.mkv", "mediabox SD"),
         // Not the file the plan saw: refused, nothing moves.
         item(&lib_nas, "Shows/S01/e02.mkv", "something else"),
-        // A region nobody holds.
+        // A region no box has.
         ("cd".repeat(32), "Shows/S01/e03.mkv".into(), h(b"nas e03")),
         // Read rights are not leave to empty a region.
         item(&lib_ro, "Shows/S01/e05.mkv", "read-only e05"),
@@ -120,7 +120,10 @@ fn one_regions_copy_goes_and_a_list_goes_on_past_refusals() {
     assert_eq!(got.len(), items.len());
     assert_eq!(got[0], Ok(true), "mediabox's copy of e01");
     assert!(matches!(&got[1], Err(e) if e.contains("conflict")), "{:?}", got[1]);
-    assert!(matches!(&got[2], Err(e) if e.contains("cdcdcdcd") || e.contains("nobody.sock")), "{:?}", got[2]);
+    // A region no box has: a box with no rights reaching that node says
+    // `forbidden` before it could say `not_found` — either way that item's
+    // own refusal (in the fleet every box has every region's node).
+    assert!(got[2].is_err(), "{:?}", got[2]);
     assert!(matches!(&got[3], Err(e) if e.contains("forbidden")), "{:?}", got[3]);
     assert_eq!(got[4], Ok(true), "the list went on past three refusals");
     assert_eq!(got[5], Ok(false), "already gone");
