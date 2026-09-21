@@ -21,7 +21,7 @@ This is a ground-up implementation. It is designed to run as a single binary on 
 | **P7** | Region logs + the streaming FUSE mount ([doc 20](docs/20-f4-regions-and-streaming.md)) | Implemented, released 1.4.0 |
 | **P8–P9** | Attachment kinds ([doc 21](docs/21-attachment-policies.md)); the swarm data plane + serve-while-fetching ([doc 22](docs/22-swarm-data-plane.md)) | Implemented, released 1.4.0 |
 | **P10** | External-ingest sessions & the BT bridge ([doc 23](docs/23-ingest-sessions-and-the-bt-bridge.md)) | Implemented, unreleased on main |
-| **Regions** | Regions own their files — catalogue regions, the merged view, resolution, `receive`, fleet health and supervision ([doc 26](docs/26-regions-own-their-files.md)); moving the owner ([doc 28](docs/28-moving-the-owner.md)); the cutover ([doc 29](docs/29-cutover-to-the-new-model.md)); monitoring ([doc 30](docs/30-monitoring-the-fleet.md)) | Implemented, unreleased on main; running the production fleet since 2026-09-12 |
+| **Regions** | Regions own their files — catalogue regions, the merged view, resolution, `receive`, fleet health and supervision ([doc 26](docs/26-regions-own-their-files.md)); moving the owner ([doc 28](docs/28-moving-the-owner.md)); the cutover ([doc 29](docs/29-cutover-to-the-new-model.md)); monitoring ([doc 30](docs/30-monitoring-the-fleet.md)); common issues and fixes ([doc 31](docs/31-common-issues-and-fixes.md)) | Implemented, unreleased on main; running the production fleet since 2026-09-12 |
 | **Compaction** | Verifiable snapshots ([doc 11](docs/11-compaction-and-verifiable-snapshots.md)) | Deferred by decision (trigger metric in the doc) |
 
 Build locally with `cargo test --workspace`, or on a remote Linux host — see **[Install guide](docs/INSTALL.md)**.
@@ -72,6 +72,7 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [28-moving-the-owner.md](docs/28-moving-the-owner.md) | Moving the forest owner (`pvfs forest promote`) |
 | [29-cutover-to-the-new-model.md](docs/29-cutover-to-the-new-model.md) | The cutover runbook to the new model — executed 2026-09-12 |
 | [**30-monitoring-the-fleet.md**](docs/30-monitoring-the-fleet.md) | **Monitoring** — job states, fleet health, supervision, notifications, and a worked Home Assistant build |
+| [**31-common-issues-and-fixes.md**](docs/31-common-issues-and-fixes.md) | **Common issues and fixes** — duplicates across boxes, misfiled shows, film editions, a starved watch, the arrs' recycle bin and download clients; each with the fix |
 
 ## Core ideas
 

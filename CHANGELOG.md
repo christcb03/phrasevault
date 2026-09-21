@@ -5,6 +5,29 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Doc 31, common issues and fixes (PVOS D168).** An operations page: what
+  each issue looks like, why, and the fix, with the fleet as the worked
+  example — first the duplicate cleanup (plan, the holds a folder-and-number
+  key needs, canary, `trash put --from`, freeing the space, verified moves,
+  the arrs' rescan), then a show misfiled in another's folder, two editions
+  of a film (Plex's `{edition-…}`), the watch starved by writes under a
+  region root, the arrs' recycle bin and download clients on the union.
+- **`pvfs trash put`: one region's copy to its trash (PVOS D168).** The
+  duplicate cleanup keeps the better of two copies, and where two regions
+  hold different bytes at the same path a delete through the view — which
+  asks every holder (D169) — would trash the one being kept. `pvfs trash put
+  <PATH> --region <ID>` sends D169's `TrashPath` for that region's copy
+  alone: here when this box catalogues the region from its own disk, else to
+  the box that answers for it; write-gated, and only while the copy is still
+  the file with the catalogue's hash (or `--hash`). Bare at a terminal it
+  asks for the path and, if more than one region has a file there, which.
+  `--from FILE|-` takes a list (`region<TAB>path<TAB>hash`, full ids): every
+  line is checked before anything moves, each gets its own answer —
+  `trashed`, `already gone`, `refused` and why — over one connection per
+  box, the list goes on past a refusal, and the exit status is non-zero (2, the
+  CLI's invalid-input code) if any was refused. `--json` too. `hash_cache::trash_each` is the list's client half;
+  D169's `ask_holders` gained a per-item core (`ask_holder`) for it, its own
+  behaviour unchanged. No wire or daemon change.
 - **A stream of writes under a region root no longer holds the watch off
   (PVOS D180).** The watch started a pass only after 2 s with no inotify
   event, and every event under the root counted, including writes to a

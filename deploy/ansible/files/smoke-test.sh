@@ -1132,6 +1132,27 @@ else
   ok "fuse unavailable here — view mount checks skipped (not a failure)"
 fi
 
+# PVOS D168 — one region's copy to its trash, without the view: what the
+# duplicate cleanup does where two regions hold different bytes at a path.
+CAT12="$(printf '%s' "$CAT" | cut -c1-12)"
+if [ -f "$CATLIB/sub/b.mkv" ]; then
+  BHASH="$($PVFS --json region entries "$CAT" | python3 -c 'import json,sys; print(next(e["hash"] for e in json.load(sys.stdin)["entries"] if e["path"]=="sub/b.mkv"))')"
+  $PVFS trash put sub/b.mkv --region "$CAT12" --hash "$(printf 'ab%.0s' $(seq 1 32))" >/dev/null 2>&1 \
+    && fail "D168: a hash that is not the file's must be refused" || ok "D168: a copy that is not the file with that hash is refused"
+  [ -f "$CATLIB/sub/b.mkv" ] || fail "D168: the refusal moved the file"
+  $PVFS trash put sub/b.mkv --region "$CAT12" | qgrep "^trashed	sub/b.mkv	$CAT12" \
+    && [ ! -e "$CATLIB/sub/b.mkv" ] && ok "D168: pvfs trash put moved that region's copy to its trash" \
+    || fail "D168: trash put: $($PVFS trash put sub/b.mkv --region "$CAT12" 2>&1 | tail -2)"
+  $PVFS trash ls | qgrep 'sub/b.mkv' && ok "D168: pvfs trash ls lists it" || fail "D168: not in the trash"
+  printf '# a list, as the cleanup sends it\n%s\tsub/b.mkv\t%s\n' "$CAT" "$BHASH" > "$DATA/d168.list"
+  $PVFS trash put --from "$DATA/d168.list" | qgrep '^already gone' && ok "D168: a --from list — a copy already trashed is 'already gone', not an error" \
+    || fail "D168: --from: $($PVFS trash put --from "$DATA/d168.list" 2>&1 | tail -2)"
+  $PVFS trash restore sub/b.mkv --region "$CAT12" | qgrep '^restored' && [ -f "$CATLIB/sub/b.mkv" ] \
+    && ok "D168: and pvfs trash restore --region puts it back" || fail "D168: restore after trash put"
+else
+  ok "D168: sub/b.mkv not in the catalogue library here — trash put checks skipped"
+fi
+
 say "D131: fleet health — the fleet as this box observed it (doc 26 phase 7; D83 piece 1)"
 $PVFS fleet health | qgrep 'no fleet health record yet' && ok "no record yet: says so and how to get one" || fail "fleet health (no record)"
 $PVFS fleet health --now | qgrep 'no announced peers' && ok "a poll with nobody announced says so" || fail "fleet health --now"
