@@ -151,8 +151,10 @@ mv "Superbad (2007).en.srt"      "Superbad (2007) {edition-Theatrical}.en.srt"
 
 A rename through the view is done by the box that holds the file, sidecar
 and catalogue rows with it (D170). Then rescan the movie in Radarr: it tracks
-one edition and leaves the other alone. Radarr's "Rename" would drop the tags
-unless its movie format carries `{edition-{Edition Tags}}`.
+one edition and leaves the other alone. Radarr's movie format carries
+`{edition-{Edition Tags}}` (added 2026-09-21: `{Movie Title} ({Release Year})
+{edition-{Edition Tags}}`), so its "Rename" keeps the tags and new imports get
+them; without it, a rename would strip them.
 
 ## 4. A catalogue stops updating while files are copied into its region
 
