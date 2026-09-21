@@ -439,8 +439,28 @@ the files does it on its own disk (`RenamePath` / `RemoveDir`, proto 10,
 write-gated), its rows follow at once so the bytes stay findable by hash,
 and the mount remembers its own changes until the catalogue agrees
 (`overlay.rs`). Byte writes — create, write-open, truncate — are still
-refused: new bytes arrive through `/mnt/local` and `receive`. The original
-spec follows.
+refused: new bytes arrive through `/mnt/local` and `receive`. **D181
+(2026-09-21): the view for Plex — `--cache-mode stream`.** Plex on the LAN
+wants no cache (Chris), and a watched movie stays OPEN for as long as it
+plays, so "drop at close" alone would leave a whole remux on disk. Stream
+mode keeps nothing: no background completion; the readahead is kept filled
+ahead of each sequential reader (a reader is told apart by position — a
+read continuing where one ended is that reader); pieces more than `behind`
+(64 MiB) behind the rearmost reader are punched out of the partial
+(`fallocate` `PUNCH_HOLE`, under the file's lock, so never between a read
+being told "here" and reading); the partial is deleted at the last close.
+Small files are still verified before their last piece is served, and served
+from the verified partial, not kept. A 600 MiB file read end to end held at
+most 80 MiB on disk. **And rolling under it:** restarting the mount ends
+every stream open through it (Plex takes the I/O error for the end of the
+file), restarting the daemon does not. So a box can leave its mount on an
+older build across a roll and move it when idle (PVOS D181 §8). `MOUNT_COMPAT`
+says when that is unsafe; `projection::projection_plan` tells an in-place
+migration from a rebuild without doing either; a view mount writes
+`<data>/mounts/<mountpoint>.json` (build, compat, protocol, schema) and says
+when the catalogue on disk is newer than it reads; `pvfs versions` answers,
+for each running mount, whether it survives this build and why not. The
+original spec follows.
 The FUSE mount (doc 20 §3, built) over the merged
 view instead of the tree; the swarm over admitted copies. This is D82's
 presentation layer, arriving on a model that can carry it.

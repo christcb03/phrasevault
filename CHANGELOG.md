@@ -5,6 +5,25 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The view's stream mode, and rolling under it (PVOS D181).** `pvfs mount
+  --view --cache-mode stream` keeps nothing — Plex on the LAN reads the view
+  and Chris wants no cache: no background completion, the readahead kept
+  filled ahead of each sequential reader, pieces more than 64 MiB behind the
+  rearmost reader punched out of the partial, the partial deleted at the last
+  close; small files still verified before their last piece is served, and
+  not kept. `keep` (D165) stays the default. For a box that leaves its mount
+  on an older build across a roll (restarting a mount ends every stream open
+  through it; restarting the daemon does not): `MOUNT_COMPAT` (bump for a
+  change a running older mount cannot follow), `projection::projection_plan`
+  (in place, rebuild, newer — the decision the open will make, the ladder and
+  its gate now shared through `migration_step` / `rebuild_reason`), a status
+  file per running view mount (`<data>/mounts/`), a once-a-minute check that
+  says when the catalogue is newer than the mount reads, and `pvfs versions`
+  reporting the build, the compat level, the plan and each running mount with
+  `survives` / `why_not`. Lab: `deploy/d130-view-pair.sh` stage E2b (600 MiB
+  in stream mode, at most 80 MiB on disk, gone at close) and
+  `deploy/d181-backlog-pair.sh` (a daemon catches up 600 events and a
+  3,004-row catalogue beside a streaming mount in 1.8 s). No wire change.
 - **Doc 31, common issues and fixes (PVOS D168).** An operations page: what
   each issue looks like, why, and the fix, with the fleet as the worked
   example — first the duplicate cleanup (plan, the holds a folder-and-number
