@@ -25,6 +25,13 @@
 //!
 //! Piece maps live in memory: a restart forgets probes (every leftover
 //! `.partial` is swept when the cache is made) and keeps complete files.
+//!
+//! **Stream mode** (PVOS D181 — Plex on the LAN, Chris: no cache) keeps
+//! nothing: no background completion; readahead stays ahead of each
+//! sequential reader instead of waiting for it to run out; pieces more than
+//! `behind` bytes behind every reader are punched out of the partial; and
+//! the partial is deleted when the file's last handle closes. A file's disk
+//! use is its readers' windows, not what they have read.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,10 +43,51 @@ use pvfs_core::{Engine, ReplicaSource};
 
 use crate::ClientError;
 
+/// What the cache keeps (PVOS D181).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+    /// D165: a consumer's file is completed, verified and kept under the bound.
+    #[default]
+    Keep,
+    /// D181: only what readers are reading, dropped behind them and at close.
+    Stream,
+}
+
+impl std::str::FromStr for CacheMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<CacheMode, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "keep" => Ok(CacheMode::Keep),
+            "stream" => Ok(CacheMode::Stream),
+            other => Err(format!("{other:?}: the cache mode is `keep` or `stream`")),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CacheMode::Keep => "keep",
+            CacheMode::Stream => "stream",
+        })
+    }
+}
+
+/// A stream-mode reader not heard from in this long no longer holds pieces
+/// behind it. Above the mount's longest wait for a read (120 s), so a read
+/// that waited is never punched between being told "here" and reading.
+const CURSOR_IDLE: Duration = Duration::from_secs(300);
+/// Sequential readers tracked per file (Plex's player, its analysers).
+const MAX_CURSORS: usize = 16;
+
 /// The cache's knobs. `Default` is production (PVOS D164 §3, Chris's numbers
 /// for the bound: 500 GB, one day); tests shrink them.
 #[derive(Debug, Clone)]
 pub struct CacheOpts {
+    /// D181: keep what was read (D165), or stream it through.
+    pub mode: CacheMode,
+    /// Stream mode: pieces this far behind every reader are dropped.
+    pub behind: u64,
     /// The unit a file is fetched and mapped in.
     pub piece: u64,
     /// The most a sequential reader is read ahead of.
@@ -71,6 +119,8 @@ pub struct CacheOpts {
 impl Default for CacheOpts {
     fn default() -> CacheOpts {
         CacheOpts {
+            mode: CacheMode::Keep,
+            behind: 64 << 20,
             piece: 1 << 20,
             max_readahead: 8 << 20,
             complete_after: 64 << 20,
@@ -115,6 +165,13 @@ impl Pieces {
 
     fn all(&self) -> bool {
         self.have == self.n
+    }
+
+    fn unset(&mut self, i: usize) {
+        if self.get(i) {
+            self.bits[i / 64] &= !(1 << (i % 64));
+            self.have -= 1;
+        }
     }
 
     fn clear(&mut self) {
@@ -178,6 +235,15 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// D181 — one sequential reader of a stream-mode file: where its last read
+/// started and ended, the bytes it has read in a row, and when.
+struct Cursor {
+    off: u64,
+    end: u64,
+    run: u64,
+    at: Instant,
+}
+
 /// One waiting read: the pieces it covers and how far past them to fetch.
 struct Demand {
     id: u64,
@@ -205,6 +271,11 @@ struct FetchSt {
     fail_gen: u64,
     last_err: String,
     last_fail: Option<Instant>,
+    /// Stream mode: the readers, the window kept ahead of them, and the
+    /// piece below which the last sweep dropped everything.
+    cursors: Vec<Cursor>,
+    prefetch: Option<(usize, usize)>,
+    swept: usize,
 }
 
 /// One file being read through: its piece map, its waiting reads, its worker.
@@ -264,14 +335,28 @@ impl HashFetch {
     }
 
     /// "The application says it is done": the last close ends a probe's
-    /// fetch and starts a completing fetch's grace.
-    pub fn handle_closed(&self) {
-        let mut st = self.st.lock().unwrap();
-        st.handles = st.handles.saturating_sub(1);
-        if st.handles == 0 {
-            st.last_close = Some(Instant::now());
+    /// fetch and starts a completing fetch's grace — in stream mode, it
+    /// deletes the partial (now, or when the worker has stopped).
+    pub fn handle_closed(self: &Arc<Self>) {
+        let last = {
+            let mut st = self.st.lock().unwrap();
+            st.handles = st.handles.saturating_sub(1);
+            if st.handles == 0 {
+                st.last_close = Some(Instant::now());
+            }
+            self.cv.notify_all();
+            st.handles == 0
+        };
+        if last && self.opts.mode == CacheMode::Stream {
+            if let Some(cache) = self.cache.upgrade() {
+                cache.drop_idle_stream(self);
+            }
         }
-        self.cv.notify_all();
+    }
+
+    /// Stream mode: the partial's allocated bytes (tests, the lab).
+    pub fn allocated_bytes(&self) -> u64 {
+        std::fs::metadata(&self.part).map(|m| std::os::unix::fs::MetadataExt::blocks(&m) * 512).unwrap_or(0)
     }
 
     fn span(&self, off: u64, len: u64) -> (usize, usize) {
@@ -291,6 +376,10 @@ impl HashFetch {
     }
 
     fn note_read(&self, st: &mut FetchSt, off: u64, len: u64) -> bool {
+        if self.opts.mode == CacheMode::Stream {
+            self.note_cursor(st, off, len);
+            return false;
+        }
         let piece = self.opts.piece;
         let near = off <= st.seq_end.saturating_add(piece) && off.saturating_add(piece) >= st.seq_end;
         if near && st.seq_bytes > 0 {
@@ -304,6 +393,87 @@ impl HashFetch {
             return true;
         }
         false
+    }
+
+    /// Stream mode: the read joins the reader it continues (or is a new
+    /// one); `seq_bytes` is then THAT reader's run, so two readers of one
+    /// file each get their readahead. Then drop what is behind them all.
+    fn note_cursor(&self, st: &mut FetchSt, off: u64, len: u64) {
+        let piece = self.opts.piece;
+        let now = Instant::now();
+        st.cursors.retain(|c| now.duration_since(c.at) < CURSOR_IDLE);
+        let near = |c: &Cursor| off <= c.end.saturating_add(piece) && off.saturating_add(piece) >= c.end;
+        let run = match st.cursors.iter_mut().find(|c| near(c)) {
+            Some(c) => {
+                c.run = c.run.saturating_add(len);
+                (c.off, c.end, c.at) = (off, off.saturating_add(len), now);
+                c.run
+            }
+            None => {
+                if st.cursors.len() >= MAX_CURSORS {
+                    // the least recently heard from — never the read in hand
+                    if let Some(i) = (0..st.cursors.len()).min_by_key(|&i| st.cursors[i].at) {
+                        st.cursors.swap_remove(i);
+                    }
+                }
+                st.cursors.push(Cursor {
+                    off,
+                    end: off.saturating_add(len),
+                    run: len,
+                    at: now,
+                });
+                len
+            }
+        };
+        st.seq_bytes = run;
+        st.seq_end = off.saturating_add(len);
+        self.drop_behind(st);
+    }
+
+    /// The pieces a sequential reader is read ahead by (0 for a probe).
+    fn ahead(&self, st: &FetchSt) -> usize {
+        if st.seq_bytes >= self.opts.piece {
+            let pow2 = 1u64 << (63 - st.seq_bytes.leading_zeros());
+            (pow2.min(self.opts.max_readahead) / self.opts.piece) as usize
+        } else {
+            0
+        }
+    }
+
+    /// Stream mode: punch out every piece more than `behind` bytes behind
+    /// the rearmost reader. Under the file's lock, so a piece is never
+    /// dropped between a read being told it is here and the read — the
+    /// reader's own cursor is at or below what it reads, and the floor is
+    /// `behind` below every cursor. Swept each time the floor passes 1/4 of
+    /// `behind` more (a backward seek resets it).
+    fn drop_behind(&self, st: &mut FetchSt) {
+        let piece = self.opts.piece;
+        let Some(rear) = st.cursors.iter().map(|c| c.off).min() else { return };
+        let below = (rear.saturating_sub(self.opts.behind) / piece) as usize;
+        let step = ((self.opts.behind / piece) as usize / 4).max(1);
+        if below < st.swept {
+            st.swept = below;
+        }
+        if below < st.swept + step {
+            return;
+        }
+        st.swept = below;
+        let mut i = 0;
+        while i < below.min(st.pieces.n) {
+            if !st.pieces.get(i) {
+                i += 1;
+                continue;
+            }
+            let from = i;
+            while i < below.min(st.pieces.n) && st.pieces.get(i) {
+                i += 1;
+            }
+            let off = from as u64 * piece;
+            let len = (i as u64 * piece).min(self.size) - off;
+            if punch(&self.part, off, len) {
+                (from..i).for_each(|p| st.pieces.unset(p));
+            }
+        }
     }
 
     /// The bytes of `[off, off+len)` if they can be served now — and the
@@ -326,7 +496,19 @@ impl HashFetch {
             return Some(Ok(self.part.clone()));
         }
         let (first, last) = self.span(off, len);
-        self.covered(&st, first, last).then(|| Ok(self.part.clone()))
+        let covered = self.covered(&st, first, last);
+        if covered && self.opts.mode == CacheMode::Stream {
+            // Keep the window ahead of a sequential reader filled, so it
+            // never waits at the edge of what was read ahead (D165 waits:
+            // it completes the file instead).
+            let to = (last + self.ahead(&st)).min(st.pieces.n.saturating_sub(1));
+            if to > last && st.pieces.first_missing(last + 1, to).is_some() {
+                st.prefetch = Some((last + 1, to));
+                self.ensure_worker(&mut st);
+                self.cv.notify_all();
+            }
+        }
+        covered.then(|| Ok(self.part.clone()))
     }
 
     /// Register `[off, off+len)` as demand and wait for it. `Ok(path)` names
@@ -337,12 +519,7 @@ impl HashFetch {
         let mut st = self.st.lock().unwrap();
         let id = st.next_demand;
         st.next_demand += 1;
-        let ahead = if st.seq_bytes >= self.opts.piece {
-            let pow2 = 1u64 << (63 - st.seq_bytes.leading_zeros());
-            (pow2.min(self.opts.max_readahead) / self.opts.piece) as usize
-        } else {
-            0
-        };
+        let ahead = self.ahead(&st);
         st.demands.push(Demand { id, first, last, ahead });
         let failures = st.fail_gen;
         self.ensure_worker(&mut st);
@@ -355,6 +532,9 @@ impl HashFetch {
                 break Err(st.last_err.clone());
             }
             if self.covered(&st, first, last) {
+                // (stream mode) heard from now, not when it began waiting
+                let now = Instant::now();
+                st.cursors.iter_mut().filter(|c| c.off == off).for_each(|c| c.at = now);
                 break Ok(self.part.clone());
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -442,6 +622,15 @@ fn next_job(st: &FetchSt, o: &CacheOpts) -> Option<Job> {
             return Some(Job::Fetch { first: p, end, demand: true });
         }
     }
+    if let (Some((from, to)), true) = (st.prefetch, st.handles > 0) {
+        if let Some(p) = st.pieces.first_missing(from, to) {
+            let mut end = p + 1;
+            while end <= to && !st.pieces.get(end) {
+                end += 1;
+            }
+            return Some(Job::Fetch { first: p, end, demand: false });
+        }
+    }
     let keep_going = st.handles > 0
         || st.last_close.is_some_and(|t| t.elapsed() < o.grace)
         || st.pieces.have as u64 * 100 >= o.finish_percent * n as u64;
@@ -502,6 +691,13 @@ impl std::io::Write for PieceSink<'_> {
 }
 
 fn worker(cache: Arc<CacheInner>, fetch: Arc<HashFetch>) {
+    work(&cache, &fetch);
+    if cache.opts.mode == CacheMode::Stream {
+        cache.drop_idle_stream(&fetch);
+    }
+}
+
+fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
     let sources = cache.sources();
     let mut run = Run {
         cur: cache.hint.load(Ordering::Relaxed),
@@ -534,7 +730,7 @@ fn worker(cache: Arc<CacheInner>, fetch: Arc<HashFetch>) {
         };
         match job {
             Job::Fetch { first, end, demand } => {
-                if let Err(e) = fetch_run(&cache, &fetch, &sources, &mut run, first, end, demand) {
+                if let Err(e) = fetch_run(cache, fetch, &sources, &mut run, first, end, demand) {
                     eprintln!("mount: read-through of {} failed: {e}", &fetch.hash[..8]);
                     let mut st = fetch.st.lock().unwrap();
                     st.fail_gen += 1;
@@ -547,7 +743,7 @@ fn worker(cache: Arc<CacheInner>, fetch: Arc<HashFetch>) {
                     std::thread::sleep(cache.opts.background_pause);
                 }
             }
-            Job::Verify => verify(&cache, &fetch, &sources, &mut run),
+            Job::Verify => verify(cache, fetch, &sources, &mut run),
             Job::Exit => unreachable!("handled under the lock"),
         }
     }
@@ -660,6 +856,12 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
             return;
         }
     };
+    if got == fetch.hash && cache.opts.mode == CacheMode::Stream {
+        // Nothing is kept: the verified partial serves until the last close.
+        eprintln!("mount: {} is whole and verified ({} bytes; stream mode keeps nothing)", &fetch.hash[..8], fetch.size);
+        fetch.finish(Ok(fetch.part.clone()));
+        return;
+    }
     if got == fetch.hash {
         drop(run.file.take());
         match std::fs::rename(&fetch.part, &fetch.final_path) {
@@ -710,6 +912,28 @@ fn touch(path: &Path) {
     if let Ok(f) = std::fs::File::open(path) {
         let _ = f.set_modified(SystemTime::now());
     }
+}
+
+/// D181 — give `[off, off+len)` of a sparse partial back to the disk. False
+/// (the piece stays marked, its bytes intact) where holes cannot be punched.
+#[cfg(target_os = "linux")]
+fn punch(path: &Path, off: u64, len: u64) -> bool {
+    use nix::fcntl::{fallocate, FallocateFlags};
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) else { return false };
+    let flags = FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE;
+    match fallocate(f.as_raw_fd(), flags, off as i64, len as i64) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("mount: cannot drop read pieces of {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch(_path: &Path, _off: u64, _len: u64) -> bool {
+    false
 }
 
 /// The fleet's other boxes, as the forest at `data_dir` knows them: every
@@ -925,6 +1149,22 @@ impl CacheInner {
         }
     }
 
+    /// Stream mode: a file nobody has open and nothing is fetching goes —
+    /// its map entry and its partial, under the map's lock, so an open
+    /// either took it up first (and it stays) or starts a new one after.
+    /// A fetch already replaced in the map leaves the path to its successor.
+    fn drop_idle_stream(&self, fetch: &Arc<HashFetch>) {
+        let mut map = self.fetches.lock().unwrap();
+        let st = fetch.st.lock().unwrap();
+        if st.handles > 0 || st.worker {
+            return;
+        }
+        if map.get(&fetch.hash).is_some_and(|f| Arc::ptr_eq(f, fetch)) {
+            map.remove(&fetch.hash);
+            let _ = std::fs::remove_file(&fetch.part);
+        }
+    }
+
     fn by_hash_dir(&self) -> Option<PathBuf> {
         pvfs_core::sync::sync_store_dir(&self.data_dir).ok().map(|d| d.join("by-hash"))
     }
@@ -1082,6 +1322,9 @@ impl HashCache {
                         fail_gen: 0,
                         last_err: String::new(),
                         last_fail: None,
+                        cursors: Vec::new(),
+                        prefetch: None,
+                        swept: 0,
                     }),
                     cv: Condvar::new(),
                 });
@@ -1209,6 +1452,9 @@ mod tests {
             fail_gen: 0,
             last_err: String::new(),
             last_fail: None,
+            cursors: Vec::new(),
+            prefetch: None,
+            swept: 0,
         }
     }
 

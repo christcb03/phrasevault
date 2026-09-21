@@ -357,6 +357,12 @@ enum Cmd {
         /// `1d`, `12h`, `90m`.
         #[arg(long, default_value = "1d")]
         cache_age: String,
+        /// D181, with --view: `keep` (D165 — a file read through is
+        /// completed and kept under --cache-max/--cache-age) or `stream`
+        /// (nothing kept: only what is being read, dropped behind the
+        /// readers and when the file closes — Plex on the LAN).
+        #[arg(long, default_value = "keep")]
+        cache_mode: pvfs_client::hash_cache::CacheMode,
     },
     /// Unmount a pvfs mount (fusermount -u)
     #[cfg(target_os = "linux")]
@@ -6223,8 +6229,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             view,
             cache_max,
             cache_age,
+            cache_mode,
         } => {
             let cache = pvfs_client::hash_cache::CacheOpts {
+                mode: cache_mode,
                 max_bytes: parse_size(&cache_max)?,
                 max_age: parse_age(&cache_age)?,
                 ..Default::default()
@@ -6271,9 +6279,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let _ = signal(Signal::SIGPIPE, SigHandler::SigIgn);
             }
             if view {
-                eprintln!(
-                    "  read-through cache: files held elsewhere are fetched by the piece a read asks for, kept up to {cache_max} and {cache_age} unread (D165)"
-                );
+                match cache_mode {
+                    pvfs_client::hash_cache::CacheMode::Keep => eprintln!(
+                        "  read-through cache: files held elsewhere are fetched by the piece a read asks for, kept up to {cache_max} and {cache_age} unread (D165)"
+                    ),
+                    pvfs_client::hash_cache::CacheMode::Stream => eprintln!(
+                        "  read-through, stream mode: files held elsewhere are fetched by the piece a read asks for and kept only while open — dropped behind the readers and at close (D181)"
+                    ),
+                }
                 pvfs_fuse::mount_view_with(&data_dir, &dir, allow_other, cache)?;
             } else {
                 pvfs_fuse::mount(&data_dir, &id, &dir, allow_other)?;
