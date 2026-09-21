@@ -58,7 +58,7 @@ fn a_stopped_pass_is_stopped_not_ingested_and_not_quiet() {
     // stop ends it before its sweep and its head.
     let stop = Arc::new(AtomicBool::new(true));
     let mut seen: Vec<String> = Vec::new();
-    watch::run(&data, 3600, 2000, &stop, |ev| {
+    watch::run(&data, 3600, 2000, 30_000, &stop, |ev| {
         seen.push(match ev {
             WatchEvent::Ingested(f, ..) => format!("ingested {f}"),
             WatchEvent::Stopped(f, a, c, _) => format!("stopped {f} +{a} !{c}"),

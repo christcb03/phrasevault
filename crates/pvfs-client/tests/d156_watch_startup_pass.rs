@@ -56,7 +56,7 @@ fn the_startup_pass_reports_like_every_other_pass() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut seen: Vec<String> = Vec::new();
-    watch::run(&data, 3600, 2000, &stop, |ev| {
+    watch::run(&data, 3600, 2000, 30_000, &stop, |ev| {
         seen.push(match ev {
             WatchEvent::Ingested(..) => "ingested".into(),
             WatchEvent::Stopped(..) => "stopped".into(),

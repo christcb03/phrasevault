@@ -3,12 +3,12 @@
 //! daemon's `watch` job or the CLI's foreground `pvfs serve watch`. One
 //! implementation, two drivers — the follow/fetch pattern.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use pvfs_core::{Engine, PvfsError};
+use pvfs_core::{sync, Engine, PvfsError};
 
 /// How soon a failed pass tries again, and the ceiling it backs off to.
 const RETRY_MIN: Duration = Duration::from_secs(5);
@@ -74,10 +74,16 @@ pub enum WatchEvent {
 
 /// Run the watcher until `stop` is set. Holds `serve.lock` in the data dir —
 /// a second watcher on the same forest errors instead of double-scanning.
+///
+/// A change starts a pass once `debounce_ms` have gone by with no other, or
+/// (D180) once the first of them is `ceiling_ms` old, whatever keeps coming;
+/// the ceiling is never below the debounce. Changes to what the walk passes
+/// over — PVFS's own bookkeeping, litter — are not changes (`counts`).
 pub fn run(
     data_dir: &Path,
     reconcile_secs: u64,
     debounce_ms: u64,
+    ceiling_ms: u64,
     stop: &std::sync::Arc<AtomicBool>,
     mut notify_cb: impl FnMut(WatchEvent),
 ) -> Result<(), PvfsError> {
@@ -143,42 +149,50 @@ pub fn run(
             Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
         }
 
-        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-        let mut watcher = notify::recommended_watcher(tx).map_err(|e| PvfsError::BadInput {
-            field: "watcher".into(),
-            reason: e.to_string(),
-        })?;
-        let mut watching = 0usize;
         // THIS machine's bindings only (D71 W1). A binding made on another box
         // names a directory that does not exist here, so registering a watch on
         // it fails — which used to abort the whole watcher on any replica.
         let local = engine.local_bindings()?;
         let elsewhere = engine.bindings()?.len() - local.len();
+        let mut watched = Vec::new();
         for b in local {
             if !b.auto_index {
                 continue;
             }
             let path = pvfs_core::storage::uri_to_path(&b.source_uri)?;
-            notify::Watcher::watch(
-                &mut watcher,
-                &path,
-                if b.recursive {
-                    notify::RecursiveMode::Recursive
-                } else {
-                    notify::RecursiveMode::NonRecursive
-                },
-            )
-            .map_err(|e| PvfsError::BadInput {
+            let mode = if b.recursive {
+                notify::RecursiveMode::Recursive
+            } else {
+                notify::RecursiveMode::NonRecursive
+            };
+            watched.push((path, mode));
+        }
+        // D180 — the handler, not the loop, drops what does not count, so a
+        // copy's thousands of writes a second into `.pvfs-incoming` never
+        // queue up behind a long pass.
+        let roots: Vec<PathBuf> = watched.iter().map(|(p, _)| p.clone()).collect();
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if counts(&res, &roots) {
+                let _ = tx.send(res);
+            }
+        })
+        .map_err(|e| PvfsError::BadInput {
+            field: "watcher".into(),
+            reason: e.to_string(),
+        })?;
+        for (path, mode) in &watched {
+            notify::Watcher::watch(&mut watcher, path, *mode).map_err(|e| PvfsError::BadInput {
                 field: "watcher".into(),
                 reason: format!("{}: {e}", path.display()),
             })?;
-            watching += 1;
         }
-        notify_cb(WatchEvent::Watching(watching, elsewhere));
+        notify_cb(WatchEvent::Watching(watched.len(), elsewhere));
 
         let debounce = Duration::from_millis(debounce_ms);
+        let ceiling = Duration::from_millis(ceiling_ms.max(debounce_ms));
         let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
-        let mut dirty_since: Option<Instant> = None;
+        let mut pending: Option<Pending> = None;
         let mut last_reconcile = Instant::now();
         // A failed pass must come back SOON, not at the next reconcile — that
         // is an hour on the daemon, which is no kind of autocorrect. A scan is
@@ -189,17 +203,15 @@ pub fn run(
 
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(_) => dirty_since = Some(Instant::now()),
+                Ok(_) => pending = Some(Pending::saw(pending, Instant::now())),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            let due_debounce = dirty_since
-                .map(|t| t.elapsed() >= debounce)
-                .unwrap_or(false);
+            let due_debounce = pending.is_some_and(|p| p.due(Instant::now(), debounce, ceiling));
             let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
             let due_retry = retry_at.is_some_and(|t| Instant::now() >= t);
             if due_debounce || due_reconcile || due_retry {
-                dirty_since = None;
+                pending = None;
                 last_reconcile = Instant::now();
                 notify_cb(WatchEvent::PassStarted);
                 match scan_pass(&mut engine, &mut route) {
@@ -251,6 +263,106 @@ pub fn run(
     drop(_lock);
     let _ = std::fs::remove_file(&lock_path);
     result
+}
+
+/// D180 — changes no pass has answered yet: when the first came, and the
+/// latest.
+///
+/// The loop kept the latest alone, so a pass waited for `debounce` of quiet
+/// however long that took: rclone copying into mediabox's library held every
+/// pass off for over half an hour (D168), with the reconcile, an hour, the
+/// only way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    first: Instant,
+    last: Instant,
+}
+
+impl Pending {
+    /// `pending` after one more change, seen at `now`.
+    fn saw(pending: Option<Pending>, now: Instant) -> Pending {
+        match pending {
+            Some(p) => Pending { last: now, ..p },
+            None => Pending { first: now, last: now },
+        }
+    }
+
+    /// Whether a pass is due: `debounce` of quiet since the latest, or
+    /// `ceiling` since the first, however many keep coming.
+    fn due(&self, now: Instant, debounce: Duration, ceiling: Duration) -> bool {
+        now.saturating_duration_since(self.last) >= debounce
+            || now.saturating_duration_since(self.first) >= ceiling
+    }
+}
+
+/// D180 — whether a watcher event can change what a pass finds. It cannot
+/// when every path it names is one the walk passes over (`passed_over`).
+///
+/// Every event used to count, so writes the walk never looks at kept the
+/// debounce from ever running out: the NAS's `receive` writing
+/// `.pvfs-incoming/<hash>.partial` inside the library root for as long as a
+/// pull runs, D168's copies into `.pvfs-d168-incoming`, and each pass's own
+/// sidecars, which set off the pass after it. What cannot be placed counts —
+/// an error, the rescan an overflowing queue asks for (it names no path), a
+/// path under no root: in doubt, a pass.
+fn counts(res: &notify::Result<notify::Event>, roots: &[PathBuf]) -> bool {
+    match res {
+        Err(_) => true,
+        Ok(ev) => ev.paths.is_empty() || ev.paths.iter().any(|p| !passed_over(p, &ev.kind, roots)),
+    }
+}
+
+/// D180 — whether the walk passes over `path`: below the root it lies in, one
+/// of its names is PVFS's own (`sync::is_own_name`) or litter
+/// (`sync::is_litter_name`) — the walk's own test (`walk_disk`). Every name
+/// but the last is a folder's; whether the last is matters only for a name
+/// that is ours as a file alone (a sidecar, a `.partial`), and
+/// `names_a_folder` says.
+fn passed_over(path: &Path, kind: &notify::EventKind, roots: &[PathBuf]) -> bool {
+    // The deepest root it lies in: a root may itself sit under a `.pvfs-`
+    // folder, and only what is below it is the walk's to pass over.
+    let Some(rel) = roots
+        .iter()
+        .filter_map(|r| path.strip_prefix(r).ok())
+        .min_by_key(|rel| rel.components().count())
+    else {
+        return false;
+    };
+    let names: Vec<_> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    names.iter().enumerate().any(|(i, name)| {
+        sync::is_own_name(name, true)
+            || sync::is_litter_name(name)
+            // D166: a FOLDER named like a sidecar is the operator's.
+            || (i + 1 == names.len()
+                && sync::is_own_name(name, false)
+                && !names_a_folder(path, kind))
+    })
+}
+
+/// Whether an event's path is a folder. A create, a remove or a write says;
+/// a rename or a chmod does not, so the disk is asked, as the walk asks it
+/// (not following a link). A path already gone is taken for a folder, whose
+/// events count.
+fn names_a_folder(path: &Path, kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind};
+    use notify::EventKind;
+    match kind {
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => true,
+        EventKind::Create(CreateKind::File)
+        | EventKind::Remove(RemoveKind::File)
+        | EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Access(AccessKind::Close(_)) => false,
+        _ => match std::fs::symlink_metadata(path) {
+            Ok(m) => m.is_dir(),
+            Err(_) => true,
+        },
+    }
 }
 
 /// One reconcile pass, with a replica's writes routed to the owner.
@@ -408,6 +520,147 @@ mod tests {
             panic!("{ev:?}")
         };
         assert_eq!((*n, named.len()), (13, 8));
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// D180 — one change waits out the debounce, as it always did.
+    #[test]
+    fn one_change_waits_for_the_debounce() {
+        let t0 = Instant::now();
+        let p = Pending::saw(None, t0);
+        assert!(!p.due(t0 + ms(1_999), ms(2_000), ms(30_000)));
+        assert!(p.due(t0 + ms(2_000), ms(2_000), ms(30_000)));
+    }
+
+    /// D180 — changes that never stop for the debounce are due at the ceiling:
+    /// not before, not after. The clock ticks every 100 ms, as the loop wakes
+    /// at least every 500 ms, and a change comes every `gap`.
+    #[test]
+    fn a_stream_that_never_stops_is_due_at_the_ceiling() {
+        for gap in [100u64, 1_900] {
+            let t0 = Instant::now();
+            let mut pending = None;
+            let mut due_at = None;
+            for tick in 0..600u64 {
+                let now = t0 + ms(tick * 100);
+                if (tick * 100) % gap == 0 {
+                    pending = Some(Pending::saw(pending, now));
+                }
+                if pending.is_some_and(|p| p.due(now, ms(2_000), ms(30_000))) {
+                    due_at = Some(tick * 100);
+                    break;
+                }
+            }
+            assert_eq!(due_at, Some(30_000), "a change every {gap} ms");
+        }
+    }
+
+    /// The first change is kept as later ones come; only the latest moves.
+    #[test]
+    fn a_later_change_moves_only_the_latest() {
+        let t0 = Instant::now();
+        let p = Pending::saw(Some(Pending::saw(None, t0)), t0 + ms(700));
+        assert_eq!(p, Pending { first: t0, last: t0 + ms(700) });
+    }
+
+    const WRITE: notify::EventKind =
+        notify::EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Any));
+    const NEW_FILE: notify::EventKind =
+        notify::EventKind::Create(notify::event::CreateKind::File);
+    const CHMOD: notify::EventKind = notify::EventKind::Modify(
+        notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any),
+    );
+
+    fn rename(mode: notify::event::RenameMode) -> notify::EventKind {
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(mode))
+    }
+
+    fn event(kind: notify::EventKind, paths: &[PathBuf]) -> notify::Result<notify::Event> {
+        Ok(paths.iter().fold(notify::Event::new(kind), |e, p| e.add_path(p.clone())))
+    }
+
+    /// A root with a sidecar and a folder named like one on disk, as the
+    /// disk is what answers for a rename or a chmod.
+    fn library() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("TV/Show.manifest")).unwrap();
+        std::fs::write(lib.join("TV/.x.mkv.manifest"), b"pvfs-manifest 3\n").unwrap();
+        (dir, lib)
+    }
+
+    /// D180 — what the walk passes over is no change: receive's partials, the
+    /// trash, a sidecar being written (its temp, the rename, its mtime), the
+    /// root marker, litter.
+    #[test]
+    fn our_bookkeeping_and_litter_do_not_count() {
+        use notify::event::RenameMode;
+        let (_dir, lib) = library();
+        let roots = vec![lib.clone()];
+        let tmp = lib.join("TV/.pvfs-secure-17-.x.mkv.manifest.tmp");
+        for (what, ev) in [
+            ("a partial", event(WRITE, &[lib.join(".pvfs-incoming/ab12.partial")])),
+            ("the trash", event(NEW_FILE, &[lib.join(".pvfs-trash/20714/TV/x.mkv")])),
+            ("the root marker", event(WRITE, &[lib.join(".pvfs-root")])),
+            ("a sidecar's temp", event(NEW_FILE, std::slice::from_ref(&tmp))),
+            (
+                "a sidecar's rename",
+                event(rename(RenameMode::Both), &[tmp.clone(), lib.join("TV/.x.mkv.manifest")]),
+            ),
+            ("a sidecar's rename, arriving", event(rename(RenameMode::To), &[lib.join("TV/.x.mkv.manifest")])),
+            ("a sidecar's mtime", event(CHMOD, &[lib.join("TV/.x.mkv.manifest")])),
+            ("QNAP's thumbnails", event(NEW_FILE, &[lib.join("TV/.@__thumb/x.jpg")])),
+            ("macOS's litter", event(WRITE, &[lib.join("TV/.DS_Store")])),
+        ] {
+            assert!(!counts(&ev, &roots), "{what} started a pass");
+        }
+    }
+
+    /// D180 — and everything else counts: content, a file renamed out of
+    /// `.pvfs-incoming` into place, the operator's dotfile and a folder named
+    /// like a sidecar (D166), a name that is gone (in doubt), an error, the
+    /// overflow's rescan, the root itself, a path under no root.
+    #[test]
+    fn content_and_what_cannot_be_placed_count() {
+        use notify::event::{CreateKind, Flag, RenameMode};
+        let (_dir, lib) = library();
+        let roots = vec![lib.clone()];
+        for (what, ev) in [
+            ("a write", event(WRITE, &[lib.join("TV/x.mkv")])),
+            (
+                "a file received into place",
+                event(rename(RenameMode::Both), &[lib.join(".pvfs-incoming/ab12.partial"), lib.join("TV/x.mkv")]),
+            ),
+            ("its arrival alone", event(rename(RenameMode::To), &[lib.join("TV/x.mkv")])),
+            ("a .plexmatch", event(WRITE, &[lib.join("TV/.plexmatch")])),
+            (
+                "a folder named like a sidecar",
+                event(notify::EventKind::Create(CreateKind::Folder), &[lib.join("TV/Show.manifest")]),
+            ),
+            ("that folder renamed", event(rename(RenameMode::To), &[lib.join("TV/Show.manifest")])),
+            ("a file under it", event(WRITE, &[lib.join("TV/Show.manifest/x.mkv")])),
+            ("a sidecar-like name that is gone", event(rename(RenameMode::From), &[lib.join("TV/.y.mkv.manifest")])),
+            ("the root", event(CHMOD, std::slice::from_ref(&lib))),
+            ("a path under no root", event(WRITE, &[PathBuf::from("/elsewhere/.pvfs-incoming/x")])),
+            ("an error", Err(notify::Error::generic("inotify read failed"))),
+            ("the overflow's rescan", Ok(notify::Event::new(notify::EventKind::Other).set_flag(Flag::Rescan))),
+        ] {
+            assert!(counts(&ev, &roots), "{what} did not start a pass");
+        }
+    }
+
+    /// D180 — names are judged below the root, and below the deepest root a
+    /// path lies in: a root inside a `.pvfs-` folder still sees its content.
+    #[test]
+    fn names_are_judged_below_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(".pvfs-stage/lib");
+        let roots = vec![dir.path().to_path_buf(), staged.clone()];
+        assert!(counts(&event(WRITE, &[staged.join("TV/x.mkv")]), &roots));
+        assert!(!counts(&event(WRITE, &[staged.join(".pvfs-incoming/x.partial")]), &roots));
     }
 
     /// A stopped pass still names what it skipped before the stop, after its
