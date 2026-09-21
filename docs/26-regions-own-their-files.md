@@ -238,7 +238,7 @@ there, which; a script passes `--region`. `--from FILE` (`-` for stdin) takes
 a list, `region<TAB>path<TAB>hash` per line with full ids: every line is
 checked before anything moves, each is its own answer (`trashed`, `already
 gone`, `refused` and why), the list goes on past a refusal, and the exit
-status is 1 if any line was refused. `pvfs trash restore --region` undoes it.
+status is non-zero if any line was refused. `pvfs trash restore --region` undoes it.
 
 *D145 (2026-09-12) amends both cells of the draining row, after the drain
 lost an arr upgrade on the first production day. The ladder, with no quality

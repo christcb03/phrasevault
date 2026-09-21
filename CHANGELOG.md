@@ -17,8 +17,8 @@ file tracks Layer 0, the file-system engine.
   `--from FILE|-` takes a list (`region<TAB>path<TAB>hash`, full ids): every
   line is checked before anything moves, each gets its own answer —
   `trashed`, `already gone`, `refused` and why — over one connection per
-  box, the list goes on past a refusal, and the exit status is 1 if any was
-  refused. `--json` too. `hash_cache::trash_each` is the list's client half;
+  box, the list goes on past a refusal, and the exit status is non-zero (2, the
+  CLI's invalid-input code) if any was refused. `--json` too. `hash_cache::trash_each` is the list's client half;
   D169's `ask_holders` gained a per-item core (`ask_holder`) for it, its own
   behaviour unchanged. No wire or daemon change.
 - **One free-space figure per disk when choosing where to receive (PVOS
