@@ -54,6 +54,7 @@ pub mod fetch;
 pub mod follow;
 pub mod hash_cache;
 pub mod health;
+pub mod mount_status;
 pub mod notify;
 pub mod receive;
 pub mod supervise;

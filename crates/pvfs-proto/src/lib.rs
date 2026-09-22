@@ -144,6 +144,14 @@ pub enum ServerMsg {
         /// — on a holder, the library's disk. Absent on older daemons.
         #[serde(default)]
         capacity: Option<CapacityWire>,
+        /// D181 (PVOS D181 §8): the view mounts running on this box, as their
+        /// own status files describe them — which build each is on, and
+        /// whether it is behind this daemon's. A box that keeps its mount up
+        /// across a roll (Plex streams through it) moves it when nothing is
+        /// open, and this is how the fleet sees that it has not yet. Absent on
+        /// older daemons, so defaulted rather than a proto bump.
+        #[serde(default)]
+        mounts: Vec<MountWire>,
         /// D148: each local catalogue region's trash as its last purge pass
         /// left it. Absent on older daemons, so defaulted rather than a proto bump.
         /// Boxed (PVOS D178) with `stores` below, to keep the variant small.
@@ -283,6 +291,21 @@ pub struct ServeJobWire {
     pub last_ok_ms: Option<u64>,
     /// The last failure message, cleared by the next success.
     pub last_error: Option<String>,
+}
+
+/// D181 — one running view mount, as its status file describes it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MountWire {
+    pub mountpoint: String,
+    /// The build the mount process is running (not this daemon's).
+    pub build: String,
+    /// The mount is on an older build than this daemon: it is waiting for a
+    /// minute with nothing open through it (PVOS D181 §8).
+    pub behind: bool,
+    /// Why the mount says it can no longer read the catalogue, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
+    pub started_ms: u64,
 }
 
 /// D131 — free and total bytes of the filesystem under a box's sync store.

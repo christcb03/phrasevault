@@ -237,6 +237,26 @@ impl Daemon {
         false
     }
 
+    /// D181 (PVOS D181 §8) — the view mounts running on this box, from the
+    /// files they write under `<data dir>/mounts/`, and whether each is on an
+    /// older build than this daemon. A box that feeds Plex keeps its mount up
+    /// across a roll and moves it when nothing is open through it; this is
+    /// what tells the fleet it has not moved yet. Only live ones: a file left
+    /// by a killed mount is not a mount.
+    pub fn running_mounts(&self) -> Vec<pvfs_proto::MountWire> {
+        pvfs_client::mount_status::running(&self.data_dir)
+            .into_iter()
+            .filter(|m| m.alive)
+            .map(|m| pvfs_proto::MountWire {
+                behind: m.build != env!("PVFS_BUILD"),
+                mountpoint: m.mountpoint,
+                build: m.build,
+                stale: m.stale,
+                started_ms: m.started_ms,
+            })
+            .collect()
+    }
+
     /// Attach the job runner's state so `ServeStatus` answers live (set once,
     /// by the binary, before serving).
     pub fn attach_jobs(&self, jobs: Arc<jobs::JobsState>) {
@@ -634,6 +654,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                     Some(j) => ServerMsg::ServeJobs {
                         runner: "on".into(),
                         jobs: j.snapshot(),
+                        mounts: daemon.running_mounts(),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
@@ -643,6 +664,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
+                        mounts: daemon.running_mounts(),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
