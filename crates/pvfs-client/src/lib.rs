@@ -105,6 +105,9 @@ pub struct ServeStatusReply {
     pub trash: Vec<pvfs_proto::TrashWire>,
     /// PVOS D178 — every filesystem the box stores on (empty from an older daemon).
     pub stores: Vec<pvfs_proto::StoreWire>,
+    /// PVOS D181 — the view mounts running on the box, each with the build it
+    /// is on (empty from an older daemon, and from a box with no mount).
+    pub mounts: Vec<pvfs_proto::MountWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -323,6 +326,7 @@ impl Client {
                 capacity,
                 trash,
                 stores,
+                mounts,
             } => Ok(ServeStatusReply {
                 runner,
                 jobs,
@@ -331,6 +335,7 @@ impl Client {
                 capacity,
                 trash: *trash,
                 stores: *stores,
+                mounts: *mounts,
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }

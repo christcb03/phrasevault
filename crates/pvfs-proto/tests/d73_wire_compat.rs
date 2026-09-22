@@ -114,6 +114,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             measured_ms: 1,
         }]),
         stores: Box::default(),
+        mounts: Box::default(),
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -142,6 +143,38 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
             pvfs_proto::StoreWire { path: "/srv/pvfs/x/.pvfs/sync".into(), regions: vec![], free_bytes: 3, total_bytes: 4 },
             pvfs_proto::StoreWire { path: "/mnt/local".into(), regions: vec!["c020473f".into()], free_bytes: 5, total_bytes: 6 },
         ]),
+        mounts: Box::default(),
+    };
+    let s = serde_json::to_string(&new).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+
+/// PVOS D181 — an older daemon's reply has no `mounts`: it decodes (empty),
+/// and a new reply round-trips with them. A box keeps its view mount running
+/// across a roll, so the fleet has to be able to read "which build is that
+/// mount on" from a daemon that has just been rolled and one that has not.
+#[test]
+fn an_older_serve_jobs_reply_without_mounts_decodes() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[],"conflicts":0,"stale":0,"trash":[],"stores":[]}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { mounts, .. } => assert!(mounts.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    let new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: vec![],
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: Box::default(),
+        stores: Box::default(),
+        mounts: Box::new(vec![pvfs_proto::MountWire {
+            mountpoint: "/mnt/pvfs/Media".into(),
+            build: "v1.4-416-gf085fdb".into(),
+            behind: true,
+            stale: None,
+            started_ms: 7,
+        }]),
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);

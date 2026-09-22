@@ -52,6 +52,12 @@ pub struct PeerHealth {
     /// PVOS D178: every filesystem that box stores on (empty from an older daemon).
     #[serde(default)]
     pub stores: Vec<pvfs_proto::StoreWire>,
+    /// PVOS D181: the view mounts running on that box, each with the build it
+    /// is on and whether that is older than its daemon's — what tells the
+    /// fleet a mount has not yet moved to a new build (it moves when nothing
+    /// is open through it: Plex streams through mediabox's).
+    #[serde(default)]
+    pub mounts: Vec<pvfs_proto::MountWire>,
     pub error: Option<String>,
 }
 
@@ -203,6 +209,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.capacity = s.capacity.map(|c| (c.free_bytes, c.total_bytes));
             h.trash = s.trash;
             h.stores = s.stores;
+            h.mounts = s.mounts;
         }
         Err(e) => h.error = Some(format!("serve status: {e}")),
     }

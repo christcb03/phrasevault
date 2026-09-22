@@ -151,10 +151,11 @@ pub enum ServerMsg {
         /// open, and this is how the fleet sees that it has not yet. Absent on
         /// older daemons, so defaulted rather than a proto bump.
         #[serde(default)]
-        mounts: Vec<MountWire>,
+        mounts: Box<Vec<MountWire>>,
         /// D148: each local catalogue region's trash as its last purge pass
         /// left it. Absent on older daemons, so defaulted rather than a proto bump.
-        /// Boxed (PVOS D178) with `stores` below, to keep the variant small.
+        /// Boxed (PVOS D178) with `stores` and `mounts`, to keep the variant
+        /// small: `ServerMsg` is an `Err` type, and a fat one is a lint.
         #[serde(default)]
         trash: Box<Vec<TrashWire>>,
         /// PVOS D178: every filesystem this box stores on — `capacity` is the

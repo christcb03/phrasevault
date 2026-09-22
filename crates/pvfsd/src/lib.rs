@@ -654,7 +654,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                     Some(j) => ServerMsg::ServeJobs {
                         runner: "on".into(),
                         jobs: j.snapshot(),
-                        mounts: daemon.running_mounts(),
+                        mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
@@ -664,7 +664,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
                         jobs: Vec::new(),
-                        mounts: daemon.running_mounts(),
+                        mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity(),
