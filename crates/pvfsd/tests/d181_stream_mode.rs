@@ -172,7 +172,10 @@ fn a_reader_gets_its_readahead_kept_ahead_and_no_completion() {
         assert_eq!(read(&f, off, step), data[off..off + step], "at {off}");
     }
     // The window ahead (4 pieces) is filled without the reader asking...
-    until("the readahead is fetched ahead of the reader", Duration::from_secs(10), || {
+    // Generous: this asserts WHAT is fetched, never how fast. The whole suite
+    // in parallel on the build host once took this past 10 s and failed a
+    // correct build (2026-09-22).
+    until("the readahead is fetched ahead of the reader", Duration::from_secs(60), || {
         f.fetched_bytes() == 24 * PIECE
     });
     // ...and nothing more: no background completion.
