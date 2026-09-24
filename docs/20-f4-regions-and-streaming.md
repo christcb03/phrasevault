@@ -366,7 +366,7 @@ phase validates on presubuntu before its commit, as always.
   promote`, `pvfs replica repoint`; runbook in doc 28. PVOS D182 (2026-09-23)
   made it one append, by phrase or companion, and added the fence (an owner
   behind any follower refuses every write). Region-scoped writers (§A) remain
-  open for event regions; for catalogue regions PVOS D183 (2026-09-24) goes
+  open for event regions; for catalogue regions PVOS D183 (2026-09-23) goes
   most of the way — the region's own box already wrote its catalogue, and its
   head now travels box to box as a signed claim while the owner is down,
   committing to the log when it is back (doc 26 §8).

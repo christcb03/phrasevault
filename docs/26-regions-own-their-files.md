@@ -289,7 +289,7 @@ announced an endpoint and holds the file; nothing is special about the
 owner, and the bytes are verified against the head before a row is written,
 so a wrong box can waste a round trip and nothing else.*
 
-*PVOS D183 (2026-09-24) took the owner out of the head's path as well. The
+*PVOS D183 (2026-09-23) took the owner out of the head's path as well. The
 head was always signed by the region's box; until D183 it reached another box
 only as a forest-log row, so an owner outage froze every catalogue. Now a
 replica whose bindings are all catalogue regions scans with no route and

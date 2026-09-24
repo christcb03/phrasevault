@@ -4,7 +4,7 @@
 #   owner : presubuntu (192.168.0.184:7471) — the forest; binds nothing
 #   edge  : pvos-test  (192.168.0.138:7472) — replica, catalogues edge-shelf
 #   near  : presubuntu (192.168.0.184:7473) — replica with its OWN client
-#           identity (XDG_CONFIG_HOME), catalogues near-shelf
+#           identity (XDG_CONFIG_HOME) and socket dir, catalogues near-shelf
 # The owner stops. Both replicas keep cataloguing: each publishes its head
 # locally (pending), the other takes it as a signed claim and fetches the
 # manifest from it, and its view shows the new files — with the owner down the
@@ -21,17 +21,21 @@ gate() { if [ "$FAIL" -gt 0 ]; then echo; echo "ABORT at: $1 ($PASS ok, $FAIL fa
 has()  { printf '%s' "$1" | grep -q "$2"; }
 val()  { printf '%s' "$1" | sed -n "s/^$2=//p" | tail -1; }
 RH='B=$HOME/.local/bin; FT=$HOME/fleet-test; O=$FT/d183-owner; R=$FT/d183-edge; N=$FT/d183-near; D=$O/.pvfs; RD=$R/.pvfs; ND=$N/.pvfs
-NX="env XDG_CONFIG_HOME=$FT/d183-near-xdg"
+# near is a second daemon of the SAME forest on the owner box: its own client
+# identity, and its own socket dir. The socket is <dir>/<forest_id>.sock, so
+# sharing /tmp/pvfs would replace the socket of the owner with that of near.
+NX="env XDG_CONFIG_HOME=$FT/d183-near-xdg PVFS_SOCKET_DIR=$FT/d183-near-sock"
+envfor(){ [ "$1" = "$ND" ] && printf "%s" "$NX"; }
 jget(){ python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 stopd(){ p=$(cat "$1" 2>/dev/null) || return 0; kill "$p" 2>/dev/null; for _ in $(seq 1 100); do kill -0 "$p" 2>/dev/null || return 0; sleep 0.2; done; echo "STILL_RUNNING $p"; }
 # region ls for one region as held/head/committed/provisional/pending/stale
-rq(){ "$B/pvfs" --json --data-dir "$1" region ls 2>/dev/null | python3 -c "
+rq(){ $(envfor "$1") "$B/pvfs" --json --data-dir "$1" region ls 2>/dev/null | python3 -c "
 import json,sys
 for r in json.load(sys.stdin):
     if r[\"region\"]==sys.argv[1]: print(\"%s/%s/%s/%s/%s/%s\" % (r.get(\"held\"), r.get(\"head\"), r.get(\"committed\"), r.get(\"provisional\"), r.get(\"pending\"), r.get(\"stale\")))" "$2"; }
 # wait until rq matches, up to N×2 seconds
 waitq(){ for _ in $(seq 1 "$3"); do [ "$(rq "$1" "$2")" = "$4" ] && return 0; sleep 2; done; echo "TIMEOUT rq=$(rq "$1" "$2") want=$4"; return 1; }
-vpaths(){ "$B/pvfs" --json --data-dir "$1" view ls "$2" 2>/dev/null | python3 -c "import json,sys; print(\",\".join(e[\"path\"] for e in json.load(sys.stdin)))"; }
+vpaths(){ $(envfor "$1") "$B/pvfs" --json --data-dir "$1" view ls "$2" 2>/dev/null | python3 -c "import json,sys; print(\",\".join(e[\"path\"] for e in json.load(sys.stdin)))"; }
 heads(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(\"file:\"+sys.argv[1]+\"?mode=ro\", uri=True); print(c.execute(\"SELECT COUNT(*) FROM events WHERE kind = ?\", (\"SubRegionHead\",)).fetchone()[0])" "$D/log.db"; }
 # the settle rule: a file younger than 15 s is not catalogued yet
 settle(){ age=$(( $(date +%s) - $(stat -c %Z "$1") )); [ "$age" -lt 17 ] && sleep $(( 17 - age )); return 0; }
