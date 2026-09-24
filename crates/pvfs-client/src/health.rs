@@ -69,6 +69,9 @@ pub struct PeerHealth {
     /// PVOS D182: that box says it is a fenced owner.
     #[serde(default)]
     pub fenced: Option<pvfs_proto::FenceWire>,
+    /// PVOS D182: that box's last dated copy of the log, when it makes them.
+    #[serde(default)]
+    pub backup: Option<pvfs_proto::BackupWire>,
     pub error: Option<String>,
 }
 
@@ -235,6 +238,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.mounts = s.mounts;
             h.log = s.log;
             h.fenced = s.fenced;
+            h.backup = s.backup;
         }
         Err(e) => h.error = Some(format!("serve status: {e}")),
     }
@@ -323,6 +327,16 @@ fn judge_tip(data_dir: &Path, addr: &str, health: &mut PeerHealth) {
         }
         Err(e) => eprintln!("pvfs: health: could not judge {addr}'s log tip: {e}"),
     }
+}
+
+/// PVOS D182 — the record `pvfs forest backup` leaves in the data dir: the
+/// last dated copy of the log, whether it verified, and why not.
+pub const BACKUP_STATE_FILE: &str = "backup-state.json";
+
+/// PVOS D182 — that record, if this box has ever made a copy.
+pub fn load_backup_state(data_dir: &Path) -> Option<pvfs_proto::BackupWire> {
+    let text = std::fs::read_to_string(data_dir.join(BACKUP_STATE_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn now_ms() -> u64 {

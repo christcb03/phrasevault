@@ -122,7 +122,7 @@ printf '%s\n' "$MN" | "\$BIN/pvfs" forest promote "\$R" --device-index 0 >/dev/n
 [ -f "\$RD/replica" ] && echo P1=ok
 J=\$(printf '%s\n' "$MN" | "\$BIN/pvfs" --json forest promote "\$R" --device-index 1 2>"\$FT/d128-promote.err") || { echo "PROMOTE_FAILED: \$(cat "\$FT/d128-promote.err")"; exit 0; }
 printf '%s' "\$J" | grep -q '"promoted":true' && echo P2=ok
-printf '%s' "\$J" | grep -q "\"revoked\":\"$DEV0\"" && echo P3=ok
+printf '%s' "\$J" | grep -q "\"revoked\":\\[\"$DEV0\"\\]" && echo P3=ok  # D182: a list now
 [ -f "\$RD/promoted-from" ] && [ ! -f "\$RD/replica" ] && echo P4=ok
 grep -q "$A_IP:7442" "\$RD/promoted-from" && echo P5=ok
 echo "TIP_PROMOTED=\$(tip "\$RD/log.db")"

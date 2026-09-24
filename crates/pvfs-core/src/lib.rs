@@ -40,6 +40,7 @@ pub mod identity;
 pub mod ingest;
 pub mod link;
 pub mod arr;
+pub mod backup;
 pub mod media;
 pub mod probe;
 pub mod log_store;

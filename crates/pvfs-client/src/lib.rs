@@ -112,6 +112,8 @@ pub struct ServeStatusReply {
     pub log: Option<pvfs_proto::LogTipWire>,
     /// PVOS D182 — present when the box is a fenced owner.
     pub fenced: Option<pvfs_proto::FenceWire>,
+    /// PVOS D182 — the box's last dated copy of the log, when it makes them.
+    pub backup: Option<pvfs_proto::BackupWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -346,9 +348,10 @@ impl Client {
                 mounts,
                 log,
                 fenced,
+                backup,
             } => Ok(ServeStatusReply {
                 runner,
-                jobs,
+                jobs: *jobs,
                 conflicts,
                 stale,
                 capacity: capacity.map(|b| *b),
@@ -357,6 +360,7 @@ impl Client {
                 mounts: *mounts,
                 log: log.map(|b| *b),
                 fenced: fenced.map(|b| *b),
+                backup: backup.map(|b| *b),
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }
@@ -373,7 +377,7 @@ impl Client {
 
     pub fn serve_status(&mut self) -> Result<(String, Vec<ServeJobWire>)> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((runner, jobs)),
+            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((runner, *jobs)),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

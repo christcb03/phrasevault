@@ -383,6 +383,12 @@ impl Daemon {
         }
     }
 
+    /// PVOS D182: this box's last dated copy of the log, from the record
+    /// `pvfs forest backup` leaves (absent where none was ever made).
+    pub fn backup_wire(&self) -> Option<pvfs_proto::BackupWire> {
+        pvfs_client::health::load_backup_state(&self.data_dir)
+    }
+
     /// PVOS D182: the fence, when this owner is fenced.
     pub fn fence_wire(&self) -> Option<pvfs_proto::FenceWire> {
         pvfs_core::fence::load(&self.data_dir).map(|f| pvfs_proto::FenceWire {
@@ -718,7 +724,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                 match daemon.jobs.get() {
                     Some(j) => ServerMsg::ServeJobs {
                         runner: "on".into(),
-                        jobs: j.snapshot(),
+                        jobs: Box::new(j.snapshot()),
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
@@ -727,10 +733,11 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         stores: Box::new(daemon.store_filesystems()),
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),
+                        backup: daemon.backup_wire().map(Box::new),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
-                        jobs: Vec::new(),
+                        jobs: Box::default(),
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
@@ -739,6 +746,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         stores: Box::new(daemon.store_filesystems()),
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),
+                        backup: daemon.backup_wire().map(Box::new),
                     },
                 }
             }

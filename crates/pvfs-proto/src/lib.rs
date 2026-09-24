@@ -129,7 +129,10 @@ pub enum ServerMsg {
     /// daemon predates jobs or was started without one.
     ServeJobs {
         runner: String,
-        jobs: Vec<ServeJobWire>,
+        /// Boxed (PVOS D182, with `capacity`): the variant must stay under
+        /// clippy's 128 bytes, since `ServerMsg` is the error half of many
+        /// results. The JSON is the same.
+        jobs: Box<Vec<ServeJobWire>>,
         /// D127 (doc 26 §7.5): conflicting paths in the merged view this box
         /// holds — the in-band signal nobody has to remember to ask for.
         /// Absent on pre-D127 daemons, so defaulted rather than a proto bump.
@@ -178,6 +181,11 @@ pub enum ServerMsg {
         /// older daemons.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fenced: Option<Box<FenceWire>>,
+        /// PVOS D182: this box's last dated copy of the log (`pvfs forest
+        /// backup`) — when, whether it verified, and why not. Absent where
+        /// no copy has ever been made, and on older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backup: Option<Box<BackupWire>>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -361,6 +369,17 @@ pub struct FenceWire {
     pub own_seq: u64,
     #[serde(default)]
     pub at_ms: u64,
+}
+
+/// PVOS D182 — a box's last dated copy of the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupWire {
+    pub at_ms: u64,
+    pub ok: bool,
+    #[serde(default)]
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// D148 — one catalogue region's trash on a box, as its last purge pass left

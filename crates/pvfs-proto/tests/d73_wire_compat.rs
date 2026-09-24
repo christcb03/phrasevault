@@ -100,7 +100,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -117,6 +117,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         mounts: Box::default(),
         log: None,
         fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -136,7 +137,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -148,6 +149,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
         mounts: Box::default(),
         log: None,
         fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -166,7 +168,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -181,6 +183,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
         }]),
         log: None,
         fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -200,7 +203,7 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -215,6 +218,7 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
             own_seq: 3472,
             at_ms: 9,
         })),
+        backup: Some(Box::new(pvfs_proto::BackupWire { at_ms: 7, ok: true, seq: Some(3472), error: None })),
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
