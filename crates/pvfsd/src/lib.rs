@@ -383,6 +383,24 @@ impl Daemon {
         }
     }
 
+    /// PVOS D183: this box's signed heads for the catalogue regions it owns,
+    /// through the read pool, signed by the box's client identity.
+    pub fn region_claims(&self) -> pvfs_core::Result<Vec<pvfs_proto::RegionClaimWire>> {
+        let mn = pvfs_core::identity::client_identity_mnemonic()?;
+        let key = pvfs_core::identity::device_key(&mn, "", 0)?;
+        let author = pvfs_core::crypto::pubkey_bytes(&key);
+        let claims = self.reader().region_claims(&author, |d| pvfs_core::crypto::sign_digest(&key, d))?;
+        Ok(claims
+            .into_iter()
+            .map(|c| pvfs_proto::RegionClaimWire {
+                region: c.region,
+                seq: c.seq,
+                hash: c.hash,
+                body: hex::encode(c.body),
+            })
+            .collect())
+    }
+
     /// PVOS D182: this box's last dated copy of the log, from the record
     /// `pvfs forest backup` leaves (absent where none was ever made).
     pub fn backup_wire(&self) -> Option<pvfs_proto::BackupWire> {
@@ -748,6 +766,23 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         fenced: daemon.fence_wire().map(Box::new),
                         backup: daemon.backup_wire().map(Box::new),
                     },
+                }
+            }
+        }
+        // PVOS D183: gated as `ServeStatus` is. Each claim is signed now, by
+        // this box's client identity — the key its region grants name, the
+        // same key that signs its routed commits.
+        ClientMsg::RegionClaims => {
+            let member = match principal {
+                Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+                _ => false,
+            };
+            if !member {
+                err("forbidden", "region claims are member-gated (enroll this box)")
+            } else {
+                match daemon.region_claims() {
+                    Ok(claims) => ServerMsg::RegionClaims { claims },
+                    Err(e) => err("io", &format!("region claims: {e}")),
                 }
             }
         }

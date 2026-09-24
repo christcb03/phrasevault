@@ -385,32 +385,76 @@ fn scan_pass(
     route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
 ) -> Result<Vec<pvfs_core::ScanReport>, PvfsError> {
     // Reconnect if a previous pass dropped the route (see the Err arm above).
-    // A replica with no route cannot write anything it finds, so failing to
-    // reconnect must surface as the pass failing — not as a silent local scan.
+    // A replica with no route cannot write through the owner, so for an
+    // old-model binding (folder nodes) failing to reconnect must surface as
+    // the pass failing — not as a silent local scan. PVOS D183: a replica
+    // whose bindings are ALL catalogue regions scans anyway — its rows are
+    // local and its head is published here, pending, and committed when the
+    // owner answers again (below, and by the `catalogue` job).
     if route.is_none() && engine.is_replica() {
-        *route = crate::advertise::replica_route(engine.data_dir(), true)?;
+        match crate::advertise::replica_route(engine.data_dir(), true) {
+            Ok(r) => *route = r,
+            Err(e) if engine.catalogues_only()? => {
+                eprintln!(
+                    "pvfs: watch: the owner is unreachable ({e}) — cataloguing here; \
+                     the head is published locally and committed when it answers"
+                );
+                let mut away = pvfs_core::OwnerAway;
+                return engine.scan_routed(None, Some(&mut away), pvfs_core::WATCH_SETTLE_MS);
+            }
+            Err(e) => return Err(e),
+        }
     }
     match route {
         Some((client, sign)) => {
             let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &**sign;
             let mut w =
                 crate::advertise::RoutedScanWriter::new(engine.data_dir(), client, signer);
+            // PVOS D183 — heads published while the owner was away go in first,
+            // the newest per region (the owner takes any seq that advances).
+            let settled = commit_pending_heads(engine, &mut w)?;
             let reports = engine.scan_routed(None, Some(&mut w), pvfs_core::WATCH_SETTLE_MS)?;
             // Read-your-writes — the same F5.0 precedent `advertise` follows.
             // A routed write lands in the OWNER's log, and this box does not
             // see it until the tail is folded here. Skip this and the next
             // pass cannot find the folder it just created, so it makes a
             // second one: the D71 lab produced two `Season 03` nodes exactly
-            // this way before the catch-up was added.
-            if reports.iter().any(|r| {
-                r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked > 0
-            }) {
+            // this way before the catch-up was added. (D183: a settled head
+            // too, or the next pass offers it again.)
+            if settled > 0
+                || reports.iter().any(|r| {
+                    r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked > 0
+                })
+            {
                 crate::advertise::catch_up(engine.data_dir(), client);
             }
             Ok(reports)
         }
         None => engine.scan_routed(None, None, pvfs_core::WATCH_SETTLE_MS),
     }
+}
+
+/// PVOS D183 — commit this box's pending heads (published while the owner was
+/// away) through `w`: one routed `CommitRegionHead` per region, the newest.
+/// A head the owner already holds (committed by an earlier pass or the
+/// `catalogue` job, and not yet folded here) is settled too, not a failure.
+/// Returns how many were settled; the caller catches up when any were.
+pub fn commit_pending_heads(
+    engine: &Engine,
+    w: &mut dyn pvfs_core::ScanWriter,
+) -> Result<usize, PvfsError> {
+    let pending = engine.pending_region_heads()?;
+    for (region, seq, hash) in &pending {
+        let short = &region[..region.len().min(8)];
+        match w.commit_region_head(region, *seq, hash) {
+            Ok(()) => eprintln!("pvfs: committed head {seq} of {short} — published while the owner was away"),
+            Err(PvfsError::BadInput { reason, .. }) if reason.contains("does not advance") => {
+                eprintln!("pvfs: head {seq} of {short} — the owner already holds it or a newer one")
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pending.len())
 }
 
 /// Everything one pass says, in order (D156): each binding's `Ingested` or

@@ -171,6 +171,9 @@ struct Challenge {
     version: u32,
 }
 
+/// PVOS D183 — the first proto that answers `RegionClaims`.
+pub const REGION_CLAIMS_PROTO: u32 = 12;
+
 /// A connected, authenticated session with a forest's daemon.
 pub struct Client {
     stream: Stream,
@@ -363,6 +366,15 @@ impl Client {
                 backup: backup.map(|b| *b),
             }),
             other => Err(unexpected("ServeJobs", &other)),
+        }
+    }
+
+    /// PVOS D183 — the box's signed heads for the catalogue regions it owns.
+    /// Callers check `daemon_proto() >= REGION_CLAIMS_PROTO` first.
+    pub fn region_claims(&mut self) -> Result<Vec<pvfs_proto::RegionClaimWire>> {
+        match self.request(ClientMsg::RegionClaims)? {
+            ServerMsg::RegionClaims { claims } => Ok(claims),
+            other => Err(unexpected("RegionClaims", &other)),
         }
     }
 
@@ -1330,6 +1342,27 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
 }
 
 /// Dial `addr` and wrap it in TLS verified only by the transport pin.
+/// PVOS D183 — how long a dial waits for the far end to answer at all. With a
+/// box's host DOWN (not just its daemon), a plain `connect` waits out the
+/// kernel's SYN retries — about two minutes on Linux — and every job that
+/// dials it (the watch's route to the owner, the `catalogue` job's claims, the
+/// follow) stalls that long per attempt. A box silent this long is not there.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn dial(addr: &str) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = None;
+    for sa in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sa, DIAL_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{addr} names no address"))
+    }))
+}
+
 fn tls_connect(
     addr: &str,
     pin_hex: &str,
@@ -1355,7 +1388,7 @@ fn tls_connect(
         .map_err(|_| ClientError::Protocol(format!("bad server name in address {addr:?}")))?;
     let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|e| ClientError::Protocol(format!("tls: {e}")))?;
-    let tcp = TcpStream::connect(addr)?;
+    let tcp = dial(addr)?;
     // D78 — a read that can never end is worse than a read that fails.
     //
     // Without this, a request whose reply never comes blocks the calling

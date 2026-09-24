@@ -563,9 +563,15 @@ pub struct StoreFs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogueStatus {
     pub region: NodeId,
-    /// The head the log attests (0 = none yet).
+    /// The region's head: the newer of what the log attests and, since PVOS
+    /// D183, a provisional head taken from the region's own box (0 = none).
     pub head_seq: u64,
     pub head_hash: String,
+    /// What the forest log attests (the head, when nothing provisional is newer).
+    pub committed_seq: u64,
+    /// PVOS D183: `head_*` is provisional — signed by the region's owner and
+    /// taken from its box, not yet committed to the forest log.
+    pub provisional: bool,
     /// What this box holds: the head itself for a region it catalogues,
     /// the fetched seq otherwise, `None` when nothing has been fetched.
     pub held_seq: Option<u64>,
@@ -577,6 +583,28 @@ pub struct CatalogueStatus {
     pub source: Option<String>,
     /// Rows held here.
     pub entries: u64,
+}
+
+/// PVOS D183 — a signed head a box hands its peers for a region it owns
+/// (`RegionClaims`): the `SubRegionHead` body, signed by the region's owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionClaim {
+    pub region: NodeId,
+    pub seq: u64,
+    pub hash: String,
+    pub body: Vec<u8>,
+}
+
+/// PVOS D183 — what taking a claim did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// Taken as the region's provisional head.
+    Accepted { region: NodeId, seq: u64 },
+    /// Nothing new: the log or a provisional head already has it (or newer),
+    /// or it is this box's own region.
+    Known,
+    /// Refused, and why.
+    Refused(String),
 }
 
 /// D127 — what one resolution pass did (doc 26 §7.3). Paths, with the region
@@ -1757,17 +1785,37 @@ impl Engine {
             ));
         }
         let info = self.region_info(region)?.ok_or_else(|| bad("catalogue", "no region row"))?;
-        if info.committed_seq == 0 {
-            return Err(bad("catalogue", "the log attests no head for that region yet"));
-        }
-        if seq != info.committed_seq {
+        // PVOS D183 — the installable heads: the log's, and a provisional one
+        // taken from the region's own box (signed by it, on the fold's rule).
+        let provisional: Option<(u64, String)> = self
+            .conn
+            .query_row(
+                "SELECT seq, manifest_hash FROM region_provisional WHERE region_id = ?1",
+                params![region],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("install snapshot: provisional"))?;
+        let expected: Option<String> = if info.committed_seq > 0 && seq == info.committed_seq {
+            Some(info.committed_head.clone())
+        } else {
+            provisional.as_ref().filter(|(ps, _)| *ps == seq).map(|(_, ph)| ph.clone())
+        };
+        let Some(expected) = expected else {
+            if info.committed_seq == 0 && provisional.is_none() {
+                return Err(bad("catalogue", "the log attests no head for that region yet"));
+            }
             return Err(bad(
                 "catalogue",
-                &format!("seq {seq} is not the attested head ({})", info.committed_seq),
+                &format!(
+                    "seq {seq} is not the attested head ({}){}",
+                    info.committed_seq,
+                    provisional.map(|(ps, _)| format!(" nor the provisional one ({ps})")).unwrap_or_default()
+                ),
             ));
-        }
+        };
         let hash = blake3::hash(bytes).to_hex().to_string();
-        if hash != info.committed_head {
+        if hash != expected {
             return Err(bad("catalogue", "manifest hash does not match the attested head"));
         }
         let (named, named_seq, rows) = Self::parse_region_manifest(bytes)?;
@@ -1921,8 +1969,11 @@ impl Engine {
             .prepare(
                 "SELECT r.node_id, r.committed_seq, r.committed_head,
                         f.seq, f.fetched_at, f.source,
-                        (SELECT COUNT(*) FROM region_entries e WHERE e.region_id = r.node_id)
-                   FROM regions r LEFT JOIN region_fetched f ON f.region_id = r.node_id
+                        (SELECT COUNT(*) FROM region_entries e WHERE e.region_id = r.node_id),
+                        p.seq, p.manifest_hash
+                   FROM regions r
+                   LEFT JOIN region_fetched f ON f.region_id = r.node_id
+                   LEFT JOIN region_provisional p ON p.region_id = r.node_id
                   WHERE r.kind = 'catalogue'
                   ORDER BY r.node_id",
             )
@@ -1937,19 +1988,28 @@ impl Engine {
                     r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, i64>(6)? as u64,
+                    r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(map_db("catalogue status"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("catalogue status"))?;
         let mut out = Vec::with_capacity(rows.len());
-        for (region, head_seq, head_hash, held, fetched_at, source, entries) in rows {
+        for (region, committed_seq, committed_head, held, fetched_at, source, entries, p_seq, p_hash) in rows {
             let local = self.catalogues_here(&region)?;
+            // PVOS D183 — the newer of the log's head and a provisional one.
+            let (head_seq, head_hash, provisional) = match (p_seq, p_hash) {
+                (Some(ps), Some(ph)) if ps > committed_seq => (ps, ph, true),
+                _ => (committed_seq, committed_head, false),
+            };
             let held_seq = if local { Some(head_seq) } else { held };
             out.push(CatalogueStatus {
                 region,
                 head_seq,
                 head_hash,
+                committed_seq,
+                provisional,
                 held_seq,
                 local,
                 stale: !local && held_seq.unwrap_or(0) < head_seq,
@@ -1959,6 +2019,169 @@ impl Engine {
             });
         }
         Ok(out)
+    }
+
+    /// PVOS D183 — every binding on this box is a catalogue region (and there
+    /// is at least one): its scans write only local rows and a head, so they
+    /// need no owner to run. A box with an old-model binding (a folder node)
+    /// does — its scan writes nodes through the owner. The same set the scan
+    /// walks ([`Engine::local_bindings`]: logged and this box's own).
+    pub fn catalogues_only(&self) -> Result<bool> {
+        let bindings = self.local_bindings()?;
+        if bindings.is_empty() {
+            return Ok(false);
+        }
+        for b in &bindings {
+            if !self.is_catalogue_region(&b.folder_id)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// PVOS D183 — this box's newest published head for each catalogue region
+    /// it catalogues, each as a `SubRegionHead` signed by `author` through
+    /// `sign`: the claim a peer takes provisionally (`RegionClaims`). `author`
+    /// is the key the region's grant names — a replica's client identity, the
+    /// same key that signs its routed commits.
+    pub fn region_claims(
+        &self,
+        author: &[u8],
+        sign: impl Fn(&[u8; 32]) -> Result<Vec<u8>>,
+    ) -> Result<Vec<RegionClaim>> {
+        let mut out = Vec::new();
+        for (region, seq, hash) in self.published_heads(false)? {
+            let head_hash = hex::decode(&hash).map_err(|_| bad("claim", "manifest hash is not hex"))?;
+            let at = now_ms();
+            let sig = sign(&event::msg_sub_region_head(&region, seq, &head_hash, at, author))?;
+            let ev = Event::SubRegionHead {
+                node_id: region.clone(),
+                head_seq: seq,
+                head_hash,
+                at,
+                author: author.to_vec(),
+                sig,
+            };
+            out.push(RegionClaim { region, seq, hash, body: ev.encode_body() });
+        }
+        Ok(out)
+    }
+
+    /// PVOS D183 — the heads this box published that the forest log does not
+    /// yet hold (published while the owner was away): the newest per region,
+    /// to commit when the owner answers again.
+    pub fn pending_region_heads(&self) -> Result<Vec<(NodeId, u64, String)>> {
+        self.published_heads(true)
+    }
+
+    /// The newest `region_snapshots` row per catalogue region — all of them,
+    /// or (`pending_only`) those past the log's committed head.
+    fn published_heads(&self, pending_only: bool) -> Result<Vec<(NodeId, u64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.region_id, s.seq, s.manifest_hash, r.committed_seq
+                   FROM region_snapshots s JOIN regions r ON r.node_id = s.region_id
+                  WHERE r.kind = 'catalogue'
+                    AND s.seq = (SELECT MAX(x.seq) FROM region_snapshots x WHERE x.region_id = s.region_id)
+                  ORDER BY s.region_id",
+            )
+            .map_err(map_db("published heads"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })
+            .map_err(map_db("published heads"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("published heads"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, seq, _, committed)| !pending_only || seq > committed)
+            .map(|(region, seq, hash, _)| (region, seq, hash))
+            .collect())
+    }
+
+    /// PVOS D183 — take a claim (a `SubRegionHead` from the region's own box)
+    /// as the region's provisional head, if the fold's own rule would accept
+    /// it: the signature verifies; a catalogue region this box does not
+    /// catalogue itself; an active, unrevoked author holding admin on the
+    /// region (`projection::check_member_event`); a seq past the log's head
+    /// and past any provisional one. A different hash at a seq already held
+    /// is refused — equivocation is for the owner's commit to settle.
+    pub fn accept_region_claim(&self, body: &[u8], source: &str) -> Result<ClaimOutcome> {
+        let ev = match Event::decode(crate::event::K_SUB_REGION_HEAD, body) {
+            Ok(ev) => ev,
+            Err(e) => return Ok(ClaimOutcome::Refused(format!("not a region head ({e})"))),
+        };
+        let Event::SubRegionHead { node_id, head_seq, head_hash, author, .. } = &ev else {
+            return Ok(ClaimOutcome::Refused("not a region head".into()));
+        };
+        if let Err(e) = ev.verify_sig() {
+            return Ok(ClaimOutcome::Refused(format!("its signature does not verify ({e})")));
+        }
+        if !self.is_catalogue_region(node_id)? {
+            return Ok(ClaimOutcome::Refused(format!("{node_id} is not a catalogue region")));
+        }
+        if self.catalogues_here(node_id)? {
+            return Ok(ClaimOutcome::Known); // our own region: our rows are the authority
+        }
+        if let Err(e) = crate::projection::check_member_event(&self.conn, &ev, now_ms()) {
+            return Ok(ClaimOutcome::Refused(format!("its author may not publish this region ({e})")));
+        }
+        let info = self.region_info(node_id)?.ok_or_else(|| bad("claim", "no region row"))?;
+        let hash = hex::encode(head_hash);
+        if *head_seq < info.committed_seq {
+            return Ok(ClaimOutcome::Known);
+        }
+        if *head_seq == info.committed_seq {
+            return Ok(if hash == info.committed_head {
+                ClaimOutcome::Known
+            } else {
+                ClaimOutcome::Refused(format!(
+                    "another hash at seq {head_seq}, which the forest log already holds"
+                ))
+            });
+        }
+        let held: Option<(u64, String)> = self
+            .conn
+            .query_row(
+                "SELECT seq, manifest_hash FROM region_provisional WHERE region_id = ?1",
+                params![node_id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("claim: provisional"))?;
+        if let Some((ps, ph)) = &held {
+            if *head_seq < *ps {
+                return Ok(ClaimOutcome::Known);
+            }
+            if *head_seq == *ps {
+                return Ok(if &hash == ph {
+                    ClaimOutcome::Known
+                } else {
+                    ClaimOutcome::Refused(format!(
+                        "two different heads at seq {head_seq} for {node_id} — the owner's commit settles it"
+                    ))
+                });
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO region_provisional (region_id, seq, manifest_hash, author, source, received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(region_id) DO UPDATE SET
+                   seq = excluded.seq, manifest_hash = excluded.manifest_hash,
+                   author = excluded.author, source = excluded.source,
+                   received_at = excluded.received_at",
+                params![node_id, *head_seq as i64, hash, author, source, now_ms() as i64],
+            )
+            .map_err(map_db("claim: record"))?;
+        Ok(ClaimOutcome::Accepted { region: node_id.clone(), seq: *head_seq })
     }
 
     /// D125 item 4 — publish the region's catalogue as a new snapshot when it
@@ -1988,12 +2211,6 @@ impl Engine {
             .optional()
             .map_err(map_db("last snapshot"))?;
         let (last_seq, last_hash) = last.unwrap_or((0, String::new()));
-        if last_seq > 0 {
-            let again = Self::region_manifest_bytes(region, last_seq as u64, &rows);
-            if blake3::hash(&again).to_hex().as_str() == last_hash {
-                return Ok(None);
-            }
-        }
         // D173 — the head the LOG attests is the floor. This box's own record
         // of what it published (`region_snapshots`) is derived state: a
         // projection replay wiped it on the NAS (2026-09-17, 9:40 PM EDT),
@@ -2010,6 +2227,18 @@ impl Engine {
             .optional()
             .map_err(map_db("attested head"))?
             .unwrap_or((0, String::new()));
+        if last_seq > 0 {
+            let again = Self::region_manifest_bytes(region, last_seq as u64, &rows);
+            // PVOS D183 — unchanged is nothing to publish, unless the log's
+            // head at that very seq names another manifest: a head committed
+            // whose answer was lost, then published again here while the owner
+            // was away. Peers install only what the log attests, so publish
+            // past it rather than leave them stale until the next change.
+            let superseded = attested.0 == last_seq && attested.1 != last_hash;
+            if blake3::hash(&again).to_hex().as_str() == last_hash && !superseded {
+                return Ok(None);
+            }
+        }
         if last_seq == 0 && attested.0 > 0 {
             let again = Self::region_manifest_bytes(region, attested.0 as u64, &rows);
             if blake3::hash(&again).to_hex().as_str() == attested.1 {
@@ -5535,6 +5764,45 @@ pub trait ScanWriter {
     /// D125 item 8 — publish the head of a catalogue region this box owns:
     /// the ONE routed write ownership grants (milestone §4.3).
     fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> Result<()>;
+}
+
+/// PVOS D183 — the writer a catalogue-only replica scans with while its
+/// owner is unreachable. A catalogue region's scan writes local rows and one
+/// head; the head is published here (manifest + `region_snapshots`) and stays
+/// PENDING until a routed pass or the `catalogue` job commits it
+/// ([`Engine::pending_region_heads`]). Anything else a scan might write goes
+/// through the owner and fails as transient — never silently dropped.
+pub struct OwnerAway;
+
+impl OwnerAway {
+    fn away<T>(what: &str) -> Result<T> {
+        Err(PvfsError::Busy { op: format!("{what} (the owner is unreachable)"), retries: 0 })
+    }
+}
+
+impl ScanWriter for OwnerAway {
+    fn add_folder(&mut self, _parent: &str, _label: &str) -> Result<NodeId> {
+        Self::away("add a folder")
+    }
+    fn add_file(&mut self, _p: &str, _l: &str, _s: u64, _m: &str, _h: &str) -> Result<NodeId> {
+        Self::away("add a file")
+    }
+    fn add_location(&mut self, _file: &str, _uri: &str) -> Result<()> {
+        Self::away("add a location")
+    }
+    fn remove_location(&mut self, _file: &str, _uri: &str) -> Result<()> {
+        Self::away("remove a location")
+    }
+    fn set_content_hash(&mut self, _file: &str, _h: &str, _size: u64) -> Result<NodeId> {
+        Self::away("set a content hash")
+    }
+    fn remove_link(&mut self, _link_id: &str) -> Result<()> {
+        Self::away("remove a link")
+    }
+    /// Published locally; committed later.
+    fn commit_region_head(&mut self, _region: &str, _seq: u64, _hash: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Will retrying fix it? (D71 W4 — Chris: *fail loudly, but autocorrect, and

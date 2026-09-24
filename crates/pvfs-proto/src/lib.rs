@@ -37,7 +37,10 @@ use serde::{Deserialize, Serialize};
 ///          running daemon from its read pool, so a status collector never
 ///          opens (and folds) the forest to ask. Additive; compatible-with
 ///          stays.
-pub const PROTO_VERSION: u32 = 11;
+///   11 → 12: PVOS D183 `RegionClaims` — a box's signed heads for the
+///          catalogue regions it owns, handed to peers directly so an owner
+///          outage stops no catalogue. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 12;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -104,6 +107,9 @@ pub enum ServerMsg {
     /// `ClientMsg::RegionManifest`): `total` is the file's length, `bytes`
     /// the hex of the page at the requested offset.
     RegionManifest { total: u64, bytes: String },
+    /// PVOS D183: the answer to `ClientMsg::RegionClaims` — one signed head
+    /// per catalogue region this box owns and has published.
+    RegionClaims { claims: Vec<RegionClaimWire> },
     /// D169: the answer to `ClientMsg::TrashPath` — `moved` is false when
     /// this box catalogues the region and holds nothing at that path (already
     /// gone: not an error).
@@ -347,6 +353,17 @@ pub struct StoreWire {
     pub regions: Vec<String>,
     pub free_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// PVOS D183 — one signed region head: the `SubRegionHead` event body (hex),
+/// signed by the region owner's key, with its region, seq and manifest hash
+/// spelled out (the body is what is verified; these are for reading).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionClaimWire {
+    pub region: String,
+    pub seq: u64,
+    pub hash: String,
+    pub body: String,
 }
 
 /// PVOS D182 — a log's tip: its last seq and that row's chain hash (hex).
@@ -663,6 +680,11 @@ pub enum ClientMsg {
         #[serde(default)]
         max: u32,
     },
+    /// PVOS D183: this box's signed heads for the catalogue regions it owns
+    /// (`ServerMsg::RegionClaims`). A peer takes each as a provisional head
+    /// if the fold's own rule would accept it — so heads move box to box
+    /// while the forest owner is away. Member-gated like `ServeStatus`.
+    RegionClaims,
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite {
         op: WriteOp,
