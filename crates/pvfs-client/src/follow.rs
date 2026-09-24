@@ -25,7 +25,8 @@ pub enum FollowEvent<'a> {
     /// New events ingested and folded; the store is at `tip`.
     CaughtUp { tip: u64 },
     /// D146 — connected and current: a long-poll came back empty with the
-    /// source's tip at or behind ours (`tip`). `CaughtUp` only fires when
+    /// source's tip at ours (`tip`; a source BEHIND ours is an error since
+    /// PVOS D182 — a stale or replaced owner). `CaughtUp` only fires when
     /// events land, so on a quiet log this is the follower's only proof of
     /// health — without it the status row froze at the last event and the
     /// stall detector called a caught-up follower "overdue" forever.
@@ -148,7 +149,24 @@ pub fn run(
                     // D146 — nothing new and the source is not ahead of us:
                     // current. Said on every quiet tick (the poll window), so
                     // "last ok" means "last confirmed current with the source".
-                    Ok(0) if source_tip < from => notify(FollowEvent::UpToDate { tip: from - 1 }),
+                    // PVOS D182 — but only when the source is AT our tip. A
+                    // source BEHIND this replica is not its owner as it was:
+                    // it was restored from an older copy, or another box was
+                    // promoted and this one is its ghost. That used to read as
+                    // healthy; it is an error, so the fleet sees it.
+                    Ok(0) if source_tip + 1 == from => notify(FollowEvent::UpToDate { tip: from - 1 }),
+                    Ok(0) if source_tip + 1 < from => {
+                        notify(FollowEvent::Retrying {
+                            reason: format!(
+                                "the source ({}) is behind this replica: its log ends at seq {source_tip}, \
+                                 this box holds {} — a stale or restored owner, or one another box has \
+                                 replaced; nothing is taken from it",
+                                dial.target,
+                                from - 1
+                            ),
+                        });
+                        break;
+                    }
                     Ok(0) => {}
                     Ok(_) => {
                         let _ = Engine::open(data_dir).and_then(|e| e.close());
@@ -177,10 +195,20 @@ pub fn run(
             };
             let tip = match ReplicaStore::open(data_dir).and_then(|mut s| s.append(&rows)) {
                 Ok(t) => t,
+                // PVOS D182 — say what a broken chain means: the source is not
+                // the writer this replica has been following.
                 Err(e) => {
-                    notify(FollowEvent::Retrying {
-                        reason: format!("ingest failed ({e})"),
-                    });
+                    let reason = match &e {
+                        PvfsError::LogChainBroken { seq, .. } => format!(
+                            "the source ({})'s log differs from this replica's at seq {seq} — it is not \
+                             the writer this box has been following (restored from the wrong copy, or \
+                             replaced by a promotion), or this box followed one that was not; nothing \
+                             is taken from it ({e})",
+                            dial.target
+                        ),
+                        _ => format!("ingest failed ({e})"),
+                    };
+                    notify(FollowEvent::Retrying { reason });
                     break; // the next pass re-fetches from the real tip
                 }
             };

@@ -47,9 +47,16 @@ pub struct Notify {
 
 impl Notify {
     /// The name a person knows a peer by, or its address when unnamed.
+    /// PVOS D182: a label for the full address (`host:port`) wins over one for
+    /// the host — two daemons on one box (mediabox's holder and the standby
+    /// owner) are two boxes to a person.
     pub fn name_for(&self, addr: &str) -> String {
         let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-        self.labels.get(host).cloned().unwrap_or_else(|| addr.to_string())
+        self.labels
+            .get(addr)
+            .or_else(|| self.labels.get(host))
+            .cloned()
+            .unwrap_or_else(|| addr.to_string())
     }
 }
 
@@ -85,7 +92,9 @@ pub struct Seen {
 }
 
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
-/// `supervise`, `job_error`, `job_error_cleared`, `heartbeat`, `test`.
+/// `supervise`, `job_error`, `job_error_cleared`, `heartbeat`, `test`, and
+/// since PVOS D182 `owner_fenced`, `owner_unfenced`, `peer_diverged`,
+/// `peer_diverged_cleared`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub event: String,
@@ -228,6 +237,50 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
         // Job errors are handled by `job_errors` (they need memory across
         // passes and restarts: a restart's "connection refused" clears itself
         // in a minute and must not wake anyone).
+        //
+        // PVOS D182 — a peer whose copy of the log is on another branch: said
+        // once when it is first seen, and cleared once when it agrees again
+        // (re-seeded). Only answering peers count: a peer that did not answer
+        // keeps its verdict unknown, not cleared.
+        let diverged = r.last.log_verdict.as_deref() == Some("diverged");
+        let was_diverged = p.is_some_and(|p| p.last.log_verdict.as_deref() == Some("diverged"));
+        if diverged && !was_diverged {
+            let mut e = base("peer_diverged", pin, r);
+            e.detail = r.last.log.as_ref().map(|t| format!("seq {}", t.seq));
+            out.push(e);
+        }
+        if was_diverged && r.last.log_verdict.as_deref() == Some("consistent") {
+            out.push(base("peer_diverged_cleared", pin, r));
+        }
+    }
+    // PVOS D182 — this box's own fence, said once when it appears (on the
+    // very first poll too: worth one message, like a peer already down) and
+    // once when a person lifts it.
+    let was_fenced = prev.is_some_and(|p| p.fenced.is_some());
+    let own = |event: &str| Event {
+        event: event.into(),
+        at_ms: now_ms,
+        peer: None,
+        addr: next.self_addr.clone(),
+        since_ms: None,
+        detail: None,
+        up,
+        down,
+        until_ms: None,
+    };
+    match (&next.fenced, was_fenced) {
+        (Some(f), false) => {
+            let mut e = own("owner_fenced");
+            e.since_ms = Some(f.at_ms);
+            e.detail = Some(f.reason.clone());
+            out.push(e);
+        }
+        (None, true) => {
+            let mut e = own("owner_unfenced");
+            e.since_ms = prev.and_then(|p| p.fenced.as_ref()).map(|f| f.at_ms);
+            out.push(e);
+        }
+        _ => {}
     }
     out
 }
@@ -344,13 +397,18 @@ pub fn heartbeat(state: &mut State, next: &FleetHealth, now_ms: u64) -> Option<E
         .iter()
         .map(|(pin, r)| format!("{} {} {}", short(pin), r.addr, if r.is_down() { "DOWN" } else { "up" }))
         .collect();
+    // PVOS D182 — a fenced owner's check-in says that, not "all good".
+    let detail = match &next.fenced {
+        Some(f) => format!("FENCED: {}", f.reason),
+        None => peers.join("; "),
+    };
     Some(Event {
         event: "heartbeat".into(),
         at_ms: now_ms,
         peer: None,
-        addr: None,
+        addr: next.self_addr.clone().filter(|_| next.fenced.is_some()),
         since_ms: None,
-        detail: Some(peers.join("; ")),
+        detail: Some(detail),
         up,
         down,
         until_ms: None,
@@ -385,6 +443,10 @@ pub fn severity(ev: &Event) -> &'static str {
         "supervise" if restart_worked => "info",
         "supervise" => "critical",
         "job_error" => "warning",
+        // PVOS D182 — an owner that has stopped writing is the forest stopped.
+        "owner_fenced" => "critical",
+        "peer_diverged" => "warning",
+        "heartbeat" if ev.detail.as_deref().is_some_and(|d| d.starts_with("FENCED")) => "warning",
         "heartbeat" if ev.down > 0 => "warning",
         _ => "info",
     }
@@ -394,6 +456,10 @@ pub fn severity(ev: &Event) -> &'static str {
 /// one), says what happened, and what was done or is expected.
 pub fn summary(n: &Notify, ev: &Event) -> String {
     let who = ev.addr.as_deref().map(|a| n.name_for(a)).unwrap_or_else(|| "a peer".into());
+    // PVOS D182 — events about THIS box (its fence) name it by its own
+    // announced address; without one, it is "the owner".
+    let me = ev.addr.as_deref().map(|a| n.name_for(a)).unwrap_or_else(|| "the owner".into());
+    let me_cap = format!("{}{}", me.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default(), me.chars().skip(1).collect::<String>());
     match ev.event.as_str() {
         "peer_down" => {
             let since = ev.since_ms.map(|s| format!(" It has not answered for {}.", minutes(ev.at_ms.saturating_sub(s)))).unwrap_or_default();
@@ -424,6 +490,26 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
             };
             format!("On {who}, the {job} job's error has cleared{lasted}. It had reported: {err}")
         }
+        "owner_fenced" => format!(
+            "{me_cap} has stopped writing to the forest: {}. It writes nothing until a person looks \
+             (pvfs forest fence on that box).",
+            ev.detail.as_deref().unwrap_or("a follower holds more of the log than it does")
+        ),
+        "owner_unfenced" => {
+            let how_long = ev.since_ms.map(|s| format!(" after {}", minutes(ev.at_ms.saturating_sub(s)))).unwrap_or_default();
+            format!("{me_cap}'s fence has been lifted{how_long}; it writes to the forest again.")
+        }
+        "peer_diverged" => format!(
+            "{who}'s copy of the forest's log differs from the owner's{}: it followed a writer that is \
+             not the owner, or was restored from the wrong copy. The owner takes no writes from it until it \
+             is re-seeded (pvfs replica add into a fresh directory).",
+            ev.detail.as_deref().map(|d| format!(" at {d}")).unwrap_or_default()
+        ),
+        "peer_diverged_cleared" => format!("{who}'s copy of the forest's log agrees with the owner's again."),
+        "heartbeat" if ev.detail.as_deref().is_some_and(|d| d.starts_with("FENCED")) => format!(
+            "Daily check-in: {me} is still fenced and writes nothing — {}. Run pvfs forest fence on it.",
+            ev.detail.as_deref().unwrap_or("").trim_start_matches("FENCED: ")
+        ),
         "heartbeat" => {
             if ev.down == 0 {
                 format!("All good: {} boxes up, nothing to do.", ev.up)
@@ -508,6 +594,12 @@ pub fn emit(data_dir: &Path, prev: Option<&FleetHealth>, next: &FleetHealth, now
     let mut state = load_state(data_dir);
     let mut events = transitions(prev, next, now_ms);
     events.extend(job_errors(&mut state, next, now_ms));
+    // PVOS D182 — a fenced owner's view of the fleet is not the fleet's (after
+    // a promotion it is a zombie, and the new owner reports the fleet): it
+    // says its own fence, its clear and the check-in, nothing else.
+    if next.fenced.is_some() {
+        events.retain(|e| matches!(e.event.as_str(), "owner_fenced" | "owner_unfenced"));
+    }
     if let Some(h) = heartbeat(&mut state, next, now_ms) {
         events.push(h);
     }

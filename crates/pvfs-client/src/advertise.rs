@@ -77,6 +77,12 @@ pub fn replica_route(
         }),
     }
     .map_err(remote_err)?;
+    // PVOS D182 — every write through this route carries this replica's own
+    // tip, so an owner that is behind it (restored, or replaced by a
+    // promotion) fences itself instead of forking the forest. Unreadable
+    // here means only that the check is skipped: the write is the same.
+    let mut client = client;
+    client.set_write_tip(pvfs_core::mount::peek_tip(data_dir).ok());
     let sign: BoxedSign =
         Box::new(move |d| crypto::sign_digest(&sign_key, d).unwrap_or_default());
     Ok(Some((client, sign)))

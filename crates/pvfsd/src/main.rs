@@ -121,9 +121,47 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// PVOS D182 — wait (at most `limit`) for the `health` job's first pass on
+/// this start, when that job is enabled. Returns at once when it is not.
+fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::Duration) {
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        let row = jobs.snapshot().into_iter().find(|j| j.name == "health");
+        match row {
+            Some(j) if j.enabled => {
+                if j.last_ok_ms.is_some() || j.last_error.is_some() {
+                    if said {
+                        eprintln!("pvfsd: health: first pass done — listening");
+                    }
+                    return;
+                }
+            }
+            _ => return,
+        }
+        if started.elapsed() >= limit {
+            eprintln!(
+                "pvfsd: health: no first pass within {} s — listening anyway (the fence still \
+                 checks every write's tip)",
+                limit.as_secs()
+            );
+            return;
+        }
+        if !said {
+            eprintln!("pvfsd: health: hearing the fleet before listening (D182)");
+            said = true;
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
+    let is_replica = engine.is_replica();
 
     // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
     // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
@@ -174,6 +212,17 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD, Some(d)))
     };
+
+    // PVOS D182 — an owner hears its peers before it takes a write from any.
+    // Its first health pass reads every follower's log tip, and a follower
+    // holding more of the log than this box fences it: it was restored from
+    // an older copy, or replaced by a promotion while it was away. Routed
+    // writes arrive only over the listener, so the listener waits for that
+    // pass — bounded, so a fleet that is itself down cannot keep the owner
+    // off the network.
+    if cli.listen.is_some() && !is_replica {
+        wait_for_first_health_pass(&jobs, std::time::Duration::from_secs(30));
+    }
 
     // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,
     // sharing the daemon and the shutdown flag.

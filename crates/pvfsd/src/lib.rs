@@ -329,6 +329,71 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    /// PVOS D182: this box's top-log tip, through the read pool — how the
+    /// owner's health job learns that a follower holds more of the log than
+    /// it does (and so that it is stale), and how the page shows lag.
+    pub fn log_tip_wire(&self) -> Option<pvfs_proto::LogTipWire> {
+        self.reader()
+            .log_tip_hash()
+            .ok()
+            .map(|(seq, hash)| pvfs_proto::LogTipWire { seq, hash: hex::encode(hash) })
+    }
+
+    /// PVOS D182 — the fence rule, applied to a routed write's tip (the
+    /// writing replica's own log). `None`: go ahead. `Some(refusal)`: prepare
+    /// nothing. Judged on the WRITER engine: the verdict may set the fence,
+    /// and must see the log exactly as the append would.
+    fn judge_writer_tip(&self, author: &[u8], t: &pvfs_proto::LogTipWire) -> Option<ServerMsg> {
+        use pvfs_core::fence::TipVerdict;
+        let Ok(hash) = hex::decode(&t.hash) else {
+            return Some(err("bad_input", "the write's log tip is not hex"));
+        };
+        let key = hex::encode(author);
+        let who = format!("the box with key {}…", &key[..key.len().min(16)]);
+        let judged = self.engine.lock().unwrap().judge_peer_tip(&who, t.seq, &hash);
+        match judged {
+            Ok((TipVerdict::Consistent, _)) => None,
+            Ok((TipVerdict::Ahead, _)) => {
+                let f = pvfs_core::fence::load(&self.data_dir).unwrap_or_default();
+                Some(err("forbidden", &f.refusal()))
+            }
+            Ok((TipVerdict::Diverged, own)) => {
+                eprintln!(
+                    "pvfsd: a write from {who} not accepted: its log differs from this owner's at \
+                     seq {} (this owner holds {own})",
+                    t.seq
+                );
+                Some(err(
+                    "forbidden",
+                    &format!(
+                        "your log differs from this owner's at seq {} — this box followed a writer \
+                         that is not the forest's owner, or was restored from the wrong copy. \
+                         Re-seed it (pvfs replica add into a fresh directory); nothing it sends \
+                         is written",
+                        t.seq
+                    ),
+                ))
+            }
+            // The owner could not read its own log: a transient answer, so the
+            // replica tries again, rather than a write let through unchecked.
+            Err(e) => Some(err(
+                "busy",
+                &format!("could not check this write's log tip against the owner's log ({e})"),
+            )),
+        }
+    }
+
+    /// PVOS D182: the fence, when this owner is fenced.
+    pub fn fence_wire(&self) -> Option<pvfs_proto::FenceWire> {
+        pvfs_core::fence::load(&self.data_dir).map(|f| pvfs_proto::FenceWire {
+            reason: f.reason,
+            peer: f.peer,
+            peer_seq: f.peer_seq,
+            own_seq: f.own_seq,
+            at_ms: f.at_ms,
+        })
+    }
+
     /// D129: catalogue regions this box holds a superseded snapshot of.
     pub fn stale_catalogue_count(&self) -> u64 {
         self.reader()
@@ -657,9 +722,11 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
-                        capacity: daemon.store_capacity(),
+                        capacity: daemon.store_capacity().map(Box::new),
                         trash: Box::new(j.trash_snapshot()),
                         stores: Box::new(daemon.store_filesystems()),
+                        log: daemon.log_tip_wire().map(Box::new),
+                        fenced: daemon.fence_wire().map(Box::new),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
@@ -667,9 +734,11 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
                         stale: daemon.stale_catalogue_count(),
-                        capacity: daemon.store_capacity(),
+                        capacity: daemon.store_capacity().map(Box::new),
                         trash: Box::default(),
                         stores: Box::new(daemon.store_filesystems()),
+                        log: daemon.log_tip_wire().map(Box::new),
+                        fenced: daemon.fence_wire().map(Box::new),
                     },
                 }
             }
@@ -733,7 +802,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             offset,
             max,
         } => do_region_manifest(daemon, principal, &region, seq, offset, max),
-        ClientMsg::PrepareWrite { op } => do_prepare_write(daemon, principal, op, conn),
+        ClientMsg::PrepareWrite { op, tip } => do_prepare_write(daemon, principal, op, tip.map(|b| *b), conn),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
         ClientMsg::ChunkManifest { node } => {
@@ -2317,11 +2386,33 @@ fn do_claim_write_lease(
     }
 }
 
-fn do_prepare_write(daemon: &Daemon, principal: &Principal, op: WriteOp, conn: u64) -> ServerMsg {
+fn do_prepare_write(
+    daemon: &Daemon,
+    principal: &Principal,
+    op: WriteOp,
+    tip: Option<pvfs_proto::LogTipWire>,
+    conn: u64,
+) -> ServerMsg {
     let author = match principal {
         Principal::Key(pk) => pk.clone(),
         _ => return err("forbidden", "writes require an authenticated identity"),
     };
+    // PVOS D182 — a fenced owner prepares nothing (the append would refuse at
+    // commit anyway; saying so here spares the round trip and the signing).
+    if let Some(f) = pvfs_core::fence::load(&daemon.data_dir) {
+        return err("forbidden", &f.refusal());
+    }
+    // PVOS D182 — the writer's own log is the evidence. A replica only ever
+    // copies this owner, so one that holds MORE of the log than this box
+    // proves this box stale (restored from an older copy, or replaced by a
+    // promotion): fence, and write nothing — at the first publish from the
+    // first box that is ahead, before a fork can start. One whose chain
+    // differs at its own tip is on another branch: refuse it, keep writing.
+    if let Some(t) = &tip {
+        if let Some(refusal) = daemon.judge_writer_tip(&author, t) {
+            return refusal;
+        }
+    }
     // D67 C3: the lease check sits where the author is established, so no
     // write path can reach the engine having skipped it.
     if let Some(node) = write_target(&op) {

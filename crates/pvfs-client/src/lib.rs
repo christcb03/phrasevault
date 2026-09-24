@@ -108,6 +108,10 @@ pub struct ServeStatusReply {
     /// PVOS D181 — the view mounts running on the box, each with the build it
     /// is on (empty from an older daemon, and from a box with no mount).
     pub mounts: Vec<pvfs_proto::MountWire>,
+    /// PVOS D182 — the box's top-log tip (absent from an older daemon).
+    pub log: Option<pvfs_proto::LogTipWire>,
+    /// PVOS D182 — present when the box is a fenced owner.
+    pub fenced: Option<pvfs_proto::FenceWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -173,6 +177,10 @@ pub struct Client {
     /// The daemon's `PROTO_VERSION`, learned from the connect challenge —
     /// what a consumer checks a minimum against (PVOS D63).
     daemon_proto: u32,
+    /// PVOS D182 — this box's top-log tip, sent with every routed write when
+    /// set ([`Client::set_write_tip`]): an owner behind it fences itself
+    /// instead of forking the forest.
+    write_tip: Option<pvfs_proto::LogTipWire>,
 }
 
 impl Client {
@@ -267,7 +275,7 @@ impl Client {
     fn finish(mut stream: Stream, daemon_proto: u32) -> Result<Client> {
         match read_msg::<_, ServerMsg>(&mut stream)? {
             Some(ServerMsg::Ready { principal }) => {
-                Ok(Client { stream, principal, daemon_proto })
+                Ok(Client { stream, principal, daemon_proto, write_tip: None })
             }
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
             Some(other) => Err(unexpected("Ready", &other)),
@@ -280,6 +288,15 @@ impl Client {
     /// (PVOS D63). Present before any op is sent.
     pub fn daemon_proto(&self) -> u32 {
         self.daemon_proto
+    }
+
+    /// PVOS D182 — carry this box's top-log tip `(seq, chain hash)` on every
+    /// routed write from here on. A replica sets it when it dials its owner
+    /// to write through: the owner compares it with its own log, and an owner
+    /// that is behind it (restored, or replaced by a promotion) fences itself
+    /// rather than append at seqs the fleet already holds.
+    pub fn set_write_tip(&mut self, tip: Option<(u64, Vec<u8>)>) {
+        self.write_tip = tip.map(|(seq, hash)| pvfs_proto::LogTipWire { seq, hash: hex::encode(hash) });
     }
 
     fn request(&mut self, req: ClientMsg) -> Result<ServerMsg> {
@@ -327,15 +344,19 @@ impl Client {
                 trash,
                 stores,
                 mounts,
+                log,
+                fenced,
             } => Ok(ServeStatusReply {
                 runner,
                 jobs,
                 conflicts,
                 stale,
-                capacity,
+                capacity: capacity.map(|b| *b),
                 trash: *trash,
                 stores: *stores,
                 mounts: *mounts,
+                log: log.map(|b| *b),
+                fenced: fenced.map(|b| *b),
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }
@@ -1208,7 +1229,8 @@ impl Client {
     where
         F: Fn(&[u8; 32]) -> Vec<u8>,
     {
-        let (prepared_id, preimages) = match self.request(ClientMsg::PrepareWrite { op })? {
+        let tip = self.write_tip.clone().map(Box::new);
+        let (prepared_id, preimages) = match self.request(ClientMsg::PrepareWrite { op, tip })? {
             ServerMsg::Prepared {
                 prepared_id,
                 preimages,

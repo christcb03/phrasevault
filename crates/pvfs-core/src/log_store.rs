@@ -193,3 +193,38 @@ pub fn read_event_in(conn: &Connection, db: &str, seq: u64) -> Result<Option<Eve
 pub fn read_event(conn: &Connection, seq: u64) -> Result<Option<EventRow>> {
     read_event_in(conn, TOP_LOG, seq)
 }
+
+/// PVOS D182 — a log's tip as one answer: its last seq and that row's chain
+/// hash, or `(0, [])` for an empty log. What the fence compares (a follower
+/// whose tip is past the owner's proves the owner stale) and what `pvfs forest
+/// tip` prints.
+pub fn tip_in(conn: &Connection, db: &str) -> Result<(u64, Vec<u8>)> {
+    let row: Option<(i64, Vec<u8>)> = conn
+        .query_row(
+            &format!("SELECT seq, chain_hash FROM {db}.events ORDER BY seq DESC LIMIT 1"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read log tip"))?;
+    Ok(row.map(|(s, h)| (s as u64, h)).unwrap_or((0, Vec::new())))
+}
+
+pub fn tip(conn: &Connection) -> Result<(u64, Vec<u8>)> {
+    tip_in(conn, TOP_LOG)
+}
+
+/// The chain hash at `seq`, when the log holds that row.
+pub fn hash_at_in(conn: &Connection, db: &str, seq: u64) -> Result<Option<Vec<u8>>> {
+    conn.query_row(
+        &format!("SELECT chain_hash FROM {db}.events WHERE seq = ?1"),
+        params![seq as i64],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(map_db("read chain hash"))
+}
+
+pub fn hash_at(conn: &Connection, seq: u64) -> Result<Option<Vec<u8>>> {
+    hash_at_in(conn, TOP_LOG, seq)
+}

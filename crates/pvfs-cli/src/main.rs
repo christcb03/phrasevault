@@ -902,6 +902,22 @@ enum ForestCmd {
     },
     /// Show a forest's identity (default: current context)
     Info { target: Option<String> },
+    /// PVOS D182 — this box's copy of the forest log: its tip (seq + chain
+    /// hash), whether this box is the owner or a replica (and of whom), and
+    /// whether the owner is fenced. Read-only and safe beside a running
+    /// daemon; what `promote.yml` compares across boxes before a promotion.
+    Tip { target: Option<String> },
+    /// PVOS D182 — show this owner's fence, and lift it. An owner fences
+    /// itself when a follower holds more of the log than it does (it was
+    /// restored from an older copy, or another box was promoted), and then
+    /// writes nothing. Bare: shows the fence and asks. Lift it only when this
+    /// box really is the forest's writer.
+    Fence {
+        target: Option<String>,
+        /// Lift the fence without asking (for scripts)
+        #[arg(long)]
+        clear: bool,
+    },
     /// Register an offline **rotation recovery key** (doc 15 §C5) so you can
     /// rotate the root even after total seed compromise. Reads your current
     /// recovery phrase from stdin to authorize; prints a NEW recovery phrase to
@@ -2433,6 +2449,9 @@ fn replica_write_client(data_dir: &std::path::Path) -> Result<(Client, SignFn), 
         }),
     }
     .map_err(remote_err)?;
+    // PVOS D182 — carry this replica's tip, as `advertise::replica_route` does.
+    let mut client = client;
+    client.set_write_tip(pvfs_core::mount::peek_tip(data_dir).ok());
     let sign: SignFn = Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
     Ok((client, sign))
 }
@@ -9271,6 +9290,116 @@ fn forest_cmd(
             }
             engine.close()
         }
+        ForestCmd::Tip { target } => {
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
+            let id = mount::peek_identity(&mount_dir)?;
+            let (seq, hash) = mount::peek_tip(&state)?;
+            let source = pvfs_core::ReplicaSource::load(&state).ok();
+            let fence = pvfs_core::fence::load(&state);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "forest_id": id.forest_id,
+                        "seq": seq,
+                        "hash": hex::encode(&hash),
+                        "replica": source.is_some(),
+                        "source": source.as_ref().map(|s| s.target.clone()),
+                        "fenced": fence.as_ref().map(|f| serde_json::json!({
+                            "reason": f.reason, "peer": f.peer, "peer_seq": f.peer_seq,
+                            "own_seq": f.own_seq, "at_ms": f.at_ms,
+                        })),
+                    })
+                );
+            } else {
+                println!("forest : {}", id.forest_id);
+                let short: String = hex::encode(&hash).chars().take(16).collect();
+                println!("log    : seq {seq}, hash {short}…");
+                match &source {
+                    Some(s) => println!("role   : replica, following {}", s.target),
+                    None => println!("role   : owner"),
+                }
+                match &fence {
+                    Some(f) => println!("fence  : FENCED {} — {}", ago(f.at_ms), f.reason),
+                    None if source.is_none() => println!("fence  : none"),
+                    None => {}
+                }
+            }
+            Ok(())
+        }
+        ForestCmd::Fence { target, clear } => {
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let Some(f) = pvfs_core::fence::load(&state) else {
+                if json {
+                    println!("{{\"fenced\":false}}");
+                } else {
+                    println!("not fenced — this box writes as usual");
+                }
+                return Ok(());
+            };
+            if !clear {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"fenced": true, "reason": f.reason, "peer": f.peer,
+                            "peer_seq": f.peer_seq, "own_seq": f.own_seq, "at_ms": f.at_ms})
+                    );
+                    return Ok(());
+                }
+                println!("FENCED {} — {}", ago(f.at_ms), f.reason);
+                println!();
+                println!("This box writes nothing while fenced. Lift the fence only when this box");
+                println!("really is the forest's writer:");
+                println!("  * another box was promoted: do not lift it — make this box a replica of");
+                println!("    the new owner (PVFS doc 28 §5) and retire this directory;");
+                println!("  * this box was restored behind its followers: promote the most advanced");
+                println!("    follower instead (promote.yml).");
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    println!("(pass --clear to lift it from a script)");
+                    return Ok(());
+                }
+                let a = prompt_line("lift the fence? [y/N]", Some("N"))?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return Ok(());
+                }
+            }
+            pvfs_core::fence::clear(&state)?;
+            // The next health pass sets it again if nothing has changed: say
+            // so, rather than let the lift look as if it did not work.
+            let again = pvfs_client::health::FleetHealth::load(&state)
+                .ok()
+                .flatten()
+                .map(|h| {
+                    h.peers
+                        .values()
+                        .filter(|r| r.last.log_verdict.as_deref() == Some("ahead"))
+                        .map(|r| r.addr.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if json {
+                println!("{}", serde_json::json!({"fenced": false, "lifted": f.reason, "still_ahead": again}));
+            } else {
+                println!("fence lifted (it said: {})", f.reason);
+                if !again.is_empty() {
+                    println!(
+                        "warning: the last health pass saw {} ahead of this box — unless that has \
+                         changed, the next pass (within 2 minutes) fences it again",
+                        again.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
         ForestCmd::RecoveryKey { forest, revoke } => {
             let state = forest_state_dir(forest, ctx)?;
             let auth_mn = read_phrase_stdin("current recovery phrase (to authorize)")?;
@@ -9436,6 +9565,7 @@ fn serve_status_print(
     let st = client.serve_status_full().map_err(remote_err)?;
     let (runner, jobs, conflicts, stale, capacity, trash, stores) =
         (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash, st.stores);
+    let (log, fenced) = (st.log, st.fenced);
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -9455,7 +9585,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -9463,9 +9593,18 @@ fn serve_status_print(
                 .unwrap_or_else(|| "null".into()),
             serde_json::to_string(&trash).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&stores).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&log).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&fenced).unwrap_or_else(|_| "null".into()),
         );
     } else {
+        // PVOS D182 — first, because nothing else matters while it holds.
+        if let Some(f) = &fenced {
+            println!("FENCED: {} — this owner writes nothing until a person looks (pvfs forest fence)", f.reason);
+        }
         println!("runner: {runner}");
+        if let Some(t) = &log {
+            println!("log: seq {}  (this box's copy of the forest log; D182)", t.seq);
+        }
         if conflicts > 0 {
             println!("conflicts: {conflicts}  (see `pvfs view conflicts`; D127)");
         }

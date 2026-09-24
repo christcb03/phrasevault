@@ -781,7 +781,11 @@ impl Engine {
             }
         }
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
-        engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
+        // PVOS D182: a fenced owner still opens — it serves reads and reports
+        // its fence — it only writes nothing, and a split is a write.
+        if crate::fence::load(&engine.data_dir).is_none() {
+            engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
+        }
         Ok(engine)
     }
 
@@ -926,6 +930,43 @@ impl Engine {
     /// Highest seq in the log (the chain tip position).
     pub fn log_tip(&self) -> Result<u64> {
         log_store::max_seq(&self.conn)
+    }
+
+    /// PVOS D182 — the top log's tip: its seq and that row's chain hash.
+    pub fn log_tip_hash(&self) -> Result<(u64, Vec<u8>)> {
+        log_store::tip(&self.conn)
+    }
+
+    /// PVOS D182 — judge a peer's top-log tip against this forest's log
+    /// ([`crate::fence::judge`]), and FENCE this owner when the peer is ahead:
+    /// a follower holding more of the log than its only writer proves the
+    /// writer stale. `peer` names who said so, for the person who reads the
+    /// fence. A replica judges but never fences (it writes nothing anyway).
+    /// Returns the verdict and this log's tip seq.
+    pub fn judge_peer_tip(
+        &self,
+        peer: &str,
+        peer_seq: u64,
+        peer_hash: &[u8],
+    ) -> Result<(crate::fence::TipVerdict, u64)> {
+        let (own_seq, own_hash) = self.log_tip_hash()?;
+        let at = if peer_seq > 0 && peer_seq <= own_seq {
+            log_store::hash_at(&self.conn, peer_seq)?
+        } else {
+            None
+        };
+        let verdict = crate::fence::judge(own_seq, at.as_deref(), peer_seq, peer_hash);
+        crate::fence::fence_if_ahead(
+            &self.data_dir,
+            self.replica,
+            verdict,
+            peer,
+            peer_seq,
+            peer_hash,
+            own_seq,
+            &own_hash,
+        )?;
+        Ok((verdict, own_seq))
     }
 
     /// Raw log rows `[from_seq ..]`, at most `max` (log shipping, F2). The
@@ -1429,6 +1470,17 @@ impl Engine {
                 action: "write".into(),
                 reason: "replica forest is read-only — its owner instance is the only writer"
                     .into(),
+            });
+        }
+        // PVOS D182 — a fenced owner writes nothing: a follower holds a longer
+        // log than this box, so every event appended here would fork the
+        // forest. This is the one choke point every owner append passes (the
+        // daemon's routed writes, the CLI, the mount, every serve job's pass);
+        // only a person lifts it (`pvfs forest fence`).
+        if let Some(f) = crate::fence::load(&self.data_dir) {
+            return Err(PvfsError::Forbidden {
+                action: "write".into(),
+                reason: f.refusal(),
             });
         }
         let routes = self.route_events(&events)?;
