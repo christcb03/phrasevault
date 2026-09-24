@@ -29,7 +29,7 @@ VA=$(ssh "$A" '"$HOME/.local/bin/pvfs" --version' 2>&1); VB=$(ssh "$B" '"$HOME/.
 for h in "$A" "$B"; do
   ssh "$h" 'for c in tip fence backup restore; do "$HOME/.local/bin/pvfs" forest $c --help >/dev/null 2>&1 || exit 1; done' \
     && ok "$h has forest tip/fence/backup/restore" || fail "$h: not a D182 build"
-  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d182" 2>/dev/null; pkill -f "d182-companion" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d182-*; mkdir -p "$HOME/fleet-test"' \
+  ssh "$h" 'pkill -f "pvfsd --mount $HOME/fleet-test/d182" 2>/dev/null; pkill -f "[d]182-companion" 2>/dev/null; sleep 1; rm -rf "$HOME/fleet-test"/d182-*; mkdir -p "$HOME/fleet-test"' \
     && ok "$h: clean slate" || fail "$h: clean slate"
 done
 AKEY=$(ssh "$A" '"$HOME/.local/bin/pvfs" --json whoami' | python3 -c 'import json,sys; print(json.load(sys.stdin)["pubkey"])')
