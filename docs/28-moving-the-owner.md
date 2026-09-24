@@ -30,7 +30,9 @@ opt-in for other users — doc 08, the availability track.)
 **The standby** (PVOS D182) is a follower kept for exactly this: its own
 daemon and directory (production: `mediabox-standby`, `/srv/pvfs/media2-standby`,
 port 7435 on mediabox — bare metal, off the PVE host that carries the owner's
-VM), `follow` only, announced so the owner's health job probes it; the page
+VM — and its own socket dir, `/tmp/pvfs-standby`, because mediabox's holder
+daemon serves the same forest and a daemon's socket is named by the forest id),
+`follow` only, announced so the owner's health job probes it; the page
 shows its lag, and it makes the daily dated copy of the log (§7). Promoting it
 leaves the fleet's shape unchanged: an owner that holds no bytes, in a daemon
 of its own. Any follower can be promoted by hand; `promote.sh` promotes only a
