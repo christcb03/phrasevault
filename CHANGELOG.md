@@ -51,7 +51,11 @@ file tracks Layer 0, the file-system engine.
   `pvfs forest tip` (read-only, beside a running daemon), `pvfs forest
   backup` (a dated copy by `VACUUM INTO`, verified by a full replay, pruned
   by `--keep`; `backup` in `serve status`) and `pvfs forest restore`.
-  Notify labels resolve by `host:port` before host. `ServeJobs` boxes `jobs`
+  A second `pvfsd` for a forest whose socket already answers refuses to
+  start instead of deleting it and taking its place (the socket is
+  `<dir>/<forest_id>.sock`, so a standby beside a holder's replica on one box
+  needs its own `PVFS_SOCKET_DIR`), and it refuses before sweeping sync tmp
+  files. Notify labels resolve by `host:port` before host. `ServeJobs` boxes `jobs`
   and `capacity` (same JSON) to stay under clippy's 128 bytes. Wire: two
   defaulted fields and one optional request field — no proto bump. Lab:
   `deploy/d182-owner-pair.sh`; doc 28 rewritten around PVOS `promote.sh`.

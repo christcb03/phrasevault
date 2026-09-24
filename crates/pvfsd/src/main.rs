@@ -163,17 +163,6 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = engine.data_dir().to_path_buf();
     let is_replica = engine.is_replica();
 
-    // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
-    // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
-    // the file is never re-fetched. Sinks are process-local, so nothing holds
-    // a tmp across restarts — sweep before the job runner can begin a fetch.
-    // Best-effort: a failed sweep is worth a warning, never a refused start.
-    match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
-        Ok(0) => {}
-        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
-        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
-    }
-
     let socket = match &cli.socket {
         Some(s) => s.clone(),
         None => {
@@ -190,6 +179,32 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             mount::daemon_socket_path(&engine.identity.forest_id)
         }
     };
+
+    // PVOS D182 — a socket that ANSWERS is another daemon's, and with the
+    // conventional path it is another daemon of this same forest on this box
+    // (the name is the forest id): a standby beside a holder's replica, say.
+    // Removing it would hand that daemon's local clients — its CLI, its mount —
+    // to this one without a word. Refuse, and say how to run two — before the
+    // tmp sweep below, which would delete that daemon's in-flight fetches. A
+    // stale socket (a hard kill) refuses the connection and is cleared as before.
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Err(format!(
+            "another pvfsd already serves {} — give this daemon its own socket \
+             (--socket <path>, or PVFS_SOCKET_DIR for it and its clients)",
+            socket.display()
+        )
+        .into());
+    }
+    // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
+    // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
+    // the file is never re-fetched. Sinks are process-local, so nothing holds
+    // a tmp across restarts — sweep before the job runner can begin a fetch.
+    // Best-effort: a failed sweep is worth a warning, never a refused start.
+    match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
+        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
+    }
 
     let daemon = Arc::new(Daemon::new(engine));
     let _ = std::fs::remove_file(&socket); // clear a stale socket from a previous hard kill
