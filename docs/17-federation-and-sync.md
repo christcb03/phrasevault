@@ -556,7 +556,7 @@ no new wire ops, no schema change, no CLI surface.
    **Built as P7.3's unprivileged `pvfs mount` (doc 20 §3).**
 3. ✅ **Swarm data plane**: multi-source fetch-by-hash (doc 03 §2.1's future schemes; P2-F's seam).
    **Built as P9 (doc 22).**
-4. ☐ **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic
+4. ☑ **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic: D128, then PVOS D182 (the fence, the standby, `promote.sh`, companion promotion, dated copies; doc 28). What remains is doc 08's availability track (D, B, C, E).
    dual-writers. **The only remaining F4 item.**
 
 ---
