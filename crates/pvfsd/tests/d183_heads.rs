@@ -119,6 +119,8 @@ fn heads_move_box_to_box_while_the_owner_is_down_and_commit_when_it_is_back() {
         let pending = h.pending_region_heads().unwrap();
         assert_eq!(pending.len(), 1, "the head is published here and pending");
         assert_eq!((pending[0].0.as_str(), pending[0].1), (region.as_str(), 1));
+        let st = h.catalogue_status().unwrap().into_iter().find(|s| s.region == region).unwrap();
+        assert_eq!((st.local, st.committed_seq, st.pending), (true, 0, Some(1)), "region ls says so");
         h.close().unwrap();
     }
     let pdir = tempfile::tempdir().unwrap();
@@ -166,6 +168,8 @@ fn heads_move_box_to_box_while_the_owner_is_down_and_commit_when_it_is_back() {
     follow_once(&mut to_owner, &hdata);
     let h = Engine::open(&hdata).unwrap();
     assert!(h.pending_region_heads().unwrap().is_empty(), "nothing pending once the log holds it");
+    let st = h.catalogue_status().unwrap().into_iter().find(|s| s.region == region).unwrap();
+    assert_eq!((st.committed_seq, st.pending), (1, None));
     h.close().unwrap();
 
     // The peer follows the owner: the committed head arrives and the

@@ -4,7 +4,7 @@
 
 use pvfs_core::acl::Principal;
 use pvfs_core::event::{self, Event};
-use pvfs_core::{crypto, identity, BindSpec, ClaimOutcome, Engine, HashPolicy, NodeSpec, RegionEntry, TYPE_FOLDER};
+use pvfs_core::{crypto, identity, BindSpec, ClaimOutcome, Engine, HashPolicy, NodeSpec, RegionEntry, ReplicaSource, ReplicaStore, TYPE_FOLDER};
 
 fn folder(e: &mut Engine, parent: &str, label: &str) -> String {
     e.add_node(
@@ -200,29 +200,59 @@ fn a_committed_head_clears_the_provisional_one() {
 }
 
 #[test]
-fn region_claims_sign_this_boxs_newest_published_heads() {
+fn region_claims_sign_a_replicas_newest_published_heads() {
     let s = setup();
-    assert!(s.e.catalogues_only().unwrap(), "every binding here is a catalogue region");
     let author = crypto::pubkey_bytes(&s.holder);
-    // The setup's scan published `local` at seq 1; `far` is not this box's.
-    let claims = s.e.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap();
-    assert_eq!(claims.iter().map(|c| (c.region.as_str(), c.seq)).collect::<Vec<_>>(), vec![(s.local.as_str(), 1)]);
+    // The forest owner offers none: it commits its heads straight into the log.
+    assert!(s.e.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap().is_empty());
+
+    // A replica that catalogues `far`, scanning with the owner away.
+    let rows = s.e.log_events(1, s.e.log_tip().unwrap() as usize).unwrap();
+    let rdir = s._tmp.path().join("replica");
+    ReplicaStore::open(&rdir).unwrap().append(&rows).unwrap();
+    ReplicaSource {
+        transport: "socket".into(),
+        target: s._tmp.path().join("owner.sock").display().to_string(),
+        pin: String::new(),
+        region: String::new(),
+    }
+    .save(&rdir)
+    .unwrap();
+    let media = s._tmp.path().join("far-media");
+    std::fs::create_dir_all(media.join("Shows")).unwrap();
+    std::fs::write(media.join("Shows/one.mkv"), b"one").unwrap();
+    let mut r = Engine::open(&rdir).unwrap();
+    r.bind_folder(
+        &s.far,
+        BindSpec {
+            source_uri: format!("file://{}", media.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy: HashPolicy::OnAdd,
+        },
+    )
+    .unwrap();
+    assert!(r.catalogues_only().unwrap(), "every binding here is a catalogue region");
+    let mut away = pvfs_core::OwnerAway;
+    r.scan_routed(None, Some(&mut away), 0).unwrap();
+    let claims = r.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap();
+    assert_eq!(claims.iter().map(|c| (c.region.as_str(), c.seq)).collect::<Vec<_>>(), vec![(s.far.as_str(), 1)]);
     let ev = Event::decode(event::K_SUB_REGION_HEAD, &claims[0].body).unwrap();
     ev.verify_sig().unwrap();
     match ev {
         Event::SubRegionHead { node_id, head_seq, head_hash, author: a, .. } => {
-            assert_eq!((node_id.as_str(), head_seq, a.as_slice()), (s.local.as_str(), 1, author.as_slice()));
+            assert_eq!((node_id.as_str(), head_seq, a.as_slice()), (s.far.as_str(), 1, author.as_slice()));
             assert_eq!(hex::encode(head_hash), claims[0].hash);
         }
         other => panic!("{other:?}"),
     }
-    // A scan through `OwnerAway` still publishes (on a replica it would stay
-    // pending); the claim follows the newest.
-    let mut e = s.e;
-    let dir = e.bindings_for(&s.local).unwrap()[0].source_uri.trim_start_matches("file://").to_string();
-    std::fs::write(format!("{dir}/Shows/new.mkv"), b"new-bytes").unwrap();
-    let mut away = pvfs_core::OwnerAway;
-    e.scan_routed(Some(&s.local), Some(&mut away), 0).unwrap();
-    let claims = e.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap();
-    assert_eq!(claims[0].seq, 2);
+    // Another scan while still away: the claim follows the newest, and one
+    // head per region is pending — the newest, which is what commits.
+    std::fs::write(media.join("Shows/two.mkv"), b"two").unwrap();
+    r.scan_routed(None, Some(&mut away), 0).unwrap();
+    let claims = r.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap();
+    assert_eq!(claims.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(r.pending_region_heads().unwrap().iter().map(|p| p.1).collect::<Vec<_>>(), vec![2]);
+    r.close().unwrap();
 }

@@ -5,6 +5,31 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The owner out of the daily path (PVOS D183).** A catalogue region's head
+  was already signed by the box that owns the region; it now also travels
+  **box to box**, so an owner outage no longer freezes cataloguing, the heads
+  between boxes, or anything downstream of them. A replica whose bindings are
+  all catalogue regions scans with no route (`OwnerAway`): its rows are local
+  and its head is **published here, pending** (`region ls` `pending`), then
+  committed through the existing `CommitRegionHead` by the next routed watch
+  pass or the `catalogue` job — the newest per region, so an outage costs the
+  log one row per region. New read op **`RegionClaims`** (proto 12,
+  member-gated): a replica's daemon answers with a fresh `SubRegionHead` for
+  each region it binds and has published, signed by its client identity. The
+  `catalogue` job asks every endpoint and takes each claim the fold's own rule
+  accepts (signature; catalogue region; active, unrevoked author with admin
+  on it; a seq past what is held) as a **provisional head**
+  (`region_provisional`, schema v20, in place); a second hash at a held seq is
+  refused. `catalogue_status`, the fetch pass and `install_region_snapshot`
+  read max(committed, provisional); the fold of a committed head at or past a
+  provisional one deletes it; `region ls` shows `provisional` and
+  `committed`. A head the owner already holds settles instead of failing the
+  pass, and a local head the log names differently at the same seq is
+  published past. Client dials time out after 10 s (a powered-off host cost
+  every dial the kernel's ~2 min of SYN retries). An outage still stops what
+  is the owner's own: admin changes, revocations, NAS supervision, the health
+  observer and the HA feed. Lab: `deploy/d183-heads-pair.sh`.
+
 - **The owner can be lost (PVOS D182).** A follower only ever copies the
   owner, so a follower holding more of the log than the owner proves it
   stale — restored from an older copy, or replaced by a promotion. Such an

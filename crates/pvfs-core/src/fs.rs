@@ -579,6 +579,9 @@ pub struct CatalogueStatus {
     pub local: bool,
     /// The log attests a newer head than the copy held.
     pub stale: bool,
+    /// PVOS D183: for a region this box catalogues, a head it published past
+    /// the log's (while the owner was away) and has not committed yet.
+    pub pending: Option<u64>,
     pub fetched_at: Option<u64>,
     pub source: Option<String>,
     /// Rows held here.
@@ -1995,6 +1998,8 @@ impl Engine {
             .map_err(map_db("catalogue status"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_db("catalogue status"))?;
+        let pending: std::collections::HashMap<NodeId, u64> =
+            self.pending_region_heads()?.into_iter().map(|(r, seq, _)| (r, seq)).collect();
         let mut out = Vec::with_capacity(rows.len());
         for (region, committed_seq, committed_head, held, fetched_at, source, entries, p_seq, p_hash) in rows {
             let local = self.catalogues_here(&region)?;
@@ -2004,6 +2009,7 @@ impl Engine {
                 _ => (committed_seq, committed_head, false),
             };
             let held_seq = if local { Some(head_seq) } else { held };
+            let pending_here = if local { pending.get(&region).copied() } else { None };
             out.push(CatalogueStatus {
                 region,
                 head_seq,
@@ -2013,6 +2019,7 @@ impl Engine {
                 held_seq,
                 local,
                 stale: !local && held_seq.unwrap_or(0) < head_seq,
+                pending: pending_here,
                 fetched_at,
                 source,
                 entries,
@@ -2074,9 +2081,17 @@ impl Engine {
         self.published_heads(true)
     }
 
-    /// The newest `region_snapshots` row per catalogue region — all of them,
-    /// or (`pending_only`) those past the log's committed head.
+    /// The newest `region_snapshots` row per catalogue region this box still
+    /// binds — all of them, or (`pending_only`) those past the log's committed
+    /// head. Only a replica's: the forest owner commits its heads straight
+    /// into the log, and a claim signed by its client key (which need hold no
+    /// grant on the owner's regions) would only be refused by every peer.
     fn published_heads(&self, pending_only: bool) -> Result<Vec<(NodeId, u64, String)>> {
+        if !self.replica {
+            return Ok(Vec::new());
+        }
+        let bound: std::collections::HashSet<NodeId> =
+            self.local_bindings()?.into_iter().map(|b| b.folder_id).collect();
         let mut stmt = self
             .conn
             .prepare(
@@ -2101,7 +2116,7 @@ impl Engine {
             .map_err(map_db("published heads"))?;
         Ok(rows
             .into_iter()
-            .filter(|(_, seq, _, committed)| !pending_only || seq > committed)
+            .filter(|(region, seq, _, committed)| bound.contains(region) && (!pending_only || seq > committed))
             .map(|(region, seq, hash, _)| (region, seq, hash))
             .collect())
     }

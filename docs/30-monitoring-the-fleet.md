@@ -268,7 +268,7 @@ a systemd timer every minute, **read-only everywhere**:
 |---|---|
 | `fleet-health.json` | each peer: up/down, announced version (§1.2: not its build), jobs with last run, free space, trash |
 | `pvfs serve status --json` | the owner's own jobs |
-| `pvfs region ls --json` | each catalogue region's head and entries |
+| `pvfs region ls --json` | each catalogue region's head and entries; since PVOS D183 also `committed` (the log's head), `provisional` (the head was taken from the region's own box while the owner was away) and, for a region this box catalogues, `pending` (a head published here that the owner has not committed yet) |
 | `pvfs region entries <id> --json` (only when a head moves) | the file lists diffed into "moved / deleted" |
 | the holder's `progress` verb (§1.3, the supervise key) | the mover: partial sizes + the receive plan |
 | `pvfs view ls <dir> --json` (cached by hash) | sizes of queued files |
