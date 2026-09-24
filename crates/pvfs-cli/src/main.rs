@@ -9431,6 +9431,8 @@ fn forest_cmd(
                     "{}",
                     serde_json::json!({
                         "forest_id": id.forest_id,
+                        // the genesis root: what a companion must hold to promote (D182)
+                        "root": hex::encode(&id.root_pubkey),
                         "seq": seq,
                         "hash": hex::encode(&hash),
                         "replica": source.is_some(),
@@ -9443,6 +9445,7 @@ fn forest_cmd(
                 );
             } else {
                 println!("forest : {}", id.forest_id);
+                println!("root   : {}", hex::encode(&id.root_pubkey));
                 let short: String = hex::encode(&hash).chars().take(16).collect();
                 println!("log    : seq {seq}, hash {short}…");
                 match &source {
