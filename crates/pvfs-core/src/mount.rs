@@ -106,6 +106,16 @@ pub fn peek_tip(data_dir: &Path) -> Result<(u64, Vec<u8>)> {
     crate::log_store::tip_in(&conn, "main")
 }
 
+/// PVOS D185 — the forest's CURRENT root (the last `RootRotated`'s key, else
+/// the genesis root), read-only beside a running daemon. It is the key a
+/// companion must hold to promote (D182): genesis's alone is wrong once the
+/// root has been rotated.
+pub fn peek_current_root(data_dir: &Path, identity: &ForestIdentity) -> Result<Vec<u8>> {
+    let conn = Connection::open_with_flags(data_dir.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(map_db("open projection read-only"))?;
+    crate::projection::current_root(&conn, identity)
+}
+
 // ---- mount-level engine lifecycle ---------------------------------------------
 
 /// `pvfs forest init` (doc 05 §5.1): genesis under `<mount>/.pvfs/`, then

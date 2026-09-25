@@ -132,7 +132,7 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
             Some(j) if j.enabled => {
                 if j.last_ok_ms.is_some() || j.last_error.is_some() {
                     if said {
-                        eprintln!("pvfsd: health: first pass done — listening");
+                        eprintln!("pvfsd: health: first pass done — taking network writes");
                     }
                     return;
                 }
@@ -141,14 +141,17 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
         }
         if started.elapsed() >= limit {
             eprintln!(
-                "pvfsd: health: no first pass within {} s — listening anyway (the fence still \
-                 checks every write's tip)",
+                "pvfsd: health: no first pass within {} s — taking network writes anyway (the \
+                 fence still checks every write's tip)",
                 limit.as_secs()
             );
             return;
         }
         if !said {
-            eprintln!("pvfsd: health: hearing the fleet before listening (D182)");
+            eprintln!(
+                "pvfsd: health: hearing the fleet before taking network writes (D182); reads are \
+                 served meanwhile (D185)"
+            );
             said = true;
         }
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -232,12 +235,23 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Its first health pass reads every follower's log tip, and a follower
     // holding more of the log than this box fences it: it was restored from
     // an older copy, or replaced by a promotion while it was away. Routed
-    // writes arrive only over the listener, so the listener waits for that
-    // pass — bounded, so a fleet that is itself down cannot keep the owner
-    // off the network.
-    if cli.listen.is_some() && !is_replica {
-        wait_for_first_health_pass(&jobs, std::time::Duration::from_secs(30));
-    }
+    // writes arrive only over the listener, so they wait for that pass —
+    // bounded, so a fleet that is itself down cannot keep the owner from
+    // writing.
+    //
+    // PVOS D185 — only the WRITES wait. The listener opens at once and serves
+    // reads (bytes, manifests, the log) meanwhile: an owner that holds regions
+    // is also where its peers read those regions' files.
+    let writes_gate = if cli.listen.is_some() && !is_replica {
+        daemon.hold_network_writes(true);
+        let (j, d) = (Arc::clone(&jobs), Arc::clone(&daemon));
+        Some(std::thread::spawn(move || {
+            wait_for_first_health_pass(&j, std::time::Duration::from_secs(30));
+            d.hold_network_writes(false);
+        }))
+    } else {
+        None
+    };
 
     // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,
     // sharing the daemon and the shutdown flag.
@@ -291,6 +305,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // `_guard` on return. The TLS accept loop polls the same flag — join it so its
     // listener closes before the checkpoint.
     if let Some(t) = tls_thread {
+        let _ = t.join();
+    }
+    // The first-pass wait watches SHUTDOWN too, so this returns at once.
+    if let Some(t) = writes_gate {
         let _ = t.join();
     }
     let _ = drain.join();

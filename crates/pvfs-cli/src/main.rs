@@ -9434,6 +9434,10 @@ fn forest_cmd(
             let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
             let id = mount::peek_identity(&mount_dir)?;
             let (seq, hash) = mount::peek_tip(&state)?;
+            // PVOS D185 — the CURRENT root (a rotation changes it): what a
+            // companion must hold to promote (D182). A projection that cannot
+            // be read yet (a copy just restored) falls back to genesis's.
+            let root = mount::peek_current_root(&state, &id).unwrap_or_else(|_| id.root_pubkey.clone());
             let source = pvfs_core::ReplicaSource::load(&state).ok();
             let fence = pvfs_core::fence::load(&state);
             if json {
@@ -9441,8 +9445,7 @@ fn forest_cmd(
                     "{}",
                     serde_json::json!({
                         "forest_id": id.forest_id,
-                        // the genesis root: what a companion must hold to promote (D182)
-                        "root": hex::encode(&id.root_pubkey),
+                        "root": hex::encode(&root),
                         "seq": seq,
                         "hash": hex::encode(&hash),
                         "replica": source.is_some(),
@@ -9455,7 +9458,7 @@ fn forest_cmd(
                 );
             } else {
                 println!("forest : {}", id.forest_id);
-                println!("root   : {}", hex::encode(&id.root_pubkey));
+                println!("root   : {}", hex::encode(&root));
                 let short: String = hex::encode(&hash).chars().take(16).collect();
                 println!("log    : seq {seq}, hash {short}…");
                 match &source {

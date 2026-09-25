@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **An owner that holds its own regions (PVOS D185).** A holder promoted to
+  owner (D182) keeps its `bindings.local`, and it now keeps its library too:
+  `bindings_for` marks those rows as this device's, as `bindings()` and
+  `binding_for()` always did, so the owner-side checks that filter on
+  `bound_by == me` see them. Before, a promoted holder served none of its own
+  bytes (`CatHash` said "no bytes for that hash"; its own view could not read
+  its disks), refused view trashes and renames there, left its disks out of
+  `stores`, and `pvfs scan <region>` called its region "bound on another
+  machine". Unbinding a root the log never held (a local one) on an owner
+  edits `bindings.local` instead of logging an unbind that changed nothing.
+  An owner that has just started opens its listener at once and serves
+  reads; only **routed writes** wait for its first health pass (D182's fence,
+  still bounded at 30 s), answered `busy` meanwhile — the whole listener used
+  to wait. `forest tip` prints the forest's **current** root (the last
+  `RootRotated`'s, else genesis's) — the key a companion must hold to
+  promote.
 - **The owner out of the daily path (PVOS D183).** A catalogue region's head
   was already signed by the box that owns the region; it now also travels
   **box to box**, so an owner outage no longer freezes cataloguing, the heads

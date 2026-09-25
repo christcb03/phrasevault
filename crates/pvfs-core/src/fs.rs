@@ -912,7 +912,12 @@ impl Engine {
                 ))
             }
         };
-        if self.replica {
+        // D185 — a promoted holder keeps its enrollments in `bindings.local`;
+        // unbinding one of those edits the file, exactly as it did while the
+        // box was a replica. Only a root the log recorded gets a logged
+        // unbind — one for a root the log never held would leave the local
+        // row, and the binding, where it was.
+        if self.replica || !self.is_logged_root(folder, &target)? {
             let mut rows = load_local_bindings(&self.data_dir)?;
             rows.retain(|b| !(b.folder_id == *folder && b.source_uri == target));
             return save_local_bindings(&self.data_dir, &rows);
@@ -960,20 +965,75 @@ impl Engine {
         // Exactly Chris's NAS with `Data` and `Data_ext`. Invisible to
         // single-box testing, because an owner's bindings are LOGGED and come
         // from the query above; only a replica's are local, and only a replica
-        // can have several.
-        let me = self.device.pubkey();
-        for mut b in load_local_bindings(&self.data_dir)? {
+        // can have several (D185: or a holder promoted to owner, which keeps
+        // its file).
+        for b in self.local_binding_rows()? {
             if out
                 .iter()
                 .any(|l| l.folder_id == b.folder_id && l.source_uri == b.source_uri)
             {
                 continue;
             }
-            b.bound_by = me.clone();
             out.push(b);
         }
         out.sort_by(|a, b| a.folder_id.cmp(&b.folder_id));
         Ok(out)
+    }
+
+    /// This machine's own enrollments (`bindings.local`, D71 W4), each marked
+    /// as bound by this device. The file stores no author — it is this box's
+    /// by where it lives — so every reader goes through here rather than
+    /// filling `bound_by` itself.
+    ///
+    /// D185 — `bindings_for` used to take the rows raw, with `bound_by` empty.
+    /// Harmless on a replica, whose branches read the file directly; fatal on
+    /// a PROMOTED holder, which keeps its file and becomes an owner whose
+    /// branches filter on `bound_by == me`: it stopped serving its own bytes,
+    /// reading its own disks in its view, and trashing or renaming there.
+    fn local_binding_rows(&self) -> Result<Vec<Binding>> {
+        let me = self.device.pubkey();
+        Ok(load_local_bindings(&self.data_dir)?
+            .into_iter()
+            .map(|mut b| {
+                b.bound_by = me.clone();
+                b
+            })
+            .collect())
+    }
+
+    /// D185 — the roots THIS box binds for `folder`. On a replica, only its
+    /// `bindings.local` rows (the log's rows there are other boxes'). On an
+    /// owner, its logged `FolderBound` rows AND its `bindings.local` rows —
+    /// the enrollments a promoted holder brought with it.
+    fn own_bindings_for(&self, folder: &NodeId) -> Result<Vec<Binding>> {
+        if self.replica {
+            return Ok(self
+                .local_binding_rows()?
+                .into_iter()
+                .filter(|b| b.folder_id == *folder)
+                .collect());
+        }
+        let me = self.device.pubkey();
+        Ok(self
+            .bindings_for(folder)?
+            .into_iter()
+            .filter(|b| b.bound_by == me)
+            .collect())
+    }
+
+    /// D185 — whether `folder`'s root `source_uri` is a LOGGED binding (a
+    /// `FolderBound` row still bound), as opposed to a `bindings.local` one.
+    fn is_logged_root(&self, folder: &NodeId, source_uri: &str) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM folder_bindings
+                  WHERE folder_id = ?1 AND source_uri = ?2 AND unbound_at IS NULL",
+                params![folder, source_uri],
+                |r| r.get(0),
+            )
+            .map_err(map_db("binding lookup"))?;
+        Ok(n > 0)
     }
 
     /// The bindings THIS machine owns — the only ones whose `source_uri`
@@ -1028,7 +1088,7 @@ impl Engine {
         for r in rows {
             out.push(r.map_err(map_db("binding lookup"))??);
         }
-        for b in load_local_bindings(&self.data_dir)? {
+        for b in self.local_binding_rows()? {
             if b.folder_id == *folder && !out.iter().any(|x| x.source_uri == b.source_uri) {
                 out.push(b);
             }
@@ -1050,16 +1110,10 @@ impl Engine {
         match got {
             Some(r) => Ok(Some(r?)),
             // Fall through to this machine's own enrollments (D71 W4).
-            None => {
-                let me = self.device.pubkey();
-                Ok(load_local_bindings(&self.data_dir)?
-                    .into_iter()
-                    .find(|b| b.folder_id == *folder)
-                    .map(|mut b| {
-                        b.bound_by = me;
-                        b
-                    }))
-            }
+            None => Ok(self
+                .local_binding_rows()?
+                .into_iter()
+                .find(|b| b.folder_id == *folder)),
         }
     }
 
@@ -2429,19 +2483,7 @@ impl Engine {
             if !self.catalogues_here(&region)? {
                 continue;
             }
-            let mine: Vec<Binding> = if self.replica {
-                load_local_bindings(&self.data_dir)?
-                    .into_iter()
-                    .filter(|b| b.folder_id == region)
-                    .collect()
-            } else {
-                let me = self.device.pubkey();
-                self.bindings_for(&region)?
-                    .into_iter()
-                    .filter(|b| b.bound_by == me)
-                    .collect()
-            };
-            for b in mine {
+            for b in self.own_bindings_for(&region)? {
                 let Ok(root) = self
                     .resolve_uri(&b.source_uri)
                     .and_then(|u| crate::storage::uri_to_path(&u))
@@ -2519,19 +2561,8 @@ impl Engine {
         if !self.is_catalogue_region(region)? || !self.catalogues_here(region)? {
             return Ok(None);
         }
-        let mine: Vec<Binding> = if self.replica {
-            load_local_bindings(&self.data_dir)?
-                .into_iter()
-                .filter(|b| &b.folder_id == region)
-                .collect()
-        } else {
-            let me = self.device.pubkey();
-            self.bindings_for(region)?
-                .into_iter()
-                .filter(|b| b.bound_by == me)
-                .collect()
-        };
-        let roots: Vec<std::path::PathBuf> = mine
+        let roots: Vec<std::path::PathBuf> = self
+            .own_bindings_for(region)?
             .iter()
             .filter_map(|b| {
                 self.resolve_uri(&b.source_uri)

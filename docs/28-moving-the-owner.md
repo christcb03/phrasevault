@@ -1,4 +1,4 @@
-# 28 — Moving the owner (D128; PVOS D182)
+# 28 — Moving the owner (D128; PVOS D182, D185)
 
 **Status: D128 wrote this runbook on 2026-09-10 (lab pair). PVOS D182
 (2026-09-23) made it one prompted run (`promote.sh`), added the fence that
@@ -6,14 +6,17 @@ stops a stale or replaced owner, promotion through the companion, a standby
 owner, and dated copies of the log. Rehearsed on the lab pair
 (`deploy/d182-owner-pair.sh`); on the lab fleet and the live fleet as D182's
 checklist records — until the live drill has run, this is "rehearsed", not
-"proven".** The sibling of doc 25: that one rebuilds a forest, this one keeps
+"proven". PVOS D185 (2026-09-25) let a HOLDER become the owner — one daemon,
+owner and holder — and let the owner serve reads while it hears its peers.**
+The sibling of doc 25: that one rebuilds a forest, this one keeps
 it and changes which box may append to it.
 
 ## 1. What an owner is, and why it can move
 
 The owner is the forest's one writer: every box dials it to publish, it
 appends to the log, everyone else follows (doc 03 §1, doc 69 §9 in PVOS).
-It holds no bytes. Its authority is not the box — it is a device certificate
+It may hold no bytes (production's did, until PVOS D185) or catalogue regions
+of its own like any holder. Its authority is not the box — it is a device certificate
 on the log, signed by the root key the recovery phrase derives. So a replica,
 which already holds the whole verified log, becomes the owner when the root
 signs a `DeviceAuthorized` for it and a `DeviceRevoked` for the old box. The
@@ -35,7 +38,16 @@ all of them log events), the NAS's supervision, the health observer and its
 notifications, and the HA feed. So promotion is for an owner that is gone,
 not one that is down for a reboot.
 
-## 2. The standby, and the fence
+## 2. Who can become the owner, and the fence
+
+**Any follower that holds the whole log** — every holder does (doc 26 §1).
+Region catalogues live with their holders and the log holds only their heads,
+so a holder that becomes the owner keeps its regions (PVOS D185: its
+`bindings.local` counts as its own, so it goes on serving its bytes, its own
+view, trashes and renames) and nobody rescans anything. `promote.sh` promotes
+a holder or a standby; the NAS is promoted by hand (§4, the last paragraph).
+Chris's fleet keeps no standby (D185): the recovery is any follower's copy of
+the log plus the root.
 
 **The standby** (PVOS D182) is a follower kept for exactly this: its own
 daemon and directory (production: `mediabox-standby`, `/srv/pvfs/media2-standby`,
@@ -45,8 +57,8 @@ daemon serves the same forest and a daemon's socket is named by the forest id),
 `follow` only, announced so the owner's health job probes it; the page
 shows its lag, and it makes the daily dated copy of the log (§7). Promoting it
 leaves the fleet's shape unchanged: an owner that holds no bytes, in a daemon
-of its own. Any follower can be promoted by hand; `promote.sh` promotes only a
-standby, because a holder's replica would make one daemon owner and holder.
+of its own. (Until D185 `promote.sh` promoted only a standby: a promoted
+holder stopped serving its own library, a bug D185 fixed.)
 
 **The fence** (PVOS D182) is what makes a move safe to get wrong. A follower
 only ever copies the owner, so a follower that holds MORE of the log than the
@@ -58,8 +70,11 @@ writes nothing:
   fences before preparing anything;
 - the owner's health job reads every peer's tip every two minutes;
 - an owner's daemon hears its peers (its first health pass, 30 s at most)
-  before it listens — so a zombie that boots after a promotion meets the
-  promoted fleet's longer logs before any write can reach it.
+  before it takes a routed write — so a zombie that boots after a promotion
+  meets the promoted fleet's longer logs before any write can reach it. Reads
+  are served meanwhile (PVOS D185: an owner that holds regions is where its
+  peers read those files); a write is answered `busy`, which a replica
+  retries.
 
 Only a key holding **admin on the forest root** may fence the owner this way
 — a routed write's author, or the key that announced a probed endpoint (every
@@ -83,8 +98,8 @@ instead of calling itself up to date.
 - The root: the companion on this Mac (it holds the seed in its vault and
   asks you to approve each root signature — doc 14), or the recovery phrase,
   from custody. The phrase is on no box, and `promote.sh` never sees it.
-- A standby that is at the owner's tip (the page shows it; `pvfs forest tip`
-  on each box says it).
+- A target at the owner's tip — a holder or a standby (the page shows each
+  box's lag; `pvfs forest tip` on each box says it).
 - The new owner reachable by the fleet on its port: feederbox dials the owner
   from outside (WireGuard, `wg0`), and the NAS and mediabox on the LAN.
 - `deploy-respects-active-work` (memory): a planned move waits for an ingest
@@ -97,8 +112,8 @@ cd deploy/ansible/fleet
 ./promote.sh
 ```
 
-Bare, it asks (the inventory, which standby, the signer, and each
-confirmation). Each step refuses rather than guesses; if one refuses, read
+Bare, it asks (the inventory, which box — a holder or a standby — the
+signer, and each confirmation). Each step refuses rather than guesses; if one refuses, read
 why, do not force.
 
 1. **Look.** Every box's `pvfs forest tip`, as a table. Refuses when the
@@ -129,10 +144,17 @@ why, do not force.
    it.
 5. **The inventory.** The target moves into `[fleet_owner]` and `owner_addr`
    follows; the old owner goes to `[fleet_retired]` (out of every fleet
-   group). A dated backup first; the diff shown and confirmed. The file is
-   written through its link (worktrees link `fleet-prod.ini`, D155).
+   group). A holder's settings live in its group's `[<group>:vars]`, which
+   stop applying once it leaves the group, so they come with it onto its host
+   line (D185) — its directory as `pvfs_mount`, its port, unit, regions,
+   mount and nice/ionice — where they outrank `[fleet_owner:vars]`; its jobs
+   join the owner's, minus `follow`. A dated backup first; the diff shown and
+   confirmed. The file is written through its link (worktrees link
+   `fleet-prod.ini`, D155).
 6. **The owner's role:** `fleet.yml --tags owner --limit <target>` — the
-   owner's jobs, notify, the HA collector, `fleet announce`, the daemon.
+   owner's jobs, notify, the HA collector, `fleet announce`, the daemon; for a
+   holder also its regions (`pvfs_regions`, accepted as bound) and its view
+   mount (D185).
 7. **Point.** `promote.yml -e phase=point`: every follower's registry row
    and marker re-pointed and its daemon restarted (follow reads its marker
    once, at start); the NAS's supervision moved to the new owner's key; then
