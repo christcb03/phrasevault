@@ -634,6 +634,9 @@ pub fn serve_tls_until(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false)?;
+                // PVOS D187 — replies go out whole, never held for an ACK
+                // (see `pvfs_proto::write_msg`).
+                let _ = stream.set_nodelay(true);
                 let d = Arc::clone(&daemon);
                 let cfg = Arc::clone(&tls);
                 std::thread::spawn(move || {

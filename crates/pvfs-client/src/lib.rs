@@ -1386,7 +1386,12 @@ fn dial(addr: &str) -> std::io::Result<TcpStream> {
     let mut last = None;
     for sa in addr.to_socket_addrs()? {
         match TcpStream::connect_timeout(&sa, DIAL_TIMEOUT) {
-            Ok(s) => return Ok(s),
+            Ok(s) => {
+                // PVOS D187 — requests are small and answered one at a time:
+                // never hold a segment back for an ACK (see `write_msg`).
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
             Err(e) => last = Some(e),
         }
     }
