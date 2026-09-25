@@ -171,11 +171,17 @@ fn a_reader_gets_its_readahead_kept_ahead_and_no_completion() {
     for off in (0..20 * PIECE as usize).step_by(step) {
         assert_eq!(read(&f, off, step), data[off..off + step], "at {off}");
     }
-    // The window ahead (4 pieces) is filled without the reader asking...
-    // Generous: this asserts WHAT is fetched, never how fast. The whole suite
-    // in parallel on the build host once took this past 10 s and failed a
-    // correct build (2026-09-22).
-    until("the readahead is fetched ahead of the reader", Duration::from_secs(60), || {
+    // The window ahead (4 pieces) is filled without the reader asking.
+    //
+    // 10 s is generous for 24 pieces off a socket: this asserts WHAT is
+    // fetched, not how fast. It was raised to 60 s on 2026-09-22 on the
+    // theory that the build host was merely slow under the full suite. It
+    // was not: the readahead was STALLING (a waited read left no window
+    // behind it — `HashFetch::arm_readahead`), 8 runs in 20 on the build
+    // host and about one CI run in three, and the extra 50 s only bought a
+    // slower red. Back to 10 s now the stall is fixed: this failing means
+    // the keep-ahead stopped, so let it say so quickly.
+    until("the readahead is fetched ahead of the reader", Duration::from_secs(10), || {
         f.fetched_bytes() == 24 * PIECE
     });
     // ...and nothing more: no background completion.

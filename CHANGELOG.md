@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Stream mode kept the readahead ahead only after reads it could serve at
+  once (D181 fix).** The window was armed in one place — `poll_range`'s
+  covered branch — so a read that had to WAIT left none behind it. Such a
+  read carried its readahead as the `ahead` extension of its own fetch job,
+  and `wait_range` drops its demand the moment its own pieces land: when a
+  reader caught the prefetcher up, the demand was satisfied by a job already
+  in flight, the worker came back to no demand and a window it had just
+  filled, and it idled with the keep-ahead short. A playing file re-armed
+  itself at the next read it could serve at once, so the cost was a stream
+  running without its cushion, not a stall; nothing re-armed it after the
+  last read. Both paths now arm it (`HashFetch::arm_readahead`). This is what
+  failed the D181 stream-mode test intermittently — 8 runs in 20 on the build
+  host, about one CI run in three, since D181 shipped; raising that test's
+  budget to 60 s on 2026-09-22 treated a stall as slowness, and it is back
+  to 10 s.
+
 - **The owner out of the daily path (PVOS D183).** A catalogue region's head
   was already signed by the box that owns the region; it now also travels
   **box to box**, so an owner outage no longer freezes cataloguing, the heads
