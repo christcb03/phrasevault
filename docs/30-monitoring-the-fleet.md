@@ -171,7 +171,7 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `peer_up` | a peer answers again (with how long it was down) | info |
 | `job_error` | a job's error has been there, with the same text, for about **four minutes** — the third poll, timed from when it was first seen, so the owner's own restarts in a row never count (D151); once, until it changes, and a changed text waits its own four minutes; the stall detector's `overdue` notice is filtered | warning |
 | `job_error_cleared` | a `job_error` that WAS sent has been gone for the same ~four minutes (D161): once per episode, naming the text last sent and how long it lasted (`since_ms` → `until_ms`); back inside the wait it is one episode and nothing is said; an error that cleared before it was sent is never cleared | info |
-| `heartbeat` | every 24 h: "All good: N boxes up, nothing to do." or what is down | info / warning |
+| `heartbeat` | every 24 h: "All good: N peers reporting, nothing to do." or what is down. N is the announced endpoints this box polls — never itself, so a four-box fleet reports three | info / warning |
 | `test` | `--test` | info |
 | `owner_fenced` | PVOS D182: this owner fenced itself — a peer holds more of the log than it does (restored from an older copy, or replaced by a promotion); it writes nothing until a person looks (`pvfs forest fence`). Once; on the first poll too. While fenced the owner says nothing else but the heartbeat, which then reads "still fenced" (warning) | critical |
 | `owner_unfenced` | the fence was lifted (a clear, sent as ✅) | info |

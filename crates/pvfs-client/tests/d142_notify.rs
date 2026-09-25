@@ -129,7 +129,8 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     assert_eq!(notify::severity(sup), "info", "a restart that worked is news, not a task");
     let mut st = notify::State::default();
     let hb = notify::heartbeat(&mut st, &r0, 1_789_000_000_000).unwrap();
-    assert_eq!(notify::summary(&n, &hb), "All good: 1 boxes up, nothing to do.");
+    // "peers", not "boxes" — the count leaves out the box sending the message.
+    assert_eq!(notify::summary(&n, &hb), "All good: 1 peer reporting, nothing to do.");
     assert_eq!(notify::severity(&hb), "info");
     // an "overdue" notice from the stall detector is not an error anyone can act on
     let mut overdue = up();

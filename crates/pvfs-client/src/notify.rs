@@ -511,10 +511,20 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
             ev.detail.as_deref().unwrap_or("").trim_start_matches("FENCED: ")
         ),
         "heartbeat" => {
+            // "peers", not "boxes": the count is the announced endpoints this
+            // box polls, which never includes the box sending the message
+            // (`poll_fleet` filters its own pin). Calling them boxes made a
+            // four-box fleet report three and read like a box was missing.
+            let peers = if ev.up == 1 { "peer" } else { "peers" };
             if ev.down == 0 {
-                format!("All good: {} boxes up, nothing to do.", ev.up)
+                format!("All good: {} {peers} reporting, nothing to do.", ev.up)
             } else {
-                format!("Daily check-in: {} up, {} DOWN — {}", ev.up, ev.down, ev.detail.as_deref().unwrap_or(""))
+                format!(
+                    "Daily check-in: {} {peers} reporting, {} DOWN — {}",
+                    ev.up,
+                    ev.down,
+                    ev.detail.as_deref().unwrap_or("")
+                )
             }
         }
         "test" => "PVFS can reach this webhook — notifications are working.".into(),
