@@ -125,7 +125,10 @@ why, do not force.
    following, must reach the old owner's last seq. Then the target's daemon
    is stopped (promotion refuses a directory a daemon holds open). A dead
    owner is skipped: step 1 has shown the target holds the longest log among
-   the boxes that answered.
+   the boxes that answered. A holder's view mount holds its directory open
+   too (its engine takes the writer lock), so it is stopped as well (D185) —
+   refused while anything reads through it (a Plex stream would end) unless
+   `-e mount_interrupt=yes`; the owner step starts it again.
 3. **Sign — the one step a person does.**
    - *Companion:* the companion's socket is forwarded over SSH (as `pvfs ssh`
      does) and `pvfs forest promote --via-companion` runs on the target; the
