@@ -892,15 +892,22 @@ pub fn auth_digest(nonce: &[u8], forest_id: &str, expiry_ms: u64) -> [u8; 32] {
     crypto::domain_digest("pvfs:daemon-auth:v1:", &e.finish())
 }
 
-/// Write one length-prefixed JSON control frame.
+/// Write one length-prefixed JSON control frame — in ONE write (PVOS D187).
+/// As two (the length, then the body), every frame left a TLS connection as
+/// two small records in two TCP segments, and Nagle held the second until the
+/// peer's delayed ACK: a request and its reply cost ~0.5 s over the network
+/// on the lab (a folder listing, 495 ms; connecting, 2.1 s) where a Unix
+/// socket answered at once. Both ends also set `TCP_NODELAY` now.
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = serde_json::to_vec(msg).map_err(invalid)?;
     let len = u32::try_from(body.len()).map_err(|_| invalid("frame too large"))?;
     if len > MAX_FRAME {
         return Err(invalid("frame exceeds cap"));
     }
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(&body)?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&body);
+    w.write_all(&frame)?;
     w.flush()
 }
 
@@ -1001,8 +1008,12 @@ pub fn write_data_frame<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
     if len > MAX_FRAME {
         return Err(invalid("data frame exceeds cap"));
     }
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(data)?;
+    // One write, like `write_msg`: a small read's last frame must not wait
+    // for an ACK either.
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(data);
+    w.write_all(&frame)?;
     w.flush()
 }
 
@@ -1053,6 +1064,29 @@ mod tests {
         assert_eq!(got, msg);
         // a second read hits clean EOF
         assert!(read_msg::<_, ServerMsg>(&mut cur).unwrap().is_none());
+    }
+
+    /// PVOS D187 — a frame goes to the stream in ONE write, so over TLS it is
+    /// one record, and Nagle never holds half of it back for an ACK.
+    #[test]
+    fn a_frame_is_one_write() {
+        struct Writes(Vec<usize>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let msg = ClientMsg::ViewLs { dir: "TV/Show".into() };
+        let mut w = Writes(Vec::new());
+        write_msg(&mut w, &msg).unwrap();
+        assert_eq!(w.0, vec![4 + serde_json::to_vec(&msg).unwrap().len()]);
+        let mut w = Writes(Vec::new());
+        write_data_frame(&mut w, b"bytes of a small file").unwrap();
+        assert_eq!(w.0, vec![4 + 21]);
     }
 
     #[test]
