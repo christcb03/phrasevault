@@ -134,6 +134,11 @@ pub struct Daemon {
     /// Connection ids, so a lease can name its holder. Monotonic; a reused
     /// id would let a new connection inherit a dead one's authority.
     next_conn: AtomicU64,
+    /// PVOS D185 — an owner just started takes no write from the network
+    /// until its first health pass has heard the followers (D182's fence),
+    /// but serves every read meanwhile. Before D185 the whole listener waited,
+    /// which a holder-owner's peers would feel as a stall on every restart.
+    network_writes_held: std::sync::atomic::AtomicBool,
 }
 
 /// PVOS D67 C3: an exclusive claim on writes under `roots`.
@@ -202,7 +207,20 @@ impl Daemon {
             lease: Mutex::new(None),
             unknown_ops: Mutex::new(std::collections::BTreeSet::new()),
             next_conn: AtomicU64::new(1),
+            network_writes_held: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// PVOS D185 — hold (or release) writes that arrive over the network
+    /// listener; see `network_writes_held`. The Unix socket is never held:
+    /// it is this box's own operator, as it was before D185.
+    pub fn hold_network_writes(&self, held: bool) {
+        self.network_writes_held.store(held, Ordering::SeqCst);
+    }
+
+    /// Whether network writes are held (the owner's first health pass).
+    pub fn network_writes_held(&self) -> bool {
+        self.network_writes_held.load(Ordering::SeqCst)
     }
 
     /// PVOS D67 C3: does a live lease held by SOMEONE ELSE cover `node`?
@@ -862,6 +880,14 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             offset,
             max,
         } => do_region_manifest(daemon, principal, &region, seq, offset, max),
+        // PVOS D185 — reads go on while an owner that just started hears its
+        // followers; a routed write waits for that (D182's fence). `busy` is
+        // the transient answer a replica already retries on its next pass.
+        ClientMsg::PrepareWrite { .. } if !local && daemon.network_writes_held() => err(
+            "busy",
+            "the owner has just started and hears its followers' logs before it takes a write \
+             (PVOS D182) — reads are served meanwhile; try the write again in a few seconds",
+        ),
         ClientMsg::PrepareWrite { op, tip } => do_prepare_write(daemon, principal, op, tip.map(|b| *b), conn),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
