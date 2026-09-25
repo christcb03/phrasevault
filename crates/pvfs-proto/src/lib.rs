@@ -129,7 +129,10 @@ pub enum ServerMsg {
     /// daemon predates jobs or was started without one.
     ServeJobs {
         runner: String,
-        jobs: Vec<ServeJobWire>,
+        /// Boxed (PVOS D182, with `capacity`): the variant must stay under
+        /// clippy's 128 bytes, since `ServerMsg` is the error half of many
+        /// results. The JSON is the same.
+        jobs: Box<Vec<ServeJobWire>>,
         /// D127 (doc 26 §7.5): conflicting paths in the merged view this box
         /// holds — the in-band signal nobody has to remember to ask for.
         /// Absent on pre-D127 daemons, so defaulted rather than a proto bump.
@@ -141,9 +144,11 @@ pub enum ServerMsg {
         #[serde(default)]
         stale: u64,
         /// D131 (doc 26 phase 7): the filesystem under this box's sync store
-        /// — on a holder, the library's disk. Absent on older daemons.
+        /// — on a holder, the library's disk. Absent on older daemons. Boxed
+        /// (PVOS D182) to keep the variant under clippy's 128 bytes; the JSON
+        /// is the same.
         #[serde(default)]
-        capacity: Option<CapacityWire>,
+        capacity: Option<Box<CapacityWire>>,
         /// D181 (PVOS D181 §8): the view mounts running on this box, as their
         /// own status files describe them — which build each is on, and
         /// whether it is behind this daemon's. A box that keeps its mount up
@@ -164,6 +169,23 @@ pub enum ServerMsg {
         /// `ServerMsg` is the error half of many results (the JSON is the same).
         #[serde(default)]
         stores: Box<Vec<StoreWire>>,
+        /// PVOS D182: this box's top-log tip. It is how the owner learns that
+        /// a follower holds more of the log than it does — proof the owner is
+        /// stale, so it fences itself — and how the page shows each
+        /// follower's lag. Absent on older daemons, so defaulted rather than
+        /// a proto bump. Boxed like the rest (the variant must stay small).
+        #[serde(default)]
+        log: Option<Box<LogTipWire>>,
+        /// PVOS D182: present when this owner is fenced — it writes nothing
+        /// until a person looks (`pvfs forest fence`). Absent otherwise, and on
+        /// older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fenced: Option<Box<FenceWire>>,
+        /// PVOS D182: this box's last dated copy of the log (`pvfs forest
+        /// backup`) — when, whether it verified, and why not. Absent where
+        /// no copy has ever been made, and on older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backup: Option<Box<BackupWire>>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
@@ -325,6 +347,39 @@ pub struct StoreWire {
     pub regions: Vec<String>,
     pub free_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// PVOS D182 — a log's tip: its last seq and that row's chain hash (hex).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogTipWire {
+    pub seq: u64,
+    pub hash: String,
+}
+
+/// PVOS D182 — why an owner is fenced: who holds the longer log, both tips,
+/// and when. `reason` is the sentence to show.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceWire {
+    pub reason: String,
+    #[serde(default)]
+    pub peer: String,
+    #[serde(default)]
+    pub peer_seq: u64,
+    #[serde(default)]
+    pub own_seq: u64,
+    #[serde(default)]
+    pub at_ms: u64,
+}
+
+/// PVOS D182 — a box's last dated copy of the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupWire {
+    pub at_ms: u64,
+    pub ok: bool,
+    #[serde(default)]
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// D148 — one catalogue region's trash on a box, as its last purge pass left
@@ -609,7 +664,17 @@ pub enum ClientMsg {
         max: u32,
     },
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
-    PrepareWrite { op: WriteOp },
+    PrepareWrite {
+        op: WriteOp,
+        /// PVOS D182: the requesting replica's top-log tip. An owner that is
+        /// BEHIND it is stale (restored, or replaced by a promotion) and
+        /// fences itself instead of writing; an owner whose chain differs at
+        /// that seq refuses the write (the replica is on another branch).
+        /// Omitted by older replicas and by writers that hold no log; an
+        /// older owner ignores it — a defaulted field, not a proto bump.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tip: Option<Box<LogTipWire>>,
+    },
     /// Phase 2: return one signature (hex) per preimage, in order.
     Commit {
         prepared_id: String,

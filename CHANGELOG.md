@@ -5,6 +5,42 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The owner can be lost (PVOS D182).** A follower only ever copies the
+  owner, so a follower holding more of the log than the owner proves it
+  stale — restored from an older copy, or replaced by a promotion. Such an
+  owner now **fences itself** and writes nothing: every routed write carries
+  the replica's tip (`PrepareWrite.tip`), the health job reads every peer's
+  (`serve status` `log`), and an owner's daemon hears its peers (its first
+  health pass, 30 s at most) before it listens. The fence is a file in the
+  data dir, checked by `Engine::append_durable_with` (the one choke point),
+  shown in `serve status` (`fenced`) and `pvfs forest fence` (which lifts
+  it, asked), told once as `owner_fenced` (critical) — a fenced owner says
+  nothing else but its check-in. Only a key holding admin on the forest
+  root can fence the owner by its word (D182 §3.3a) — a routed write's
+  author, or the key that announced a probed endpoint: such a key could
+  revoke the owner's device outright, so believing it adds no authority; a
+  longer log claimed by anyone else is refused, not believed (the write is
+  not written; the health record says `ahead-unproven`). A follower on
+  another branch is refused
+  and told as `peer_diverged`; the owner keeps writing. `follow` calls a
+  source BEHIND its replica an error instead of "up to date". Promotion is
+  one append (`Engine::promote_with_root_signer`; D128's two could
+  half-finish), by phrase or **`pvfs forest promote --via-companion`**
+  (a device key made on the box, the root signatures from the companion,
+  each approved at its prompt), with defaults that survive a second move
+  (the next index never used; revoke every other live owner device). New:
+  `pvfs forest tip` (read-only, beside a running daemon), `pvfs forest
+  backup` (a dated copy by `VACUUM INTO`, verified by a full replay, pruned
+  by `--keep`; `backup` in `serve status`) and `pvfs forest restore`.
+  A second `pvfsd` for a forest whose socket already answers refuses to
+  start instead of deleting it and taking its place (the socket is
+  `<dir>/<forest_id>.sock`, so a standby beside a holder's replica on one box
+  needs its own `PVFS_SOCKET_DIR`), and it refuses before sweeping sync tmp
+  files. Notify labels resolve by `host:port` before host. `ServeJobs` boxes `jobs`
+  and `capacity` (same JSON) to stay under clippy's 128 bytes. Wire: two
+  defaulted fields and one optional request field — no proto bump. Lab:
+  `deploy/d182-owner-pair.sh`; doc 28 rewritten around PVOS `promote.sh`.
+
 - **The view's stream mode, and rolling under it (PVOS D181).** `pvfs mount
   --view --cache-mode stream` keeps nothing — Plex on the LAN reads the view
   and Chris wants no cache: no background completion, the readahead kept

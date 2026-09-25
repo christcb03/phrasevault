@@ -121,20 +121,47 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// PVOS D182 — wait (at most `limit`) for the `health` job's first pass on
+/// this start, when that job is enabled. Returns at once when it is not.
+fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::Duration) {
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        let row = jobs.snapshot().into_iter().find(|j| j.name == "health");
+        match row {
+            Some(j) if j.enabled => {
+                if j.last_ok_ms.is_some() || j.last_error.is_some() {
+                    if said {
+                        eprintln!("pvfsd: health: first pass done — listening");
+                    }
+                    return;
+                }
+            }
+            _ => return,
+        }
+        if started.elapsed() >= limit {
+            eprintln!(
+                "pvfsd: health: no first pass within {} s — listening anyway (the fence still \
+                 checks every write's tip)",
+                limit.as_secs()
+            );
+            return;
+        }
+        if !said {
+            eprintln!("pvfsd: health: hearing the fleet before listening (D182)");
+            said = true;
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
-
-    // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
-    // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
-    // the file is never re-fetched. Sinks are process-local, so nothing holds
-    // a tmp across restarts — sweep before the job runner can begin a fetch.
-    // Best-effort: a failed sweep is worth a warning, never a refused start.
-    match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
-        Ok(0) => {}
-        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
-        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
-    }
+    let is_replica = engine.is_replica();
 
     let socket = match &cli.socket {
         Some(s) => s.clone(),
@@ -152,6 +179,32 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             mount::daemon_socket_path(&engine.identity.forest_id)
         }
     };
+
+    // PVOS D182 — a socket that ANSWERS is another daemon's, and with the
+    // conventional path it is another daemon of this same forest on this box
+    // (the name is the forest id): a standby beside a holder's replica, say.
+    // Removing it would hand that daemon's local clients — its CLI, its mount —
+    // to this one without a word. Refuse, and say how to run two — before the
+    // tmp sweep below, which would delete that daemon's in-flight fetches. A
+    // stale socket (a hard kill) refuses the connection and is cleared as before.
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Err(format!(
+            "another pvfsd already serves {} — give this daemon its own socket \
+             (--socket <path>, or PVFS_SOCKET_DIR for it and its clients)",
+            socket.display()
+        )
+        .into());
+    }
+    // A fetch killed mid-stream (SIGKILL, power loss) never runs its sink's
+    // Drop, leaving `.{id}.tmp` litter in the sync store that leaks disk if
+    // the file is never re-fetched. Sinks are process-local, so nothing holds
+    // a tmp across restarts — sweep before the job runner can begin a fetch.
+    // Best-effort: a failed sweep is worth a warning, never a refused start.
+    match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
+        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
+    }
 
     let daemon = Arc::new(Daemon::new(engine));
     let _ = std::fs::remove_file(&socket); // clear a stale socket from a previous hard kill
@@ -174,6 +227,17 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD, Some(d)))
     };
+
+    // PVOS D182 — an owner hears its peers before it takes a write from any.
+    // Its first health pass reads every follower's log tip, and a follower
+    // holding more of the log than this box fences it: it was restored from
+    // an older copy, or replaced by a promotion while it was away. Routed
+    // writes arrive only over the listener, so the listener waits for that
+    // pass — bounded, so a fleet that is itself down cannot keep the owner
+    // off the network.
+    if cli.listen.is_some() && !is_replica {
+        wait_for_first_health_pass(&jobs, std::time::Duration::from_secs(30));
+    }
 
     // Network listener (F1, doc 17 §4): TCP+TLS alongside the Unix socket,
     // sharing the daemon and the shutdown flag.

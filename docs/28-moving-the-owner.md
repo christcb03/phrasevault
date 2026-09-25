@@ -1,9 +1,13 @@
-# 28 — Moving the owner (D128 runbook)
+# 28 — Moving the owner (D128; PVOS D182)
 
-**Status: written 2026-09-10 with D128; rehearsed on the lab pair
-(`deploy/d128-promote-pair.sh`), not yet on the live fleet.** The sibling of
-doc 25: that one rebuilds a forest, this one keeps it and changes which box
-may append to it.
+**Status: D128 wrote this runbook on 2026-09-10 (lab pair). PVOS D182
+(2026-09-23) made it one prompted run (`promote.sh`), added the fence that
+stops a stale or replaced owner, promotion through the companion, a standby
+owner, and dated copies of the log. Rehearsed on the lab pair
+(`deploy/d182-owner-pair.sh`); on the lab fleet and the live fleet as D182's
+checklist records — until the live drill has run, this is "rehearsed", not
+"proven".** The sibling of doc 25: that one rebuilds a forest, this one keeps
+it and changes which box may append to it.
 
 ## 1. What an owner is, and why it can move
 
@@ -11,106 +15,196 @@ The owner is the forest's one writer: every box dials it to publish, it
 appends to the log, everyone else follows (doc 03 §1, doc 69 §9 in PVOS).
 It holds no bytes. Its authority is not the box — it is a device certificate
 on the log, signed by the root key the recovery phrase derives. So a replica,
-which already holds the whole verified log, becomes the owner when the phrase
+which already holds the whole verified log, becomes the owner when the root
 signs a `DeviceAuthorized` for it and a `DeviceRevoked` for the old box. The
 forest id, every node id, every grant, every region head: unchanged. Nothing
 is copied anywhere.
 
 Never automatic (doc 20 §6, doc 03 §6 Q3): no job, no watchdog, no quorum
-promotes. D83 may one day *say* the owner is down; a person promotes.
+promotes. Home Assistant says the owner is down (PVOS D182: within ten
+minutes); a person promotes. (Automatic failover is on the roadmap as an
+opt-in for other users — doc 08, the availability track.)
 
-## 2. Before you start
+## 2. The standby, and the fence
 
-- The recovery phrase, from custody. It is on no box.
-- The new box is already a replica of the forest and follows it: enrolled on
-  the owner with `rwa` (replication needs admin), `pvfs replica add`, pvfsd
-  with `follow`. The ingest role of the fleet play does exactly this.
-- The new box is reachable by the fleet on the owner port (7421 in
-  production): feederbox dials the owner from outside, so the forward or VPN
-  that points at the old VM must point at the new box before step 5.
-- `deploy-respects-active-work` (memory): check the old owner is not mid-import
-  before stopping it — an ingest session in flight is the thing to protect.
+**The standby** (PVOS D182) is a follower kept for exactly this: its own
+daemon and directory (production: `mediabox-standby`, `/srv/pvfs/media2-standby`,
+port 7435 on mediabox — bare metal, off the PVE host that carries the owner's
+VM — and its own socket dir, `/tmp/pvfs-standby`, because mediabox's holder
+daemon serves the same forest and a daemon's socket is named by the forest id),
+`follow` only, announced so the owner's health job probes it; the page
+shows its lag, and it makes the daily dated copy of the log (§7). Promoting it
+leaves the fleet's shape unchanged: an owner that holds no bytes, in a daemon
+of its own. Any follower can be promoted by hand; `promote.sh` promotes only a
+standby, because a holder's replica would make one daemon owner and holder.
 
-## 3. The move
+**The fence** (PVOS D182) is what makes a move safe to get wrong. A follower
+only ever copies the owner, so a follower that holds MORE of the log than the
+owner proves the owner stale — restored from an older image or copy, or
+replaced by a promotion while it was away. Such an owner fences itself and
+writes nothing:
 
-Each step refuses rather than guesses; if one refuses, read why, do not force.
+- every routed write carries the writing replica's tip; an owner behind it
+  fences before preparing anything;
+- the owner's health job reads every peer's tip every two minutes;
+- an owner's daemon hears its peers (its first health pass, 30 s at most)
+  before it listens — so a zombie that boots after a promotion meets the
+  promoted fleet's longer logs before any write can reach it.
 
-1. **Quiet the writers.** Every write goes through the owner, so stop the
-   jobs that publish: on feederbox `pvfs serve disable watch` (or stop
-   `pvfsd-replica`), on the QNAP stop `tier` (or the daemon — the watchdog
-   bracket applies, see the fleet README). Reads keep working everywhere.
-2. **Bring the new box to the tip.** On it: `pvfs replica sync <mount>`.
-3. **Stop the old owner.** `sudo systemctl stop pvfsd-media` on the old VM,
-   then `sudo systemctl disable pvfsd-media` — it must never start there
-   again (§5).
-4. **Check the tips match.** On both boxes:
-   ```bash
-   python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('select max(seq) from events').fetchone()[0])" <mount>/.pvfs/log.db
-   ```
-   Different numbers mean a write landed between 2 and 3: start the old
-   owner again, repeat from 2.
-5. **Promote.** On the new box, with its pvfsd stopped (promotion refuses a
-   dir a daemon holds open):
-   ```bash
-   pvfs forest promote <mount>
-   ```
-   It lists the forest's devices, refuses while the old owner's address
-   still answers (`--force` only if that address now belongs to something
-   else), asks for the phrase, takes device index 1 by default (pass
-   `--device-index` for a free one if 1 is taken — it refuses a taken
-   index), and revokes device 0, the key `forest init` made on the old VM
-   (`--revoke <hex>` to name another; `--keep-old-device` only when that
-   key is destroyed with its box). The replica marker is kept as
-   `.pvfs/promoted-from`. Then `pvfs forest register <mount> --alias media`.
-6. **Start the new owner.** Move the box into `[fleet_owner]` in
-   `fleet-prod.ini`, set `owner_addr` to it, and run the owner role of the
-   fleet play (`--tags owner`): unit with `--listen`, serve jobs, `fleet
-   announce`. Its transport pin is new — the play reads it from the box.
-7. **Re-point the fleet.** Run the ingest and NAS roles (`--tags ingest`,
-   `--tags nas`). Since D128 both compare the registered `media-src` row
-   with the inventory's address and the owner's pin, replace it when they
-   differ, run `pvfs replica repoint` on the replica, and restart the daemon
-   (the follow job reads the marker once, at start). By hand, per box:
-   ```bash
-   pvfs instance add media-src <new-owner>:7421 <new pin>
-   pvfs replica repoint <mount> --instance media-src
-   ```
-   then restart pvfsd. `repoint` refuses a source that serves another forest.
-8. **Re-enable the writers** from step 1.
+Only a key holding **admin on the forest root** may fence the owner this way
+— a routed write's author, or the key that announced a probed endpoint (every
+box of Chris's fleet holds `rwa`). The owner cannot check rows it does not
+hold, so a longer log is only a claim; an admin could revoke the owner's
+device outright, so believing an admin adds no authority. A longer log claimed
+by anyone else is refused, not believed: that write is not written, and the
+health record marks the peer `ahead-unproven`.
 
-## 4. Verify
+A fenced owner opens and serves reads, refuses every append (daemon, CLI,
+mount, jobs: `Engine::append_durable_with` is the one choke point), says so in
+`serve status`, sends one `owner_fenced` (critical) and then nothing but its
+daily check-in, and its HA collector posts nothing. `pvfs forest fence`
+shows it and, asked, lifts it. A follower on ANOTHER branch (its chain
+differs at its own tip) is refused and reported (`peer_diverged`); the owner
+keeps writing. A follower whose source is behind it says so (`follow` error),
+instead of calling itself up to date.
 
-- On every replica `pvfs replica sync <mount>` succeeds and the tips agree
-  (step 4's one-liner).
-- The log carries the pair, at the seqs promotion printed: `select kind from
-  events where seq > <tip before>` shows `DeviceAuthorized`, `DeviceRevoked`.
-- feederbox's watch job publishes a head the new owner attests (`pvfs region
-  ls` on the owner shows the catalogue region's head moving); the QNAP's tier
-  pulls (`pvfs serve status`).
-- `<mount>/.fleet/endpoints/<new pin>` exists on a replica once the new owner's `fleet announce` has been folded; `pvfs fleet versions` shows every box.
+## 3. Before you start
 
-## 5. The old VM
+- The root: the companion on this Mac (it holds the seed in its vault and
+  asks you to approve each root signature — doc 14), or the recovery phrase,
+  from custody. The phrase is on no box, and `promote.sh` never sees it.
+- A standby that is at the owner's tip (the page shows it; `pvfs forest tip`
+  on each box says it).
+- The new owner reachable by the fleet on its port: feederbox dials the owner
+  from outside (WireGuard, `wg0`), and the NAS and mediabox on the LAN.
+- `deploy-respects-active-work` (memory): a planned move waits for an ingest
+  session in flight to finish.
 
-Its device is revoked in the canonical chain, so anything it appends is a dead
-branch every replica refuses — but it would still *write* it locally and
-report success. So: the unit stays disabled; the VM stays cold until the new
-owner has been through a full ingest cycle; then either destroy it or make it
-a replica of the new owner (`pvfs replica add` into a fresh dir — its old
-`.pvfs` is not reused). Delete the old `.pvfs` only after that.
+## 4. The move: `promote.sh`
 
-## 6. Rollback
+```bash
+cd deploy/ansible/fleet
+./promote.sh
+```
 
-- Before step 5: start the old owner again; nothing has changed.
-- After step 5: there is no undo, only another move. The old box becomes a
-  replica of the new owner (§5) and can be promoted back by the same
-  procedure. Every move leaves one certificate pair in the log; the chain
-  never breaks.
+Bare, it asks (the inventory, which standby, the signer, and each
+confirmation). Each step refuses rather than guesses; if one refuses, read
+why, do not force.
 
-## 7. What D128 built for this
+1. **Look.** Every box's `pvfs forest tip`, as a table. Refuses when the
+   target is behind another box (promoting it would fork the forest), or when
+   two boxes disagree at one seq (the forest has forked already: a person
+   decides which branch is the forest).
+2. **Prepare.** The old owner, if it answers, is stopped and **disabled**, and
+   its HA collector with it (a planned move — the drill). The target, still
+   following, must reach the old owner's last seq. Then the target's daemon
+   is stopped (promotion refuses a directory a daemon holds open). A dead
+   owner is skipped: step 1 has shown the target holds the longest log among
+   the boxes that answered.
+3. **Sign — the one step a person does.**
+   - *Companion:* the companion's socket is forwarded over SSH (as `pvfs ssh`
+     does) and `pvfs forest promote --via-companion` runs on the target; the
+     companion asks you to approve two root signatures — admit the target's
+     new device (a key made on the target), revoke the old owner's. Its
+     prompt names the forest and the devices.
+   - *Phrase:* the script prints one command to run in another terminal —
+     `ssh -t <target> pvfs forest promote <dir>` — which asks for the phrase
+     there.
+   Either way: every check and signature first, then `DeviceAuthorized` and
+   every `DeviceRevoked` in ONE append (D128's two appends could half-finish).
+   The default device index is the next never used; the default revocation is
+   every live owner device other than the new one. The replica marker is kept
+   as `.pvfs/promoted-from`.
+4. **Verify.** The target says owner, not fenced; `follow` is turned off on
+   it.
+5. **The inventory.** The target moves into `[fleet_owner]` and `owner_addr`
+   follows; the old owner goes to `[fleet_retired]` (out of every fleet
+   group). A dated backup first; the diff shown and confirmed. The file is
+   written through its link (worktrees link `fleet-prod.ini`, D155).
+6. **The owner's role:** `fleet.yml --tags owner --limit <target>` — the
+   owner's jobs, notify, the HA collector, `fleet announce`, the daemon.
+7. **Point.** `promote.yml -e phase=point`: every follower's registry row
+   and marker re-pointed and its daemon restarted (follow reads its marker
+   once, at start); the NAS's supervision moved to the new owner's key; then
+   every box must reach the new owner's tip. **No binary is touched** — a
+   promotion must not become a roll.
 
-`Engine::promote` (`recover` + marker kept + revoke, refusing a non-replica or
-an open one), `pvfs forest promote`, `pvfs replica repoint`, the fleet play's
-re-point in both replica roles, and the lab pair script above, which walks
-this whole runbook on presubuntu + pvos-test: refusal while the old owner
-answers, promotion, a write on the new owner, the old box rejoining as a
-replica and seeing it, one chain.
+It prints how long it took, and what is left by hand: Home Assistant's
+quiet-owner page names VM 310 (edit it while the owner is elsewhere), and the
+old box.
+
+By hand (no Ansible), per doc 28's first edition: quiet the writers, `pvfs
+replica sync`, stop the old owner, compare `pvfs forest tip` on every box,
+`pvfs forest promote <mount>` (asks companion or phrase), `pvfs forest
+register <mount> --alias <alias>`, start the new owner with `--listen`, and on
+every replica `pvfs instance add <alias>-src <new-owner>:<port> <pin>` +
+`pvfs replica repoint <mount> --instance <alias>-src` + restart.
+
+## 5. Verify
+
+- `pvfs forest tip` on every box: the same seq and hash, the new owner saying
+  owner.
+- The log carries the pair at the seqs promotion printed (`"revoked"` lists
+  the old device).
+- A region head is attested after the move (`pvfs region ls` on the new
+  owner shows a head moving); `pvfs fleet health --now` shows every box; the
+  page's feed is fresh and its owner row is the new box.
+
+## 6. The old box
+
+Its device is revoked in the canonical chain, and since D182 it fences itself
+the moment it can see any box that followed the promotion — so a forgotten
+unit that starts writes nothing. Still: its unit stays disabled (step 2 does
+it when the box answers); the box stays cold until the new owner has been
+through a full ingest cycle; then destroy it, or make it a replica of the new
+owner in a FRESH directory (`pvfs replica add` — its old `.pvfs` is not
+reused), or the next standby (`fleet.yml --tags standby` with a new host row).
+Delete the old `.pvfs` only after that.
+
+## 7. Dated copies of the log, and restoring one
+
+Followers protect against losing a box; they faithfully copy whatever the
+owner writes, a bad build's events included. A dated copy is the way back to a
+known-good log. `pvfs forest backup [<mount>] --to <dir> --keep <days>` takes a
+consistent copy beside a running daemon (`VACUUM INTO`), counts it only once a
+full replay of it verifies (chain, signatures, authorization from seq 1),
+names it `<forest>-<YYYYMMDD-HHMM>-seq<N>` with a `manifest.json`, prunes this
+forest's older copies, and records its result in `backup-state.json`, which
+`serve status` reports. Production: `pvfs-log-backup.timer` daily at 3:30 AM
+Eastern on the standby (mediabox) and on feederbox (off-site), 30 days kept,
+in `/srv/pvfs/log-backups`; about 3 MB a copy.
+
+`pvfs forest restore <copy> <mount>` makes a replica directory from a copy,
+verified the same way, following what the copied box followed. Two uses:
+
+- **A damaged follower** is simpler to re-seed from a live owner (`replica add`
+  into a fresh directory); a copy is for when that is not possible.
+- **Every live log damaged** (a build that broke `log.db` on every box it
+  reached): restore the newest good copy on the box that should own, and
+  `pvfs forest promote` it. That rolls the forest back to the copy's seq:
+  every follower now holds a longer, different chain and must be re-seeded
+  (`replica add` into a fresh directory); each region republishes its head at
+  its next pass, since the catalogues live on the boxes, not in the log.
+
+## 8. Rollback
+
+- Before the signing (step 3): start the old owner again (and enable its unit
+  and collector); nothing has changed.
+- After: there is no undo, only another move. The old box becomes a replica
+  (or the standby) of the new owner (§6) and can be promoted back by the same
+  run. Every move leaves one certificate pair in the log; the chain never
+  breaks. Moving back revokes the device that is live at the time (D182: the
+  first edition's default, "device 0", would have revoked nobody).
+
+## 9. What built this
+
+D128: `Engine::promote`, `pvfs forest promote`, `pvfs replica repoint`, the
+fleet play's re-point in both replica roles, `deploy/d128-promote-pair.sh`.
+PVOS D182: `Engine::promote_with_root_signer` (one append, phrase or
+companion), `pvfs forest promote --via-companion` and its defaults, the fence
+(`pvfs_core::fence`, the tip on `PrepareWrite`, `log`/`fenced` in `serve
+status`, the health job's verdicts, the listener held for the first health
+pass), `pvfs forest tip|fence|backup|restore`, the follower's *behind* error,
+`owner_fenced`/`peer_diverged` and their clears, the standby role, `promote.sh`
++ `promote.yml`, the page (PVOS `deploy/homeassistant/pvfs-fleet.yaml`
+`pvfs_owner_quiet`), `deploy/d182-owner-pair.sh`.

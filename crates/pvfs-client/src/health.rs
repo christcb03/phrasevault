@@ -58,6 +58,20 @@ pub struct PeerHealth {
     /// is open through it: Plex streams through mediabox's).
     #[serde(default)]
     pub mounts: Vec<pvfs_proto::MountWire>,
+    /// PVOS D182: that box's top-log tip (absent from an older daemon).
+    #[serde(default)]
+    pub log: Option<pvfs_proto::LogTipWire>,
+    /// PVOS D182: what THIS box concluded from `log` against its own log —
+    /// `consistent`, `ahead` (this box is stale: it fences itself) or
+    /// `diverged` (that box is on another branch). Absent without a tip.
+    #[serde(default)]
+    pub log_verdict: Option<String>,
+    /// PVOS D182: that box says it is a fenced owner.
+    #[serde(default)]
+    pub fenced: Option<pvfs_proto::FenceWire>,
+    /// PVOS D182: that box's last dated copy of the log, when it makes them.
+    #[serde(default)]
+    pub backup: Option<pvfs_proto::BackupWire>,
     pub error: Option<String>,
 }
 
@@ -104,6 +118,18 @@ pub struct FleetHealth {
     pub polled_at_ms: u64,
     /// By transport pin (the endpoint directory's key), sorted.
     pub peers: BTreeMap<String, PeerRecord>,
+    /// PVOS D182: THIS box's own fence at the end of the poll — what the
+    /// notifier compares to say `owner_fenced` / `owner_unfenced` once.
+    #[serde(default)]
+    pub fenced: Option<pvfs_proto::FenceWire>,
+    /// PVOS D182: this box's own announced address (from the catalogue), so a
+    /// notification about this box can name it.
+    #[serde(default)]
+    pub self_addr: Option<String>,
+    /// PVOS D182: this box's own top-log tip seq at the end of the poll — the
+    /// page reads each follower's lag against it.
+    #[serde(default)]
+    pub self_log_seq: Option<u64>,
 }
 
 impl FleetHealth {
@@ -210,6 +236,9 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.trash = s.trash;
             h.stores = s.stores;
             h.mounts = s.mounts;
+            h.log = s.log;
+            h.fenced = s.fenced;
+            h.backup = s.backup;
         }
         Err(e) => h.error = Some(format!("serve status: {e}")),
     }
@@ -236,17 +265,32 @@ pub fn catalog_versions(engine: &Engine) -> BTreeMap<String, String> {
     out
 }
 
+/// PVOS D182 §3.3a — the announced endpoints (pins) whose word may fence
+/// this owner: those announced by a key holding admin on the forest root.
+pub fn trusted_announcers(engine: &Engine) -> std::collections::HashSet<String> {
+    crate::fetch::catalog_endpoint_authors(engine)
+        .into_iter()
+        .filter(|(_, author)| engine.may_fence_owner(author).unwrap_or(false))
+        .map(|(pin, _)| pin)
+        .collect()
+}
+
 /// One poll of every announced peer (minus this box), folded into the
 /// record on disk. Honours `cancel` between peers (D123).
 pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, PvfsError> {
     let engine = Engine::open(data_dir)?;
     let forest = engine.identity.forest_id.clone();
     let own = pvfs_core::storage::host_pin(data_dir);
-    let endpoints: BTreeMap<String, String> = crate::fetch::catalog_endpoints(&engine)
+    let all = crate::fetch::catalog_endpoints(&engine);
+    let self_addr = own.as_deref().and_then(|p| all.get(p).cloned());
+    let endpoints: BTreeMap<String, String> = all
         .into_iter()
         .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
         .collect();
     let versions = catalog_versions(&engine);
+    // §3.3a: a peer's longer log fences this owner only when the key that
+    // announced it holds admin on the forest root.
+    let trusted = trusted_announcers(&engine);
     engine.close()?;
     let mut record = FleetHealth::load(data_dir)?.unwrap_or_default();
     for (pin, addr) in endpoints {
@@ -259,11 +303,56 @@ pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, P
             pin: pin.clone(),
             region: String::new(),
         };
-        let health = probe_peer(&src, &forest);
+        let mut health = probe_peer(&src, &forest);
+        judge_tip(data_dir, &addr, trusted.contains(&pin), &mut health);
         record.observe(&pin, &addr, versions.get(&pin).cloned(), now_ms(), health);
     }
+    record.fenced = pvfs_core::fence::load(data_dir).map(|f| pvfs_proto::FenceWire {
+        reason: f.reason,
+        peer: f.peer,
+        peer_seq: f.peer_seq,
+        own_seq: f.own_seq,
+        at_ms: f.at_ms,
+    });
+    record.self_addr = self_addr;
+    record.self_log_seq = pvfs_core::mount::peek_tip(data_dir).ok().map(|(seq, _)| seq);
     record.save(data_dir)?;
     Ok(record)
+}
+
+/// PVOS D182 — the fence rule for one probed peer: its tip against this
+/// box's log. A peer AHEAD of this owner proves it stale and fences it
+/// (`pvfs_core::fence::check_peer`) — when `trusted` (§3.3a: announced by a
+/// key with admin on the root); an untrusted one is only marked
+/// `ahead-unproven`. One on another branch is only marked (the notifier says
+/// so; the owner refuses its writes as they come).
+fn judge_tip(data_dir: &Path, addr: &str, trusted: bool, health: &mut PeerHealth) {
+    let Some(t) = health.log.as_ref().filter(|_| health.ok()) else { return };
+    let Ok(hash) = hex::decode(&t.hash) else { return };
+    match pvfs_core::fence::check_peer(data_dir, addr, t.seq, &hash, trusted) {
+        Ok((v, _)) => {
+            health.log_verdict = Some(
+                match v {
+                    pvfs_core::fence::TipVerdict::Consistent => "consistent",
+                    pvfs_core::fence::TipVerdict::Ahead if trusted => "ahead",
+                    pvfs_core::fence::TipVerdict::Ahead => "ahead-unproven",
+                    pvfs_core::fence::TipVerdict::Diverged => "diverged",
+                }
+                .into(),
+            )
+        }
+        Err(e) => eprintln!("pvfs: health: could not judge {addr}'s log tip: {e}"),
+    }
+}
+
+/// PVOS D182 — the record `pvfs forest backup` leaves in the data dir: the
+/// last dated copy of the log, whether it verified, and why not.
+pub const BACKUP_STATE_FILE: &str = "backup-state.json";
+
+/// PVOS D182 — that record, if this box has ever made a copy.
+pub fn load_backup_state(data_dir: &Path) -> Option<pvfs_proto::BackupWire> {
+    let text = std::fs::read_to_string(data_dir.join(BACKUP_STATE_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn now_ms() -> u64 {

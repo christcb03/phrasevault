@@ -781,7 +781,11 @@ impl Engine {
             }
         }
         engine.sweep_temp_spool()?; // doc 04 §7 startup reconciliation
-        engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
+        // PVOS D182: a fenced owner still opens — it serves reads and reports
+        // its fence — it only writes nothing, and a split is a write.
+        if crate::fence::load(&engine.data_dir).is_none() {
+            engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
+        }
         Ok(engine)
     }
 
@@ -926,6 +930,56 @@ impl Engine {
     /// Highest seq in the log (the chain tip position).
     pub fn log_tip(&self) -> Result<u64> {
         log_store::max_seq(&self.conn)
+    }
+
+    /// PVOS D182 — the top log's tip: its seq and that row's chain hash.
+    pub fn log_tip_hash(&self) -> Result<(u64, Vec<u8>)> {
+        log_store::tip(&self.conn)
+    }
+
+    /// PVOS D182 — judge a peer's top-log tip against this forest's log
+    /// ([`crate::fence::judge`]), and FENCE this owner when the peer is ahead
+    /// and `trusted` (§3.3a: the claim comes from a key with admin on the
+    /// forest root): a follower holding more of the log than its only writer
+    /// proves the writer stale. `peer` names who said so, for the person who
+    /// reads the fence. A replica judges but never fences (it writes nothing
+    /// anyway). Returns the verdict and this log's tip seq.
+    pub fn judge_peer_tip(
+        &self,
+        peer: &str,
+        peer_seq: u64,
+        peer_hash: &[u8],
+        trusted: bool,
+    ) -> Result<(crate::fence::TipVerdict, u64)> {
+        let (own_seq, own_hash) = self.log_tip_hash()?;
+        let at = if peer_seq > 0 && peer_seq <= own_seq {
+            log_store::hash_at(&self.conn, peer_seq)?
+        } else {
+            None
+        };
+        let verdict = crate::fence::judge(own_seq, at.as_deref(), peer_seq, peer_hash);
+        crate::fence::fence_if_ahead(
+            &self.data_dir,
+            self.replica,
+            verdict,
+            trusted,
+            peer,
+            peer_seq,
+            peer_hash,
+            own_seq,
+            &own_hash,
+        )?;
+        Ok((verdict, own_seq))
+    }
+
+    /// PVOS D182 §3.3a — may `key`'s claim of a longer log fence this owner?
+    /// Only a key holding admin (`a`) on the forest root: it could revoke
+    /// this owner's device outright, so believing it adds no authority. A
+    /// revoked key holds no rights, so its word counts for nothing.
+    pub fn may_fence_owner(&self, key: &[u8]) -> Result<bool> {
+        let root = self.identity.root_node_id.clone();
+        let rights = projection::effective_rights(&self.conn, &crate::acl::Principal::Key(key.to_vec()), &root)?;
+        Ok(rights & crate::acl::ACL_A != 0)
     }
 
     /// Raw log rows `[from_seq ..]`, at most `max` (log shipping, F2). The
@@ -1106,6 +1160,49 @@ impl Engine {
         device_index: u64,
         revoke: Option<&[u8]>,
     ) -> Result<Engine> {
+        let revoke: Vec<Vec<u8>> = revoke.map(|r| vec![r.to_vec()]).unwrap_or_default();
+        Self::promote_with_phrase(data_dir, mnemonic, device_index, &revoke)
+    }
+
+    /// PVOS D182 — [`Engine::promote`] with any number of devices to revoke,
+    /// the phrase signing: the device key is derived from the phrase at
+    /// `device_index` (so the phrase can recreate it), the root signs.
+    pub fn promote_with_phrase(
+        data_dir: &Path,
+        mnemonic: &Mnemonic,
+        device_index: u64,
+        revoke: &[Vec<u8>],
+    ) -> Result<Engine> {
+        let root_key = identity::root_key(mnemonic, "")?;
+        let root_pub = crypto::pubkey_bytes(&root_key);
+        let device_key = identity::device_key(mnemonic, "", device_index)?;
+        Self::promote_with_root_signer(data_dir, &root_pub, device_key, device_index, revoke, |d| {
+            crypto::sign_digest(&root_key, d)
+        })
+    }
+
+    /// PVOS D182 — the one promotion, whoever holds the root. `sign_root`
+    /// makes the root signatures: the phrase's root key, or a running
+    /// companion that asks a person to approve each (doc 14 — the seed never
+    /// leaves the vault). `device_key` is this box's new owner key: derived
+    /// from the phrase, or generated here (`identity::generate_device_key`, as
+    /// `init_with_root_signer` does — nothing binds a key to its index).
+    ///
+    /// Everything is checked, and every signature made, BEFORE anything is
+    /// written; then the `DeviceAuthorized` and every `DeviceRevoked` land in
+    /// ONE append. A refused revoke used to leave a half-promoted box: its
+    /// marker gone, its new device live, the old owner not revoked (D128's
+    /// two appends). A failure before the append puts the marker back — a
+    /// failed promotion leaves a replica.
+    pub fn promote_with_root_signer(
+        data_dir: &Path,
+        root_pub: &[u8],
+        device_key: identity::SigningKey,
+        device_index: u64,
+        revoke: &[Vec<u8>],
+        mut sign_root: impl FnMut(&[u8; 32]) -> Result<Vec<u8>>,
+    ) -> Result<Engine> {
+        crypto::validate_pubkey(root_pub)?;
         let marker = crate::replica::marker_path(data_dir);
         if !marker.exists() {
             return Err(bad(
@@ -1122,19 +1219,104 @@ impl Engine {
         }
         let kept = data_dir.join("promoted-from");
         std::fs::rename(&marker, &kept).map_err(|e| PvfsError::io("keep replica marker", e))?;
-        let mut engine = match Engine::recover(data_dir, mnemonic, device_index) {
-            Ok(e) => e,
-            Err(e) => {
-                // Put the marker back: a failed promotion leaves a replica.
-                let _ = std::fs::rename(&kept, &marker);
-                return Err(e);
-            }
+        let restore = |e: PvfsError| {
+            let _ = std::fs::rename(&kept, &marker);
+            e
         };
-        if let Some(old) = revoke {
-            if old != engine.device.pubkey().as_slice() {
-                engine.revoke_device(mnemonic, old)?;
+        let device_pub = crypto::pubkey_bytes(&device_key);
+
+        // The writer engine, built as `recover` builds it (the dir is no
+        // longer a replica, and its device is not authorized yet).
+        let others = probe_other_writers(data_dir);
+        let lock = take_writer_lock(data_dir);
+        let mut conn = open_connection(data_dir).map_err(restore)?;
+        let identity = projection::startup_check(&mut conn, data_dir, others).map_err(restore)?;
+        let current_root = projection::current_root(&conn, &identity).map_err(restore)?;
+        if current_root != root_pub {
+            return Err(restore(PvfsError::Identity {
+                detail: "that root key is not this forest's current identity root".into(),
+            }));
+        }
+        let mut engine = Engine {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            device: DeviceKeyCache { signing_key: device_key, device_index },
+            identity,
+            closed: false,
+            replica: false,
+            _writer_lock: lock,
+            own_pin: std::sync::OnceLock::new(),
+            cancel: None,
+            catalogue_batch: (crate::fs::CATALOGUE_BATCH_ROWS, crate::fs::CATALOGUE_BATCH_MS),
+            catalogue_interrupt: None,
+            catalogue_read_hook: None,
+        };
+
+        // Check everything first.
+        let devices = engine.devices().map_err(restore)?;
+        if let Some(d) = devices.iter().find(|d| d.index == device_index && d.revoked_at.is_none())
+        {
+            if d.pubkey != hex::encode(&device_pub) {
+                return Err(restore(bad(
+                    "promote",
+                    &format!("device index {device_index} is taken by a live device ({}…)", &d.pubkey[..16]),
+                )));
             }
         }
+        let known = devices.iter().find(|d| d.pubkey == hex::encode(&device_pub));
+        if known.is_some_and(|d| d.revoked_at.is_some()) {
+            return Err(restore(bad(
+                "promote",
+                "this device key was revoked — a revoked key never writes again; use another index",
+            )));
+        }
+        for old in revoke {
+            if old == &device_pub {
+                continue;
+            }
+            let live = devices.iter().any(|d| d.pubkey == hex::encode(old) && d.revoked_at.is_none());
+            let member = engine.device_known(old).map_err(restore)?;
+            if !live && !member {
+                return Err(restore(PvfsError::NotFound { kind: "device", id: hex::encode(old) }));
+            }
+        }
+
+        // Every signature before any write: a companion that says no, or a
+        // phrase that is wrong, changes nothing.
+        let t = now_ms();
+        let mut events = Vec::new();
+        if known.is_none() {
+            let sig = sign_root(&event::msg_device_authorized(&device_pub, device_index, t, root_pub))
+                .map_err(restore)?;
+            events.push(Event::DeviceAuthorized {
+                device_pubkey: device_pub.clone(),
+                device_index,
+                authorized_at: t,
+                author: root_pub.to_vec(),
+                sig,
+            });
+        }
+        for old in revoke {
+            if old == &device_pub {
+                continue;
+            }
+            let sig = sign_root(&event::msg_device_revoked(old, t, root_pub)).map_err(restore)?;
+            events.push(Event::DeviceRevoked {
+                device_pubkey: old.clone(),
+                revoked_at: t,
+                author: root_pub.to_vec(),
+                sig,
+            });
+        }
+        if !events.is_empty() {
+            engine.append_durable(events).map_err(restore)?;
+        }
+        // From here the promotion stands; the marker stays as `promoted-from`.
+        engine.device.save(data_dir)?;
+        engine.split_unsplit_regions()?; // P7.2a upgrade path (doc 20 §2.3)
+        projection::meta_set(&engine.conn, "clean_shutdown", "0")?;
+        engine.ensure_device_active()?;
+        engine.sweep_temp_spool()?;
         Ok(engine)
     }
 
@@ -1429,6 +1611,17 @@ impl Engine {
                 action: "write".into(),
                 reason: "replica forest is read-only — its owner instance is the only writer"
                     .into(),
+            });
+        }
+        // PVOS D182 — a fenced owner writes nothing: a follower holds a longer
+        // log than this box, so every event appended here would fork the
+        // forest. This is the one choke point every owner append passes (the
+        // daemon's routed writes, the CLI, the mount, every serve job's pass);
+        // only a person lifts it (`pvfs forest fence`).
+        if let Some(f) = crate::fence::load(&self.data_dir) {
+            return Err(PvfsError::Forbidden {
+                action: "write".into(),
+                reason: f.refusal(),
             });
         }
         let routes = self.route_events(&events)?;

@@ -100,7 +100,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -115,6 +115,9 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         }]),
         stores: Box::default(),
         mounts: Box::default(),
+        log: None,
+        fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -134,7 +137,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -144,6 +147,9 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
             pvfs_proto::StoreWire { path: "/mnt/local".into(), regions: vec!["c020473f".into()], free_bytes: 5, total_bytes: 6 },
         ]),
         mounts: Box::default(),
+        log: None,
+        fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -162,7 +168,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
         runner: "on".into(),
-        jobs: vec![],
+        jobs: Box::default(),
         conflicts: 0,
         stale: 0,
         capacity: None,
@@ -175,7 +181,79 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
             stale: None,
             started_ms: 7,
         }]),
+        log: None,
+        fenced: None,
+        backup: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+
+/// PVOS D182 — `serve status` gains the box's log tip and, on a fenced owner,
+/// the fence. An older reply decodes without them; a new one round-trips.
+#[test]
+fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[],"conflicts":0,"stale":0,"trash":[],"stores":[],"mounts":[]}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { log, fenced, .. } => {
+            assert!(log.is_none());
+            assert!(fenced.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    let new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: Box::default(),
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: Box::default(),
+        stores: Box::default(),
+        mounts: Box::default(),
+        log: Some(Box::new(pvfs_proto::LogTipWire { seq: 3472, hash: "ab".repeat(32) })),
+        fenced: Some(Box::new(pvfs_proto::FenceWire {
+            reason: "x holds the forest's log to seq 3480".into(),
+            peer: "192.168.1.142:7435".into(),
+            peer_seq: 3480,
+            own_seq: 3472,
+            at_ms: 9,
+        })),
+        backup: Some(Box::new(pvfs_proto::BackupWire { at_ms: 7, ok: true, seq: Some(3472), error: None })),
+    };
+    let s = serde_json::to_string(&new).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+
+/// PVOS D182 — a routed write carries the replica's tip. An older replica's
+/// request (no tip) decodes on a new owner; a new request decodes as the same
+/// write on an older owner, which simply ignores the field (serde's default:
+/// unknown fields are not an error). And no tip, no field on the wire.
+#[test]
+fn a_prepare_write_tip_is_optional_both_ways() {
+    let op = pvfs_proto::WriteOp::CommitRegionHead { region: "r".into(), seq: 2, hash: "h".into() };
+    let old = r#"{"t":"prepare_write","op":{"op":"commit_region_head","region":"r","seq":2,"hash":"h"}}"#;
+    match serde_json::from_str::<pvfs_proto::ClientMsg>(old).unwrap() {
+        pvfs_proto::ClientMsg::PrepareWrite { op: got, tip } => {
+            assert_eq!(got, op);
+            assert!(tip.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    let bare = serde_json::to_string(&pvfs_proto::ClientMsg::PrepareWrite { op: op.clone(), tip: None }).unwrap();
+    assert!(!bare.contains("tip"), "no tip, no field: {bare}");
+    let with = pvfs_proto::ClientMsg::PrepareWrite {
+        op: op.clone(),
+        tip: Some(Box::new(pvfs_proto::LogTipWire { seq: 3472, hash: "cd".repeat(32) })),
+    };
+    let s = serde_json::to_string(&with).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ClientMsg>(&s).unwrap(), with);
+    // What an older owner does with it: the same struct minus the field.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "t", rename_all = "snake_case")]
+    enum OldClientMsg {
+        PrepareWrite { op: pvfs_proto::WriteOp },
+    }
+    match serde_json::from_str::<OldClientMsg>(&s).unwrap() {
+        OldClientMsg::PrepareWrite { op: got } => assert_eq!(got, op),
+    }
 }

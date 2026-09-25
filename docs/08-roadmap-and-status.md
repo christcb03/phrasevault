@@ -215,8 +215,9 @@ replica-ingest race fix); BitTorrent itself stays app-side.
 2. ~~**`pvfs sync --to <dir>`** custom sync-store destinations.~~ ✅ shipped (P6, doc 19).
 3. **Mode B crosslink** (doc 03 §6 Q4): a grant that lets a replica's held copy be recorded in the
    owner's log as catalog-visible redundancy (today only the owner's own `tier` does that).
-4. **F4 tier** (doc 17 §8): reduced to **standby failover only** — region-granular logs (P7.2),
-   the FUSE read-through mount (P7.3), and swarm transfer (P9) all shipped.
+4. ~~**F4 tier** (doc 17 §8): reduced to **standby failover only**~~ — built as D128 (explicit
+   promotion) and PVOS D182 (the fence, the standby, `promote.sh`, companion promotion, dated
+   copies); what is left of availability is the track below.
 5. Doc 18 §6 leftovers: backoff tuning (the watcher-as-a-`watch`-job and tier's local-commit
    nudge shipped in the punch batch).
 6. Long-deferred polish: Touch ID unlock (doc 14), stable macOS .app signing identity.
@@ -249,6 +250,18 @@ replica-ingest race fix); BitTorrent itself stays app-side.
 | **P4 F5.7: the self-teaching swarm** ([doc 17](17-federation-and-sync.md) §7.8 — answers doc 03's open question #1) — `pvfs fleet announce <host:port>` publishes this box's pin→address into `<root>/.fleet/endpoints/` (plain member-signed nodes, write-through from replicas); every fetcher resolves location pins missing from its LOCAL registry from the catalog (registry always wins; the pin still gates every connect — a hostile address only fails the handshake). One bootstrap entry and the fleet teaches itself. No new wire ops | ✅ built (2026-08-16, branch d69-nas-arm) |
 | **P4 F5.6: attested external ingest** ([doc 17](17-federation-and-sync.md) §7.7 — the mover attests) — `pvfs tier` hash-fills + attests every unhashed file it migrates (successor via `Engine::hash_node`, verified from the bytes it just fetched, owner-signed); satisfied-in-place files are never ground silently (bulk = explicit `pvfs loc hash`). Ingest-box files (the D69 arr hook's output) become streamable/healable/verifiable the moment they tier. No new wire ops | ✅ built (2026-08-16, branch d69-nas-arm) |
 | **P4 F5.8: one folder at a time** ([doc 17](17-federation-and-sync.md) §7.9 — the D69 tear's prevention) — every projection-mutating critical section (`full_rebuild`, the open-time tail fold, the write path's append+fold tx) holds a blocking exclusive flock on a per-forest `fold.lock`, so a write can never land between another engine's replay segments (the interleave that tore the D69 lab owner's cache). The writer flock stays a shared probe; the self-heal stays as the net for old binaries and killed folders. No new wire ops, no schema change, no CLI surface | ✅ built (2026-08-16, branch f58-fold-serialization) |
+
+**The availability track (PVOS D182, 2026-09-23 — Chris: A first, then D; B and C for
+other users; E as two forests that cross-link).** Each step keeps the one below it; none
+replaces the single signed chain.
+
+| step | what | status |
+|---|---|---|
+| **A** | disaster recovery: the owner noticed within minutes (HA), fenced when stale (a follower's tip past its own), promoted by one prompted run (phrase or companion), a standby kept at the tip, dated verified copies of the log | ✅ built (PVOS D182; doc 28) |
+| **D** | the owner out of the daily path: a region's head signed by the box that owns the region and handed to peers directly; the owner commits heads to the forest log when it is up — an owner outage then stops only admin changes | PVOS D183 — doc 20 §6's open "region-scoped writers" |
+| **B** | warm standby, one-button takeover: the phrase pre-authorizes a writer pair once; a takeover is a signed event with a term; followers follow the highest valid term (no re-point); the old owner demotes itself on seeing a higher term; failback is the same button | roadmap — for users who want minutes without the phrase |
+| **C** | automatic failover: B's takeover fired by the standby and a witness agreeing the owner has been unreachable N minutes; votes signed into the takeover event; the owner self-fences when it loses the majority | roadmap — **opt-in per forest**: it reverses doc 28 §1's "no job, no watchdog, no quorum promotes" |
+| **E** | two forests that cross-link, each with its own single writer — "active-active" that keeps every integrity property: each site writes its own forest and links (and replicates) the other's regions; the same mechanism serves different users sharing content | roadmap — PVOS D77's questions (authority, verification, revocation, lifetime) |
 
 **Post-1.1 (unchanged tracks):** federation + sub-forest replication (P4, doc 03 — **now phased and started**, [doc 17](17-federation-and-sync.md)), compaction (doc 11) —
 both carry the doc 15 lineage edges (checkpoint embeds the root lineage; federation pins genesis +

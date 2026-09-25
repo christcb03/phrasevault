@@ -97,6 +97,15 @@ pub fn peek_identity(mount: &Path) -> Result<ForestIdentity> {
     }
 }
 
+/// PVOS D182 — a data dir's top-log tip `(seq, chain hash)`, read-only: no
+/// engine open, no recovery, safe beside a running daemon. What a replica
+/// sends with its routed writes, and what `pvfs forest tip` prints.
+pub fn peek_tip(data_dir: &Path) -> Result<(u64, Vec<u8>)> {
+    let conn = Connection::open_with_flags(data_dir.join("log.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(map_db("open log read-only"))?;
+    crate::log_store::tip_in(&conn, "main")
+}
+
 // ---- mount-level engine lifecycle ---------------------------------------------
 
 /// `pvfs forest init` (doc 05 §5.1): genesis under `<mount>/.pvfs/`, then

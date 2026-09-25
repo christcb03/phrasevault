@@ -509,6 +509,17 @@ for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 # the client finds the socket by forest (mount path) without --socket
 $PVFS --json remote --forest "$DMOUNT" --anon info | qgrep "\"forest_id\":\"$DFID\"" \
   && ok "remote --forest resolves the daemon socket" || fail "remote --forest resolves the daemon socket"
+# PVOS D182 — a second daemon of a served forest (a standby beside a holder's
+# replica, on one box) refuses the live socket instead of taking it over.
+if timeout 30 "$PVFSD" --mount "$DMOUNT" >/dev/null 2>"$DATA/pvfsd-second.log"; then
+  fail "a second pvfsd took over a live socket"
+else
+  grep -q "another pvfsd already serves" "$DATA/pvfsd-second.log" \
+    && ok "a second pvfsd refuses the live socket (PVOS D182)" \
+    || fail "second pvfsd: $(tail -1 "$DATA/pvfsd-second.log")"
+fi
+$PVFS --json remote --socket "$SOCK" --anon info | qgrep "\"forest_id\":\"$DFID\"" \
+  && ok "…and the first daemon still answers on it" || fail "the first daemon lost its socket"
 
 $PVFS --json remote --socket "$SOCK" --anon info | qgrep "\"forest_id\":\"$DFID\"" \
   && ok "remote info (anonymous)" || fail "remote info (anonymous)"

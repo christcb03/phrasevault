@@ -137,6 +137,19 @@ a shell:
 registers the channel; the health job sends `start` after two missed polls,
 backed off from 10 minutes doubling to 2 hours, recorded under `actions`.
 
+### 1.3b The log's tip, and the fence (PVOS D182)
+
+`serve status` carries `log: {seq, hash}` — the box's top-log tip — and, on a
+fenced owner, `fenced: {reason, peer, peer_seq, own_seq, at_ms}`; a box that
+makes dated copies adds `backup: {at_ms, ok, seq, error}`. The owner's health
+job judges every peer's tip against its own log and records the verdict per
+peer (`log_verdict`: `consistent`, `ahead` — this owner is stale and fences
+itself — or `diverged`), with its own `fenced`, `self_addr` and
+`self_log_seq`, in `fleet-health.json`. `pvfs forest tip [<mount>]` prints
+one box's tip read-only (beside a running daemon); `pvfs forest fence` shows
+and lifts a fence. Labels (`--label`) resolve by `host:port` before `host`,
+so two daemons on one box can be named apart.
+
 ### 1.4 Telling a person: `pvfs fleet notify` (D142)
 
 ```bash
@@ -160,6 +173,10 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `job_error_cleared` | a `job_error` that WAS sent has been gone for the same ~four minutes (D161): once per episode, naming the text last sent and how long it lasted (`since_ms` → `until_ms`); back inside the wait it is one episode and nothing is said; an error that cleared before it was sent is never cleared | info |
 | `heartbeat` | every 24 h: "All good: N boxes up, nothing to do." or what is down | info / warning |
 | `test` | `--test` | info |
+| `owner_fenced` | PVOS D182: this owner fenced itself — a peer holds more of the log than it does (restored from an older copy, or replaced by a promotion); it writes nothing until a person looks (`pvfs forest fence`). Once; on the first poll too. While fenced the owner says nothing else but the heartbeat, which then reads "still fenced" (warning) | critical |
+| `owner_unfenced` | the fence was lifted (a clear, sent as ✅) | info |
+| `peer_diverged` | a peer's copy of the log differs from the owner's at its tip: it followed a writer that is not the owner, or was restored wrongly; the owner takes no writes from it until it is re-seeded. Once | warning |
+| `peer_diverged_cleared` | that peer agrees again (re-seeded) — a clear, sent as ✅ | info |
 
 Payload (format `ha`/`json`):
 
@@ -176,7 +193,10 @@ should have to read. The first version sent the raw fields
 rightly called meaningless; the sentence is the product.
 
 The daily heartbeat exists so a *silent owner* is noticed by its absence —
-the one failure the fleet cannot report about itself (§2.1).
+the one failure the fleet cannot report about itself (§2.1). Since PVOS D182
+the worked example below does not wait a day for it: Home Assistant pages
+when the owner's status feed stops for ten minutes, or when the feed says the
+owner's daemon is down (the notifier lives inside that daemon).
 
 ---
 

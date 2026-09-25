@@ -856,14 +856,16 @@ enum ForestCmd {
     Promote {
         /// The replica's mount directory
         mount: PathBuf,
-        /// Device index for this box's key (must differ from the old
-        /// owner's, whose key is revoked; the box that ran `forest init` is 0)
-        #[arg(long, default_value_t = 1)]
-        device_index: u64,
-        /// Old owner's device pubkey (hex) to revoke. Default: the forest's
-        /// device 0, the one `forest init` created.
+        /// Device index for this box's key. Default: the next index this
+        /// forest has never used (PVOS D182 — a second move found 1 taken).
         #[arg(long)]
-        revoke: Option<String>,
+        device_index: Option<u64>,
+        /// A device pubkey (hex) to revoke; repeatable. Default: every live
+        /// owner device other than this box's new one — at most one owner
+        /// device is ever live (PVOS D182; it was "device 0", which after one
+        /// move revoked nobody).
+        #[arg(long)]
+        revoke: Vec<String>,
         /// Revoke nothing (the old device stays authorized — only when it
         /// really is destroyed, e.g. the box is gone with its key)
         #[arg(long, conflicts_with = "revoke")]
@@ -871,6 +873,18 @@ enum ForestCmd {
         /// Promote even though the recorded owner's address still answers
         #[arg(long)]
         force: bool,
+        /// PVOS D182 — root-sign through a running companion (no phrase
+        /// typed); it asks a person to approve each signature. Bare at a
+        /// terminal, you are asked when a companion answers.
+        #[arg(long)]
+        via_companion: bool,
+        /// The companion's socket (default: $PVFS_COMPANION_SOCKET, then the
+        /// usual path; `pvfs ssh` forwards it to a server)
+        #[arg(long)]
+        companion_socket: Option<PathBuf>,
+        /// Do not ask for confirmation (scripts)
+        #[arg(long)]
+        yes: bool,
     },
     /// Remove a forest from the registry (never deletes .pvfs/)
     Unregister { name: String },
@@ -902,6 +916,47 @@ enum ForestCmd {
     },
     /// Show a forest's identity (default: current context)
     Info { target: Option<String> },
+    /// PVOS D182 — this box's copy of the forest log: its tip (seq + chain
+    /// hash), whether this box is the owner or a replica (and of whom), and
+    /// whether the owner is fenced. Read-only and safe beside a running
+    /// daemon; what `promote.yml` compares across boxes before a promotion.
+    Tip { target: Option<String> },
+    /// PVOS D182 — a dated, verified copy of this forest's log (`log.db` and
+    /// any region log generations), safe beside a running daemon. Followers
+    /// copy a bad build's events faithfully; a dated copy is the way back to
+    /// a known-good log. The copy counts only once a full replay of it
+    /// verifies; older copies of this forest are pruned by `--keep`.
+    Backup {
+        target: Option<String>,
+        /// Where copies go (default: `log-backups` beside the forest's
+        /// directory; asked when run bare at a terminal)
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Remove this forest's copies older than this many days (default 30)
+        #[arg(long)]
+        keep: Option<u64>,
+    },
+    /// PVOS D182 — a new replica directory from a dated copy (`pvfs forest
+    /// backup`), verified the same way. Then `pvfs replica repoint` to follow
+    /// a live owner, or — only when every live log is damaged — `pvfs forest
+    /// promote`, which rolls the forest back to the copy (PVFS doc 28).
+    Restore {
+        /// The copy: a directory `pvfs forest backup` made (asked when bare)
+        copy: Option<PathBuf>,
+        /// The new forest directory; its `.pvfs` is created (asked when bare)
+        mount: Option<PathBuf>,
+    },
+    /// PVOS D182 — show this owner's fence, and lift it. An owner fences
+    /// itself when a follower holds more of the log than it does (it was
+    /// restored from an older copy, or another box was promoted), and then
+    /// writes nothing. Bare: shows the fence and asks. Lift it only when this
+    /// box really is the forest's writer.
+    Fence {
+        target: Option<String>,
+        /// Lift the fence without asking (for scripts)
+        #[arg(long)]
+        clear: bool,
+    },
     /// Register an offline **rotation recovery key** (doc 15 §C5) so you can
     /// rotate the root even after total seed compromise. Reads your current
     /// recovery phrase from stdin to authorize; prints a NEW recovery phrase to
@@ -2433,6 +2488,9 @@ fn replica_write_client(data_dir: &std::path::Path) -> Result<(Client, SignFn), 
         }),
     }
     .map_err(remote_err)?;
+    // PVOS D182 — carry this replica's tip, as `advertise::replica_route` does.
+    let mut client = client;
+    client.set_write_tip(pvfs_core::mount::peek_tip(data_dir).ok());
     let sign: SignFn = Box::new(move |d| crypto::sign_digest(&key, d).unwrap_or_default());
     Ok((client, sign))
 }
@@ -2648,13 +2706,25 @@ fn companion_pubkey(socket: &Path, role: &str) -> Result<Vec<u8>, PvfsError> {
 
 /// Ask a running companion to sign `digest` for a request type (doc 14 §3, §4).
 fn companion_sign(socket: &Path, request_type: &str, digest: &[u8; 32]) -> Result<Vec<u8>, PvfsError> {
+    companion_sign_ctx(socket, request_type, digest, None)
+}
+
+/// [`companion_sign`] with the approval context the companion shows and
+/// audits (doc 16 §3.1) — PVOS D182: a promotion's prompt names the forest,
+/// the device admitted and how many are revoked, instead of the generic line.
+fn companion_sign_ctx(
+    socket: &Path,
+    request_type: &str,
+    digest: &[u8; 32],
+    context: Option<pvfs_companion::ApprovalContext>,
+) -> Result<Vec<u8>, PvfsError> {
     let resp = pvfs_companion::request(
         socket,
         &pvfs_companion::AgentRequest::Sign {
             request_type: request_type.into(),
             digest: hex::encode(digest),
             origin: Some("local".into()),
-            context: None,
+            context,
         },
     )
     .map_err(|e| PvfsError::BadInput {
@@ -9071,7 +9141,11 @@ fn forest_cmd(
             revoke,
             keep_old_device,
             force,
+            via_companion,
+            companion_socket,
+            yes,
         } => {
+            use std::io::IsTerminal;
             let data_dir = mount.join(".pvfs");
             let src = match pvfs_core::ReplicaSource::load(&data_dir) {
                 Ok(s) => s,
@@ -9099,16 +9173,46 @@ fn forest_cmd(
                     ),
                 });
             }
-            // The forest's devices, so the operator sees what is being
-            // decided: the index this box takes must be unused (a taken
-            // index would make it share another device's key), and the
-            // default revocation is device 0, the one `forest init` made.
+            // The forest's devices and this copy's tip, so the operator sees
+            // what is being decided (PVOS D182: promote.yml compares the tips
+            // of every box first — the box promoted must hold the longest log).
             let devs = {
                 let ro = Engine::open(&data_dir)?;
                 let d = ro.devices()?;
                 ro.close()?;
                 d
             };
+            let (tip_before, _) = mount::peek_tip(&data_dir)?;
+            let index = device_index
+                .unwrap_or_else(|| devs.iter().map(|d| d.index + 1).max().unwrap_or(1).max(1));
+            if let Some(taken) = devs.iter().find(|d| d.index == index && d.revoked_at.is_none()) {
+                return Err(PvfsError::BadInput {
+                    field: "device-index".into(),
+                    reason: format!(
+                        "index {index} is already device {}; pick an unused --device-index",
+                        taken.pubkey
+                    ),
+                });
+            }
+            let old: Vec<Vec<u8>> = if keep_old_device {
+                Vec::new()
+            } else if !revoke.is_empty() {
+                revoke
+                    .iter()
+                    .map(|h| {
+                        hex::decode(h).map_err(|_| PvfsError::BadInput {
+                            field: "revoke".into(),
+                            reason: "--revoke takes a device pubkey as hex".into(),
+                        })
+                    })
+                    .collect::<Result<_, _>>()?
+            } else {
+                devs.iter()
+                    .filter(|d| d.revoked_at.is_none())
+                    .filter_map(|d| hex::decode(&d.pubkey).ok())
+                    .collect()
+            };
+            let interactive = std::io::stdin().is_terminal() && !json;
             if !json {
                 println!("devices of this forest:");
                 for d in &devs {
@@ -9119,57 +9223,98 @@ fn forest_cmd(
                         if d.revoked_at.is_some() { "revoked" } else { "live" }
                     );
                 }
+                println!("this replica's log: seq {tip_before} (following {})", src.target);
+                println!("this box becomes device {index}");
+                if old.is_empty() {
+                    println!("revoke: nothing{}", if keep_old_device { " (--keep-old-device)" } else { "" });
+                } else {
+                    for k in &old {
+                        println!("revoke: {}", hex::encode(k));
+                    }
+                }
             }
-            if let Some(taken) = devs.iter().find(|d| d.index == device_index && d.revoked_at.is_none()) {
-                return Err(PvfsError::BadInput {
-                    field: "device-index".into(),
-                    reason: format!(
-                        "index {device_index} is already device {}; pick an unused --device-index",
-                        taken.pubkey
-                    ),
-                });
+            // The signer: the companion (the seed never leaves its vault; it
+            // asks a person to approve each signature) or the phrase.
+            let use_companion = via_companion
+                || (interactive
+                    && resolve_companion_socket(companion_socket.clone()).is_ok()
+                    && {
+                        let a = prompt_line("sign with the companion on this machine? [Y/n]", Some("Y"))?;
+                        !a.trim().eq_ignore_ascii_case("n")
+                    });
+            if interactive && !yes {
+                let a = prompt_line("promote this replica to the forest's owner? [y/N]", Some("N"))?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return Ok(());
+                }
             }
-            let old: Option<Vec<u8>> = if keep_old_device {
-                None
-            } else if let Some(h) = &revoke {
-                Some(hex::decode(h).map_err(|_| PvfsError::BadInput {
-                    field: "revoke".into(),
-                    reason: "--revoke takes the device pubkey as hex".into(),
-                })?)
+            let engine = if use_companion {
+                let sock = resolve_companion_socket(companion_socket)?;
+                let root_pub = companion_pubkey(&sock, "root")?;
+                let forest = mount::peek_identity(&mount)?.forest_id;
+                let summary = format!(
+                    "promote {} to owner of forest {forest}: authorize device {index}, revoke {}",
+                    mount.display(),
+                    old.len()
+                );
+                Engine::promote_with_root_signer(
+                    &data_dir,
+                    &root_pub,
+                    identity::generate_device_key(),
+                    index,
+                    &old,
+                    |d| {
+                        let ctx = pvfs_companion::ApprovalContext {
+                            app_id: "pvfs-cli".into(),
+                            action: "promote".into(),
+                            summary: summary.clone(),
+                            resource: Some(forest.clone()),
+                            digest_hex: Some(hex::encode(d)),
+                        };
+                        companion_sign_ctx(&sock, "root_device_cert", d, Some(ctx))
+                    },
+                )?
             } else {
-                devs.iter()
-                    .find(|d| d.index == 0 && d.revoked_at.is_none())
-                    .and_then(|d| hex::decode(&d.pubkey).ok())
+                let mn = read_phrase_stdin("recovery phrase (to promote this replica to owner)")?;
+                Engine::promote_with_phrase(&data_dir, &mn, index, &old)?
             };
-            let mn = read_phrase_stdin("recovery phrase (to promote this replica to owner)")?;
-            let engine = Engine::promote(&data_dir, &mn, device_index, old.as_deref())?;
             let pubkey = hex::encode(engine.device_pubkey());
             let tip = engine.log_tip()?;
             engine.close()?;
+            let revoked: Vec<String> = old.iter().map(hex::encode).filter(|k| k != &pubkey).collect();
             if json {
                 println!(
-                    "{{\"promoted\":true,\"mount\":\"{}\",\"device_index\":{},\"device_pubkey\":\"{}\",\"revoked\":{},\"was_following\":\"{}\",\"tip\":{}}}",
-                    json_escape(&mount.to_string_lossy()),
-                    device_index,
-                    pubkey,
-                    old.as_ref()
-                        .map(|k| format!("\"{}\"", hex::encode(k)))
-                        .unwrap_or_else(|| "null".into()),
-                    json_escape(&src.target),
-                    tip,
+                    "{}",
+                    serde_json::json!({
+                        "promoted": true,
+                        "mount": mount.to_string_lossy(),
+                        "device_index": index,
+                        "device_pubkey": pubkey,
+                        "revoked": revoked,
+                        "signed_by": if use_companion { "companion" } else { "phrase" },
+                        "was_following": src.target,
+                        "tip": tip,
+                    })
                 );
             } else {
                 println!("promoted {} to owner", mount.display());
-                println!("  this device : {device_index} ({pubkey})");
-                match &old {
-                    Some(k) => println!("  revoked     : {}", hex::encode(k)),
-                    None => println!("  revoked     : nothing (--keep-old-device)"),
+                println!("  this device : {index} ({pubkey})");
+                if revoked.is_empty() {
+                    println!(
+                        "  revoked     : nothing{}",
+                        if keep_old_device { " (--keep-old-device)" } else { " (no other live owner device)" }
+                    );
                 }
+                for k in &revoked {
+                    println!("  revoked     : {k}");
+                }
+                println!("  signed by   : {}", if use_companion { "the companion" } else { "the recovery phrase" });
                 println!("  followed    : {} (kept as .pvfs/promoted-from)", src.target);
                 println!("  log tip     : {tip}");
                 println!();
                 println!("next: start pvfsd here with --listen, then re-point every replica");
-                println!("      (`pvfs replica repoint <mount> --instance <name>`, or the fleet play).");
+                println!("      (`pvfs replica repoint <mount> --instance <name>`, or promote.yml).");
             }
             Ok(())
         }
@@ -9270,6 +9415,204 @@ fn forest_cmd(
                 println!("device key  : {}", hex::encode(engine.device_pubkey()));
             }
             engine.close()
+        }
+        ForestCmd::Tip { target } => {
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
+            let id = mount::peek_identity(&mount_dir)?;
+            let (seq, hash) = mount::peek_tip(&state)?;
+            let source = pvfs_core::ReplicaSource::load(&state).ok();
+            let fence = pvfs_core::fence::load(&state);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "forest_id": id.forest_id,
+                        // the genesis root: what a companion must hold to promote (D182)
+                        "root": hex::encode(&id.root_pubkey),
+                        "seq": seq,
+                        "hash": hex::encode(&hash),
+                        "replica": source.is_some(),
+                        "source": source.as_ref().map(|s| s.target.clone()),
+                        "fenced": fence.as_ref().map(|f| serde_json::json!({
+                            "reason": f.reason, "peer": f.peer, "peer_seq": f.peer_seq,
+                            "own_seq": f.own_seq, "at_ms": f.at_ms,
+                        })),
+                    })
+                );
+            } else {
+                println!("forest : {}", id.forest_id);
+                println!("root   : {}", hex::encode(&id.root_pubkey));
+                let short: String = hex::encode(&hash).chars().take(16).collect();
+                println!("log    : seq {seq}, hash {short}…");
+                match &source {
+                    Some(s) => println!("role   : replica, following {}", s.target),
+                    None => println!("role   : owner"),
+                }
+                match &fence {
+                    Some(f) => println!("fence  : FENCED {} — {}", ago(f.at_ms), f.reason),
+                    None if source.is_none() => println!("fence  : none"),
+                    None => {}
+                }
+            }
+            Ok(())
+        }
+        ForestCmd::Backup { target, to, keep } => {
+            use std::io::IsTerminal;
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
+            let default_to = mount_dir
+                .parent()
+                .map(|p| p.join("log-backups"))
+                .unwrap_or_else(|| PathBuf::from("log-backups"));
+            let to = match to {
+                Some(t) => t,
+                None if std::io::stdin().is_terminal() && !json => PathBuf::from(prompt_line(
+                    "copy the log to (directory)",
+                    Some(&default_to.to_string_lossy()),
+                )?),
+                None => default_to,
+            };
+            let keep = keep.unwrap_or(30);
+            let made = now_ms();
+            let result = forest_backup(&state, &mount_dir, &to, keep, made);
+            // What `serve status` reports (the page says when copies stop).
+            let record = match &result {
+                Ok((dir, v, _)) => serde_json::json!({"at_ms": made, "ok": true, "seq": v.seq,
+                    "dir": dir.to_string_lossy(), "error": null}),
+                Err(e) => serde_json::json!({"at_ms": made, "ok": false, "seq": null, "dir": null,
+                    "error": e.to_string()}),
+            };
+            let _ = std::fs::write(state.join("backup-state.json"), record.to_string());
+            let (dir, v, pruned) = result?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"copy": dir.to_string_lossy(), "forest_id": v.forest_id,
+                        "seq": v.seq, "hash": hex::encode(&v.hash), "bytes": v.bytes,
+                        "files": v.files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                        "pruned": pruned.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>()})
+                );
+            } else {
+                println!("copied and verified: {} (seq {}, {})", dir.display(), v.seq, fmt_bytes(v.bytes));
+                for p in &pruned {
+                    println!("pruned (older than {keep} days): {}", p.display());
+                }
+            }
+            Ok(())
+        }
+        ForestCmd::Restore { copy, mount: dest } => {
+            let copy = match copy {
+                Some(c) => c,
+                None => PathBuf::from(prompt_line("the copy to restore (a directory pvfs forest backup made)", None)?),
+            };
+            let dest = match dest {
+                Some(m) => m,
+                None => PathBuf::from(prompt_line("the new forest directory", None)?),
+            };
+            // What the copied box followed, from the copy's manifest, so the
+            // restored replica can simply follow it again.
+            let source = std::fs::read_to_string(copy.join("manifest.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|m| {
+                    let target = m.get("source")?.as_str()?.to_string();
+                    let pin = m.get("source_pin").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    Some(pvfs_core::ReplicaSource { transport: "tcp".into(), target, pin, region: String::new() })
+                });
+            let followed = source.as_ref().map(|s| s.target.clone());
+            let v = pvfs_core::backup::restore(&copy, &dest, source)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"restored": dest.to_string_lossy(), "forest_id": v.forest_id,
+                        "seq": v.seq, "follows": followed})
+                );
+            } else {
+                println!("restored {} from {} (forest {}, seq {})", dest.display(), copy.display(), v.forest_id, v.seq);
+                match followed {
+                    Some(t) => println!("it is a replica of {t} again — start its daemon, or `pvfs replica repoint` it elsewhere"),
+                    None => println!("it follows nothing yet — `pvfs replica repoint` it to a live owner"),
+                }
+                println!("only when EVERY live log is damaged: `pvfs forest promote` it — that rolls the forest");
+                println!("back to seq {}, and every follower must then be re-seeded (PVFS doc 28).", v.seq);
+            }
+            Ok(())
+        }
+        ForestCmd::Fence { target, clear } => {
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let Some(f) = pvfs_core::fence::load(&state) else {
+                if json {
+                    println!("{{\"fenced\":false}}");
+                } else {
+                    println!("not fenced — this box writes as usual");
+                }
+                return Ok(());
+            };
+            if !clear {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"fenced": true, "reason": f.reason, "peer": f.peer,
+                            "peer_seq": f.peer_seq, "own_seq": f.own_seq, "at_ms": f.at_ms})
+                    );
+                    return Ok(());
+                }
+                println!("FENCED {} — {}", ago(f.at_ms), f.reason);
+                println!();
+                println!("This box writes nothing while fenced. Lift the fence only when this box");
+                println!("really is the forest's writer:");
+                println!("  * another box was promoted: do not lift it — make this box a replica of");
+                println!("    the new owner (PVFS doc 28 §5) and retire this directory;");
+                println!("  * this box was restored behind its followers: promote the most advanced");
+                println!("    follower instead (promote.yml).");
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    println!("(pass --clear to lift it from a script)");
+                    return Ok(());
+                }
+                let a = prompt_line("lift the fence? [y/N]", Some("N"))?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return Ok(());
+                }
+            }
+            pvfs_core::fence::clear(&state)?;
+            // The next health pass sets it again if nothing has changed: say
+            // so, rather than let the lift look as if it did not work.
+            let again = pvfs_client::health::FleetHealth::load(&state)
+                .ok()
+                .flatten()
+                .map(|h| {
+                    h.peers
+                        .values()
+                        .filter(|r| r.last.log_verdict.as_deref() == Some("ahead"))
+                        .map(|r| r.addr.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if json {
+                println!("{}", serde_json::json!({"fenced": false, "lifted": f.reason, "still_ahead": again}));
+            } else {
+                println!("fence lifted (it said: {})", f.reason);
+                if !again.is_empty() {
+                    println!(
+                        "warning: the last health pass saw {} ahead of this box — unless that has \
+                         changed, the next pass (within 2 minutes) fences it again",
+                        again.join(", ")
+                    );
+                }
+            }
+            Ok(())
         }
         ForestCmd::RecoveryKey { forest, revoke } => {
             let state = forest_state_dir(forest, ctx)?;
@@ -9436,6 +9779,7 @@ fn serve_status_print(
     let st = client.serve_status_full().map_err(remote_err)?;
     let (runner, jobs, conflicts, stale, capacity, trash, stores) =
         (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash, st.stores);
+    let (log, fenced) = (st.log, st.fenced);
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -9455,7 +9799,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -9463,9 +9807,18 @@ fn serve_status_print(
                 .unwrap_or_else(|| "null".into()),
             serde_json::to_string(&trash).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&stores).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&log).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&fenced).unwrap_or_else(|_| "null".into()),
         );
     } else {
+        // PVOS D182 — first, because nothing else matters while it holds.
+        if let Some(f) = &fenced {
+            println!("FENCED: {} — this owner writes nothing until a person looks (pvfs forest fence)", f.reason);
+        }
         println!("runner: {runner}");
+        if let Some(t) = &log {
+            println!("log: seq {}  (this box's copy of the forest log; D182)", t.seq);
+        }
         if conflicts > 0 {
             println!("conflicts: {conflicts}  (see `pvfs view conflicts`; D127)");
         }
@@ -9608,6 +9961,60 @@ fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
             reason: format!("{what} is required"),
         }),
     }
+}
+
+/// PVOS D182 — `pvfs forest backup`'s work: copy (VACUUM INTO) into a
+/// partial directory, verify it by a full replay, name it by its forest,
+/// time and seq, write its manifest, prune older copies. Returns the copy,
+/// what it holds, and what was pruned.
+fn forest_backup(
+    state: &std::path::Path,
+    mount_dir: &std::path::Path,
+    to: &std::path::Path,
+    keep: u64,
+    made: u64,
+) -> Result<(PathBuf, pvfs_core::backup::VerifiedCopy, Vec<PathBuf>), PvfsError> {
+    std::fs::create_dir_all(to).map_err(|e| PvfsError::io("make backup dir", e))?;
+    let partial = to.join(format!(".partial-{}-{made}", std::process::id()));
+    let done = (|| {
+        pvfs_core::backup::copy_logs(state, &partial)?;
+        let v = pvfs_core::backup::verify_copy(&partial)?;
+        let id = mount::peek_identity(mount_dir)?;
+        if v.forest_id != id.forest_id {
+            return Err(PvfsError::BadInput {
+                field: "backup".into(),
+                reason: format!("the copy holds forest {}, not {}", v.forest_id, id.forest_id),
+            });
+        }
+        let source = pvfs_core::ReplicaSource::load(state).ok();
+        let manifest = serde_json::json!({
+            "format": "pvfs-log-copy 1",
+            "forest_id": v.forest_id,
+            "instance_id": v.instance_id,
+            "seq": v.seq,
+            "hash": hex::encode(&v.hash),
+            "made_ms": made,
+            "made_utc": pvfs_core::backup::stamp(made),
+            "box": std::fs::read_to_string("/etc/hostname").map(|h| h.trim().to_string()).unwrap_or_default(),
+            "build": env!("PVFS_BUILD"),
+            "from": state.to_string_lossy(),
+            "source": source.as_ref().map(|s| s.target.clone()),
+            "source_pin": source.as_ref().map(|s| s.pin.clone()),
+            "files": v.files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "bytes": v.bytes,
+            "verified": true,
+        });
+        std::fs::write(partial.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap_or_default())
+            .map_err(|e| PvfsError::io("write copy manifest", e))?;
+        let dir = to.join(pvfs_core::backup::copy_name(&v.forest_id, made, v.seq));
+        std::fs::rename(&partial, &dir).map_err(|e| PvfsError::io("name the copy", e))?;
+        let pruned = pvfs_core::backup::prune(to, &v.forest_id, keep, made)?;
+        Ok((dir, v, pruned))
+    })();
+    if done.is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+    done
 }
 
 /// Read + validate a recovery phrase from stdin (piped or typed).
