@@ -1699,6 +1699,28 @@ pub fn catalog_endpoints(engine: &Engine) -> std::collections::HashMap<String, S
     out
 }
 
+/// PVOS D182 §3.3a — who announced each endpoint: pin → the key that
+/// created its node under `<root>/.fleet/endpoints`. The owner's health job
+/// believes a peer's longer log only when this key holds admin on the root.
+pub fn catalog_endpoint_authors(engine: &Engine) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut out = std::collections::HashMap::new();
+    let step = |parent: &str, label: &str| -> Option<String> {
+        engine
+            .children(&parent.to_string())
+            .ok()?
+            .into_iter()
+            .find(|c| c.label == label)
+            .map(|c| c.node.id)
+    };
+    let root = engine.identity.root_node_id.clone();
+    let Some(fleet) = step(&root, FLEET_DIR) else { return out };
+    let Some(eps) = step(&fleet, ENDPOINTS_DIR) else { return out };
+    for c in engine.children(&eps).unwrap_or_default() {
+        out.insert(c.label, c.node.author);
+    }
+    out
+}
+
 /// Fetch missing bytes under `roots`, streaming each file into the managed
 /// sync store (hash-verified on commit). Returns `(fetched, failures)` —
 /// per-file failures never abort the pass.

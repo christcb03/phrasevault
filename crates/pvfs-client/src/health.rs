@@ -265,6 +265,16 @@ pub fn catalog_versions(engine: &Engine) -> BTreeMap<String, String> {
     out
 }
 
+/// PVOS D182 §3.3a — the announced endpoints (pins) whose word may fence
+/// this owner: those announced by a key holding admin on the forest root.
+pub fn trusted_announcers(engine: &Engine) -> std::collections::HashSet<String> {
+    crate::fetch::catalog_endpoint_authors(engine)
+        .into_iter()
+        .filter(|(_, author)| engine.may_fence_owner(author).unwrap_or(false))
+        .map(|(pin, _)| pin)
+        .collect()
+}
+
 /// One poll of every announced peer (minus this box), folded into the
 /// record on disk. Honours `cancel` between peers (D123).
 pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, PvfsError> {
@@ -278,6 +288,9 @@ pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, P
         .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
         .collect();
     let versions = catalog_versions(&engine);
+    // §3.3a: a peer's longer log fences this owner only when the key that
+    // announced it holds admin on the forest root.
+    let trusted = trusted_announcers(&engine);
     engine.close()?;
     let mut record = FleetHealth::load(data_dir)?.unwrap_or_default();
     for (pin, addr) in endpoints {
@@ -291,7 +304,7 @@ pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, P
             region: String::new(),
         };
         let mut health = probe_peer(&src, &forest);
-        judge_tip(data_dir, &addr, &mut health);
+        judge_tip(data_dir, &addr, trusted.contains(&pin), &mut health);
         record.observe(&pin, &addr, versions.get(&pin).cloned(), now_ms(), health);
     }
     record.fenced = pvfs_core::fence::load(data_dir).map(|f| pvfs_proto::FenceWire {
@@ -309,17 +322,20 @@ pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, P
 
 /// PVOS D182 — the fence rule for one probed peer: its tip against this
 /// box's log. A peer AHEAD of this owner proves it stale and fences it
-/// (`pvfs_core::fence::check_peer`); one on another branch is only marked
-/// (the notifier says so; the owner refuses its writes as they come).
-fn judge_tip(data_dir: &Path, addr: &str, health: &mut PeerHealth) {
+/// (`pvfs_core::fence::check_peer`) — when `trusted` (§3.3a: announced by a
+/// key with admin on the root); an untrusted one is only marked
+/// `ahead-unproven`. One on another branch is only marked (the notifier says
+/// so; the owner refuses its writes as they come).
+fn judge_tip(data_dir: &Path, addr: &str, trusted: bool, health: &mut PeerHealth) {
     let Some(t) = health.log.as_ref().filter(|_| health.ok()) else { return };
     let Ok(hash) = hex::decode(&t.hash) else { return };
-    match pvfs_core::fence::check_peer(data_dir, addr, t.seq, &hash) {
+    match pvfs_core::fence::check_peer(data_dir, addr, t.seq, &hash, trusted) {
         Ok((v, _)) => {
             health.log_verdict = Some(
                 match v {
                     pvfs_core::fence::TipVerdict::Consistent => "consistent",
-                    pvfs_core::fence::TipVerdict::Ahead => "ahead",
+                    pvfs_core::fence::TipVerdict::Ahead if trusted => "ahead",
+                    pvfs_core::fence::TipVerdict::Ahead => "ahead-unproven",
                     pvfs_core::fence::TipVerdict::Diverged => "diverged",
                 }
                 .into(),

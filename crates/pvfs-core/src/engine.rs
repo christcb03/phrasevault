@@ -938,16 +938,18 @@ impl Engine {
     }
 
     /// PVOS D182 — judge a peer's top-log tip against this forest's log
-    /// ([`crate::fence::judge`]), and FENCE this owner when the peer is ahead:
-    /// a follower holding more of the log than its only writer proves the
-    /// writer stale. `peer` names who said so, for the person who reads the
-    /// fence. A replica judges but never fences (it writes nothing anyway).
-    /// Returns the verdict and this log's tip seq.
+    /// ([`crate::fence::judge`]), and FENCE this owner when the peer is ahead
+    /// and `trusted` (§3.3a: the claim comes from a key with admin on the
+    /// forest root): a follower holding more of the log than its only writer
+    /// proves the writer stale. `peer` names who said so, for the person who
+    /// reads the fence. A replica judges but never fences (it writes nothing
+    /// anyway). Returns the verdict and this log's tip seq.
     pub fn judge_peer_tip(
         &self,
         peer: &str,
         peer_seq: u64,
         peer_hash: &[u8],
+        trusted: bool,
     ) -> Result<(crate::fence::TipVerdict, u64)> {
         let (own_seq, own_hash) = self.log_tip_hash()?;
         let at = if peer_seq > 0 && peer_seq <= own_seq {
@@ -960,6 +962,7 @@ impl Engine {
             &self.data_dir,
             self.replica,
             verdict,
+            trusted,
             peer,
             peer_seq,
             peer_hash,
@@ -967,6 +970,16 @@ impl Engine {
             &own_hash,
         )?;
         Ok((verdict, own_seq))
+    }
+
+    /// PVOS D182 §3.3a — may `key`'s claim of a longer log fence this owner?
+    /// Only a key holding admin (`a`) on the forest root: it could revoke
+    /// this owner's device outright, so believing it adds no authority. A
+    /// revoked key holds no rights, so its word counts for nothing.
+    pub fn may_fence_owner(&self, key: &[u8]) -> Result<bool> {
+        let root = self.identity.root_node_id.clone();
+        let rights = projection::effective_rights(&self.conn, &crate::acl::Principal::Key(key.to_vec()), &root)?;
+        Ok(rights & crate::acl::ACL_A != 0)
     }
 
     /// Raw log rows `[from_seq ..]`, at most `max` (log shipping, F2). The

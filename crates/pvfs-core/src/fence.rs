@@ -14,6 +14,14 @@
 //! forest fence`. Its PRESENCE is the fence: a file that cannot be read still
 //! fences, and says so.
 //!
+//! **Whose word counts (D182 §3.3a).** The owner cannot check rows it does not
+//! hold, so a longer tip is only a claim. It fences only when the claim comes
+//! from a key holding admin (`a`) on the forest root — one that could revoke
+//! this owner's device outright, so believing it adds no authority. A longer
+//! tip from anyone else is refused, not believed (the callers say what that
+//! means for them). Proof cannot replace this: a restored owner may have lost
+//! only member-authored rows, which another member could forge.
+//!
 //! The other verdict, [`TipVerdict::Diverged`], is about the PEER, not this
 //! box: a follower on another branch is refused and reported, and the owner
 //! keeps writing — one bad follower must not stop the forest.
@@ -154,14 +162,16 @@ pub fn fence_path(data_dir: &Path) -> PathBuf {
     data_dir.join(FENCE_FILE)
 }
 
-/// Set the fence for an `Ahead` verdict — never on a replica (it writes
-/// nothing anyway, and a replica's peers are not its evidence). Says so in the
-/// journal the first time.
+/// Set the fence for an `Ahead` verdict from a `trusted` source (a key with
+/// admin on the forest root, §3.3a) — never on a replica (it writes nothing
+/// anyway, and a replica's peers are not its evidence). Says so in the journal
+/// the first time; an untrusted `Ahead` is logged and changes nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fence_if_ahead(
     data_dir: &Path,
     is_replica: bool,
     verdict: TipVerdict,
+    trusted: bool,
     peer: &str,
     peer_seq: u64,
     peer_hash: &[u8],
@@ -169,6 +179,13 @@ pub(crate) fn fence_if_ahead(
     own_hash: &[u8],
 ) -> Result<()> {
     if verdict != TipVerdict::Ahead || is_replica {
+        return Ok(());
+    }
+    if !trusted {
+        eprintln!(
+            "pvfs: {peer} claims the log reaches seq {peer_seq} (this owner holds {own_seq}) but \
+             holds no admin on the forest root — not believed, not fenced"
+        );
         return Ok(());
     }
     let fence = Fence {
@@ -188,13 +205,15 @@ pub(crate) fn fence_if_ahead(
 
 /// PVOS D182 — judge a peer's tip against this data dir's log without opening
 /// an engine (read-only, safe beside a running daemon — the health job's
-/// path), fencing an owner when the peer is ahead. Returns the verdict and
-/// this log's tip seq.
+/// path), fencing an owner when the peer is ahead and `trusted` (its endpoint
+/// was announced by a key with admin on the forest root, §3.3a). Returns the
+/// verdict and this log's tip seq.
 pub fn check_peer(
     data_dir: &Path,
     peer: &str,
     peer_seq: u64,
     peer_hash: &[u8],
+    trusted: bool,
 ) -> Result<(TipVerdict, u64)> {
     use rusqlite::{Connection, OpenFlags};
     let conn = Connection::open_with_flags(data_dir.join("log.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -207,7 +226,7 @@ pub fn check_peer(
     };
     let verdict = judge(own_seq, at.as_deref(), peer_seq, peer_hash);
     let is_replica = crate::replica::marker_path(data_dir).exists();
-    fence_if_ahead(data_dir, is_replica, verdict, peer, peer_seq, peer_hash, own_seq, &own_hash)?;
+    fence_if_ahead(data_dir, is_replica, verdict, trusted, peer, peer_seq, peer_hash, own_seq, &own_hash)?;
     Ok((verdict, own_seq))
 }
 
