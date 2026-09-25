@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The merged view over the socket (PVOS D187, protocol 13).** Three read
+  ops, answered from the read pool: `ViewLs { dir }` (the merged view's
+  children of a directory), `ViewEntry { rel_path }` and `CatalogueStatus`
+  (`region ls`). Member-gated like `ServeStatus`, and every answer is judged
+  only over the catalogue regions the caller may read (`r`): a path held only
+  where it may not read is not listed, and a path held in several regions
+  shows the copies it may read, re-judged by the view's admission rule. An
+  application — PVOS's Media app — reads a forest through its daemon under
+  the forest's ACLs instead of opening its store (which would need the
+  owner's device key). Client: `view_ls`, `view_entry`, `catalogue_status`,
+  `VIEW_PROTO`. Additive; compatible-with stays 3.
 - **An owner that holds its own regions (PVOS D185).** A holder promoted to
   owner (D182) keeps its `bindings.local`, and it now keeps its library too:
   `bindings_for` marks those rows as this device's, as `bindings()` and
