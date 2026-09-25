@@ -51,6 +51,14 @@ writes nothing:
   before it listens — so a zombie that boots after a promotion meets the
   promoted fleet's longer logs before any write can reach it.
 
+Only a key holding **admin on the forest root** may fence the owner this way
+— a routed write's author, or the key that announced a probed endpoint (every
+box of Chris's fleet holds `rwa`). The owner cannot check rows it does not
+hold, so a longer log is only a claim; an admin could revoke the owner's
+device outright, so believing an admin adds no authority. A longer log claimed
+by anyone else is refused, not believed: that write is not written, and the
+health record marks the peer `ahead-unproven`.
+
 A fenced owner opens and serves reads, refuses every append (daemon, CLI,
 mount, jobs: `Engine::append_durable_with` is the one choke point), says so in
 `serve status`, sends one `owner_fenced` (critical) and then nothing but its

@@ -15,7 +15,13 @@ file tracks Layer 0, the file-system engine.
   data dir, checked by `Engine::append_durable_with` (the one choke point),
   shown in `serve status` (`fenced`) and `pvfs forest fence` (which lifts
   it, asked), told once as `owner_fenced` (critical) — a fenced owner says
-  nothing else but its check-in. A follower on another branch is refused
+  nothing else but its check-in. Only a key holding admin on the forest
+  root can fence the owner by its word (D182 §3.3a) — a routed write's
+  author, or the key that announced a probed endpoint: such a key could
+  revoke the owner's device outright, so believing it adds no authority; a
+  longer log claimed by anyone else is refused, not believed (the write is
+  not written; the health record says `ahead-unproven`). A follower on
+  another branch is refused
   and told as `peer_diverged`; the owner keeps writing. `follow` calls a
   source BEHIND its replica an error instead of "up to date". Promotion is
   one append (`Engine::promote_with_root_signer`; D128's two could

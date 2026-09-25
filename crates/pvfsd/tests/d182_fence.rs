@@ -135,7 +135,12 @@ fn a_fenced_owner_opens_and_refuses_every_append_until_the_fence_is_lifted() {
     engine.close().unwrap();
 
     let (tip, _) = pvfs_core::mount::peek_tip(&data).unwrap();
-    let (v, own) = pvfs_core::fence::check_peer(&data, "192.168.1.142:7435", tip + 3, &[1u8; 32]).unwrap();
+    // §3.3a: announced by a key without admin on the root, the same claim is
+    // only a claim — not believed, not fenced.
+    let (v, _) = pvfs_core::fence::check_peer(&data, "192.168.1.9:7435", tip + 3, &[1u8; 32], false).unwrap();
+    assert_eq!(v, TipVerdict::Ahead);
+    assert!(pvfs_core::fence::load(&data).is_none(), "an untrusted peer's word fences nothing");
+    let (v, own) = pvfs_core::fence::check_peer(&data, "192.168.1.142:7435", tip + 3, &[1u8; 32], true).unwrap();
     assert_eq!((v, own), (TipVerdict::Ahead, tip));
     let f = pvfs_core::fence::load(&data).expect("the health rule fences an owner");
     assert!(f.reason.contains("192.168.1.142:7435"), "{}", f.reason);
@@ -166,9 +171,86 @@ fn the_health_rule_never_fences_a_replica() {
         .save(&data)
         .unwrap();
     let (tip, _) = pvfs_core::mount::peek_tip(&data).unwrap();
-    let (v, _) = pvfs_core::fence::check_peer(&data, "peer", tip + 1, &[2u8; 32]).unwrap();
+    let (v, _) = pvfs_core::fence::check_peer(&data, "peer", tip + 1, &[2u8; 32], true).unwrap();
     assert_eq!(v, TipVerdict::Ahead);
     assert!(pvfs_core::fence::load(&data).is_none());
+}
+
+#[test]
+fn only_an_admin_key_can_fence_the_owner_by_its_word() {
+    // §3.3a: a member without admin on the forest root claims a longer log —
+    // its write is refused, and the owner is NOT fenced.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut owner, mn) = Engine::init(dir.path()).unwrap();
+    let root = owner.identity.root_node_id.clone();
+    let data = owner.data_dir().to_path_buf();
+    let reader = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let reader_pub = crypto::pubkey_bytes(&reader);
+    owner.authorize_member(&mn, &reader_pub).unwrap();
+    owner.set_acl(&root, &Principal::Key(reader_pub.clone()), acl::ACL_R | acl::ACL_W).unwrap();
+    let admin = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let admin_pub = crypto::pubkey_bytes(&admin);
+    owner.authorize_member(&mn, &admin_pub).unwrap();
+    owner.set_acl(&root, &Principal::Key(admin_pub.clone()), acl::ACL_RWA).unwrap();
+    assert!(!owner.may_fence_owner(&reader_pub).unwrap());
+    assert!(owner.may_fence_owner(&admin_pub).unwrap());
+    let daemon = Arc::new(Daemon::new(owner));
+    let (_sockdir, sock) = serve_on(daemon);
+    let (tip, _) = pvfs_core::mount::peek_tip(&data).unwrap();
+
+    let r2 = reader.clone();
+    let mut as_reader = Client::connect_signed(&sock, &reader_pub, move |d| crypto::sign_digest(&r2, d).unwrap()).unwrap();
+    as_reader.set_write_tip(Some((tip + 50, vec![0xee; 32])));
+    let (code, message) = server_msg(as_reader.mkdir(&root, "a-claim", |d| crypto::sign_digest(&reader, d).unwrap()));
+    assert_eq!(code, "forbidden");
+    assert!(message.contains("no admin"), "{message}");
+    assert!(pvfs_core::fence::load(&data).is_none(), "a non-admin's word fences nothing");
+    // …and the owner goes on writing for everyone else, this reader included
+    // once it stops claiming.
+    as_reader.set_write_tip(None);
+    as_reader.mkdir(&root, "no-claim", |d| crypto::sign_digest(&reader, d).unwrap()).unwrap();
+
+    // The same claim from a key with admin on the root fences it.
+    let (tip, _) = pvfs_core::mount::peek_tip(&data).unwrap();
+    let a2 = admin.clone();
+    let mut as_admin = Client::connect_signed(&sock, &admin_pub, move |d| crypto::sign_digest(&a2, d).unwrap()).unwrap();
+    as_admin.set_write_tip(Some((tip + 50, vec![0xee; 32])));
+    let (_, message) = server_msg(as_admin.mkdir(&root, "proof-enough", |d| crypto::sign_digest(&admin, d).unwrap()));
+    assert!(message.contains("fenced"), "{message}");
+    assert!(pvfs_core::fence::load(&data).is_some());
+}
+
+#[test]
+fn the_health_job_believes_only_endpoints_an_admin_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut owner, mn) = Engine::init(dir.path()).unwrap();
+    let root = owner.identity.root_node_id.clone();
+    let data = owner.data_dir().to_path_buf();
+    // The owner's own announce (its device is an owner device: trusted).
+    let fleet = owner.add_node(&root, folder(".fleet")).unwrap();
+    let eps = owner.add_node(&fleet, folder("endpoints")).unwrap();
+    owner.add_node(&eps, folder("pin-announced-by-the-owner")).unwrap();
+    // A member that may write the endpoints folder but holds no admin on the root.
+    let member = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let member_pub = crypto::pubkey_bytes(&member);
+    owner.authorize_member(&mn, &member_pub).unwrap();
+    owner.set_acl(&root, &Principal::Key(member_pub.clone()), acl::ACL_R).unwrap();
+    owner.set_acl(&eps, &Principal::Key(member_pub.clone()), acl::ACL_R | acl::ACL_W).unwrap();
+    let daemon = Arc::new(Daemon::new(owner));
+    let (_sockdir, sock) = serve_on(daemon.clone());
+    let m2 = member.clone();
+    let mut as_member = Client::connect_signed(&sock, &member_pub, move |d| crypto::sign_digest(&m2, d).unwrap()).unwrap();
+    as_member.mkdir(&eps, "pin-announced-by-a-member", |d| crypto::sign_digest(&member, d).unwrap()).unwrap();
+    drop(as_member);
+    drop(daemon);
+
+    let engine = Engine::open(&data).unwrap();
+    let authors = pvfs_client::fetch::catalog_endpoint_authors(&engine);
+    assert_eq!(authors.get("pin-announced-by-a-member"), Some(&member_pub));
+    let trusted = pvfs_client::health::trusted_announcers(&engine);
+    assert!(trusted.contains("pin-announced-by-the-owner"));
+    assert!(!trusted.contains("pin-announced-by-a-member"), "a non-admin's endpoint is not evidence");
+    engine.close().unwrap();
 }
 
 /// One process-wide config dir: the follower dials with the client identity,

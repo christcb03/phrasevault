@@ -350,14 +350,31 @@ impl Daemon {
         };
         let key = hex::encode(author);
         let who = format!("the box with key {}…", &key[..key.len().min(16)]);
-        let judged = self.engine.lock().unwrap().judge_peer_tip(&who, t.seq, &hash);
+        // §3.3a: only a key with admin on the forest root may fence this
+        // owner by its word; anyone else's longer log is not believed.
+        let judged = {
+            let e = self.engine.lock().unwrap();
+            let trusted = e.may_fence_owner(author).unwrap_or(false);
+            e.judge_peer_tip(&who, t.seq, &hash, trusted).map(|v| (v, trusted))
+        };
         match judged {
-            Ok((TipVerdict::Consistent, _)) => None,
-            Ok((TipVerdict::Ahead, _)) => {
+            Ok(((TipVerdict::Consistent, _), _)) => None,
+            Ok(((TipVerdict::Ahead, _), true)) => {
                 let f = pvfs_core::fence::load(&self.data_dir).unwrap_or_default();
                 Some(err("forbidden", &f.refusal()))
             }
-            Ok((TipVerdict::Diverged, own)) => {
+            Ok(((TipVerdict::Ahead, own), false)) => Some(err(
+                "forbidden",
+                &format!(
+                    "your log claims seq {}, past this owner's {own}, but your key holds no admin on \
+                     the forest root, so this owner does not fence on its word — and writes nothing \
+                     for you while you claim it. If this owner really is stale, a box with admin \
+                     will fence it; if your copy is wrong, re-seed it (pvfs replica add into a \
+                     fresh directory)",
+                    t.seq
+                ),
+            )),
+            Ok(((TipVerdict::Diverged, own), _)) => {
                 eprintln!(
                     "pvfsd: a write from {who} not accepted: its log differs from this owner's at \
                      seq {} (this owner holds {own})",
