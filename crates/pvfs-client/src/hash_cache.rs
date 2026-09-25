@@ -497,18 +497,38 @@ impl HashFetch {
         }
         let (first, last) = self.span(off, len);
         let covered = self.covered(&st, first, last);
-        if covered && self.opts.mode == CacheMode::Stream {
-            // Keep the window ahead of a sequential reader filled, so it
-            // never waits at the edge of what was read ahead (D165 waits:
-            // it completes the file instead).
-            let to = (last + self.ahead(&st)).min(st.pieces.n.saturating_sub(1));
-            if to > last && st.pieces.first_missing(last + 1, to).is_some() {
-                st.prefetch = Some((last + 1, to));
-                self.ensure_worker(&mut st);
-                self.cv.notify_all();
-            }
+        if covered {
+            self.arm_readahead(&mut st, last);
         }
         covered.then(|| Ok(self.part.clone()))
+    }
+
+    /// Stream mode: keep the window ahead of a sequential reader filled, so
+    /// it never waits at the edge of what was read ahead (D165 waits: it
+    /// completes the file instead).
+    ///
+    /// Every served read arms it, whichever path served it. Until 2026-09-25
+    /// only [`HashFetch::poll_range`]'s covered branch did, and a read that
+    /// WAITED left no window behind it: its own demand carried the readahead
+    /// as the `ahead` extension of one fetch job, and [`HashFetch::wait_range`]
+    /// drops that demand the moment its own pieces land. So when a reader
+    /// caught the prefetcher up — the demand satisfied by a job already in
+    /// flight, before the worker ever looked at it — the worker came back to
+    /// no demand and a `prefetch` window it had just filled, and idled with
+    /// the keep-ahead short. The next covered read re-armed it, so a playing
+    /// file recovered by itself; nothing re-armed it after the LAST read,
+    /// which is how the D181 test caught this (as a 40% stall, mistaken on
+    /// 2026-09-22 for the suite being slow).
+    fn arm_readahead(self: &Arc<Self>, st: &mut FetchSt, last: usize) {
+        if self.opts.mode != CacheMode::Stream {
+            return;
+        }
+        let to = (last + self.ahead(st)).min(st.pieces.n.saturating_sub(1));
+        if to > last && st.pieces.first_missing(last + 1, to).is_some() {
+            st.prefetch = Some((last + 1, to));
+            self.ensure_worker(st);
+            self.cv.notify_all();
+        }
     }
 
     /// Register `[off, off+len)` as demand and wait for it. `Ok(path)` names
@@ -535,6 +555,9 @@ impl HashFetch {
                 // (stream mode) heard from now, not when it began waiting
                 let now = Instant::now();
                 st.cursors.iter_mut().filter(|c| c.off == off).for_each(|c| c.at = now);
+                // …and this read leaves a window behind it too, because the
+                // demand below is about to go: see [`HashFetch::arm_readahead`].
+                self.arm_readahead(&mut st, last);
                 break Ok(self.part.clone());
             }
             let left = deadline.saturating_duration_since(Instant::now());
