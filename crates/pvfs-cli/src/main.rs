@@ -6945,8 +6945,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 let drains = engine.region_drains(id).unwrap_or(false);
                                 let cat = status.get(id).map(|s| {
                                     format!(
-                                        ",\"head\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{},\"receives\":{},\"retention_days\":{}",
+                                        ",\"head\":{},\"committed\":{},\"provisional\":{},\"pending\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{},\"receives\":{},\"retention_days\":{}",
                                         s.head_seq,
+                                        s.committed_seq,
+                                        s.provisional,
+                                        s.pending.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
                                         s.held_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
                                         s.local,
                                         s.stale,
@@ -6973,9 +6976,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                         (false, Some(h)) => format!("held {h}"),
                                         (false, None) => "not fetched".to_string(),
                                     };
+                                    // PVOS D183 — a head taken from the region's own
+                                    // box, not yet in the forest log, says so.
+                                    let head = match (s.provisional, s.pending) {
+                                        (true, _) => format!("{} (provisional; log {})", s.head_seq, s.committed_seq),
+                                        (false, Some(p)) => format!("{} ({p} published here, pending the owner)", s.head_seq),
+                                        (false, None) => s.head_seq.to_string(),
+                                    };
                                     format!(
                                         "\thead {}\t{held}\t{} rows{}{}",
-                                        s.head_seq,
+                                        head,
                                         s.entries,
                                         if s.stale { "\tSTALE" } else { "" },
                                         if receiving.contains(id) { "\treceives" } else { "" }

@@ -41,7 +41,7 @@ use crate::log_store;
 // was a scan of every row on the box (72k on feederbox, 13 ms; 30 s to list
 // Movies with attributes). Migrated in place (CREATE INDEX, no replay) — the
 // rows are not in the log, so a replay could not bring them back.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 pub const INDEX_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
@@ -331,6 +331,19 @@ CREATE TABLE IF NOT EXISTS region_fetched (
   fetched_at    INTEGER NOT NULL,
   source        TEXT    NOT NULL
 );
+-- PVOS D183 — a region's head taken PROVISIONALLY from the box that owns the
+-- region, signed by it (RegionClaims), ahead of the forest log: what moves the
+-- fleet while the owner is away. Accepted on the fold's own rule (an active,
+-- unrevoked author with admin on the region); one row per region, the newest;
+-- the fold of a committed head at or past its seq deletes it.
+CREATE TABLE IF NOT EXISTS region_provisional (
+  region_id     TEXT    NOT NULL PRIMARY KEY,
+  seq           INTEGER NOT NULL,
+  manifest_hash TEXT    NOT NULL,
+  author        BLOB    NOT NULL,
+  source        TEXT    NOT NULL,
+  received_at   INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS scan_state (
   uri        TEXT PRIMARY KEY,
@@ -398,7 +411,8 @@ CREATE INDEX IF NOT EXISTS idx_tlinks_child        ON temp_links(child_id)      
 /// taking from the replay: derived from disks and fetched manifests, not from
 /// the log, so a replay comes back without them. All three are also in
 /// [`MAIN_OBJECTS`] (the swap copies them back like everything else).
-pub const CARRIED_ACROSS_A_REBUILD: &[&str] = &["region_entries", "region_snapshots", "region_fetched"];
+pub const CARRIED_ACROSS_A_REBUILD: &[&str] =
+    &["region_entries", "region_snapshots", "region_fetched", "region_provisional"];
 
 pub const MAIN_OBJECTS: &[&str] = &[
     "nodes",
@@ -423,6 +437,7 @@ pub const MAIN_OBJECTS: &[&str] = &[
     "region_entries",
     "region_snapshots",
     "region_fetched",
+    "region_provisional",
     "scan_state",
     "projection_meta",
     "media_quality",
@@ -1409,6 +1424,13 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
             tx.execute(
                 "UPDATE regions SET committed_seq = ?1, committed_head = ?2 WHERE node_id = ?3",
                 params![*head_seq as i64, hex::encode(head_hash), node_id],
+            )
+            .map_err(&m)?;
+            // PVOS D183 — a committed head at or past a provisional one is the
+            // record now: the provisional row goes, here, so it cannot linger.
+            tx.execute(
+                "DELETE FROM region_provisional WHERE region_id = ?1 AND seq <= ?2",
+                params![node_id, *head_seq as i64],
             )
             .map_err(&m)?;
         }
@@ -3038,6 +3060,7 @@ fn migration_step(v: u32) -> Option<MigrationStep> {
         16 => (migrate_v16_to_v17, "regions.drains"),
         17 => (migrate_v17_to_v18, "region_fetched"),
         18 => (migrate_v18_to_v19, "idx_region_entries_path; idx_region_entries_hash"),
+        19 => (migrate_v19_to_v20, "region_provisional"),
         _ => return None,
     })
 }
@@ -3286,6 +3309,22 @@ fn migrate_v9_to_v10(conn: &mut Connection) -> Result<()> {
             .map_err(map_db("add temp_links.label"))?;
     }
     Ok(())
+}
+
+fn migrate_v19_to_v20(conn: &mut Connection) -> Result<()> {
+    // PVOS D183 — additive: one new table, nothing re-read (the same shape as
+    // v17→v18). A running mount of the older build reads none of it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS region_provisional (
+           region_id     TEXT    NOT NULL PRIMARY KEY,
+           seq           INTEGER NOT NULL,
+           manifest_hash TEXT    NOT NULL,
+           author        BLOB    NOT NULL,
+           source        TEXT    NOT NULL,
+           received_at   INTEGER NOT NULL
+         );",
+    )
+    .map_err(map_db("migrate v19→v20: region_provisional"))
 }
 
 fn migrate_v18_to_v19(conn: &mut Connection) -> Result<()> {

@@ -63,6 +63,7 @@ fn rewind_to_v18(data_dir: &Path) {
         data_dir,
         "DROP INDEX IF EXISTS idx_region_entries_path;
          DROP INDEX IF EXISTS idx_region_entries_hash;
+         DROP TABLE IF EXISTS region_provisional;
          UPDATE projection_meta SET v = '18' WHERE k = 'schema_version';",
     );
 }
@@ -83,7 +84,8 @@ fn an_additive_step_is_planned_in_place_and_the_open_migrates() {
     match projection_plan(dir.path()) {
         ProjectionPlan::InPlace { from, steps } => {
             assert_eq!(from, 18);
-            assert_eq!(steps, vec!["idx_region_entries_path; idx_region_entries_hash"]);
+            // PVOS D183 added v19 → v20 (region_provisional): two steps now.
+            assert_eq!(steps, vec!["idx_region_entries_path; idx_region_entries_hash", "region_provisional"]);
         }
         other => panic!("expected an in-place plan, got {other:?}"),
     }

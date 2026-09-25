@@ -25,6 +25,16 @@ promotes. Home Assistant says the owner is down (PVOS D182: within ten
 minutes); a person promotes. (Automatic failover is on the roadmap as an
 opt-in for other users — doc 08, the availability track.)
 
+**What an owner outage stops** (PVOS D183). Not the daily path: every box
+keeps cataloguing its own regions, hands its heads to its peers directly as
+signed claims, and each installs the others' catalogues — views, `receive`
+and the drain move on — while the heads published meanwhile commit when the
+owner is back, one row per region (doc 26 §8). What stops is the owner's own:
+admin changes (grants, region marks, drain flags, enrolment — and revocation:
+all of them log events), the NAS's supervision, the health observer and its
+notifications, and the HA feed. So promotion is for an owner that is gone,
+not one that is down for a reboot.
+
 ## 2. The standby, and the fence
 
 **The standby** (PVOS D182) is a follower kept for exactly this: its own

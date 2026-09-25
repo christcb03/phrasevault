@@ -936,6 +936,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             let r = pvfs_client::catalogue::fetch_pass(st.data_dir(), &cancel);
             match r {
                 Ok(rep) => {
+                    // PVOS D183 — a head taken from the region's own box
+                    // (refusals and commits say so where they happen).
+                    for (region, seq, from) in &rep.claims_taken {
+                        eprintln!("pvfsd: catalogue {} head {seq} taken from {from} — provisional until the owner commits it", &region[..8]);
+                    }
                     for (region, seq, n) in &rep.fetched {
                         eprintln!("pvfsd: catalogue {} at head {seq}: {n} rows", &region[..8]);
                     }

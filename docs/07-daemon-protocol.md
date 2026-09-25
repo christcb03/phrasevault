@@ -66,7 +66,9 @@ Requests (current `ClientMsg` set): `Auth`/`Anonymous` (handshake, §2), then by
 in-flight ingest partials, P10.1), `ChunkManifest` · writes: `PrepareWrite` / `Commit` (§5) ·
 secure: `SecureCreate` (via `WriteOp`), `SecurePut`, `SecureCat` · log shipping: `LogInfo`,
 `LogRead`, `LogWait` · serve: `ServeStatus`, `ReceivePlan` (proto 11, PVOS D174 — the receive plan
-from the read pool, member-gated) · ingest (P10, doc 23): `IngestBegin`/`IngestWrite`/
+from the read pool, member-gated), `RegionClaims` (proto 12, PVOS D183 — a replica's signed
+`SubRegionHead` for each catalogue region it binds and has published, member-gated; peers take
+them as provisional heads, doc 26 §8) · ingest (P10, doc 23): `IngestBegin`/`IngestWrite`/
 `IngestVerified`/`IngestCommit`/`IngestAbort`/`IngestList`. Responses are typed results or a typed
 error reusing `PvfsError` codes.
 

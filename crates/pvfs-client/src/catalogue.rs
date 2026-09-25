@@ -26,6 +26,12 @@ pub struct CatalogueReport {
     /// Catalogue regions that needed nothing: up to date, or this box's own.
     pub skipped: usize,
     pub cancelled: bool,
+    /// PVOS D183: claims taken as provisional heads — `(region, seq, from)`.
+    pub claims_taken: Vec<(String, u64, String)>,
+    /// PVOS D183: claims refused — `(from, why)`.
+    pub claims_refused: Vec<(String, String)>,
+    /// PVOS D183: this box's own pending heads committed through the owner.
+    pub committed: usize,
 }
 
 /// One pass over every stale, non-local catalogue region (doc 26 §8).
@@ -46,6 +52,30 @@ pub fn fetch_pass_on(
     only: Option<&str>,
 ) -> Result<CatalogueReport, PvfsError> {
     let mut report = CatalogueReport::default();
+    // PVOS D183 — first, this box's own heads published while the owner was
+    // away: committed now if the owner answers (quietly left for the next
+    // pass if it does not).
+    if engine.is_replica() && !engine.pending_region_heads()?.is_empty() {
+        if let Ok(Some((mut client, sign))) = crate::advertise::replica_route(engine.data_dir(), true) {
+            let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &*sign;
+            let data_dir = engine.data_dir().to_path_buf();
+            let committed = {
+                let mut w = crate::advertise::RoutedScanWriter::new(&data_dir, &mut client, signer);
+                crate::watch::commit_pending_heads(engine, &mut w)
+            };
+            match committed {
+                Ok(n) => {
+                    report.committed = n;
+                    crate::advertise::catch_up(&data_dir, &mut client);
+                }
+                Err(e) => eprintln!("pvfs: catalogue: pending heads not committed yet: {e}"),
+            }
+        }
+    }
+    // PVOS D183 — then every peer's signed claims for the regions it owns,
+    // taken as provisional heads on the fold's own rule; each remembered with
+    // the box that made it, which is the box that holds the manifest.
+    let claimed_by = collect_claims(engine, &mut report)?;
     let status = engine.catalogue_status()?;
     let wanted: Vec<(String, u64)> = status
         .iter()
@@ -87,7 +117,12 @@ pub fn fetch_pass_on(
         }
         let mut last = String::from("no endpoint holds it");
         let mut done = false;
-        for (pin, addr) in &endpoints {
+        // The box that claimed a provisional head holds its manifest: ask it first.
+        let mut order: Vec<&(String, String)> = endpoints.iter().collect();
+        if let Some(from) = claimed_by.get(&region) {
+            order.sort_by_key(|(_, addr)| addr != from);
+        }
+        for (pin, addr) in order {
             let src = ReplicaSource {
                 transport: "tcp".into(),
                 target: addr.clone(),
@@ -127,4 +162,57 @@ pub fn fetch_pass_on(
         }
     }
     Ok(report)
+}
+
+/// PVOS D183 — ask every announced endpoint (minus this box) for its signed
+/// claims (`RegionClaims`, proto 12; an older daemon is skipped) and take each
+/// the fold's rule accepts as the region's provisional head. Returns, per
+/// region taken, the address that claimed it.
+fn collect_claims(
+    engine: &Engine,
+    report: &mut CatalogueReport,
+) -> Result<std::collections::HashMap<String, String>, PvfsError> {
+    let mut claimed_by = std::collections::HashMap::new();
+    let own_pin = pvfs_core::storage::host_pin(engine.data_dir());
+    let mut endpoints: Vec<(String, String)> = crate::fetch::catalog_endpoints(engine)
+        .into_iter()
+        .filter(|(pin, _)| own_pin.as_deref() != Some(pin.as_str()))
+        .collect();
+    endpoints.sort();
+    if endpoints.is_empty() {
+        return Ok(claimed_by);
+    }
+    let mn = identity::client_identity_mnemonic()?;
+    let key = identity::device_key(&mn, "", 0)?;
+    let pubkey = pvfs_core::crypto::pubkey_bytes(&key);
+    let sign = |d: &[u8; 32]| pvfs_core::crypto::sign_digest(&key, d).unwrap_or_default();
+    for (pin, addr) in &endpoints {
+        let Ok(mut client) = crate::Client::connect_tcp_signed(addr, pin, &pubkey, sign) else {
+            continue; // down, or not ours: the manifest loop says so if it matters
+        };
+        if client.daemon_proto() < crate::REGION_CLAIMS_PROTO {
+            continue;
+        }
+        let Ok(claims) = client.region_claims() else { continue };
+        for c in claims {
+            let Ok(body) = hex::decode(&c.body) else {
+                report.claims_refused.push((addr.clone(), "claim body is not hex".into()));
+                continue;
+            };
+            match engine.accept_region_claim(&body, addr)? {
+                pvfs_core::ClaimOutcome::Accepted { region, seq } => {
+                    claimed_by.insert(region.clone(), addr.clone());
+                    report.claims_taken.push((region, seq, addr.clone()));
+                }
+                pvfs_core::ClaimOutcome::Known => {
+                    claimed_by.entry(c.region.clone()).or_insert_with(|| addr.clone());
+                }
+                pvfs_core::ClaimOutcome::Refused(why) => {
+                    eprintln!("pvfs: catalogue: a claim from {addr} for {} refused: {why}", &c.region[..c.region.len().min(8)]);
+                    report.claims_refused.push((addr.clone(), why));
+                }
+            }
+        }
+    }
+    Ok(claimed_by)
 }
