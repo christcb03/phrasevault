@@ -365,7 +365,11 @@ every known hash agrees (copies = hashed copies), `Unhashed` when none is,
 `ConflictHashes`/`ConflictKind` otherwise — never merged, nothing deleted.
 `pvfs view ls [dir]` / `pvfs view conflicts`. What phase 4 receives: the
 conflict entries, each carrying every copy (region, size, mtime, hash) and,
-for now, the newest copy as the description. The original spec follows.
+for now, the newest copy as the description. **Over the socket (PVOS D187,
+protocol 13):** `ViewLs`, `ViewEntry` and `CatalogueStatus` answer the same
+questions from a daemon's read pool, member-gated, each judged over only the
+regions the caller may read — so an application reads a forest through its
+daemon under the forest's ACLs. The original spec follows.
 Union region catalogues by relative path.
 Admission by hash agreement. Conflict detection. Directory entries unioned.
 *Testable alone:* two regions, overlapping paths, identical and differing

@@ -468,6 +468,51 @@ impl Daemon {
             .unwrap_or(0)
     }
 
+    /// PVOS D187 — the merged view's children of `dir`, for `principal`: each
+    /// entry judged by the view's own admission rule over the copies in
+    /// regions it may read (`r`), so a caller never learns of a path, a hash
+    /// or a size it could not read. One read-pool engine for the whole
+    /// answer (a second `reader()` inside could wait on the one held).
+    pub fn view_ls_for(&self, principal: &Principal, dir: &str) -> pvfs_core::Result<Vec<pvfs_proto::ViewEntryWire>> {
+        let e = self.reader();
+        let entries = e.merged_view(dir)?;
+        Ok(readable_view(&e, principal, entries))
+    }
+
+    /// PVOS D187 — one path of the merged view for `principal` (see
+    /// [`Daemon::view_ls_for`]); `None` when no copy it may read holds it.
+    pub fn view_entry_for(&self, principal: &Principal, rel_path: &str) -> pvfs_core::Result<Option<pvfs_proto::ViewEntryWire>> {
+        let e = self.reader();
+        let entries: Vec<pvfs_core::ViewEntry> = e.view_entry(rel_path)?.into_iter().collect();
+        Ok(readable_view(&e, principal, entries).into_iter().next())
+    }
+
+    /// PVOS D187 — `region ls` for the catalogue regions `principal` may read.
+    pub fn catalogue_status_for(&self, principal: &Principal) -> pvfs_core::Result<Vec<pvfs_proto::CatalogueStatusWire>> {
+        let e = self.reader();
+        let mut out = Vec::new();
+        for s in e.catalogue_status()? {
+            if !may_read_region(&e, principal, &s.region) {
+                continue;
+            }
+            let label = e.node(&s.region).ok().flatten().map(|n| n.label).unwrap_or_default();
+            out.push(pvfs_proto::CatalogueStatusWire {
+                region: s.region,
+                label,
+                head_seq: s.head_seq,
+                head_hash: s.head_hash,
+                committed_seq: s.committed_seq,
+                provisional: s.provisional,
+                held_seq: s.held_seq,
+                local: s.local,
+                stale: s.stale,
+                pending: s.pending,
+                entries: s.entries,
+            });
+        }
+        Ok(out)
+    }
+
     /// PVOS D174 — this box's receive plan, for `pvfs serve receive-plan`:
     /// what `view receive --dry-run` computes, but through the READ POOL.
     /// The dry run was a second process opening the forest — and folding
@@ -821,6 +866,31 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                 }
             }
         }
+        // PVOS D187 — the merged view and `region ls` over the socket, for an
+        // application that reads a forest through its daemon (PVOS's Media
+        // app) instead of opening its store. Member-gated like `ServeStatus`,
+        // and every answer judged only over the regions the caller may read.
+        ClientMsg::ViewLs { dir } => match view_gate(daemon, principal) {
+            Err(m) => m,
+            Ok(()) => daemon
+                .view_ls_for(principal, &dir)
+                .map(|entries| ServerMsg::ViewLs { entries })
+                .unwrap_or_else(err_from),
+        },
+        ClientMsg::ViewEntry { rel_path } => match view_gate(daemon, principal) {
+            Err(m) => m,
+            Ok(()) => daemon
+                .view_entry_for(principal, &rel_path)
+                .map(|entry| ServerMsg::ViewEntry { entry: entry.map(Box::new) })
+                .unwrap_or_else(err_from),
+        },
+        ClientMsg::CatalogueStatus => match view_gate(daemon, principal) {
+            Err(m) => m,
+            Ok(()) => daemon
+                .catalogue_status_for(principal)
+                .map(|regions| ServerMsg::CatalogueStatus { regions })
+                .unwrap_or_else(err_from),
+        },
         // PVOS D174: gated as `ServeStatus` is — library paths are
         // operational detail, not public metadata.
         ClientMsg::ReceivePlan => {
@@ -2469,6 +2539,94 @@ fn do_claim_write_lease(
                 principal: principal.display(),
             }
         }
+    }
+}
+
+/// PVOS D187 — the view ops' gate: an active member, as `ServeStatus`.
+fn view_gate(daemon: &Daemon, principal: &Principal) -> Result<(), ServerMsg> {
+    let member = match principal {
+        Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+        _ => false,
+    };
+    if member {
+        Ok(())
+    } else {
+        Err(err("forbidden", "the view is member-gated (enroll this key on the forest)"))
+    }
+}
+
+/// PVOS D187 — may `principal` read catalogue region `region`?
+fn may_read_region(e: &pvfs_core::Engine, principal: &Principal, region: &str) -> bool {
+    e.effective_rights(principal, &region.to_string())
+        .map(|r| r & acl::ACL_R != 0)
+        .unwrap_or(false)
+}
+
+/// PVOS D187 — `entries` as `principal` may see them: each re-judged by the
+/// view's admission rule over the copies in regions it may read (an entry
+/// left with none is dropped), then put on the wire.
+fn readable_view(
+    e: &pvfs_core::Engine,
+    principal: &Principal,
+    entries: Vec<pvfs_core::ViewEntry>,
+) -> Vec<pvfs_proto::ViewEntryWire> {
+    let mut readable: HashMap<String, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for entry in entries {
+        let mut every = true;
+        let mut kept = Vec::with_capacity(entry.sources.len());
+        for c in &entry.sources {
+            let ok = *readable
+                .entry(c.region.clone())
+                .or_insert_with(|| may_read_region(e, principal, &c.region));
+            if ok {
+                kept.push(c.clone());
+            } else {
+                every = false;
+            }
+        }
+        let judged = if every {
+            Some(entry)
+        } else {
+            pvfs_core::Engine::view_entry_of_copies(&entry.rel_path, &kept)
+        };
+        if let Some(v) = judged {
+            out.push(view_entry_wire(v));
+        }
+    }
+    out
+}
+
+fn view_entry_wire(v: pvfs_core::ViewEntry) -> pvfs_proto::ViewEntryWire {
+    let (state, conflict_hashes) = match v.state {
+        pvfs_core::ViewState::Admitted => ("admitted", Vec::new()),
+        pvfs_core::ViewState::Unhashed => ("unhashed", Vec::new()),
+        pvfs_core::ViewState::ConflictHashes(h) => ("conflict-hashes", h),
+        pvfs_core::ViewState::ConflictKind => ("conflict-kind", Vec::new()),
+    };
+    pvfs_proto::ViewEntryWire {
+        rel_path: v.rel_path,
+        kind: v.kind,
+        size_bytes: v.size_bytes,
+        mtime_ms: v.mtime_ms,
+        content_hash: v.content_hash,
+        quality: v.quality,
+        state: state.to_string(),
+        conflict_hashes,
+        copies: v.copies,
+        sources: v
+            .sources
+            .into_iter()
+            .map(|c| pvfs_proto::ViewCopyWire {
+                region: c.region,
+                kind: c.kind,
+                size_bytes: c.size_bytes,
+                mtime_ms: c.mtime_ms,
+                content_hash: c.content_hash,
+                quality: c.quality,
+                stale: c.stale,
+            })
+            .collect(),
     }
 }
 

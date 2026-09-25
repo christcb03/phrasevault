@@ -40,7 +40,12 @@ use serde::{Deserialize, Serialize};
 ///   11 → 12: PVOS D183 `RegionClaims` — a box's signed heads for the
 ///          catalogue regions it owns, handed to peers directly so an owner
 ///          outage stops no catalogue. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 12;
+///   12 → 13: PVOS D187 `ViewLs`, `ViewEntry` and `CatalogueStatus` — the
+///          merged view and `region ls` over the socket, so an application
+///          (PVOS's Media app) reads a forest through its daemon, under the
+///          forest's ACLs, without opening its store. Additive;
+///          compatible-with stays.
+pub const PROTO_VERSION: u32 = 13;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -110,6 +115,15 @@ pub enum ServerMsg {
     /// PVOS D183: the answer to `ClientMsg::RegionClaims` — one signed head
     /// per catalogue region this box owns and has published.
     RegionClaims { claims: Vec<RegionClaimWire> },
+    /// PVOS D187: the answer to `ClientMsg::ViewLs` — the merged view's
+    /// children of one directory, judged over the copies the caller may read.
+    ViewLs { entries: Vec<ViewEntryWire> },
+    /// PVOS D187: the answer to `ClientMsg::ViewEntry` — `None` when no copy
+    /// the caller may read holds that path.
+    ViewEntry { entry: Option<Box<ViewEntryWire>> },
+    /// PVOS D187: the answer to `ClientMsg::CatalogueStatus` — `region ls`
+    /// for the catalogue regions the caller may read.
+    CatalogueStatus { regions: Vec<CatalogueStatusWire> },
     /// D169: the answer to `ClientMsg::TrashPath` — `moved` is false when
     /// this box catalogues the region and holds nothing at that path (already
     /// gone: not an error).
@@ -220,6 +234,62 @@ pub enum ServerMsg {
         #[serde(default)]
         reported: Vec<ReceiveSkipWire>,
     },
+}
+
+/// PVOS D187 — one path of the merged view (doc 26 §6), as `pvfs view ls`
+/// shows it: the admitted metadata and the copies behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewEntryWire {
+    pub rel_path: String,
+    /// `file` | `dir`.
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    pub content_hash: Option<String>,
+    pub quality: Option<String>,
+    /// `admitted` | `unhashed` | `conflict-hashes` | `conflict-kind`.
+    pub state: String,
+    /// For `conflict-hashes`: the distinct hashes at this path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_hashes: Vec<String>,
+    /// Hashed file copies behind the path (its redundancy); 0 for a folder.
+    pub copies: u64,
+    pub sources: Vec<ViewCopyWire>,
+}
+
+/// PVOS D187 — one region's copy of a view path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewCopyWire {
+    pub region: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub mtime_ms: u64,
+    pub content_hash: Option<String>,
+    pub quality: Option<String>,
+    /// From a fetched catalogue the log has since superseded.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// PVOS D187 — one catalogue region, as `pvfs region ls` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogueStatusWire {
+    pub region: String,
+    /// The region folder's label (e.g. `mediabox-local`).
+    #[serde(default)]
+    pub label: String,
+    pub head_seq: u64,
+    pub head_hash: String,
+    pub committed_seq: u64,
+    #[serde(default)]
+    pub provisional: bool,
+    pub held_seq: Option<u64>,
+    /// The answering box catalogues this region itself.
+    pub local: bool,
+    pub stale: bool,
+    #[serde(default)]
+    pub pending: Option<u64>,
+    pub entries: u64,
 }
 
 /// PVOS D174 — one file the receive plan will pull.
@@ -685,6 +755,17 @@ pub enum ClientMsg {
     /// if the fold's own rule would accept it — so heads move box to box
     /// while the forest owner is away. Member-gated like `ServeStatus`.
     RegionClaims,
+    /// PVOS D187: the merged view's children of `dir` (`""` = the top), from
+    /// the read pool — `ServerMsg::ViewLs`. Member-gated, and judged only over
+    /// the copies in regions the caller may read (`r`): a path held only in
+    /// regions it may not read is not listed.
+    ViewLs { dir: String },
+    /// PVOS D187: the merged view's entry for one path — `ServerMsg::ViewEntry`.
+    /// Gated and filtered as `ViewLs`.
+    ViewEntry { rel_path: String },
+    /// PVOS D187: `region ls` over the socket — `ServerMsg::CatalogueStatus`,
+    /// for the catalogue regions the caller may read. Member-gated.
+    CatalogueStatus,
     /// Phase 1 of a write: ask the daemon to build the signable events for `op`.
     PrepareWrite {
         op: WriteOp,

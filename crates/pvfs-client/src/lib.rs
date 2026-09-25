@@ -174,6 +174,10 @@ struct Challenge {
 /// PVOS D183 — the first proto that answers `RegionClaims`.
 pub const REGION_CLAIMS_PROTO: u32 = 12;
 
+/// PVOS D187 — the first proto that answers `ViewLs`, `ViewEntry` and
+/// `CatalogueStatus` (the merged view and `region ls` over the socket).
+pub const VIEW_PROTO: u32 = 13;
+
 /// A connected, authenticated session with a forest's daemon.
 pub struct Client {
     stream: Stream,
@@ -375,6 +379,34 @@ impl Client {
         match self.request(ClientMsg::RegionClaims)? {
             ServerMsg::RegionClaims { claims } => Ok(claims),
             other => Err(unexpected("RegionClaims", &other)),
+        }
+    }
+
+    /// PVOS D187 — the merged view's children of `dir` (`""` = the top), as
+    /// the daemon judges them over the regions this key may read. Callers
+    /// check `daemon_proto() >= VIEW_PROTO` first.
+    pub fn view_ls(&mut self, dir: &str) -> Result<Vec<pvfs_proto::ViewEntryWire>> {
+        match self.request(ClientMsg::ViewLs { dir: dir.into() })? {
+            ServerMsg::ViewLs { entries } => Ok(entries),
+            other => Err(unexpected("ViewLs", &other)),
+        }
+    }
+
+    /// PVOS D187 — the merged view's entry for one path; `None` when no copy
+    /// this key may read holds it.
+    pub fn view_entry(&mut self, rel_path: &str) -> Result<Option<pvfs_proto::ViewEntryWire>> {
+        match self.request(ClientMsg::ViewEntry { rel_path: rel_path.into() })? {
+            ServerMsg::ViewEntry { entry } => Ok(entry.map(|b| *b)),
+            other => Err(unexpected("ViewEntry", &other)),
+        }
+    }
+
+    /// PVOS D187 — `region ls` over the socket, for the catalogue regions this
+    /// key may read.
+    pub fn catalogue_status(&mut self) -> Result<Vec<pvfs_proto::CatalogueStatusWire>> {
+        match self.request(ClientMsg::CatalogueStatus)? {
+            ServerMsg::CatalogueStatus { regions } => Ok(regions),
+            other => Err(unexpected("CatalogueStatus", &other)),
         }
     }
 
