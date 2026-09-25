@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every request over the network cost about half a second (PVOS D187).**
+  `write_msg` wrote a frame as two writes — its length, then its body — so
+  over TLS each frame left as two records in two TCP segments, and Nagle held
+  the second until the peer's delayed ACK: a stall on the request and
+  another on the reply. On the lab a folder listing took 495 ms and a connect
+  2.1 s, where the Unix socket answered at once. A frame (control and data)
+  is now one write, and both ends set `TCP_NODELAY` (`pvfs_client`'s dial,
+  the daemon's TLS accept): the same listing takes one round trip (138 ms
+  over a 137 ms path; 316 ms with only the client fixed). On a LAN the stalls
+  were the delayed-ACK timer, 40–200 ms each — every small request a view
+  mount makes of a remote holder paid two. The bytes on the wire are
+  unchanged.
 - **The merged view over the socket (PVOS D187, protocol 13).** Three read
   ops, answered from the read pool: `ViewLs { dir }` (the merged view's
   children of a directory), `ViewEntry { rel_path }` and `CatalogueStatus`
