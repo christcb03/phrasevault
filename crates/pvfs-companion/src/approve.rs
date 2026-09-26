@@ -62,6 +62,14 @@ pub trait Prompter: Send + Sync {
         false
     }
 
+    /// PVOS D193 — approve a statement whose every word the companion wrote
+    /// from structured fields (making a personal forest; confirming a delete
+    /// or a grant). Default deny.
+    fn approve_statement(&self, text: &str) -> bool {
+        let _ = text;
+        false
+    }
+
     /// Accept a PVOS member invite (D18): ONE approval covers both halves —
     /// enrolling the inviting server as paired, and signing the acceptance
     /// that makes this identity a member there. Default deny.
@@ -262,6 +270,9 @@ impl Prompter for TerminalPrompter {
     fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
         self.ask(&describe_trust_url(name, server_pubkey_hex, origin))
     }
+    fn approve_statement(&self, text: &str) -> bool {
+        self.ask(text)
+    }
     fn approve_redeem_invite(
         &self,
         member: &str,
@@ -317,6 +328,9 @@ impl Prompter for DesktopPrompter {
     }
     fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
         self.dialog(&describe_trust_url(name, server_pubkey_hex, origin))
+    }
+    fn approve_statement(&self, text: &str) -> bool {
+        self.dialog(text)
     }
     fn approve_redeem_invite(
         &self,
@@ -411,6 +425,10 @@ impl Prompter for NamedPrompter {
 
     fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
         self.inner.approve_trust_url(name, server_pubkey_hex, origin)
+    }
+
+    fn approve_statement(&self, text: &str) -> bool {
+        self.inner.approve_statement(&format!("[recovery phrase '{}'] {text}", self.phrase))
     }
 
     fn approve_redeem_invite(
