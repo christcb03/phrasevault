@@ -16,8 +16,9 @@ file tracks Layer 0, the file-system engine.
   commit hashes there too): nice +10 and the idle disk class, which
   mq-deadline honours (its 10 s aging keeps an idle request from waiting
   forever). The listeners and their connection threads keep the unit's
-  priority. Job threads are named `pvfsd-<job>`; `PVFSD_BACKGROUND=normal`
-  keeps background at the daemon's priority.
+  priority. Job threads are named `pvfsd-<job>`. `PVFSD_BACKGROUND` sets
+  the step (1–19; the NAS takes 19, D88's level — its start script's
+  `renice` had moved only the main thread) or `normal` for none.
 - **Before an owner holds regions on a busy box (PVOS D188).** Found reading
   the code for mediabox's move to owner:
   - **A mount left on an older build no longer passes the roll's check.** A
