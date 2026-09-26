@@ -7192,7 +7192,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         let fetched: Vec<String> = rep
                             .fetched
                             .iter()
-                            .map(|(r, s, n)| format!("{{\"region\":\"{r}\",\"seq\":{s},\"rows\":{n}}}"))
+                            .map(|(r, s, n)| {
+                                format!(
+                                    "{{\"region\":\"{r}\",\"seq\":{s},\"rows\":{},\"added\":{},\"changed\":{},\"removed\":{}}}",
+                                    n.rows, n.added, n.changed, n.removed
+                                )
+                            })
                             .collect();
                         let failed: Vec<String> = rep
                             .failed
@@ -7208,7 +7213,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         );
                     } else {
                         for (r, s, n) in &rep.fetched {
-                            println!("fetched {r} at head {s}: {n} rows");
+                            println!(
+                                "fetched {r} at head {s}: {} rows (+{} changed {} removed {})",
+                                n.rows, n.added, n.changed, n.removed
+                            );
                         }
                         for (r, w) in &rep.failed {
                             println!("still behind {r}: {w}");

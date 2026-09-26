@@ -400,6 +400,13 @@ head than the copy held; a box that is offline publishes nothing, so its
 region is old, not stale — the §8 behaviour. The `catalogue` serve job
 (60 s), `pvfs region fetch`, `region ls` head/held/stale, `stale: N` in
 `serve status`. No deltas yet (§8: whole-snapshot is viable from day one).
+*PVOS D194 (2026-09-26): the transfer is still the whole manifest, but the
+install writes only the rows that differ — it reads the rows held without
+the write lock, reads them again under it if another connection committed
+in between, and deletes and upserts the difference (and refuses a manifest
+listing a path twice). Rewriting every row on each head bump had held the
+NAS's database past the 15 s its other jobs wait: about one lost pass a
+day.*
 Found on the way: since D125 the forest owner's heads tick re-attested
 `(0, empty)` for every catalogue region another box owned; fixed. The
 original spec follows.
