@@ -5,6 +5,24 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One companion, several recovery phrases (PVOS D189; agent protocol
+  v4).** `pvfs-companion serve --vault A --vault B …` serves every phrase
+  from one process, one socket and one web port: one agent per vault (its
+  own lock, prompts, audit log and pairings), behind a router that sends
+  each request to the phrase holding the public key its optional top-level
+  `key` field names — any of a phrase's root, identity or encryption keys;
+  `role`/`request_type` still pick the key inside it. No `key` → the first
+  (default) vault, so every client before v4 works unchanged; a key no
+  phrase holds → `no_such_key`, never another phrase. `list_keys` lists the
+  phrases' public keys. With several, every signing prompt names the phrase
+  that would sign. An extra vault that will not open is left out (said), the
+  default one must. `pvfs` names the CURRENT root of the forest a command
+  runs on (`$PVFS_COMPANION_KEY` overrides, for a new forest) and routes a
+  secure unwrap by the wrap's recipient. The macOS app launches its
+  companion with every keychain-sealed vault in `~/.config/pvfs`
+  (`companion.vault` first). Why: separate forests should not share a
+  phrase — one phrase is one root key in every forest, and root
+  certificates do not name the forest.
 - **Before an owner holds regions on a busy box (PVOS D188).** Found reading
   the code for mediabox's move to owner:
   - **A mount left on an older build no longer passes the roll's check.** A

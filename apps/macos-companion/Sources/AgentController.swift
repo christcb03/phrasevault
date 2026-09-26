@@ -55,6 +55,25 @@ final class AgentController: ObservableObject {
         vaultPath.deletingLastPathComponent().appendingPathComponent("companion.audit.jsonl")
     }
 
+    /// PVOS D189 — every other keychain-sealed vault beside the default one
+    /// (`media2.vault`, …): served by the same companion, which picks the
+    /// phrase per request by the key the client names (a forest's root).
+    /// Password-sealed ones are left out: the one password the app holds is
+    /// the default vault's.
+    var extraVaultPaths: [URL] {
+        let dir = vaultPath.deletingLastPathComponent()
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files
+            .filter { $0.pathExtension == "vault" && $0.lastPathComponent != vaultPath.lastPathComponent }
+            .filter { url in
+                guard let data = try? Data(contentsOf: url),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return false }
+                return (obj["sealing"] as? String) == "keychain"
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     var companionBinary: URL {
         if let exec = Bundle.main.executableURL {
             let sibling = exec.deletingLastPathComponent().appendingPathComponent("pvfs-companion")
@@ -190,11 +209,12 @@ final class AgentController: ObservableObject {
 
         let proc = Process()
         proc.executableURL = companionBinary
-        proc.arguments = [
-            "serve",
-            "--vault", vaultPath.path,
-            "--prompt", "desktop",
-        ]
+        var args = ["serve", "--vault", vaultPath.path]
+        for extra in extraVaultPaths {
+            args += ["--vault", extra.path]
+        }
+        args += ["--prompt", "desktop"]
+        proc.arguments = args
         var env = ProcessInfo.processInfo.environment
         if let pass, !pass.isEmpty {
             env["PVFS_COMPANION_PASSPHRASE"] = pass

@@ -20,7 +20,19 @@ use serde::{Deserialize, Serialize};
 /// urls), a relay from a new url for a known key gets a one-time "trust this
 /// new address?" prompt (remembered as a per-`(key, url)` grant), and
 /// `sign_in` from a trusted url auto-approves. v2 clients work unchanged.
-pub const API_VERSION: u32 = 3;
+///
+/// v4 (additive; PVOS D189): several recovery phrases in one companion. A
+/// request may carry a top-level [`KEY_FIELD`] naming a public key (hex) the
+/// companion must hold — any of a phrase's root, identity or encryption keys
+/// selects that phrase, and `role`/`request_type` still pick the key inside
+/// it; a key no phrase holds is refused (`no_such_key`), never substituted.
+/// A request without one goes to the default phrase, so v3 clients work
+/// unchanged. [`AgentRequest::ListKeys`] lists the phrases' public keys.
+pub const API_VERSION: u32 = 4;
+
+/// PVOS D189 — the optional top-level field of a request that selects the
+/// phrase: a public key (hex) one of the companion's phrases holds.
+pub const KEY_FIELD: &str = "key";
 
 /// Domain prefix for the relay envelope signature: the paired server signs
 /// `domain_digest(RELAY_DOMAIN, payload_json_bytes)`.
@@ -132,6 +144,24 @@ pub enum AgentRequest {
     },
     ListPairings,
     RevokePairing { name: String },
+    /// PVOS D189 (v4): the phrases this companion holds — public keys only.
+    ListKeys,
+}
+
+/// PVOS D189 — one phrase the companion holds, as `list_keys` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyInfo {
+    /// The vault's name (its file stem, e.g. `companion`, `media2`).
+    pub vault: String,
+    /// The phrase requests without a `key` use.
+    pub default: bool,
+    /// Hex public keys: the root (`0'`), the current identity, the encryption
+    /// key (`2'/0'`).
+    pub root: String,
+    pub identity: String,
+    pub encryption: String,
+    /// Dropped from memory now (it re-unlocks on use).
+    pub locked: bool,
 }
 
 /// The agent's reply.
@@ -157,6 +187,8 @@ pub enum AgentResponse {
     /// verify relayed answers against.
     Paired { identity_pubkey: String },
     Pairings { pairings: Vec<PairingInfo> },
+    /// The reply to [`AgentRequest::ListKeys`] (v4).
+    Keys { keys: Vec<KeyInfo> },
     Ok,
     Error { code: String, message: String },
 }

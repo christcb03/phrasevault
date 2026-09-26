@@ -17,7 +17,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use pvfs_companion::{
-    serve, serve_tenant, tenant_request, Agent, ApprovalPolicy, Sessions, TenantAgent,
+    serve_tenant, tenant_request, Agent, ApprovalPolicy, Sessions, TenantAgent,
     TenantRequest, TenantResponse, UnlockedSigner, Vault, VaultStore,
 };
 
@@ -129,9 +129,12 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct ServeArgs {
-    /// Vault file (default: ~/.config/pvfs/companion.vault, or $PVFS_COMPANION_VAULT)
+    /// Vault file (default: ~/.config/pvfs/companion.vault, or $PVFS_COMPANION_VAULT).
+    /// PVOS D189: repeat it to serve several recovery phrases from one
+    /// companion — the first is the default; a request picks another by
+    /// naming one of its public keys.
     #[arg(long)]
-    vault: Option<PathBuf>,
+    vault: Vec<PathBuf>,
     /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -508,69 +511,55 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         prompt,
         web_port,
     } = args;
-    let vault = match vault {
-        Some(p) => p,
-        None => default_vault()?,
-    };
-    if !vault.exists() {
-        return Err(format!(
-            "no vault at {} — run `pvfs-companion init` first",
-            vault.display()
-        ));
+    let vaults = if vault.is_empty() { vec![default_vault()?] } else { vault };
+    for v in &vaults {
+        if !v.exists() {
+            return Err(format!("no vault at {} — run `pvfs-companion init` first", v.display()));
+        }
     }
     let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
-    let signer = unseal_signer(&vault)?;
     let policy = ApprovalPolicy {
         auto_root: allow_root,
         ..Default::default()
     };
-
-    // Phase 5 controls (doc 14 §4, §9): prompts, audit, rate limit, and
-    // lock with on-demand re-unlock (the unlocker retains no secrets —
-    // it re-opens the vault and unseals the same way serve just did).
-    // `--prompt deny` makes a scripted agent deterministic: a prompt can
-    // never block it (it denies instead), no matter what tty it holds.
-    let (prompter, prompt_label): (Box<dyn pvfs_companion::Prompter>, &str) =
-        match prompt.as_str() {
-            "deny" => (Box::new(pvfs_companion::DenyPrompter), "deny (forced)"),
-            "terminal" => match pvfs_companion::approve::TerminalPrompter::open() {
-                Some(p) => (Box::new(p), "terminal (forced)"),
-                None => return Err("--prompt terminal: no controlling terminal".into()),
-            },
-            "desktop" => match pvfs_companion::approve::DesktopPrompter::detect() {
-                Some(p) => (Box::new(p), "desktop dialog (forced)"),
-                None => return Err("--prompt desktop: no GUI session detected".into()),
-            },
-            _ => pvfs_companion::auto_prompter_labeled(),
-        };
-    let audit_path = vault.with_extension("audit.jsonl");
-    let audit =
-        pvfs_companion::AuditLog::open(&audit_path).map_err(|e| e.to_string())?;
-    let unlock_vault = vault.clone();
-    let unlocker: pvfs_companion::Unlocker =
-        Box::new(move || unseal_signer(&unlock_vault));
-    // Identity rotation (doc 15 §1) persists its index bump to the vault
-    // envelope, so restarts and re-unlocks stay on the new identity.
-    let rotate_vault = vault.clone();
-    let rotator: pvfs_companion::IdentityRotator = Box::new(move |idx| {
-        Vault::set_identity_index(&rotate_vault, idx).map_err(|e| e.to_string())
-    });
     let idle = match idle_lock_secs {
         0 => None,
         n => Some(Duration::from_secs(n)),
     };
-    let agent = Arc::new(
-        Agent::new(signer, policy)
-            .with_prompter(prompter)
-            .with_audit(audit)
-            .with_unlocker(unlocker)
-            .with_identity_rotator(rotator)
-            .with_idle_timeout(idle)
-            .with_rate_limit(rate_limit)
-            .with_pairings(pvfs_companion::PairingRegistry::at(
-                &vault.with_extension("pairings.json"),
-            )),
-    );
+
+    // PVOS D189 — one agent per phrase (its own lock, prompts, audit and
+    // pairings, exactly as a one-phrase companion runs), behind a router
+    // that sends each request to the phrase holding the key it names. With
+    // several, every signing prompt names the phrase that would sign.
+    let several = vaults.len() > 1;
+    let mut slots = Vec::new();
+    let mut prompt_label = "";
+    let mut audits = Vec::new();
+    for (i, v) in vaults.iter().enumerate() {
+        let name = v.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "vault".into());
+        let (prompter, label) = make_prompter(&prompt)?;
+        prompt_label = label;
+        let prompter: Box<dyn pvfs_companion::Prompter> =
+            if several { Box::new(pvfs_companion::NamedPrompter::new(name.clone(), prompter)) } else { prompter };
+        // The default phrase must open; another that cannot (a different
+        // password, a missing keychain item) is left out, said, and the
+        // companion serves the rest rather than none.
+        let slot = vault_agent(v, policy, prompter, idle, rate_limit)
+            .and_then(|agent| pvfs_companion::router::Slot::new(name.clone(), agent));
+        match slot {
+            Ok(slot) => {
+                audits.push(v.with_extension("audit.jsonl"));
+                slots.push(slot);
+            }
+            Err(e) if i > 0 => eprintln!("pvfs-companion: phrase {name} left out — {e}"),
+            Err(e) => return Err(e),
+        }
+    }
+    let router = Arc::new(pvfs_companion::Router::new(slots)?);
+    // The web agent (the browser's sign-in) and its files follow the
+    // default phrase.
+    let agent = router.default_agent();
+    let vault = vaults[0].clone();
 
     // Singleton per user (2026-07-21 request): take over from any existing
     // instance — kill it via its pidfile, clear the stale socket — then bind
@@ -644,20 +633,77 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     }
 
     eprintln!("pvfs-companion: serving on {}", socket.display());
+    for k in router.keys() {
+        eprintln!(
+            "pvfs-companion: phrase {}{}: root {}",
+            k.vault,
+            if k.default { " (default)" } else { "" },
+            &k.root[..k.root.len().min(12)]
+        );
+    }
     eprintln!(
         "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
         match idle_lock_secs {
             0 => "off".to_string(),
             n => format!("{n}s"),
         },
-        audit_path.display()
+        audits.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", ")
     );
     eprintln!(
         "pvfs-companion: identity agent on http(s)://{addr} (dual-mode; port file {})",
         port_file.display()
     );
-    serve(listener, agent).map_err(|e| e.to_string())?;
+    pvfs_companion::serve_router(listener, router).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The approval backend for one phrase's agent. `--prompt deny` makes a
+/// scripted agent deterministic: a prompt can never block it (it denies
+/// instead), no matter what tty it holds.
+fn make_prompter(prompt: &str) -> Result<(Box<dyn pvfs_companion::Prompter>, &'static str), String> {
+    Ok(match prompt {
+        "deny" => (Box::new(pvfs_companion::DenyPrompter), "deny (forced)"),
+        "terminal" => match pvfs_companion::approve::TerminalPrompter::open() {
+            Some(p) => (Box::new(p), "terminal (forced)"),
+            None => return Err("--prompt terminal: no controlling terminal".into()),
+        },
+        "desktop" => match pvfs_companion::approve::DesktopPrompter::detect() {
+            Some(p) => (Box::new(p), "desktop dialog (forced)"),
+            None => return Err("--prompt desktop: no GUI session detected".into()),
+        },
+        _ => pvfs_companion::auto_prompter_labeled(),
+    })
+}
+
+/// One phrase's agent, with the phase 5 controls (doc 14 §4, §9): prompts,
+/// audit, rate limit, and lock with on-demand re-unlock (the unlocker keeps
+/// no secret — it re-opens the vault and unseals it the way serve did).
+fn vault_agent(
+    vault: &std::path::Path,
+    policy: ApprovalPolicy,
+    prompter: Box<dyn pvfs_companion::Prompter>,
+    idle: Option<Duration>,
+    rate_limit: u32,
+) -> Result<Arc<Agent>, String> {
+    let signer = unseal_signer(vault)?;
+    let audit = pvfs_companion::AuditLog::open(&vault.with_extension("audit.jsonl")).map_err(|e| e.to_string())?;
+    let unlock_vault = vault.to_path_buf();
+    let unlocker: pvfs_companion::Unlocker = Box::new(move || unseal_signer(&unlock_vault));
+    // Identity rotation (doc 15 §1) persists its index bump to the vault
+    // envelope, so restarts and re-unlocks stay on the new identity.
+    let rotate_vault = vault.to_path_buf();
+    let rotator: pvfs_companion::IdentityRotator =
+        Box::new(move |idx| Vault::set_identity_index(&rotate_vault, idx).map_err(|e| e.to_string()));
+    Ok(Arc::new(
+        Agent::new(signer, policy)
+            .with_prompter(prompter)
+            .with_audit(audit)
+            .with_unlocker(unlocker)
+            .with_identity_rotator(rotator)
+            .with_idle_timeout(idle)
+            .with_rate_limit(rate_limit)
+            .with_pairings(pvfs_companion::PairingRegistry::at(&vault.with_extension("pairings.json"))),
+    ))
 }
 
 fn run_status(vault: Option<PathBuf>, socket: Option<PathBuf>) -> Result<(), String> {
