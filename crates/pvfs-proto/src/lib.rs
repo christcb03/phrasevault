@@ -45,7 +45,11 @@ use serde::{Deserialize, Serialize};
 ///          (PVOS's Media app) reads a forest through its daemon, under the
 ///          forest's ACLs, without opening its store. Additive;
 ///          compatible-with stays.
-pub const PROTO_VERSION: u32 = 13;
+///   13 → 14: PVOS D192 — this box understands forest-bound certificates
+///          (v2 authority digests, `CertificatesBound`) and offers the
+///          `BindCertificates` write op. A forest binds only when every box
+///          announces 14 or later. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 14;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -598,6 +602,10 @@ pub enum WriteOp {
     AuthorizeMember { pubkey: String },
     /// Revoke a device/member key (hex).
     Revoke { pubkey: String },
+    /// PVOS D192 — bind the forest's certificates: a `CertificatesBound`
+    /// authored by the caller, who must be the current root or hold admin on
+    /// the forest root.
+    BindCertificates,
     /// D125 item 8 — a region owner publishes the head of its catalogue
     /// region: `hash` is the hex blake3 of manifest `seq`. The forest owner
     /// prepares a `SubRegionHead` under the author's admin grant on the

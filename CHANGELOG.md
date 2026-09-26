@@ -5,6 +5,23 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Root certificates bound to their forest (PVOS D192; protocol 14).**
+  One phrase is one root key in every forest it roots, and the forest-
+  authority events — `DeviceAuthorized`, `DeviceRevoked`, `RootRotated`,
+  `RecoveryKeyRegistered`, `RecoveryKeyRevoked`, `MemberTagged` — were
+  signed without the forest id: a certificate from one forest verified in
+  another with the same root (a member with write access could append it
+  and gain a device, a revocation, a rotation, a tag). v2 digests carry the
+  forest id (same fields, `:v2:` domains). A forest is unbound (v1 valid, as
+  before) or bound (an authority event must be signed for THIS forest; v1
+  refused on replay and at commit, history kept). Forests made by this
+  build are **born bound** (a v2 genesis, no extra signature); an existing
+  forest binds with one new event, `CertificatesBound` (the current root or
+  an admin device; the first counts), through `pvfs forest bind-certs` —
+  which refuses unless every box the fleet knows announces protocol 14 (an
+  older box could not read the forest after). Until a forest binds, this
+  build still writes v1: fleet-neutral. `forest tip` and `fleet versions`
+  report the binding; new write op `BindCertificates`.
 - **One companion, several recovery phrases (PVOS D189; agent protocol
   v4).** `pvfs-companion serve --vault A --vault B …` serves every phrase
   from one process, one socket and one web port: one agent per vault (its

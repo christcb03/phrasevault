@@ -53,6 +53,9 @@ pub const K_REGION_DRAIN_SET: &str = "RegionDrainSet";
 pub const K_NODE_MOVED_OUT: &str = "NodeMovedOut";
 pub const K_NODE_MOVED_IN: &str = "NodeMovedIn";
 pub const K_CHUNK_MANIFEST_RECORDED: &str = "ChunkManifestRecorded";
+/// PVOS D192 — from here on the forest's authority events must be signed for
+/// THIS forest (see [`Event::CertificatesBound`]).
+pub const K_CERTS_BOUND: &str = "CertificatesBound";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -101,6 +104,19 @@ pub enum Event {
     RecoveryKeyRevoked {
         recovery_pubkey: Vec<u8>,
         revoked_at: u64,
+        author: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// PVOS D192 — the forest binds its certificates: from here on every
+    /// forest-authority event (device certificates, root rotation, recovery
+    /// keys, member tags) must be signed for THIS forest — its v2 digest
+    /// carries the forest id — and one that verifies only in the older form
+    /// is refused. Earlier ones stay valid (history). Authored by the current
+    /// root or an admin device: binding only takes authority away. The first
+    /// in the log counts. A forest made by a D192 build is born bound (a v2
+    /// genesis) and never carries one.
+    CertificatesBound {
+        at: u64,
         author: Vec<u8>,
         sig: Vec<u8>,
     },
@@ -351,12 +367,16 @@ pub enum Event {
 
 // ---- signed-message digests (spec §6 table) --------------------------------
 
+/// Genesis. `born_bound` (PVOS D192): the v2 domain, which makes the forest
+/// bound from its first event — its certificates are signed for it alone
+/// ([`Event::CertificatesBound`]). The fields are the same either way.
 pub fn msg_forest_created(
     instance_id: &str,
     forest_id: &str,
     root_node_id: &str,
     created_at: u64,
     author: &[u8],
+    born_bound: bool,
 ) -> [u8; 32] {
     let mut e = Enc::new();
     e.string(instance_id)
@@ -364,49 +384,75 @@ pub fn msg_forest_created(
         .string(root_node_id)
         .u64(created_at)
         .bytes(author);
-    crypto::domain_digest("pvfs:forestcreated:v1:", &e.finish())
+    let v = if born_bound { "v2" } else { "v1" };
+    crypto::domain_digest(&format!("pvfs:forestcreated:{v}:"), &e.finish())
 }
 
-pub fn msg_root_rotated(new_root_pubkey: &[u8], rotated_at: u64, author: &[u8]) -> [u8; 32] {
+/// PVOS D192 — a forest-authority digest. `forest: None` is the v1 form,
+/// signed without the forest (valid only in a forest not yet bound);
+/// `Some(id)` is v2, the forest id first, under the `:v2:` domain — a
+/// certificate for that forest and no other. The fields are the same.
+fn authority_digest(name: &str, forest: Option<&str>, fields: impl FnOnce(&mut Enc)) -> [u8; 32] {
     let mut e = Enc::new();
-    e.bytes(new_root_pubkey).u64(rotated_at).bytes(author);
-    crypto::domain_digest("pvfs:rootrotated:v1:", &e.finish())
+    if let Some(f) = forest {
+        e.string(f);
+    }
+    fields(&mut e);
+    let v = if forest.is_some() { "v2" } else { "v1" };
+    crypto::domain_digest(&format!("pvfs:{name}:{v}:"), &e.finish())
+}
+
+pub fn msg_root_rotated(forest: Option<&str>, new_root_pubkey: &[u8], rotated_at: u64, author: &[u8]) -> [u8; 32] {
+    authority_digest("rootrotated", forest, |e| {
+        e.bytes(new_root_pubkey).u64(rotated_at).bytes(author);
+    })
 }
 
 pub fn msg_recovery_key_registered(
+    forest: Option<&str>,
     recovery_pubkey: &[u8],
     registered_at: u64,
     author: &[u8],
 ) -> [u8; 32] {
-    let mut e = Enc::new();
-    e.bytes(recovery_pubkey).u64(registered_at).bytes(author);
-    crypto::domain_digest("pvfs:recoverykey:v1:", &e.finish())
+    authority_digest("recoverykey", forest, |e| {
+        e.bytes(recovery_pubkey).u64(registered_at).bytes(author);
+    })
 }
 
-pub fn msg_recovery_key_revoked(recovery_pubkey: &[u8], revoked_at: u64, author: &[u8]) -> [u8; 32] {
-    let mut e = Enc::new();
-    e.bytes(recovery_pubkey).u64(revoked_at).bytes(author);
-    crypto::domain_digest("pvfs:recoverykeyrevoked:v1:", &e.finish())
+pub fn msg_recovery_key_revoked(
+    forest: Option<&str>,
+    recovery_pubkey: &[u8],
+    revoked_at: u64,
+    author: &[u8],
+) -> [u8; 32] {
+    authority_digest("recoverykeyrevoked", forest, |e| {
+        e.bytes(recovery_pubkey).u64(revoked_at).bytes(author);
+    })
 }
 
 pub fn msg_device_authorized(
+    forest: Option<&str>,
     device_pubkey: &[u8],
     device_index: u64,
     authorized_at: u64,
     author: &[u8],
 ) -> [u8; 32] {
-    let mut e = Enc::new();
-    e.bytes(device_pubkey)
-        .u64(device_index)
-        .u64(authorized_at)
-        .bytes(author);
-    crypto::domain_digest("pvfs:deviceauthorized:v1:", &e.finish())
+    authority_digest("deviceauthorized", forest, |e| {
+        e.bytes(device_pubkey).u64(device_index).u64(authorized_at).bytes(author);
+    })
 }
 
-pub fn msg_device_revoked(device_pubkey: &[u8], revoked_at: u64, author: &[u8]) -> [u8; 32] {
+pub fn msg_device_revoked(forest: Option<&str>, device_pubkey: &[u8], revoked_at: u64, author: &[u8]) -> [u8; 32] {
+    authority_digest("devicerevoked", forest, |e| {
+        e.bytes(device_pubkey).u64(revoked_at).bytes(author);
+    })
+}
+
+/// PVOS D192 — [`Event::CertificatesBound`]: always for one forest.
+pub fn msg_certs_bound(forest_id: &str, at: u64, author: &[u8]) -> [u8; 32] {
     let mut e = Enc::new();
-    e.bytes(device_pubkey).u64(revoked_at).bytes(author);
-    crypto::domain_digest("pvfs:devicerevoked:v1:", &e.finish())
+    e.string(forest_id).u64(at).bytes(author);
+    crypto::domain_digest("pvfs:certsbound:v1:", &e.finish())
 }
 
 pub fn msg_link_removed(link_id: &str, removed_at: u64, removed_by: &[u8]) -> [u8; 32] {
@@ -630,19 +676,16 @@ pub fn msg_acl_set(
 }
 
 pub fn msg_member_tagged(
+    forest: Option<&str>,
     member_pubkey: &[u8],
     tag: &str,
     granted: bool,
     set_at: u64,
     author: &[u8],
 ) -> [u8; 32] {
-    let mut e = Enc::new();
-    e.bytes(member_pubkey)
-        .string(tag)
-        .boolean(granted)
-        .u64(set_at)
-        .bytes(author);
-    crypto::domain_digest("pvfs:membertagged:v1:", &e.finish())
+    authority_digest("membertagged", forest, |e| {
+        e.bytes(member_pubkey).string(tag).boolean(granted).u64(set_at).bytes(author);
+    })
 }
 
 pub fn msg_secure_blob_updated(
@@ -673,7 +716,54 @@ pub fn is_known_kind(kind: &str) -> bool {
     !matches!(Event::decode(kind, &[]), Ok(Event::Unknown { .. }))
 }
 
+/// PVOS D192 — what an event's signature is checked against: the forest it
+/// sits in, and whether that forest has bound its certificates (born bound,
+/// or a [`Event::CertificatesBound`] earlier in its log).
+#[derive(Clone, Copy, Debug)]
+pub struct SigContext<'a> {
+    pub forest_id: &'a str,
+    pub bound: bool,
+}
+
+/// A forest-authority signature: for this forest (v2), or — only while it
+/// is not bound — the older form without a forest (v1). A certificate
+/// signed for another forest never verifies here: its digest names that one.
+fn verify_authority(
+    ctx: &SigContext<'_>,
+    author: &[u8],
+    sig: &[u8],
+    digest: impl Fn(Option<&str>) -> [u8; 32],
+) -> Result<()> {
+    if crypto::verify_digest(author, &digest(Some(ctx.forest_id)), sig).is_ok() {
+        return Ok(());
+    }
+    if !ctx.bound {
+        return crypto::verify_digest(author, &digest(None), sig);
+    }
+    Err(PvfsError::Integrity {
+        kind: "event",
+        id: format!("certificate not signed for forest {} (it binds its certificates)", ctx.forest_id),
+        reason: crate::error::IntegrityReason::SignatureInvalid,
+    })
+}
+
 impl Event {
+    /// PVOS D192 — a genesis signed in the v2 form: the forest is bound from
+    /// its first event. `false` for any other event, or a v1 genesis.
+    pub fn genesis_born_bound(&self) -> bool {
+        match self {
+            Event::ForestCreated { instance_id, forest_id, root_node_id, created_at, author, sig } => {
+                crypto::verify_digest(
+                    author,
+                    &msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, true),
+                    sig,
+                )
+                .is_ok()
+            }
+            _ => false,
+        }
+    }
+
     pub fn kind(&self) -> &str {
         match self {
             Event::ForestCreated { .. } => K_FOREST_CREATED,
@@ -682,6 +772,7 @@ impl Event {
             Event::RootRotated { .. } => K_ROOT_ROTATED,
             Event::RecoveryKeyRegistered { .. } => K_RECOVERY_KEY_REGISTERED,
             Event::RecoveryKeyRevoked { .. } => K_RECOVERY_KEY_REVOKED,
+            Event::CertificatesBound { .. } => K_CERTS_BOUND,
             Event::NodeCreated(_) => K_NODE_CREATED,
             Event::LinkCreated(_) => K_LINK_CREATED,
             Event::LinkRemoved { .. } => K_LINK_REMOVED,
@@ -723,6 +814,7 @@ impl Event {
             | Event::RootRotated { author, .. }
             | Event::RecoveryKeyRegistered { author, .. }
             | Event::RecoveryKeyRevoked { author, .. }
+            | Event::CertificatesBound { author, .. }
             | Event::LinkReordered { author, .. }
             | Event::LinkRelabeled { author, .. }
             | Event::MediaQuality { author, .. }
@@ -773,6 +865,7 @@ impl Event {
             | Event::RootRotated { sig: s, .. }
             | Event::RecoveryKeyRegistered { sig: s, .. }
             | Event::RecoveryKeyRevoked { sig: s, .. }
+            | Event::CertificatesBound { sig: s, .. }
             | Event::FileLocationAdded { sig: s, .. }
             | Event::RegionMarked { sig: s, .. }
             | Event::RegionUnmarked { sig: s, .. }
@@ -866,6 +959,9 @@ impl Event {
                 sig,
             } => {
                 e.bytes(recovery_pubkey).u64(*revoked_at).bytes(author).bytes(sig);
+            }
+            Event::CertificatesBound { at, author, sig } => {
+                e.u64(*at).bytes(author).bytes(sig);
             }
             Event::NodeCreated(n) => {
                 e.string(&n.id)
@@ -1229,6 +1325,11 @@ impl Event {
                 author: d.bytes()?,
                 sig: d.bytes()?,
             },
+            K_CERTS_BOUND => Event::CertificatesBound {
+                at: d.u64()?,
+                author: d.bytes()?,
+                sig: d.bytes()?,
+            },
             K_NODE_CREATED => Event::NodeCreated(Node {
                 id: d.string()?,
                 node_type: d.string()?,
@@ -1517,7 +1618,10 @@ impl Event {
     }
 
     /// Verify the event's own signature(s) — used on replay/sync (spec §6).
-    pub fn verify_sig(&self) -> Result<()> {
+    /// PVOS D192: `ctx` is the forest the event sits in — a forest-authority
+    /// event must be signed for it (v2), or, only while it is not bound, in
+    /// the older form without a forest (v1).
+    pub fn verify_sig(&self, ctx: &SigContext<'_>) -> Result<()> {
         // D72: an event we cannot parse cannot have its signature checked —
         // we do not know which bytes were signed. Report that honestly
         // instead of returning Ok, which would be a silent "verified".
@@ -1543,62 +1647,53 @@ impl Event {
                 created_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author),
-                sig,
-            ),
+            } => {
+                // Genesis: born bound (v2) or not (v1) — either verifies;
+                // `genesis_born_bound` says which.
+                let digest = |bound| msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, bound);
+                crypto::verify_digest(author, &digest(true), sig)
+                    .or_else(|_| crypto::verify_digest(author, &digest(false), sig))
+            }
             Event::DeviceAuthorized {
                 device_pubkey,
                 device_index,
                 authorized_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_device_authorized(device_pubkey, *device_index, *authorized_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| {
+                msg_device_authorized(f, device_pubkey, *device_index, *authorized_at, author)
+            }),
             Event::DeviceRevoked {
                 device_pubkey,
                 revoked_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_device_revoked(device_pubkey, *revoked_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| msg_device_revoked(f, device_pubkey, *revoked_at, author)),
             Event::RootRotated {
                 new_root_pubkey,
                 rotated_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_root_rotated(new_root_pubkey, *rotated_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| msg_root_rotated(f, new_root_pubkey, *rotated_at, author)),
             Event::RecoveryKeyRegistered {
                 recovery_pubkey,
                 registered_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_recovery_key_registered(recovery_pubkey, *registered_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| {
+                msg_recovery_key_registered(f, recovery_pubkey, *registered_at, author)
+            }),
             Event::RecoveryKeyRevoked {
                 recovery_pubkey,
                 revoked_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_recovery_key_revoked(recovery_pubkey, *revoked_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| {
+                msg_recovery_key_revoked(f, recovery_pubkey, *revoked_at, author)
+            }),
+            Event::CertificatesBound { at, author, sig } => {
+                crypto::verify_digest(author, &msg_certs_bound(ctx.forest_id, *at, author), sig)
+            }
             Event::NodeCreated(n) => n.verify(),
             Event::LinkCreated(l) => l.verify(),
             Event::NodeMovedIn { link, .. } => link.verify(),
@@ -1861,11 +1956,9 @@ impl Event {
                 set_at,
                 author,
                 sig,
-            } => crypto::verify_digest(
-                author,
-                &msg_member_tagged(member_pubkey, tag, *granted, *set_at, author),
-                sig,
-            ),
+            } => verify_authority(ctx, author, sig, |f| {
+                msg_member_tagged(f, member_pubkey, tag, *granted, *set_at, author)
+            }),
             Event::SecureBlobUpdated {
                 blob_id,
                 content_hash,
@@ -1891,6 +1984,98 @@ mod tests {
         let k = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
         let pk = crypto::pubkey_bytes(&k);
         (k, pk)
+    }
+
+    fn unbound() -> SigContext<'static> {
+        SigContext { forest_id: "forest-a", bound: false }
+    }
+
+    /// A device certificate from `key`, signed for `forest` (v2) or, with
+    /// `None`, in the older form (v1).
+    fn device_cert(key: &identity::SigningKey, author: &[u8], forest: Option<&str>) -> Event {
+        let device = crypto::pubkey_bytes(&identity::generate_device_key());
+        let sig = crypto::sign_digest(key, &msg_device_authorized(forest, &device, 5, 1_000, author)).unwrap();
+        Event::DeviceAuthorized {
+            device_pubkey: device,
+            device_index: 5,
+            authorized_at: 1_000,
+            author: author.to_vec(),
+            sig,
+        }
+    }
+
+    // PVOS D192 — the forest id is in the v2 digest: one certificate, one forest.
+    #[test]
+    fn a_v2_certificate_names_its_forest() {
+        let (d, a) = (b"device", b"author");
+        let v1 = msg_device_authorized(None, d, 1, 2, a);
+        let in_a = msg_device_authorized(Some("forest-a"), d, 1, 2, a);
+        let in_b = msg_device_authorized(Some("forest-b"), d, 1, 2, a);
+        assert_ne!(v1, in_a);
+        assert_ne!(in_a, in_b);
+        // every family member differs by forest
+        assert_ne!(msg_root_rotated(Some("forest-a"), d, 1, a), msg_root_rotated(Some("forest-b"), d, 1, a));
+        assert_ne!(msg_device_revoked(Some("forest-a"), d, 1, a), msg_device_revoked(None, d, 1, a));
+        assert_ne!(
+            msg_member_tagged(Some("forest-a"), d, "admin", true, 1, a),
+            msg_member_tagged(Some("forest-b"), d, "admin", true, 1, a)
+        );
+        assert_ne!(
+            msg_recovery_key_registered(Some("forest-a"), d, 1, a),
+            msg_recovery_key_registered(None, d, 1, a)
+        );
+        assert_ne!(msg_recovery_key_revoked(Some("forest-a"), d, 1, a), msg_recovery_key_revoked(None, d, 1, a));
+    }
+
+    #[test]
+    fn a_certificate_verifies_only_in_its_own_forest_and_v1_only_while_unbound() {
+        let (key, author) = signer();
+        let bound_a = SigContext { forest_id: "forest-a", bound: true };
+        let unbound_a = SigContext { forest_id: "forest-a", bound: false };
+        let bound_b = SigContext { forest_id: "forest-b", bound: true };
+        let unbound_b = SigContext { forest_id: "forest-b", bound: false };
+
+        let for_a = device_cert(&key, &author, Some("forest-a"));
+        for_a.verify_sig(&bound_a).expect("signed for forest-a: valid there");
+        for_a.verify_sig(&unbound_a).expect("a v2 certificate is valid before the binding too");
+        assert!(for_a.verify_sig(&bound_b).is_err(), "never in another forest — the replay");
+        assert!(for_a.verify_sig(&unbound_b).is_err(), "not even one that is not bound yet");
+
+        let old = device_cert(&key, &author, None);
+        old.verify_sig(&unbound_a).expect("v1: valid while the forest is not bound");
+        let err = old.verify_sig(&bound_a).unwrap_err().to_string();
+        assert!(err.contains("forest-a"), "{err}");
+    }
+
+    #[test]
+    fn the_binding_and_a_bound_genesis_verify_for_their_forest() {
+        let (key, author) = signer();
+        let sig = crypto::sign_digest(&key, &msg_certs_bound("forest-a", 7, &author)).unwrap();
+        let ev = Event::CertificatesBound { at: 7, author: author.clone(), sig };
+        let back = Event::decode(K_CERTS_BOUND, &ev.encode_body()).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(back.kind(), K_CERTS_BOUND);
+        assert_eq!(back.author(), author.as_slice());
+        back.verify_sig(&unbound()).unwrap();
+        assert!(back.verify_sig(&SigContext { forest_id: "forest-b", bound: false }).is_err());
+
+        let genesis = |born_bound| {
+            let sig = crypto::sign_digest(&key, &msg_forest_created("i", "forest-a", "r", 9, &author, born_bound)).unwrap();
+            Event::ForestCreated {
+                instance_id: "i".into(),
+                forest_id: "forest-a".into(),
+                root_node_id: "r".into(),
+                created_at: 9,
+                author: author.clone(),
+                sig,
+            }
+        };
+        let (born, old) = (genesis(true), genesis(false));
+        born.verify_sig(&unbound()).unwrap();
+        old.verify_sig(&unbound()).unwrap();
+        assert!(born.genesis_born_bound());
+        assert!(!old.genesis_born_bound());
+        assert!(!back.genesis_born_bound());
     }
 
     fn acl_set(expires_at: u64) -> Event {
@@ -1945,7 +2130,7 @@ mod tests {
 
         let back = Event::decode(K_ACL_SET, &body).unwrap();
         assert_eq!(back, ev);
-        back.verify_sig().unwrap();
+        back.verify_sig(&unbound()).unwrap();
     }
 
     #[test]
@@ -1954,7 +2139,7 @@ mod tests {
         let body = ev.encode_body();
         let back = Event::decode(K_ACL_SET, &body).unwrap();
         assert_eq!(back, ev);
-        back.verify_sig().unwrap();
+        back.verify_sig(&unbound()).unwrap();
         assert!(matches!(back, Event::AclSet { expires_at: 2_000, .. }));
     }
 

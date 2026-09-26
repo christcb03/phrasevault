@@ -53,7 +53,8 @@ fn an_unknown_event_carries_no_authority() {
 #[test]
 fn an_unknown_event_refuses_signature_verification() {
     let ev = Event::decode("FutureKind", b"x").unwrap();
-    let err = ev.verify_sig().unwrap_err().to_string();
+    let ctx = pvfs_core::event::SigContext { forest_id: "f", bound: false };
+    let err = ev.verify_sig(&ctx).unwrap_err().to_string();
     assert!(
         err.contains("does not know the kind"),
         "the refusal must explain itself, got: {err}"

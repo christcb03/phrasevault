@@ -557,6 +557,26 @@ pub(crate) fn lock_folds_within(
 
 // ---- meta helpers -----------------------------------------------------------
 
+/// PVOS D192 — whether this forest binds its certificates, and since when:
+/// `genesis` (born bound) or the seq of its `CertificatesBound`.
+pub fn certs_bound(conn: &Connection) -> Result<Option<String>> {
+    meta_get(conn, "certs_bound")
+}
+
+/// PVOS D192 — the events a forest's binding covers: signed for one forest
+/// (v2) once it is bound.
+pub fn is_authority_event(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::DeviceAuthorized { .. }
+            | Event::DeviceRevoked { .. }
+            | Event::RootRotated { .. }
+            | Event::RecoveryKeyRegistered { .. }
+            | Event::RecoveryKeyRevoked { .. }
+            | Event::MemberTagged { .. }
+    )
+}
+
 pub fn meta_get(conn: &Connection, k: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT v FROM projection_meta WHERE k = ?1",
@@ -905,6 +925,22 @@ pub fn fold(tx: &Transaction<'_>, log_id: &str, seq: u64, event: &Event) -> Resu
                 "INSERT INTO projection_meta (k, v) VALUES ('identity_root_pubkey', ?1)
                  ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 params![hex::encode(author)],
+            )
+            .map_err(&m)?;
+            // PVOS D192 — a v2 genesis: bound from the first event.
+            if event.genesis_born_bound() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO projection_meta (k, v) VALUES ('certs_bound', 'genesis')",
+                    [],
+                )
+                .map_err(&m)?;
+            }
+        }
+        // PVOS D192 — the first binding counts; a later one changes nothing.
+        Event::CertificatesBound { .. } => {
+            tx.execute(
+                "INSERT OR IGNORE INTO projection_meta (k, v) VALUES ('certs_bound', ?1)",
+                params![seq.to_string()],
             )
             .map_err(&m)?;
         }
@@ -1719,7 +1755,11 @@ fn decode_genesis(conn: &Connection) -> Result<ForestIdentity> {
         });
     }
     let ev = Event::decode(&row.kind, &row.body)?;
-    ev.verify_sig()?;
+    if let Event::ForestCreated { forest_id, .. } = &ev {
+        // a genesis verifies in either form; the form says whether the forest
+        // is born bound (PVOS D192), which the fold records
+        ev.verify_sig(&crate::event::SigContext { forest_id, bound: false })?;
+    }
     match ev {
         Event::ForestCreated {
             instance_id,
@@ -1783,7 +1823,11 @@ fn replay_one(
     // never authorized. Until then it changes nothing and is reported as
     // not understood.
     if !matches!(ev, Event::Unknown { .. }) {
-        ev.verify_sig()?;
+        // PVOS D192 — an authority event must be signed for this forest once
+        // it binds its certificates; the bound state is what the log has
+        // folded so far (a v2 genesis, or a CertificatesBound before this).
+        let bound = is_authority_event(&ev) && certs_bound(tx)?.is_some();
+        ev.verify_sig(&crate::event::SigContext { forest_id: &identity.forest_id, bound })?;
     }
     if !log_id.is_empty() {
         if let Event::ForestCreated { .. }
@@ -1792,6 +1836,7 @@ fn replay_one(
         | Event::RootRotated { .. }
         | Event::RecoveryKeyRegistered { .. }
         | Event::RecoveryKeyRevoked { .. }
+        | Event::CertificatesBound { .. }
         | Event::MemberTagged { .. } = &ev
         {
             return Err(PvfsError::Corruption {
@@ -1814,6 +1859,14 @@ fn replay_one(
         // is the CURRENT root of the lineage as of this position (doc 15 §C2), so
         // certs signed by a post-rotation root validate on replay.
         Event::DeviceAuthorized { author, .. } | Event::DeviceRevoked { author, .. } => {
+            let root = current_root(tx, identity)?;
+            check_device_cert(tx, &root, &identity.root_node_id, author, row.written_at)
+                .map_err(|_| unauthorized(row.seq, ev.kind()))?;
+        }
+        // PVOS D192 — binding the certificates: the current root or an admin
+        // device, the device-certificate rule (binding only takes authority
+        // away).
+        Event::CertificatesBound { author, .. } => {
             let root = current_root(tx, identity)?;
             check_device_cert(tx, &root, &identity.root_node_id, author, row.written_at)
                 .map_err(|_| unauthorized(row.seq, ev.kind()))?;
@@ -2018,7 +2071,8 @@ pub fn check_member_event(conn: &Connection, ev: &Event, as_of_ms: u64) -> Resul
         | Event::DeviceRevoked { .. }
         | Event::RootRotated { .. }
         | Event::RecoveryKeyRegistered { .. }
-        | Event::RecoveryKeyRevoked { .. } => {}
+        | Event::RecoveryKeyRevoked { .. }
+        | Event::CertificatesBound { .. } => {}
 
         // Genesis, seq 1, root-authored — there is no prior state to check.
         Event::ForestCreated { .. } => {}
@@ -4255,6 +4309,7 @@ mod enforcement_tests {
     fn replay_accepts_member_tagged_under_own_authority() {
         let dir = tempfile::tempdir().unwrap();
         let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let forest = engine.identity.forest_id.clone(); // born bound (PVOS D192)
         let member = foreign_key();
         let member_pub = crypto::pubkey_bytes(&member);
         engine.authorize_member(&m, &member_pub).unwrap(); // authorized, not admin
@@ -4264,7 +4319,7 @@ mod enforcement_tests {
         let (tag, granted) = ("friends", true);
         let sig = crypto::sign_digest(
             &member,
-            &crate::event::msg_member_tagged(&member_pub, tag, granted, t, &member_pub),
+            &crate::event::msg_member_tagged(Some(&forest), &member_pub, tag, granted, t, &member_pub),
         )
         .unwrap();
         append_to_log(
@@ -4289,6 +4344,7 @@ mod enforcement_tests {
     fn replay_rejects_member_tagged_from_unauthorized_key() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _m) = Engine::init(dir.path()).unwrap();
+        let forest = engine.identity.forest_id.clone(); // signed for it: the AUTHOR is refused
         engine.close().unwrap();
 
         let stranger = foreign_key();
@@ -4297,7 +4353,7 @@ mod enforcement_tests {
         let (tag, granted) = ("sneaky", true);
         let sig = crypto::sign_digest(
             &stranger,
-            &crate::event::msg_member_tagged(&stranger_pub, tag, granted, t, &stranger_pub),
+            &crate::event::msg_member_tagged(Some(&forest), &stranger_pub, tag, granted, t, &stranger_pub),
         )
         .unwrap();
         append_to_log(
@@ -4329,6 +4385,7 @@ mod enforcement_tests {
     fn replay_rejects_device_cert_from_non_admin() {
         let dir = tempfile::tempdir().unwrap();
         let (mut engine, m) = Engine::init(dir.path()).unwrap();
+        let forest = engine.identity.forest_id.clone(); // signed for it: the AUTHOR is refused
         let member = foreign_key();
         let member_pub = crypto::pubkey_bytes(&member);
         engine.authorize_member(&m, &member_pub).unwrap(); // authorized, not admin
@@ -4340,7 +4397,7 @@ mod enforcement_tests {
         let idx = acl::MEMBER_DEVICE_INDEX;
         let sig = crypto::sign_digest(
             &member,
-            &crate::event::msg_device_authorized(&victim, idx, t, &member_pub),
+            &crate::event::msg_device_authorized(Some(&forest), &victim, idx, t, &member_pub),
         )
         .unwrap();
         append_to_log(

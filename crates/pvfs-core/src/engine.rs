@@ -546,12 +546,27 @@ impl Engine {
 
     /// First-time setup (spec §6 init flow): generate mnemonic + keys, write
     /// the genesis events. Returns the mnemonic for ONE-TIME display.
+    ///
+    /// PVOS D192: the forest is born bound — its genesis and certificates are
+    /// signed for it alone, so its followers must run D192 or later.
     pub fn init(data_dir: &Path) -> Result<(Engine, Mnemonic)> {
+        Self::init_bound(data_dir, true)
+    }
+
+    /// PVOS D192 — [`Engine::init`] for a forest NOT born bound: older boxes can
+    /// follow it; it binds later with a `CertificatesBound`
+    /// ([`Engine::bind_certificates`]). For compatibility, and the tests of the
+    /// binding itself.
+    pub fn init_unbound(data_dir: &Path) -> Result<(Engine, Mnemonic)> {
+        Self::init_bound(data_dir, false)
+    }
+
+    fn init_bound(data_dir: &Path, born_bound: bool) -> Result<(Engine, Mnemonic)> {
         let mnemonic = identity::generate_mnemonic()?;
         let root_key = identity::root_key(&mnemonic, "")?;
         let root_pub = crypto::pubkey_bytes(&root_key);
         let device_key = identity::device_key(&mnemonic, "", 0)?;
-        let engine = Self::init_with_keys(data_dir, &root_pub, device_key, 0, |digest| {
+        let engine = Self::init_with_keys(data_dir, &root_pub, device_key, 0, born_bound, |digest| {
             crypto::sign_digest(&root_key, digest)
         })?;
         Ok((engine, mnemonic))
@@ -571,7 +586,7 @@ impl Engine {
     ) -> Result<Engine> {
         crypto::validate_pubkey(root_pub)?;
         let device_key = identity::generate_device_key();
-        Self::init_with_keys(data_dir, root_pub, device_key, 0, |d| sign_root(d))
+        Self::init_with_keys(data_dir, root_pub, device_key, 0, true, |d| sign_root(d))
     }
 
     fn init_with_keys(
@@ -579,6 +594,7 @@ impl Engine {
         root_pub: &[u8],
         device_key: identity::SigningKey,
         device_index: u64,
+        born_bound: bool,
         mut sign_root: impl FnMut(&[u8; 32]) -> Result<Vec<u8>>,
     ) -> Result<Engine> {
         std::fs::create_dir_all(data_dir).map_err(|e| PvfsError::io("create data dir", e))?;
@@ -642,8 +658,10 @@ impl Engine {
             &root_node.id,
             t,
             &root_pub,
+            born_bound,
         ))?;
         let da_sig = sign_root(&event::msg_device_authorized(
+            born_bound.then_some(forest_id.as_str()),
             &device_pub,
             device_index,
             t,
@@ -1068,6 +1086,13 @@ impl Engine {
 
     /// Recover onto a machine from the mnemonic: re-derive the device key and
     /// (if needed) self-authorize it with the identity root (spec §10).
+    /// PVOS D192 — the forest an authority signature is for: this forest's id
+    /// once it binds its certificates (the v2 form), `None` before — the v1
+    /// form an older follower still reads.
+    pub fn cert_forest(&self) -> Result<Option<String>> {
+        Ok(projection::certs_bound(&self.conn)?.map(|_| self.identity.forest_id.clone()))
+    }
+
     pub fn recover(data_dir: &Path, mnemonic: &Mnemonic, device_index: u64) -> Result<Engine> {
         let root_key = identity::root_key(mnemonic, "")?;
         let root_pub = crypto::pubkey_bytes(&root_key);
@@ -1111,7 +1136,7 @@ impl Engine {
             let t = now_ms();
             let sig = crypto::sign_digest(
                 &root_key,
-                &event::msg_device_authorized(&device_pub, device_index, t, &root_pub),
+                &event::msg_device_authorized(engine.cert_forest()?.as_deref(), &device_pub, device_index, t, &root_pub),
             )?;
             engine.append_durable(vec![Event::DeviceAuthorized {
                 device_pubkey: device_pub,
@@ -1298,10 +1323,11 @@ impl Engine {
 
         // Every signature before any write: a companion that says no, or a
         // phrase that is wrong, changes nothing.
+        let cf = engine.cert_forest().map_err(restore)?;
         let t = now_ms();
         let mut events = Vec::new();
         if known.is_none() {
-            let sig = sign_root(&event::msg_device_authorized(&device_pub, device_index, t, root_pub))
+            let sig = sign_root(&event::msg_device_authorized(cf.as_deref(), &device_pub, device_index, t, root_pub))
                 .map_err(restore)?;
             events.push(Event::DeviceAuthorized {
                 device_pubkey: device_pub.clone(),
@@ -1315,7 +1341,7 @@ impl Engine {
             if old == &device_pub {
                 continue;
             }
-            let sig = sign_root(&event::msg_device_revoked(old, t, root_pub)).map_err(restore)?;
+            let sig = sign_root(&event::msg_device_revoked(cf.as_deref(), old, t, root_pub)).map_err(restore)?;
             events.push(Event::DeviceRevoked {
                 device_pubkey: old.clone(),
                 revoked_at: t,
@@ -1543,6 +1569,7 @@ impl Engine {
                 | Event::RootRotated { .. }
                 | Event::RecoveryKeyRegistered { .. }
                 | Event::RecoveryKeyRevoked { .. }
+                | Event::CertificatesBound { .. }
                 | Event::MemberTagged { .. } => String::new(),
                 // Region boundary events author in the enclosing region.
                 Event::RegionMarked { node_id, .. }
@@ -3708,7 +3735,7 @@ impl Engine {
         let t = now_ms();
         let sig = crypto::sign_digest(
             &root_key,
-            &event::msg_device_authorized(&device_pub, device_index, t, &root_pub),
+            &event::msg_device_authorized(self.cert_forest()?.as_deref(), &device_pub, device_index, t, &root_pub),
         )?;
         self.append_durable(vec![Event::DeviceAuthorized {
             device_pubkey: device_pub.clone(),
@@ -3752,7 +3779,7 @@ impl Engine {
         let device_index = crate::acl::MEMBER_DEVICE_INDEX;
         let sig = crypto::sign_digest(
             &root_key,
-            &event::msg_device_authorized(member_pubkey, device_index, t, &root_pub),
+            &event::msg_device_authorized(self.cert_forest()?.as_deref(), member_pubkey, device_index, t, &root_pub),
         )?;
         self.append_durable(vec![Event::DeviceAuthorized {
             device_pubkey: member_pubkey.to_vec(),
@@ -3781,7 +3808,7 @@ impl Engine {
         let t = now_ms();
         let sig = crypto::sign_digest(
             &root_key,
-            &event::msg_device_revoked(device_pubkey, t, &root_pub),
+            &event::msg_device_revoked(self.cert_forest()?.as_deref(), device_pubkey, t, &root_pub),
         )?;
         self.append_durable(vec![Event::DeviceRevoked {
             device_pubkey: device_pubkey.to_vec(),
@@ -3814,7 +3841,7 @@ impl Engine {
         let author = self.device_pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_device_authorized(member_pubkey, crate::acl::MEMBER_DEVICE_INDEX, t, &author),
+            &event::msg_device_authorized(self.cert_forest()?.as_deref(), member_pubkey, crate::acl::MEMBER_DEVICE_INDEX, t, &author),
         )?;
         self.append_durable(vec![Event::DeviceAuthorized {
             device_pubkey: member_pubkey.to_vec(),
@@ -3840,7 +3867,7 @@ impl Engine {
         let author = self.device_pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_device_revoked(device_pubkey, t, &author),
+            &event::msg_device_revoked(self.cert_forest()?.as_deref(), device_pubkey, t, &author),
         )?;
         self.append_durable(vec![Event::DeviceRevoked {
             device_pubkey: device_pubkey.to_vec(),
@@ -4025,7 +4052,7 @@ impl Engine {
         let author = self.device_pubkey();
         let sig = crypto::sign_digest(
             &self.device.signing_key,
-            &event::msg_member_tagged(member_pubkey, tag, granted, t, &author),
+            &event::msg_member_tagged(self.cert_forest()?.as_deref(), member_pubkey, tag, granted, t, &author),
         )?;
         self.append_durable(vec![Event::MemberTagged {
             member_pubkey: member_pubkey.to_vec(),
@@ -4195,8 +4222,16 @@ impl Engine {
                 }
             }
         }
+        // PVOS D192 — authority events must be signed for this forest once it
+        // binds its certificates, including after a binding earlier in this
+        // same batch: replay folds that binding first, so the commit must too.
+        let mut bound = projection::certs_bound(&self.conn)?.is_some();
         for ev in &events {
-            ev.verify_sig()?;
+            let ctx = crate::event::SigContext {
+                forest_id: &self.identity.forest_id,
+                bound: bound && projection::is_authority_event(ev),
+            };
+            ev.verify_sig(&ctx)?;
             match ev {
                 // Device certs follow the root-or-admin rule (doc 09 §2.2), where
                 // "root" is the current lineage root (doc 15 §C2).
@@ -4208,6 +4243,17 @@ impl Engine {
                         ev.author(),
                         now_ms(),
                     )?;
+                }
+                // PVOS D192 — the root or an admin device binds the forest.
+                Event::CertificatesBound { .. } => {
+                    projection::check_device_cert(
+                        &self.conn,
+                        &root,
+                        &self.identity.root_node_id,
+                        ev.author(),
+                        now_ms(),
+                    )?;
+                    bound = true;
                 }
                 // Root rotation: current root or a registered recovery key (§C2).
                 Event::RootRotated { author, .. } => {
@@ -5806,7 +5852,7 @@ impl Engine {
         crate::acl::validate_tag(tag)?;
         self.require_active_member(author_pub, "tag member")?;
         let t = now_ms();
-        let digest = event::msg_member_tagged(member_pubkey, tag, granted, t, author_pub);
+        let digest = event::msg_member_tagged(self.cert_forest()?.as_deref(), member_pubkey, tag, granted, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(member_pubkey),
             events: vec![PreparedEvent {
@@ -5840,7 +5886,7 @@ impl Engine {
         }
         let t = now_ms();
         let idx = crate::acl::MEMBER_DEVICE_INDEX;
-        let digest = event::msg_device_authorized(member_pubkey, idx, t, author_pub);
+        let digest = event::msg_device_authorized(self.cert_forest()?.as_deref(), member_pubkey, idx, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(member_pubkey),
             events: vec![PreparedEvent {
@@ -5877,7 +5923,7 @@ impl Engine {
         }
         let t = now_ms();
         let idx = crate::acl::IDENTITY_DEVICE_INDEX;
-        let digest = event::msg_device_authorized(identity_pubkey, idx, t, author_pub);
+        let digest = event::msg_device_authorized(self.cert_forest()?.as_deref(), identity_pubkey, idx, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(identity_pubkey),
             events: vec![PreparedEvent {
@@ -6156,8 +6202,8 @@ impl Engine {
         }
         let t = now_ms();
         let idx = crate::acl::IDENTITY_DEVICE_INDEX;
-        let revoke_digest = event::msg_device_revoked(old_pub, t, author_pub);
-        let admit_digest = event::msg_device_authorized(new_pub, idx, t, author_pub);
+        let revoke_digest = event::msg_device_revoked(self.cert_forest()?.as_deref(), old_pub, t, author_pub);
+        let admit_digest = event::msg_device_authorized(self.cert_forest()?.as_deref(), new_pub, idx, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(new_pub),
             events: vec![
@@ -6218,7 +6264,7 @@ impl Engine {
             if member == old_pub {
                 continue; // never re-grant the replaced key its own memberships
             }
-            let digest = event::msg_member_tagged(&member, &tag, true, t, new_pub);
+            let digest = event::msg_member_tagged(self.cert_forest()?.as_deref(), &member, &tag, true, t, new_pub);
             events.push(PreparedEvent {
                 digest,
                 event: Event::MemberTagged {
@@ -6282,6 +6328,54 @@ impl Engine {
         })
     }
 
+    /// PVOS D192 — Phase 1: an unsigned `CertificatesBound` for `author_pub`,
+    /// which must be the current root or hold admin on the forest root
+    /// (re-checked at commit and replay). A bound forest is refused: there is
+    /// nothing to bind.
+    pub fn prepare_bind_certificates(&self, author_pub: &[u8]) -> Result<PreparedWrite> {
+        if let Some(since) = projection::certs_bound(&self.conn)? {
+            return Err(PvfsError::AlreadyExists {
+                kind: "certificate binding",
+                id: format!("{} (bound since {since})", self.identity.forest_id),
+            });
+        }
+        if author_pub != self.current_root()?.as_slice() {
+            self.require_admin_on_root(author_pub, "bind certificates")?;
+        }
+        let t = now_ms();
+        let digest = event::msg_certs_bound(&self.identity.forest_id, t, author_pub);
+        Ok(PreparedWrite {
+            result_id: self.identity.forest_id.clone(),
+            events: vec![PreparedEvent {
+                digest,
+                event: Event::CertificatesBound { at: t, author: author_pub.to_vec(), sig: Vec::new() },
+            }],
+        })
+    }
+
+    /// PVOS D192 — bind this forest's certificates with this box's device key
+    /// (admin on the forest root). `Ok(false)`: it was bound already.
+    pub fn bind_certificates(&mut self) -> Result<bool> {
+        if projection::certs_bound(&self.conn)?.is_some() {
+            return Ok(false);
+        }
+        self.require_local_admin("bind certificates")?;
+        let t = now_ms();
+        let author = self.device_pubkey();
+        let sig = crypto::sign_digest(
+            &self.device.signing_key,
+            &event::msg_certs_bound(&self.identity.forest_id, t, &author),
+        )?;
+        self.append_durable(vec![Event::CertificatesBound { at: t, author, sig }])?;
+        Ok(true)
+    }
+
+    /// PVOS D192 — `genesis` (born bound), the seq of the forest's
+    /// `CertificatesBound`, or `None`: not bound.
+    pub fn certificates_bound(&self) -> Result<Option<String>> {
+        projection::certs_bound(&self.conn)
+    }
+
     /// Phase 1: build an unsigned `DeviceRevoked`. The author must hold admin on root.
     pub fn prepare_revoke(
         &self,
@@ -6296,7 +6390,7 @@ impl Engine {
             });
         }
         let t = now_ms();
-        let digest = event::msg_device_revoked(device_pubkey, t, author_pub);
+        let digest = event::msg_device_revoked(self.cert_forest()?.as_deref(), device_pubkey, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(device_pubkey),
             events: vec![PreparedEvent {
@@ -6331,7 +6425,7 @@ impl Engine {
             });
         }
         let t = now_ms();
-        let digest = event::msg_root_rotated(new_root_pubkey, t, author_pub);
+        let digest = event::msg_root_rotated(self.cert_forest()?.as_deref(), new_root_pubkey, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(new_root_pubkey),
             events: vec![PreparedEvent {
@@ -6363,7 +6457,7 @@ impl Engine {
             });
         }
         let t = now_ms();
-        let digest = event::msg_recovery_key_registered(recovery_pubkey, t, author_pub);
+        let digest = event::msg_recovery_key_registered(self.cert_forest()?.as_deref(), recovery_pubkey, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(recovery_pubkey),
             events: vec![PreparedEvent {
@@ -6400,7 +6494,7 @@ impl Engine {
             });
         }
         let t = now_ms();
-        let digest = event::msg_recovery_key_revoked(recovery_pubkey, t, author_pub);
+        let digest = event::msg_recovery_key_revoked(self.cert_forest()?.as_deref(), recovery_pubkey, t, author_pub);
         Ok(PreparedWrite {
             result_id: hex::encode(recovery_pubkey),
             events: vec![PreparedEvent {

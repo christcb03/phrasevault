@@ -239,7 +239,7 @@ fn region_claims_sign_a_replicas_newest_published_heads() {
     let claims = r.region_claims(&author, |d| crypto::sign_digest(&s.holder, d)).unwrap();
     assert_eq!(claims.iter().map(|c| (c.region.as_str(), c.seq)).collect::<Vec<_>>(), vec![(s.far.as_str(), 1)]);
     let ev = Event::decode(event::K_SUB_REGION_HEAD, &claims[0].body).unwrap();
-    ev.verify_sig().unwrap();
+    ev.verify_sig(&event::SigContext { forest_id: "any", bound: false }).unwrap(); // a region head: no forest authority
     match ev {
         Event::SubRegionHead { node_id, head_seq, head_hash, author: a, .. } => {
             assert_eq!((node_id.as_str(), head_seq, a.as_slice()), (s.far.as_str(), 1, author.as_slice()));
