@@ -922,6 +922,21 @@ impl Engine {
         Ok(n != 0)
     }
 
+    /// PVOS D188 — true when `pubkey` is a DEVICE key (not a member key) the
+    /// forest has revoked: a retired owner's, after a promotion.
+    pub fn is_revoked_device(&self, pubkey: &[u8]) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1
+                   AND revoked_at IS NOT NULL AND device_index != ?2)",
+                params![pubkey, crate::acl::MEMBER_DEVICE_INDEX as i64],
+                |r| r.get(0),
+            )
+            .map_err(map_db("revoked device check"))?;
+        Ok(n != 0)
+    }
+
     /// True for a replica forest (local writes refused).
     pub fn is_replica(&self) -> bool {
         self.replica
@@ -1322,6 +1337,12 @@ impl Engine {
 
     /// Graceful close — sets the clean-shutdown flag (spec §9.3).
     pub fn close(mut self) -> Result<()> {
+        // PVOS D188 — a read view (`open_read_view`) is born closed: its
+        // shutdown bookkeeping belongs to the writer, and it may write nothing
+        // (no head commits, no flag). Closing one is dropping it.
+        if self.closed {
+            return Ok(());
+        }
         // P7.2a: leave every region head attested at rest (doc 20 §2.3).
         // Best-effort — closing must succeed even if a head can't author.
         if !self.replica {

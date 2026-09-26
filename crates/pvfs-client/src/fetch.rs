@@ -1689,6 +1689,15 @@ pub fn catalog_endpoints(engine: &Engine) -> std::collections::HashMap<String, S
     let Some(fleet) = step(&root, FLEET_DIR) else { return out };
     let Some(eps) = step(&fleet, ENDPOINTS_DIR) else { return out };
     for c in engine.children(&eps).unwrap_or_default() {
+        // PVOS D188 — a record written by a device key the forest has since
+        // revoked is a retired box's (a promotion revokes the old owner's
+        // device): every box dialed it each pass and the owner paged "peer
+        // down" for it forever. Only revoked DEVICE keys — a follower
+        // announces with its member key, which this never hides, so a
+        // changed identity cannot make a live box disappear.
+        if engine.is_revoked_device(&c.node.author).unwrap_or(false) {
+            continue;
+        }
         if let Ok(addr) = String::from_utf8(c.node.payload) {
             let addr = addr.trim().to_string();
             if !addr.is_empty() {

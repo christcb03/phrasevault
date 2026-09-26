@@ -2229,6 +2229,19 @@ fn mount_survives(m: &MountStatus, plan: &pvfs_core::projection::ProjectionPlan)
             pvfs_client::PROTO_COMPATIBLE_WITH
         ));
     }
+    // PVOS D188 — a mount reads the catalogue at ITS schema. Moving the
+    // catalogue in place still leaves it behind: every fresh open the mount
+    // makes (each read it fetches from another box, each delete or rename it
+    // routes there) refuses a schema newer than it reads. It would list and
+    // read this box's own disks and nothing else until it restarts.
+    if m.schema < pvfs_core::projection::SCHEMA_VERSION {
+        why.push(format!(
+            "it reads catalogue schema v{}, and this build moves the catalogue to v{}: \
+             its reads from other boxes, and deletes and renames routed there, would fail",
+            m.schema,
+            pvfs_core::projection::SCHEMA_VERSION
+        ));
+    }
     match plan {
         ProjectionPlan::Rebuild { from, why: w } => why.push(format!(
             "the catalogue would be rebuilt from the log (v{from}: {w}), emptying under the mount"
@@ -2451,6 +2464,35 @@ fn try_daemon_socket(state_dir: &std::path::Path) -> Option<PathBuf> {
         Some(sock)
     } else {
         None
+    }
+}
+
+/// PVOS D188 — open the forest for a command that only READS it. While its
+/// daemon runs, a read view: a read-only connection with none of a full
+/// open's writes — no writer lock, no startup fold, no clean-shutdown flip,
+/// and no region-head commit on close (which an owner holding regions would
+/// otherwise make from this second process). The Home Assistant page runs
+/// these every minute on the owner. With no daemon — or where a view cannot
+/// open (a replica holds no device key) — the full open, as before.
+fn open_for_reading(state_dir: &std::path::Path) -> Result<Engine, PvfsError> {
+    if try_daemon_socket(state_dir).is_some() {
+        if let Ok(view) = Engine::open_read_view(state_dir) {
+            return Ok(view);
+        }
+    }
+    Engine::open(state_dir)
+}
+
+/// [`engine_and_node`] for a command that only reads ([`open_for_reading`]).
+fn engine_and_node_reading(
+    ctx: Result<PathBuf, PvfsError>,
+    target: &str,
+) -> Result<(Engine, String), PvfsError> {
+    if is_node_id(target) {
+        let dir = ctx?;
+        Ok((open_for_reading(&dir)?, target.to_string()))
+    } else {
+        engine_and_node(ctx, target)
     }
 }
 
@@ -2846,7 +2888,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             engine.close()
         }
         Cmd::Info => {
-            let engine = Engine::open(&ctx?)?;
+            let engine = open_for_reading(&ctx?)?;
             if json {
                 println!(
                     "{{\"instance_id\":\"{}\",\"forest_id\":\"{}\",\"root_node_id\":\"{}\",\"device_pubkey\":\"{}\"}}",
@@ -6687,7 +6729,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             Ok(())
         }
         Cmd::View(cmd) => {
-            let engine = Engine::open(&ctx?)?;
+            let engine = open_for_reading(&ctx?)?;
             let entries = match &cmd {
                 ViewCmd::Ls { dir } => engine.merged_view(dir.as_deref().unwrap_or(""))?,
                 ViewCmd::Conflicts => engine.view_conflicts()?,
@@ -6878,7 +6920,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     engine.close()
                 }
                 RegionCmd::Entries { target } => {
-                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    let (engine, id) = engine_and_node_reading(ctx, &target)?;
                     if !engine.is_catalogue_region(&id)? {
                         return Err(PvfsError::BadInput {
                             field: "target".into(),
@@ -6928,7 +6970,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     engine.close()
                 }
                 RegionCmd::Ls { target: None } => {
-                    let engine = Engine::open(&ctx?)?;
+                    let engine = open_for_reading(&ctx?)?;
                     let regions = engine.regions()?;
                     // D129: what this box holds of each catalogue region.
                     let status: std::collections::HashMap<String, pvfs_core::CatalogueStatus> = engine
@@ -7436,7 +7478,20 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 .is_some_and(|(_, _, p)| p.as_slice() == ver_json.as_bytes());
             // Convergence-friendly: an unchanged record is a NO-OP — a
             // scheduled re-run must not churn the log.
-            if !retract {
+            // PVOS D188 — a record whose author the forest has revoked (a
+            // retired device) is hidden from every fetcher
+            // (`catalog_endpoints`): write it anew as this box's current key
+            // even when nothing in it changed — an owner that replaced its
+            // device key must not stay invisible.
+            let existing_hidden = match (&eps, &existing) {
+                (Some((eps_id, _, _)), Some(_)) => engine
+                    .children(eps_id)?
+                    .into_iter()
+                    .find(|c| c.label == pin)
+                    .is_some_and(|c| engine.is_revoked_device(&c.node.author).unwrap_or(false)),
+                _ => false,
+            };
+            if !retract && !existing_hidden {
                 // Both halves, or neither. After an upgrade the ADDRESS is
                 // unchanged and the VERSION is not — returning early on the
                 // address alone would leave the catalog claiming this box still
@@ -9793,6 +9848,9 @@ fn serve_status_print(
     let (runner, jobs, conflicts, stale, capacity, trash, stores) =
         (st.runner, st.jobs, st.conflicts, st.stale, st.capacity, st.trash, st.stores);
     let (log, fenced) = (st.log, st.fenced);
+    // PVOS D188 — the owner's own row on the Home Assistant page reads these
+    // from here (a peer's come through the health record, in the same shape).
+    let (mounts, backup) = (st.mounts, st.backup);
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -9812,7 +9870,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -9822,6 +9880,8 @@ fn serve_status_print(
             serde_json::to_string(&stores).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&log).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&fenced).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&backup).unwrap_or_else(|_| "null".into()),
         );
     } else {
         // PVOS D182 — first, because nothing else matters while it holds.
@@ -10466,7 +10526,16 @@ mod tests {
         let current = ProjectionPlan::Current { version: pvfs_core::projection::SCHEMA_VERSION };
         let in_place = ProjectionPlan::InPlace { from: 18, steps: vec!["x"] };
         assert!(mount_survives(&same, &current).is_empty());
-        assert!(mount_survives(&same, &in_place).is_empty(), "an additive migration runs under it");
+        assert!(
+            mount_survives(&same, &in_place).is_empty(),
+            "an additive migration runs under a mount that already reads its schema"
+        );
+        // PVOS D188: a mount on the old schema does NOT survive an in-place
+        // migration — its fresh opens would refuse the moved catalogue.
+        let old_schema = MountStatus { schema: pvfs_core::projection::SCHEMA_VERSION - 1, ..same.clone() };
+        let why = mount_survives(&old_schema, &in_place);
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("schema") && why[0].contains("other boxes"), "{why:?}");
         let rebuild = ProjectionPlan::Rebuild { from: 1, why: "no in-place step from v1".into() };
         assert!(mount_survives(&same, &rebuild)[0].contains("rebuilt"));
         assert!(mount_survives(&same, &ProjectionPlan::Newer { found: 99 })[0].contains("newer"));
