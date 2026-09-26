@@ -28,7 +28,7 @@ use pvfs_core::{
 use pvfs_proto::{
     auth_digest, read_data_frame, read_frame, read_msg, write_data_frame, write_msg, ChildInfo,
     ClientMsg,
-    IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, WriteOp,
+    IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, SignedEventWire, WriteOp,
     DATA_CHUNK, PROTO_VERSION,
 };
 use rand::RngCore;
@@ -964,6 +964,12 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
         ),
         ClientMsg::PrepareWrite { op, tip } => do_prepare_write(daemon, principal, op, tip.map(|b| *b), conn),
         ClientMsg::Commit { prepared_id, sigs } => do_commit(daemon, principal, &prepared_id, sigs),
+        ClientMsg::CommitSigned { .. } if !local && daemon.network_writes_held() => err(
+            "busy",
+            "the owner has just started and hears its followers' logs before it takes a write \
+             (PVOS D182) — try again in a few seconds",
+        ),
+        ClientMsg::CommitSigned { events } => do_commit_signed(daemon, principal, events),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
         ClientMsg::ChunkManifest { node } => {
             let e = daemon.reader();
@@ -2850,6 +2856,51 @@ fn do_prepare_write(
         prepared_id,
         preimages,
         result_id,
+    }
+}
+
+/// PVOS D193 — commit events their authors signed elsewhere (a person's
+/// session certificate, signed in their browser and delivered by the box that
+/// hosts their forest). The deliverer must be authenticated but needs no
+/// authority of its own: every event is verified exactly as its author's own
+/// commit would be — signature, authority, ACL — in one atomic append.
+fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEventWire>) -> ServerMsg {
+    if !matches!(principal, Principal::Key(_)) {
+        return err("forbidden", "delivering signed events requires an authenticated connection");
+    }
+    if wire.is_empty() || wire.len() > 64 {
+        return err("bad_input", "deliver between 1 and 64 signed events");
+    }
+    let mut events = Vec::with_capacity(wire.len());
+    for w in wire {
+        let Ok(body) = hex::decode(&w.body) else {
+            return err("bad_input", "event body not hex");
+        };
+        match pvfs_core::event::Event::decode(&w.kind, &body) {
+            // An event this binary cannot read cannot have its signature
+            // checked (D72) — never "verified" by being unknown.
+            Ok(pvfs_core::event::Event::Unknown { kind, .. }) => {
+                return err("bad_input", &format!("unknown event kind {kind:?}"));
+            }
+            Ok(ev) => events.push(ev),
+            Err(pve) => return err_from(pve),
+        }
+    }
+    let mut e = daemon.engine.lock().unwrap();
+    // The same bounded Busy retry as a two-phase commit (see do_commit).
+    let mut attempt = 0;
+    let outcome = loop {
+        match e.commit_member_write(events.clone()) {
+            Err(PvfsError::Busy { .. }) if attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+            }
+            other => break other,
+        }
+    };
+    match outcome {
+        Ok(()) => ServerMsg::Committed { id: String::new() },
+        Err(pve) => err_from(pve),
     }
 }
 

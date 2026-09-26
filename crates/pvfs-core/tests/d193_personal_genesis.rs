@@ -7,8 +7,8 @@
 
 use pvfs_core::acl::{Principal, ACL_A, ACL_R, ACL_W};
 use pvfs_core::personal::{
-    init_signed_genesis, prepare_personal_genesis, prepare_personal_genesis_with, GenesisParams, GenesisSigner,
-    PersonalGenesis,
+    init_signed_genesis, prepare_personal_genesis, prepare_personal_genesis_with, session_cert_events, GenesisParams,
+    GenesisSigner, PersonalGenesis, SessionCert,
 };
 use pvfs_core::event::{self, Event};
 use pvfs_core::{crypto, identity, Engine, NodeSpec};
@@ -238,4 +238,41 @@ fn genesis_parameters_are_checked() {
     assert!(with(&|p| p.instance_id = "pvfs-0000000G".into()).is_err(), "instance not hex");
     assert!(with(&|p| p.instance_id = "pvfs-000000001".into()).is_err(), "instance too long");
     assert!(with(&|p| p.created_at = 0).is_err(), "no time");
+}
+
+/// A session certificate from fixed inputs — the digests and the identity's
+/// signatures the web page's tests pin too (it builds these itself at every
+/// sign-in, from the forest its own identity bound at join).
+#[test]
+fn the_session_certificate_the_page_must_build() {
+    let mn = identity::parse_mnemonic(VECTOR).unwrap();
+    let ident = identity::identity_key(&mn, "", 0).unwrap();
+    let cert = SessionCert {
+        forest_id: "00000000-0000-4000-8000-000000000001".into(),
+        root_node_id: "31071f80e0846ec198c1e2327480f4440fecc9a94af5bd92710b87c24331ff80".into(),
+        identity_pub: crypto::pubkey_bytes(&ident),
+        // any key will do as the session's: the vector's encryption key
+        session_pub: hex::decode("03d02843b4ffdfe3ae8a18feb3a9a2e6a4d5cc39150f2e8d9990da1b281355d744").unwrap(),
+        at: 1_700_000_001_000,
+        expires_at: 1_700_000_001_000 + 7 * 24 * 3_600_000,
+    };
+    let prepared = session_cert_events(&cert).unwrap();
+    let got: Vec<(String, String)> = prepared
+        .iter()
+        .map(|p| (hex::encode(p.digest), hex::encode(crypto::sign_digest(&ident, &p.digest).unwrap())))
+        .collect();
+    let pinned = [
+        ("9e0e18bc72ff5cb9639c0022be1244407f0c126ed6fdd38c359f29bb3d3cd2ec", "6456381035a050f64806fc2e20b160d7220c302315a69184d2efe8ff4e8417c31b970d041caaf1c6a26eb8b08e6d822accf7882217fce43602bc1bed76c0df73"), // the session key as a member
+        ("f1dc24e9f0e92b638cfafe03b6662e287cc8885d2ac02c58abcd73c272d196cf", "5d368462b2379aa7843ad1139ae86da76cc7d32e5372ec8a330f71295dfb19762b93437226aeba52ac42fb09c382dd38575f6e09aae352d11e1bccf468b6a2b7"), // rw on the root until expiry
+    ];
+    for ((d, sig), (wd, ws)) in got.iter().zip(pinned) {
+        assert_eq!((d.as_str(), sig.as_str()), (wd, ws));
+    }
+
+    let mut bad = cert.clone();
+    bad.expires_at = bad.at;
+    assert!(session_cert_events(&bad).is_err(), "a grant that never lives");
+    let mut bad = cert.clone();
+    bad.session_pub = bad.identity_pub.clone();
+    assert!(session_cert_events(&bad).is_err(), "the identity as its own session");
 }

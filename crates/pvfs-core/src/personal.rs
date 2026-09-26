@@ -17,14 +17,19 @@
 //! [`init_signed_genesis`] writes the signed events and opens the forest,
 //! which REPLAYS them — every signature and authority checked as any
 //! follower would — before it is kept.
+//!
+//! A sign-in then signs a [`SessionCert`]: the session key admitted as a
+//! member and granted `rw` on the root until the session's grant expires —
+//! built by the signer from structured data, delivered by the box
+//! (`CommitSigned`), and never able to grant, admit or revoke.
 
 use std::path::Path;
 
 use rand::RngCore;
 
-use crate::acl::MEMBER_DEVICE_INDEX;
+use crate::acl::{Principal, ACL_R, ACL_W, MEMBER_DEVICE_INDEX};
 use crate::crypto;
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, PreparedEvent};
 use crate::error::{PvfsError, Result};
 use crate::event::{self, Event};
 use crate::identity::{DeviceKeyCache, SigningKey};
@@ -333,4 +338,77 @@ pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: Signin
         }
     }
     written
+}
+
+/// PVOS D193 — a SESSION CERTIFICATE in a personal forest: the session key
+/// admitted as a member (`DeviceAuthorized`, v2 — this forest only) and
+/// granted `rw` on the forest root until `expires_at` (`AclSet`, v2), both by
+/// the person's identity key, the forest's owner device. What a sign-in
+/// signs: the signer builds these from the fields itself — never from
+/// digests a server hands it — and the box that hosts the forest delivers
+/// them (`CommitSigned`). The session key holds no `a`: it can grant, admit
+/// and revoke nothing.
+#[derive(Clone, Debug)]
+pub struct SessionCert {
+    pub forest_id: String,
+    pub root_node_id: String,
+    pub identity_pub: Vec<u8>,
+    pub session_pub: Vec<u8>,
+    /// When it was signed (ms): both events' time.
+    pub at: u64,
+    /// When the `rw` grant goes inert (ms).
+    pub expires_at: u64,
+}
+
+/// The session certificate's two events, unsigned, each with the digest the
+/// identity signs, in log order.
+pub fn session_cert_events(c: &SessionCert) -> Result<Vec<PreparedEvent>> {
+    let bad = |reason: &str| PvfsError::BadInput { field: "session certificate".into(), reason: reason.into() };
+    crypto::validate_pubkey(&c.identity_pub)?;
+    crypto::validate_pubkey(&c.session_pub)?;
+    if c.identity_pub == c.session_pub {
+        return Err(bad("the session key must not be the identity"));
+    }
+    if c.at == 0 || c.expires_at <= c.at {
+        return Err(bad("a session grant is made at a time and expires after it"));
+    }
+    let key = Principal::Key(c.session_pub.clone());
+    let rights = (ACL_R | ACL_W) as u64;
+    let id = &c.identity_pub;
+    Ok(vec![
+        PreparedEvent {
+            digest: event::msg_device_authorized(Some(&c.forest_id), &c.session_pub, MEMBER_DEVICE_INDEX, c.at, id),
+            event: Event::DeviceAuthorized {
+                device_pubkey: c.session_pub.clone(),
+                device_index: MEMBER_DEVICE_INDEX,
+                authorized_at: c.at,
+                author: id.clone(),
+                sig: Vec::new(),
+            },
+        },
+        PreparedEvent {
+            digest: event::msg_acl_set(&c.root_node_id, key.kind(), key.id(), rights, c.at, c.expires_at, id),
+            event: Event::AclSet {
+                node_id: c.root_node_id.clone(),
+                principal_kind: key.kind(),
+                principal_id: key.id().to_vec(),
+                rights,
+                set_at: c.at,
+                expires_at: c.expires_at,
+                author: id.clone(),
+                sig: Vec::new(),
+            },
+        },
+    ])
+}
+
+/// Attach one signature per prepared event, in order.
+pub fn attach_sigs(prepared: Vec<PreparedEvent>, sigs: Vec<Vec<u8>>) -> Result<Vec<Event>> {
+    if sigs.len() != prepared.len() {
+        return Err(PvfsError::BadInput {
+            field: "signatures".into(),
+            reason: format!("{} signatures for {} events", sigs.len(), prepared.len()),
+        });
+    }
+    Ok(prepared.into_iter().zip(sigs).map(|(p, sig)| with_sig(p.event, sig)).collect())
 }

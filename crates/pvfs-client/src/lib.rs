@@ -954,6 +954,20 @@ impl Client {
         self.write_op(WriteOp::BindCertificates, sign)
     }
 
+    /// PVOS D193 — deliver events their authors signed elsewhere (see
+    /// `ClientMsg::CommitSigned`): each is verified as its author's own
+    /// commit would be, so this connection's key needs no authority.
+    pub fn commit_signed(&mut self, events: &[pvfs_core::event::Event]) -> Result<()> {
+        let events = events
+            .iter()
+            .map(|e| pvfs_proto::SignedEventWire { kind: e.kind().to_string(), body: hex::encode(e.encode_body()) })
+            .collect();
+        match self.request(ClientMsg::CommitSigned { events })? {
+            ServerMsg::Committed { .. } => Ok(()),
+            other => Err(unexpected("Committed", &other)),
+        }
+    }
+
     pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
     where
         F: Fn(&[u8; 32]) -> Vec<u8>,
