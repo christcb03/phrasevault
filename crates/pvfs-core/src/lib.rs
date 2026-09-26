@@ -47,6 +47,7 @@ pub mod log_store;
 pub mod mount;
 pub mod node;
 pub mod orderkey;
+pub mod personal;
 pub mod projection;
 pub mod replica;
 pub mod serve;
