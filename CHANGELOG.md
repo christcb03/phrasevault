@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Serving at the daemon's priority, background below it (PVOS D191).**
+  mediabox's unit lowered the whole daemon (nice 10, best-effort 7): the
+  threads answering the view mount's listings and lookups and other boxes'
+  reads too. And its disk half did nothing there — mq-deadline, the media
+  disks' scheduler, ignores the level inside best-effort. Now the job
+  supervisor (`pvfsd-jobs`) lowers itself before it spawns anything, so
+  every pass and the trash step start below serving, and the hashing pool
+  is built at start with lowered workers (`pvfsd-hash-<n>`; a write's
+  commit hashes there too): nice +10 and the idle disk class, which
+  mq-deadline honours (its 10 s aging keeps an idle request from waiting
+  forever). The listeners and their connection threads keep the unit's
+  priority. Job threads are named `pvfsd-<job>`; `PVFSD_BACKGROUND=normal`
+  keeps background at the daemon's priority.
 - **Before an owner holds regions on a busy box (PVOS D188).** Found reading
   the code for mediabox's move to owner:
   - **A mount left on an older build no longer passes the roll's check.** A
