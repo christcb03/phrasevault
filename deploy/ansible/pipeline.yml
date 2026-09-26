@@ -417,6 +417,36 @@
       environment: "{{ user_systemd_env }}"
       tags: [daemon]
 
+    # PVOS D188 (found in D182's run) — the testbed is shared by every build
+    # slot, and a catalogue only moves forward: after a newer build opened it,
+    # a branch on an older schema refuses it and the stage fails for nothing.
+    # Ask THIS build; a testbed it calls newer is set aside (renamed, kept)
+    # and made again below.
+    - name: Would this build open the daemon test forest?
+      ansible.builtin.command:
+        argv: ["{{ pvfs_user_bin }}/pvfs", --json, --forest, "{{ daemon_mount }}", versions]
+      register: testbed_versions
+      changed_when: false
+      failed_when: false
+      tags: [daemon]
+
+    - name: Set aside a test forest newer than this build (made again below)
+      ansible.builtin.shell: |
+        systemctl --user stop pvfsd@{{ daemon_forest }} || true
+        mv {{ daemon_mount }} {{ daemon_mount }}.newer-schema-$(date +%s)
+      environment: "{{ user_systemd_env }}"
+      when:
+        - testbed_versions.rc == 0
+        - (testbed_versions.stdout | from_json).projection_plan.action | default('') == 'newer'
+      tags: [daemon]
+
+    - name: Ensure the daemon test forest directory exists
+      ansible.builtin.file:
+        path: "{{ daemon_mount }}"
+        state: directory
+        mode: "0755"
+      tags: [daemon]
+
     # A disposable test forest — its recovery phrase lands in the ansible log,
     # which is fine here; never init a real forest this way.
     - name: Initialize the daemon test forest (first run only)
