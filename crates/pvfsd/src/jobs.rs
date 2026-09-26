@@ -952,7 +952,14 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                         eprintln!("pvfsd: catalogue {} head {seq} taken from {from} — provisional until the owner commits it", &region[..8]);
                     }
                     for (region, seq, n) in &rep.fetched {
-                        eprintln!("pvfsd: catalogue {} at head {seq}: {n} rows", &region[..8]);
+                        eprintln!(
+                            "pvfsd: catalogue {} at head {seq}: {} rows (+{} changed {} removed {})",
+                            &region[..8],
+                            n.rows,
+                            n.added,
+                            n.changed,
+                            n.removed
+                        );
                     }
                     for (region, why) in &rep.failed {
                         eprintln!("pvfsd: catalogue {}: {why}", &region[..8]);

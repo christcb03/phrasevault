@@ -16,8 +16,9 @@ use crate::ClientError;
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CatalogueReport {
-    /// `(region, head seq installed, rows)`.
-    pub fetched: Vec<(String, u64, usize)>,
+    /// `(region, head seq installed, what the install wrote)` — the rows,
+    /// and since PVOS D194 how many were added, changed and removed.
+    pub fetched: Vec<(String, u64, pvfs_core::SnapshotInstall)>,
     /// Regions still behind after the pass: `(region, why)` — no endpoint
     /// held the manifest, or every dial failed.
     pub failed: Vec<(String, String)>,
@@ -137,7 +138,7 @@ pub fn fetch_pass_on(
                 }
             };
             match client.region_manifest(&region, seq) {
-                Ok(bytes) => match engine.install_region_snapshot(&region, seq, &bytes, addr) {
+                Ok(bytes) => match engine.install_region_snapshot_delta(&region, seq, &bytes, addr) {
                     Ok(n) => {
                         report.fetched.push((region.clone(), seq, n));
                         done = true;

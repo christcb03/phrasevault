@@ -405,6 +405,97 @@ pub struct RegionSnapshot {
     pub published_at: u64,
 }
 
+/// PVOS D194 — what installing a fetched catalogue snapshot wrote: the
+/// manifest's row count, and the rows added, changed and removed to get
+/// there. Every other row was left as it was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotInstall {
+    pub rows: usize,
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+}
+
+/// D194 — the columns of a held row that an install writes, as stored.
+#[derive(Debug)]
+struct HeldRow {
+    kind: String,
+    size_bytes: i64,
+    mtime_ms: i64,
+    changed_ms: i64,
+    content_hash: Option<String>,
+    quality: Option<String>,
+}
+
+impl HeldRow {
+    /// Already what the manifest's row would write.
+    fn is(&self, r: &RegionEntry) -> bool {
+        self.kind == r.kind
+            && self.size_bytes == r.size_bytes as i64
+            && self.mtime_ms == r.mtime_ms as i64
+            && self.changed_ms == r.changed_ms as i64
+            && self.content_hash == r.content_hash
+            && self.quality == r.quality
+    }
+}
+
+/// D194 — the writes that turn the rows held into a manifest's: its rows
+/// with no row here, its rows whose row here differs, and the paths held
+/// that it does not list.
+struct SnapshotDelta<'a> {
+    added: Vec<&'a RegionEntry>,
+    changed: Vec<&'a RegionEntry>,
+    removed: Vec<String>,
+}
+
+impl<'a> SnapshotDelta<'a> {
+    fn of(mut held: HashMap<String, HeldRow>, rows: &'a [RegionEntry]) -> Self {
+        let (mut added, mut changed) = (Vec::new(), Vec::new());
+        for r in rows {
+            match held.remove(r.rel_path.as_str()) {
+                None => added.push(r),
+                Some(h) if !h.is(r) => changed.push(r),
+                Some(_) => {}
+            }
+        }
+        SnapshotDelta { added, changed, removed: held.into_keys().collect() }
+    }
+}
+
+/// D194 — every row held for `region`, by path.
+fn held_region_rows(conn: &rusqlite::Connection, region: &NodeId) -> Result<HashMap<String, HeldRow>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT rel_path, kind, size_bytes, mtime_ms, changed_ms, content_hash, quality
+               FROM region_entries WHERE region_id = ?1",
+        )
+        .map_err(map_db("install snapshot: read"))?;
+    let rows = stmt
+        .query_map(params![region], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                HeldRow {
+                    kind: r.get(1)?,
+                    size_bytes: r.get(2)?,
+                    mtime_ms: r.get(3)?,
+                    changed_ms: r.get(4)?,
+                    content_hash: r.get(5)?,
+                    quality: r.get(6)?,
+                },
+            ))
+        })
+        .map_err(map_db("install snapshot: read"))?;
+    rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+        .map_err(map_db("install snapshot: read"))
+}
+
+/// D194 — SQLite's `data_version`: it moves whenever ANOTHER connection
+/// commits to the main database, never for this connection's own writes.
+fn data_version(conn: &rusqlite::Connection) -> Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get(0))
+        .map_err(map_db("install snapshot: data version"))
+}
+
 /// One catalogue row on its way to `region_entries` (D125):
 /// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
 type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
@@ -1821,10 +1912,11 @@ impl Engine {
     /// region is a catalogue region; this box does not bind it (its own rows
     /// are the authority — a fetched copy never overwrites a live catalogue);
     /// `seq` is the log's attested head (only the head is installable);
-    /// `blake3(bytes)` is the attested hash; the bytes parse and name this
-    /// region and seq. Then, in one transaction, the region's rows are
-    /// replaced and `region_fetched` records what is held. Returns the row
-    /// count.
+    /// `blake3(bytes)` is the attested hash; the bytes parse, name this
+    /// region and seq, and list each path once. Then, in one transaction,
+    /// the region's rows become the manifest's — writing only the rows that
+    /// differ (PVOS D194) — and `region_fetched` records what is held.
+    /// Returns the row count.
     pub fn install_region_snapshot(
         &mut self,
         region: &NodeId,
@@ -1832,6 +1924,33 @@ impl Engine {
         bytes: &[u8],
         source: &str,
     ) -> Result<usize> {
+        self.install_region_snapshot_delta(region, seq, bytes, source)
+            .map(|i| i.rows)
+    }
+
+    /// PVOS D194 — [`Engine::install_region_snapshot`], saying what it wrote.
+    pub fn install_region_snapshot_delta(
+        &mut self,
+        region: &NodeId,
+        seq: u64,
+        bytes: &[u8],
+        source: &str,
+    ) -> Result<SnapshotInstall> {
+        self.install_region_snapshot_with(region, seq, bytes, source, || {})
+    }
+
+    /// The install, running `between` after the rows are read and before
+    /// the write lock is taken: where a test commits on another connection,
+    /// to see the install notice (D194).
+    #[doc(hidden)]
+    pub fn install_region_snapshot_with(
+        &mut self,
+        region: &NodeId,
+        seq: u64,
+        bytes: &[u8],
+        source: &str,
+        between: impl FnOnce(),
+    ) -> Result<SnapshotInstall> {
         if !self.is_catalogue_region(region)? {
             return Err(bad("catalogue", "not a catalogue region"));
         }
@@ -1879,24 +1998,62 @@ impl Engine {
         if &named != region || named_seq != seq {
             return Err(bad("catalogue", "manifest names another region or seq"));
         }
+        // D194 — each path once: the delta goes by path, and the region's
+        // key could not hold a second row for one anyway.
+        let mut paths: HashSet<&str> = HashSet::with_capacity(rows.len());
+        if let Some(twice) = rows.iter().find(|r| !paths.insert(r.rel_path.as_str())) {
+            return Err(bad("catalogue", &format!("the manifest lists {} twice", twice.rel_path)));
+        }
+        // D194 — what to write comes from the rows held, read without the
+        // write lock, and the database's version as of that read. Until
+        // D194 the install deleted every row and inserted the manifest's:
+        // ≈59,000 row writes on the NAS for a head that moved two rows of
+        // mediabox-local (2026-09-26), longer than the 15 s the daemon's
+        // other writers wait (D141), so the watch, the follow or the receive
+        // lost its pass.
+        let (version, held) = {
+            let tx = self.conn.transaction().map_err(map_db("install snapshot: read"))?;
+            let version = data_version(&tx)?;
+            let held = held_region_rows(&tx, region)?;
+            tx.commit().map_err(map_db("install snapshot: read"))?;
+            (version, held)
+        };
+        let mut delta = SnapshotDelta::of(held, &rows);
+        between();
         let now = now_ms() as i64;
-        let tx = self.conn.transaction().map_err(map_db("install snapshot"))?;
-        tx.execute("DELETE FROM region_entries WHERE region_id = ?1", params![region])
-            .map_err(map_db("install snapshot: clear"))?;
-        // D141 — one prepared statement for the whole snapshot. Parsing the
-        // INSERT 30 000 times held the owner's index for seconds on every
-        // head bump, and every routed write behind it hit SQLITE_BUSY.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_db("install snapshot"))?;
+        // Another connection committed since the read: read again, under the
+        // lock, so the delta is against exactly what is there.
+        if data_version(&tx)? != version {
+            delta = SnapshotDelta::of(held_region_rows(&tx, region)?, &rows);
+        }
         {
-            let mut ins = tx
+            let mut del = tx
+                .prepare_cached("DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2")
+                .map_err(map_db("install snapshot: prepare"))?;
+            for rel in &delta.removed {
+                del.execute(params![region, rel])
+                    .map_err(map_db("install snapshot: remove"))?;
+            }
+            // D141 — one prepared statement for every row written.
+            let mut put = tx
                 .prepare_cached(
                     "INSERT INTO region_entries
                        (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
                         content_hash, quality, seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(region_id, rel_path) DO UPDATE SET
+                       kind = excluded.kind, size_bytes = excluded.size_bytes,
+                       mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
+                       content_hash = excluded.content_hash, quality = excluded.quality,
+                       seen_at = excluded.seen_at",
                 )
                 .map_err(map_db("install snapshot: prepare"))?;
-            for r in &rows {
-                ins.execute(params![
+            for r in delta.added.iter().chain(&delta.changed) {
+                put.execute(params![
                     region,
                     r.rel_path,
                     r.kind,
@@ -1921,7 +2078,12 @@ impl Engine {
         )
         .map_err(map_db("install snapshot: record"))?;
         tx.commit().map_err(map_db("install snapshot"))?;
-        Ok(rows.len())
+        Ok(SnapshotInstall {
+            rows: rows.len(),
+            added: delta.added.len(),
+            changed: delta.changed.len(),
+            removed: delta.removed.len(),
+        })
     }
 
     /// D129 — does THIS box catalogue `region` (so its rows are live and
