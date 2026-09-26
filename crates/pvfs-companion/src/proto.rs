@@ -28,11 +28,30 @@ use serde::{Deserialize, Serialize};
 /// it; a key no phrase holds is refused (`no_such_key`), never substituted.
 /// A request without one goes to the default phrase, so v3 clients work
 /// unchanged. [`AgentRequest::ListKeys`] lists the phrases' public keys.
+/// A request may also carry a top-level [`FOREST_FIELD`] ([`ForestRef`]):
+/// the forest it is for, recorded in the answering phrase's ledger — never
+/// used to route or to authorize. [`AgentRequest::LinkForest`] records one
+/// without signing anything.
 pub const API_VERSION: u32 = 4;
 
 /// PVOS D189 — the optional top-level field of a request that selects the
 /// phrase: a public key (hex) one of the companion's phrases holds.
 pub const KEY_FIELD: &str = "key";
+
+/// PVOS D189 — the optional top-level field naming the forest a request is
+/// for ([`ForestRef`]). What the requesting tool says: shown and recorded,
+/// never trusted for routing or authority.
+pub const FOREST_FIELD: &str = "forest";
+
+/// PVOS D189 — the forest a request is for, as the requesting tool names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForestRef {
+    /// The forest's id (a UUID).
+    pub id: String,
+    /// Its alias on the requesting box, else its directory.
+    #[serde(default)]
+    pub label: String,
+}
 
 /// Domain prefix for the relay envelope signature: the paired server signs
 /// `domain_digest(RELAY_DOMAIN, payload_json_bytes)`.
@@ -146,6 +165,11 @@ pub enum AgentRequest {
     RevokePairing { name: String },
     /// PVOS D189 (v4): the phrases this companion holds — public keys only.
     ListKeys,
+    /// PVOS D189 (v4): record that the forest in [`FOREST_FIELD`] uses the key
+    /// in [`KEY_FIELD`] — a forest made before the companion recorded forests.
+    /// Answered by the router from public keys: no unlock, no prompt, and a
+    /// key no phrase holds is refused (`no_such_key`).
+    LinkForest,
 }
 
 /// PVOS D189 — one phrase the companion holds, as `list_keys` reports it.
@@ -162,6 +186,9 @@ pub struct KeyInfo {
     pub encryption: String,
     /// Dropped from memory now (it re-unlocks on use).
     pub locked: bool,
+    /// The vault file (its ledger, pairings, origins and audit sit beside it).
+    #[serde(default)]
+    pub path: String,
 }
 
 /// The agent's reply.

@@ -125,6 +125,41 @@ enum Cmd {
         #[arg(long)]
         vault: Option<PathBuf>,
     },
+    /// PVOS D189 — the recovery phrases this companion holds and what each is
+    /// used for: its public keys, the forests that used them (recorded as
+    /// tools use them, or linked), the servers paired with it, the web origins
+    /// it signs in to, and the approvals and root signatures it has given.
+    /// Public data only. `link` records a forest made before the companion
+    /// kept a ledger.
+    Keys {
+        #[command(subcommand)]
+        cmd: Option<KeysCmd>,
+        /// Machine-readable output (the Mac app's settings read it)
+        #[arg(long)]
+        json: bool,
+        /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Record that a forest uses one of this companion's keys — a forest this
+    /// phrase roots, made before the ledger existed. Asks for what it needs;
+    /// refused unless a phrase here holds the key. `pvfs --json forest tip
+    /// <forest dir>`, on a box that has the forest, prints its id and root.
+    Link {
+        /// The key (hex) — the forest's current root
+        #[arg(long)]
+        key: Option<String>,
+        /// The forest's id
+        #[arg(long)]
+        forest_id: Option<String>,
+        /// The name to show for it
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -428,6 +463,7 @@ fn run() -> Result<(), String> {
         Cmd::Status { vault, socket } => run_status(vault, socket),
         Cmd::Origins { cmd, vault } => run_origins(cmd, vault),
         Cmd::Pairings { cmd, vault } => run_pairings(cmd, vault),
+        Cmd::Keys { cmd, json, socket } => run_keys(cmd, json, socket),
         Cmd::TenantInit { store, user } => {
             let pass = passphrase()?;
             let phrase = read_phrase()?;
@@ -545,7 +581,8 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         // password, a missing keychain item) is left out, said, and the
         // companion serves the rest rather than none.
         let slot = vault_agent(v, policy, prompter, idle, rate_limit)
-            .and_then(|agent| pvfs_companion::router::Slot::new(name.clone(), agent));
+            .and_then(|agent| pvfs_companion::router::Slot::new(name.clone(), agent))
+            .map(|slot| slot.with_vault_path(v));
         match slot {
             Ok(slot) => {
                 audits.push(v.with_extension("audit.jsonl"));
@@ -847,6 +884,337 @@ fn run_pairings(cmd: Option<PairingsCmd>, vault: Option<PathBuf>) -> Result<(), 
             } else {
                 Err(format!("{url} was not trusted for {name}"))
             }
+        }
+    }
+}
+
+// ---- PVOS D189: `keys` — what each phrase is used for ----------------------
+
+#[derive(serde::Serialize)]
+struct KeysReport {
+    /// `running`, `not running`, or `older` (a companion before `list_keys`).
+    agent: String,
+    phrases: Vec<PhraseReport>,
+}
+
+#[derive(serde::Serialize)]
+struct PhraseReport {
+    vault: String,
+    path: String,
+    is_default: bool,
+    /// Served by the running companion (its keys are known).
+    served: bool,
+    sealing: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<PublicKeys>,
+    forests: Vec<pvfs_companion::ledger::ForestUse>,
+    pairings: Vec<PairingRow>,
+    origins: Vec<OriginRow>,
+    approvals: Vec<ApprovalRow>,
+    root_signatures: Vec<RootSignature>,
+}
+
+#[derive(serde::Serialize)]
+struct PublicKeys {
+    root: String,
+    identity: String,
+    encryption: String,
+}
+
+#[derive(serde::Serialize)]
+struct PairingRow {
+    name: String,
+    server_pubkey: String,
+    created_ms: u64,
+    origins: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct OriginRow {
+    origin: String,
+    expires_ms: u64,
+}
+
+/// Approved signatures of one kind for one app or server, from the audit log.
+#[derive(serde::Serialize)]
+struct ApprovalRow {
+    kind: String,
+    who: String,
+    action: String,
+    count: u64,
+    last_ms: u64,
+}
+
+/// One approved root signature — a device admitted or revoked, a promotion.
+#[derive(serde::Serialize)]
+struct RootSignature {
+    summary: String,
+    at_ms: u64,
+}
+
+fn run_keys(cmd: Option<KeysCmd>, json: bool, socket: Option<PathBuf>) -> Result<(), String> {
+    let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
+    if let Some(KeysCmd::Link { key, forest_id, label }) = cmd {
+        return run_keys_link(&socket, key, forest_id, label);
+    }
+    let report = keys_report(&socket)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    } else {
+        print_keys(&report);
+    }
+    Ok(())
+}
+
+fn run_keys_link(
+    socket: &std::path::Path,
+    key: Option<String>,
+    forest_id: Option<String>,
+    label: Option<String>,
+) -> Result<(), String> {
+    let key = match key {
+        Some(k) => k,
+        None => ask_line("The forest's root key (hex, from `pvfs --json forest tip <dir>`)")?,
+    };
+    let key = hex::decode(key.trim()).map_err(|_| "the key must be hex".to_string())?;
+    let id = match forest_id {
+        Some(f) => f,
+        None => ask_line("The forest's id")?,
+    };
+    let label = match label {
+        Some(l) => l,
+        None => ask_line("A name to show for it")?,
+    };
+    let forest = pvfs_companion::ForestRef { id: id.trim().to_string(), label: label.trim().to_string() };
+    let resp = pvfs_companion::request_routed(
+        socket,
+        &pvfs_companion::AgentRequest::LinkForest,
+        Some(&key),
+        Some(&forest),
+    )
+    .map_err(|e| format!("no companion at {} ({e})", socket.display()))?;
+    match resp {
+        pvfs_companion::AgentResponse::Ok => {
+            eprintln!("pvfs-companion: linked {} ({}) to key {}…", forest.label, forest.id, &hex::encode(&key)[..12]);
+            Ok(())
+        }
+        pvfs_companion::AgentResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+/// One answer on a terminal; a script must pass the flag instead.
+fn ask_line(question: &str) -> Result<String, String> {
+    if !interactive() {
+        return Err(format!("{question}: not given (pass the flag, or run it in a terminal)"));
+    }
+    eprint!("{question}: ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        return Err(format!("{question}: nothing given"));
+    }
+    Ok(line)
+}
+
+fn keys_report(socket: &std::path::Path) -> Result<KeysReport, String> {
+    let (agent, served) = match pvfs_companion::request(socket, &pvfs_companion::AgentRequest::ListKeys) {
+        Ok(pvfs_companion::AgentResponse::Keys { keys }) => ("running", keys),
+        Ok(_) => ("older", Vec::new()),
+        Err(_) => ("not running", Vec::new()),
+    };
+    let dir = default_vault()?.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let mut phrases = Vec::new();
+    for k in &served {
+        let path = if k.path.is_empty() { dir.join(format!("{}.vault", k.vault)) } else { PathBuf::from(&k.path) };
+        let mut p = phrase_report(&k.vault, &path, k.default, true);
+        p.locked = Some(k.locked);
+        p.keys = Some(PublicKeys { root: k.root.clone(), identity: k.identity.clone(), encryption: k.encryption.clone() });
+        phrases.push(p);
+    }
+    // Vaults beside them that the companion does not serve (not running, or
+    // left out): their files still say what they were used for.
+    let mut others: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("vault"))
+                .collect()
+        })
+        .unwrap_or_default();
+    others.sort();
+    for path in others {
+        if phrases.iter().any(|p| PathBuf::from(&p.path) == path) {
+            continue;
+        }
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let is_default = served.is_empty() && name == "companion";
+        phrases.push(phrase_report(&name, &path, is_default, false));
+    }
+    Ok(KeysReport { agent: agent.into(), phrases })
+}
+
+fn phrase_report(vault: &str, path: &std::path::Path, is_default: bool, served: bool) -> PhraseReport {
+    let sealing = match Vault::open(path) {
+        Ok(v) => match v.sealing() {
+            pvfs_companion::Sealing::Keychain => "keychain",
+            pvfs_companion::Sealing::Passphrase => "passphrase",
+        },
+        Err(_) => "unreadable",
+    }
+    .to_string();
+    let pairings = pvfs_companion::PairingRegistry::at(&path.with_extension("pairings.json"))
+        .list()
+        .into_iter()
+        .map(|p| PairingRow { name: p.name, server_pubkey: p.server_pubkey_hex, created_ms: p.created_ms, origins: p.origins })
+        .collect();
+    let origins = pvfs_companion::OriginRegistry::at(&path.with_extension("origins.json"))
+        .list()
+        .into_iter()
+        .map(|g| OriginRow { expires_ms: g.expires_at_ms(), origin: g.origin })
+        .collect();
+    let (approvals, root_signatures) = audit_summary(&path.with_extension("audit.jsonl"));
+    PhraseReport {
+        vault: vault.to_string(),
+        path: path.display().to_string(),
+        is_default,
+        served,
+        sealing,
+        locked: None,
+        keys: None,
+        forests: pvfs_companion::ledger::read(&path.with_extension("forests.json")),
+        pairings,
+        origins,
+        approvals,
+        root_signatures,
+    }
+}
+
+/// The approvals a phrase gave, grouped, and its root signatures, newest
+/// first — read from its audit log.
+fn audit_summary(path: &std::path::Path) -> (Vec<ApprovalRow>, Vec<RootSignature>) {
+    let mut rows: Vec<ApprovalRow> = Vec::new();
+    let mut roots = Vec::new();
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    for line in body.lines() {
+        let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if e["event"] != "sign" || e["decision"] != "approved" {
+            continue;
+        }
+        let at = e["ts_ms"].as_u64().unwrap_or(0);
+        let rt = e["request_type"].as_str().unwrap_or("");
+        let ctx = &e["context"];
+        if rt == "root_device_cert" {
+            let summary = ctx["summary"].as_str().unwrap_or("a root signature (no details recorded)").to_string();
+            roots.push(RootSignature { summary, at_ms: at });
+            continue;
+        }
+        let kind = match rt {
+            "identity_assertion" => "sign-in",
+            "user_action" => "approval",
+            "identity_tag" => "identity tag",
+            other => other,
+        };
+        let who = ctx["app_id"].as_str().or(e["origin"].as_str()).unwrap_or("local").to_string();
+        let action = ctx["action"].as_str().unwrap_or("").to_string();
+        match rows.iter_mut().find(|r| r.kind == kind && r.who == who && r.action == action) {
+            Some(r) => {
+                r.count += 1;
+                r.last_ms = r.last_ms.max(at);
+            }
+            None => rows.push(ApprovalRow { kind: kind.to_string(), who, action, count: 1, last_ms: at }),
+        }
+    }
+    rows.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
+    roots.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    roots.truncate(50);
+    (rows, roots)
+}
+
+/// "3 d ago" / "5 h ago" / "12 min ago".
+fn ago(ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let s = now.saturating_sub(ms) / 1000;
+    if s >= 86_400 {
+        format!("{} d ago", s / 86_400)
+    } else if s >= 3_600 {
+        format!("{} h ago", s / 3_600)
+    } else {
+        format!("{} min ago", s / 60)
+    }
+}
+
+fn print_keys(r: &KeysReport) {
+    println!("companion: {}", r.agent);
+    if r.phrases.is_empty() {
+        println!("(no phrases — run `pvfs-companion init`)");
+    }
+    for p in &r.phrases {
+        println!();
+        println!(
+            "phrase {}{} — {}{} — {}",
+            p.vault,
+            if p.is_default { " (default)" } else { "" },
+            p.sealing,
+            match (p.served, p.locked) {
+                (false, _) => " — not served now".to_string(),
+                (true, Some(true)) => " — locked".to_string(),
+                (true, _) => " — unlocked".to_string(),
+            },
+            p.path
+        );
+        match &p.keys {
+            Some(k) => {
+                println!("  root        {}", k.root);
+                println!("  identity    {}", k.identity);
+                println!("  encryption  {}", k.encryption);
+            }
+            None => println!("  keys        (shown while the companion serves this phrase)"),
+        }
+        if p.forests.is_empty() {
+            println!("  forests     none recorded yet — pvfs records the forests it uses this phrase for;");
+            println!("              `pvfs-companion keys link` records an older one");
+        }
+        for f in &p.forests {
+            println!(
+                "  forest      {} ({}) — {} {}… — {} use(s), last {} — {}",
+                if f.label.is_empty() { "?" } else { f.label.as_str() },
+                f.forest_id,
+                f.role,
+                &f.key[..f.key.len().min(12)],
+                f.uses,
+                ago(f.last_ms),
+                f.last_action
+            );
+        }
+        for s in &p.pairings {
+            println!(
+                "  paired      {} — server key {}… — since {}",
+                s.name,
+                &s.server_pubkey[..s.server_pubkey.len().min(12)],
+                ago(s.created_ms)
+            );
+        }
+        for o in &p.origins {
+            println!("  origin      {} — expires {}", o.origin, fmt_expiry(o.expires_ms));
+        }
+        for a in &p.approvals {
+            println!(
+                "  approved    {} × {} — {}{} — last {}",
+                a.kind,
+                a.count,
+                a.who,
+                if a.action.is_empty() { String::new() } else { format!(" ({})", a.action) },
+                ago(a.last_ms)
+            );
+        }
+        for s in p.root_signatures.iter().take(10) {
+            println!("  root signed {} — {}", s.summary, ago(s.at_ms));
         }
     }
 }

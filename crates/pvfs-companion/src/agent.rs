@@ -705,8 +705,8 @@ impl Agent {
             },
             // PVOS D189: the phrases are the router's to list (one agent is
             // one phrase and does not know its vault's name).
-            AgentRequest::ListKeys => {
-                AgentResponse::error("bad_input", "list_keys is answered by the companion's router")
+            AgentRequest::ListKeys | AgentRequest::LinkForest => {
+                AgentResponse::error("bad_input", "list_keys and link_forest are answered by the companion's router")
             }
             AgentRequest::RotateIdentity => self.rotate_identity(),
             AgentRequest::SecureUnwrap {
