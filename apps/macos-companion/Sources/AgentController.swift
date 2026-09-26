@@ -40,6 +40,9 @@ final class AgentController: ObservableObject {
     @Published var auditEntries: [AuditEntry] = []
     @Published var openAtLogin = false
     @Published var loginItemNote: String?
+    /// PVOS D189 — Settings → Phrases & keys.
+    @Published var keysReport: KeysReport?
+    @Published var keysError: String?
 
     private var agentProcess: Process?
     private var statusTimer: Timer?
@@ -53,6 +56,25 @@ final class AgentController: ObservableObject {
 
     var auditPath: URL {
         vaultPath.deletingLastPathComponent().appendingPathComponent("companion.audit.jsonl")
+    }
+
+    /// PVOS D189 — every other keychain-sealed vault beside the default one
+    /// (`media2.vault`, …): served by the same companion, which picks the
+    /// phrase per request by the key the client names (a forest's root).
+    /// Password-sealed ones are left out: the one password the app holds is
+    /// the default vault's.
+    var extraVaultPaths: [URL] {
+        let dir = vaultPath.deletingLastPathComponent()
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files
+            .filter { $0.pathExtension == "vault" && $0.lastPathComponent != vaultPath.lastPathComponent }
+            .filter { url in
+                guard let data = try? Data(contentsOf: url),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return false }
+                return (obj["sealing"] as? String) == "keychain"
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     var companionBinary: URL {
@@ -190,11 +212,12 @@ final class AgentController: ObservableObject {
 
         let proc = Process()
         proc.executableURL = companionBinary
-        proc.arguments = [
-            "serve",
-            "--vault", vaultPath.path,
-            "--prompt", "desktop",
-        ]
+        var args = ["serve", "--vault", vaultPath.path]
+        for extra in extraVaultPaths {
+            args += ["--vault", extra.path]
+        }
+        args += ["--prompt", "desktop"]
+        proc.arguments = args
         var env = ProcessInfo.processInfo.environment
         if let pass, !pass.isEmpty {
             env["PVFS_COMPANION_PASSPHRASE"] = pass
@@ -254,6 +277,24 @@ final class AgentController: ObservableObject {
             if origin.hasPrefix("(") { return nil }
             let expiry = parts.dropFirst().joined(separator: " ")
             return OriginGrant(origin: origin, expiry: expiry.isEmpty ? "—" : expiry)
+        }
+    }
+
+    /// PVOS D189 — every phrase, its keys and what uses them
+    /// (`pvfs-companion keys --json`). Read on demand, not on the 2 s poll.
+    func refreshKeys() {
+        let r = runCompanionCapturing(args: ["keys", "--json"], env: [:], stdin: nil)
+        guard r.exitCode == 0 else {
+            keysError = r.stderr.isEmpty ? "keys: exit \(r.exitCode)" : r.stderr
+            return
+        }
+        do {
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            keysReport = try decoder.decode(KeysReport.self, from: Data(r.stdout.utf8))
+            keysError = nil
+        } catch {
+            keysError = "Could not read the phrase list: \(error.localizedDescription)"
         }
     }
 

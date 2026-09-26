@@ -2732,9 +2732,11 @@ fn companion_pubkey(socket: &Path, role: &str) -> Result<Vec<u8>, PvfsError> {
         field: "companion".into(),
         reason,
     };
-    let resp = pvfs_companion::request(
+    let resp = pvfs_companion::request_routed(
         socket,
         &pvfs_companion::AgentRequest::GetPubkey { role: role.into() },
+        companion_key().as_deref(),
+        companion_forest().as_ref(),
     )
     .map_err(|e| bad(e.to_string()))?;
     match resp {
@@ -2760,7 +2762,7 @@ fn companion_sign_ctx(
     digest: &[u8; 32],
     context: Option<pvfs_companion::ApprovalContext>,
 ) -> Result<Vec<u8>, PvfsError> {
-    let resp = pvfs_companion::request(
+    let resp = pvfs_companion::request_routed(
         socket,
         &pvfs_companion::AgentRequest::Sign {
             request_type: request_type.into(),
@@ -2768,6 +2770,8 @@ fn companion_sign_ctx(
             origin: Some("local".into()),
             context,
         },
+        companion_key().as_deref(),
+        companion_forest().as_ref(),
     )
     .map_err(|e| PvfsError::BadInput {
         field: "companion".into(),
@@ -2796,13 +2800,18 @@ fn companion_unwrap(
     socket: &Path,
     wrap: &pvfs_core::envelope::Wrap,
 ) -> Result<[u8; 32], PvfsError> {
-    let resp = pvfs_companion::request(
+    // PVOS D189: the wrap names its recipient (a phrase's encryption key) —
+    // route by it; an older wrap without one goes by the forest's root.
+    let key = Some(wrap.recipient_pubkey.clone()).filter(|k| !k.is_empty()).or_else(companion_key);
+    let resp = pvfs_companion::request_routed(
         socket,
         &pvfs_companion::AgentRequest::SecureUnwrap {
             ephemeral_pubkey: hex::encode(&wrap.ephemeral_pubkey),
             nonce: hex::encode(&wrap.nonce),
             wrapped_key: hex::encode(&wrap.wrapped_key),
         },
+        key.as_deref(),
+        companion_forest().as_ref(),
     )
     .map_err(|e| PvfsError::BadInput {
         field: "companion".into(),
@@ -2838,9 +2847,56 @@ fn secure_spec(label: &str) -> NodeSpec {
     }
 }
 
+/// PVOS D189 — the phrase a companion should use: the CURRENT root of the
+/// forest this command runs on. A companion holding several phrases routes
+/// each request by it; one before protocol v4 ignores it (and the command's
+/// own check then accepts or refuses its one phrase, as before). Set once at
+/// start; `$PVFS_COMPANION_KEY` (a hex public key) overrides — for a new
+/// forest (`forest init --via-companion`), whose root does not exist yet.
+static COMPANION_KEY: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+
+fn companion_key() -> Option<Vec<u8>> {
+    COMPANION_KEY.get().cloned().flatten()
+}
+
+/// PVOS D189 — the forest this command runs on, named to the companion with
+/// each request (its id, and its alias here else its directory): the
+/// companion records which of a phrase's keys each forest uses, for its
+/// settings to show. Never used to route or authorize.
+static COMPANION_FOREST: std::sync::OnceLock<Option<pvfs_companion::ForestRef>> = std::sync::OnceLock::new();
+
+fn companion_forest() -> Option<pvfs_companion::ForestRef> {
+    COMPANION_FOREST.get().cloned().flatten()
+}
+
+fn set_companion_key(ctx: &Result<PathBuf, PvfsError>) {
+    let forest = ctx.as_ref().ok().and_then(|dir| {
+        let mount = dir.parent()?;
+        let identity = mount::peek_identity(mount).ok()?;
+        let label = Registry::system()
+            .find(&mount.to_string_lossy())
+            .ok()
+            .flatten()
+            .and_then(|f| f.alias)
+            .unwrap_or_else(|| mount.display().to_string());
+        Some(pvfs_companion::ForestRef { id: identity.forest_id, label })
+    });
+    let _ = COMPANION_FOREST.set(forest);
+    let key = std::env::var("PVFS_COMPANION_KEY")
+        .ok()
+        .and_then(|h| hex::decode(h.trim()).ok())
+        .or_else(|| {
+            let dir = ctx.as_ref().ok()?;
+            let identity = mount::peek_identity(dir.parent()?).ok()?;
+            mount::peek_current_root(dir, &identity).ok()
+        });
+    let _ = COMPANION_KEY.set(key);
+}
+
 fn run(cli: Cli) -> Result<(), PvfsError> {
     let legacy = legacy_state_dir(&cli);
     let ctx = context_state_dir(&cli);
+    set_companion_key(&ctx);
     let json = cli.json;
     match cli.cmd {
         Cmd::Init => {

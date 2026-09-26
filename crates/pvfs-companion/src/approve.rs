@@ -360,6 +360,72 @@ pub fn auto_prompter() -> Box<dyn Prompter> {
 }
 
 /// As [`auto_prompter`], with a human-readable label for the serve banner.
+/// PVOS D189 — a companion holding several phrases names, in every signing
+/// prompt, the phrase that would sign: the human approving a device
+/// certificate must know WHICH forest's root it is. Everything else passes
+/// through to the backend.
+pub struct NamedPrompter {
+    phrase: String,
+    inner: Box<dyn Prompter>,
+}
+
+impl NamedPrompter {
+    pub fn new(phrase: impl Into<String>, inner: Box<dyn Prompter>) -> NamedPrompter {
+        NamedPrompter { phrase: phrase.into(), inner }
+    }
+}
+
+impl Prompter for NamedPrompter {
+    fn approve(&self, request: RequestType, origin: Origin) -> bool {
+        self.approve_with_context(request, origin, None)
+    }
+
+    fn approve_with_context(&self, request: RequestType, origin: Origin, context: Option<&ApprovalContext>) -> bool {
+        let named = match context {
+            Some(c) => ApprovalContext {
+                summary: format!("[recovery phrase '{}'] {}", self.phrase, c.summary),
+                ..c.clone()
+            },
+            None => ApprovalContext {
+                app_id: "companion".into(),
+                action: "sign".into(),
+                summary: format!("with the recovery phrase '{}'", self.phrase),
+                resource: None,
+                digest_hex: None,
+            },
+        };
+        self.inner.approve_with_context(request, origin, Some(&named))
+    }
+
+    fn approve_connect(&self, origin: &str) -> bool {
+        self.inner.approve_connect(origin)
+    }
+
+    fn approve_rotation(&self, old_hex: &str, new_hex: &str) -> bool {
+        self.inner.approve_rotation(old_hex, new_hex)
+    }
+
+    fn approve_pair(&self, name: &str, server_pubkey_hex: &str, origins: &[String]) -> bool {
+        self.inner.approve_pair(&format!("{name} (recovery phrase '{}')", self.phrase), server_pubkey_hex, origins)
+    }
+
+    fn approve_trust_url(&self, name: &str, server_pubkey_hex: &str, origin: &str) -> bool {
+        self.inner.approve_trust_url(name, server_pubkey_hex, origin)
+    }
+
+    fn approve_redeem_invite(
+        &self,
+        member: &str,
+        email: &str,
+        role: &str,
+        capabilities: &[String],
+        server_pubkey_hex: &str,
+        origins: &[String],
+    ) -> bool {
+        self.inner.approve_redeem_invite(member, email, role, capabilities, server_pubkey_hex, origins)
+    }
+}
+
 pub fn auto_prompter_labeled() -> (Box<dyn Prompter>, &'static str) {
     if let Some(p) = DesktopPrompter::detect() {
         return (Box::new(p), "desktop dialog");

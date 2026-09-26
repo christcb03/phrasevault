@@ -198,6 +198,7 @@ struct ConsoleView: View {
 
     private var settingsTab: some View {
         Form {
+            KeysSections(agent: agent)
             Section("Startup") {
                 Toggle("Open at login", isOn: Binding(
                     get: { agent.openAtLogin },
@@ -263,6 +264,7 @@ struct ConsoleView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { agent.refreshKeys() }
     }
 
     private var passwordSheet: some View {

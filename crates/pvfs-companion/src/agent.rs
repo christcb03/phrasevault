@@ -17,7 +17,7 @@ use crate::approve::{DenyPrompter, Prompter};
 use crate::audit::AuditLog;
 use crate::policy::{ApprovalPolicy, Decision, Origin};
 use crate::proto::{AgentRequest, AgentResponse, ApprovalContext, API_VERSION};
-use crate::signer::{KeyRole, RequestType, UnlockedSigner};
+use crate::signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
 
 /// A PVOS invite as presented for redemption (D18 §2.7) — the fields the
 /// server's `RedeemChallenge` handed the page, plus the bearer code the
@@ -78,6 +78,15 @@ pub type IdentityRotator = Box<dyn Fn(u64) -> Result<(), String> + Send + Sync>;
 const DEFAULT_RATE_PER_MIN: u32 = 60;
 
 /// An unlocked signer plus the controls that gate it.
+/// PVOS D189 — one phrase's public keys: its root (`0'`), its current
+/// identity, its encryption key (`2'/0'`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhraseKeys {
+    pub root: Vec<u8>,
+    pub identity: Vec<u8>,
+    pub encryption: Vec<u8>,
+}
+
 pub struct Agent {
     signer: Mutex<Option<UnlockedSigner>>,
     policy: ApprovalPolicy,
@@ -190,6 +199,29 @@ impl Agent {
         if had {
             self.audit_event(reason);
         }
+    }
+
+    /// PVOS D189 — this phrase's public keys, unlocking if it must: what
+    /// the router routes by.
+    pub fn public_keys(&self) -> Result<PhraseKeys, String> {
+        let got = self.with_signer(|s| {
+            Ok::<_, SignerError>(PhraseKeys {
+                root: s.pubkey(KeyRole::Root)?,
+                identity: s.pubkey(KeyRole::Identity)?,
+                encryption: s.pubkey(KeyRole::Encryption)?,
+            })
+        });
+        match got {
+            Ok(Ok(keys)) => Ok(keys),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(AgentResponse::Error { message, .. }) => Err(message),
+            Err(_) => Err("the phrase could not be read".into()),
+        }
+    }
+
+    /// PVOS D189 — is the phrase dropped from memory right now?
+    pub fn is_locked(&self) -> bool {
+        self.signer.lock().expect("signer poisoned").is_none()
     }
 
     /// Enforce the idle timeout, then run `f` with the signer — re-unlocking
@@ -671,6 +703,11 @@ impl Agent {
                     Err(e) => AgentResponse::error("io", e.to_string()),
                 },
             },
+            // PVOS D189: the phrases are the router's to list (one agent is
+            // one phrase and does not know its vault's name).
+            AgentRequest::ListKeys | AgentRequest::LinkForest => {
+                AgentResponse::error("bad_input", "list_keys and link_forest are answered by the companion's router")
+            }
             AgentRequest::RotateIdentity => self.rotate_identity(),
             AgentRequest::SecureUnwrap {
                 ephemeral_pubkey,

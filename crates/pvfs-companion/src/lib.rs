@@ -20,6 +20,8 @@ mod policy;
 mod webagent;
 pub mod webtls;
 mod proto;
+pub mod ledger;
+pub mod router;
 mod session;
 mod signer;
 mod singleton;
@@ -27,10 +29,10 @@ mod store;
 mod tenant;
 mod vault;
 
-pub use agent::{invite_acceptance_digest, normalize_invite_code, serve, Agent, IdentityRotator, InviteRedemption, Unlocker};
-pub use approve::{auto_prompter, auto_prompter_labeled, DenyPrompter, Prompter};
+pub use agent::{invite_acceptance_digest, normalize_invite_code, serve, Agent, IdentityRotator, InviteRedemption, PhraseKeys, Unlocker};
+pub use approve::{auto_prompter, auto_prompter_labeled, DenyPrompter, NamedPrompter, Prompter};
 pub use audit::{AuditEntry, AuditLog};
-pub use client::request;
+pub use client::{request, request_for_key, request_routed};
 #[cfg(feature = "os-keychain")]
 pub use keychain::OsKeychain;
 pub use origins::{OriginGrant, OriginRegistry, DEFAULT_CONNECT_TTL_SECS};
@@ -40,9 +42,10 @@ pub use keychain::{MemoryStore, SecretStore};
 pub use paths::{default_socket_path, default_vault_path};
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{
-    verify_code, AgentRequest, AgentResponse, ApprovalContext, PairingInfo, RelayPayload,
-    API_VERSION, RELAY_DOMAIN,
+    verify_code, AgentRequest, AgentResponse, ApprovalContext, ForestRef, KeyInfo, PairingInfo, RelayPayload,
+    API_VERSION, FOREST_FIELD, KEY_FIELD, RELAY_DOMAIN,
 };
+pub use router::{serve_router, Router};
 pub use session::{DeviceTrust, SessionError, Sessions};
 pub use singleton::{pidfile_path, take_over, write_pidfile, TakeoverReport};
 pub use signer::{KeyRole, RequestType, SignerError, UnlockedSigner};
