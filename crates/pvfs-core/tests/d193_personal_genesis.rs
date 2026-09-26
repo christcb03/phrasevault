@@ -1,9 +1,9 @@
 //! PVOS D193 — a personal forest's genesis, signed by the person.
 //!
-//! Prepared from public keys, signed with the person's root and own device
-//! key, committed by the hosting box only after a full verifying replay.
-//! The box's key is a member with no grant; the person's identity key is an
-//! admin member (it certifies their session keys).
+//! Prepared from public keys, signed with the person's root and identity
+//! keys, committed by the hosting box only after a full verifying replay.
+//! The box's key is a member with no grant; the person's identity key is the
+//! owner device (it certifies their session keys).
 
 use pvfs_core::acl::{Principal, ACL_A, ACL_R, ACL_W};
 use pvfs_core::personal::{init_signed_genesis, prepare_personal_genesis, PersonalGenesis};
@@ -11,7 +11,6 @@ use pvfs_core::{crypto, identity, Engine, NodeSpec};
 
 struct Person {
     root: identity::SigningKey,
-    device: identity::SigningKey,
     ident: identity::SigningKey,
 }
 
@@ -20,7 +19,6 @@ impl Person {
         let mn = identity::generate_mnemonic().unwrap();
         Person {
             root: identity::root_key(&mn, "").unwrap(),
-            device: identity::device_key(&mn, "", 0).unwrap(),
             ident: identity::identity_key(&mn, "", 0).unwrap(),
         }
     }
@@ -28,7 +26,6 @@ impl Person {
     fn genesis(&self, host: &identity::SigningKey) -> PersonalGenesis {
         PersonalGenesis {
             root_pub: crypto::pubkey_bytes(&self.root),
-            owner_device_pub: crypto::pubkey_bytes(&self.device),
             identity_pub: crypto::pubkey_bytes(&self.ident),
             host_pub: crypto::pubkey_bytes(host),
         }
@@ -42,9 +39,9 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     let person = Person::new();
     let host = identity::generate_device_key();
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
-    assert_eq!(prep.events.len(), 7);
+    assert_eq!(prep.events.len(), 5);
     let forest_id = prep.forest_id.clone();
-    let events = prep.sign(&person.root, &person.device).unwrap();
+    let events = prep.sign(&person.root, &person.ident).unwrap();
     let mut engine = init_signed_genesis(&data, events, host.clone()).unwrap();
 
     assert_eq!(engine.identity.forest_id, forest_id);
@@ -52,7 +49,7 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     assert_eq!(engine.current_root().unwrap(), crypto::pubkey_bytes(&person.root));
     let root = engine.identity.root_node_id.clone();
     let rights = |k: &identity::SigningKey| engine.effective_rights(&Principal::Key(crypto::pubkey_bytes(k)), &root).unwrap();
-    assert_eq!(rights(&person.ident), ACL_R | ACL_W | ACL_A, "the identity is an admin member");
+    assert_eq!(rights(&person.ident), ACL_R | ACL_W | ACL_A, "the identity is the owner device");
     assert_eq!(rights(&host), 0, "the host holds no grant");
 
     // the host cannot write on its own, nor admit anyone
@@ -85,8 +82,8 @@ fn a_genesis_that_does_not_verify_leaves_nothing() {
     let person = Person::new();
     let host = identity::generate_device_key();
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
-    // the owner-device events signed by someone else
-    let events = prep.sign(&person.root, &identity::generate_device_key()).unwrap();
+    // the identity's events signed by someone else
+    let events = prep.sign(&person.root, &identity::generate_device_key()).unwrap(); // the identity's events by a stranger
     assert!(init_signed_genesis(&data, events, host).is_err());
     assert!(!data.exists(), "nothing is left behind");
 }
@@ -97,7 +94,7 @@ fn the_box_opens_it_only_with_the_key_the_genesis_admits() {
     let data = dir.path().join("people-carol");
     let person = Person::new();
     let host = identity::generate_device_key();
-    let events = prepare_personal_genesis(&person.genesis(&host)).unwrap().sign(&person.root, &person.device).unwrap();
+    let events = prepare_personal_genesis(&person.genesis(&host)).unwrap().sign(&person.root, &person.ident).unwrap();
     assert!(init_signed_genesis(&data, events, identity::generate_device_key()).is_err());
     assert!(!data.exists());
 

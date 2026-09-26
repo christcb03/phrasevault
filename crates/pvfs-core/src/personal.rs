@@ -6,12 +6,11 @@
 //! browser, or their companion):
 //!
 //! 1. `ForestCreated` — root-signed, v2: born bound (D192);
-//! 2. the person's own device key as the forest's OWNER device — a key that
-//!    never leaves them (`m/43'/20566'/1'/0'` of their phrase);
-//! 3. the root folder and 4. its link — by that device;
-//! 5. their IDENTITY key as a member, with 6. an `rwa` grant on the root —
-//!    what later certifies the keys of their sessions;
-//! 7. the hosting box's key as a member with NO grant: it serves the forest
+//! 2. their IDENTITY key (`3'/0'` of their phrase) as the forest's owner
+//!    device — the key that signs them in and certifies their sessions,
+//!    which a browser and a companion both hold;
+//! 3. the root folder and 4. its link — by that identity;
+//! 5. the hosting box's key as a member with NO grant: it serves the forest
 //!    and commits what the person signed; it can grant, revoke or delete
 //!    nothing on its own.
 //!
@@ -23,7 +22,7 @@ use std::path::Path;
 
 use rand::RngCore;
 
-use crate::acl::{ACL_RWA, MEMBER_DEVICE_INDEX};
+use crate::acl::MEMBER_DEVICE_INDEX;
 use crate::crypto;
 use crate::engine::{self, Engine};
 use crate::error::{PvfsError, Result};
@@ -40,9 +39,7 @@ use crate::projection;
 pub struct PersonalGenesis {
     /// The person's root (`0'`): roots the forest.
     pub root_pub: Vec<u8>,
-    /// The person's own device (`1'/0'`): the forest's owner device.
-    pub owner_device_pub: Vec<u8>,
-    /// The person's identity (`3'/0'`): an admin member.
+    /// The person's identity (`3'/0'`): the forest's owner device.
     pub identity_pub: Vec<u8>,
     /// The hosting box's key: a member with no grant.
     pub host_pub: Vec<u8>,
@@ -52,7 +49,7 @@ pub struct PersonalGenesis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenesisSigner {
     Root,
-    OwnerDevice,
+    Identity,
 }
 
 #[derive(Clone, Debug)]
@@ -85,13 +82,13 @@ impl PreparedGenesis {
 
     /// Sign every event here, with the person's two keys (tests; a tool
     /// holding the phrase).
-    pub fn sign(self, root: &SigningKey, owner_device: &SigningKey) -> Result<Vec<Event>> {
+    pub fn sign(self, root: &SigningKey, identity: &SigningKey) -> Result<Vec<Event>> {
         let sigs = self
             .events
             .iter()
             .map(|p| match p.signer {
                 GenesisSigner::Root => crypto::sign_digest(root, &p.digest),
-                GenesisSigner::OwnerDevice => crypto::sign_digest(owner_device, &p.digest),
+                GenesisSigner::Identity => crypto::sign_digest(identity, &p.digest),
             })
             .collect::<Result<Vec<_>>>()?;
         self.attach(sigs)
@@ -108,7 +105,7 @@ fn with_sig(mut ev: Event, sig: Vec<u8>) -> Event {
 
 /// The unsigned genesis of a personal forest (see the module docs).
 pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> {
-    let keys = [&g.root_pub, &g.owner_device_pub, &g.identity_pub, &g.host_pub];
+    let keys = [&g.root_pub, &g.identity_pub, &g.host_pub];
     for k in keys {
         crypto::validate_pubkey(k)?;
     }
@@ -116,7 +113,7 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
         if keys[..i].contains(a) {
             return Err(PvfsError::BadInput {
                 field: "genesis".into(),
-                reason: "the root, device, identity and host keys must all differ".into(),
+                reason: "the root, identity and host keys must all differ".into(),
             });
         }
     }
@@ -126,7 +123,7 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
     let forest_id = uuid::Uuid::new_v4().to_string();
     let t = engine::now_ms();
     let f = Some(forest_id.as_str());
-    let (root, device) = (g.root_pub.clone(), g.owner_device_pub.clone());
+    let (root, device) = (g.root_pub.clone(), g.identity_pub.clone());
 
     let mut nonce = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -205,23 +202,8 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
                 sig: Vec::new(),
             },
         },
-        PreparedGenesisEvent { signer: GenesisSigner::OwnerDevice, digest: root_digest, event: Event::NodeCreated(root_node) },
-        PreparedGenesisEvent { signer: GenesisSigner::OwnerDevice, digest: link_digest, event: Event::LinkCreated(root_link) },
-        member(&g.identity_pub),
-        PreparedGenesisEvent {
-            signer: GenesisSigner::OwnerDevice,
-            digest: event::msg_acl_set(&root_node_id, 1, &g.identity_pub, ACL_RWA as u64, t, 0, &device),
-            event: Event::AclSet {
-                node_id: root_node_id.clone(),
-                principal_kind: 1,
-                principal_id: g.identity_pub.clone(),
-                rights: ACL_RWA as u64,
-                set_at: t,
-                expires_at: 0,
-                author: device.clone(),
-                sig: Vec::new(),
-            },
-        },
+        PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: root_digest, event: Event::NodeCreated(root_node) },
+        PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: link_digest, event: Event::LinkCreated(root_link) },
         member(&g.host_pub),
     ];
     Ok(PreparedGenesis { forest_id, instance_id, events })
