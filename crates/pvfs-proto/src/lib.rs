@@ -49,7 +49,11 @@ use serde::{Deserialize, Serialize};
 ///          (v2 authority digests, `CertificatesBound`) and offers the
 ///          `BindCertificates` write op. A forest binds only when every box
 ///          announces 14 or later. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 14;
+///   14 → 15: PVOS D193 `CommitSigned` — events their authors signed
+///          elsewhere, delivered by the box that hosts the forest (a
+///          person's session certificate, signed in their browser).
+///          Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 15;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -627,6 +631,14 @@ pub enum WriteOp {
     },
 }
 
+/// PVOS D193 — one event as its author signed it: the kind and the canonical
+/// body (hex), signature included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEventWire {
+    pub kind: String,
+    pub body: String,
+}
+
 /// Client → server messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -791,6 +803,13 @@ pub enum ClientMsg {
         prepared_id: String,
         sigs: Vec<String>,
     },
+    /// PVOS D193 (proto 15) — commit events their authors already signed
+    /// elsewhere: a person's browser signs their session certificate, and the
+    /// box that hosts their forest delivers it. Each event is verified as its
+    /// author's own commit would be — signature, authority, ACL — in one
+    /// atomic append, so delivering grants the deliverer nothing. An
+    /// authenticated connection is still required. Answered `Committed`.
+    CommitSigned { events: Vec<SignedEventWire> },
     /// Live job-runner state (P5, doc 18 §2). Answered like `Info` — operational
     /// metadata, no catalog content.
     ServeStatus,

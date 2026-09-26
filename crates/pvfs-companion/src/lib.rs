@@ -20,6 +20,7 @@ mod policy;
 mod webagent;
 pub mod webtls;
 mod proto;
+pub mod pvos;
 pub mod ledger;
 pub mod router;
 mod session;
@@ -42,7 +43,8 @@ pub use keychain::{MemoryStore, SecretStore};
 pub use paths::{default_socket_path, default_vault_path};
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{
-    verify_code, AgentRequest, AgentResponse, ApprovalContext, ForestRef, KeyInfo, PairingInfo, RelayPayload,
+    verify_code, AgentRequest, AgentResponse, ApprovalContext, ConfirmFields, ForestRef, GenesisFields, GenesisOut, KeyInfo,
+    LoginFields, PairingInfo, RelayPayload, SessionCertFields,
     API_VERSION, FOREST_FIELD, KEY_FIELD, RELAY_DOMAIN,
 };
 pub use router::{serve_router, Router};

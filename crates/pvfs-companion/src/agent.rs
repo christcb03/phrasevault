@@ -54,6 +54,17 @@ pub fn invite_acceptance_digest(
     h.finalize().into()
 }
 
+/// PVOS D193: how long a session certificate's `rw` grant lives (pvosd takes
+/// an hour to 31 days) — the page picks the same.
+const SESSION_GRANT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// PVOS invite codes are compared normalized: uppercase alphanumerics only
 /// (dashes and whitespace are presentation).
 pub fn normalize_invite_code(input: &str) -> String {
@@ -496,12 +507,41 @@ impl Agent {
             }
             self.audit_event("url_trusted");
         }
-        let Ok(bytes) = hex::decode(&payload.digest) else {
-            return AgentResponse::error("bad_input", "digest not hex");
+        // PVOS D193 — the statements the companion builds itself.
+        match payload.kind.as_str() {
+            "session_cert" => return self.relay_session_cert(request_origin, &payload),
+            "personal_genesis" => return self.relay_personal_genesis(&pairing.name, request_origin, &payload),
+            "confirm" => return self.relay_confirm(&pairing.name, request_origin, &payload),
+            _ => {}
+        }
+        // A sign-in is built from its fields (D193): a server handing over any
+        // 32 bytes as "a sign-in" gets nothing signed. (`user_action` still
+        // signs the digest its context names, and still prompts.)
+        let digest32 = if payload.kind == "sign_in" {
+            let Some(l) = &payload.login else {
+                return AgentResponse::error(
+                    "bad_input",
+                    "this companion signs a sign-in only from its fields — the PVOS server needs updating (D193)",
+                );
+            };
+            let (Ok(nonce), Ok(session)) = (hex::decode(&l.nonce), hex::decode(&l.session_pubkey)) else {
+                return AgentResponse::error("bad_input", "login fields not hex");
+            };
+            let built = crate::pvos::login_digest(&nonce, &l.instance_id, l.expiry_ms, &session);
+            if !payload.digest.is_empty() && !payload.digest.eq_ignore_ascii_case(&hex::encode(built)) {
+                return AgentResponse::error("bad_input", "the digest is not this sign-in's");
+            }
+            built
+        } else {
+            let Ok(bytes) = hex::decode(&payload.digest) else {
+                return AgentResponse::error("bad_input", "digest not hex");
+            };
+            let Ok(digest32) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                return AgentResponse::error("bad_input", "digest must be 32 bytes");
+            };
+            digest32
         };
-        let Ok(digest32) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-            return AgentResponse::error("bad_input", "digest must be 32 bytes");
-        };
+        let digest_hex = hex::encode(digest32);
         let code = verify_code(&digest32);
 
         let (rt, rt_name, context) = match payload.kind.as_str() {
@@ -514,7 +554,7 @@ impl Agent {
                         pairing.name
                     ),
                     resource: None,
-                    digest_hex: Some(payload.digest.clone()),
+                    digest_hex: Some(digest_hex.clone()),
                 };
                 (RequestType::IdentityAssertion, "identity_assertion", ctx)
             }
@@ -539,7 +579,7 @@ impl Agent {
         };
 
         if self.rate_limited() {
-            self.audit_sign(rt_name, Origin::Web, "rate_limited", &payload.digest, Some(&context));
+            self.audit_sign(rt_name, Origin::Web, "rate_limited", &digest_hex, Some(&context));
             return AgentResponse::error("rate_limited", "too many signature requests");
         }
         // D29: sign-in over a trusted (key, url) is the auto tier — the pairing
@@ -558,21 +598,200 @@ impl Agent {
             }
         };
         if !approved {
-            self.audit_sign(rt_name, Origin::Web, "denied", &payload.digest, Some(&context));
+            self.audit_sign(rt_name, Origin::Web, "denied", &digest_hex, Some(&context));
             return AgentResponse::error("denied", "approval required or denied");
         }
         match self.with_signer(|s| s.sign(rt, &digest32)) {
             Ok(Ok(sig)) => {
-                self.audit_sign(rt_name, Origin::Web, "approved", &payload.digest, Some(&context));
+                self.audit_sign(rt_name, Origin::Web, "approved", &digest_hex, Some(&context));
                 AgentResponse::Signature {
                     sig: hex::encode(sig),
                 }
             }
             Ok(Err(e)) => AgentResponse::error("sign", e.to_string()),
             Err(resp) => {
-                self.audit_sign(rt_name, Origin::Web, "locked", &payload.digest, Some(&context));
+                self.audit_sign(rt_name, Origin::Web, "locked", &digest_hex, Some(&context));
                 resp
             }
+        }
+    }
+
+    /// PVOS D193 — certify a session in the member's personal forest: only for
+    /// a forest THIS phrase's owner key bound as its own on the very site
+    /// asking (the binding is checked against the relaying page's Origin),
+    /// and only with a certificate built here — the session key a member, `rw`
+    /// on the root, expiring. Part of a sign-in, so silent like one (D29): the
+    /// pairing and the url trust grant were already checked.
+    fn relay_session_cert(&self, request_origin: &str, payload: &crate::proto::RelayPayload) -> AgentResponse {
+        use pvfs_core::personal::{session_cert_events, SessionCert};
+        let Some(c) = &payload.session_cert else {
+            return AgentResponse::error("bad_input", "a session_cert relay needs its fields");
+        };
+        let rp_id = crate::pvos::origin_host(request_origin);
+        if rp_id.is_empty() || c.rp_id != rp_id {
+            return AgentResponse::error("bad_origin", "the certificate names another site than the page that asked");
+        }
+        let (Ok(binding_sig), Ok(session_pub)) = (hex::decode(&c.binding_sig), hex::decode(&c.session_pubkey)) else {
+            return AgentResponse::error("bad_input", "session_cert fields not hex");
+        };
+        if self.rate_limited() {
+            self.audit_sign_str("session_cert", "web", "rate_limited", &c.forest_id);
+            return AgentResponse::error("rate_limited", "too many signature requests");
+        }
+        let signed = self.with_signer(|s| -> Result<AgentResponse, String> {
+            let owner = s.pubkey(KeyRole::Device).map_err(|e| e.to_string())?;
+            let binding = crate::pvos::personal_binding_digest(&rp_id, &c.member, &c.forest_id, &c.root_node_id);
+            if pvfs_core::crypto::verify_digest(&owner, &binding, &binding_sig).is_err() {
+                return Err("that forest is not one this phrase bound as its own on this site".into());
+            }
+            let at = now_ms();
+            let expires_at = at + SESSION_GRANT_MS;
+            let prepared = session_cert_events(&SessionCert {
+                forest_id: c.forest_id.clone(),
+                root_node_id: c.root_node_id.clone(),
+                owner_pub: owner.clone(),
+                session_pub: session_pub.clone(),
+                at,
+                expires_at,
+            })
+            .map_err(|e| e.to_string())?;
+            let sigs = prepared
+                .iter()
+                .map(|p| s.sign_built(KeyRole::Device, &p.digest).map(hex::encode).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AgentResponse::Certified { pubkey: hex::encode(owner), at, expires_at, sigs })
+        });
+        match signed {
+            Ok(Ok(resp)) => {
+                self.audit_sign_str("session_cert", "web", "approved", &c.forest_id);
+                resp
+            }
+            Ok(Err(why)) => {
+                self.audit_sign_str("session_cert", "web", "refused", &c.forest_id);
+                AgentResponse::error("bad_binding", why)
+            }
+            Err(resp) => resp,
+        }
+    }
+
+    /// PVOS D193 — make the member's personal forest, at a prompt whose words
+    /// are written here: the companion picks a fresh forest id (so no
+    /// certificate in the genesis can name another forest this phrase roots),
+    /// builds and signs the five genesis events (root and device keys) and
+    /// the owner key's binding for the asking site.
+    fn relay_personal_genesis(&self, server: &str, request_origin: &str, payload: &crate::proto::RelayPayload) -> AgentResponse {
+        use pvfs_core::personal::{prepare_personal_genesis_with, GenesisParams, GenesisSigner, PersonalGenesis};
+        let Some(g) = &payload.genesis else {
+            return AgentResponse::error("bad_input", "a personal_genesis relay needs its fields");
+        };
+        let rp_id = crate::pvos::origin_host(request_origin);
+        if rp_id.is_empty() {
+            return AgentResponse::error("bad_origin", "no site to bind the forest to");
+        }
+        let Ok(host_pub) = hex::decode(&g.host_pub) else {
+            return AgentResponse::error("bad_input", "host key not hex");
+        };
+        if pvfs_core::crypto::validate_pubkey(&host_pub).is_err() {
+            return AgentResponse::error("bad_input", "host key is not a public key");
+        }
+        if self.rate_limited() {
+            return AgentResponse::error("rate_limited", "too many signature requests");
+        }
+        let text = format!(
+            "pvfs-companion: CREATE your personal forest on \"{server}\" ({request_origin}) as member \"{}\"? \
+             It is rooted in your recovery phrase — your key owns it; the server only stores and serves it \
+             and holds no authority in it.",
+            g.member
+        );
+        if !self.prompter.approve_statement(&text) {
+            self.audit_sign_str("personal_genesis", "web", "denied", &rp_id);
+            return AgentResponse::error("denied", "approval required or denied");
+        }
+        let built = self.with_signer(|s| -> Result<AgentResponse, String> {
+            let e = |x: crate::signer::SignerError| x.to_string();
+            let (root, owner, identity) = (s.pubkey(KeyRole::Root).map_err(e)?, s.pubkey(KeyRole::Device).map_err(e)?, s.pubkey(KeyRole::Identity).map_err(e)?);
+            let params = GenesisParams::fresh();
+            let prep = prepare_personal_genesis_with(&PersonalGenesis { root_pub: root.clone(), owner_pub: owner.clone(), host_pub: host_pub.clone() }, params.clone())
+                .map_err(|x| x.to_string())?;
+            let root_node_id = match &prep.events[0].event {
+                pvfs_core::event::Event::ForestCreated { root_node_id, .. } => root_node_id.clone(),
+                _ => return Err("the prepared genesis has no ForestCreated".into()),
+            };
+            let sigs = prep
+                .events
+                .iter()
+                .map(|p| {
+                    let role = if p.signer == GenesisSigner::Root { KeyRole::Root } else { KeyRole::Device };
+                    s.sign_built(role, &p.digest).map(hex::encode).map_err(e)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let binding = crate::pvos::personal_binding_digest(&rp_id, &g.member, &params.forest_id, &root_node_id);
+            let binding_sig = hex::encode(s.sign_built(KeyRole::Device, &binding).map_err(e)?);
+            Ok(AgentResponse::Genesis(Box::new(crate::proto::GenesisOut {
+                root: hex::encode(root),
+                owner: hex::encode(owner),
+                identity: hex::encode(identity),
+                forest_id: params.forest_id,
+                instance_id: params.instance_id,
+                created_at: params.created_at,
+                root_nonce: params.root_nonce.to_string(),
+                sigs,
+                binding_sig,
+            })))
+        });
+        match built {
+            Ok(Ok(resp)) => {
+                self.audit_sign_str("personal_genesis", "web", "approved", &rp_id);
+                resp
+            }
+            Ok(Err(why)) => AgentResponse::error("sign", why),
+            Err(resp) => resp,
+        }
+    }
+
+    /// PVOS D193 — confirm a delete or a grant (a fresh confirmation, every
+    /// time): the words are written here from the structured operation, an
+    /// operation this companion does not know is refused, and what is signed
+    /// (with the owner key) is pvos-core `confirm_digest` over the operation,
+    /// the paired server and a nonce that expires.
+    fn relay_confirm(&self, server: &str, request_origin: &str, payload: &crate::proto::RelayPayload) -> AgentResponse {
+        let Some(a) = &payload.action else {
+            return AgentResponse::error("bad_input", "a confirm relay needs its action");
+        };
+        if a.expiry_ms <= now_ms() {
+            return AgentResponse::error("expired", "that confirmation request has expired");
+        }
+        let Some(text) = crate::pvos::describe_confirm(&a.op, &a.subject, &a.detail, server, request_origin) else {
+            return AgentResponse::error("bad_input", "an operation this companion does not know — refused, not signed blind");
+        };
+        if self.rate_limited() {
+            return AgentResponse::error("rate_limited", "too many signature requests");
+        }
+        if !self.prompter.approve_statement(&text) {
+            self.audit_sign_str("confirm", "web", "denied", &a.op);
+            return AgentResponse::error("denied", "approval required or denied");
+        }
+        let digest = crate::pvos::confirm_digest(
+            &payload.server_pubkey,
+            &a.instance_id,
+            &a.op,
+            &a.subject,
+            &a.detail,
+            &a.nonce,
+            a.expiry_ms,
+        );
+        let signed = self.with_signer(|s| -> Result<AgentResponse, String> {
+            let owner = s.pubkey(KeyRole::Device).map_err(|e| e.to_string())?;
+            let sig = s.sign_built(KeyRole::Device, &digest).map_err(|e| e.to_string())?;
+            Ok(AgentResponse::Confirmed { pubkey: hex::encode(owner), sig: hex::encode(sig) })
+        });
+        match signed {
+            Ok(Ok(resp)) => {
+                self.audit_sign_str("confirm", "web", "approved", &a.op);
+                resp
+            }
+            Ok(Err(why)) => AgentResponse::error("sign", why),
+            Err(resp) => resp,
         }
     }
 

@@ -1645,6 +1645,47 @@ impl Engine {
         }
     }
 
+    /// PVOS D193 — the rules a member-key engine's own events must pass: what
+    /// `commit_member_write` checks of a routed write, minus the signatures
+    /// (this engine made them). Genesis, rotations and recovery keys are the
+    /// root's alone.
+    fn authorize_as_member(&self, events: &[Event]) -> Result<()> {
+        let root = self.current_root()?;
+        let created: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::NodeCreated(n) => Some(n.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut born: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ev in events {
+            if let Event::LinkCreated(l) = ev {
+                if let (true, Some(p)) = (created.contains(l.child_id.as_str()), &l.parent_id) {
+                    born.insert(l.child_id.clone(), p.clone());
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                Event::ForestCreated { .. }
+                | Event::RootRotated { .. }
+                | Event::RecoveryKeyRegistered { .. }
+                | Event::RecoveryKeyRevoked { .. } => {
+                    return Err(PvfsError::Forbidden {
+                        action: ev.kind().into(),
+                        reason: "this box's key is a member here — only the root may".into(),
+                    })
+                }
+                Event::DeviceAuthorized { .. } | Event::DeviceRevoked { .. } | Event::CertificatesBound { .. } => {
+                    projection::check_device_cert(&self.conn, &root, &self.identity.root_node_id, ev.author(), now_ms())?
+                }
+                _ => projection::check_member_event_batched(&self.conn, ev, now_ms(), &born)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Append durable events + fold, atomically (spec §9.1), with optional
     /// extra temp-table work in the same transaction. P7.2a: each event is
     /// routed to its region's log (doc 20 §2.3); a batch may span logs, and
@@ -1671,6 +1712,13 @@ impl Engine {
                 action: "write".into(),
                 reason: f.refusal(),
             });
+        }
+        // PVOS D193 — a box whose own key is only a MEMBER here (a personal
+        // forest's host) must not append what replay would refuse, its own and
+        // every follower's: its local writes pass the author and ACL rules a
+        // member's routed write does. An owner device keeps its implicit rights.
+        if self.device.device_index == crate::acl::MEMBER_DEVICE_INDEX {
+            self.authorize_as_member(&events)?;
         }
         let routes = self.route_events(&events)?;
         // Attach every non-top target before the transaction (ATTACH cannot

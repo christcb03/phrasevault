@@ -5,6 +5,36 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Personal forests (PVOS D193; protocol 15).** `pvfs_core::personal`:
+  a person's forest genesis, prepared from public keys and parameters the
+  SIGNER chooses (a fresh random forest id — so no certificate in it can
+  name another forest the phrase roots — the instance id, time and root
+  nonce) and signed where the person's keys are: `ForestCreated` (root,
+  born bound), the phrase's DEVICE key (`1'/0'`) as the owner device, the
+  root folder and its link (owner), and the hosting box's key as a member
+  with no grant. `init_signed_genesis` checks every signature in memory,
+  then opens the forest — the fold is the full verifying replay — and keeps
+  it only if it holds. `SessionCert` / `session_cert_events`: a session key
+  admitted as a member of THIS forest and granted `rw` on its root until it
+  expires, by the owner key. New daemon call **`CommitSigned`**: events
+  their authors signed elsewhere, delivered by any authenticated connection
+  and verified exactly as their author's own commit (it grants the
+  deliverer nothing). An engine whose own device is a member now checks the
+  member rules on its own writes (it could append what every follower would
+  refuse).
+- **The companion builds what it signs for PVOS (D193).** A relayed
+  `sign_in` carries its login fields and the companion computes the digest
+  itself — a sign-in digest it did not build is refused, so no server can
+  pass off 32 bytes as a login (a PVOS server from before D193 cannot be
+  signed into with this companion until it is updated). New relay kinds:
+  `personal_genesis` (prompted in the companion's own words; it picks the
+  forest id and signs with the root and device keys), `session_cert`
+  (silent like a sign-in, and only for a forest this phrase's device key
+  bound as its own on the very site asking), `confirm` (a delete or a
+  grant, prompted in words written from the structured operation; an
+  operation it does not know is refused). The device key is reached only
+  from these — no `request_type` maps to it — so the companion's raw-digest
+  identity paths can never touch a personal forest.
 - **A catalogue head bump writes only what changed (PVOS D194).**
   `Engine::install_region_snapshot` used to delete a fetched region's rows
   and insert the manifest's in one transaction — ≈59,000 row writes on the

@@ -45,6 +45,11 @@ pub enum KeyRole {
     Identity,
     /// The `2'/<id>'` decryption credential (doc 12 §8.5) — ECDH only, no signing.
     Encryption,
+    /// PVOS D193 — the phrase's device key `1'/0'`: the owner device of the
+    /// person's personal forests. Signed with ONLY from structured requests
+    /// whose digests the companion builds itself — no `request_type` maps
+    /// to it, so no raw digest ever reaches it.
+    Device,
 }
 
 impl RequestType {
@@ -130,6 +135,7 @@ impl UnlockedSigner {
             KeyRole::Root => identity::root_key(&self.mnemonic, ""),
             KeyRole::Identity => identity::identity_key(&self.mnemonic, "", self.identity_id),
             KeyRole::Encryption => identity::encryption_key(&self.mnemonic, "", 0),
+            KeyRole::Device => identity::device_key(&self.mnemonic, "", 0),
         }
         .map_err(|e| SignerError::Identity(e.to_string()))
     }
@@ -150,6 +156,16 @@ impl UnlockedSigner {
             ));
         }
         let key = self.key_for(request.key_role())?;
+        crypto::sign_digest(&key, digest).map_err(|e| SignerError::Sign(e.to_string()))
+    }
+
+    /// PVOS D193 — sign a digest the CALLER built from structured fields, with
+    /// the root or device key. Never reachable from a raw `Sign` request.
+    pub(crate) fn sign_built(&self, role: KeyRole, digest: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
+        if !matches!(role, KeyRole::Root | KeyRole::Device) {
+            return Err(SignerError::Sign("only the root and device keys sign built statements".into()));
+        }
+        let key = self.key_for(role)?;
         crypto::sign_digest(&key, digest).map_err(|e| SignerError::Sign(e.to_string()))
     }
 

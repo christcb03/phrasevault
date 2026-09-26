@@ -67,17 +67,97 @@ pub fn verify_code(digest: &[u8; 32]) -> String {
 
 /// The relayed request a paired server signs (transmitted as the exact JSON
 /// string the signature covers — no canonicalization games).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RelayPayload {
-    /// `"sign_in"` or `"user_action"`.
+    /// `"sign_in"`, `"user_action"`, or (PVOS D193) `"session_cert"`,
+    /// `"personal_genesis"`, `"confirm"`.
     pub kind: String,
     /// The paired server's pubkey (hex) — selects the pairing to verify with.
     pub server_pubkey: String,
-    /// The 32-byte digest (hex) to sign.
+    /// The 32-byte digest (hex) to sign — `user_action` only now. A D193
+    /// `sign_in` is built from `login`; the other D193 kinds from their own
+    /// fields. (An older server's `sign_in` digest must match what the
+    /// companion builds.)
+    #[serde(default)]
     pub digest: String,
     /// Required for `user_action` (doc 16 §3); optional context for sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ApprovalContext>,
+    /// D193 `sign_in`: the login's fields — the companion builds the digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginFields>,
+    /// D193 `session_cert`: certify a session in the member's personal forest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_cert: Option<SessionCertFields>,
+    /// D193 `personal_genesis`: make the member's personal forest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<GenesisFields>,
+    /// D193 `confirm`: a delete or a grant — the companion writes the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ConfirmFields>,
+}
+
+/// D193: a personal forest's genesis as the companion built and signed it:
+/// the person's keys, the parameters it chose, five signatures in log order,
+/// and the owner key's binding for the asking site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisOut {
+    pub root: String,
+    pub owner: String,
+    pub identity: String,
+    pub forest_id: String,
+    pub instance_id: String,
+    pub created_at: u64,
+    pub root_nonce: String,
+    pub sigs: Vec<String>,
+    pub binding_sig: String,
+}
+
+/// D193: a PVOS sign-in's fields (pvos-core `login_digest` v2 inputs).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoginFields {
+    /// Hex.
+    pub nonce: String,
+    pub instance_id: String,
+    pub expiry_ms: u64,
+    /// Hex, compressed.
+    pub session_pubkey: String,
+}
+
+/// D193: what a session certificate needs — and the binding that says the
+/// forest is this member's own on this site (checked before anything is
+/// signed; the companion picks the times).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionCertFields {
+    pub member: String,
+    pub rp_id: String,
+    pub forest_id: String,
+    pub root_node_id: String,
+    pub binding_sig: String,
+    pub session_pubkey: String,
+}
+
+/// D193: a personal forest to make for `member`, hosted by the box whose
+/// key is `host_pub` (a member there with no grant). The companion picks
+/// the forest's parameters.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenesisFields {
+    pub member: String,
+    pub host_pub: String,
+}
+
+/// D193: a delete or a grant for the human to confirm, as data: the
+/// companion writes the words from `op`, `subject` and `detail`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfirmFields {
+    pub op: String,
+    pub subject: String,
+    #[serde(default)]
+    pub detail: String,
+    pub instance_id: String,
+    /// Hex.
+    pub nonce: String,
+    pub expiry_ms: u64,
 }
 
 /// A pairing as reported over the socket (no secrets — it's all public data).
@@ -210,6 +290,14 @@ pub enum AgentResponse {
     },
     /// A recovered secure-blob content key (hex), from `SecureUnwrap`.
     ContentKey { content_key: String },
+    /// D193 — a session certificate the companion built: the owner key and
+    /// the times it chose, and one signature per event in log order.
+    Certified { pubkey: String, at: u64, expires_at: u64, sigs: Vec<String> },
+    /// D193 — a personal forest's genesis the companion built and signed.
+    Genesis(Box<GenesisOut>),
+    /// D193 — a confirmed delete or grant: the owner key's signature over
+    /// pvos-core `confirm_digest`.
+    Confirmed { pubkey: String, sig: String },
     /// Pairing accepted: the identity pubkey (hex) the server stores and will
     /// verify relayed answers against.
     Paired { identity_pubkey: String },

@@ -234,6 +234,23 @@ impl WebAgent {
                         ),
                         other => error_response(other),
                     },
+                    // PVOS D193 — the statements the companion built: the page
+                    // forwards these as the relay outcome they name.
+                    AgentResponse::Certified { pubkey, at, expires_at, sigs } => (
+                        200,
+                        "OK",
+                        serde_json::json!({"outcome": "certified", "pubkey": pubkey, "at": at, "expires_at": expires_at, "sigs": sigs}).to_string(),
+                    ),
+                    AgentResponse::Genesis(g) => {
+                        let mut v = serde_json::to_value(&*g).unwrap_or_default();
+                        v["outcome"] = "genesis".into();
+                        (200, "OK", v.to_string())
+                    }
+                    AgentResponse::Confirmed { pubkey, sig } => (
+                        200,
+                        "OK",
+                        serde_json::json!({"outcome": "confirmed", "pubkey": pubkey, "sig": sig}).to_string(),
+                    ),
                     other => error_response(other),
                 }
             }

@@ -128,13 +128,15 @@ fn pairing_and_relay_end_to_end() {
         std::thread::spawn(move || w.serve(http, None));
     }
 
-    // sign_in happy path (note: NO x-pvfs-token header anywhere).
-    let digest = [7u8; 32];
+    // sign_in happy path (note: NO x-pvfs-token header anywhere). D193: the
+    // companion builds the login digest from its fields.
+    let login = login_fields();
+    let digest = login_digest_of(&login);
     let payload = RelayPayload {
         kind: "sign_in".into(),
         server_pubkey: server_pub.clone(),
-        digest: hex::encode(digest),
-        context: None,
+        login: Some(login.clone()),
+        ..Default::default()
     };
     let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &payload));
     assert!(resp.contains("200 OK"), "sign_in relay: {resp}");
@@ -146,6 +148,15 @@ fn pairing_and_relay_end_to_end() {
     // D29: sign-in over the trusted (key, url) is AUTOMATIC — no prompt ran.
     let seen = summaries.lock().unwrap().clone();
     assert!(seen.is_empty(), "sign_in must not prompt on a trusted url: {seen}");
+
+    // D193: a sign-in is never signed from a handed digest — without its
+    // fields it is refused, and a digest that is not the fields' is refused.
+    let raw = RelayPayload { kind: "sign_in".into(), server_pubkey: server_pub.clone(), digest: hex::encode([7u8; 32]), ..Default::default() };
+    let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &raw));
+    assert!(resp.contains("bad_input"), "a raw sign-in digest: {resp}");
+    let lying = RelayPayload { digest: hex::encode([7u8; 32]), ..payload.clone() };
+    let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &lying));
+    assert!(resp.contains("bad_input"), "a digest that is not the login's: {resp}");
 
     // Untrusted url + a prompter that doesn't grant trust (the Recorder keeps
     // the default-deny `approve_trust_url`) → bad_origin. The envelope was
@@ -184,6 +195,7 @@ fn pairing_and_relay_end_to_end() {
         server_pubkey: server_pub.clone(),
         digest: hex::encode([1u8; 32]),
         context: Some(ctx.clone()),
+        ..Default::default()
     };
     let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &mismatch));
     assert!(resp.contains("bad_input"), "context mismatch refused: {resp}");
@@ -193,6 +205,7 @@ fn pairing_and_relay_end_to_end() {
         server_pubkey: server_pub.clone(),
         digest: hex::encode(action_digest),
         context: Some(ctx),
+        ..Default::default()
     };
     let resp = http_post(&addr, "/relay", Some(origin_ok), &envelope(&server_sign, &action));
     assert!(resp.contains("200 OK"), "user_action relay: {resp}");
@@ -266,8 +279,8 @@ fn new_url_for_known_key_prompts_once_then_signs_in_automatically() {
     let payload = RelayPayload {
         kind: "sign_in".into(),
         server_pubkey: server_pub.clone(),
-        digest: hex::encode([7u8; 32]),
-        context: None,
+        login: Some(login_fields()),
+        ..Default::default()
     };
     let payload_json = serde_json::to_string(&payload).unwrap();
     let d = crypto::domain_digest(RELAY_DOMAIN, payload_json.as_bytes());
@@ -289,4 +302,23 @@ fn new_url_for_known_key_prompts_once_then_signs_in_automatically() {
     let resp = agent.relay("https://pvos.example", &payload_json, &sig_hex);
     assert!(matches!(resp, AgentResponse::Signature { .. }), "{resp:?}");
     assert_eq!(asked.load(Ordering::SeqCst), 1, "no second trust prompt");
+}
+
+/// A PVOS sign-in's fields (D193), and the digest pvos-core builds from them.
+fn login_fields() -> pvfs_companion::LoginFields {
+    pvfs_companion::LoginFields {
+        nonce: hex::encode([3u8; 16]),
+        instance_id: "00000000-0000-4000-8000-000000000001".into(),
+        expiry_ms: u64::MAX / 2,
+        session_pubkey: "03d02843b4ffdfe3ae8a18feb3a9a2e6a4d5cc39150f2e8d9990da1b281355d744".into(),
+    }
+}
+
+fn login_digest_of(l: &pvfs_companion::LoginFields) -> [u8; 32] {
+    pvfs_companion::pvos::login_digest(
+        &hex::decode(&l.nonce).unwrap(),
+        &l.instance_id,
+        l.expiry_ms,
+        &hex::decode(&l.session_pubkey).unwrap(),
+    )
 }
