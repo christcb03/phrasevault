@@ -278,7 +278,14 @@ pub fn trusted_announcers(engine: &Engine) -> std::collections::HashSet<String> 
 /// One poll of every announced peer (minus this box), folded into the
 /// record on disk. Honours `cancel` between peers (D123).
 pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, PvfsError> {
-    let engine = Engine::open(data_dir)?;
+    // PVOS D188 — this job only READS the forest (endpoint and version
+    // records): a read view, not a second writer engine whose close commits
+    // an owner's region heads every poll. Where a view cannot open (no
+    // daemon holds the forest; a replica), the full open, as before.
+    let engine = match Engine::open_read_view(data_dir) {
+        Ok(view) => view,
+        Err(_) => Engine::open(data_dir)?,
+    };
     let forest = engine.identity.forest_id.clone();
     let own = pvfs_core::storage::host_pin(data_dir);
     let all = crate::fetch::catalog_endpoints(&engine);
@@ -293,6 +300,10 @@ pub fn poll_fleet(data_dir: &Path, cancel: &AtomicBool) -> Result<FleetHealth, P
     let trusted = trusted_announcers(&engine);
     engine.close()?;
     let mut record = FleetHealth::load(data_dir)?.unwrap_or_default();
+    // PVOS D188 — a peer no longer announced (a retired owner, whose
+    // device the promotion revoked; a retracted endpoint) leaves the record.
+    // It stayed listed as "not answering" forever.
+    record.peers.retain(|pin, _| endpoints.contains_key(pin));
     for (pin, addr) in endpoints {
         if cancel.load(Ordering::SeqCst) {
             break;

@@ -37,7 +37,8 @@ fn a_revoked_devices_endpoint_is_skipped_and_a_members_is_kept() {
     // The old owner announced itself: its device key wrote the record.
     let fleet = owner.add_node(&root, node(".fleet", "")).unwrap();
     let eps = owner.add_node(&fleet, node("endpoints", "")).unwrap();
-    owner.add_node(&eps, node("pin-old-owner", "10.0.0.1:7434")).unwrap();
+    // Addresses nothing answers on, refused at once (the health poll dials).
+    owner.add_node(&eps, node("pin-old-owner", "127.0.0.1:1")).unwrap();
 
     // A follower announces itself with its member key, through the owner.
     let member = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
@@ -59,7 +60,7 @@ fn a_revoked_devices_endpoint_is_skipped_and_a_members_is_kept() {
     let mut as_member =
         Client::connect_signed(&sock, &member_pub, move |d| crypto::sign_digest(&m2, d).unwrap()).unwrap();
     as_member
-        .add_node(&eps, "pin-follower", "fleet.endpoint", b"10.0.0.2:7434", |d| {
+        .add_node(&eps, "pin-follower", "fleet.endpoint", b"127.0.0.1:2", |d| {
             crypto::sign_digest(&member, d).unwrap()
         })
         .unwrap();
@@ -72,6 +73,8 @@ fn a_revoked_devices_endpoint_is_skipped_and_a_members_is_kept() {
     pins.sort();
     assert_eq!(pins, vec!["pin-follower", "pin-old-owner"]);
     e.close().unwrap();
+    let polled = pvfs_client::health::poll_fleet(&data, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert_eq!(polled.peers.keys().collect::<Vec<_>>(), vec!["pin-follower", "pin-old-owner"]);
 
     // The promotion: a new owner device admitted, the old one revoked, the
     // data dir now holding the new device's key.
@@ -88,8 +91,12 @@ fn a_revoked_devices_endpoint_is_skipped_and_a_members_is_kept() {
     assert!(!e.is_revoked_device(&member_pub).unwrap(), "a member key is never a revoked device");
     let eps_now = pvfs_client::fetch::catalog_endpoints(&e);
     assert_eq!(eps_now.keys().collect::<Vec<_>>(), vec!["pin-follower"], "the retired owner is not dialed");
-    assert_eq!(eps_now["pin-follower"], "10.0.0.2:7434");
+    assert_eq!(eps_now["pin-follower"], "127.0.0.1:2");
     // Who announced what stays on record (the fence's evidence rule reads it).
     assert!(pvfs_client::fetch::catalog_endpoint_authors(&e).contains_key("pin-old-owner"));
     e.close().unwrap();
+
+    // …and the owner's health record stops listing it as "not answering".
+    let polled = pvfs_client::health::poll_fleet(&data, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+    assert_eq!(polled.peers.keys().collect::<Vec<_>>(), vec!["pin-follower"], "the retired owner leaves the record");
 }

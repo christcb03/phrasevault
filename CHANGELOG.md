@@ -30,7 +30,10 @@ file tracks Layer 0, the file-system engine.
     promotion revokes the old owner's — so no box dials it each pass and the
     owner stops paging "peer down" for it. A follower's record (written with
     its member key) is never hidden by this; a re-announce rewrites a hidden
-    record under the box's current key.
+    record under the box's current key. The owner's health record drops a
+    peer that is no longer announced (it listed it "not answering" forever),
+    and the health job reads through a read view (it only reads; its full
+    open committed an owner's region heads on every poll).
   - `serve status --json` carries `mounts` and `backup`, as the daemon sends
     them.
 - **Every request over the network cost about half a second (PVOS D187).**
