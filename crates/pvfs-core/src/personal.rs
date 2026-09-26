@@ -6,10 +6,13 @@
 //! browser, or their companion):
 //!
 //! 1. `ForestCreated` — root-signed, v2: born bound (D192);
-//! 2. their IDENTITY key (`3'/0'` of their phrase) as the forest's owner
-//!    device — the key that signs them in and certifies their sessions,
-//!    which a browser and a companion both hold;
-//! 3. the root folder and 4. its link — by that identity;
+//! 2. their DEVICE key (`1'/0'` of their phrase — what `pvfs forest init`
+//!    makes device 0) as the forest's owner device: it certifies their
+//!    sessions, and a browser and a companion both hold it. Not the identity
+//!    key (`3'/0'`): a companion signs raw digests with the identity (sign-in
+//!    assertions) and never with the device key, so no such path can reach a
+//!    personal forest;
+//! 3. the root folder and 4. its link — by that device key;
 //! 5. the hosting box's key as a member with NO grant: it serves the forest
 //!    and commits what the person signed; it can grant, revoke or delete
 //!    nothing on its own.
@@ -44,8 +47,8 @@ use crate::projection;
 pub struct PersonalGenesis {
     /// The person's root (`0'`): roots the forest.
     pub root_pub: Vec<u8>,
-    /// The person's identity (`3'/0'`): the forest's owner device.
-    pub identity_pub: Vec<u8>,
+    /// The person's device key (`1'/0'`): the forest's owner device.
+    pub owner_pub: Vec<u8>,
     /// The hosting box's key: a member with no grant.
     pub host_pub: Vec<u8>,
 }
@@ -106,7 +109,7 @@ impl GenesisParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenesisSigner {
     Root,
-    Identity,
+    Owner,
 }
 
 #[derive(Clone, Debug)]
@@ -139,15 +142,15 @@ impl PreparedGenesis {
         Ok(self.events.into_iter().zip(sigs).map(|(p, sig)| with_sig(p.event, sig)).collect())
     }
 
-    /// Sign every event here, with the person's two keys (tests; a tool
-    /// holding the phrase).
-    pub fn sign(self, root: &SigningKey, identity: &SigningKey) -> Result<Vec<Event>> {
+    /// Sign every event here, with the person's two keys (a companion; tests;
+    /// a tool holding the phrase).
+    pub fn sign(self, root: &SigningKey, owner: &SigningKey) -> Result<Vec<Event>> {
         let sigs = self
             .events
             .iter()
             .map(|p| match p.signer {
                 GenesisSigner::Root => crypto::sign_digest(root, &p.digest),
-                GenesisSigner::Identity => crypto::sign_digest(identity, &p.digest),
+                GenesisSigner::Owner => crypto::sign_digest(owner, &p.digest),
             })
             .collect::<Result<Vec<_>>>()?;
         self.attach(sigs)
@@ -172,7 +175,7 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
 /// to attach the signatures the person's browser made over them.
 pub fn prepare_personal_genesis_with(g: &PersonalGenesis, params: GenesisParams) -> Result<PreparedGenesis> {
     params.validate()?;
-    let keys = [&g.root_pub, &g.identity_pub, &g.host_pub];
+    let keys = [&g.root_pub, &g.owner_pub, &g.host_pub];
     for k in keys {
         crypto::validate_pubkey(k)?;
     }
@@ -180,13 +183,13 @@ pub fn prepare_personal_genesis_with(g: &PersonalGenesis, params: GenesisParams)
         if keys[..i].contains(a) {
             return Err(PvfsError::BadInput {
                 field: "genesis".into(),
-                reason: "the root, identity and host keys must all differ".into(),
+                reason: "the root, owner and host keys must all differ".into(),
             });
         }
     }
     let GenesisParams { forest_id, instance_id, created_at: t, root_nonce: creation_nonce } = params.clone();
     let f = Some(forest_id.as_str());
-    let (root, device) = (g.root_pub.clone(), g.identity_pub.clone());
+    let (root, device) = (g.root_pub.clone(), g.owner_pub.clone());
     let payload = node::folder_payload();
     let root_digest = node::compute_id_digest(
         node::TYPE_FOLDER,
@@ -261,8 +264,8 @@ pub fn prepare_personal_genesis_with(g: &PersonalGenesis, params: GenesisParams)
                 sig: Vec::new(),
             },
         },
-        PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: root_digest, event: Event::NodeCreated(root_node) },
-        PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: link_digest, event: Event::LinkCreated(root_link) },
+        PreparedGenesisEvent { signer: GenesisSigner::Owner, digest: root_digest, event: Event::NodeCreated(root_node) },
+        PreparedGenesisEvent { signer: GenesisSigner::Owner, digest: link_digest, event: Event::LinkCreated(root_link) },
         member(&g.host_pub),
     ];
     Ok(PreparedGenesis { params, events })
@@ -349,7 +352,7 @@ pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: Signin
 /// PVOS D193 — a SESSION CERTIFICATE in a personal forest: the session key
 /// admitted as a member (`DeviceAuthorized`, v2 — this forest only) and
 /// granted `rw` on the forest root until `expires_at` (`AclSet`, v2), both by
-/// the person's identity key, the forest's owner device. What a sign-in
+/// the person's device key, the forest's owner device. What a sign-in
 /// signs: the signer builds these from the fields itself — never from
 /// digests a server hands it — and the box that hosts the forest delivers
 /// them (`CommitSigned`). The session key holds no `a`: it can grant, admit
@@ -358,7 +361,8 @@ pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: Signin
 pub struct SessionCert {
     pub forest_id: String,
     pub root_node_id: String,
-    pub identity_pub: Vec<u8>,
+    /// The forest's owner device (the person's `1'/0'`): the author.
+    pub owner_pub: Vec<u8>,
     pub session_pub: Vec<u8>,
     /// When it was signed (ms): both events' time.
     pub at: u64,
@@ -367,20 +371,20 @@ pub struct SessionCert {
 }
 
 /// The session certificate's two events, unsigned, each with the digest the
-/// identity signs, in log order.
+/// owner key signs, in log order.
 pub fn session_cert_events(c: &SessionCert) -> Result<Vec<PreparedEvent>> {
     let bad = |reason: &str| PvfsError::BadInput { field: "session certificate".into(), reason: reason.into() };
-    crypto::validate_pubkey(&c.identity_pub)?;
+    crypto::validate_pubkey(&c.owner_pub)?;
     crypto::validate_pubkey(&c.session_pub)?;
-    if c.identity_pub == c.session_pub {
-        return Err(bad("the session key must not be the identity"));
+    if c.owner_pub == c.session_pub {
+        return Err(bad("the session key must not be the owner key"));
     }
     if c.at == 0 || c.expires_at <= c.at {
         return Err(bad("a session grant is made at a time and expires after it"));
     }
     let key = Principal::Key(c.session_pub.clone());
     let rights = (ACL_R | ACL_W) as u64;
-    let id = &c.identity_pub;
+    let id = &c.owner_pub;
     Ok(vec![
         PreparedEvent {
             digest: event::msg_device_authorized(Some(&c.forest_id), &c.session_pub, MEMBER_DEVICE_INDEX, c.at, id),

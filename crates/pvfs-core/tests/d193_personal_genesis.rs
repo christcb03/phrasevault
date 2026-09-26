@@ -1,8 +1,8 @@
 //! PVOS D193 — a personal forest's genesis, signed by the person.
 //!
-//! Prepared from public keys, signed with the person's root and identity
-//! keys, committed by the hosting box only after a full verifying replay.
-//! The box's key is a member with no grant; the person's identity key is the
+//! Prepared from public keys, signed with the person's root and device keys,
+//! committed by the hosting box only after a full verifying replay. The box's
+//! key is a member with no grant; the person's device key (`1'/0'`) is the
 //! owner device (it certifies their session keys).
 
 use pvfs_core::acl::{Principal, ACL_A, ACL_R, ACL_W};
@@ -15,7 +15,7 @@ use pvfs_core::{crypto, identity, Engine, NodeSpec};
 
 struct Person {
     root: identity::SigningKey,
-    ident: identity::SigningKey,
+    owner: identity::SigningKey,
 }
 
 impl Person {
@@ -23,14 +23,14 @@ impl Person {
         let mn = identity::generate_mnemonic().unwrap();
         Person {
             root: identity::root_key(&mn, "").unwrap(),
-            ident: identity::identity_key(&mn, "", 0).unwrap(),
+            owner: identity::device_key(&mn, "", 0).unwrap(),
         }
     }
 
     fn genesis(&self, host: &identity::SigningKey) -> PersonalGenesis {
         PersonalGenesis {
             root_pub: crypto::pubkey_bytes(&self.root),
-            identity_pub: crypto::pubkey_bytes(&self.ident),
+            owner_pub: crypto::pubkey_bytes(&self.owner),
             host_pub: crypto::pubkey_bytes(host),
         }
     }
@@ -45,7 +45,7 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
     assert_eq!(prep.events.len(), 5);
     let forest_id = prep.params.forest_id.clone();
-    let events = prep.sign(&person.root, &person.ident).unwrap();
+    let events = prep.sign(&person.root, &person.owner).unwrap();
     let mut engine = init_signed_genesis(&data, events, host.clone()).unwrap();
 
     assert_eq!(engine.identity.forest_id, forest_id);
@@ -53,7 +53,7 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     assert_eq!(engine.current_root().unwrap(), crypto::pubkey_bytes(&person.root));
     let root = engine.identity.root_node_id.clone();
     let rights = |k: &identity::SigningKey| engine.effective_rights(&Principal::Key(crypto::pubkey_bytes(k)), &root).unwrap();
-    assert_eq!(rights(&person.ident), ACL_R | ACL_W | ACL_A, "the identity is the owner device");
+    assert_eq!(rights(&person.owner), ACL_R | ACL_W | ACL_A, "the device key is the owner device");
     assert_eq!(rights(&host), 0, "the host holds no grant");
 
     // the host cannot write on its own, nor admit anyone
@@ -68,10 +68,10 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     let stranger = crypto::pubkey_bytes(&identity::generate_device_key());
     assert!(engine.prepare_authorize_member(&crypto::pubkey_bytes(&host), &stranger).is_err());
 
-    // the person's identity certifies a session key (what a sign-in does)
+    // the person's device key certifies a session key (what a sign-in does)
     let session = crypto::pubkey_bytes(&identity::generate_device_key());
-    let mut p = engine.prepare_authorize_member(&crypto::pubkey_bytes(&person.ident), &session).unwrap().events.remove(0);
-    p.event.set_author_sig(crypto::sign_digest(&person.ident, &p.digest).unwrap());
+    let mut p = engine.prepare_authorize_member(&crypto::pubkey_bytes(&person.owner), &session).unwrap().events.remove(0);
+    p.event.set_author_sig(crypto::sign_digest(&person.owner, &p.digest).unwrap());
     engine.commit_member_write(vec![p.event]).unwrap();
     assert!(engine.authority_active(&session).unwrap());
     engine.close().unwrap();
@@ -86,13 +86,13 @@ fn a_genesis_that_does_not_verify_leaves_nothing() {
     let person = Person::new();
     let host = identity::generate_device_key();
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
-    // the identity's events signed by someone else
+    // the owner's events signed by someone else
     let events = prep.clone().sign(&person.root, &identity::generate_device_key()).unwrap();
     assert!(init_signed_genesis(&data, events, host.clone()).is_err());
     assert!(!data.exists(), "nothing is left behind");
 
     // a genesis signed in the unbound (v1) form: a personal forest is born bound
-    let mut events = prep.sign(&person.root, &person.ident).unwrap();
+    let mut events = prep.sign(&person.root, &person.owner).unwrap();
     if let Event::ForestCreated { instance_id, forest_id, root_node_id, created_at, author, sig } = &mut events[0] {
         let v1 = event::msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, false);
         *sig = crypto::sign_digest(&person.root, &v1).unwrap();
@@ -109,13 +109,13 @@ fn the_box_opens_it_only_with_the_key_the_genesis_admits() {
     let data = dir.path().join("people-carol");
     let person = Person::new();
     let host = identity::generate_device_key();
-    let events = prepare_personal_genesis(&person.genesis(&host)).unwrap().sign(&person.root, &person.ident).unwrap();
+    let events = prepare_personal_genesis(&person.genesis(&host)).unwrap().sign(&person.root, &person.owner).unwrap();
     assert!(init_signed_genesis(&data, events, identity::generate_device_key()).is_err());
     assert!(!data.exists());
 
     let mut same = person.genesis(&host);
-    same.identity_pub = same.root_pub.clone();
-    assert!(prepare_personal_genesis(&same).is_err(), "the four keys must differ");
+    same.owner_pub = same.root_pub.clone();
+    assert!(prepare_personal_genesis(&same).is_err(), "the keys must differ");
 }
 
 /// BIP39's all-zero 256-bit vector.
@@ -154,23 +154,25 @@ fn the_phrase_keys_the_page_must_derive() {
 fn the_genesis_digests_the_page_must_recompute() {
     use pvfs_core::{acl, link, node};
     let root = hex::decode("036242fd83e40688fc2c61fa05061edc98fef9bf2e4c85c28718b9d5f4f6acd2ac").unwrap();
-    let ident = hex::decode("036435e78bcc147f4c92e0db70d4107d0c5bf04b169cf1b3d339212088df21a544").unwrap();
-    let host = hex::decode("02c3a30e05b8c44bf16f0fcec80f481954acb45984d6ff6d6b0766385362092656").unwrap();
+    // the owner: the vector's device key 1'/0'
+    let owner = hex::decode("02c3a30e05b8c44bf16f0fcec80f481954acb45984d6ff6d6b0766385362092656").unwrap();
+    // any other key will do as the host's: the vector's encryption key
+    let host = hex::decode("03d02843b4ffdfe3ae8a18feb3a9a2e6a4d5cc39150f2e8d9990da1b281355d744").unwrap();
     let (instance, forest, t, nonce) = ("pvfs-00000001", "00000000-0000-4000-8000-000000000001", 1_700_000_000_000u64, 0x0123_4567_89ab_cdefu64);
-    let node_id = hex::encode(node::compute_id_digest(node::TYPE_FOLDER, "root", node::VISIBILITY_PUBLIC, &[], false, nonce, t, &ident));
+    let node_id = hex::encode(node::compute_id_digest(node::TYPE_FOLDER, "root", node::VISIBILITY_PUBLIC, &[], false, nonce, t, &owner));
     let got = [
         ("root node", node_id.clone()),
         ("root link", hex::encode(link::compute_id_digest(None, &node_id, link::LINK_CONTAINS, 0))),
         ("forest created v2", hex::encode(event::msg_forest_created(instance, forest, &node_id, t, &root, true))),
-        ("identity as owner device", hex::encode(event::msg_device_authorized(Some(forest), &ident, 0, t, &root))),
+        ("device key as owner device", hex::encode(event::msg_device_authorized(Some(forest), &owner, 0, t, &root))),
         ("host as member", hex::encode(event::msg_device_authorized(Some(forest), &host, acl::MEMBER_DEVICE_INDEX, t, &root))),
     ];
     let pinned = [
-        "31071f80e0846ec198c1e2327480f4440fecc9a94af5bd92710b87c24331ff80",
-        "5cc12ef8cdcfae7b6afda6cd6ec4893853c21de1eb0f5c921f796f6e185cc64c",
-        "2ae3f1e6fcfb6c40784dc6c9f147fccfdc95e3dbb3e34f98a0aac13d5d4b7f68",
-        "889c858d02e774d5f950f336eb5940eb034c20f8a9e43cada785eda4a1025b97",
-        "7eaf631a33e329df0751ee57b42a0676215d6f96a580618f9fa04b11a7b634d3",
+        "ab6204fd70bb60e2dbaa651ac02bb755289ac2673fefb49e30c8eef6c68835fb",
+        "11aef9525fd2eba6c68b502be50e47cfe6e7ee1a1f66d2a312bb969b6b4dfb16",
+        "502b11561516cb8e4fbfd885707fdd3520294246e988785e8c2f99036df87265",
+        "6ce5ea738991800e65aaf6086b42976d7b88e1767b191290982e0b848beb06e6",
+        "c00c8a1d1898f119bdb3ef08fde6b26033a7e4f6777e459a1b61fd918c8b5e8b",
     ];
     for ((what, d), want) in got.iter().zip(pinned) {
         assert_eq!(d, want, "{what}");
@@ -179,9 +181,9 @@ fn the_genesis_digests_the_page_must_recompute() {
     // ... and they are exactly what the box prepares from those parameters,
     // in log order, each with its signer.
     let params = GenesisParams { forest_id: forest.into(), instance_id: instance.into(), created_at: t, root_nonce: nonce };
-    let g = PersonalGenesis { root_pub: root, identity_pub: ident, host_pub: host };
+    let g = PersonalGenesis { root_pub: root, owner_pub: owner, host_pub: host };
     let prep = prepare_personal_genesis_with(&g, params).unwrap();
-    let order = [(2, GenesisSigner::Root), (3, GenesisSigner::Root), (0, GenesisSigner::Identity), (1, GenesisSigner::Identity), (4, GenesisSigner::Root)];
+    let order = [(2, GenesisSigner::Root), (3, GenesisSigner::Root), (0, GenesisSigner::Owner), (1, GenesisSigner::Owner), (4, GenesisSigner::Root)];
     assert_eq!(prep.events.len(), order.len());
     for (p, (i, signer)) in prep.events.iter().zip(order) {
         assert_eq!(hex::encode(p.digest), pinned[i], "{}", got[i].0);
@@ -192,26 +194,26 @@ fn the_genesis_digests_the_page_must_recompute() {
     // deterministic, so the page's must be these exact bytes) — and they
     // make a personal forest the box keeps.
     let mn = identity::parse_mnemonic(VECTOR).unwrap();
-    let (root_key, ident_key) = (identity::root_key(&mn, "").unwrap(), identity::identity_key(&mn, "", 0).unwrap());
+    let (root_key, owner_key) = (identity::root_key(&mn, "").unwrap(), identity::device_key(&mn, "", 0).unwrap());
     let sigs: Vec<String> = prep
         .events
         .iter()
         .map(|p| {
-            let key = if p.signer == GenesisSigner::Root { &root_key } else { &ident_key };
+            let key = if p.signer == GenesisSigner::Root { &root_key } else { &owner_key };
             hex::encode(crypto::sign_digest(key, &p.digest).unwrap())
         })
         .collect();
     let pinned_sigs = [
-        "259a215ad3612da674e615d63b774aeb1fcfd74ced43919a473b66e66abe35dc02d668d64523b96ab5d45c162e3f737fdd9b61dd36d2375379332e02e08a26ac",
-        "b3d4d50c9cbd5bd84588329b79e6c1325ec56f28fdad27135d53dae3e93bfd82765a0289ce20aadddf94f8b3b3daf5e488d698da2033790c449076b93c7718f6",
-        "2c30841f2edfd13a9aabe25d5523cdba295c411fd81c2f06ff3009ed31bbb6ac7b2f6bd46722efff3f7ce5262c463ca96ae4925cf3237a932bebb794ff27a358",
-        "9b6a53a7062df17120298fe76e5f60c746608ee6c5d2b1a5d6e375d5c8bee7aa198a481810a02d5fc70047de4cdc29e134aaaa7b58a3320b78d2d0dbe3347bc4",
-        "ffe2f994b1fce79d9cbd6c9ae115977b83783091ef07eb3d3e866146ed1276a465dc69b57ba2ee371d0586224ef4d8e5f22368585c558021bcd48713689bf3e4",
+        "0f3698e75bf64a229156fb4105f67f73ad9765b07ff0c70696482034d190d86a4f104ac0cca0584cb200a2eed563b83c03bd92b570288fee1b8e81f38af64c2c",
+        "7a0307541172811629b996f4ae19a34b24808c93cf834ff9bc2ade3944300e3f4d0fdc6d6057841891e25f0a4fd9c093a7f1d717090fbf2130eeb9fe2413e138",
+        "304781f4eb88dd60545da5ffe5d834b03d2024682d788033382217009996aeda17b708084410631eb19a0594538b3d54c8df6e82e27ed88a36fb5a9bc3a248f3",
+        "1a88a42be38fe884d335f7e15f4f5ab6493b25f490f15030c4815a4e9ea2049575c385880da900166c8a4d6b4d0dfb884d0f32769cf17ea1cde3819bd8a4d874",
+        "8ce8dbce16cc44029acfd0a4fd500f2adf019b8dd84936be4f7ef7783e6fb93033043ad34c1a7a1c3a72df4cb1fc72657cef703a1bf33665a5da1d59d1db661a",
     ];
     assert_eq!(sigs, pinned_sigs, "the genesis signatures");
     let dir = tempfile::tempdir().unwrap();
     let events = prep.attach(sigs.iter().map(|s| hex::decode(s).unwrap()).collect()).unwrap();
-    let host_key = identity::device_key(&mn, "", 0).unwrap();
+    let host_key = identity::encryption_key(&mn, "", 0).unwrap();
     let engine = init_signed_genesis(&dir.path().join("vector"), events, host_key).expect("the vector genesis replays");
     assert_eq!(engine.identity.forest_id, forest);
     engine.close().unwrap();
@@ -240,18 +242,18 @@ fn genesis_parameters_are_checked() {
     assert!(with(&|p| p.created_at = 0).is_err(), "no time");
 }
 
-/// A session certificate from fixed inputs — the digests and the identity's
+/// A session certificate from fixed inputs — the digests and the owner key's
 /// signatures the web page's tests pin too (it builds these itself at every
-/// sign-in, from the forest its own identity bound at join).
+/// sign-in, from the forest its own key bound at join).
 #[test]
 fn the_session_certificate_the_page_must_build() {
     let mn = identity::parse_mnemonic(VECTOR).unwrap();
-    let ident = identity::identity_key(&mn, "", 0).unwrap();
+    let owner = identity::device_key(&mn, "", 0).unwrap();
     let cert = SessionCert {
         forest_id: "00000000-0000-4000-8000-000000000001".into(),
-        root_node_id: "31071f80e0846ec198c1e2327480f4440fecc9a94af5bd92710b87c24331ff80".into(),
-        identity_pub: crypto::pubkey_bytes(&ident),
-        // any key will do as the session's: the vector's encryption key
+        root_node_id: "ab6204fd70bb60e2dbaa651ac02bb755289ac2673fefb49e30c8eef6c68835fb".into(),
+        owner_pub: crypto::pubkey_bytes(&owner),
+        // any other key will do as the session's: the vector's encryption key
         session_pub: hex::decode("03d02843b4ffdfe3ae8a18feb3a9a2e6a4d5cc39150f2e8d9990da1b281355d744").unwrap(),
         at: 1_700_000_001_000,
         expires_at: 1_700_000_001_000 + 7 * 24 * 3_600_000,
@@ -259,11 +261,11 @@ fn the_session_certificate_the_page_must_build() {
     let prepared = session_cert_events(&cert).unwrap();
     let got: Vec<(String, String)> = prepared
         .iter()
-        .map(|p| (hex::encode(p.digest), hex::encode(crypto::sign_digest(&ident, &p.digest).unwrap())))
+        .map(|p| (hex::encode(p.digest), hex::encode(crypto::sign_digest(&owner, &p.digest).unwrap())))
         .collect();
     let pinned = [
-        ("9e0e18bc72ff5cb9639c0022be1244407f0c126ed6fdd38c359f29bb3d3cd2ec", "6456381035a050f64806fc2e20b160d7220c302315a69184d2efe8ff4e8417c31b970d041caaf1c6a26eb8b08e6d822accf7882217fce43602bc1bed76c0df73"), // the session key as a member
-        ("f1dc24e9f0e92b638cfafe03b6662e287cc8885d2ac02c58abcd73c272d196cf", "5d368462b2379aa7843ad1139ae86da76cc7d32e5372ec8a330f71295dfb19762b93437226aeba52ac42fb09c382dd38575f6e09aae352d11e1bccf468b6a2b7"), // rw on the root until expiry
+        ("2fe0a5eeaa9bdbce2a666d9078b1767a5967b006362873d9352241c47ca633d4", "ffb1e8a8ff1ec93fbca584d44d4e67cbcaf428799ed386ea9eb2907726c80f6433ba94ee226746297ff476f591308cbe5747a7efcbab13a7e7f3789baa36e022"), // the session key as a member
+        ("5863431a5c11ceaa98726ad259c54d6c8c2d9b5aea4026f797252d314e18c7db", "2a9b97096a66183bc935443f9e2916137eed55c92e04778e114a7a68316874f923dede8491d8602b26edd6902dc363e535cdf133fc0080c204ec09b63c07cb23"), // rw on the root until expiry
     ];
     for ((d, sig), (wd, ws)) in got.iter().zip(pinned) {
         assert_eq!((d.as_str(), sig.as_str()), (wd, ws));
@@ -273,6 +275,6 @@ fn the_session_certificate_the_page_must_build() {
     bad.expires_at = bad.at;
     assert!(session_cert_events(&bad).is_err(), "a grant that never lives");
     let mut bad = cert.clone();
-    bad.session_pub = bad.identity_pub.clone();
-    assert!(session_cert_events(&bad).is_err(), "the identity as its own session");
+    bad.session_pub = bad.owner_pub.clone();
+    assert!(session_cert_events(&bad).is_err(), "the owner as its own session");
 }

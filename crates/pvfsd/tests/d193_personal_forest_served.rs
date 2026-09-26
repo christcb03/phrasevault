@@ -38,14 +38,14 @@ fn the_box_delivers_what_the_person_signed_and_writes_nothing_itself() {
     std::env::set_var("XDG_CONFIG_HOME", cfg.path());
     let dir = tempfile::tempdir().unwrap();
     let mn = identity::generate_mnemonic().unwrap();
-    let (root, ident) = (identity::root_key(&mn, "").unwrap(), identity::identity_key(&mn, "", 0).unwrap());
+    let (root, owner) = (identity::root_key(&mn, "").unwrap(), identity::device_key(&mn, "", 0).unwrap());
     let host = identity::generate_device_key();
     let g = PersonalGenesis {
         root_pub: crypto::pubkey_bytes(&root),
-        identity_pub: crypto::pubkey_bytes(&ident),
+        owner_pub: crypto::pubkey_bytes(&owner),
         host_pub: crypto::pubkey_bytes(&host),
     };
-    let events = prepare_personal_genesis(&g).unwrap().sign(&root, &ident).unwrap();
+    let events = prepare_personal_genesis(&g).unwrap().sign(&root, &owner).unwrap();
     let engine = init_signed_genesis(&dir.path().join("people-kim"), events, host.clone()).unwrap();
     let (forest_id, root_node) = (engine.identity.forest_id.clone(), engine.identity.root_node_id.clone());
 
@@ -65,7 +65,7 @@ fn the_box_delivers_what_the_person_signed_and_writes_nothing_itself() {
         let prepared = session_cert_events(&SessionCert {
             forest_id: forest_id.clone(),
             root_node_id: root_node.clone(),
-            identity_pub: crypto::pubkey_bytes(&ident),
+            owner_pub: crypto::pubkey_bytes(&owner),
             session_pub: crypto::pubkey_bytes(session),
             at,
             expires_at,
@@ -75,14 +75,14 @@ fn the_box_delivers_what_the_person_signed_and_writes_nothing_itself() {
         attach_sigs(prepared, sigs).unwrap()
     };
 
-    // Forged (signed by a stranger, naming kim's identity): refused.
+    // Forged (signed by a stranger, naming kim's owner key): refused.
     let forger = identity::generate_device_key();
     let stolen = identity::generate_device_key();
     let t = now_ms();
     assert!(boxc.commit_signed(&cert(&stolen, t, t + 3_600_000, &forger)).is_err(), "a forged certificate");
     // Delivered anonymously: refused, however well signed.
     let session = identity::generate_device_key();
-    let good = cert(&session, t, t + 3_600_000, &ident);
+    let good = cert(&session, t, t + 3_600_000, &owner);
     let mut anon = Client::connect_public(&sock).unwrap();
     assert!(anon.commit_signed(&good).is_err(), "an anonymous delivery");
     // Delivered by the box: kept.
@@ -99,6 +99,6 @@ fn the_box_delivers_what_the_person_signed_and_writes_nothing_itself() {
 
     // A grant that has expired is inert, though its certificate is genuine.
     let old = identity::generate_device_key();
-    boxc.commit_signed(&cert(&old, t - 7_200_000, t - 3_600_000, &ident)).expect("a genuine, expired certificate");
+    boxc.commit_signed(&cert(&old, t - 7_200_000, t - 3_600_000, &owner)).expect("a genuine, expired certificate");
     assert!(connect(&sock, &old).mkdir(&root_node, "late", signer(&old)).is_err(), "an expired grant writes nothing");
 }
