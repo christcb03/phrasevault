@@ -35,8 +35,8 @@ pub struct Slot {
 impl Slot {
     /// Reads the phrase's public keys now (the agent unlocks if it must).
     pub fn new(vault: impl Into<String>, agent: Arc<Agent>) -> Result<Slot, String> {
-        let (root, identity, encryption) = agent.public_keys()?;
-        Ok(Slot { vault: vault.into(), root, identity, encryption, agent })
+        let keys = agent.public_keys()?;
+        Ok(Slot { vault: vault.into(), root: keys.root, identity: keys.identity, encryption: keys.encryption, agent })
     }
 
     fn holds(&self, key: &[u8]) -> bool {

@@ -78,6 +78,15 @@ pub type IdentityRotator = Box<dyn Fn(u64) -> Result<(), String> + Send + Sync>;
 const DEFAULT_RATE_PER_MIN: u32 = 60;
 
 /// An unlocked signer plus the controls that gate it.
+/// PVOS D189 — one phrase's public keys: its root (`0'`), its current
+/// identity, its encryption key (`2'/0'`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhraseKeys {
+    pub root: Vec<u8>,
+    pub identity: Vec<u8>,
+    pub encryption: Vec<u8>,
+}
+
 pub struct Agent {
     signer: Mutex<Option<UnlockedSigner>>,
     policy: ApprovalPolicy,
@@ -192,15 +201,15 @@ impl Agent {
         }
     }
 
-    /// PVOS D189 — this phrase's public keys (root, current identity,
-    /// encryption), unlocking if it must: what the router routes by.
-    pub fn public_keys(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    /// PVOS D189 — this phrase's public keys, unlocking if it must: what
+    /// the router routes by.
+    pub fn public_keys(&self) -> Result<PhraseKeys, String> {
         let got = self.with_signer(|s| {
-            Ok::<_, SignerError>((
-                s.pubkey(KeyRole::Root)?,
-                s.pubkey(KeyRole::Identity)?,
-                s.pubkey(KeyRole::Encryption)?,
-            ))
+            Ok::<_, SignerError>(PhraseKeys {
+                root: s.pubkey(KeyRole::Root)?,
+                identity: s.pubkey(KeyRole::Identity)?,
+                encryption: s.pubkey(KeyRole::Encryption)?,
+            })
         });
         match got {
             Ok(Ok(keys)) => Ok(keys),
