@@ -31,6 +31,11 @@ nix = { workspace = true, features = ["signal"] }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 rcgen.workspace = true
+# PVOS D191 — background threads lower their own CPU and disk priority
+# (setpriority, ioprio_set); the hashing pool (BLAKE3's, already in the
+# tree through its `rayon` feature) is built at start with lowered workers.
+libc = "0.2"
+rayon-core = "1.13"
 
 [dev-dependencies]
 pvfs-client = { path = "../pvfs-client" }

@@ -162,6 +162,11 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // PVOS D191 — the hashing pool exists before anything can hash, its
+    // workers lowered whichever thread hashes first; the job supervisor
+    // lowers itself below. Serving keeps the unit's priority.
+    pvfsd::priority::build_hash_pool();
+    eprintln!("{}", pvfsd::priority::policy_line());
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
     let is_replica = engine.is_replica();
@@ -225,11 +230,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // A corrupt config refuses startup — loud beats silently jobless.
     let jobs = Arc::new(pvfsd::jobs::JobsState::load(data_dir.clone())?);
     daemon.attach_jobs(Arc::clone(&jobs));
-    let jobs_thread = {
-        let j = Arc::clone(&jobs);
-        let d = Arc::clone(&daemon);
-        std::thread::spawn(move || pvfsd::jobs::run(j, &SHUTDOWN, &RELOAD, Some(d)))
-    };
+    // PVOS D191 — the supervisor runs below serving, and so does every pass.
+    let jobs_thread =
+        pvfsd::jobs::spawn_supervisor(Arc::clone(&jobs), &SHUTDOWN, &RELOAD, Some(Arc::clone(&daemon)))?;
 
     // PVOS D182 — an owner hears its peers before it takes a write from any.
     // Its first health pass reads every follower's log tip, and a follower
