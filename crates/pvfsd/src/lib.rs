@@ -9,6 +9,7 @@
 
 pub mod jobs;
 pub mod nettls;
+pub mod priority;
 
 use std::collections::HashMap;
 use std::io;

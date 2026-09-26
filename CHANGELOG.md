@@ -23,6 +23,30 @@ file tracks Layer 0, the file-system engine.
   (`companion.vault` first). Why: separate forests should not share a
   phrase — one phrase is one root key in every forest, and root
   certificates do not name the forest.
+- **What each phrase is used for (PVOS D189).** A companion request may
+  name its forest (top-level `forest`: id + label); once it succeeds, the
+  answering phrase's ledger (`<vault>.forests.json`) records which of its
+  keys that forest used and for what — never used to route or authorize.
+  `link_forest` records an older forest by a key a phrase holds (public keys
+  only: no unlock, no prompt). `pvfs` names the forest it runs on with every
+  companion request. `pvfs-companion keys [--json]` reports each phrase: its
+  public keys, the forests that used them, paired servers, web origins, and
+  the approvals and root signatures in its audit log; `keys link` asks for
+  what it needs. The macOS app's Settings show it, key by key.
+- **Serving at the daemon's priority, background below it (PVOS D191).**
+  mediabox's unit lowered the whole daemon (nice 10, best-effort 7): its
+  serving threads too (writes through the view mount, other boxes' reads of
+  files held there). And its disk half did nothing — mq-deadline, the media
+  disks' scheduler, ignores the level inside best-effort. Now the job
+  supervisor (`pvfsd-jobs`) lowers itself before it spawns anything, so
+  every pass and the trash step start below serving, and the hashing pool
+  is built at start with lowered workers (`pvfsd-hash-<n>`; a write's
+  commit hashes there too): nice +10 and the idle disk class, which
+  mq-deadline honours (its 10 s aging keeps an idle request from waiting
+  forever). The listeners and their connection threads keep the unit's
+  priority. Job threads are named `pvfsd-<job>`. `PVFSD_BACKGROUND` sets
+  the step (1–19; the NAS takes 19, D88's level — its start script's
+  `renice` had moved only the main thread) or `normal` for none.
 - **Before an owner holds regions on a busy box (PVOS D188).** Found reading
   the code for mediabox's move to owner:
   - **A mount left on an older build no longer passes the roll's check.** A

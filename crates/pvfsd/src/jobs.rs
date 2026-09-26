@@ -479,13 +479,23 @@ struct Managed {
     handle: std::thread::JoinHandle<()>,
 }
 
+/// PVOS D191 — a job's thread, named `pvfsd-<job>` so `ps -L`/`top -H` say
+/// which thread is which. It starts with its creator's priority: the
+/// supervisor's, lowered below serving.
+fn job_thread<F: FnOnce() + Send + 'static>(job: &str, f: F) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!("pvfsd-{job}"))
+        .spawn(f)
+        .expect("failed to spawn a job thread")
+}
+
 fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = match name {
         "follow" => {
             let st = Arc::clone(state);
             let flag = Arc::clone(&stop);
-            std::thread::spawn(move || {
+            job_thread(name, move || {
                 st.set_state("follow", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
@@ -502,7 +512,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
         "watch" => {
             let st = Arc::clone(state);
             let flag = Arc::clone(&stop);
-            std::thread::spawn(move || {
+            job_thread(name, move || {
                 st.set_state("watch", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
@@ -788,7 +798,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
     // disabled mid-pass (and at shutdown, as before).
     let cancel = Arc::clone(&stop);
     let handle = match name {
-        "sync" => std::thread::spawn(move || {
+        "sync" => job_thread(name, move || {
             st.set_state("sync", "running");
             match sync_pass(&st, cancel) {
                 Ok((fetched, failed)) => {
@@ -804,7 +814,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("sync", Some(e.to_string())),
             }
         }),
-        "export" => std::thread::spawn(move || {
+        "export" => job_thread(name, move || {
             st.set_state("export", "running");
             match export_pass(&st, cancel) {
                 Ok(_) => st.mark_pass("export", None),
@@ -813,7 +823,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         }),
         "tier" => {
             let cancel = Arc::clone(&stop);
-            std::thread::spawn(move || {
+            job_thread(name, move || {
             st.set_state("tier", "running");
             let r = (|| -> Result<Option<pvfs_client::fetch::TierReport>, PvfsError> {
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
@@ -883,7 +893,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         // D127 (doc 26 §7.3) — resolve the merged view's conflicts and
         // redundancies for the draining regions THIS box owns: the losing copy
         // goes to that region's trash; nothing on a library region is touched.
-        "health" => std::thread::spawn(move || {
+        "health" => job_thread(name, move || {
             st.set_state("health", "running");
             // D142 — the record BEFORE this poll, so what changed can be told.
             let prev = pvfs_client::health::FleetHealth::load(st.data_dir()).ok().flatten();
@@ -931,7 +941,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("health", Some(e.to_string())),
             }
         }),
-        "catalogue" => std::thread::spawn(move || {
+        "catalogue" => job_thread(name, move || {
             st.set_state("catalogue", "running");
             let r = pvfs_client::catalogue::fetch_pass(st.data_dir(), &cancel);
             match r {
@@ -952,7 +962,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("catalogue", Some(e.to_string())),
             }
         }),
-        "receive" => std::thread::spawn(move || {
+        "receive" => job_thread(name, move || {
             st.set_state("receive", "running");
             let r = pvfs_client::receive::receive_pass(
                 st.data_dir(),
@@ -1001,7 +1011,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("receive", Some(e.to_string())),
             }
         }),
-        "resolve" => std::thread::spawn(move || {
+        "resolve" => job_thread(name, move || {
             st.set_state("resolve", "running");
             let r = (|| -> Result<(pvfs_core::ResolveReport, u64), PvfsError> {
                 let mut engine = pvfs_core::Engine::open(st.data_dir())?;
@@ -1044,7 +1054,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("resolve", Some(e.to_string())),
             }
         }),
-        "reclaim" => std::thread::spawn(move || {
+        "reclaim" => job_thread(name, move || {
             st.set_state("reclaim", "running");
             let r = (|| -> Result<pvfs_core::sync::TrashPurge, PvfsError> {
                 let engine = pvfs_core::Engine::open(st.data_dir())?;
@@ -1057,7 +1067,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 Err(e) => st.mark_pass("reclaim", Some(e.to_string())),
             }
         }),
-        "evict" => std::thread::spawn(move || {
+        "evict" => job_thread(name, move || {
             st.set_state("evict", "running");
             let r = (|| -> Result<pvfs_core::sync::EvictReport, PvfsError> {
                 // F5.5: retract de-placed advertised copies before the
@@ -1319,6 +1329,22 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
+/// PVOS D191 — the supervisor as pvfsd runs it: on its own thread, named
+/// `pvfsd-jobs`, lowered below serving before it spawns anything, so every
+/// pass and the trash step start with its priority. Tests that drive [`run`]
+/// directly keep their own thread's priority.
+pub fn spawn_supervisor(
+    state: Arc<JobsState>,
+    shutdown: &'static AtomicBool,
+    reload: &'static AtomicBool,
+    daemon: Option<Arc<crate::Daemon>>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("pvfsd-jobs".into()).spawn(move || {
+        crate::priority::enter_background("background work");
+        run(state, shutdown, reload, daemon)
+    })
+}
+
 /// The supervisor loop. Polls `reload` (SIGHUP) and `shutdown` (SIGTERM/INT);
 /// reconciles configured jobs against live threads each tick; a failed reload
 /// keeps the previous config and logs — a running fleet box must not lose its
@@ -1368,7 +1394,7 @@ pub fn run(
                 }
                 let stop = Arc::new(AtomicBool::new(false));
                 let (st, d, flag) = (Arc::clone(&state), Arc::clone(d), Arc::clone(&stop));
-                let handle = std::thread::spawn(move || {
+                let handle = job_thread("trash", move || {
                     // the read view is handed back before any disk work
                     let roots = d.trash_roots();
                     for line in trash_step(&st, roots, &flag) {
