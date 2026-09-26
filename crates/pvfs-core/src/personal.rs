@@ -45,6 +45,58 @@ pub struct PersonalGenesis {
     pub host_pub: Vec<u8>,
 }
 
+/// What a personal genesis is built from besides the keys. The SIGNER
+/// chooses these — the person's browser or companion — so every
+/// certificate in the genesis names a forest id that is new: none can name
+/// another forest the same phrase roots (D192), whatever the hosting box
+/// would like. The box checks only that the id is new to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisParams {
+    /// A random (v4) UUID, lowercase and hyphenated — it names sockets and
+    /// directories, so nothing else is accepted.
+    pub forest_id: String,
+    /// `pvfs-` and 8 lowercase hex digits, as every forest's.
+    pub instance_id: String,
+    /// Milliseconds since the epoch: every genesis event's time.
+    pub created_at: u64,
+    /// The root folder's creation nonce.
+    pub root_nonce: u64,
+}
+
+impl GenesisParams {
+    /// Fresh parameters, drawn here (a signer that is Rust: tests, tools).
+    pub fn fresh() -> GenesisParams {
+        let mut b = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut b);
+        GenesisParams {
+            forest_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: format!("pvfs-{}", hex::encode(b)),
+            created_at: engine::now_ms(),
+            root_nonce: rand::thread_rng().next_u64(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let bad = |reason: &str| PvfsError::BadInput { field: "genesis".into(), reason: reason.into() };
+        let uuid_ok = uuid::Uuid::parse_str(&self.forest_id)
+            .map(|u| u.get_version_num() == 4 && u.hyphenated().to_string() == self.forest_id)
+            .unwrap_or(false);
+        if !uuid_ok {
+            return Err(bad("the forest id must be a random UUID, lowercase and hyphenated"));
+        }
+        let inst_ok = self.instance_id.strip_prefix("pvfs-").is_some_and(|h| {
+            h.len() == 8 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        });
+        if !inst_ok {
+            return Err(bad("the instance id must be `pvfs-` and 8 lowercase hex digits"));
+        }
+        if self.created_at == 0 {
+            return Err(bad("the genesis needs its time"));
+        }
+        Ok(())
+    }
+}
+
 /// Which of the person's keys signs a prepared event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenesisSigner {
@@ -59,16 +111,13 @@ pub struct PreparedGenesisEvent {
     pub event: Event,
 }
 
-/// The unsigned genesis, in log order. The genesis has one fixed shape, so
-/// `forest_id`, `instance_id`, `created_at`, `root_nonce` and the host key
-/// are all a signer needs to rebuild every digest itself — which a person's
-/// browser does, rather than sign digests a server hands it.
+/// The unsigned genesis, in log order. It has one fixed shape, so the
+/// [`GenesisParams`] and the three keys are all a signer needs to build
+/// every digest itself — which the person's browser does, rather than sign
+/// digests a server hands it.
 #[derive(Clone, Debug)]
 pub struct PreparedGenesis {
-    pub forest_id: String,
-    pub instance_id: String,
-    pub created_at: u64,
-    pub root_nonce: u64,
+    pub params: GenesisParams,
     pub events: Vec<PreparedGenesisEvent>,
 }
 
@@ -108,8 +157,16 @@ fn with_sig(mut ev: Event, sig: Vec<u8>) -> Event {
     ev
 }
 
-/// The unsigned genesis of a personal forest (see the module docs).
+/// The unsigned genesis of a personal forest (see the module docs), with
+/// fresh parameters.
 pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> {
+    prepare_personal_genesis_with(g, GenesisParams::fresh())
+}
+
+/// The same from parameters the signer chose — what a hosting box rebuilds
+/// to attach the signatures the person's browser made over them.
+pub fn prepare_personal_genesis_with(g: &PersonalGenesis, params: GenesisParams) -> Result<PreparedGenesis> {
+    params.validate()?;
     let keys = [&g.root_pub, &g.identity_pub, &g.host_pub];
     for k in keys {
         crypto::validate_pubkey(k)?;
@@ -122,17 +179,9 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
             });
         }
     }
-    let mut b = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut b);
-    let instance_id = format!("pvfs-{}", hex::encode(b));
-    let forest_id = uuid::Uuid::new_v4().to_string();
-    let t = engine::now_ms();
+    let GenesisParams { forest_id, instance_id, created_at: t, root_nonce: creation_nonce } = params.clone();
     let f = Some(forest_id.as_str());
     let (root, device) = (g.root_pub.clone(), g.identity_pub.clone());
-
-    let mut nonce = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let creation_nonce = u64::from_le_bytes(nonce);
     let payload = node::folder_payload();
     let root_digest = node::compute_id_digest(
         node::TYPE_FOLDER,
@@ -211,7 +260,7 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
         PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: link_digest, event: Event::LinkCreated(root_link) },
         member(&g.host_pub),
     ];
-    Ok(PreparedGenesis { forest_id, instance_id, created_at: t, root_nonce: creation_nonce, events })
+    Ok(PreparedGenesis { params, events })
 }
 
 /// Write a signed personal genesis at `data_dir` and open the forest, with

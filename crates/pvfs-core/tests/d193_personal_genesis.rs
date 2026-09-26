@@ -6,7 +6,10 @@
 //! owner device (it certifies their session keys).
 
 use pvfs_core::acl::{Principal, ACL_A, ACL_R, ACL_W};
-use pvfs_core::personal::{init_signed_genesis, prepare_personal_genesis, PersonalGenesis};
+use pvfs_core::personal::{
+    init_signed_genesis, prepare_personal_genesis, prepare_personal_genesis_with, GenesisParams, GenesisSigner,
+    PersonalGenesis,
+};
 use pvfs_core::{crypto, identity, Engine, NodeSpec};
 
 struct Person {
@@ -40,7 +43,7 @@ fn a_personal_forest_is_the_persons_and_its_host_holds_no_grant() {
     let host = identity::generate_device_key();
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
     assert_eq!(prep.events.len(), 5);
-    let forest_id = prep.forest_id.clone();
+    let forest_id = prep.params.forest_id.clone();
     let events = prep.sign(&person.root, &person.ident).unwrap();
     let mut engine = init_signed_genesis(&data, events, host.clone()).unwrap();
 
@@ -128,9 +131,11 @@ fn the_phrase_keys_the_page_must_derive() {
     }
 }
 
-/// The genesis digests from fixed inputs — pinned in the web page's tests,
-/// which recompute them from the events a server proposes before signing
-/// (so no server can slip itself in as the owner device).
+/// The genesis digests from fixed inputs — pinned in the web page's tests:
+/// the page builds them itself from parameters it chose and the host's key
+/// (so no server can slip itself in as the owner device, or aim a
+/// certificate at another forest), and the box rebuilds the same events to
+/// attach its signatures.
 #[test]
 fn the_genesis_digests_the_page_must_recompute() {
     use pvfs_core::{acl, event, link, node};
@@ -156,4 +161,38 @@ fn the_genesis_digests_the_page_must_recompute() {
     for ((what, d), want) in got.iter().zip(pinned) {
         assert_eq!(d, want, "{what}");
     }
+
+    // ... and they are exactly what the box prepares from those parameters,
+    // in log order, each with its signer.
+    let params = GenesisParams { forest_id: forest.into(), instance_id: instance.into(), created_at: t, root_nonce: nonce };
+    let g = PersonalGenesis { root_pub: root, identity_pub: ident, host_pub: host };
+    let prep = prepare_personal_genesis_with(&g, params).unwrap();
+    let order = [(2, GenesisSigner::Root), (3, GenesisSigner::Root), (0, GenesisSigner::Identity), (1, GenesisSigner::Identity), (4, GenesisSigner::Root)];
+    assert_eq!(prep.events.len(), order.len());
+    for (p, (i, signer)) in prep.events.iter().zip(order) {
+        assert_eq!(hex::encode(p.digest), pinned[i], "{}", got[i].0);
+        assert_eq!(p.signer, signer, "{}", got[i].0);
+    }
+}
+
+/// The signer's parameters name sockets and directories on the box: only
+/// the one canonical form is accepted.
+#[test]
+fn genesis_parameters_are_checked() {
+    let person = Person::new();
+    let host = identity::generate_device_key();
+    let ok = GenesisParams::fresh();
+    assert!(prepare_personal_genesis_with(&person.genesis(&host), ok.clone()).is_ok());
+    let with = |f: &dyn Fn(&mut GenesisParams)| {
+        let mut p = ok.clone();
+        f(&mut p);
+        prepare_personal_genesis_with(&person.genesis(&host), p)
+    };
+    assert!(with(&|p| p.forest_id = "../../run/pvfs/x".into()).is_err(), "a path");
+    assert!(with(&|p| p.forest_id = p.forest_id.to_uppercase()).is_err(), "uppercase");
+    assert!(with(&|p| p.forest_id = p.forest_id.replace('-', "")).is_err(), "unhyphenated");
+    assert!(with(&|p| p.forest_id = "00000000-0000-1000-8000-000000000001".into()).is_err(), "not random (v1)");
+    assert!(with(&|p| p.instance_id = "pvfs-0000000G".into()).is_err(), "instance not hex");
+    assert!(with(&|p| p.instance_id = "pvfs-000000001".into()).is_err(), "instance too long");
+    assert!(with(&|p| p.created_at = 0).is_err(), "no time");
 }
