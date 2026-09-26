@@ -1132,8 +1132,8 @@ fn audit_summary(path: &std::path::Path) -> (Vec<ApprovalRow>, Vec<RootSignature
             None => rows.push(ApprovalRow { kind: kind.to_string(), who, action, count: 1, last_ms: at }),
         }
     }
-    rows.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
-    roots.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.last_ms));
+    roots.sort_by_key(|r| std::cmp::Reverse(r.at_ms));
     roots.truncate(50);
     (rows, roots)
 }

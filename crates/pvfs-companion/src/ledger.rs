@@ -86,7 +86,7 @@ impl Ledger {
             }),
         }
         if file.forests.len() > MAX_ENTRIES {
-            file.forests.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
+            file.forests.sort_by_key(|u| std::cmp::Reverse(u.last_ms));
             file.forests.truncate(MAX_ENTRIES);
         }
         write_file(&self.path, &file)
@@ -97,7 +97,7 @@ impl Ledger {
 /// (the `keys` command). A missing or unreadable file is an empty ledger.
 pub fn read(path: &Path) -> Vec<ForestUse> {
     let mut forests = read_file(path).forests;
-    forests.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
+    forests.sort_by_key(|u| std::cmp::Reverse(u.last_ms));
     forests
 }
 
