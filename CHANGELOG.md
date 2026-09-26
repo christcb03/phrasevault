@@ -35,6 +35,23 @@ file tracks Layer 0, the file-system engine.
   operation it does not know is refused). The device key is reached only
   from these — no `request_type` maps to it — so the companion's raw-digest
   identity paths can never touch a personal forest.
+- **A catalogue head bump writes only what changed (PVOS D194).**
+  `Engine::install_region_snapshot` used to delete a fetched region's rows
+  and insert the manifest's in one transaction — ≈59,000 row writes on the
+  NAS for a two-row bump of mediabox's 29,500-row catalogue, longer than the
+  15 s the daemon's other jobs wait for the write lock, so a watch, follow
+  or receive pass failed about once a day ("SQLite is busy/locked … (retried
+  0x)"). It now reads the rows held without the lock (noting `PRAGMA
+  data_version`), takes the lock with `BEGIN IMMEDIATE`, reads again under
+  it only if another connection committed in between, and deletes and
+  upserts the difference: the rows end exactly as before (a row it does not
+  touch keeps its `seen_at`), and a two-row bump of 30,000 rows holds the
+  lock 28–68 ms instead of 1.4 s on presubuntu's disk. A manifest listing a
+  path twice is refused up front. New `install_region_snapshot_delta`
+  returns `SnapshotInstall { rows, added, changed, removed }`; pvfsd logs
+  `catalogue <region> at head N: M rows (+a changed c removed r)`, and `pvfs
+  region fetch` prints the same (`--json`: `added`, `changed`, `removed`).
+  No wire, schema or protocol change.
 - **Root certificates bound to their forest (PVOS D192; protocol 14).**
   One phrase is one root key in every forest it roots, and the forest-
   authority events — `DeviceAuthorized`, `DeviceRevoked`, `RootRotated`,

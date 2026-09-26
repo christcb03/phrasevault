@@ -93,6 +93,7 @@ pub use fs::{
     RenamedHere,
     DirRemovedHere,
     RegionSnapshot,
+    SnapshotInstall,
     ResolveAction,
     ResolveReport,
     ScanReport,

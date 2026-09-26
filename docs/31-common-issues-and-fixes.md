@@ -15,6 +15,7 @@ whenever a fix is found, not only when it recurs.**
 | sabnzbd or qBittorrent stall after a roll | [§6](#6-download-clients-stall-after-a-roll) |
 | A season's files numbered in another order than Sonarr's | [§7](#7-a-seasons-files-numbered-in-another-order-than-sonarrs) |
 | A show Sonarr numbers by segment (whole broadcasts beside segment files) | [§8](#8-a-show-sonarr-numbers-by-segment) |
+| A job on the NAS fails for two minutes: "SQLite is busy/locked" | [§9](#9-a-job-fails-for-two-minutes-sqlite-is-busylocked) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -245,3 +246,34 @@ test — 29 SD `.avi` broadcasts and 3 480p segment files trashed (6 GB).
 Probe every file first: only groups that differed had been probed, and a
 segment "with no file" was really one with a file nobody had measured.
 
+
+## 9. A job fails for two minutes: "SQLite is busy/locked"
+
+**What it looks like.** The forest page goes `warning` for a minute or two
+with *"the NAS: watch — SQLite is busy/locked during upsert region entry
+(retried 0x)"* — or the same for the NAS's follow (`begin replica
+ingest`), receive or `insert snapshot` — then clears by itself. About once a
+day in the week to 2026-09-26 (PVOS D194). The box's `pvfsd.log` shows
+`watch pass failed: … ; retrying`, a `catalogue <region> at head N: M rows`
+line beside it, and `watch recovered: a pass completed after 1 failed
+pass(es) over 2 min`.
+
+**Why.** Each box keeps a copy of every other box's catalogue, and its
+`catalogue` job (every 60 s) installs a region's new head when the region's
+box publishes one. Until D194 the install deleted every row of the region
+and inserted the manifest's, in one transaction: ≈59,000 row writes for
+mediabox's `mediabox-local` (≈29,500 rows) when two files had changed. The
+daemon's other jobs wait 15 s for the write lock (D141); on the NAS the
+install took longer, so the job that wrote next lost its pass. 20 of the 23
+busy failures in the NAS's log (2026-09-17 → 26) sit beside such an
+install. "Retried 0x" is accurate: the statement did not retry; the pass
+did, two minutes later.
+
+**Fix.** PVFS with D194: an install writes only the rows that differ, so a
+two-row head bump holds the lock for milliseconds (measured on presubuntu's
+disk: 1.4 s → 28–68 ms for 30,000 rows). The daemon then logs `catalogue …
+M rows (+a changed c removed r)`. Nothing to do on a box before that — each
+failure heals at the next pass; check the box's build (`pvfs --version`)
+before chasing one. A busy failure with no `catalogue` line beside it, or a
+`routed scan write` one (the owner's database, not the box's), is something
+else.
