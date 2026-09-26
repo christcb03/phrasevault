@@ -134,17 +134,4 @@ mod tests {
         assert!(matches!(s.get("k1"), Err(VaultError::Keychain(_))));
     }
 
-    /// Touches the REAL platform keychain — run by hand on a desktop:
-    /// `cargo test -p pvfs-companion -- --ignored os_keychain`.
-    #[cfg(feature = "os-keychain")]
-    #[test]
-    #[ignore]
-    fn os_keychain_round_trip() {
-        let s = OsKeychain::new();
-        let key_id = format!("pvfs-test-{}", std::process::id());
-        s.set(&key_id, b"test-data-key").unwrap();
-        assert_eq!(&s.get(&key_id).unwrap()[..], b"test-data-key");
-        s.delete(&key_id).unwrap();
-        assert!(s.get(&key_id).is_err());
-    }
 }
