@@ -58,8 +58,11 @@ fn version(proto: u32) -> String {
 
 #[test]
 fn binding_waits_for_every_box_the_fleet_knows() {
-    let dir = Scratch::new();
-    let (mut engine, _mn) = Engine::init_unbound(dir.path()).unwrap();
+    let scratch = Scratch::new();
+    // a forest laid out as a mount: its state in <mount>/.pvfs (what `tip` reads)
+    let data = pvfs_core::mount::state_dir(scratch.path());
+    let dir = &data;
+    let (mut engine, _mn) = Engine::init_unbound(dir).unwrap();
     let root = engine.identity.root_node_id.clone();
     let fleet = node(&mut engine, &root, ".fleet", "folder", "");
     let eps = node(&mut engine, &fleet, "endpoints", "folder", "");
@@ -71,18 +74,18 @@ fn binding_waits_for_every_box_the_fleet_knows() {
     engine.close().unwrap();
 
     // one box on protocol 13, one silent: refused, nothing written
-    let out = pvfs(dir.path(), &["forest", "bind-certs", "--yes"]);
+    let out = pvfs(dir, &["forest", "bind-certs", "--yes"]);
     assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("2 box(es) do not announce protocol 14"), "{err}");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("BEHIND") && text.contains("silent"), "{text}");
-    let tip = pvfs(dir.path(), &["--json", "forest", "tip"]);
+    let tip = pvfs(dir, &["--json", "forest", "tip"]);
     let tip: serde_json::Value = serde_json::from_slice(&tip.stdout).unwrap();
     assert_eq!(tip["certs_bound"], serde_json::Value::Null);
 
     // both boxes announce 14
-    let mut engine = Engine::open(dir.path()).unwrap();
+    let mut engine = Engine::open(dir).unwrap();
     for c in engine.children(&vers).unwrap() {
         engine.remove_link(&c.link_id).unwrap();
     }
@@ -91,25 +94,25 @@ fn binding_waits_for_every_box_the_fleet_knows() {
     engine.close().unwrap();
 
     // not at a terminal and no --yes: asked for, not assumed
-    let out = pvfs(dir.path(), &["forest", "bind-certs"]);
+    let out = pvfs(dir, &["forest", "bind-certs"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--yes"));
 
-    let out = pvfs(dir.path(), &["--json", "forest", "bind-certs", "--yes"]);
+    let out = pvfs(dir, &["--json", "forest", "bind-certs", "--yes"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let done: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(done["changed"], true);
     let seq = done["bound"].as_str().unwrap().to_string();
     assert!(seq.parse::<u64>().is_ok(), "bound at a seq: {seq}");
 
-    let out = pvfs(dir.path(), &["forest", "bind-certs", "--yes"]);
+    let out = pvfs(dir, &["forest", "bind-certs", "--yes"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("already"));
 
-    let tip = pvfs(dir.path(), &["--json", "forest", "tip"]);
+    let tip = pvfs(dir, &["--json", "forest", "tip"]);
     let tip: serde_json::Value = serde_json::from_slice(&tip.stdout).unwrap();
     assert_eq!(tip["certs_bound"], seq.as_str());
-    let v = pvfs(dir.path(), &["--json", "fleet", "versions"]);
+    let v = pvfs(dir, &["--json", "fleet", "versions"]);
     let v: serde_json::Value = serde_json::from_slice(&v.stdout).unwrap();
     assert_eq!(v["certificates"]["bound"], seq.as_str());
 }

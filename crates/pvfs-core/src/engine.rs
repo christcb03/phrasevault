@@ -1569,6 +1569,7 @@ impl Engine {
                 | Event::RootRotated { .. }
                 | Event::RecoveryKeyRegistered { .. }
                 | Event::RecoveryKeyRevoked { .. }
+                | Event::CertificatesBound { .. }
                 | Event::MemberTagged { .. } => String::new(),
                 // Region boundary events author in the enclosing region.
                 Event::RegionMarked { node_id, .. }
