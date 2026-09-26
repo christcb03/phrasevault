@@ -10,6 +10,7 @@ use pvfs_core::personal::{
     init_signed_genesis, prepare_personal_genesis, prepare_personal_genesis_with, GenesisParams, GenesisSigner,
     PersonalGenesis,
 };
+use pvfs_core::event::{self, Event};
 use pvfs_core::{crypto, identity, Engine, NodeSpec};
 
 struct Person {
@@ -86,9 +87,20 @@ fn a_genesis_that_does_not_verify_leaves_nothing() {
     let host = identity::generate_device_key();
     let prep = prepare_personal_genesis(&person.genesis(&host)).unwrap();
     // the identity's events signed by someone else
-    let events = prep.sign(&person.root, &identity::generate_device_key()).unwrap(); // the identity's events by a stranger
-    assert!(init_signed_genesis(&data, events, host).is_err());
+    let events = prep.clone().sign(&person.root, &identity::generate_device_key()).unwrap();
+    assert!(init_signed_genesis(&data, events, host.clone()).is_err());
     assert!(!data.exists(), "nothing is left behind");
+
+    // a genesis signed in the unbound (v1) form: a personal forest is born bound
+    let mut events = prep.sign(&person.root, &person.ident).unwrap();
+    if let Event::ForestCreated { instance_id, forest_id, root_node_id, created_at, author, sig } = &mut events[0] {
+        let v1 = event::msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, false);
+        *sig = crypto::sign_digest(&person.root, &v1).unwrap();
+    }
+    let Err(err) = init_signed_genesis(&data, events, host).map(|_| ()) else { panic!("an unbound genesis was kept") };
+    let err = err.to_string();
+    assert!(err.contains("born bound"), "{err}");
+    assert!(!data.exists());
 }
 
 #[test]
@@ -140,7 +152,7 @@ fn the_phrase_keys_the_page_must_derive() {
 /// attach its signatures.
 #[test]
 fn the_genesis_digests_the_page_must_recompute() {
-    use pvfs_core::{acl, event, link, node};
+    use pvfs_core::{acl, link, node};
     let root = hex::decode("036242fd83e40688fc2c61fa05061edc98fef9bf2e4c85c28718b9d5f4f6acd2ac").unwrap();
     let ident = hex::decode("036435e78bcc147f4c92e0db70d4107d0c5bf04b169cf1b3d339212088df21a544").unwrap();
     let host = hex::decode("02c3a30e05b8c44bf16f0fcec80f481954acb45984d6ff6d6b0766385362092656").unwrap();

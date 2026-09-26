@@ -268,9 +268,20 @@ pub fn prepare_personal_genesis_with(g: &PersonalGenesis, params: GenesisParams)
 /// replays every event — signatures and authority, as a follower would —
 /// and a genesis that does not hold leaves nothing behind.
 pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: SigningKey) -> Result<Engine> {
-    let Some(Event::ForestCreated { instance_id, forest_id, .. }) = events.first() else {
-        return Err(PvfsError::BadInput { field: "genesis".into(), reason: "the first event must be ForestCreated".into() });
+    let bad = |reason: &str| PvfsError::BadInput { field: "genesis".into(), reason: reason.into() };
+    let Some(Event::ForestCreated { instance_id, forest_id, root_node_id, created_at, author, sig }) = events.first()
+    else {
+        return Err(bad("the first event must be ForestCreated"));
     };
+    // Born bound (D192): the genesis signed in its v2 form.
+    let v2 = event::msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, true);
+    crypto::verify_digest(author, &v2, sig).map_err(|_| bad("a personal forest is born bound: its genesis must be signed as v2"))?;
+    // Every signature in memory before anything touches the disk; the fold
+    // on open stays the full check — authority as well as signatures.
+    let ctx = event::SigContext { forest_id, bound: true };
+    for ev in &events {
+        ev.verify_sig(&ctx)?;
+    }
     let (instance_id, forest_id) = (instance_id.clone(), forest_id.clone());
     let host_pub = crypto::pubkey_bytes(&host_key);
     let admitted = events.iter().any(|e| {
@@ -302,10 +313,14 @@ pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: Signin
                 chain = log_store::append_event(&tx, &chain, i as u64 + 1, ev, t)?;
             }
             tx.commit().map_err(crate::error::map_db("commit genesis"))?;
-            projection::meta_set(&conn, "clean_shutdown", "0")?;
         }
         DeviceKeyCache { signing_key: host_key, device_index: MEMBER_DEVICE_INDEX }.save(data_dir)?;
-        // The projection is empty: this open replays the whole genesis.
+        // The projection is empty, so this open folds every event through the
+        // same verification a follower applies (the genesis signature first,
+        // then each event's signature and authority), and a genesis that
+        // fails it is refused by the full replay that follows a failed fold.
+        // (Not marked unclean: that forced the build-beside-and-swap rebuild,
+        // ~4 s of schema churn for five events, with no more verification.)
         Engine::open(data_dir)
     })();
     if written.is_err() {
