@@ -106,13 +106,15 @@ fn the_box_opens_it_only_with_the_key_the_genesis_admits() {
     assert!(prepare_personal_genesis(&same).is_err(), "the four keys must differ");
 }
 
+/// BIP39's all-zero 256-bit vector.
+const VECTOR: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
 /// The keys a browser derives from a phrase must be the ones PVFS derives:
 /// these vectors are pinned in the web page's tests too.
 #[test]
 fn the_phrase_keys_the_page_must_derive() {
-    let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-                 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
-    let mn = identity::parse_mnemonic(words).unwrap();
+    let mn = identity::parse_mnemonic(VECTOR).unwrap();
     let hex = |k: identity::SigningKey| hex::encode(crypto::pubkey_bytes(&k));
     let got = [
         ("root 0'", hex(identity::root_key(&mn, "").unwrap())),
@@ -173,6 +175,34 @@ fn the_genesis_digests_the_page_must_recompute() {
         assert_eq!(hex::encode(p.digest), pinned[i], "{}", got[i].0);
         assert_eq!(p.signer, signer, "{}", got[i].0);
     }
+
+    // The signatures the vector phrase's keys make over them (RFC 6979 is
+    // deterministic, so the page's must be these exact bytes) — and they
+    // make a personal forest the box keeps.
+    let mn = identity::parse_mnemonic(VECTOR).unwrap();
+    let (root_key, ident_key) = (identity::root_key(&mn, "").unwrap(), identity::identity_key(&mn, "", 0).unwrap());
+    let sigs: Vec<String> = prep
+        .events
+        .iter()
+        .map(|p| {
+            let key = if p.signer == GenesisSigner::Root { &root_key } else { &ident_key };
+            hex::encode(crypto::sign_digest(key, &p.digest).unwrap())
+        })
+        .collect();
+    let pinned_sigs = [
+        "259a215ad3612da674e615d63b774aeb1fcfd74ced43919a473b66e66abe35dc02d668d64523b96ab5d45c162e3f737fdd9b61dd36d2375379332e02e08a26ac",
+        "b3d4d50c9cbd5bd84588329b79e6c1325ec56f28fdad27135d53dae3e93bfd82765a0289ce20aadddf94f8b3b3daf5e488d698da2033790c449076b93c7718f6",
+        "2c30841f2edfd13a9aabe25d5523cdba295c411fd81c2f06ff3009ed31bbb6ac7b2f6bd46722efff3f7ce5262c463ca96ae4925cf3237a932bebb794ff27a358",
+        "9b6a53a7062df17120298fe76e5f60c746608ee6c5d2b1a5d6e375d5c8bee7aa198a481810a02d5fc70047de4cdc29e134aaaa7b58a3320b78d2d0dbe3347bc4",
+        "ffe2f994b1fce79d9cbd6c9ae115977b83783091ef07eb3d3e866146ed1276a465dc69b57ba2ee371d0586224ef4d8e5f22368585c558021bcd48713689bf3e4",
+    ];
+    assert_eq!(sigs, pinned_sigs, "the genesis signatures");
+    let dir = tempfile::tempdir().unwrap();
+    let events = prep.attach(sigs.iter().map(|s| hex::decode(s).unwrap()).collect()).unwrap();
+    let host_key = identity::device_key(&mn, "", 0).unwrap();
+    let engine = init_signed_genesis(&dir.path().join("vector"), events, host_key).expect("the vector genesis replays");
+    assert_eq!(engine.identity.forest_id, forest);
+    engine.close().unwrap();
 }
 
 /// The signer's parameters name sockets and directories on the box: only
@@ -189,7 +219,8 @@ fn genesis_parameters_are_checked() {
         prepare_personal_genesis_with(&person.genesis(&host), p)
     };
     assert!(with(&|p| p.forest_id = "../../run/pvfs/x".into()).is_err(), "a path");
-    assert!(with(&|p| p.forest_id = p.forest_id.to_uppercase()).is_err(), "uppercase");
+    assert!(with(&|p| p.forest_id = "0A0B0C0D-0000-4000-8000-00000000000E".into()).is_err(), "uppercase");
+    assert!(with(&|p| p.forest_id = "0a0b0c0d-0000-4000-8000-00000000000e".into()).is_ok(), "its lowercase form");
     assert!(with(&|p| p.forest_id = p.forest_id.replace('-', "")).is_err(), "unhyphenated");
     assert!(with(&|p| p.forest_id = "00000000-0000-1000-8000-000000000001".into()).is_err(), "not random (v1)");
     assert!(with(&|p| p.instance_id = "pvfs-0000000G".into()).is_err(), "instance not hex");
