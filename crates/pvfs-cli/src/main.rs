@@ -7609,10 +7609,20 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Some((id, _, _)) => find(id, &pin)?,
                 None => None,
             };
+            // PVOS D192 — the protocol this box RUNS: the lower of this CLI's and
+            // the running daemon's. After binaries are replaced the daemon keeps
+            // the old build in memory until it restarts; announcing the new
+            // CLI's number then would let a forest bind that the daemon cannot
+            // read (found rehearsing D192: a standby whose daemon was not
+            // restarted). `fleet versions` and the binding gate trust this record.
+            let proto = try_daemon_socket(&state_dir)
+                .and_then(|sock| pvfs_client::Client::connect_public(&sock).ok())
+                .map(|c| c.daemon_proto().min(pvfs_client::PROTO_VERSION))
+                .unwrap_or(pvfs_client::PROTO_VERSION);
             let ver_json = format!(
                 "{{\"pvfs\":\"{}\",\"proto\":{},\"schema\":{}}}",
                 env!("CARGO_PKG_VERSION"),
-                pvfs_client::PROTO_VERSION,
+                proto,
                 pvfs_core::projection::SCHEMA_VERSION
             );
             let ver_unchanged = existing_ver
