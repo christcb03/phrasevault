@@ -2190,7 +2190,10 @@ impl Engine {
         let Event::SubRegionHead { node_id, head_seq, head_hash, author, .. } = &ev else {
             return Ok(ClaimOutcome::Refused("not a region head".into()));
         };
-        if let Err(e) = ev.verify_sig() {
+        // a region head is no forest-authority event: the bound state does not
+        // enter into it (PVOS D192)
+        let ctx = crate::event::SigContext { forest_id: &self.identity.forest_id, bound: false };
+        if let Err(e) = ev.verify_sig(&ctx) {
             return Ok(ClaimOutcome::Refused(format!("its signature does not verify ({e})")));
         }
         if !self.is_catalogue_region(node_id)? {

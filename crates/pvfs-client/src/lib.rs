@@ -944,6 +944,16 @@ impl Client {
     }
 
     /// Create a folder named `label` under `parent`. Returns the new node id.
+    /// PVOS D192 — bind the forest's certificates, signed by this client's
+    /// key (the current root, or admin on the forest root). Returns the
+    /// forest id.
+    pub fn bind_certificates<F>(&mut self, sign: F) -> Result<String>
+    where
+        F: Fn(&[u8; 32]) -> Vec<u8>,
+    {
+        self.write_op(WriteOp::BindCertificates, sign)
+    }
+
     pub fn mkdir<F>(&mut self, parent: &str, label: &str, sign: F) -> Result<String>
     where
         F: Fn(&[u8; 32]) -> Vec<u8>,

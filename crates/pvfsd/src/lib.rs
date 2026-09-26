@@ -2826,6 +2826,7 @@ fn do_prepare_write(
                 Ok(pk) => e.prepare_revoke(&author, &pk),
                 Err(_) => Err(bad_hex("pubkey")),
             },
+            WriteOp::BindCertificates => e.prepare_bind_certificates(&author),
         }
     };
     let prepared = match prepared {

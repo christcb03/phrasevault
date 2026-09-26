@@ -116,6 +116,14 @@ pub fn peek_current_root(data_dir: &Path, identity: &ForestIdentity) -> Result<V
     crate::projection::current_root(&conn, identity)
 }
 
+/// PVOS D192 — whether the forest binds its certificates (`genesis`, or the
+/// seq of its `CertificatesBound`), read-only beside a running daemon.
+pub fn peek_certs_bound(data_dir: &Path) -> Result<Option<String>> {
+    let conn = Connection::open_with_flags(data_dir.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(map_db("open projection read-only"))?;
+    crate::projection::certs_bound(&conn)
+}
+
 // ---- mount-level engine lifecycle ---------------------------------------------
 
 /// `pvfs forest init` (doc 05 §5.1): genesis under `<mount>/.pvfs/`, then

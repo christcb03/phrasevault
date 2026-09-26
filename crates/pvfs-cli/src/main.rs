@@ -921,6 +921,18 @@ enum ForestCmd {
     /// whether the owner is fenced. Read-only and safe beside a running
     /// daemon; what `promote.yml` compares across boxes before a promotion.
     Tip { target: Option<String> },
+    /// PVOS D192 — bind this forest's root certificates to it: from then on a
+    /// device certificate, root rotation, recovery key or member tag must be
+    /// signed for THIS forest, and one signed for another is refused. Checks
+    /// first that every box the fleet knows runs a build that understands it
+    /// (protocol 14) — an older box could not read the forest after. Run it
+    /// bare: it shows the fleet and asks. Cannot be undone.
+    BindCerts {
+        target: Option<String>,
+        /// Don't ask (scripts)
+        #[arg(long)]
+        yes: bool,
+    },
     /// PVOS D182 — a dated, verified copy of this forest's log (`log.db` and
     /// any region log generations), safe beside a running daemon. Followers
     /// copy a bad build's events faithfully; a dated copy is the way back to
@@ -2588,6 +2600,64 @@ fn replica_catch_up(data_dir: &std::path::Path, client: &mut Client) {
         Engine::open(data_dir)?.close()?;
         Ok(())
     })();
+}
+
+/// PVOS D192 — the protocol a box must announce before a forest binds its
+/// certificates: the first that understands them.
+const BIND_PROTO: u32 = 14;
+
+/// PVOS D192 — every box the forest's fleet knows (an endpoint or a version
+/// record, written by a key the forest has not revoked) and the protocol it
+/// announced (`None`: silent).
+struct FleetReadiness {
+    boxes: Vec<(String, Option<u32>)>,
+}
+
+impl FleetReadiness {
+    /// The boxes that would not read the forest after a binding.
+    fn behind(&self) -> Vec<&str> {
+        self.boxes
+            .iter()
+            .filter(|(_, p)| !p.is_some_and(|p| p >= BIND_PROTO))
+            .map(|(pin, _)| pin.as_str())
+            .collect()
+    }
+}
+
+fn bind_readiness(engine: &Engine) -> Result<FleetReadiness, PvfsError> {
+    let mut boxes: std::collections::BTreeMap<String, Option<u32>> =
+        pvfs_client::fetch::catalog_endpoints(engine).into_keys().map(|pin| (pin, None)).collect();
+    let find = |parent: &str, label: &str| -> Result<Option<String>, PvfsError> {
+        Ok(engine
+            .children(&parent.to_string())?
+            .into_iter()
+            .find_map(|c| (c.label == label).then_some(c.node.id)))
+    };
+    let root = engine.identity.root_node_id.clone();
+    if let Some(fleet) = find(&root, pvfs_client::fetch::FLEET_DIR)? {
+        if let Some(vers) = find(&fleet, pvfs_client::fetch::VERSIONS_DIR)? {
+            for c in engine.children(&vers)? {
+                if engine.is_revoked_device(&c.node.author).unwrap_or(false) {
+                    continue; // a retired box's record (PVOS D188)
+                }
+                let proto = serde_json::from_slice::<serde_json::Value>(&c.node.payload)
+                    .ok()
+                    .and_then(|v| v["proto"].as_u64())
+                    .map(|p| p as u32);
+                boxes.insert(c.label.clone(), proto);
+            }
+        }
+    }
+    Ok(FleetReadiness { boxes: boxes.into_iter().collect() })
+}
+
+/// "born bound" / "bound at seq N".
+fn bound_since(since: &str) -> String {
+    if since == "genesis" {
+        "born bound".into()
+    } else {
+        format!("bound at seq {since}")
+    }
 }
 
 fn daemon_client(state_dir: &std::path::Path) -> Result<Option<(Client, SignFn)>, PvfsError> {
@@ -7411,6 +7481,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // Uniform means "every box the fleet knows about reports the same
             // build" — so a silent box makes the answer NO, not "probably".
             let uniform = distinct.len() <= 1 && silent.is_empty() && !rows.is_empty();
+            // PVOS D192 — the forest's certificate binding, and whether every
+            // box could read the forest after one.
+            let certs_bound = engine.certificates_bound()?;
+            let certs_behind = bind_readiness(&engine)?.behind().len();
             engine.close()?;
 
             if json {
@@ -7428,9 +7502,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .map(|p| format!("\"{}\"", json_escape(p)))
                     .collect();
                 println!(
-                    "{{\"uniform\":{uniform},\"boxes\":[{}],\"silent\":[{}]}}",
+                    "{{\"uniform\":{uniform},\"boxes\":[{}],\"silent\":[{}],\"certificates\":{}}}",
                     items.join(","),
-                    sil.join(",")
+                    sil.join(","),
+                    serde_json::json!({"bound": certs_bound, "boxes_behind": certs_behind})
                 );
             } else if rows.is_empty() {
                 println!(
@@ -7465,6 +7540,17 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                          safe once this reads uniform.",
                         distinct.len()
                     );
+                }
+            }
+            if !json {
+                match &certs_bound {
+                    Some(since) => println!("certificates: {}", bound_since(since)),
+                    None if certs_behind == 0 => {
+                        println!("certificates: not bound — every box understands a binding (`pvfs forest bind-certs`)")
+                    }
+                    None => println!(
+                        "certificates: not bound — {certs_behind} box(es) below protocol {BIND_PROTO} must roll first"
+                    ),
                 }
             }
             Ok(())
@@ -9537,6 +9623,86 @@ fn forest_cmd(
             }
             engine.close()
         }
+        ForestCmd::BindCerts { target, yes } => {
+            let state = match target {
+                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                None => ctx?,
+            };
+            let engine = open_for_reading(&state)?;
+            let forest_id = engine.identity.forest_id.clone();
+            if let Some(since) = engine.certificates_bound()? {
+                engine.close()?;
+                if json {
+                    println!("{}", serde_json::json!({"forest_id": forest_id, "bound": since, "changed": false}));
+                } else {
+                    println!("forest {forest_id} binds its certificates already ({})", bound_since(&since));
+                }
+                return Ok(());
+            }
+            let fleet = bind_readiness(&engine)?;
+            engine.close()?;
+            if !json {
+                println!("forest {forest_id}: certificates not bound yet");
+                if fleet.boxes.is_empty() {
+                    println!("  no box has announced itself in this forest's fleet — any box that follows it must run protocol {} or later", pvfs_client::PROTO_VERSION);
+                }
+                for (pin, proto) in &fleet.boxes {
+                    let p = proto.map(|p| format!("protocol {p}")).unwrap_or_else(|| "no version announced (silent)".into());
+                    let ok = proto.is_some_and(|p| p >= BIND_PROTO);
+                    println!("  {} {}  {p}", if ok { "ok    " } else { "BEHIND" }, &pin[..12.min(pin.len())]);
+                }
+            }
+            if !fleet.behind().is_empty() {
+                return Err(PvfsError::BadInput {
+                    field: "fleet".into(),
+                    reason: format!(
+                        "{} box(es) do not announce protocol {BIND_PROTO} or later — roll them (and `pvfs fleet announce`) \
+                         first: after the binding an older box cannot read this forest",
+                        fleet.behind().len()
+                    ),
+                });
+            }
+            use std::io::IsTerminal;
+            if !yes {
+                if json || !std::io::stdin().is_terminal() {
+                    return Err(PvfsError::BadInput {
+                        field: "yes".into(),
+                        reason: "binding cannot be undone — run it at a terminal, or pass --yes".into(),
+                    });
+                }
+                let a = prompt_line("bind this forest's certificates now? It cannot be undone [y/N]", Some("N"))?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return Ok(());
+                }
+            }
+            match daemon_client(&state)? {
+                Some((mut client, sign)) => {
+                    client.bind_certificates(|d| sign(d)).map_err(remote_err)?;
+                    if pvfs_core::replica::marker_path(&state).exists() {
+                        replica_catch_up(&state, &mut client);
+                    }
+                }
+                None => {
+                    let mut e = Engine::open(&state)?;
+                    e.bind_certificates()?;
+                    e.close()?;
+                }
+            }
+            let since = open_for_reading(&state)
+                .and_then(|e| {
+                    let s = e.certificates_bound();
+                    e.close()?;
+                    s
+                })?
+                .unwrap_or_else(|| "?".into());
+            if json {
+                println!("{}", serde_json::json!({"forest_id": forest_id, "bound": since, "changed": true}));
+            } else {
+                println!("bound: forest {forest_id} ({})", bound_since(&since));
+            }
+            Ok(())
+        }
         ForestCmd::Tip { target } => {
             let state = match target {
                 Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
@@ -9551,11 +9717,13 @@ fn forest_cmd(
             let root = mount::peek_current_root(&state, &id).unwrap_or_else(|_| id.root_pubkey.clone());
             let source = pvfs_core::ReplicaSource::load(&state).ok();
             let fence = pvfs_core::fence::load(&state);
+            let certs = mount::peek_certs_bound(&state).ok().flatten(); // PVOS D192
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "forest_id": id.forest_id,
+                        "certs_bound": certs,
                         "root": hex::encode(&root),
                         "seq": seq,
                         "hash": hex::encode(&hash),
@@ -9570,6 +9738,7 @@ fn forest_cmd(
             } else {
                 println!("forest : {}", id.forest_id);
                 println!("root   : {}", hex::encode(&root));
+                println!("certs  : {}", certs.as_deref().map(bound_since).unwrap_or_else(|| "not bound".into()));
                 let short: String = hex::encode(&hash).chars().take(16).collect();
                 println!("log    : seq {seq}, hash {short}…");
                 match &source {
