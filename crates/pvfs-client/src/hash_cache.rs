@@ -959,18 +959,53 @@ fn punch(_path: &Path, _off: u64, _len: u64) -> bool {
     false
 }
 
+/// How long [`announced_sources`] keeps an answer.
+const ANNOUNCED_KEEP: Duration = Duration::from_secs(60);
+
 /// The fleet's other boxes, as the forest at `data_dir` knows them: every
 /// announced endpoint minus this box, in pin order (D130's rule).
+///
+/// PVOS D188 — a mount asks this for every read it fetches from another box
+/// and for every delete or rename it routes there, so it must be cheap and
+/// must not open the forest the way a daemon does. It opened the forest in
+/// full each time: the writer lock, the startup check (which can fold the
+/// log), the clean-shutdown flip — on an owner, the writer path, from a
+/// second process. Now a READ VIEW answers (a read-only connection with none
+/// of that; the running daemon keeps the forest current), falling back to
+/// the full open only where a view can't open (a replica holds no device
+/// key), and a non-empty answer is kept for a minute.
 pub fn announced_sources(data_dir: &Path) -> Vec<ReplicaSource> {
-    let Ok(engine) = Engine::open(data_dir) else {
-        return Vec::new();
+    static KEPT: Mutex<std::collections::BTreeMap<PathBuf, (Instant, Vec<ReplicaSource>)>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    if let Some((at, kept)) = KEPT.lock().unwrap().get(data_dir) {
+        if at.elapsed() < ANNOUNCED_KEEP {
+            return kept.clone();
+        }
+    }
+    let fresh = announced_now(data_dir);
+    if !fresh.is_empty() {
+        KEPT.lock().unwrap().insert(data_dir.to_path_buf(), (Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+/// [`announced_sources`] without the minute's memory.
+fn announced_now(data_dir: &Path) -> Vec<ReplicaSource> {
+    let mut eps: Vec<(String, String)> = match Engine::open_read_view(data_dir) {
+        // A read view is never closed: its shutdown bookkeeping belongs to
+        // the writer (`Engine::close` would try to commit heads).
+        Ok(view) => crate::fetch::catalog_endpoints(&view).into_iter().collect(),
+        Err(_) => {
+            let Ok(engine) = Engine::open(data_dir) else {
+                return Vec::new();
+            };
+            let eps = crate::fetch::catalog_endpoints(&engine).into_iter().collect();
+            let _ = engine.close();
+            eps
+        }
     };
     let own = pvfs_core::storage::host_pin(data_dir);
-    let mut eps: Vec<(String, String)> = crate::fetch::catalog_endpoints(&engine)
-        .into_iter()
-        .filter(|(pin, _)| own.as_deref() != Some(pin.as_str()))
-        .collect();
-    let _ = engine.close();
+    eps.retain(|(pin, _)| own.as_deref() != Some(pin.as_str()));
     eps.sort();
     eps.into_iter()
         .map(|(pin, addr)| ReplicaSource {
@@ -1412,6 +1447,38 @@ impl HashCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PVOS D188 — with the forest open by its writer (the daemon), the
+    /// mount's lookup reads the endpoints through a read view, and keeps the
+    /// answer for a minute.
+    #[test]
+    fn a_mount_reads_the_endpoints_through_a_read_view_and_keeps_them() {
+        use pvfs_core::{NodeSpec, TYPE_FOLDER};
+        let spec = |label: &str, payload: &str| NodeSpec {
+            node_type: TYPE_FOLDER.into(),
+            label: label.into(),
+            payload: payload.as_bytes().to_vec(),
+            is_temp: false,
+            creation_nonce: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut writer, _mn) = Engine::init(dir.path()).unwrap();
+        let root = writer.identity.root_node_id.clone();
+        let fleet = writer.add_node(&root, spec(crate::fetch::FLEET_DIR, "")).unwrap();
+        let eps = writer.add_node(&fleet, spec(crate::fetch::ENDPOINTS_DIR, "")).unwrap();
+        writer.add_node(&eps, spec("bbbb", "10.0.0.2:7434")).unwrap();
+        writer.add_node(&eps, spec("aaaa", "10.0.0.1:7434")).unwrap();
+
+        // The writer stays open, as a daemon keeps it.
+        let got = announced_sources(dir.path());
+        let pins: Vec<&str> = got.iter().map(|s| s.pin.as_str()).collect();
+        assert_eq!(pins, vec!["aaaa", "bbbb"], "in pin order");
+        assert_eq!(got[0].target, "10.0.0.1:7434");
+
+        writer.add_node(&eps, spec("cccc", "10.0.0.3:7434")).unwrap();
+        assert_eq!(announced_sources(dir.path()).len(), 2, "kept for a minute");
+        assert_eq!(announced_now(dir.path()).len(), 3, "a fresh look sees the new one");
+    }
 
     #[test]
     fn the_piece_map_counts_and_finds() {

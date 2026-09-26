@@ -5,6 +5,34 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Before an owner holds regions on a busy box (PVOS D188).** Found reading
+  the code for mediabox's move to owner:
+  - **A mount left on an older build no longer passes the roll's check.** A
+    running mount reads the catalogue at its own schema; moving the
+    catalogue in place still leaves it behind, because every fresh open it
+    makes (each read it fetches from another box, each delete or rename it
+    routes there) refuses the newer schema. `versions --json` now says such
+    a mount does not survive, so a roll stops on a Plex box unless told to
+    interrupt the mount (PVOS D181's rule) instead of leaving it unable to
+    open anything held elsewhere until it restarts.
+  - **A mount's endpoint lookup opens a read view and remembers it for a
+    minute** (`hash_cache::announced_sources`). It opened the forest in full
+    for every such read — the writer lock, the startup check, the
+    clean-shutdown flip; on an owner, the writer path from a second process.
+    A forest a read view can't open (a replica) still takes the full open.
+  - **Read-only commands read through a read view while the daemon runs**:
+    `info`, `view ls|conflicts`, `region ls`, `region entries`. A full open
+    commits region heads on close on an owner that holds regions; a status
+    page polling these every minute on the owner no longer writes to the
+    log. `Engine::close` on a read view is a no-op (it used to fail).
+  - **A retired box's endpoint is no longer dialed.** `catalog_endpoints`
+    skips a record written by a device key the forest has revoked — a
+    promotion revokes the old owner's — so no box dials it each pass and the
+    owner stops paging "peer down" for it. A follower's record (written with
+    its member key) is never hidden by this; a re-announce rewrites a hidden
+    record under the box's current key.
+  - `serve status --json` carries `mounts` and `backup`, as the daemon sends
+    them.
 - **Every request over the network cost about half a second (PVOS D187).**
   `write_msg` wrote a frame as two writes — its length, then its body — so
   over TLS each frame left as two records in two TCP segments, and Nagle held
