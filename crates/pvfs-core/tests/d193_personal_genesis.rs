@@ -127,3 +127,33 @@ fn the_phrase_keys_the_page_must_derive() {
         assert_eq!(key, want, "{what}");
     }
 }
+
+/// The genesis digests from fixed inputs — pinned in the web page's tests,
+/// which recompute them from the events a server proposes before signing
+/// (so no server can slip itself in as the owner device).
+#[test]
+fn the_genesis_digests_the_page_must_recompute() {
+    use pvfs_core::{acl, event, link, node};
+    let root = hex::decode("036242fd83e40688fc2c61fa05061edc98fef9bf2e4c85c28718b9d5f4f6acd2ac").unwrap();
+    let ident = hex::decode("036435e78bcc147f4c92e0db70d4107d0c5bf04b169cf1b3d339212088df21a544").unwrap();
+    let host = hex::decode("02c3a30e05b8c44bf16f0fcec80f481954acb45984d6ff6d6b0766385362092656").unwrap();
+    let (instance, forest, t, nonce) = ("pvfs-00000001", "00000000-0000-4000-8000-000000000001", 1_700_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+    let node_id = hex::encode(node::compute_id_digest(node::TYPE_FOLDER, "root", node::VISIBILITY_PUBLIC, &[], false, nonce, t, &ident));
+    let got = [
+        ("root node", node_id.clone()),
+        ("root link", hex::encode(link::compute_id_digest(None, &node_id, link::LINK_CONTAINS, 0))),
+        ("forest created v2", hex::encode(event::msg_forest_created(instance, forest, &node_id, t, &root, true))),
+        ("identity as owner device", hex::encode(event::msg_device_authorized(Some(forest), &ident, 0, t, &root))),
+        ("host as member", hex::encode(event::msg_device_authorized(Some(forest), &host, acl::MEMBER_DEVICE_INDEX, t, &root))),
+    ];
+    let pinned = [
+        "31071f80e0846ec198c1e2327480f4440fecc9a94af5bd92710b87c24331ff80",
+        "5cc12ef8cdcfae7b6afda6cd6ec4893853c21de1eb0f5c921f796f6e185cc64c",
+        "2ae3f1e6fcfb6c40784dc6c9f147fccfdc95e3dbb3e34f98a0aac13d5d4b7f68",
+        "889c858d02e774d5f950f336eb5940eb034c20f8a9e43cada785eda4a1025b97",
+        "7eaf631a33e329df0751ee57b42a0676215d6f96a580618f9fa04b11a7b634d3",
+    ];
+    for ((what, d), want) in got.iter().zip(pinned) {
+        assert_eq!(d, want, "{what}");
+    }
+}
