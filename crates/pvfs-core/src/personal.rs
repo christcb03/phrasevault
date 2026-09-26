@@ -279,8 +279,14 @@ pub fn init_signed_genesis(data_dir: &Path, events: Vec<Event>, host_key: Signin
         return Err(bad("the first event must be ForestCreated"));
     };
     // Born bound (D192): the genesis signed in its v2 form.
-    let v2 = event::msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, true);
-    crypto::verify_digest(author, &v2, sig).map_err(|_| bad("a personal forest is born bound: its genesis must be signed as v2"))?;
+    let form = |bound| event::msg_forest_created(instance_id, forest_id, root_node_id, *created_at, author, bound);
+    if crypto::verify_digest(author, &form(true), sig).is_err() {
+        return Err(if crypto::verify_digest(author, &form(false), sig).is_ok() {
+            bad("a personal forest is born bound: its genesis must be signed as v2")
+        } else {
+            bad("the genesis is not signed by the root it names")
+        });
+    }
     // Every signature in memory before anything touches the disk; the fold
     // on open stays the full check — authority as well as signatures.
     let ctx = event::SigContext { forest_id, bound: true };
