@@ -1051,7 +1051,7 @@ fn keys_report(socket: &std::path::Path) -> Result<KeysReport, String> {
         .unwrap_or_default();
     others.sort();
     for path in others {
-        if phrases.iter().any(|p| PathBuf::from(&p.path) == path) {
+        if phrases.iter().any(|p| std::path::Path::new(&p.path) == path.as_path()) {
             continue;
         }
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
