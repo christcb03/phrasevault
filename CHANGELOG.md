@@ -6,9 +6,9 @@ file tracks Layer 0, the file-system engine.
 ## Unreleased
 
 - **Serving at the daemon's priority, background below it (PVOS D191).**
-  mediabox's unit lowered the whole daemon (nice 10, best-effort 7): the
-  threads answering the view mount's listings and lookups and other boxes'
-  reads too. And its disk half did nothing there — mq-deadline, the media
+  mediabox's unit lowered the whole daemon (nice 10, best-effort 7): its
+  serving threads too (writes through the view mount, other boxes' reads of
+  files held there). And its disk half did nothing — mq-deadline, the media
   disks' scheduler, ignores the level inside best-effort. Now the job
   supervisor (`pvfsd-jobs`) lowers itself before it spawns anything, so
   every pass and the trash step start below serving, and the hashing pool

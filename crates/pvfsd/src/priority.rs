@@ -1,8 +1,8 @@
 //! PVOS D191 — serving at the daemon's priority, background below it.
 //!
 //! mediabox's unit used to lower the WHOLE daemon (nice 10, best-effort 7):
-//! the threads answering the view mount's listings and other boxes' reads
-//! too. And its disk half did nothing there — mq-deadline, the media disks'
+//! its serving threads too (writes through the view mount, other boxes'
+//! reads). And its disk half did nothing there — mq-deadline, the media disks'
 //! scheduler, orders requests by class and ignores the level inside
 //! best-effort. Now the daemon runs at the unit's priority and its
 //! background lowers itself: the job supervisor before it spawns any pass
