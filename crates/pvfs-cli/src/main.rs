@@ -1560,6 +1560,17 @@ enum FleetCmd {
         #[arg(long)]
         retract: bool,
     },
+    /// PVOS D192 — remove ANOTHER box's endpoint and version records: a box
+    /// that is gone for good, whose records the fleet (and a certificate
+    /// binding's check) would otherwise count forever. Its keys are not
+    /// touched. Run it bare: it lists the boxes and asks.
+    Forget {
+        /// The box's pin, or a unique prefix of it (as `fleet versions` shows)
+        pin: Option<String>,
+        /// Don't ask (scripts)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7555,6 +7566,101 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Fleet(FleetCmd::Forget { pin, yes }) => {
+            let state_dir = ctx?;
+            let engine = Engine::open(&state_dir)?;
+            let root = engine.identity.root_node_id.clone();
+            let find = |parent: &str, label: &str| -> Result<Option<String>, PvfsError> {
+                Ok(engine
+                    .children(&parent.to_string())?
+                    .into_iter()
+                    .find_map(|c| (c.label == label).then_some(c.node.id)))
+            };
+            // every record: (pin, node, link, kind)
+            let mut records: Vec<(String, String, String, &str)> = Vec::new();
+            if let Some(fleet) = find(&root, pvfs_client::fetch::FLEET_DIR)? {
+                for (dir, kind) in [(pvfs_client::fetch::ENDPOINTS_DIR, "endpoint"), (pvfs_client::fetch::VERSIONS_DIR, "version")] {
+                    if let Some(d) = find(&fleet, dir)? {
+                        for c in engine.children(&d)? {
+                            records.push((c.label.clone(), c.node.id.clone(), c.link_id.clone(), kind));
+                        }
+                    }
+                }
+            }
+            let mut pins: Vec<String> = records.iter().map(|r| r.0.clone()).collect();
+            pins.sort();
+            pins.dedup();
+            let wanted = match pin {
+                Some(p) => p,
+                None => {
+                    for p in &pins {
+                        println!("  {}", &p[..12.min(p.len())]);
+                    }
+                    prompt_line("which box to forget (its pin or a prefix)", None)?
+                }
+            };
+            let matching: Vec<&String> = pins.iter().filter(|p| p.starts_with(wanted.trim())).collect();
+            let target = match matching.as_slice() {
+                [one] => (*one).clone(),
+                [] => {
+                    engine.close()?;
+                    return Err(PvfsError::NotFound { kind: "fleet record", id: wanted });
+                }
+                _ => {
+                    engine.close()?;
+                    return Err(PvfsError::BadInput {
+                        field: "pin".into(),
+                        reason: format!("{wanted:?} names {} boxes — give more of the pin", matching.len()),
+                    });
+                }
+            };
+            if pvfs_core::storage::host_pin(&state_dir).as_deref() == Some(target.as_str()) {
+                engine.close()?;
+                return Err(PvfsError::BadInput {
+                    field: "pin".into(),
+                    reason: "that is this box — `pvfs fleet announce --retract` removes its own records".into(),
+                });
+            }
+            let mine: Vec<&(String, String, String, &str)> = records.iter().filter(|r| r.0 == target).collect();
+            println!(
+                "forget {}: its {} record(s) — {}",
+                &target[..12.min(target.len())],
+                mine.len(),
+                mine.iter().map(|r| r.3).collect::<Vec<_>>().join(", ")
+            );
+            use std::io::IsTerminal;
+            if !yes {
+                if json || !std::io::stdin().is_terminal() {
+                    engine.close()?;
+                    return Err(PvfsError::BadInput {
+                        field: "yes".into(),
+                        reason: "run it at a terminal, or pass --yes".into(),
+                    });
+                }
+                let a = prompt_line("remove them? [y/N]", Some("N"))?;
+                if !a.trim().eq_ignore_ascii_case("y") {
+                    println!("nothing was changed");
+                    return engine.close();
+                }
+            }
+            if engine.is_replica() {
+                let data_dir = engine.data_dir().to_path_buf();
+                engine.close()?;
+                let (mut client, sign) = replica_write_client(&data_dir)?;
+                for r in &mine {
+                    client.rm(&r.1, |d| sign(d)).map_err(remote_err)?;
+                }
+                replica_catch_up(&data_dir, &mut client);
+            } else {
+                let mut engine = engine;
+                for r in &mine {
+                    engine.remove_link(&r.2)?;
+                }
+                engine.close()?;
+            }
+            println!("forgot {}", &target[..12.min(target.len())]);
+            Ok(())
+        }
         Cmd::Fleet(FleetCmd::Announce { addr, retract }) => {
             let state_dir = ctx?;
             let pin = pvfs_core::storage::host_pin(&state_dir).ok_or_else(|| {
@@ -9667,7 +9773,8 @@ fn forest_cmd(
                     field: "fleet".into(),
                     reason: format!(
                         "{} box(es) do not announce protocol {BIND_PROTO} or later — roll them (and `pvfs fleet announce`) \
-                         first: after the binding an older box cannot read this forest",
+                         first: after the binding an older box cannot read this forest. A box that is gone for good: \
+                         `pvfs fleet forget <pin>`",
                         fleet.behind().len()
                     ),
                 });

@@ -1,6 +1,7 @@
 //! PVOS D192 — `pvfs forest bind-certs`: refused while any box the fleet
 //! knows announces an older protocol (or none — a silent box), done once
-//! every box announces 14; then `forest tip` and `fleet versions` say so.
+//! every box announces 14 (or a box that is gone is forgotten — `fleet
+//! forget`); then `forest tip` and `fleet versions` say so.
 
 use pvfs_core::{Engine, NodeSpec};
 
@@ -84,14 +85,20 @@ fn binding_waits_for_every_box_the_fleet_knows() {
     let tip: serde_json::Value = serde_json::from_slice(&tip.stdout).unwrap();
     assert_eq!(tip["certs_bound"], serde_json::Value::Null);
 
-    // both boxes announce 14
+    // box a rolls and announces 14; box b is gone for good — forgotten
     let mut engine = Engine::open(dir).unwrap();
     for c in engine.children(&vers).unwrap() {
         engine.remove_link(&c.link_id).unwrap();
     }
     node(&mut engine, &vers, &a, "fleet.version", &version(14));
-    node(&mut engine, &vers, &b, "fleet.version", &version(14));
     engine.close().unwrap();
+    let out = pvfs(dir, &["fleet", "forget", "bbbbbbbbbbbb"]);
+    assert!(!out.status.success(), "no --yes, no terminal: asked, not assumed");
+    let out = pvfs(dir, &["fleet", "forget", "bbbbbbbbbbbb", "--yes"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("forgot bbbbbbbbbbbb"));
+    let out = pvfs(dir, &["fleet", "forget", "bbbb", "--yes"]);
+    assert!(!out.status.success(), "nothing left to forget");
 
     // not at a terminal and no --yes: asked for, not assumed
     let out = pvfs(dir, &["forest", "bind-certs"]);
