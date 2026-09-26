@@ -40,6 +40,9 @@ final class AgentController: ObservableObject {
     @Published var auditEntries: [AuditEntry] = []
     @Published var openAtLogin = false
     @Published var loginItemNote: String?
+    /// PVOS D189 — Settings → Phrases & keys.
+    @Published var keysReport: KeysReport?
+    @Published var keysError: String?
 
     private var agentProcess: Process?
     private var statusTimer: Timer?
@@ -274,6 +277,24 @@ final class AgentController: ObservableObject {
             if origin.hasPrefix("(") { return nil }
             let expiry = parts.dropFirst().joined(separator: " ")
             return OriginGrant(origin: origin, expiry: expiry.isEmpty ? "—" : expiry)
+        }
+    }
+
+    /// PVOS D189 — every phrase, its keys and what uses them
+    /// (`pvfs-companion keys --json`). Read on demand, not on the 2 s poll.
+    func refreshKeys() {
+        let r = runCompanionCapturing(args: ["keys", "--json"], env: [:], stdin: nil)
+        guard r.exitCode == 0 else {
+            keysError = r.stderr.isEmpty ? "keys: exit \(r.exitCode)" : r.stderr
+            return
+        }
+        do {
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            keysReport = try decoder.decode(KeysReport.self, from: Data(r.stdout.utf8))
+            keysError = nil
+        } catch {
+            keysError = "Could not read the phrase list: \(error.localizedDescription)"
         }
     }
 

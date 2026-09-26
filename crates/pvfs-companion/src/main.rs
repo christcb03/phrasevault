@@ -1024,7 +1024,12 @@ fn keys_report(socket: &std::path::Path) -> Result<KeysReport, String> {
     let (agent, served) = match pvfs_companion::request(socket, &pvfs_companion::AgentRequest::ListKeys) {
         Ok(pvfs_companion::AgentResponse::Keys { keys }) => ("running", keys),
         Ok(_) => ("older", Vec::new()),
-        Err(_) => ("not running", Vec::new()),
+        // A companion before v4 drops the connection on a request it cannot
+        // read; one that still answers the version is running, just older.
+        Err(_) => match pvfs_companion::request(socket, &pvfs_companion::AgentRequest::ApiVersion) {
+            Ok(_) => ("older", Vec::new()),
+            Err(_) => ("not running", Vec::new()),
+        },
     };
     let dir = default_vault()?.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut phrases = Vec::new();

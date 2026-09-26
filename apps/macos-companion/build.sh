@@ -30,6 +30,7 @@ SWIFT_FILES=(
   "$APP_SRC/Sources/CompanionSSH.swift"
   "$APP_SRC/Sources/SetupView.swift"
   "$APP_SRC/Sources/ConsoleView.swift"
+  "$APP_SRC/Sources/KeysView.swift"
   "$APP_SRC/Sources/AppRoot.swift"
 )
 
