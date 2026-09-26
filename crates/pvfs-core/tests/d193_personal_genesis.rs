@@ -120,8 +120,13 @@ fn the_phrase_keys_the_page_must_derive() {
         ("encryption 2'/0'", hex(identity::encryption_key(&mn, "", 0).unwrap())),
         ("identity 3'/0'", hex(identity::identity_key(&mn, "", 0).unwrap())),
     ];
-    for (what, key) in &got {
-        println!("D193 vector {what}: {key}");
+    let pinned = [
+        ("root 0'", "036242fd83e40688fc2c61fa05061edc98fef9bf2e4c85c28718b9d5f4f6acd2ac"),
+        ("device 1'/0'", "02c3a30e05b8c44bf16f0fcec80f481954acb45984d6ff6d6b0766385362092656"),
+        ("encryption 2'/0'", "03d02843b4ffdfe3ae8a18feb3a9a2e6a4d5cc39150f2e8d9990da1b281355d744"),
+        ("identity 3'/0'", "036435e78bcc147f4c92e0db70d4107d0c5bf04b169cf1b3d339212088df21a544"),
+    ];
+    for ((what, key), (_, want)) in got.iter().zip(pinned) {
+        assert_eq!(key, want, "{what}");
     }
-    assert_eq!(got.len(), 4);
 }
