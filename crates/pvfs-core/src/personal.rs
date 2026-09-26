@@ -59,11 +59,16 @@ pub struct PreparedGenesisEvent {
     pub event: Event,
 }
 
-/// The unsigned genesis, in log order.
+/// The unsigned genesis, in log order. The genesis has one fixed shape, so
+/// `forest_id`, `instance_id`, `created_at`, `root_nonce` and the host key
+/// are all a signer needs to rebuild every digest itself — which a person's
+/// browser does, rather than sign digests a server hands it.
 #[derive(Clone, Debug)]
 pub struct PreparedGenesis {
     pub forest_id: String,
     pub instance_id: String,
+    pub created_at: u64,
+    pub root_nonce: u64,
     pub events: Vec<PreparedGenesisEvent>,
 }
 
@@ -206,7 +211,7 @@ pub fn prepare_personal_genesis(g: &PersonalGenesis) -> Result<PreparedGenesis> 
         PreparedGenesisEvent { signer: GenesisSigner::Identity, digest: link_digest, event: Event::LinkCreated(root_link) },
         member(&g.host_pub),
     ];
-    Ok(PreparedGenesis { forest_id, instance_id, events })
+    Ok(PreparedGenesis { forest_id, instance_id, created_at: t, root_nonce: creation_nonce, events })
 }
 
 /// Write a signed personal genesis at `data_dir` and open the forest, with
