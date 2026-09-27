@@ -162,12 +162,21 @@ since=\$(cat "\$FT/d196-edge.mark")
 tail -n +\$((since + 1)) "\$FT/d196-edge.log" > "\$FT/d196-edge.after"
 grep -q "no route through the owner" "\$FT/d196-edge.after" && grep -q "the owner is fenced" "\$FT/d196-edge.after" && echo E2=ok
 echo "FAILED_PASSES=\$(grep -c 'watch pass failed' "\$FT/d196-edge.after")"
+# the one allowed: the route opened BEFORE the fence meets the refusal once
+grep 'watch pass failed' "\$FT/d196-edge.after" | grep -vq 'fenced' && echo E3=other-failure
+grep -q 'watch recovered: a pass completed after 1 failed pass' "\$FT/d196-edge.after" && echo E4=ok
 echo "LINE=\$(grep -m1 'no route through the owner' "\$FT/d196-edge.after" | cut -c1-220)"
 EOS
 )
 has "$E_OUT" E1=ok && ok "the edge catalogued z.mkv here: edge-shelf head 2 pending" || fail "no pending head: $(val "$E_OUT" PENDING) $(ssh "$EDGE" 'tail -4 $HOME/fleet-test/d196-edge.log')"
 has "$E_OUT" E2=ok && ok "the edge's watch said it had no route through the owner, which is fenced" || fail "no route line: $(ssh "$EDGE" 'tail -4 $HOME/fleet-test/d196-edge.after')"
-[ "$(val "$E_OUT" FAILED_PASSES)" = "0" ] && ok "no watch pass failed while the owner was fenced" || fail "watch passes failed: $(val "$E_OUT" FAILED_PASSES)"
+# A watch holding a route opened before the fence meets the refusal once: that
+# pass fails (and says fenced); the next, 5 s later, opens a route, learns
+# the fence and catalogues here. More than one, or another error, is a fault.
+FP=$(val "$E_OUT" FAILED_PASSES)
+{ [ "$FP" = "0" ] || { [ "$FP" = "1" ] && has "$E_OUT" E4=ok; }; } && ! has "$E_OUT" E3=other-failure \
+  && ok "at most one watch pass failed, on the route from before the fence ($FP), and it recovered" \
+  || fail "watch passes failed: $FP $(ssh "$EDGE" 'grep "watch pass" $HOME/fleet-test/d196-edge.after | cut -c1-160')"
 echo "     $(val "$E_OUT" LINE)"
 F_OUT=$(ssh "$OWNER" "bash -s" <<EOS
 $RH
