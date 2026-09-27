@@ -135,7 +135,7 @@ pub fn run(
         let mut route = crate::advertise::replica_route(data_dir, is_replica).unwrap_or(None);
         // initial reconciliation
         notify_cb(WatchEvent::PassStarted);
-        match scan_pass(&mut engine, &mut route) {
+        match scan_pass(&mut engine, &mut route, pvfs_core::WATCH_SETTLE_MS) {
             // D156 — the same events as every later pass. This had its own
             // copy (`Ingested` per report, never `Quiet`), so the first pass
             // after each daemon start never said `NeedsAttention`: the lab's
@@ -214,7 +214,7 @@ pub fn run(
                 pending = None;
                 last_reconcile = Instant::now();
                 notify_cb(WatchEvent::PassStarted);
-                match scan_pass(&mut engine, &mut route) {
+                match scan_pass(&mut engine, &mut route, pvfs_core::WATCH_SETTLE_MS) {
                     Ok(reports) => {
                         retry_at = None;
                         backoff = RETRY_MIN;
@@ -383,6 +383,7 @@ fn names_a_folder(path: &Path, kind: &notify::EventKind) -> bool {
 fn scan_pass(
     engine: &mut Engine,
     route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
+    settle_ms: u64,
 ) -> Result<Vec<pvfs_core::ScanReport>, PvfsError> {
     // Reconnect if a previous pass dropped the route (see the Err arm above).
     // A replica with no route cannot write through the owner, so for an
@@ -394,13 +395,14 @@ fn scan_pass(
     if route.is_none() && engine.is_replica() {
         match crate::advertise::replica_route(engine.data_dir(), true) {
             Ok(r) => *route = r,
+            // PVOS D196 — unreachable, or fenced (`replica_route` says which).
             Err(e) if engine.catalogues_only()? => {
                 eprintln!(
-                    "pvfs: watch: the owner is unreachable ({e}) — cataloguing here; \
-                     the head is published locally and committed when it answers"
+                    "pvfs: watch: no route through the owner ({e}) — cataloguing here; \
+                     the head is published locally and committed when a writer answers"
                 );
                 let mut away = pvfs_core::OwnerAway;
-                return engine.scan_routed(None, Some(&mut away), pvfs_core::WATCH_SETTLE_MS);
+                return engine.scan_routed(None, Some(&mut away), settle_ms);
             }
             Err(e) => return Err(e),
         }
@@ -413,7 +415,7 @@ fn scan_pass(
             // PVOS D183 — heads published while the owner was away go in first,
             // the newest per region (the owner takes any seq that advances).
             let settled = commit_pending_heads(engine, &mut w)?;
-            let reports = engine.scan_routed(None, Some(&mut w), pvfs_core::WATCH_SETTLE_MS)?;
+            let reports = engine.scan_routed(None, Some(&mut w), settle_ms)?;
             // Read-your-writes — the same F5.0 precedent `advertise` follows.
             // A routed write lands in the OWNER's log, and this box does not
             // see it until the tail is folded here. Skip this and the next
@@ -430,8 +432,21 @@ fn scan_pass(
             }
             Ok(reports)
         }
-        None => engine.scan_routed(None, None, pvfs_core::WATCH_SETTLE_MS),
+        None => engine.scan_routed(None, None, settle_ms),
     }
+}
+
+/// One watch pass as `run` makes it, route handling included — for a test
+/// that drives the decision between routing through the owner and
+/// cataloguing here (PVOS D196). `settle_ms` is the settle window `run`
+/// passes as `WATCH_SETTLE_MS`; a test passes 0 rather than wait it out.
+#[doc(hidden)]
+pub fn scan_once(
+    engine: &mut Engine,
+    route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
+    settle_ms: u64,
+) -> Result<Vec<pvfs_core::ScanReport>, PvfsError> {
+    scan_pass(engine, route, settle_ms)
 }
 
 /// PVOS D183 — commit this box's pending heads (published while the owner was

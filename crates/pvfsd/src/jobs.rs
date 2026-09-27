@@ -130,7 +130,7 @@ enum Fault {
     /// in backoff, 5 s doubling to 300 s.
     WatchPass,
     /// A follow session failed (`FollowEvent::Retrying`); `follow::run`
-    /// retries it every 2 s.
+    /// retries it in backoff, 2 s doubling to 30 s (PVOS D196).
     FollowSession,
     /// The job's thread exited with an error; the supervisor restarts it
     /// after `FATAL_RETRY`.
@@ -138,6 +138,9 @@ enum Fault {
     /// D176 — the runner's trash step failed for a region (or could not
     /// list them); the next step tries again.
     Trash,
+    /// PVOS D196 — a periodic job's pass failed as a whole; the next pass,
+    /// at the job's interval, tries again. Ended by a pass that completes.
+    Pass(&'static str),
 }
 
 impl Fault {
@@ -150,6 +153,7 @@ impl Fault {
                 FATAL_RETRY.as_secs()
             ),
             Fault::Trash => format!("pvfsd: trash purge failed: {err}; the next step tries again"),
+            Fault::Pass(job) => format!("pvfsd: {job} pass failed: {err}; the next pass tries again"),
         }
     }
 
@@ -167,6 +171,9 @@ impl Fault {
             ),
             Fault::Trash => format!(
                 "pvfsd: trash purge recovered: a step completed after {failed} failed step(s) over {span}"
+            ),
+            Fault::Pass(job) => format!(
+                "pvfsd: {job} recovered: a pass completed after {failed} failed pass(es) over {span}"
             ),
         }
     }
@@ -321,7 +328,14 @@ impl JobsState {
                     // no pass has finished lately, and on a library this size
                     // that is the normal state of a healthy long pass.
                     r.state = "overdue".into();
-                    r.last_error = Some(why);
+                    // PVOS D196 — except a follower, which stamps its row on
+                    // every long-poll (D146): its overdue IS the evidence, and
+                    // it says so in its own words (the notifier reports it).
+                    r.last_error = Some(if r.name == "follow" {
+                        follow_hung_reason(now.saturating_sub(since))
+                    } else {
+                        why
+                    });
                 }
                 r
             })
@@ -394,8 +408,9 @@ impl JobsState {
     /// D157, D159 — `fault` happened: the journal line it earns, if any. The
     /// first failure of a run is said, and after that only a changed text
     /// (D151's rule for the notifier's job errors), so a job retrying the same
-    /// fault (a watch pass in backoff, a follower every 2 s, a thread the
-    /// supervisor restarts every 60 s) does not repeat itself.
+    /// fault (a watch pass in backoff, a follower in its, a thread the
+    /// supervisor restarts every 60 s, a periodic pass every interval) does
+    /// not repeat itself.
     fn failed(&self, fault: Fault, err: &str) -> Option<String> {
         let mut runs = self.failing.lock().unwrap();
         let r = runs
@@ -470,6 +485,32 @@ impl JobsState {
                 r.last_error = None;
             }
         });
+    }
+
+    /// PVOS D196 — a periodic job's pass failed as a whole: the row says so,
+    /// as `mark_pass` always did, and now the journal too — the first
+    /// failure of a run and any change of text (D157's rule), not every
+    /// pass. D162's "database or disk is full" reached the phone and never
+    /// `pvfsd.log`, and the NAS has no other log. Returns the line it printed.
+    fn pass_failed(&self, name: &'static str, err: String) -> Option<String> {
+        let line = self.failed(Fault::Pass(name), &err);
+        if let Some(l) = &line {
+            eprintln!("{l}");
+        }
+        self.mark_pass(name, Some(err));
+        line
+    }
+
+    /// PVOS D196 — a periodic job's pass completed (per-file `issue`s, if
+    /// any, stay in the row as before): ends the job's run of failed passes,
+    /// saying so once. Returns the line it printed.
+    fn pass_done(&self, name: &'static str, issue: Option<String>) -> Option<String> {
+        let line = self.recovered(Fault::Pass(name));
+        if let Some(l) = &line {
+            eprintln!("{l}");
+        }
+        self.mark_pass(name, issue);
+        line
     }
 }
 
@@ -584,8 +625,8 @@ fn follow_event(cb: &JobsState, ev: FollowEvent<'_>) -> Vec<String> {
             log.extend(cb.recovered(Fault::FollowSession));
         }
         // D159 — and say so in the journal, as a failed watch pass does
-        // (D157). The follower retries every 2 s with no backoff, so a source
-        // down for an hour is one line here, not 1,800.
+        // (D157). The follower retries in backoff (2 s doubling to 30 s since
+        // PVOS D196), so a source down for an hour is one line here, not ~120.
         FollowEvent::Retrying { reason } => {
             cb.mark_retry("follow", &reason);
             log.extend(cb.failed(Fault::FollowSession, &reason));
@@ -805,20 +846,26 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     let issue = failed.first().map(|(label, e)| {
                         format!("{} fetch failures (first: {label} — {e})", failed.len())
                     });
-                    st.mark_pass("sync", issue);
+                    st.pass_done("sync", issue);
                     if fetched > 0 {
                         // new bytes landed — refresh the export views now
                         st.nudge_export.store(true, Ordering::SeqCst);
                     }
                 }
-                Err(e) => st.mark_pass("sync", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("sync", e.to_string());
+                }
             }
         }),
         "export" => job_thread(name, move || {
             st.set_state("export", "running");
             match export_pass(&st, cancel) {
-                Ok(_) => st.mark_pass("export", None),
-                Err(e) => st.mark_pass("export", Some(e.to_string())),
+                Ok(_) => {
+                    st.pass_done("export", None);
+                }
+                Err(e) => {
+                    st.pass_failed("export", e.to_string());
+                }
             }
         }),
         "tier" => {
@@ -880,9 +927,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                             format!("{} migrations failed (first: {label} — {e})", t.failed.len())
                         })
                     });
-                    st.mark_pass("tier", issue);
+                    st.pass_done("tier", issue);
                 }
-                Err(e) => st.mark_pass("tier", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("tier", e.to_string());
+                }
             }
             })
         }
@@ -933,12 +982,16 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                                 }
                                 Err(e) => eprintln!("pvfsd: notify: {e}"),
                             }
-                            st.mark_pass("health", None)
+                            st.pass_done("health", None);
                         }
-                        Err(e) => st.mark_pass("health", Some(e.to_string())),
+                        Err(e) => {
+                            st.pass_failed("health", e.to_string());
+                        }
                     }
                 }
-                Err(e) => st.mark_pass("health", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("health", e.to_string());
+                }
             }
         }),
         "catalogue" => job_thread(name, move || {
@@ -964,9 +1017,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     for (region, why) in &rep.failed {
                         eprintln!("pvfsd: catalogue {}: {why}", &region[..8]);
                     }
-                    st.mark_pass("catalogue", None)
+                    st.pass_done("catalogue", None);
                 }
-                Err(e) => st.mark_pass("catalogue", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("catalogue", e.to_string());
+                }
             }
         }),
         "receive" => job_thread(name, move || {
@@ -1013,9 +1068,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     for (p, why) in &rep.failed {
                         eprintln!("pvfsd: receive: {p}: {why}");
                     }
-                    st.mark_pass("receive", None)
+                    st.pass_done("receive", None);
                 }
-                Err(e) => st.mark_pass("receive", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("receive", e.to_string());
+                }
             }
         }),
         "resolve" => job_thread(name, move || {
@@ -1056,9 +1113,11 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                     if purged > 0 {
                         eprintln!("pvfsd: resolve purged {purged} trash buckets past retention");
                     }
-                    st.mark_pass("resolve", None)
+                    st.pass_done("resolve", None);
                 }
-                Err(e) => st.mark_pass("resolve", Some(e.to_string())),
+                Err(e) => {
+                    st.pass_failed("resolve", e.to_string());
+                }
             }
         }),
         "reclaim" => job_thread(name, move || {
@@ -1070,8 +1129,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
                 r
             })();
             match r {
-                Ok(_) => st.mark_pass("reclaim", None),
-                Err(e) => st.mark_pass("reclaim", Some(e.to_string())),
+                Ok(_) => {
+                    st.pass_done("reclaim", None);
+                }
+                Err(e) => {
+                    st.pass_failed("reclaim", e.to_string());
+                }
             }
         }),
         "evict" => job_thread(name, move || {
@@ -1096,8 +1159,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             match r {
                 // held-back files (no other live location) are expected, not
                 // errors — the next mover pass unblocks them
-                Ok(_) => st.mark_pass("evict", None),
-                Err(e) => st.mark_pass("evict", Some(e.to_string())),
+                Ok(_) => {
+                    st.pass_done("evict", None);
+                }
+                Err(e) => {
+                    st.pass_failed("evict", e.to_string());
+                }
             }
         }),
         other => unreachable!("no pass body for job {other}"),
@@ -1236,6 +1303,17 @@ pub fn stalled_reason(
         waited / 60_000,
         every.as_secs()
     ))
+}
+
+/// PVOS D196 — what a follower's `overdue` means. `follow` stamps its row on
+/// every long-poll, empty or not (D146), so no stamp for `waited_ms` is a
+/// long-poll that never came back — not a slow pass. `follow`'s threshold
+/// stays the 300 s fallback × 3 (D146: a tighter one would be a guess).
+pub fn follow_hung_reason(waited_ms: u64) -> String {
+    format!(
+        "no word from the source in {} min — its long-poll never came back: the follower is hung",
+        waited_ms / 60_000
+    )
 }
 
 fn interval(name: &str) -> Duration {
@@ -1616,7 +1694,8 @@ mod tests {
     }
 
     /// D159 — a failed follow session reaches the journal on D157's rule. The
-    /// follower retries every 2 s, so saying the same text once is the point.
+    /// follower retries often (2 s doubling to 30 s), so saying the same text
+    /// once is the point.
     /// A connect is no recovery; being current with the source is.
     #[test]
     fn a_failing_follow_session_is_said_once_per_text_and_its_recovery_once() {
@@ -1802,5 +1881,74 @@ mod tests {
         let log = trash_step(&st, Err(PvfsError::BadInput { field: "x".into(), reason: "y".into() }), &never);
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0].starts_with("pvfsd: trash purge failed: listing this box's regions: "), "{log:?}");
+    }
+
+    /// PVOS D196 — a periodic job's failed pass reaches the journal on D157's
+    /// rule: the first failure of a run, then only a changed text, and one
+    /// `recovered` line at the pass that completes. A pass that completes
+    /// with no run open says nothing, and each job's run is its own.
+    #[test]
+    fn a_failed_periodic_pass_is_logged_once_per_run_and_its_recovery_once() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d196-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        assert_eq!(st.pass_done("catalogue", None), None, "no run open: nothing to say");
+        assert_eq!(
+            st.pass_failed("catalogue", "database or disk is full".into()).as_deref(),
+            Some("pvfsd: catalogue pass failed: database or disk is full; the next pass tries again")
+        );
+        assert_eq!(st.pass_failed("catalogue", "database or disk is full".into()), None, "the same text is quiet");
+        let changed = st.pass_failed("catalogue", "I/O error during open index.db".into()).unwrap();
+        assert!(changed.ends_with("I/O error during open index.db; the next pass tries again"), "{changed}");
+        assert!(st.pass_failed("receive", "no space".into()).is_some(), "another job's run is its own");
+        let rec = st.pass_done("catalogue", Some("2 files could not be read".into())).unwrap();
+        assert!(
+            rec.starts_with("pvfsd: catalogue recovered: a pass completed after 3 failed pass(es) over "),
+            "a pass with per-file issues still completed: {rec}"
+        );
+        assert_eq!(st.pass_done("catalogue", None), None, "said once");
+        assert!(st.pass_done("receive", None).unwrap().contains("after 1 failed pass(es)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PVOS D196 — the stall detector, read through `snapshot` as `serve
+    /// status` reads it: a follower silent for 20 minutes is overdue in its
+    /// own words; a watch silent as long is not overdue at all (its floor is
+    /// 36 h), and a receive past its floor keeps the generic notice.
+    #[test]
+    fn a_silent_follower_reads_hung_in_serve_status() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d196-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let now = now_ms();
+        for (job, ago_ms) in [("follow", 20 * 60_000), ("watch", 20 * 60_000), ("receive", 7 * 3_600_000)] {
+            st.with_row(job, |r| {
+                r.enabled = true;
+                r.state = "running".into();
+                r.last_ok_ms = Some(now - ago_ms);
+            });
+        }
+        let snap = st.snapshot();
+        let row = |name: &str| snap.iter().find(|r| r.name == name).unwrap().clone();
+        let follow = row("follow");
+        assert_eq!(follow.state, "overdue");
+        assert_eq!(
+            follow.last_error.as_deref(),
+            Some("no word from the source in 20 min — its long-poll never came back: the follower is hung")
+        );
+        assert_eq!(row("watch").state, "running", "a quiet watch is not overdue at 20 min");
+        let receive = row("receive");
+        assert_eq!(receive.state, "overdue");
+        assert!(receive.last_error.unwrap().contains("overdue, which is not the same as stuck"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PVOS D196 — a follower's overdue, in its own words.
+    #[test]
+    fn a_hung_follower_says_so_in_its_own_words() {
+        assert_eq!(
+            follow_hung_reason(16 * 60_000 + 30_000),
+            "no word from the source in 16 min — its long-poll never came back: the follower is hung"
+        );
     }
 }
