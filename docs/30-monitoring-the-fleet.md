@@ -52,7 +52,21 @@ returned source tip is not ahead of its own. So on `follow`, `last_ok` means
 *last confirmed current with the source* (seconds old when healthy), and
 `overdue` means it has not been able to say that for 15 minutes — believe it.
 Before D146 only landed events counted; on a quiet log every replica read
-`overdue` indefinitely while its log tip matched the owner's.
+`overdue` indefinitely while its log tip matched the owner's. *Since PVOS
+D196* a follower's overdue says so in its own words — *"no word from the
+source in N min — its long-poll never came back: the follower is hung"* — and
+it is the one `overdue` that reaches the phone and the page (below). A
+follower that fails retries in backoff, 2 s doubling to 30 s, back to 2 s at
+the next contact that proves it current.
+
+**A failed pass reaches the log (PVOS D196).** Every job's failures are in
+its row; the journal (on the NAS, `pvfsd.log`) hears each run of them once:
+`pvfsd: <job> pass failed: <error>; the next pass tries again` at the first
+failure and whenever the text changes, then `pvfsd: <job> recovered: a pass
+completed after N failed pass(es) over <span>`. The watch, the follower, a
+thread's exit and the trash step have said so since D157/D159/D176; the
+periodic jobs (catalogue, receive, resolve, health, reclaim, sync, export,
+tier, evict) since D196.
 
 To prove "caught up" without trusting any status: compare
 `select max(seq) from events` in the owner's and the replica's `log.db`,
@@ -147,7 +161,13 @@ peer (`log_verdict`: `consistent`, `ahead` — this owner is stale and fences
 itself — or `diverged`), with its own `fenced`, `self_addr` and
 `self_log_seq`, in `fleet-health.json`. `pvfs forest tip [<mount>]` prints
 one box's tip read-only (beside a running daemon); `pvfs forest fence` shows
-and lifts a fence. Labels (`--label`) resolve by `host:port` before `host`,
+and lifts a fence. *Since PVOS D196* a replica asks its owner's `serve status`
+whenever it opens a route to write through it; a `fenced` answer is no route,
+as an unreachable owner is, so a box whose bindings are all catalogue regions
+catalogues here and publishes its head locally (pending, D183) instead of
+failing every pass against the refusal. Its watch logs `no route through the
+owner (… the owner is fenced (…)) — cataloguing here`, and the pending head
+commits at the first pass after the fence is lifted or the box is re-pointed. Labels (`--label`) resolve by `host:port` before `host`,
 so two daemons on one box can be named apart.
 
 ### 1.4 Telling a person: `pvfs fleet notify` (D142)
@@ -169,7 +189,7 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `peer_down` | a peer missed two polls (once, with since-when) | critical |
 | `supervise` | a `start` was sent — ok, or failed | info / critical |
 | `peer_up` | a peer answers again (with how long it was down) | info |
-| `job_error` | a job's error has been there, with the same text, for about **four minutes** — the third poll, timed from when it was first seen, so the owner's own restarts in a row never count (D151); once, until it changes, and a changed text waits its own four minutes; the stall detector's `overdue` notice is filtered | warning |
+| `job_error` | a job's error has been there, with the same text, for about **four minutes** — the third poll, timed from when it was first seen, so the owner's own restarts in a row never count (D151); once, until it changes, and a changed text waits its own four minutes; the stall detector's `overdue` notice is filtered — except on `follow`, where it is a hung follower (PVOS D196) | warning |
 | `job_error_cleared` | a `job_error` that WAS sent has been gone for the same ~four minutes (D161): once per episode, naming the text last sent and how long it lasted (`since_ms` → `until_ms`); back inside the wait it is one episode and nothing is said; an error that cleared before it was sent is never cleared | info |
 | `heartbeat` | every 24 h: "All good: N peers reporting, nothing to do." or what is down. N is the announced endpoints this box polls — never itself, so a four-box fleet reports three | info / warning |
 | `test` | `--test` | info |
@@ -326,7 +346,8 @@ the machines; and the recent fleet events.
   change only when something changes. The summary sentence deliberately
   omits progress so the forest sensor does not churn.
 - **Say what is observed.** The page shows `overdue` as a state with the job's
-  last success, not as a failure; after D146 an overdue `follow` is real.
+  last success, not as a failure; after D146 an overdue `follow` is real, and
+  since PVOS D196 it is a problem on the page and a `job_error` on the phone.
 - **A standing test that cleanup works (D148).** A trash bucket older than
   its region's retention plus a day is a problem on the page: *"mediabox's
   trash in mediabox-local has a bucket 9 days old (kept 7): the purge is not

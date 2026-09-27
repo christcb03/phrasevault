@@ -34,6 +34,15 @@ pub const HEARTBEAT_EVERY_MS: u64 = 24 * 3600 * 1000;
 pub const JOB_ERROR_AFTER_MS: u64 = 210_000;
 pub const FORMATS: [&str; 5] = ["ha", "json", "slack", "discord", "ntfy"];
 
+/// PVOS D196 — whose stall-detector `overdue` is a real fault. `follow` is a
+/// tail that stamps its row on every long-poll (D146), so for it "overdue"
+/// means the source stopped answering mid-poll: the follower is hung. Every
+/// other job's overdue only says no pass has finished lately (D100), which a
+/// healthy long pass also says.
+pub fn overdue_is_news(job: &str) -> bool {
+    job == "follow"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notify {
     pub url: String,
@@ -314,9 +323,12 @@ pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Eve
         for j in r.last.jobs.iter().filter(|j| j.last_error.is_some()) {
             let err = j.last_error.clone().unwrap_or_default();
             // The stall detector's "overdue … not the same as stuck" is a
-            // notice, not an error (it cries wolf on follow — a long-poll
-            // never completes a pass); nobody can act on it.
-            if err.contains("overdue") {
+            // notice, not an error: a long pass that is working says it too,
+            // and nobody can act on it. Except on `follow` (PVOS D196): since
+            // D146 a follower stamps its row every few seconds, so its overdue
+            // is a long-poll that never came back — a hung follower, and the
+            // box stops hearing the forest.
+            if err.contains("overdue") && !overdue_is_news(&j.name) {
                 continue;
             }
             let key = format!("{}/{}", short(pin), j.name);

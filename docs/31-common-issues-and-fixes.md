@@ -16,6 +16,7 @@ whenever a fix is found, not only when it recurs.**
 | A season's files numbered in another order than Sonarr's | [§7](#7-a-seasons-files-numbered-in-another-order-than-sonarrs) |
 | A show Sonarr numbers by segment (whole broadcasts beside segment files) | [§8](#8-a-show-sonarr-numbers-by-segment) |
 | A job on the NAS fails for two minutes: "SQLite is busy/locked" | [§9](#9-a-job-fails-for-two-minutes-sqlite-is-busylocked) |
+| After a promotion, a box still points at the old owner | [§10](#10-after-a-promotion-a-box-still-points-at-the-old-owner) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -277,3 +278,26 @@ failure heals at the next pass; check the box's build (`pvfs --version`)
 before chasing one. A busy failure with no `catalogue` line beside it, or a
 `routed scan write` one (the owner's database, not the box's), is something
 else.
+
+## 10. After a promotion, a box still points at the old owner
+
+**What it looks like.** After another box was promoted to owner (PVFS doc
+28), one box keeps its old source. Its `follow` reports *"the source (…) is
+behind this replica …"* — a `job_error` on the phone — and its watch logs
+`no route through the owner (… the owner is fenced (…)) — cataloguing here`.
+The old owner fenced itself the first time a box ahead of it wrote (PVOS
+D182), and its `serve status` says `fenced`.
+
+**Why it is not worse.** Since PVOS D196 a replica treats a fenced owner as
+no route, as it treats an unreachable one (D183): a box whose bindings are
+all catalogue regions keeps cataloguing its disk and publishes its heads
+locally, pending, and its peers take them as provisional heads. Before D196
+every watch pass failed against the refusal, backing off to five minutes, and
+the box stopped cataloguing. Its follower now retries in backoff (2 s
+doubling to 30 s), not every 2 s.
+
+**Fix.** Re-point the box at the new owner, as the promotion does for every
+box it knows (doc 28 §4): `pvfs instance add <alias>-src <new-owner>:<port>
+<pin>`, `pvfs replica repoint <mount> --instance <alias>-src`, restart its
+daemon. The next pass routes through the new owner and the pending heads
+commit.

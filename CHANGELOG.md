@@ -5,6 +5,31 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Before the move: a hung follower says so, a failed pass reaches the log,
+  a fenced owner is no route (PVOS D196).**
+  - **A hung follower is news.** Since D146 `follow` stamps its row on every
+    long-poll, so its `overdue` is a long-poll that never came back. The
+    notifier no longer filters it (`notify::overdue_is_news`), and its row
+    says *"no word from the source in N min — its long-poll never came back:
+    the follower is hung"*. Every other job's `overdue` is still filtered.
+  - **A periodic job's failed pass reaches the journal**, once per run of
+    failures and when the text changes, and once when a pass completes again
+    (`pvfsd: <job> pass failed: …` / `pvfsd: <job> recovered: …`; the same
+    rule D157/D159 gave the watch and the follower). The periodic jobs used
+    to write only to their status row, so D162's "database or disk is full"
+    never reached the NAS's `pvfsd.log`.
+  - **A fenced owner is no route.** `replica_route` asks the owner's `serve
+    status` when it opens a route. A `fenced` answer (D182) is an error, as
+    a failed dial is, so a replica whose bindings are all catalogue regions
+    catalogues here with a pending head (D183), instead of failing every pass
+    against the refusal. The pending head commits once the fence is lifted
+    or the box is re-pointed. The watch's line is now `no route through the
+    owner (…) — cataloguing here; …`.
+  - **`follow` backs off**: 2 s doubling to 30 s, back to 2 s at the next
+    contact that proves it current (it retried every 2 s forever).
+
+  `watch::scan_once` (test hook). No wire, schema or protocol change.
+
 - **Personal forests (PVOS D193; protocol 15).** `pvfs_core::personal`:
   a person's forest genesis, prepared from public keys and parameters the
   SIGNER chooses (a fresh random forest id — so no certificate in it can

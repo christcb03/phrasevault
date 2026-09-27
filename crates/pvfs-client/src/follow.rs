@@ -13,8 +13,36 @@ use pvfs_core::{crypto, identity, Engine, PvfsError, ReplicaSource, ReplicaStore
 
 use crate::Client;
 
-/// Reconnect/backoff delay between failed sessions.
-const RETRY: Duration = Duration::from_secs(2);
+/// Reconnect/backoff delay between failed sessions: 2 s doubling to 30 s
+/// (PVOS D196). It was a flat 2 s, so a follower pointed at a fenced or
+/// behind owner, or at another branch, dialled 1,800 times an hour (D182).
+/// 30 s keeps a reconnect after an owner restart within half a minute.
+const RETRY_MIN: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// PVOS D196 — the follower's retry delay. Contact that proves the session —
+/// a batch landed, or an empty long-poll that found us current — puts it back
+/// to the minimum; a connect alone does not (D159: a socket is not a
+/// session, the next request can still fail).
+#[derive(Debug)]
+struct Backoff(Duration);
+
+impl Backoff {
+    fn new() -> Self {
+        Backoff(RETRY_MIN)
+    }
+
+    /// The wait after a failure; the one after it doubles, up to `RETRY_MAX`.
+    fn next(&mut self) -> Duration {
+        let d = self.0;
+        self.0 = (self.0 * 2).min(RETRY_MAX);
+        d
+    }
+
+    fn reset(&mut self) {
+        self.0 = RETRY_MIN;
+    }
+}
 /// How finely a sleep checks the stop flag.
 const STOP_SLICE: Duration = Duration::from_millis(250);
 
@@ -103,6 +131,7 @@ pub fn run(
     mut notify: impl FnMut(FollowEvent),
 ) -> Result<(), PvfsError> {
     let dial = ReplicaSource::load(data_dir)?;
+    let mut backoff = Backoff::new();
     while !stop.load(Ordering::SeqCst) {
         let mut client = match dial_source(&dial) {
             Ok(c) => {
@@ -115,7 +144,7 @@ pub fn run(
                 notify(FollowEvent::Retrying {
                     reason: e.to_string(),
                 });
-                stop_sleep(RETRY, stop);
+                stop_sleep(backoff.next(), stop);
                 continue;
             }
         };
@@ -154,7 +183,10 @@ pub fn run(
                     // it was restored from an older copy, or another box was
                     // promoted and this one is its ghost. That used to read as
                     // healthy; it is an error, so the fleet sees it.
-                    Ok(0) if source_tip + 1 == from => notify(FollowEvent::UpToDate { tip: from - 1 }),
+                    Ok(0) if source_tip + 1 == from => {
+                        backoff.reset();
+                        notify(FollowEvent::UpToDate { tip: from - 1 })
+                    }
                     Ok(0) if source_tip + 1 < from => {
                         notify(FollowEvent::Retrying {
                             reason: format!(
@@ -173,6 +205,7 @@ pub fn run(
                         let tip = ReplicaStore::open(data_dir)
                             .and_then(|s| s.tip())
                             .unwrap_or(0);
+                        backoff.reset();
                         notify(FollowEvent::CaughtUp { tip });
                     }
                     Err(e) => {
@@ -224,9 +257,26 @@ pub fn run(
             // fold now (best-effort), so local reads and any serving daemon
             // see it; the next open folds anyway
             let _ = Engine::open(data_dir).and_then(|e| e.close());
+            backoff.reset();
             notify(FollowEvent::CaughtUp { tip });
         }
-        stop_sleep(RETRY, stop);
+        stop_sleep(backoff.next(), stop);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PVOS D196 — 2 s doubling to 30 s, and back to 2 s after contact.
+    #[test]
+    fn the_retry_backs_off_to_thirty_seconds_and_contact_resets_it() {
+        let mut b = Backoff::new();
+        let waits: Vec<u64> = (0..7).map(|_| b.next().as_secs()).collect();
+        assert_eq!(waits, vec![2, 4, 8, 16, 30, 30, 30]);
+        b.reset();
+        assert_eq!(b.next().as_secs(), 2);
+        assert_eq!(b.next().as_secs(), 4);
+    }
 }

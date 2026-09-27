@@ -178,11 +178,11 @@ ssh "$EDGE" 'printf aaaa1 > "$HOME/fleet-test/d183-edge-lib/season/away1.mkv"' &
 F_OUT=$(ssh "$EDGE" "bash -s" <<EOS
 $RH
 waitq "\$RD" "$EDGESHELF" 90 "1/1/1/False/2/False" && echo F1=ok
-grep -q "the owner is unreachable" "\$FT/d183-edge.log" && echo F2=ok
+grep -q "no route through the owner" "\$FT/d183-edge.log" && echo F2=ok
 EOS
 )
 has "$F_OUT" F1=ok && ok "edge-shelf: log head 1, head 2 published on the edge, pending" || fail "edge pending: $F_OUT"
-has "$F_OUT" F2=ok && ok "the edge's watch said the owner is unreachable and catalogued anyway" || fail "watch message: $(ssh "$EDGE" 'tail -5 $HOME/fleet-test/d183-edge.log')"
+has "$F_OUT" F2=ok && ok "the edge's watch said it had no route through the owner and catalogued anyway" || fail "watch message: $(ssh "$EDGE" 'tail -5 $HOME/fleet-test/d183-edge.log')"
 gate edge-away
 
 say "G: near takes the edge's claim, fetches head 2 from the edge — owner still down"

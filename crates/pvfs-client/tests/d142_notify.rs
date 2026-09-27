@@ -134,13 +134,33 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     assert_eq!(notify::severity(&hb), "info");
     // an "overdue" notice from the stall detector is not an error anyone can act on
     let mut overdue = up();
-    overdue.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 34 min (interval is 300s) — overdue, which is not the same as stuck".into()) });
+    overdue.jobs.push(JobHealth { name: "watch".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 2160 min (interval is 3600s) — overdue, which is not the same as stuck".into()) });
     let mut o1 = r0.clone();
     o1.observe(&a, "10.0.0.9:7433", None, 401_000, overdue.clone());
     let mut o2 = o1.clone();
     o2.observe(&a, "10.0.0.9:7433", None, 641_000, overdue);
     assert!(notify::job_errors(&mut st, &o1, 401_000).is_empty());
     assert!(notify::job_errors(&mut st, &o2, 641_000).is_empty(), "overdue is filtered, however long it lasts");
+    // PVOS D196 — except a follower's: it stamps its row on every long-poll
+    // (D146), so its overdue is a hung follower, reported after the wait —
+    // whatever words its daemon uses. A D196 daemon says "the follower is
+    // hung"; one not yet rolled still says the generic "… overdue …", and
+    // the owner's notifier (rolled first) must report that too.
+    let mut hung = up();
+    hung.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 15 min (interval is 300s) — overdue, which is not the same as stuck".into()) });
+    let mut h1 = r0.clone();
+    h1.observe(&a, "10.0.0.9:7433", None, 401_000, hung.clone());
+    let mut h2 = h1.clone();
+    h2.observe(&a, "10.0.0.9:7433", None, 641_000, hung);
+    let mut hs = notify::State::default();
+    assert!(notify::job_errors(&mut hs, &h1, 401_000).is_empty(), "not there long enough yet");
+    let said = notify::job_errors(&mut hs, &h2, 641_000);
+    assert_eq!(said.len(), 1, "a hung follower is reported");
+    assert_eq!(
+        notify::summary(&n, &said[0]),
+        "On the NAS, the follow job reports an error: no pass has completed in 15 min (interval is 300s) — overdue, which is not the same as stuck"
+    );
+    assert!(notify::overdue_is_news("follow") && !notify::overdue_is_news("watch") && !notify::overdue_is_news("receive"));
     let mut r4 = r3.clone();
     r4.observe(&a, "10.0.0.9:7433", None, 400_000, up());
     let back = &notify::transitions(Some(&r3), &r4, 400_000)[0];

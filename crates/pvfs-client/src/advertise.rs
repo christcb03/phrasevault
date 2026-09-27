@@ -83,6 +83,23 @@ pub fn replica_route(
     // here means only that the check is skipped: the write is the same.
     let mut client = client;
     client.set_write_tip(pvfs_core::mount::peek_tip(data_dir).ok());
+    // PVOS D196 — an owner that answers but is FENCED (D182: a follower holds
+    // more of the log) takes no write, so a route through it is no route: say
+    // so, as a dial that failed would. The watch then catalogues here, as it
+    // does for an unreachable owner (D183), instead of failing every pass
+    // against the refusal — which is what a box `promote.yml` missed would
+    // do after a promotion. Asked of `serve status`: the owner's own
+    // structured word, not the refusal's text (D158). An owner too old to
+    // report a fence, or a status this key may not read, counts as unfenced;
+    // its writes still refuse, as before.
+    if let Ok(status) = client.serve_status_full() {
+        if let Some(f) = status.fenced {
+            return Err(PvfsError::Forbidden {
+                action: format!("write through the owner at {}", src.target),
+                reason: format!("the owner is fenced ({})", f.reason),
+            });
+        }
+    }
     let sign: BoxedSign =
         Box::new(move |d| crypto::sign_digest(&sign_key, d).unwrap_or_default());
     Ok(Some((client, sign)))
