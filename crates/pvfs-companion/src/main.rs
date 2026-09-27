@@ -648,6 +648,19 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     let port_file = socket.with_extension("http");
     web.write_port_file(&port_file, &addr)
         .map_err(|e| e.to_string())?;
+    // PVOS D197 — keep both runtime files beside the socket for as long as
+    // this runs: macOS's tmp_cleaner deletes /tmp files left untouched for
+    // three days, and on 2026-09-26 both were gone while the app ran.
+    pvfs_companion::runtime::keep(
+        vec![
+            pvfs_companion::runtime::RuntimeFile {
+                path: pvfs_companion::pidfile_path(&socket),
+                contents: std::process::id().to_string(),
+            },
+            pvfs_companion::runtime::RuntimeFile { path: port_file.clone(), contents: web.port_file_json(&addr) },
+        ],
+        pvfs_companion::runtime::KEEP_EVERY,
+    );
     {
         // Web-agent TLS (PVOS M3.6 §4a): serve https on the same port
         // (dual-mode peek keeps plain-http callers working). Best-effort —

@@ -5,6 +5,16 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The companion keeps its runtime files (PVOS D197).** `serve` writes
+  `<socket>.pid` and `<socket>.http` beside its socket in `/tmp`, and macOS's
+  `tmp_cleaner` deletes regular files there that have gone three days
+  untouched (sockets are left). On 2026-09-26 both were gone while the app
+  ran, so a new companion could not take over by pid and pvosd could not
+  find the web agent. A keeper thread now looks at both every hour: a file
+  still holding what this companion wrote is touched, one that has gone is
+  written again (0600, and said in the log), and one another instance has
+  rewritten is left to it. Same names, same formats, same place — no reader
+  changes (`pvfs_companion::runtime`; `WebAgent::port_file_json`).
 - **Before the move: a hung follower says so, a failed pass reaches the log,
   a fenced owner is no route (PVOS D196).**
   - **A hung follower is news.** Since D146 `follow` stamps its row on every
@@ -29,7 +39,6 @@ file tracks Layer 0, the file-system engine.
     contact that proves it current (it retried every 2 s forever).
 
   `watch::scan_once` (test hook). No wire, schema or protocol change.
-
 - **Personal forests (PVOS D193; protocol 15).** `pvfs_core::personal`:
   a person's forest genesis, prepared from public keys and parameters the
   SIGNER chooses (a fresh random forest id — so no certificate in it can
