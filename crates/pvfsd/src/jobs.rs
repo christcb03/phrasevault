@@ -1911,6 +1911,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PVOS D196 — the stall detector, read through `snapshot` as `serve
+    /// status` reads it: a follower silent for 20 minutes is overdue in its
+    /// own words; a watch silent as long is not overdue at all (its floor is
+    /// 36 h), and a receive past its floor keeps the generic notice.
+    #[test]
+    fn a_silent_follower_reads_hung_in_serve_status() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d196-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let now = now_ms();
+        for (job, ago_ms) in [("follow", 20 * 60_000), ("watch", 20 * 60_000), ("receive", 7 * 3_600_000)] {
+            st.with_row(job, |r| {
+                r.enabled = true;
+                r.state = "running".into();
+                r.last_ok_ms = Some(now - ago_ms);
+            });
+        }
+        let snap = st.snapshot();
+        let row = |name: &str| snap.iter().find(|r| r.name == name).unwrap().clone();
+        let follow = row("follow");
+        assert_eq!(follow.state, "overdue");
+        assert_eq!(
+            follow.last_error.as_deref(),
+            Some("no word from the source in 20 min — its long-poll never came back: the follower is hung")
+        );
+        assert_eq!(row("watch").state, "running", "a quiet watch is not overdue at 20 min");
+        let receive = row("receive");
+        assert_eq!(receive.state, "overdue");
+        assert!(receive.last_error.unwrap().contains("overdue, which is not the same as stuck"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// PVOS D196 — a follower's overdue, in its own words.
     #[test]
     fn a_hung_follower_says_so_in_its_own_words() {
