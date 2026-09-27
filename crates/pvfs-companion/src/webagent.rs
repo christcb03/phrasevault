@@ -50,16 +50,16 @@ impl WebAgent {
         &self.token
     }
 
-    /// Write the well-known port file (`0600`): `{"addr":"...","token":"..."}`.
+    /// The well-known port file's contents: `{"addr":"...","token":"..."}`
+    /// — one place, so what PVOS D197's keeper writes again is what was first
+    /// written.
+    pub fn port_file_json(&self, addr: &str) -> String {
+        format!("{{\"addr\":\"{addr}\",\"token\":\"{}\"}}", self.token)
+    }
+
+    /// Write the well-known port file (`0600`).
     pub fn write_port_file(&self, path: &Path, addr: &str) -> std::io::Result<()> {
-        let json = format!("{{\"addr\":\"{addr}\",\"token\":\"{}\"}}", self.token);
-        let mut f = std::fs::File::create(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.write_all(json.as_bytes())
+        crate::runtime::write_owner_only(path, &self.port_file_json(addr))
     }
 
     /// Serve until the listener closes — one thread per connection. With TLS
