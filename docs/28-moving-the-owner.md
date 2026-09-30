@@ -4,10 +4,12 @@
 (2026-09-23) made it one prompted run (`promote.sh`), added the fence that
 stops a stale or replaced owner, promotion through the companion, a standby
 owner, and dated copies of the log. Rehearsed on the lab pair
-(`deploy/d182-owner-pair.sh`); on the lab fleet and the live fleet as D182's
-checklist records — until the live drill has run, this is "rehearsed", not
-"proven". PVOS D185 (2026-09-25) let a HOLDER become the owner — one daemon,
-owner and holder — and let the owner serve reads while it hears its peers.**
+(`deploy/d182-owner-pair.sh`) and the lab fleets. PVOS D185 (2026-09-25) let a
+HOLDER become the owner — one daemon, owner and holder — and let the owner
+serve reads while it hears its peers. **Run on the live fleet on 2026-09-29
+(PVOS D186):** `promote.sh` made mediabox, a holder, the owner at 5:40 PM
+(two approvals on Chris's Mac companion), then the forest moved to
+`/opt/pvfs/media` under the alias `media`; VM 310, the old owner, is retired.**
 The sibling of doc 25: that one rebuilds a forest, this one keeps
 it and changes which box may append to it.
 
@@ -50,9 +52,9 @@ Chris's fleet keeps no standby (D185): the recovery is any follower's copy of
 the log plus the root.
 
 **The standby** (PVOS D182) is a follower kept for exactly this: its own
-daemon and directory (production: `mediabox-standby`, `/srv/pvfs/media2-standby`,
-port 7435 on mediabox — bare metal, off the PVE host that carries the owner's
-VM — and its own socket dir, `/tmp/pvfs-standby`, because mediabox's holder
+daemon and directory (as D182 planned it for production, before D185 chose
+none: `mediabox-standby`, `/srv/pvfs/media2-standby`, port 7435 on mediabox,
+and its own socket dir, `/tmp/pvfs-standby`, because mediabox's holder
 daemon serves the same forest and a daemon's socket is named by the forest id),
 `follow` only, announced so the owner's health job probes it; the page
 shows its lag, and it makes the daily dated copy of the log (§7). Promoting it
@@ -164,9 +166,10 @@ why, do not force.
    every box must reach the new owner's tip. **No binary is touched** — a
    promotion must not become a roll.
 
-It prints how long it took, and what is left by hand: Home Assistant's
-quiet-owner page names VM 310 (edit it while the owner is elsewhere), and the
-old box.
+It prints how long it took, and what is left by hand: Home Assistant's owner
+alerts, which name the owner (since D186 they name mediabox and watch its
+feed alone), and the old box (§6). Production's move (D186) took 11 min 55 s,
+about 9 of them a hidden prompt that PVOS D198 has since removed.
 
 By hand (no Ansible), per doc 28's first edition: quiet the writers, `pvfs
 replica sync`, stop the old owner, compare `pvfs forest tip` on every box,
@@ -205,9 +208,11 @@ consistent copy beside a running daemon (`VACUUM INTO`), counts it only once a
 full replay of it verifies (chain, signatures, authorization from seq 1),
 names it `<forest>-<YYYYMMDD-HHMM>-seq<N>` with a `manifest.json`, prunes this
 forest's older copies, and records its result in `backup-state.json`, which
-`serve status` reports. Production: `pvfs-log-backup.timer` daily at 3:30 AM
-Eastern on the standby (mediabox) and on feederbox (off-site), 30 days kept,
-in `/srv/pvfs/log-backups`; about 3 MB a copy.
+`serve status` reports. Production (since PVOS D186): `pvfs-log-backup.timer`
+hourly on the owner (mediabox), 30 days kept, in `/opt/pvfs/log-backups`,
+about 1.5 MiB a copy; Saltbox's weekly backup of `/opt` takes them off the
+box, and every follower holds the whole log anyway. (D182 planned a daily copy
+on the standby and on feederbox; neither runs.)
 
 `pvfs forest restore <copy> <mount>` makes a replica directory from a copy,
 verified the same way, following what the copied box followed. Two uses:

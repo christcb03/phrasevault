@@ -2,7 +2,7 @@
 
 This guide is for someone comfortable with a terminal, SSH, and copying commands — you do not need to be a Rust developer.
 
-**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). Version **`1.3.0`** is current (tags `v1.2` and `v1.3` pending; `v1.1` was tagged 2026-07-09). It includes:
+**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). The latest release is **`1.4.0`** (tag `v1.4`, 2026-08-13; `v1.0` to `v1.3` are tagged too). Main has moved on since without a new release: `pvfs --version` prints the release and the build, e.g. `1.4.0 (v1.4-495-gc17ae29)`, the build the media fleet has run since 2026-09-27 ([VERSIONING.md](../VERSIONING.md)). It includes:
 
 - **P0–P1.5** — core engine (forest, signed nodes/links, event log), storage ops (bind/scan/verified reads/watcher), mounts & host registry
 - **P2** — multi-user access: per-node ACLs, per-key tags, member-signed writes and live admin over `pvfsd`, concurrent raw-bytes `cat`, `pvfs audit`, graceful daemon shutdown
@@ -11,6 +11,8 @@ This guide is for someone comfortable with a terminal, SSH, and copying commands
 - **1.1** — PVOS-facing daemon ops (`AddNode` / `Payload` via `pvfs-client`, `stat` parent) and security/error-code fixes (see [CHANGELOG.md](../CHANGELOG.md))
 - **1.2** — expiring ACL grants, companion trust/singleton/https upgrades, concurrent daemon reads, `remote` paths + typed records, fuller `pvfs audit` (see [CHANGELOG.md](../CHANGELOG.md))
 - **1.3** — federation & sync (doc 17): `pvfs export`, TCP+TLS transport with pinned instances, verified replicas + live follow, placement/sync, write-through ingest, instance-qualified locations, read-through, tiered storage (`tier`/`evict`); plus companion invite redemption, tenant custody, sd_notify (see [CHANGELOG.md](../CHANGELOG.md))
+- **1.4** — the daemon's serve jobs (doc 18), write-through completeness (doc 19), region logs and the streaming FUSE mount (doc 20), attachment kinds (doc 21), the swarm (doc 22)
+- **Since 1.4, on main** — ingest sessions (doc 23); the region model, in production since 2026-09-12: each box catalogues its own disk, the merged view and its mount, the mover (`receive`/`resolve`), the trash (docs 26 and 29); moving the owner and dated copies of the log (doc 28); fleet monitoring (doc 30); forest-bound root certificates and personal forests (see [CHANGELOG.md](../CHANGELOG.md) and the [user manual](USER-MANUAL.md) §6.4)
 
 Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
 
