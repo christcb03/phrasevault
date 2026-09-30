@@ -5,6 +5,24 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The CLI never waits on a question nobody can see, and `forest promote`
+  signs for the forest it names (PVOS D198).**
+  - **One rule for asking**: only when not `--json` and stdin **and** stderr
+    are terminals. Ansible runs commands under a pseudo-terminal, so stdin
+    alone passed for a person: D186's promotion hung ~9 minutes on
+    `pvfs --json fleet notify 2>/dev/null`, which asked for a webhook URL on
+    the redirected stderr. `prompt_line`, the confirmations, promote's and
+    `fence`'s questions, the sidecar-upgrade check, the "use the companion's
+    identity?" question and `identity replace`'s "Type yes" (which read stdin
+    unchecked) all follow it; a person at a terminal is still asked.
+    `read_phrase_stdin` still reads a piped phrase and refuses a terminal
+    nobody watches.
+  - **`pvfs --json fleet notify` with nothing configured prints `null`** — a
+    query answers; it does not start a setup.
+  - **`forest promote <dir> --via-companion` routes by `<dir>`'s root**, not
+    by the directory it runs in: from a home directory over ssh it named no
+    key, and a companion holding several phrases (D189) answered with its
+    default one. `PVFS_COMPANION_KEY` still wins.
 - **The companion keeps its runtime files (PVOS D197).** `serve` writes
   `<socket>.pid` and `<socket>.http` beside its socket in `/tmp`, and macOS's
   `tmp_cleaner` deletes regular files there that have gone three days

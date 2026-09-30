@@ -2771,6 +2771,11 @@ fn probe_companion(explicit: Option<PathBuf>) -> Result<Option<(PathBuf, Vec<u8>
 /// Interactive: use companion identity for this forest? Default yes.
 fn confirm_use_companion(root_pub_hex: &str) -> Result<bool, PvfsError> {
     use std::io::{self, Write};
+    if !interactive() {
+        // PVOS D198 — the default a closed stdin always gave, without a read
+        // that could wait on a terminal nobody watches.
+        return Ok(true);
+    }
     eprint!(
         "Local companion is running (root key {root_pub_hex}…).\n\
          Use that identity for this forest (no new recovery phrase)? [Y/n] "
@@ -2950,8 +2955,20 @@ fn companion_forest() -> Option<pvfs_companion::ForestRef> {
     COMPANION_FOREST.get().cloned().flatten()
 }
 
-fn set_companion_key(ctx: &Result<PathBuf, PvfsError>) {
-    let forest = ctx.as_ref().ok().and_then(|dir| {
+/// PVOS D198 — the forest a command acts on when it names one as an argument
+/// rather than running inside it: its companion requests route by THAT
+/// forest's root. `forest promote <dir>` run over ssh from a home directory
+/// named no key, and a companion holding several phrases (D189) answered with
+/// its default one (found by D186's rehearsal).
+fn companion_target(cmd: &Cmd) -> Option<PathBuf> {
+    match cmd {
+        Cmd::Forest(ForestCmd::Promote { mount, .. }) => Some(mount::state_dir(mount)),
+        _ => None,
+    }
+}
+
+fn set_companion_key(dir: Option<&Path>) {
+    let forest = dir.and_then(|dir| {
         let mount = dir.parent()?;
         let identity = mount::peek_identity(mount).ok()?;
         let label = Registry::system()
@@ -2967,17 +2984,41 @@ fn set_companion_key(ctx: &Result<PathBuf, PvfsError>) {
         .ok()
         .and_then(|h| hex::decode(h.trim()).ok())
         .or_else(|| {
-            let dir = ctx.as_ref().ok()?;
+            let dir = dir?;
             let identity = mount::peek_identity(dir.parent()?).ok()?;
             mount::peek_current_root(dir, &identity).ok()
         });
     let _ = COMPANION_KEY.set(key);
 }
 
+/// PVOS D198 — `--json`: a program reads the output, so nothing is asked.
+static JSON_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// PVOS D198 — whether to ask a person anything. Only when nothing reads the
+/// output as data (`--json`), stdin is a terminal AND stderr is one: a
+/// question on a redirected stderr cannot be seen. Ansible runs commands
+/// under a pseudo-terminal, so stdin alone passed for interactive — and D186's
+/// promotion hung ~9 minutes on `pvfs --json fleet notify 2>/dev/null` asking
+/// for a webhook URL nobody could see.
+fn interactive() -> bool {
+    use std::io::IsTerminal;
+    interactive_when(
+        JSON_MODE.load(std::sync::atomic::Ordering::Relaxed),
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+fn interactive_when(json: bool, stdin_tty: bool, stderr_tty: bool) -> bool {
+    !json && stdin_tty && stderr_tty
+}
+
 fn run(cli: Cli) -> Result<(), PvfsError> {
     let legacy = legacy_state_dir(&cli);
     let ctx = context_state_dir(&cli);
-    set_companion_key(&ctx);
+    let target = companion_target(&cli.cmd);
+    set_companion_key(target.as_deref().or(ctx.as_ref().ok().map(|p| p.as_path())));
+    JSON_MODE.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     let json = cli.json;
     match cli.cmd {
         Cmd::Init => {
@@ -3163,8 +3204,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     size.folders,
                     fmt_bytes(size.bytes),
                 );
-                use std::io::IsTerminal;
-                if !yes && !json && std::io::stdin().is_terminal() {
+                if !yes && interactive() {
                     let a = prompt_line("unlink it anyway? [y/N]", Some("N"))?;
                     if !a.trim().eq_ignore_ascii_case("y") {
                         println!("nothing was changed");
@@ -4323,8 +4363,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             } else if yes {
                 true
             } else {
-                use std::io::IsTerminal;
-                if !std::io::stdin().is_terminal() {
+                if !interactive() {
                     return Err(PvfsError::BadInput {
                         field: "sidecar-upgrade".into(),
                         reason: "not a terminal — pass --yes to go ahead, or --dry-run to only look"
@@ -4473,8 +4512,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 }
                 return engine.close();
             }
-            use std::io::IsTerminal;
-            if !yes && !json && std::io::stdin().is_terminal() {
+            if !yes && interactive() {
                 let a = prompt_line(
                     &format!(
                         "merge {} group(s), unlinking {} node(s)? [y/N]",
@@ -4517,8 +4555,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     });
                 };
                 let (id, label, n) = (isl.root.id.clone(), isl.root.label.clone(), isl.size.nodes);
-                use std::io::IsTerminal;
-                if !yes && !json && std::io::stdin().is_terminal() {
+                if !yes && interactive() {
                     let a = prompt_line(
                         &format!("drop \"{label}\" and the {n} node(s) beneath it? [y/N]"),
                         Some("N"),
@@ -4795,6 +4832,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 } => {
                     let sock = resolve_companion_socket(companion_socket)?;
                     if !yes {
+                        if !interactive() {
+                            return Err(PvfsError::BadInput {
+                                field: "confirmation".into(),
+                                reason: "replacing the identity key needs a person at a terminal — or --yes".into(),
+                            });
+                        }
                         eprintln!(
                             "This REPLACES your identity key (doc 15): grants under the old key \
                              go inert and are re-issued under the new one; other forests need \
@@ -7278,6 +7321,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         return Ok(());
                     }
                     Some(n) => n,
+                    // PVOS D198 — a query answers; it does not start a setup.
+                    None if json && !test => {
+                        println!("null");
+                        return Ok(());
+                    }
                     None => {
                         let u = prompt_line("webhook URL", None)?;
                         let f = match format {
@@ -7636,9 +7684,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 mine.len(),
                 mine.iter().map(|r| r.3).collect::<Vec<_>>().join(", ")
             );
-            use std::io::IsTerminal;
             if !yes {
-                if json || !std::io::stdin().is_terminal() {
+                if !interactive() {
                     engine.close()?;
                     return Err(PvfsError::BadInput {
                         field: "yes".into(),
@@ -9476,7 +9523,6 @@ fn forest_cmd(
             companion_socket,
             yes,
         } => {
-            use std::io::IsTerminal;
             let data_dir = mount.join(".pvfs");
             let src = match pvfs_core::ReplicaSource::load(&data_dir) {
                 Ok(s) => s,
@@ -9543,7 +9589,7 @@ fn forest_cmd(
                     .filter_map(|d| hex::decode(&d.pubkey).ok())
                     .collect()
             };
-            let interactive = std::io::stdin().is_terminal() && !json;
+            let ask = interactive();
             if !json {
                 println!("devices of this forest:");
                 for d in &devs {
@@ -9567,13 +9613,13 @@ fn forest_cmd(
             // The signer: the companion (the seed never leaves its vault; it
             // asks a person to approve each signature) or the phrase.
             let use_companion = via_companion
-                || (interactive
+                || (ask
                     && resolve_companion_socket(companion_socket.clone()).is_ok()
                     && {
                         let a = prompt_line("sign with the companion on this machine? [Y/n]", Some("Y"))?;
                         !a.trim().eq_ignore_ascii_case("n")
                     });
-            if interactive && !yes {
+            if ask && !yes {
                 let a = prompt_line("promote this replica to the forest's owner? [y/N]", Some("N"))?;
                 if !a.trim().eq_ignore_ascii_case("y") {
                     println!("nothing was changed");
@@ -9787,9 +9833,8 @@ fn forest_cmd(
                     ),
                 });
             }
-            use std::io::IsTerminal;
             if !yes {
-                if json || !std::io::stdin().is_terminal() {
+                if !interactive() {
                     return Err(PvfsError::BadInput {
                         field: "yes".into(),
                         reason: "binding cannot be undone — run it at a terminal, or pass --yes".into(),
@@ -9879,7 +9924,6 @@ fn forest_cmd(
             Ok(())
         }
         ForestCmd::Backup { target, to, keep } => {
-            use std::io::IsTerminal;
             let state = match target {
                 Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
                 None => ctx?,
@@ -9891,7 +9935,7 @@ fn forest_cmd(
                 .unwrap_or_else(|| PathBuf::from("log-backups"));
             let to = match to {
                 Some(t) => t,
-                None if std::io::stdin().is_terminal() && !json => PathBuf::from(prompt_line(
+                None if interactive() => PathBuf::from(prompt_line(
                     "copy the log to (directory)",
                     Some(&default_to.to_string_lossy()),
                 )?),
@@ -9993,8 +10037,7 @@ fn forest_cmd(
                 println!("    the new owner (PVFS doc 28 §5) and retire this directory;");
                 println!("  * this box was restored behind its followers: promote the most advanced");
                 println!("    follower instead (promote.yml).");
-                use std::io::IsTerminal;
-                if !std::io::stdin().is_terminal() {
+                if !interactive() {
                     println!("(pass --clear to lift it from a script)");
                     return Ok(());
                 }
@@ -10359,8 +10402,8 @@ fn print_sidecar_upgrade(r: &pvfs_core::UpgradeReport, json: bool) {
 }
 
 fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() {
+    use std::io::Write;
+    if !interactive() {
         return Err(PvfsError::BadInput {
             field: "prompt".into(),
             reason: format!("missing {what} — pass it as an argument in non-interactive runs"),
@@ -10444,6 +10487,14 @@ fn forest_backup(
 fn read_phrase_stdin(what: &str) -> Result<pvfs_core::Mnemonic, PvfsError> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
+        // PVOS D198 — a terminal stdin under --json or with stderr redirected
+        // is a program's (Ansible's pty): nobody would see the question.
+        if !interactive() {
+            return Err(PvfsError::BadInput {
+                field: "phrase".into(),
+                reason: format!("no one can be asked for your {what} here — pipe it on stdin in non-interactive runs"),
+            });
+        }
         eprintln!("Enter your {what}:");
     }
     let mut line = String::new();
@@ -10821,6 +10872,27 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PVOS D198 — ask a person only when one can see the question: never
+    // under --json, never with stdin or stderr off a terminal (Ansible's pty
+    // gives stdin a terminal while the play redirects stderr).
+    #[test]
+    fn asks_only_when_someone_can_answer() {
+        assert!(interactive_when(false, true, true));
+        assert!(!interactive_when(true, true, true), "--json never asks");
+        assert!(!interactive_when(false, false, true), "a pipe or /dev/null on stdin");
+        assert!(!interactive_when(false, true, false), "stderr redirected: nobody sees the question");
+    }
+
+    // PVOS D198 — `forest promote <dir>` routes the companion by <dir>, not by
+    // the directory it runs in; other commands keep the context forest.
+    #[test]
+    fn promote_routes_the_companion_by_its_target() {
+        let cli = Cli::parse_from(["pvfs", "forest", "promote", "/srv/pvfs/lab5-plex", "--via-companion", "--yes"]);
+        assert_eq!(companion_target(&cli.cmd), Some(mount::state_dir(std::path::Path::new("/srv/pvfs/lab5-plex"))));
+        let cli = Cli::parse_from(["pvfs", "fleet", "notify"]);
+        assert_eq!(companion_target(&cli.cmd), None);
+    }
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
