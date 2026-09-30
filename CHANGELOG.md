@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **`pvfs serve enable --help` names every job (PVOS D203).** It listed 7 of
+  the 11 by hand (`follow|watch|sync|export|tier|evict|reclaim`), missing
+  `resolve`, `catalogue`, `health` and `receive`. `serve enable` and `serve
+  disable` now take the job from `JOB_NAMES` through clap's possible values:
+  `-h` lists the names, `--help` each with one line on what it does
+  (`serve::job_summary`, beside `JOB_NAMES`; a job without a line fails a
+  test). An unknown name is refused before the command runs — exit 2 as
+  before, now with clap's "did you mean" and, under `--json`, clap's plain
+  text like every other restricted argument. `load_jobs` still refuses an
+  unknown name in the file. Also: `pvfs --help` described `ingest` with
+  `ssh`'s text (the paragraph sat above the wrong variant) and `ssh` by its
+  examples run into one line; each has its own again, and `ssh`'s examples
+  follow its options.
 - **The CLI never waits on a question nobody can see, and `forest promote`
   signs for the forest it names (PVOS D198).**
   - **One rule for asking**: only when not `--json` and stdin **and** stderr
