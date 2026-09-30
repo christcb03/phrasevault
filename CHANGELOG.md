@@ -29,6 +29,37 @@ file tracks Layer 0, the file-system engine.
   - **The daemon sends `busy` for a busy database** (`PvfsError::Busy`),
     which went out as `internal`; D182 and D185 already sent `busy` for
     theirs. An older client finds its word in the text, as before.
+- **`pvfs serve enable --help` names every job (PVOS D203).** It listed 7 of
+  the 11 by hand (`follow|watch|sync|export|tier|evict|reclaim`), missing
+  `resolve`, `catalogue`, `health` and `receive`. `serve enable` and `serve
+  disable` now take the job from `JOB_NAMES` through clap's possible values:
+  `-h` lists the names, `--help` each with one line on what it does
+  (`serve::job_summary`, beside `JOB_NAMES`; a job without a line fails a
+  test). An unknown name is refused before the command runs — exit 2 as
+  before, now with clap's "did you mean" and, under `--json`, clap's plain
+  text like every other restricted argument. `load_jobs` still refuses an
+  unknown name in the file. Also: `pvfs --help` described `ingest` with
+  `ssh`'s text (the paragraph sat above the wrong variant) and `ssh` by its
+  examples run into one line; each has its own again, and `ssh`'s examples
+  follow its options.
+- **The CLI never waits on a question nobody can see, and `forest promote`
+  signs for the forest it names (PVOS D198).**
+  - **One rule for asking**: only when not `--json` and stdin **and** stderr
+    are terminals. Ansible runs commands under a pseudo-terminal, so stdin
+    alone passed for a person: D186's promotion hung ~9 minutes on
+    `pvfs --json fleet notify 2>/dev/null`, which asked for a webhook URL on
+    the redirected stderr. `prompt_line`, the confirmations, promote's and
+    `fence`'s questions, the sidecar-upgrade check, the "use the companion's
+    identity?" question and `identity replace`'s "Type yes" (which read stdin
+    unchecked) all follow it; a person at a terminal is still asked.
+    `read_phrase_stdin` still reads a piped phrase and refuses a terminal
+    nobody watches.
+  - **`pvfs --json fleet notify` with nothing configured prints `null`** — a
+    query answers; it does not start a setup.
+  - **`forest promote <dir> --via-companion` routes by `<dir>`'s root**, not
+    by the directory it runs in: from a home directory over ssh it named no
+    key, and a companion holding several phrases (D189) answered with its
+    default one. `PVFS_COMPANION_KEY` still wins.
 - **The companion keeps its runtime files (PVOS D197).** `serve` writes
   `<socket>.pid` and `<socket>.http` beside its socket in `/tmp`, and macOS's
   `tmp_cleaner` deletes regular files there that have gone three days

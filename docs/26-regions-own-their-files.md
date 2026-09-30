@@ -1,8 +1,11 @@
 # 26 — Regions own their files
 
-**Status: DESIGN, for review. Argued out with Chris on 2026-09-09; nothing here
-is built. Decisions marked SETTLED were agreed in that conversation; those
-marked OPEN were not. The implementation plan is §10.**
+**Status: BUILT, and what the media fleet runs.** Argued out with Chris on
+2026-09-09; phases 0–7 were built as PVOS D125–D131 (2026-09-09 → 11), and the
+fleet cut over to this model on 2026-09-12 (phase 8: doc 29, PVOS D140). §10
+says how each phase was built and what changed since. Decisions marked
+SETTLED were agreed in that conversation; those still OPEN are collected in
+§11. The user manual's §7.13 is how to use it.
 
 Prerequisite reading: doc 13 §A (the write model, resolved 2026-06-21), doc 20
 (region logs, built), doc 17 §7 (locations), doc 22 (the swarm), doc 24 §20 and

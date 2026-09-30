@@ -169,18 +169,21 @@ them; without it, a rename would strip them.
 catalogue (`pvfs region entries`, the view) for as long as a copy is running
 — up to an hour.
 
-**Why.** The watch is recursive inotify over the region's root and starts a
-pass after 2 s with no events; its fallback is an hourly reconcile. Every
-write to a file anywhere under the root is an event — including a `.pvfs-*`
-folder the catalogue walk ignores — so a long copy keeps resetting the
-2 seconds and no pass starts. (Found in D168: 46 files placed, none hashed,
-until the copies stopped.)
+**Why (before PVOS D180).** The watch is recursive inotify over the region's
+root and starts a pass after 2 s with no events; its fallback is an hourly
+reconcile. Every write to a file anywhere under the root was an event —
+including a `.pvfs-*` folder the catalogue walk ignores — so a long copy kept
+resetting the 2 seconds and no pass started. (Found in D168: 46 files
+placed, none hashed, until the copies stopped.)
 
-**Fix.** Stage copies on the same filesystem but outside the region's root,
-then rename them in; where the region is the whole filesystem, copy one file
-at a time with a few seconds' quiet after each. A PVFS fix (a ceiling on the
-debounce, or ignoring events under `.pvfs-` names) is tracked separately;
-`receive` stages its partials inside the library root the same way.
+**Fix — built.** PVOS D180 (PVFS `v1.4-402`, on the fleet since the
+v1.4-420 roll of 2026-09-22) does both: the watch ignores events on what its
+walk passes over (`.pvfs-*` names such as `receive`'s partials and the
+trash, sidecars, litter), and a pass starts at most 30 s after the first
+change however many keep coming (`pvfs serve watch --ceiling-ms`). A copy
+into a region now delays its catalogue by half a minute, not the hour.
+Staging outside the root and renaming in is still the tidy way on an older
+build, and it keeps half-copied files out of a pass.
 
 ## 5. Sonarr upgrades take minutes: the recycle bin
 
