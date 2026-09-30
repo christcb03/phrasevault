@@ -620,10 +620,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
     },
-    /// SSH to a host with this machine's companion socket reverse-forwarded
-    /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
-    /// actually your desktop agent — approvals appear on this machine.
-    ///
     /// External-ingest sessions (P10, doc 23): catalog a download now,
     /// stream bytes in as they verify, commit through the usual gates.
     /// Bare `pvfs ingest` lists the live sessions.
@@ -631,9 +627,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<IngestCmd>,
     },
-    /// Examples:
-    ///   pvfs ssh chris@presubuntu
-    ///   pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion
+    /// SSH to a host with this machine's companion socket reverse-forwarded
+    /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
+    /// actually your desktop agent — approvals appear on this machine.
+    // PVOS D203: this paragraph sat above `Ingest`, so `pvfs --help` gave
+    // `ingest` the ssh text and `ssh` the examples run into one line.
+    #[command(after_help = "Examples:\n  pvfs ssh chris@presubuntu\n  \
+                            pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion")]
     Ssh {
         /// SSH destination (`user@host` or an ssh config Host)
         target: String,
@@ -1323,14 +1323,30 @@ enum ReplicaCmd {
     },
 }
 
+/// PVOS D203 — `serve enable|disable` take a job from `JOB_NAMES`, each with
+/// what it does: `-h` lists the names, `--help` the names and their lines.
+/// The help once listed 7 of the 11 jobs by hand.
+fn serve_job_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(pvfs_core::serve::JOB_NAMES.map(|n| {
+        clap::builder::PossibleValue::new(n).help(pvfs_core::serve::job_summary(n).unwrap_or(""))
+    }))
+}
+
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// Enable a job in `serve.jobs` (follow|watch|sync|export|tier|evict|reclaim).
-    /// The
-    /// daemon picks it up on SIGHUP or restart.
-    Enable { job: String },
+    /// Enable a job in `serve.jobs`; the daemon picks it up on SIGHUP or
+    /// restart
+    Enable {
+        /// The job (`--help` says what each one does)
+        #[arg(value_parser = serve_job_parser())]
+        job: String,
+    },
     /// Disable a job in `serve.jobs`
-    Disable { job: String },
+    Disable {
+        /// The job (`--help` says what each one does)
+        #[arg(value_parser = serve_job_parser())]
+        job: String,
+    },
     /// List the jobs this data dir is configured to run
     Ls,
     /// List the exports the export job keeps fresh (`pvfs export --keep-fresh`)
