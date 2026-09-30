@@ -114,6 +114,9 @@ pub struct ServeStatusReply {
     pub fenced: Option<pvfs_proto::FenceWire>,
     /// PVOS D182 — the box's last dated copy of the log, when it makes them.
     pub backup: Option<pvfs_proto::BackupWire>,
+    /// PVOS D200 — the build the box's daemon runs (`None` from an older
+    /// daemon, which does not say).
+    pub build: Option<String>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -356,6 +359,7 @@ impl Client {
                 log,
                 fenced,
                 backup,
+                build,
             } => Ok(ServeStatusReply {
                 runner,
                 jobs: *jobs,
@@ -368,6 +372,7 @@ impl Client {
                 log: log.map(|b| *b),
                 fenced: fenced.map(|b| *b),
                 backup: backup.map(|b| *b),
+                build: build.map(|b| *b).filter(|b| !b.is_empty()),
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }

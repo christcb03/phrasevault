@@ -92,9 +92,10 @@ impl Fence {
         )
     }
 
-    /// What every refused write says. Worded without the words a routed
-    /// writer retries on (`advertise::scan_remote_err`: busy, locked, reset,
-    /// refused, closed, …) — a fenced owner must not be hammered.
+    /// What every refused write says (code `forbidden`). A routed writer
+    /// judges the refusal by that code, never by these words (PVOS D200:
+    /// they had to avoid the words it once retried on), so a fenced owner is
+    /// not hammered whatever the reason says.
     pub fn refusal(&self) -> String {
         format!(
             "this owner is fenced: {}. Nothing is written here until a person looks \
@@ -312,20 +313,5 @@ mod tests {
         std::fs::write(fence_path(d.path()), "garbage").unwrap();
         let f = load(d.path()).expect("present means fenced");
         assert!(f.reason.contains("unreadable"));
-    }
-
-    #[test]
-    fn the_refusal_avoids_the_words_routed_writers_retry_on() {
-        let f = Fence {
-            reason: Fence::evidence_sentence("192.168.1.142:7435", 3480, 3472),
-            ..Fence::default()
-        };
-        let text = format!("forbidden: write — {}", f.refusal()).to_ascii_lowercase();
-        for word in [
-            "busy", "locked", "timeout", "timed out", "connection", "broken pipe", "reset",
-            "refused", "unreachable", "eof", "closed",
-        ] {
-            assert!(!text.contains(word), "refusal contains {word:?}: {text}");
-        }
     }
 }

@@ -650,6 +650,12 @@ $PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | python3 -c '
 import json,sys
 c=json.load(sys.stdin)["capacity"]; assert c and c["total_bytes"]>0 and c["free_bytes"]<=c["total_bytes"], c
 ' && ok "live status carries the store's capacity (D131)" || fail "serve status capacity"
+# PVOS D200 — and the build the running daemon says it is (its --version's).
+DBUILD=$("$PVFSD" --version 2>&1 | sed -n 's/.*(\(.*\)).*/\1/p')
+$PVFS --json --data-dir "$DMOUNT/.pvfs" serve status | python3 -c '
+import json,sys
+b=json.load(sys.stdin)["build"]; assert b and b==sys.argv[1], (b, sys.argv[1])
+' "$DBUILD" && ok "live status carries the daemon's build (PVOS D200)" || fail "serve status build"
 # PVOS D174 — the receive plan, answered by the running daemon (this forest
 # has no receiving region: an empty plan, in the dry run's shape).
 $PVFS --json --data-dir "$DMOUNT/.pvfs" serve receive-plan | python3 -c '
