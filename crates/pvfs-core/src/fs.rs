@@ -428,6 +428,12 @@ struct HeldRow {
 }
 
 impl HeldRow {
+    /// A folder's row, as a catalogue pass writes one (D199: not written
+    /// again while it stays one).
+    fn is_folder(&self) -> bool {
+        self.kind == "dir" && self.size_bytes == 0 && self.mtime_ms == 0 && self.changed_ms == 0 && self.content_hash.is_none()
+    }
+
     /// Already what the manifest's row would write.
     fn is(&self, r: &RegionEntry) -> bool {
         self.kind == r.kind
@@ -498,7 +504,266 @@ fn data_version(conn: &rusqlite::Connection) -> Result<i64> {
 
 /// One catalogue row on its way to `region_entries` (D125):
 /// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
-type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
+pub(crate) type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
+
+/// PVOS D199 — the most rows the stale-row sweep deletes in one step of the
+/// writer (a folder of a thousand episodes deleted at once is several).
+const SWEEP_STEP: usize = 1_000;
+
+/// D199 — what one catalogue pass carries beside its database handle: its
+/// stop flag (D86) and the D154/D156 test seams, which lived on the engine
+/// the pass ran on. The daemon's watch makes one with its job's flag; an
+/// engine's own scan makes one from its fields and takes them back after.
+pub struct CatalogueCtx {
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Rows, and milliseconds, a batch holds before its step (D154).
+    pub batch: (usize, u64),
+    pub(crate) interrupt: Option<(u64, bool)>,
+    pub(crate) read_hook: Option<crate::engine::CatalogueReadHook>,
+}
+
+impl CatalogueCtx {
+    /// A pass with `cancel` as its stop flag and the production batches.
+    pub fn new(cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> CatalogueCtx {
+        CatalogueCtx { cancel, batch: (CATALOGUE_BATCH_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The D154 seam's stop: the flag the pass was given, or a new one.
+    fn raise_cancel(&mut self) {
+        self.cancel
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The first eight characters of a region id, for step names and lines.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// D125 items 2–3 — the region-kind scan (doc 26 §4, milestone §3.2): one
+/// `region_entries` row per file and per directory (empty ones included —
+/// Chris's requirement), and not one event; the log learns only the
+/// manifest hash (`publish_region_snapshot_db`). The walk applied the
+/// settle window (D112), so a file still being written is absent from
+/// `files` and its last settled row is KEPT: the sweep asks the disk.
+///
+/// D154 — rows are committed AS THE PASS GOES, in batches
+/// (`CATALOGUE_BATCH_ROWS` or `CATALOGUE_BATCH_MS`), so a stop commits what
+/// the pass holds and a kill loses one batch at most; the next pass takes
+/// every committed file's hash from its row. At the END, for a COMPLETE pass
+/// only: the stale-row sweep (it needs every path the pass produced) and the
+/// head — a stopped pass publishes nothing, so a box's rows may run ahead of
+/// its head, never the other way round.
+///
+/// D156 — one file's failed read is not the pass's failure: a file gone
+/// since the walk is left to the sweep; a file whose own trouble it is
+/// (`read_fault`) is quarantined and keeps its prior row; anything that may
+/// be the volume's fails the pass, keeping what it holds.
+///
+/// PVOS D199 — the pass reaches the database through `db`: the region's rows
+/// are read ONCE, at the start, where reads go (a read view, in the daemon);
+/// the walk, the hashing, the sweep's disk checks and the manifest need no
+/// lock; each batch, each sweep chunk and the snapshot row is one step of
+/// the writer. And (part 2) a row is written only when the pass finds it
+/// different — kind, size, mtime, changed time or hash — so a quiet pass
+/// over mediabox-local writes nothing, where it used to upsert ~29,500 rows
+/// (the sweep and the head never read `seen_at`: they work from the pass's
+/// own set).
+#[allow(clippy::too_many_arguments)]
+fn catalogue_region_pass<D: crate::writer::Db>(
+    db: &D,
+    ctx: &mut CatalogueCtx,
+    b: &Binding,
+    root: &std::path::Path,
+    files: &[DiskFile],
+    dirs: &[Vec<String>],
+    mut stats: ScanStats,
+    writer: &mut Option<&mut dyn ScanWriter>,
+) -> Result<ScanStats> {
+    let region = b.folder_id.as_str();
+    let pass = now_ms() as i64;
+    let dirs_with_files: HashSet<&[String]> = files.iter().map(|f| f.rel_dirs.as_slice()).collect();
+    stats.empty_dirs = dirs
+        .iter()
+        .filter(|d| !dirs_with_files.contains(d.as_slice()))
+        .count() as u64;
+    let held = db.read(|e| held_region_rows(&e.conn, &b.folder_id))?;
+
+    let (batch_rows, batch_ms) = ctx.batch;
+    let batch_every = std::time::Duration::from_millis(batch_ms);
+    let interrupt = ctx.interrupt.take();
+    // Directories carry no times: theirs change whenever an entry does, which
+    // the file rows already say, and two identical libraries must hash
+    // identically. One already held as a folder is not written again.
+    let mut produced: HashSet<String> = dirs.iter().map(|d| d.join("/")).collect();
+    let mut pending: Vec<CatalogueRow> = dirs
+        .iter()
+        .map(|d| d.join("/"))
+        .filter(|rel| !held.get(rel.as_str()).is_some_and(HeldRow::is_folder))
+        .map(|rel| (rel, "dir", 0, 0, 0, None))
+        .collect();
+    let mut last_commit = std::time::Instant::now();
+    for (i, f) in files.iter().enumerate() {
+        if ctx.cancelled() {
+            return stop_catalogue_pass(db, region, pass, &mut pending, stats);
+        }
+        if let Some((_, crash)) = interrupt.filter(|&(at, _)| at == i as u64) {
+            if crash {
+                // The seam's kill: whatever is pending dies with the pass.
+                return Err(PvfsError::io("catalogue pass", std::io::Error::other("killed (test seam)")));
+            }
+            ctx.raise_cancel();
+        }
+        let mut rel = f.rel_dirs.join("/");
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(&f.name);
+        let prior = held.get(rel.as_str());
+        let same = prior.is_some_and(|p| p.size_bytes == f.size as i64 && p.mtime_ms == f.mtime_ms as i64);
+        let known = match prior {
+            Some(p) if same => p.content_hash.clone(),
+            _ => None,
+        };
+        // A present sidecar is free and is read whatever the policy; only a
+        // MISSING one is where the policy decides whether bytes are read —
+        // the same split ingest makes (D103, D94).
+        let hash = match known {
+            Some(h) => Some(h),
+            None => match b.hash_policy {
+                // D154 — the stop lands inside the read, not after it: a film
+                // can be tens of GB, and a stop that waits for one overruns
+                // the unit's stop timeout and is SIGKILLed.
+                HashPolicy::OnAdd => {
+                    let injected = ctx.read_hook.as_mut().and_then(|h| h(f.path.as_path()));
+                    let read = match injected {
+                        Some(e) => Err(PvfsError::io("read for hash", e)),
+                        None => hash_reusing_sidecar_until(&f.path, f.size, ctx.cancel.as_deref()),
+                    };
+                    match read {
+                        Ok(Some((h, _))) => Some(h),
+                        // Abandoned mid-read: this file counts for nothing.
+                        Ok(None) => return stop_catalogue_pass(db, region, pass, &mut pending, stats),
+                        Err(e) => match read_fault(&e) {
+                            // Renamed or deleted since the walk: not in
+                            // `produced`, so the sweep asks the disk.
+                            ReadFault::Gone => {
+                                eprintln!(
+                                    "catalogue: {} went away before it could be read; the sweep decides",
+                                    f.path.display()
+                                );
+                                continue;
+                            }
+                            // Its own trouble: quarantined (D71 W4's rule); no
+                            // row written, so its prior row stays. Every pass
+                            // tries it again.
+                            ReadFault::File => {
+                                stats.needs_attention += 1;
+                                if stats.quarantined.len() < 8 {
+                                    let uri = path_to_uri(&f.path).unwrap_or_else(|_| f.path.display().to_string());
+                                    stats.quarantined.push((uri, e.to_string()));
+                                }
+                                continue;
+                            }
+                            // Perhaps the volume's: fail the pass, keeping what
+                            // it holds (hashed, and correct) as a stop does.
+                            ReadFault::Pass => {
+                                commit_catalogue_rows(db, region, pass, &mut pending)?;
+                                return Err(e);
+                            }
+                        },
+                    }
+                }
+                HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
+            },
+        };
+        match prior {
+            None => stats.added += 1,
+            Some(_) if same => stats.unchanged += 1,
+            Some(_) => stats.changed += 1,
+        }
+        // D199 part 2 — a row already what this pass would write stays as it is.
+        let unchanged_row = prior.is_some_and(|p| {
+            p.kind == "file" && same && p.changed_ms == f.changed_ms as i64 && p.content_hash == hash
+        });
+        produced.insert(rel.clone());
+        if !unchanged_row {
+            pending.push((rel, "file", f.size, f.mtime_ms, f.changed_ms, hash));
+        }
+        if pending.len() >= batch_rows || last_commit.elapsed() >= batch_every {
+            commit_catalogue_rows(db, region, pass, &mut pending)?;
+            last_commit = std::time::Instant::now();
+        }
+    }
+    // Asked to stop after the last file (or before a pass that had none to
+    // take — the watch's settle window can leave it every one): still a
+    // stopped pass, so no sweep and no head.
+    if ctx.cancelled() {
+        return stop_catalogue_pass(db, region, pass, &mut pending, stats);
+    }
+    commit_catalogue_rows(db, region, pass, &mut pending)?;
+
+    // D156 — the volume is still the one the pass began on: an unmount
+    // mid-pass makes every later file merely "gone", and the sweep would take
+    // every row the pass had not reached, then publish that.
+    crate::sync::verify_root_marker(root)?;
+
+    // The pass is complete. Rows it did not produce are gone from disk — or
+    // merely unseen (settling, unreadable, quarantined). Only the first is a
+    // deletion, and only the disk's own "not there" says so (D156). Read
+    // fresh: the rows now, this pass's batches and any rename's included.
+    let gone: Vec<String> = db
+        .read(|e| e.region_rel_paths(&b.folder_id))?
+        .into_iter()
+        .filter(|rel| !produced.contains(rel.as_str()) && gone_from_disk(&root.join(rel)))
+        .collect();
+    for chunk in gone.chunks(SWEEP_STEP) {
+        db.write(&format!("sweep {}", short_id(region)), |e| e.delete_region_rows(&b.folder_id, chunk))?;
+        stats.removed += chunk.len() as u64;
+    }
+    // Item 4 — a changed catalogue publishes its head; an unchanged one
+    // publishes nothing.
+    publish_region_snapshot_db(db, &b.folder_id, writer)?;
+    Ok(stats)
+}
+
+/// D154 — end a catalogue pass that was told to stop: commit what it holds
+/// (already hashed; the step takes milliseconds), neither sweep nor publish.
+/// Every file it counts has a row — `ScanStats.cancelled`'s "everything
+/// counted here really happened" — and the head still names the last
+/// COMPLETE pass.
+fn stop_catalogue_pass<D: crate::writer::Db>(
+    db: &D,
+    region: &str,
+    pass: i64,
+    pending: &mut Vec<CatalogueRow>,
+    mut stats: ScanStats,
+) -> Result<ScanStats> {
+    commit_catalogue_rows(db, region, pass, pending)?;
+    stats.cancelled = true;
+    Ok(stats)
+}
+
+/// D154 — one batch of a pass's rows as one step of the writer (D199), after
+/// which `pending` is empty. An empty batch takes no step.
+fn commit_catalogue_rows<D: crate::writer::Db>(
+    db: &D,
+    region: &str,
+    pass: i64,
+    pending: &mut Vec<CatalogueRow>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    db.write(&format!("rows {}", short_id(region)), |e| e.write_catalogue_rows(region, pass, pending))?;
+    pending.clear();
+    Ok(())
+}
 
 /// D126 — one copy of a path in the merged view: which region holds it and
 /// what that region's catalogue says about it.
@@ -1502,273 +1767,27 @@ impl Engine {
         self.scan_binding(&transient, writer, settle_ms)
     }
 
-    /// D125 items 2–3 — the region-kind scan (doc 26 §4, milestone §3.2).
-    ///
-    /// One `region_entries` row per file and per directory — EMPTY ones
-    /// included, which is Chris's requirement and the reason directories are
-    /// rows at all — and not one event: a catalogue region tells the log only
-    /// its manifest hash (item 4). The walk already applied the settle window
-    /// (D112), so a file still being written is simply absent from `files`;
-    /// its last settled row is KEPT, because the stale sweep re-checks the
-    /// disk before deleting and "still copying" is not "gone".
-    ///
-    /// D154 — the rows are committed AS THE PASS GOES, in batches
-    /// (`CATALOGUE_BATCH_ROWS` rows or `CATALOGUE_BATCH_MS`, whichever comes
-    /// first). They used to wait for the end: every hash first, then one
-    /// transaction, on the reasoning that "a pass abandoned here has cost
-    /// nothing but time". On mediabox that time was a whole first pass, hours
-    /// per region, and every daemon restart abandoned it, so two regions went
-    /// two days with no rows at all. Now a stop commits what the pass holds, a
-    /// kill loses one batch at most, and the next pass takes every committed
-    /// file's hash from its row.
-    ///
-    /// What stays at the END, for a COMPLETE pass only: the stale-row sweep,
-    /// which needs every path the pass produced ("not seen yet" is not
-    /// "gone"), and the head. A manifest of a partial pass would be attested to
-    /// the forest as the region's catalogue, and a fetch (D129) would install
-    /// it as the truth, so a stopped pass publishes nothing. This box's rows
-    /// may run ahead of its head, never the other way round.
-    ///
-    /// D156 — one file's failed read is not the pass's failure. A file gone
-    /// since the walk is left to the sweep; a file whose own trouble it is
-    /// (EACCES, EIO, …; `read_fault`) is quarantined and keeps its
-    /// prior row; anything that may be the volume's fails the pass as before.
-    /// A pass with a quarantine is complete: it sweeps and publishes.
-    fn scan_region_catalogue(
-        &mut self,
-        b: &Binding,
-        root: &std::path::Path,
-        files: &[DiskFile],
-        dirs: &[Vec<String>],
-        mut stats: ScanStats,
-        writer: &mut Option<&mut dyn ScanWriter>,
-    ) -> Result<ScanStats> {
-        let region = b.folder_id.as_str();
-        let pass = now_ms() as i64;
-        let dirs_with_files: HashSet<&[String]> =
-            files.iter().map(|f| f.rel_dirs.as_slice()).collect();
-        stats.empty_dirs = dirs
-            .iter()
-            .filter(|d| !dirs_with_files.contains(d.as_slice()))
-            .count() as u64;
-
-        let (batch_rows, batch_ms) = self.catalogue_batch;
-        let batch_every = std::time::Duration::from_millis(batch_ms);
-        let interrupt = self.catalogue_interrupt.take();
-        // (rel_path, kind, size, mtime, changed, hash). Directories carry no
-        // times: theirs change whenever an entry does, which the file rows
-        // already say, and two identical libraries must hash identically.
-        let mut pending: Vec<CatalogueRow> =
-            dirs.iter().map(|d| (d.join("/"), "dir", 0, 0, 0, None)).collect();
-        let mut produced: HashSet<String> = pending.iter().map(|r| r.0.clone()).collect();
-        let mut last_commit = std::time::Instant::now();
-        for (i, f) in files.iter().enumerate() {
-            if self.cancelled() {
-                return self.stop_catalogue_pass(region, pass, &mut pending, stats);
-            }
-            if let Some((_, crash)) = interrupt.filter(|&(at, _)| at == i as u64) {
-                if crash {
-                    // The seam's kill: whatever is pending dies with the pass.
-                    return Err(PvfsError::io(
-                        "catalogue pass",
-                        std::io::Error::other("killed (test seam)"),
-                    ));
-                }
-                self.raise_cancel();
-            }
-            let mut rel = f.rel_dirs.join("/");
-            if !rel.is_empty() {
-                rel.push('/');
-            }
-            rel.push_str(&f.name);
-            let prior: Option<(u64, u64, Option<String>)> = self
-                .conn
-                .query_row(
-                    "SELECT size_bytes, mtime_ms, content_hash FROM region_entries
-                      WHERE region_id = ?1 AND rel_path = ?2",
-                    params![region, rel],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)? as u64,
-                            r.get::<_, i64>(1)? as u64,
-                            r.get(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(map_db("region entry"))?;
-            let same = matches!(prior, Some((s, m, _)) if s == f.size && m == f.mtime_ms);
-            let known = match &prior {
-                Some((_, _, Some(h))) if same => Some(h.clone()),
-                _ => None,
-            };
-            // A present sidecar is free and is read whatever the policy; only
-            // a MISSING one is where the policy decides whether bytes are
-            // read — the same split ingest makes (D103, D94).
-            let hash = match known {
-                Some(h) => Some(h),
-                None => match b.hash_policy {
-                    // D154 — the stop lands inside the read, not after it. A
-                    // film can be tens of GB, and a stop that waits for one
-                    // overruns the unit's stop timeout and is SIGKILLed,
-                    // losing the batch a clean stop would have committed.
-                    HashPolicy::OnAdd => {
-                        let injected =
-                            self.catalogue_read_hook.as_mut().and_then(|h| h(f.path.as_path()));
-                        let read = match injected {
-                            Some(e) => Err(PvfsError::io("read for hash", e)),
-                            None => self.hash_reusing_sidecar_until(&f.path, f.size, self.cancel_flag()),
-                        };
-                        match read {
-                            Ok(Some((h, _))) => Some(h),
-                            // Abandoned mid-read: this file counts for nothing.
-                            Ok(None) => return self.stop_catalogue_pass(region, pass, &mut pending, stats),
-                            // D156 — one file's failed read no longer ends the
-                            // pass. A file that failed every time stopped every
-                            // pass at the same place, and since the sweep and
-                            // the head wait for a complete pass (D154), the
-                            // region never published again.
-                            Err(e) => match read_fault(&e) {
-                                // Renamed or deleted since the walk: not in
-                                // `produced`, so the sweep asks the disk.
-                                ReadFault::Gone => {
-                                    eprintln!(
-                                        "catalogue: {} went away before it could be read; the sweep decides",
-                                        f.path.display()
-                                    );
-                                    continue;
-                                }
-                                // Its own trouble: quarantined, as D71 W4 does
-                                // for log regions. No row is written, so its
-                                // prior row, if any, stays as the last read
-                                // left it. Every pass tries it again.
-                                ReadFault::File => {
-                                    stats.needs_attention += 1;
-                                    if stats.quarantined.len() < 8 {
-                                        let uri = path_to_uri(&f.path)
-                                            .unwrap_or_else(|_| f.path.display().to_string());
-                                        stats.quarantined.push((uri, e.to_string()));
-                                    }
-                                    continue;
-                                }
-                                // Perhaps the volume's: fail the pass, as every
-                                // read error used to, keeping what it holds
-                                // (hashed, and correct) as a stop does.
-                                ReadFault::Pass => {
-                                    self.commit_catalogue_rows(region, pass, &mut pending)?;
-                                    return Err(e);
-                                }
-                            },
-                        }
-                    }
-                    HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
-                },
-            };
-            match prior {
-                None => stats.added += 1,
-                Some(_) if same => stats.unchanged += 1,
-                Some(_) => stats.changed += 1,
-            }
-            produced.insert(rel.clone());
-            pending.push((rel, "file", f.size, f.mtime_ms, f.changed_ms, hash));
-            if pending.len() >= batch_rows || last_commit.elapsed() >= batch_every {
-                self.commit_catalogue_rows(region, pass, &mut pending)?;
-                last_commit = std::time::Instant::now();
-            }
-        }
-        // Asked to stop after the last file (or before a pass that had none
-        // to take — the watch's settle window can leave it every one): still
-        // a stopped pass, so no sweep and no head.
-        if self.cancelled() {
-            return self.stop_catalogue_pass(region, pass, &mut pending, stats);
-        }
-        self.commit_catalogue_rows(region, pass, &mut pending)?;
-
-        // D156 — the volume is still the one the pass began on. Now that a
-        // pass carries on past a file it could not read, an unmount mid-pass
-        // no longer ends it: every later file is merely "gone" (ENOENT), and
-        // the sweep below would take every row the pass had not reached, then
-        // publish that. The root marker is D81's test for exactly this; asked
-        // again here, a bare mountpoint fails the pass before either.
-        crate::sync::verify_root_marker(root)?;
-
-        // The pass is complete. Rows it did not produce are gone from disk — or
-        // merely unseen (settling, unreadable, quarantined). Only the first is
-        // a deletion, and only the disk's own "not there" says so (D156).
-        let gone: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT rel_path FROM region_entries WHERE region_id = ?1")
-                .map_err(map_db("region entries"))?;
-            let all = stmt
-                .query_map(params![region], |r| r.get::<_, String>(0))
-                .map_err(map_db("region entries"))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(map_db("region entries"))?;
-            all.into_iter()
-                .filter(|rel| !produced.contains(rel.as_str()) && gone_from_disk(&root.join(rel)))
-                .collect()
-        };
-
-        if !gone.is_empty() {
-            let tx = self.conn.transaction().map_err(map_db("begin catalogue sweep"))?;
-            for rel in &gone {
-                tx.execute(
-                    "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
-                    params![region, rel],
-                )
-                .map_err(map_db("delete region entry"))?;
-                stats.removed += 1;
-            }
-            tx.commit().map_err(map_db("commit catalogue sweep"))?;
-        }
-        // Item 4 — a changed catalogue publishes its head; an unchanged one
-        // publishes nothing.
-        self.publish_region_snapshot(&b.folder_id, writer)?;
-        Ok(stats)
-    }
-
-    /// D154 — end a catalogue pass that was told to stop. It commits what it
-    /// holds (already hashed; the commit takes milliseconds) and neither
-    /// sweeps nor publishes. So every file it counts has a row, which is
-    /// `ScanStats.cancelled`'s "everything counted here really happened", and
-    /// the head still names the last COMPLETE pass.
-    fn stop_catalogue_pass(
-        &mut self,
-        region: &str,
-        pass: i64,
-        pending: &mut Vec<CatalogueRow>,
-        mut stats: ScanStats,
-    ) -> Result<ScanStats> {
-        self.commit_catalogue_rows(region, pass, pending)?;
-        stats.cancelled = true;
-        Ok(stats)
-    }
-
-    /// D154 — one batch of a catalogue pass's rows, in one transaction, after
-    /// which `pending` is empty. The same upsert every pass has always made,
-    /// in pieces.
-    fn commit_catalogue_rows(
-        &mut self,
-        region: &str,
-        pass: i64,
-        pending: &mut Vec<CatalogueRow>,
-    ) -> Result<()> {
-        if pending.is_empty() {
-            return Ok(());
-        }
+    /// D154 — one batch of a catalogue pass's rows, in one transaction: the
+    /// same upsert every pass has always made, in pieces. PVOS D199: one step
+    /// of the writer (`catalogue_region_pass` hands it the batch), and since
+    /// part 2 only rows that changed.
+    pub(crate) fn write_catalogue_rows(&mut self, region: &str, pass: i64, rows: &[CatalogueRow]) -> Result<()> {
         let tx = self.conn.transaction().map_err(map_db("begin catalogue"))?;
-        for (rel, kind, size, mtime, changed, hash) in pending.iter() {
-            tx.execute(
-                "INSERT INTO region_entries
-                   (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
-                    content_hash, quality, seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
-                 ON CONFLICT(region_id, rel_path) DO UPDATE SET
-                   kind = excluded.kind, size_bytes = excluded.size_bytes,
-                   mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
-                   content_hash = excluded.content_hash, seen_at = excluded.seen_at",
-                params![
+        {
+            let mut put = tx
+                .prepare_cached(
+                    "INSERT INTO region_entries
+                       (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
+                        content_hash, quality, seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+                     ON CONFLICT(region_id, rel_path) DO UPDATE SET
+                       kind = excluded.kind, size_bytes = excluded.size_bytes,
+                       mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
+                       content_hash = excluded.content_hash, seen_at = excluded.seen_at",
+                )
+                .map_err(map_db("upsert region entry"))?;
+            for (rel, kind, size, mtime, changed, hash) in rows {
+                put.execute(params![
                     region,
                     rel,
                     kind,
@@ -1777,13 +1796,40 @@ impl Engine {
                     *changed as i64,
                     hash,
                     pass
-                ],
-            )
-            .map_err(map_db("upsert region entry"))?;
+                ])
+                .map_err(map_db("upsert region entry"))?;
+            }
         }
-        tx.commit().map_err(map_db("commit catalogue"))?;
-        pending.clear();
-        Ok(())
+        tx.commit().map_err(map_db("commit catalogue"))
+    }
+
+    /// The stale-row sweep's deletes for `rels` (a pass's rows gone from
+    /// disk), in one transaction — one step of the writer (D199).
+    pub(crate) fn delete_region_rows(&mut self, region: &NodeId, rels: &[String]) -> Result<()> {
+        let tx = self.conn.transaction().map_err(map_db("begin catalogue sweep"))?;
+        {
+            let mut del = tx
+                .prepare_cached("DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2")
+                .map_err(map_db("delete region entry"))?;
+            for rel in rels {
+                del.execute(params![region, rel]).map_err(map_db("delete region entry"))?;
+            }
+        }
+        tx.commit().map_err(map_db("commit catalogue sweep"))
+    }
+
+    /// Every path this box holds a row for in `region` (the sweep's read).
+    pub(crate) fn region_rel_paths(&self, region: &NodeId) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rel_path FROM region_entries WHERE region_id = ?1")
+            .map_err(map_db("region entries"))?;
+        let all = stmt
+            .query_map(params![region], |r| r.get::<_, String>(0))
+            .map_err(map_db("region entries"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("region entries"));
+        all
     }
 
     /// A catalogue region's rows in manifest order — bytewise by path, which
@@ -1951,6 +1997,14 @@ impl Engine {
         source: &str,
         between: impl FnOnce(),
     ) -> Result<SnapshotInstall> {
+        install_region_snapshot_db(&crate::writer::OwnDb::new(self), region, seq, bytes, source, between)
+    }
+
+    /// D129's refusals, in their order, and the hash `seq` must have: a
+    /// catalogue region; not catalogued here (its own rows are the
+    /// authority — a fetched copy never overwrites a live catalogue); `seq`
+    /// the log's attested head, or D183's provisional one.
+    fn install_expected(&self, region: &NodeId, seq: u64) -> Result<String> {
         if !self.is_catalogue_region(region)? {
             return Err(bad("catalogue", "not a catalogue region"));
         }
@@ -1972,100 +2026,64 @@ impl Engine {
             )
             .optional()
             .map_err(map_db("install snapshot: provisional"))?;
-        let expected: Option<String> = if info.committed_seq > 0 && seq == info.committed_seq {
-            Some(info.committed_head.clone())
-        } else {
-            provisional.as_ref().filter(|(ps, _)| *ps == seq).map(|(_, ph)| ph.clone())
-        };
-        let Some(expected) = expected else {
-            if info.committed_seq == 0 && provisional.is_none() {
-                return Err(bad("catalogue", "the log attests no head for that region yet"));
-            }
-            return Err(bad(
-                "catalogue",
-                &format!(
-                    "seq {seq} is not the attested head ({}){}",
-                    info.committed_seq,
-                    provisional.map(|(ps, _)| format!(" nor the provisional one ({ps})")).unwrap_or_default()
-                ),
-            ));
-        };
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        if hash != expected {
-            return Err(bad("catalogue", "manifest hash does not match the attested head"));
+        if info.committed_seq > 0 && seq == info.committed_seq {
+            return Ok(info.committed_head);
         }
-        let (named, named_seq, rows) = Self::parse_region_manifest(bytes)?;
-        if &named != region || named_seq != seq {
-            return Err(bad("catalogue", "manifest names another region or seq"));
+        if let Some((_, ph)) = provisional.as_ref().filter(|(ps, _)| *ps == seq) {
+            return Ok(ph.clone());
         }
-        // D194 — each path once: the delta goes by path, and the region's
-        // key could not hold a second row for one anyway.
-        let mut paths: HashSet<&str> = HashSet::with_capacity(rows.len());
-        if let Some(twice) = rows.iter().find(|r| !paths.insert(r.rel_path.as_str())) {
-            return Err(bad("catalogue", &format!("the manifest lists {} twice", twice.rel_path)));
+        if info.committed_seq == 0 && provisional.is_none() {
+            return Err(bad("catalogue", "the log attests no head for that region yet"));
         }
-        // D194 — what to write comes from the rows held, read without the
-        // write lock, and the database's version as of that read. Until
-        // D194 the install deleted every row and inserted the manifest's:
-        // ≈59,000 row writes on the NAS for a head that moved two rows of
-        // mediabox-local (2026-09-26), longer than the 15 s the daemon's
-        // other writers wait (D141), so the watch, the follow or the receive
-        // lost its pass.
-        let (version, held) = {
-            let tx = self.conn.transaction().map_err(map_db("install snapshot: read"))?;
-            let version = data_version(&tx)?;
-            let held = held_region_rows(&tx, region)?;
-            tx.commit().map_err(map_db("install snapshot: read"))?;
-            (version, held)
-        };
-        let mut delta = SnapshotDelta::of(held, &rows);
-        between();
-        let now = now_ms() as i64;
+        Err(bad(
+            "catalogue",
+            &format!(
+                "seq {seq} is not the attested head ({}){}",
+                info.committed_seq,
+                provisional.map(|(ps, _)| format!(" nor the provisional one ({ps})")).unwrap_or_default()
+            ),
+        ))
+    }
+
+    /// D199 — one step of an install: some of its upserts or its removals,
+    /// in one transaction.
+    fn install_rows(&mut self, region: &NodeId, put: &[&RegionEntry], removed: &[String], now: i64) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(map_db("install snapshot"))?;
-        // Another connection committed since the read: read again, under the
-        // lock, so the delta is against exactly what is there.
+        write_install_rows(&tx, region, put, removed, now)?;
+        tx.commit().map_err(map_db("install snapshot"))
+    }
+
+    /// D199 — an install's last step: `region_fetched` records what is held.
+    /// If another connection committed since `version` was read (D194's
+    /// test: `data_version`, which this connection's own steps never move),
+    /// the region's rows are read again here, under the lock, and whatever
+    /// no longer matches the manifest is put right in this same step — so
+    /// the install ends with exactly the manifest, whatever happened
+    /// meanwhile. Returns what that put right: `(added, changed, removed)`.
+    #[allow(clippy::too_many_arguments)]
+    fn install_finish(
+        &mut self,
+        region: &NodeId,
+        seq: u64,
+        hash: &str,
+        rows: &[RegionEntry],
+        version: i64,
+        source: &str,
+        now: i64,
+    ) -> Result<(usize, usize, usize)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_db("install snapshot"))?;
+        let mut fixed = (0, 0, 0);
         if data_version(&tx)? != version {
-            delta = SnapshotDelta::of(held_region_rows(&tx, region)?, &rows);
-        }
-        {
-            let mut del = tx
-                .prepare_cached("DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2")
-                .map_err(map_db("install snapshot: prepare"))?;
-            for rel in &delta.removed {
-                del.execute(params![region, rel])
-                    .map_err(map_db("install snapshot: remove"))?;
-            }
-            // D141 — one prepared statement for every row written.
-            let mut put = tx
-                .prepare_cached(
-                    "INSERT INTO region_entries
-                       (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
-                        content_hash, quality, seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(region_id, rel_path) DO UPDATE SET
-                       kind = excluded.kind, size_bytes = excluded.size_bytes,
-                       mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
-                       content_hash = excluded.content_hash, quality = excluded.quality,
-                       seen_at = excluded.seen_at",
-                )
-                .map_err(map_db("install snapshot: prepare"))?;
-            for r in delta.added.iter().chain(&delta.changed) {
-                put.execute(params![
-                    region,
-                    r.rel_path,
-                    r.kind,
-                    r.size_bytes as i64,
-                    r.mtime_ms as i64,
-                    r.changed_ms as i64,
-                    r.content_hash,
-                    r.quality,
-                    now
-                ])
-                .map_err(map_db("install snapshot: row"))?;
-            }
+            let delta = SnapshotDelta::of(held_region_rows(&tx, region)?, rows);
+            let put: Vec<&RegionEntry> = delta.added.iter().chain(&delta.changed).copied().collect();
+            write_install_rows(&tx, region, &put, &delta.removed, now)?;
+            fixed = (delta.added.len(), delta.changed.len(), delta.removed.len());
         }
         tx.execute(
             "INSERT INTO region_fetched (region_id, seq, manifest_hash, entries, fetched_at, source)
@@ -2078,12 +2096,7 @@ impl Engine {
         )
         .map_err(map_db("install snapshot: record"))?;
         tx.commit().map_err(map_db("install snapshot"))?;
-        Ok(SnapshotInstall {
-            rows: rows.len(),
-            added: delta.added.len(),
-            changed: delta.changed.len(),
-            removed: delta.removed.len(),
-        })
+        Ok(fixed)
     }
 
     /// D129 — does THIS box catalogue `region` (so its rows are live and
@@ -2430,6 +2443,28 @@ impl Engine {
         region: &NodeId,
         writer: &mut Option<&mut dyn ScanWriter>,
     ) -> Result<Option<u64>> {
+        publish_region_snapshot_db(&crate::writer::OwnDb::new(self), region, writer)
+    }
+
+    /// D199 — the snapshot row a publish records, and on the owner the
+    /// head it commits into the log: the publish's one write step.
+    fn record_snapshot(&mut self, region: &NodeId, seq: u64, hash: &str, entries: usize) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO region_snapshots (region_id, seq, manifest_hash, entries, published_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![region, seq as i64, hash, entries as i64, now_ms() as i64],
+            )
+            .map_err(map_db("insert snapshot"))?;
+        if !self.replica {
+            self.commit_region_heads()?;
+        }
+        Ok(())
+    }
+
+    /// D199 — what a publish reads: the rows, the last snapshot and the
+    /// log's attested head.
+    fn snapshot_inputs(&self, region: &NodeId) -> Result<SnapshotInputs> {
         if !self.is_catalogue_region(region)? {
             return Err(bad("region", "not a catalogue region"));
         }
@@ -2444,13 +2479,6 @@ impl Engine {
             )
             .optional()
             .map_err(map_db("last snapshot"))?;
-        let (last_seq, last_hash) = last.unwrap_or((0, String::new()));
-        // D173 — the head the LOG attests is the floor. This box's own record
-        // of what it published (`region_snapshots`) is derived state: a
-        // projection replay wiped it on the NAS (2026-09-17, 9:40 PM EDT),
-        // the next publish counted from 1 again, and the owner refused every
-        // head after that ("head seq 1 does not advance … (at 6)"). With the
-        // record gone, the attested head's hash says whether anything changed.
         let attested: (i64, String) = self
             .conn
             .query_row(
@@ -2461,66 +2489,13 @@ impl Engine {
             .optional()
             .map_err(map_db("attested head"))?
             .unwrap_or((0, String::new()));
-        if last_seq > 0 {
-            let again = Self::region_manifest_bytes(region, last_seq as u64, &rows);
-            // PVOS D183 — unchanged is nothing to publish, unless the log's
-            // head at that very seq names another manifest: a head committed
-            // whose answer was lost, then published again here while the owner
-            // was away. Peers install only what the log attests, so publish
-            // past it rather than leave them stale until the next change.
-            let superseded = attested.0 == last_seq && attested.1 != last_hash;
-            if blake3::hash(&again).to_hex().as_str() == last_hash && !superseded {
-                return Ok(None);
-            }
-        }
-        if last_seq == 0 && attested.0 > 0 {
-            let again = Self::region_manifest_bytes(region, attested.0 as u64, &rows);
-            if blake3::hash(&again).to_hex().as_str() == attested.1 {
-                return Ok(None);
-            }
-        }
-        let seq = last_seq.max(attested.0) as u64 + 1;
-        let bytes = Self::region_manifest_bytes(region, seq, &rows);
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        let dir = self.data_dir.join("regions").join(region);
-        crate::storage::atomic_overwrite(&dir.join(format!("manifest.{seq}")), &bytes)?;
-        // D129 hygiene: a fetch only ever asks for the attested seq, so the
-        // two newest files are all that is ever needed; older ones go.
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for ent in rd.flatten() {
-                let name = ent.file_name();
-                let Some(old) = name.to_str().and_then(|n| n.strip_prefix("manifest.")) else { continue };
-                if old.parse::<u64>().is_ok_and(|k| k + 1 < seq) {
-                    let _ = std::fs::remove_file(ent.path());
-                }
-            }
-        }
-        // The head is the ONE thing the log learns about a catalogue region.
-        // A replica publishes it through its route to the forest owner (item
-        // 8) and records the snapshot only once the owner has taken the head:
-        // a refused head is retried by the next pass, not remembered as done.
-        if self.replica {
-            match writer {
-                Some(w) => w.commit_region_head(region, seq, &hash)?,
-                None => {
-                    return Err(PvfsError::Forbidden {
-                        action: "publish region head".into(),
-                        reason: "a replica publishes through its owner, and no route was given".into(),
-                    })
-                }
-            }
-        }
-        self.conn
-            .execute(
-                "INSERT INTO region_snapshots (region_id, seq, manifest_hash, entries, published_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![region, seq as i64, hash, rows.len() as i64, now_ms() as i64],
-            )
-            .map_err(map_db("insert snapshot"))?;
-        if !self.replica {
-            self.commit_region_heads()?;
-        }
-        Ok(Some(seq))
+        Ok(SnapshotInputs {
+            rows,
+            last: last.unwrap_or((0, String::new())),
+            attested,
+            replica: self.replica,
+            data_dir: self.data_dir.clone(),
+        })
     }
 
     /// A catalogue region's published snapshots, oldest first.
@@ -2761,6 +2736,30 @@ impl Engine {
     /// file — tens of GB, for a rename. The watcher sees the move; its next
     /// pass publishes the head.
     pub fn rename_region_path(&self, region: &NodeId, from: &str, to: &str, expect: &RenameExpect) -> Result<RenamedHere> {
+        let plan = match self.rename_region_plan(region, from, to, expect)? {
+            RenameStart::Done(r) => return Ok(r),
+            RenameStart::Plan(plan) => plan,
+        };
+        let moved = rename_in_region(&plan, from, to, expect)?;
+        if matches!(moved, RenamedHere::Moved) {
+            // The rows follow the file NOW, not at the next pass: bytes are
+            // found by hash → row → path (`local_path_for_hash`, and `CatHash`
+            // for every other box), so a row left at the old path is a file
+            // nobody can open until a pass has run. Best-effort — the disk is
+            // the truth and the pass repairs a row this could not write (a
+            // read-only view, a busy database).
+            if let Err(e) = self.rows_follow_rename(region, from, to, plan.is_dir) {
+                eprintln!("pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+            }
+        }
+        Ok(moved)
+    }
+
+    /// PVOS D199 — a rename's checks and reads, and nothing on disk: the
+    /// daemon asks these of a read view, renames with no engine held
+    /// ([`rename_in_region`]), then writes the rows as one step of its
+    /// writer. `Done` is an answer already (not here, nothing to do).
+    pub fn rename_region_plan(&self, region: &NodeId, from: &str, to: &str, expect: &RenameExpect) -> Result<RenameStart> {
         Self::check_region_rel(from)?;
         Self::check_region_rel(to)?;
         let is_dir = matches!(expect, RenameExpect::Dir);
@@ -2783,82 +2782,19 @@ impl Engine {
             }
         }
         let Some(roots) = self.own_region_roots(region)? else {
-            return Ok(RenamedHere::NotHere);
+            return Ok(RenameStart::Done(RenamedHere::NotHere));
         };
         if from == to {
-            return Ok(RenamedHere::AlreadyDone);
+            return Ok(RenameStart::Done(RenamedHere::AlreadyDone));
         }
         let row = self.region_row(region, from)?;
-        for root in roots {
-            let (src, dst) = (root.join(from), root.join(to));
-            let Ok(m) = std::fs::symlink_metadata(&src) else {
-                let done = std::fs::symlink_metadata(&dst).is_ok_and(|d| match expect {
-                    RenameExpect::File { size, .. } => d.is_file() && d.len() == *size,
-                    RenameExpect::Dir => d.is_dir(),
-                });
-                if done {
-                    return Ok(RenamedHere::AlreadyDone);
-                }
-                continue;
-            };
-            match expect {
-                RenameExpect::File { hash, size } => {
-                    let known = match &row {
-                        Some((kind, _, h)) => kind == "file" && h.as_deref() == Some(hash.as_str()),
-                        None => crate::sync::sidecar_whole_hash(&src, m.len()).as_deref() == Some(hash.as_str()),
-                    };
-                    if !m.is_file() || m.len() != *size || !known {
-                        return Ok(RenamedHere::Changed);
-                    }
-                }
-                RenameExpect::Dir => {
-                    if !m.is_dir() {
-                        return Ok(RenamedHere::Changed);
-                    }
-                }
-            }
-            if std::fs::symlink_metadata(&dst).is_ok() {
-                return Ok(RenamedHere::InTheWay);
-            }
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create rename dir", e))?;
-            }
-            let sides = [
-                (crate::sync::manifest_sidecar_path(&src), crate::sync::manifest_sidecar_path(&dst)),
-                (crate::sync::legacy_manifest_sidecar_path(&src), crate::sync::legacy_manifest_sidecar_path(&dst)),
-            ];
-            std::fs::rename(&src, &dst).map_err(|e| PvfsError::io("rename in region", e))?;
-            if let RenameExpect::File { hash, .. } = expect {
-                let mut carried = false;
-                for (a, b) in sides {
-                    if a.is_file() && std::fs::symlink_metadata(&b).is_err() {
-                        carried |= std::fs::rename(&a, &b).is_ok();
-                    }
-                }
-                if !carried {
-                    // The catalogue vouched for this hash a moment ago (the
-                    // row, above) — what the backfill writes (D91).
-                    let _ = crate::sync::write_manifest_sidecar(&dst, Some(hash), &[]);
-                }
-            }
-            // The rows follow the file NOW, not at the next pass: bytes are
-            // found by hash → row → path (`local_path_for_hash`, and `CatHash`
-            // for every other box), so a row left at the old path is a file
-            // nobody can open until a pass has run. Best-effort — the disk is
-            // the truth and the pass repairs a row this could not write (a
-            // read-only view, a busy database).
-            if let Err(e) = self.rows_follow_rename(region, from, to, is_dir) {
-                eprintln!("pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
-            }
-            return Ok(RenamedHere::Moved);
-        }
-        Ok(RenamedHere::Gone)
+        Ok(RenameStart::Plan(RenamePlan { roots, row, is_dir }))
     }
 
     /// The catalogue rows of a rename just made on disk: the path itself, a
     /// folder's subtree with it, and a `dir` row for every folder the rename
     /// had to make on the way to `to`.
-    fn rows_follow_rename(&self, region: &NodeId, from: &str, to: &str, is_dir: bool) -> Result<()> {
+    pub fn rows_follow_rename(&self, region: &NodeId, from: &str, to: &str, is_dir: bool) -> Result<()> {
         crate::projection::retry_busy(|| {
             if is_dir {
                 self.conn
@@ -2903,54 +2839,36 @@ impl Engine {
     /// orphaned sidecar: those go to the region's trash — moved, as every
     /// removal here is — and then the folder goes.
     pub fn remove_region_dir(&self, region: &NodeId, rel_path: &str) -> Result<DirRemovedHere> {
-        Self::check_region_rel(rel_path)?;
-        let Some(roots) = self.own_region_roots(region)? else {
+        let Some(roots) = self.remove_region_dir_plan(region, rel_path)? else {
             return Ok(DirRemovedHere::NotHere);
         };
-        let mut removed = false;
-        for root in roots {
-            let dir = root.join(rel_path);
-            match std::fs::symlink_metadata(&dir) {
-                Err(_) => continue,
-                Ok(m) if !m.is_dir() => {
-                    return Err(PvfsError::BadInput {
-                        field: "rel_path".into(),
-                        reason: format!("{rel_path} is a file here; only a folder is removed"),
-                    })
-                }
-                Ok(_) => {}
-            }
-            let mut leftovers = Vec::new();
-            for ent in std::fs::read_dir(&dir).map_err(|e| PvfsError::io("read folder", e))? {
-                let ent = ent.map_err(|e| PvfsError::io("read folder", e))?;
-                let name = ent.file_name().to_string_lossy().into_owned();
-                let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
-                if !(crate::sync::is_own_name(&name, is_dir) || crate::sync::is_litter_name(&name)) {
-                    return Ok(DirRemovedHere::NotEmpty);
-                }
-                leftovers.push(ent.path());
-            }
-            for p in leftovers {
-                Self::trash_tree(&root, &p)?;
-            }
-            match std::fs::remove_dir(&dir) {
-                Ok(()) => {
-                    removed = true;
-                    // its row goes with it (best-effort, as a rename's rows)
-                    let _ = crate::projection::retry_busy(|| {
-                        self.conn
-                            .execute(
-                                "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2 AND kind = 'dir'",
-                                params![region, rel_path],
-                            )
-                            .map_err(map_db("row of a removed folder"))
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(DirRemovedHere::NotEmpty),
-                Err(e) => return Err(PvfsError::io("remove folder", e)),
-            }
+        let removed = remove_dir_in_region(&roots, rel_path)?;
+        if matches!(removed, DirRemovedHere::Removed) {
+            self.forget_region_dir(region, rel_path);
         }
-        Ok(if removed { DirRemovedHere::Removed } else { DirRemovedHere::Gone })
+        Ok(removed)
+    }
+
+    /// PVOS D199 — a folder removal's checks and reads: the roots this box
+    /// catalogues `region` from, `None` when it does not. The daemon asks
+    /// this of a read view, removes with no engine held
+    /// ([`remove_dir_in_region`]), then forgets the row as one step of its
+    /// writer.
+    pub fn remove_region_dir_plan(&self, region: &NodeId, rel_path: &str) -> Result<Option<Vec<std::path::PathBuf>>> {
+        Self::check_region_rel(rel_path)?;
+        self.own_region_roots(region)
+    }
+
+    /// A removed folder's row goes with it (best-effort, as a rename's rows).
+    pub fn forget_region_dir(&self, region: &NodeId, rel_path: &str) {
+        let _ = crate::projection::retry_busy(|| {
+            self.conn
+                .execute(
+                    "DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2 AND kind = 'dir'",
+                    params![region, rel_path],
+                )
+                .map_err(map_db("row of a removed folder"))
+        });
     }
 
     /// Every file under `path` into `root`'s trash, then the emptied folders.
@@ -3332,6 +3250,19 @@ impl Engine {
         cancel: &std::sync::atomic::AtomicBool,
         confirm: &mut dyn FnMut(&DrainCheck) -> bool,
     ) -> Result<ResolveReport> {
+        self.resolve_conflicts_from_view(dry_run, cancel, confirm)
+    }
+
+    /// PVOS D199 — [`Engine::resolve_conflicts`] on any engine, a read view
+    /// included: it reads rows and moves files, and writes no row (the watch
+    /// drops what it trashed), so the daemon's resolve job runs it on a view
+    /// of its own instead of an engine opened (and its log folded) per pass.
+    pub fn resolve_conflicts_from_view(
+        &self,
+        dry_run: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+        confirm: &mut dyn FnMut(&DrainCheck) -> bool,
+    ) -> Result<ResolveReport> {
         let mut report = ResolveReport::default();
         // The catalogue regions THIS box owns: a local binding on their root.
         let mut mine: HashMap<NodeId, PathBuf> = HashMap::new();
@@ -3593,45 +3524,29 @@ impl Engine {
         writer: &mut Option<&mut dyn ScanWriter>,
         settle_ms: u64,
     ) -> Result<ScanStats> {
-        let root = uri_to_path(&b.source_uri)?;
-        let st = LocalBackend.stat(&b.source_uri)?;
-        if !st.exists || !st.is_dir {
-            // Source missing (unmounted NAS?) — do NOT mass-remove; surface it.
-            return Err(PvfsError::NotFound {
-                kind: "bound directory",
-                id: b.source_uri.clone(),
-            });
-        }
-        // D81 4d — the path existing is not the volume being THERE. A volume
-        // that mounts empty, or whose mountpoint survives an unmount, passes
-        // the check above and then every tracked location under it stats as
-        // gone. The marker is what tells the difference (Chris's suggestion,
-        // and the same discriminator D74 gave central stores after the mover
-        // wrote 16MB to a VM's root filesystem believing it was the NAS).
-        crate::sync::verify_root_marker(&root)?;
-        let mut stats = ScanStats::default();
-
         // 1. pure-FS walk
-        let mut files = Vec::new();
-        let mut dirs = Vec::new();
-        let mut visited = HashSet::new();
-        let ctx = WalkCtx {
-            binding: b,
-            settle_ms,
-            orphans: std::cell::RefCell::new(Vec::new()),
-        };
-        walk_disk(&root, Vec::new(), &mut visited, &mut files, &mut dirs, &mut stats, &ctx)?;
-        // D149 — a sidecar whose file something else renamed or deleted. To
-        // the trash (PVFS never deletes; the region's retention does), once it
-        // has been alone longer than anything PVFS itself would leave it so.
-        // Before the catalogue branch, so every kind of binding does it.
-        stats.orphan_sidecars = trash_orphan_sidecars(&root, ctx.orphans.into_inner(), now_ms());
+        let (root, files, dirs, mut stats) = walk_binding(b, settle_ms)?;
 
         // D125 — a catalogue region's binding catalogues; it does not ingest.
         // Rows, not nodes: nothing below this point runs for it, and nothing
-        // it does reaches the log (doc 26 §4–§5).
+        // it does reaches the log (doc 26 §4–§5). PVOS D199: the pass is the
+        // daemon's stepped one, on this engine; its stop flag and seams go in
+        // and come back.
         if self.is_catalogue_region(&b.folder_id)? {
-            return self.scan_region_catalogue(b, &root, &files, &dirs, stats, writer);
+            let mut ctx = CatalogueCtx {
+                cancel: self.cancel.clone(),
+                batch: self.catalogue_batch,
+                interrupt: self.catalogue_interrupt.take(),
+                read_hook: self.catalogue_read_hook.take(),
+            };
+            let r = catalogue_region_pass(&crate::writer::OwnDb::new(self), &mut ctx, b, &root, &files, &dirs, stats, writer);
+            // D156 — the hook stays until replaced; D154 — the seam's stop
+            // stays raised, as it did on the engine.
+            self.catalogue_read_hook = ctx.read_hook.take();
+            if ctx.cancel.is_some() {
+                self.cancel = ctx.cancel;
+            }
+            return r;
         }
 
         // 2. mirror folders + ingest files
@@ -5113,29 +5028,7 @@ impl Engine {
         size: u64,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
-        if let Some(known) = crate::sync::sidecar_hashes(path, size) {
-            eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
-            return Ok(Some(known));
-        }
-        if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
-            // Whole hash only still saves the whole read, which is the cost.
-            eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
-            return Ok(Some((w, Vec::new())));
-        }
-        // D150 — the file as it was BEFORE the read: the manifest records this
-        // (size, mtime), and nothing is written if the file moved meanwhile.
-        let seen = std::fs::metadata(path)
-            .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
-            .ok();
-        let Some((content_hash, chunks)) = crate::sync::hash_with_manifest_until(path, cancel)? else {
-            return Ok(None);
-        };
-        // Leave the note for the next forest. Best-effort: a read-only store
-        // still indexes, it just cannot record.
-        if let (false, Some(seen)) = (chunks.is_empty(), seen) {
-            let _ = crate::sync::write_manifest_sidecar_seen(path, Some(&content_hash), &chunks, seen);
-        }
-        Ok(Some((content_hash, chunks)))
+        hash_reusing_sidecar_until(path, size, cancel)
     }
 
     fn fill_hash_if_needed(
@@ -6063,6 +5956,453 @@ enum ReadFault {
     /// dead mount, no file descriptors left): the pass fails, as before.
     Pass,
 }
+
+/// PVOS D199 — what a rename through the view read before touching the disk
+/// ([`Engine::rename_region_plan`]).
+pub struct RenamePlan {
+    roots: Vec<std::path::PathBuf>,
+    row: Option<(String, u64, Option<String>)>,
+    is_dir: bool,
+}
+
+/// A rename's first answer: already `Done`, or a `Plan` for the disk.
+pub enum RenameStart {
+    Done(RenamedHere),
+    Plan(RenamePlan),
+}
+
+impl RenamePlan {
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+/// D170 — a rename that came through the view, on this box's own disk: one
+/// `rename(2)`, a folder's subtree with it, only when what is there is what
+/// the caller saw (see [`Engine::rename_region_path`]); a file's sidecars
+/// move with it, and one is written if it had none. The rows are the
+/// caller's (`Engine::rows_follow_rename`). PVOS D199: no engine is held
+/// while the disk works.
+pub fn rename_in_region(plan: &RenamePlan, from: &str, to: &str, expect: &RenameExpect) -> Result<RenamedHere> {
+    for root in &plan.roots {
+        let (src, dst) = (root.join(from), root.join(to));
+        let Ok(m) = std::fs::symlink_metadata(&src) else {
+            let done = std::fs::symlink_metadata(&dst).is_ok_and(|d| match expect {
+                RenameExpect::File { size, .. } => d.is_file() && d.len() == *size,
+                RenameExpect::Dir => d.is_dir(),
+            });
+            if done {
+                return Ok(RenamedHere::AlreadyDone);
+            }
+            continue;
+        };
+        match expect {
+            RenameExpect::File { hash, size } => {
+                let known = match &plan.row {
+                    Some((kind, _, h)) => kind == "file" && h.as_deref() == Some(hash.as_str()),
+                    None => crate::sync::sidecar_whole_hash(&src, m.len()).as_deref() == Some(hash.as_str()),
+                };
+                if !m.is_file() || m.len() != *size || !known {
+                    return Ok(RenamedHere::Changed);
+                }
+            }
+            RenameExpect::Dir => {
+                if !m.is_dir() {
+                    return Ok(RenamedHere::Changed);
+                }
+            }
+        }
+        if std::fs::symlink_metadata(&dst).is_ok() {
+            return Ok(RenamedHere::InTheWay);
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create rename dir", e))?;
+        }
+        let sides = [
+            (crate::sync::manifest_sidecar_path(&src), crate::sync::manifest_sidecar_path(&dst)),
+            (crate::sync::legacy_manifest_sidecar_path(&src), crate::sync::legacy_manifest_sidecar_path(&dst)),
+        ];
+        std::fs::rename(&src, &dst).map_err(|e| PvfsError::io("rename in region", e))?;
+        if let RenameExpect::File { hash, .. } = expect {
+            let mut carried = false;
+            for (a, b) in sides {
+                if a.is_file() && std::fs::symlink_metadata(&b).is_err() {
+                    carried |= std::fs::rename(&a, &b).is_ok();
+                }
+            }
+            if !carried {
+                // The catalogue vouched for this hash a moment ago (the
+                // row, above) — what the backfill writes (D91).
+                let _ = crate::sync::write_manifest_sidecar(&dst, Some(hash), &[]);
+            }
+        }
+        return Ok(RenamedHere::Moved);
+    }
+    Ok(RenamedHere::Gone)
+}
+
+/// D170 — an `rmdir` that came through the view, on this box's own disk
+/// (see [`Engine::remove_region_dir`]): the folder, when it holds nothing
+/// of the operator's; PVFS's own names and litter go to the trash first.
+/// PVOS D199: no engine is held while the disk works; the row is the
+/// caller's (`Engine::forget_region_dir`).
+pub fn remove_dir_in_region(roots: &[std::path::PathBuf], rel_path: &str) -> Result<DirRemovedHere> {
+    let mut removed = false;
+    for root in roots {
+        let root = root.as_path();
+        let dir = root.join(rel_path);
+        match std::fs::symlink_metadata(&dir) {
+            Err(_) => continue,
+            Ok(m) if !m.is_dir() => {
+                return Err(PvfsError::BadInput {
+                    field: "rel_path".into(),
+                    reason: format!("{rel_path} is a file here; only a folder is removed"),
+                })
+            }
+            Ok(_) => {}
+        }
+        let mut leftovers = Vec::new();
+        for ent in std::fs::read_dir(&dir).map_err(|e| PvfsError::io("read folder", e))? {
+            let ent = ent.map_err(|e| PvfsError::io("read folder", e))?;
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
+            if !(crate::sync::is_own_name(&name, is_dir) || crate::sync::is_litter_name(&name)) {
+                return Ok(DirRemovedHere::NotEmpty);
+            }
+            leftovers.push(ent.path());
+        }
+        for p in leftovers {
+            Engine::trash_tree(root, &p)?;
+        }
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(DirRemovedHere::NotEmpty),
+            Err(e) => return Err(PvfsError::io("remove folder", e)),
+        }
+    }
+    Ok(if removed { DirRemovedHere::Removed } else { DirRemovedHere::Gone })
+}
+
+/// PVOS D199 — the most rows one step of an install writes. A box's first
+/// install of a big catalogue (30,000–55,000 rows, all additions) is many
+/// short steps instead of one hold of seconds; a served write waits for one
+/// of them at most.
+const INSTALL_STEP: usize = 500;
+
+/// D129 (doc 26 §8), D194, D199 — install a fetched catalogue snapshot as
+/// this box's rows for `region` (see [`Engine::install_region_snapshot`]),
+/// through `db`: the refusals, the hash and the parse, then the delta
+/// against the rows held — read where reads go, with no lock — then the
+/// writes in steps of at most `INSTALL_STEP` rows: **the upserts first, the
+/// removals after, `region_fetched` last**. A region only gains paths until
+/// its removals, so a view never loses a file that is there before and
+/// after; it counts as stale until `region_fetched` moves; and a crash
+/// leaves rows the next install completes, since its delta is computed from
+/// what is held. The brief's "a side table, then one short swap" cannot be
+/// short in SQLite: the swap is the same inserts into the table and its
+/// three indexes. `between` runs after the read and before the first write
+/// (D194's test seam).
+pub fn install_region_snapshot_db<D: crate::writer::Db>(
+    db: &D,
+    region: &NodeId,
+    seq: u64,
+    bytes: &[u8],
+    source: &str,
+    between: impl FnOnce(),
+) -> Result<SnapshotInstall> {
+    let expected = db.read(|e| e.install_expected(region, seq))?;
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    if hash != expected {
+        return Err(bad("catalogue", "manifest hash does not match the attested head"));
+    }
+    let (named, named_seq, rows) = Engine::parse_region_manifest(bytes)?;
+    if &named != region || named_seq != seq {
+        return Err(bad("catalogue", "manifest names another region or seq"));
+    }
+    // D194 — each path once: the delta goes by path, and the region's key
+    // could not hold a second row for one anyway.
+    let mut paths: HashSet<&str> = HashSet::with_capacity(rows.len());
+    if let Some(twice) = rows.iter().find(|r| !paths.insert(r.rel_path.as_str())) {
+        return Err(bad("catalogue", &format!("the manifest lists {} twice", twice.rel_path)));
+    }
+    // What to write comes from the rows held, and the writer's version as of
+    // that read: another process's commit after it is put right by the last
+    // step. (In the daemon every other write of this process is the writer's
+    // own, and the only writer of a fetched region's rows is this install.)
+    let version = db.write("install: version", |e| e.data_version())?;
+    let held = db.read(|e| held_region_rows(&e.conn, region))?;
+    let delta = SnapshotDelta::of(held, &rows);
+    between();
+    let now = now_ms() as i64;
+    let what = format!("install {}", short_id(region));
+    let put: Vec<&RegionEntry> = delta.added.iter().chain(&delta.changed).copied().collect();
+    for chunk in put.chunks(INSTALL_STEP) {
+        db.write(&what, |e| e.install_rows(region, chunk, &[], now))?;
+    }
+    for chunk in delta.removed.chunks(INSTALL_STEP) {
+        db.write(&what, |e| e.install_rows(region, &[], chunk, now))?;
+    }
+    let (a, c, r) = db.write(&what, |e| e.install_finish(region, seq, &hash, &rows, version, source, now))?;
+    Ok(SnapshotInstall {
+        rows: rows.len(),
+        added: delta.added.len() + a,
+        changed: delta.changed.len() + c,
+        removed: delta.removed.len() + r,
+    })
+}
+
+/// The deletes and upserts of an install, in the caller's transaction.
+fn write_install_rows(
+    tx: &rusqlite::Transaction<'_>,
+    region: &NodeId,
+    put: &[&RegionEntry],
+    removed: &[String],
+    now: i64,
+) -> Result<()> {
+    let mut del = tx
+        .prepare_cached("DELETE FROM region_entries WHERE region_id = ?1 AND rel_path = ?2")
+        .map_err(map_db("install snapshot: prepare"))?;
+    for rel in removed {
+        del.execute(params![region, rel])
+            .map_err(map_db("install snapshot: remove"))?;
+    }
+    // D141 — one prepared statement for every row written.
+    let mut upsert = tx
+        .prepare_cached(
+            "INSERT INTO region_entries
+               (region_id, rel_path, kind, size_bytes, mtime_ms, changed_ms,
+                content_hash, quality, seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(region_id, rel_path) DO UPDATE SET
+               kind = excluded.kind, size_bytes = excluded.size_bytes,
+               mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
+               content_hash = excluded.content_hash, quality = excluded.quality,
+               seen_at = excluded.seen_at",
+        )
+        .map_err(map_db("install snapshot: prepare"))?;
+    for r in put {
+        upsert
+            .execute(params![
+                region,
+                r.rel_path,
+                r.kind,
+                r.size_bytes as i64,
+                r.mtime_ms as i64,
+                r.changed_ms as i64,
+                r.content_hash,
+                r.quality,
+                now
+            ])
+            .map_err(map_db("install snapshot: row"))?;
+    }
+    Ok(())
+}
+
+/// D199 — what [`publish_region_snapshot_db`] reads, in one read.
+struct SnapshotInputs {
+    rows: Vec<RegionEntry>,
+    last: (i64, String),
+    attested: (i64, String),
+    replica: bool,
+    data_dir: PathBuf,
+}
+
+/// D125 item 4 — publish the region's catalogue as a new snapshot when it
+/// differs from the last one: the manifest file at
+/// `regions/<id>/manifest.<seq>`, a `region_snapshots` row, and — on the
+/// owner — the `SubRegionHead` that attests it (milestone §3.4). The change
+/// test re-serialises the rows at the LAST seq, so an unchanged catalogue
+/// re-hashes to the last hash and publishes nothing. Returns the new seq,
+/// or `None` when nothing changed.
+///
+/// PVOS D199 — the rows are read where reads go, the manifest is built and
+/// written and a replica's head is sent to the owner with no lock held; the
+/// snapshot row (and an owner's head commit) is the one write step.
+pub(crate) fn publish_region_snapshot_db<D: crate::writer::Db>(
+    db: &D,
+    region: &NodeId,
+    writer: &mut Option<&mut dyn ScanWriter>,
+) -> Result<Option<u64>> {
+    let SnapshotInputs { rows, last: (last_seq, last_hash), attested, replica, data_dir } =
+        db.read(|e| e.snapshot_inputs(region))?;
+    // D173 — the head the LOG attests is the floor. This box's own record
+    // of what it published (`region_snapshots`) is derived state: a
+    // projection replay wiped it on the NAS (2026-09-17, 9:40 PM EDT), the
+    // next publish counted from 1 again, and the owner refused every head
+    // after that ("head seq 1 does not advance … (at 6)"). With the record
+    // gone, the attested head's hash says whether anything changed.
+    if last_seq > 0 {
+        let again = Engine::region_manifest_bytes(region, last_seq as u64, &rows);
+        // PVOS D183 — unchanged is nothing to publish, unless the log's head
+        // at that very seq names another manifest: a head committed whose
+        // answer was lost, then published again here while the owner was
+        // away. Peers install only what the log attests, so publish past it
+        // rather than leave them stale until the next change.
+        let superseded = attested.0 == last_seq && attested.1 != last_hash;
+        if blake3::hash(&again).to_hex().as_str() == last_hash && !superseded {
+            return Ok(None);
+        }
+    }
+    if last_seq == 0 && attested.0 > 0 {
+        let again = Engine::region_manifest_bytes(region, attested.0 as u64, &rows);
+        if blake3::hash(&again).to_hex().as_str() == attested.1 {
+            return Ok(None);
+        }
+    }
+    let seq = last_seq.max(attested.0) as u64 + 1;
+    let bytes = Engine::region_manifest_bytes(region, seq, &rows);
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let dir = data_dir.join("regions").join(region);
+    crate::storage::atomic_overwrite(&dir.join(format!("manifest.{seq}")), &bytes)?;
+    // D129 hygiene: a fetch only ever asks for the attested seq, so the two
+    // newest files are all that is ever needed; older ones go.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let Some(old) = name.to_str().and_then(|n| n.strip_prefix("manifest.")) else { continue };
+            if old.parse::<u64>().is_ok_and(|k| k + 1 < seq) {
+                let _ = std::fs::remove_file(ent.path());
+            }
+        }
+    }
+    // The head is the ONE thing the log learns about a catalogue region. A
+    // replica publishes it through its route to the forest owner (item 8)
+    // and records the snapshot only once the owner has taken the head: a
+    // refused head is retried by the next pass, not remembered as done.
+    if replica {
+        match writer {
+            Some(w) => w.commit_region_head(region, seq, &hash)?,
+            None => {
+                return Err(PvfsError::Forbidden {
+                    action: "publish region head".into(),
+                    reason: "a replica publishes through its owner, and no route was given".into(),
+                })
+            }
+        }
+    }
+    db.write(&format!("snapshot {}", short_id(region)), |e| e.record_snapshot(region, seq, &hash, rows.len()))?;
+    Ok(Some(seq))
+}
+
+/// A binding's walk (no database): the root checked (present, and the
+/// volume there — D81 4d's marker), every file and folder under it, and
+/// D149's orphaned sidecars moved to the trash. What every kind of binding
+/// does first; the daemon's stepped watch (D199) does it with no lock held.
+/// A walked binding: its root, the files and folders under it, and the
+/// walk's counts.
+type Walked = (PathBuf, Vec<DiskFile>, Vec<Vec<String>>, ScanStats);
+
+fn walk_binding(b: &Binding, settle_ms: u64) -> Result<Walked> {
+    let root = uri_to_path(&b.source_uri)?;
+    let st = LocalBackend.stat(&b.source_uri)?;
+    if !st.exists || !st.is_dir {
+        // Source missing (unmounted NAS?) — do NOT mass-remove; surface it.
+        return Err(PvfsError::NotFound {
+            kind: "bound directory",
+            id: b.source_uri.clone(),
+        });
+    }
+    // D81 4d — the path existing is not the volume being THERE. A volume
+    // that mounts empty, or whose mountpoint survives an unmount, passes the
+    // check above and then every tracked location under it stats as gone.
+    // The marker is what tells the difference (Chris's suggestion, and the
+    // same discriminator D74 gave central stores after the mover wrote 16MB
+    // to a VM's root filesystem believing it was the NAS).
+    crate::sync::verify_root_marker(&root)?;
+    let mut stats = ScanStats::default();
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    let mut visited = HashSet::new();
+    let ctx = WalkCtx {
+        binding: b,
+        settle_ms,
+        orphans: std::cell::RefCell::new(Vec::new()),
+    };
+    walk_disk(&root, Vec::new(), &mut visited, &mut files, &mut dirs, &mut stats, &ctx)?;
+    // D149 — a sidecar whose file something else renamed or deleted. To the
+    // trash (PVFS never deletes; the region's retention does), once it has
+    // been alone longer than anything PVFS itself would leave it so.
+    stats.orphan_sidecars = trash_orphan_sidecars(&root, ctx.orphans.into_inner(), now_ms());
+    Ok((root, files, dirs, stats))
+}
+
+/// PVOS D199 — one watch pass over this box's bindings, every one a
+/// catalogue region, through `db`: each walked, read and hashed with no lock
+/// held, its rows written in steps (`catalogue_region_pass`). The daemon's
+/// watch runs this on its one writer; a box with a node-model binding scans
+/// with an engine of its own (`Engine::scan_routed`), as before D199.
+pub fn scan_catalogues<D: crate::writer::Db>(
+    db: &D,
+    ctx: &mut CatalogueCtx,
+    mut writer: Option<&mut dyn ScanWriter>,
+    settle_ms: u64,
+) -> Result<Vec<ScanReport>> {
+    let (bindings, replica) = db.read(|e| Ok((e.local_bindings()?, e.is_replica())))?;
+    if replica && writer.is_none() {
+        return Err(PvfsError::Forbidden {
+            action: "scan".into(),
+            reason: "a replica has no local writer, so its scan must be routed to the owner".into(),
+        });
+    }
+    let mut reports = Vec::new();
+    for b in bindings {
+        if !db.read(|e| e.is_catalogue_region(&b.folder_id))? {
+            return Err(bad(
+                "watch",
+                &format!(
+                    "{} is bound as a folder (the node model), which a stepped pass does not scan; \
+                     the watch scans it with an engine of its own",
+                    b.source_uri
+                ),
+            ));
+        }
+        let (root, files, dirs, stats) = walk_binding(&b, settle_ms)?;
+        let stats = catalogue_region_pass(db, ctx, &b, &root, &files, &dirs, stats, &mut writer)?;
+        let stopped = stats.cancelled;
+        reports.push(ScanReport { folder_id: b.folder_id.clone(), stats });
+        // A folder with several roots (D81) must not carry on after a stop.
+        if stopped {
+            break;
+        }
+    }
+    Ok(reports)
+}
+
+/// As [`Engine::hash_reusing_sidecar`], but a read of the bytes is abandoned
+/// when `cancel` is set, returning `None` and writing no sidecar: D86's
+/// `hash_with_manifest_until`, for the catalogue pass (D154). A sidecar is
+/// still taken whatever the flag says; it costs nothing. PVOS D199: no engine
+/// — a pass hashes with no lock held.
+fn hash_reusing_sidecar_until(
+    path: &std::path::Path,
+    size: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<(String, Vec<[u8; 32]>)>> {
+    if let Some(known) = crate::sync::sidecar_hashes(path, size) {
+        eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
+        return Ok(Some(known));
+    }
+    if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
+        // Whole hash only still saves the whole read, which is the cost.
+        eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
+        return Ok(Some((w, Vec::new())));
+    }
+    // D150 — the file as it was BEFORE the read: the manifest records this
+    // (size, mtime), and nothing is written if the file moved meanwhile.
+    let seen = std::fs::metadata(path)
+        .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
+        .ok();
+    let Some((content_hash, chunks)) = crate::sync::hash_with_manifest_until(path, cancel)? else {
+        return Ok(None);
+    };
+    // Leave the note for the next forest. Best-effort: a read-only store
+    // still indexes, it just cannot record.
+    if let (false, Some(seen)) = (chunks.is_empty(), seen) {
+        let _ = crate::sync::write_manifest_sidecar_seen(path, Some(&content_hash), &chunks, seen);
+    }
+    Ok(Some((content_hash, chunks)))
+}
+
 
 /// D156 — classify a scan's read of a file by what its error says about the
 /// file. The catalogue pass's read (D156), and since D158 the log pass's hash

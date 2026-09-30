@@ -5,6 +5,51 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **One writer per daemon: jobs share the daemon's engine (PVOS D199).**
+  A pvfsd process now writes `index.db` through ONE connection
+  (`pvfs_core::Writer`). Serving and every region-model job take its lock
+  for one database step at a time and hold it for nothing else: disk
+  walks, hashing, network fetches and file moves run with no lock. The
+  daemon's own threads no longer meet as "SQLite is busy/locked" or as
+  "another pvfs process folding this forest".
+  - **The jobs.** `watch` (`watch::run_shared`, `fs::scan_catalogues`): the
+    walk, the rows read once at the pass's start, the hashing and the
+    manifest outside the writer; each batch (≤1,000 rows), each sweep chunk
+    and the snapshot row a step. `catalogue` (`catalogue::fetch_pass_db`):
+    claims a step each; an install (`fs::install_region_snapshot_db`)
+    computes its delta off the writer and writes it in steps of ≤500 rows —
+    the upserts first, the removals after, `region_fetched` last — so a
+    first install of 55,000 rows is ~110 short steps, not one hold of
+    seconds; another process's commit meanwhile is put right in the last
+    step (D194's rule). `follow` (`follow::run_shared`): an ingest step
+    and a fold step per batch (`Engine::ingest_log_rows`,
+    `Engine::catch_up`; the fold lock is tried, not waited for). `receive`,
+    `resolve` and `reclaim` read through a view and write only files. A
+    replica's catch-up after routed writes: `advertise::catch_up_db`. None
+    opens an engine, so none folds the log to open one. The node-model jobs
+    (sync, export, tier, evict) and a node-model binding's scan keep their
+    own engines; no fleet box runs them.
+  - **Skip unchanged rows.** A catalogue pass writes a row only when its
+    kind, size, mtime, changed time or hash differ from the row held
+    (folders too). A quiet pass over a 29,500-row region wrote every row;
+    now it writes none.
+  - **Serving goes first.** A job about to take the writer lets a waiting
+    served op go first, so a served write waits for the one step in
+    progress at most. A rename or folder removal through the view does its
+    disk work outside the writer (in order, among themselves) and its rows
+    in one step; the ingest publish-retry hashes before it takes the writer.
+  - **A replica's read pool.** `Engine::open_read_view` works on a replica
+    (it needed the forest's device key, which a replica does not have), so
+    feederbox's and the NAS's daemons have a read pool for the first time:
+    `serve status`, listings and manifests stop waiting on the writer.
+  - **Said in the journal.** A hold of the writer over 1 s: `pvfsd: the
+    writer was held 2.4 s by catalogue: install c020473f`; a wait over 1 s,
+    with who held it; hourly: `pvfsd: the writer, last hour: N hold(s), …
+    in all (longest … by …); …; engine opens N, read views N, folds N (N
+    events)`. A step that panics no longer takes the writer with it.
+
+  No wire, schema or protocol change.
+
 - **The CLI never waits on a question nobody can see, and `forest promote`
   signs for the forest it names (PVOS D198).**
   - **One rule for asking**: only when not `--json` and stdin **and** stderr

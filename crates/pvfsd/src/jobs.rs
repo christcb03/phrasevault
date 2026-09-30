@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pvfs_client::follow::{self, FollowEvent};
 use pvfs_client::watch::{self, WatchEvent};
-use pvfs_core::{serve, PvfsError};
+use pvfs_core::{serve, PvfsError, Writer};
 use pvfs_proto::ServeJobWire;
 
 /// How often the supervisor wakes to notice shutdown/reload and reconcile.
@@ -71,6 +71,95 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// PVOS D199 — how often the runner says what the writer did.
+const WRITER_REPORT_EVERY: Duration = Duration::from_secs(3600);
+
+/// PVOS D199 — where the runner's jobs write: the daemon's one writer, or —
+/// a runner with no daemon, as tests drive it — one engine the runner opens
+/// itself (at the first pass that needs it) and shares the same way. Either
+/// way, no job opens an engine of its own (the node-model jobs aside).
+pub struct Writers {
+    daemon: Option<Arc<Writer>>,
+    own: Mutex<Option<Arc<Writer>>>,
+    data_dir: PathBuf,
+}
+
+impl Writers {
+    fn new(data_dir: PathBuf, daemon: Option<Arc<Writer>>) -> Writers {
+        Writers { daemon, own: Mutex::new(None), data_dir }
+    }
+
+    /// The writer the jobs share.
+    fn get(&self) -> Result<Arc<Writer>, PvfsError> {
+        if let Some(w) = &self.daemon {
+            return Ok(Arc::clone(w));
+        }
+        let mut own = self.own.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = own.as_ref() {
+            return Ok(Arc::clone(w));
+        }
+        let w = Arc::new(Writer::new(pvfs_core::Engine::open(&self.data_dir)?));
+        *own = Some(Arc::clone(&w));
+        Ok(w)
+    }
+
+    /// The writer, if one is open already (the hourly figure; no open).
+    fn current(&self) -> Option<Arc<Writer>> {
+        self.daemon
+            .clone()
+            .or_else(|| self.own.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
+    /// A runner's own engine is closed when the runner ends (its jobs are
+    /// joined by then); the daemon's is the daemon's.
+    fn close(&self) {
+        if let Some(w) = self.own.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            match Writer::into_engine(w) {
+                Ok(engine) => {
+                    if let Err(e) = engine.close() {
+                        eprintln!("pvfsd: the runner's engine did not close cleanly: {e}");
+                    }
+                }
+                Err(_) => eprintln!("pvfsd: the runner's engine is still shared at stop; left open"),
+            }
+        }
+    }
+}
+
+/// PVOS D199 — the hourly line: what the writer did, and the process's
+/// engine opens, read views and folds since the last line (`last`).
+fn writer_report(w: &Writer, last: &mut (u64, u64, u64, u64)) -> String {
+    let st = w.take_stats();
+    let now = pvfs_core::writer::COUNTERS.read();
+    let d = (now.0 - last.0, now.1 - last.1, now.2 - last.2, now.3 - last.3);
+    *last = now;
+    let longest = if st.steps == 0 {
+        String::new()
+    } else {
+        format!(" (longest {} by {})", pvfs_core::writer::secs(st.longest), st.longest_by)
+    };
+    let waits = if st.slow_waits == 0 {
+        String::from("no wait over 100 ms")
+    } else {
+        format!(
+            "{} wait(s) over 100 ms (longest {} by {})",
+            st.slow_waits,
+            pvfs_core::writer::secs(st.longest_wait),
+            st.longest_wait_by
+        )
+    };
+    format!(
+        "pvfsd: the writer, last hour: {} hold(s), {} in all{longest}; {waits}; engine opens {}, \
+         read views {}, folds {} ({} events)",
+        st.steps,
+        pvfs_core::writer::secs(st.held),
+        d.0,
+        d.1,
+        d.2,
+        d.3
+    )
 }
 
 /// The supervisor's shared state: one row per known job, snapshotted for
@@ -530,21 +619,29 @@ fn job_thread<F: FnOnce() + Send + 'static>(job: &str, f: F) -> std::thread::Joi
         .expect("failed to spawn a job thread")
 }
 
-fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
+fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Managed {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = match name {
         "follow" => {
             let st = Arc::clone(state);
             let flag = Arc::clone(&stop);
+            let w = Arc::clone(writers);
             job_thread(name, move || {
                 st.set_state("follow", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
-                let r = follow::run(&data_dir, FOLLOW_POLL_MS, &flag, |ev| {
+                let on_event = |ev: FollowEvent<'_>| {
                     for line in follow_event(&cb, ev) {
                         eprintln!("{line}");
                     }
-                });
+                };
+                // PVOS D199 — through the daemon's one writer. A runner with
+                // no daemon that cannot open an engine yet (a replica not yet
+                // seeded) follows as the CLI does, until its next start.
+                let r = match w.get() {
+                    Ok(writer) => follow::run_shared(writer, FOLLOW_POLL_MS, &flag, on_event),
+                    Err(_) => follow::run(&data_dir, FOLLOW_POLL_MS, &flag, on_event),
+                };
                 if let Some(line) = job_exited(&st, "follow", r) {
                     eprintln!("{line}");
                 }
@@ -553,22 +650,26 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>) -> Managed {
         "watch" => {
             let st = Arc::clone(state);
             let flag = Arc::clone(&stop);
+            let w = Arc::clone(writers);
             job_thread(name, move || {
                 st.set_state("watch", "running");
-                let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
-                let r = watch::run(
-                    &data_dir,
-                    WATCH_RECONCILE.as_secs(),
-                    WATCH_DEBOUNCE.as_millis() as u64,
-                    WATCH_CEILING.as_millis() as u64,
-                    &flag,
-                    |ev| {
-                        for line in watch_event(&cb, ev) {
-                            eprintln!("{line}");
-                        }
-                    },
-                );
+                // PVOS D199 — on the daemon's one writer (`run_shared` hands a
+                // box that binds node-model folders to an engine of its own).
+                let r = w.get().and_then(|writer| {
+                    watch::run_shared(
+                        writer,
+                        WATCH_RECONCILE.as_secs(),
+                        WATCH_DEBOUNCE.as_millis() as u64,
+                        WATCH_CEILING.as_millis() as u64,
+                        &flag,
+                        |ev| {
+                            for line in watch_event(&cb, ev) {
+                                eprintln!("{line}");
+                            }
+                        },
+                    )
+                });
                 if let Some(line) = job_exited(&st, "watch", r) {
                     eprintln!("{line}");
                 }
@@ -826,7 +927,7 @@ fn export_pass(state: &JobsState, cancel: Arc<AtomicBool>) -> Result<u64, PvfsEr
     Ok(exported)
 }
 
-fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
+fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Managed {
     // This flag used to be bookkeeping only — "passes are short" — and no pass
     // ever received it. That held for sync/evict/reclaim and was badly wrong
     // for `tier`, which moves hundreds of GB across a WAN. On 2026-08-24 a
@@ -838,6 +939,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
     // D123 — every pass gets the flag; the runner sets it when the job is
     // disabled mid-pass (and at shutdown, as before).
     let cancel = Arc::clone(&stop);
+    let w = Arc::clone(writers);
     let handle = match name {
         "sync" => job_thread(name, move || {
             st.set_state("sync", "running");
@@ -996,7 +1098,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         }),
         "catalogue" => job_thread(name, move || {
             st.set_state("catalogue", "running");
-            let r = pvfs_client::catalogue::fetch_pass(st.data_dir(), &cancel);
+            // PVOS D199 — on the daemon's one writer, reading through a view
+            // of its own: no engine opened (and no log folded) every minute.
+            let r = w
+                .get()
+                .and_then(|writer| pvfs_core::SharedDb::new(writer, "catalogue"))
+                .and_then(|db| pvfs_client::catalogue::fetch_pass_db(&db, &cancel, None));
             match r {
                 Ok(rep) => {
                     // PVOS D183 — a head taken from the region's own box
@@ -1026,8 +1133,18 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         }),
         "receive" => job_thread(name, move || {
             st.set_state("receive", "running");
-            let r = pvfs_client::receive::receive_pass(
-                st.data_dir(),
+            // PVOS D199 — a receive writes files, not rows (the watch
+            // catalogues what it places): a read view is all it needs. It
+            // used to open two engines a pass, each folding the log.
+            let view = match w.get().and_then(|writer| writer.read_view()) {
+                Ok(v) => v,
+                Err(e) => {
+                    st.pass_failed("receive", e.to_string());
+                    return;
+                }
+            };
+            let r = pvfs_client::receive::receive_pass_on(
+                &view,
                 &pvfs_core::media::Rules::default(),
                 false,
                 pvfs_client::receive::MIN_FREE_BYTES,
@@ -1036,15 +1153,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
             // D148 — then the library copies this box's receive replaced (its
             // regions' trash) are purged by each region's retention: D133
             // purged only draining regions, so they piled up on the holder.
-            match pvfs_core::Engine::open(st.data_dir()).and_then(|e| {
-                let t = {
-                    // D176 — never beside the runner's trash step
-                    let _one = st.one_purge();
-                    e.purge_region_trash()
-                };
-                e.close()?;
-                t
-            }) {
+            let purged = {
+                // D176 — never beside the runner's trash step
+                let _one = st.one_purge();
+                view.purge_region_trash()
+            };
+            match purged {
                 Ok(t) => {
                     let n: u64 = t.iter().map(|x| x.purge.removed).sum();
                     if n > 0 {
@@ -1078,21 +1192,22 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         "resolve" => job_thread(name, move || {
             st.set_state("resolve", "running");
             let r = (|| -> Result<(pvfs_core::ResolveReport, u64), PvfsError> {
-                let mut engine = pvfs_core::Engine::open(st.data_dir())?;
+                // PVOS D199 — resolve moves files, not rows (the watch drops
+                // what it trashed): a read view, no engine of its own.
+                let view = w.get()?.read_view()?;
                 // D145 — the holder confirms the bytes before a staging copy goes.
-                let sources = pvfs_client::receive::announced_sources(&engine);
+                let sources = pvfs_client::receive::announced_sources(&view);
                 let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
-                let r = engine.resolve_conflicts(false, &cancel, &mut confirm)?;
+                let r = view.resolve_conflicts_from_view(false, &cancel, &mut confirm)?;
                 // D133 — then free what retention allows; D148 — every local
                 // region's trash, and what each keeps is recorded for status;
                 // D176 — never beside the runner's trash step.
                 let trash = {
                     let _one = st.one_purge();
-                    engine.purge_region_trash()?
+                    view.purge_region_trash()?
                 };
                 let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
                 st.record_trash(&trash);
-                engine.close()?;
                 Ok((r, purged))
             })();
             match r {
@@ -1123,10 +1238,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>) -> Managed {
         "reclaim" => job_thread(name, move || {
             st.set_state("reclaim", "running");
             let r = (|| -> Result<pvfs_core::sync::TrashPurge, PvfsError> {
-                let engine = pvfs_core::Engine::open(st.data_dir())?;
-                let r = pvfs_core::sync::reclaim_pass(&engine, st.data_dir(), &cancel);
-                engine.close()?;
-                r
+                // PVOS D199 — reads and file moves: a read view.
+                let view = w.get()?.read_view()?;
+                pvfs_core::sync::reclaim_pass(&view, st.data_dir(), &cancel)
             })();
             match r {
                 Ok(_) => {
@@ -1459,8 +1573,22 @@ pub fn run(
     let trash_every = trash_every();
     let mut trash_at = Instant::now();
     let mut trashing: Option<Managed> = None;
+    // PVOS D199 — every job's writes go through one writer: the daemon's, or
+    // one the runner opens itself when it has no daemon (tests).
+    let writers = Arc::new(Writers::new(
+        state.data_dir().clone(),
+        daemon.as_ref().map(|d| Arc::clone(d.writer())),
+    ));
+    let mut report_at = Instant::now() + WRITER_REPORT_EVERY;
+    let mut counted = pvfs_core::writer::COUNTERS.read();
 
     while !shutdown.load(Ordering::SeqCst) {
+        if Instant::now() >= report_at {
+            report_at = Instant::now() + WRITER_REPORT_EVERY;
+            if let Some(w) = writers.current() {
+                eprintln!("{}", writer_report(&w, &mut counted));
+            }
+        }
         if Instant::now() >= heads_at {
             heads_at = Instant::now() + HEADS_EVERY;
             if state.data_dir().join("regions").exists() {
@@ -1523,7 +1651,7 @@ pub fn run(
                 let ready = retry_at.get(name).is_none_or(|t| Instant::now() >= *t);
                 if ready {
                     retry_at.remove(name);
-                    running.insert(name.to_string(), spawn_continuous(name, &state));
+                    running.insert(name.to_string(), spawn_continuous(name, &state, &writers));
                 }
             } else if !enabled {
                 if let Some(m) = running.remove(name) {
@@ -1563,7 +1691,7 @@ pub fn run(
             let due = next_due.get(name).is_none_or(|t| Instant::now() >= *t);
             if state.take_nudge(name) || due {
                 next_due.insert(name.to_string(), Instant::now() + interval(name));
-                running.insert(name.to_string(), spawn_pass(name, &state));
+                running.insert(name.to_string(), spawn_pass(name, &state, &writers));
             }
         }
 
@@ -1587,6 +1715,7 @@ pub fn run(
     for m in draining {
         let _ = m.handle.join();
     }
+    writers.close();
 }
 
 #[cfg(test)]

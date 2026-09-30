@@ -79,6 +79,10 @@ pub enum WatchEvent {
 /// (D180) once the first of them is `ceiling_ms` old, whatever keeps coming;
 /// the ceiling is never below the debounce. Changes to what the walk passes
 /// over — PVFS's own bookkeeping, litter — are not changes (`counts`).
+///
+/// This is the watcher with an engine of its own: the CLI's `pvfs serve
+/// watch`, and (PVOS D199) the daemon's watch on a box that binds folders of
+/// the node model. The daemon's watch otherwise runs [`run_shared`].
 pub fn run(
     data_dir: &Path,
     reconcile_secs: u64,
@@ -87,35 +91,7 @@ pub fn run(
     stop: &std::sync::Arc<AtomicBool>,
     mut notify_cb: impl FnMut(WatchEvent),
 ) -> Result<(), PvfsError> {
-    // D86 — liveness, not existence.
-    //
-    // This used to be `create_new`, so the LOCK WAS THE FILE: any watcher that
-    // died without unlinking it — a crash, an OOM kill, the `kill -9` it takes
-    // to roll a daemon that will not stand down — left the next one refusing to
-    // start, forever, with "delete the file if stale". The box then looks
-    // rolled and healthy while doing NO scanning at all, which is exactly what
-    // the NAS holder did after its swap: `watch error`, a lock file dated two
-    // days earlier, and nothing hashing.
-    //
-    // An flock is released by the KERNEL when the holder dies, so a stale lock
-    // cannot exist — the same reason `writer.lock` is one. The file is now just
-    // somewhere to hang the lock; whether it already exists means nothing.
-    let lock_path = data_dir.join("serve.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| PvfsError::io("open serve.lock", e))?;
-    let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, e)| PvfsError::BadInput {
-            field: "watch".into(),
-            reason: format!(
-                "another watcher IS running and holds {} ({e}) — this is liveness, \
-                 not a leftover file, so deleting it will not help",
-                lock_path.display()
-            ),
-        })?;
+    let lock = ServeLock::take(data_dir)?;
     let result = (|| {
         let mut engine = Engine::open(data_dir)?;
         // D86 — the same flag the loop below checks, handed to the engine so a
@@ -129,140 +105,267 @@ pub fn run(
         // watcher starts anyway and each pass reports the failure, because a
         // scan is idempotent and the NEXT pass repairs it with nobody
         // involved. A failed pass DROPS the route so the following one
-        // reconnects (see the Err arm) — an owner restart would otherwise
-        // wedge this box permanently.
+        // reconnects — an owner restart would otherwise wedge this box
+        // permanently.
         let is_replica = engine.is_replica();
         let mut route = crate::advertise::replica_route(data_dir, is_replica).unwrap_or(None);
-        // initial reconciliation
-        notify_cb(WatchEvent::PassStarted);
-        match scan_pass(&mut engine, &mut route, pvfs_core::WATCH_SETTLE_MS) {
-            // D156 — the same events as every later pass. This had its own
-            // copy (`Ingested` per report, never `Quiet`), so the first pass
-            // after each daemon start never said `NeedsAttention`: the lab's
-            // first pass after the roll skipped a file with a real EIO and
-            // told nobody.
-            Ok(reports) => {
-                for ev in pass_events(&reports) {
-                    notify_cb(ev);
+        let engine = std::cell::RefCell::new(engine);
+        drive(
+            reconcile_secs,
+            debounce_ms,
+            ceiling_ms,
+            stop,
+            &mut notify_cb,
+            &mut || {
+                let r = scan_pass(&mut engine.borrow_mut(), &mut route, pvfs_core::WATCH_SETTLE_MS);
+                if r.is_err() {
+                    route = None;
                 }
-            }
-            Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
-        }
-
-        // THIS machine's bindings only (D71 W1). A binding made on another box
-        // names a directory that does not exist here, so registering a watch on
-        // it fails — which used to abort the whole watcher on any replica.
-        let local = engine.local_bindings()?;
-        let elsewhere = engine.bindings()?.len() - local.len();
-        let mut watched = Vec::new();
-        for b in local {
-            if !b.auto_index {
-                continue;
-            }
-            let path = pvfs_core::storage::uri_to_path(&b.source_uri)?;
-            let mode = if b.recursive {
-                notify::RecursiveMode::Recursive
-            } else {
-                notify::RecursiveMode::NonRecursive
-            };
-            watched.push((path, mode));
-        }
-        // D180 — the handler, not the loop, drops what does not count, so a
-        // copy's thousands of writes a second into `.pvfs-incoming` never
-        // queue up behind a long pass.
-        let roots: Vec<PathBuf> = watched.iter().map(|(p, _)| p.clone()).collect();
-        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if counts(&res, &roots) {
-                let _ = tx.send(res);
-            }
-        })
-        .map_err(|e| PvfsError::BadInput {
-            field: "watcher".into(),
-            reason: e.to_string(),
-        })?;
-        for (path, mode) in &watched {
-            notify::Watcher::watch(&mut watcher, path, *mode).map_err(|e| PvfsError::BadInput {
-                field: "watcher".into(),
-                reason: format!("{}: {e}", path.display()),
-            })?;
-        }
-        notify_cb(WatchEvent::Watching(watched.len(), elsewhere));
-
-        let debounce = Duration::from_millis(debounce_ms);
-        let ceiling = Duration::from_millis(ceiling_ms.max(debounce_ms));
-        let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
-        let mut pending: Option<Pending> = None;
-        let mut last_reconcile = Instant::now();
-        // A failed pass must come back SOON, not at the next reconcile — that
-        // is an hour on the daemon, which is no kind of autocorrect. A scan is
-        // idempotent, so retrying is free of consequence; back off so a
-        // genuinely stuck forest does not spin.
-        let mut retry_at: Option<Instant> = None;
-        let mut backoff = RETRY_MIN;
-
-        while !stop.load(Ordering::SeqCst) {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(_) => pending = Some(Pending::saw(pending, Instant::now())),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            let due_debounce = pending.is_some_and(|p| p.due(Instant::now(), debounce, ceiling));
-            let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
-            let due_retry = retry_at.is_some_and(|t| Instant::now() >= t);
-            if due_debounce || due_reconcile || due_retry {
-                pending = None;
-                last_reconcile = Instant::now();
-                notify_cb(WatchEvent::PassStarted);
-                match scan_pass(&mut engine, &mut route, pvfs_core::WATCH_SETTLE_MS) {
-                    Ok(reports) => {
-                        retry_at = None;
-                        backoff = RETRY_MIN;
-                        // D71 W6: files still being written were deferred, not
-                        // dropped. Nothing will re-trigger us once the copy
-                        // stops (the last inotify event is the last write), so
-                        // schedule the pass that will pick them up.
-                        if reports.iter().any(|r| r.stats.settling > 0) {
-                            retry_at = Some(Instant::now() + SETTLE_RECHECK);
-                        }
-                        for ev in pass_events(&reports) {
-                            notify_cb(ev);
-                        }
-                    }
-                    Err(e) => {
-                        // Loud, and self-correcting: say so, then come back
-                        // shortly rather than waiting out the reconcile.
-                        notify_cb(WatchEvent::ScanError(e.to_string()));
-                        // DROP THE ROUTE so the next pass reconnects.
-                        //
-                        // The connection was opened once at startup, and an
-                        // owner restart kills it — which happens on every
-                        // upgrade. Retrying against a dead socket cannot
-                        // succeed no matter how patient we are, and because
-                        // the failure text says "closed" it is classified
-                        // transient and retried forever. The lab wedged
-                        // exactly this way: the owner restarted twice, and the
-                        // ingest box never catalogued another file until its
-                        // OWN daemon was restarted.
-                        //
-                        // Reconnecting is cheap and idempotent, so pay it on
-                        // any failure rather than trying to tell "the owner is
-                        // busy" from "the socket is gone" through a string.
-                        route = None;
-                        retry_at = Some(Instant::now() + backoff);
-                        backoff = (backoff * 2).min(RETRY_MAX);
-                    }
-                }
-            }
-        }
-        engine.close()
+                r
+            },
+            &|| {
+                let e = engine.borrow();
+                let local = e.local_bindings()?;
+                let elsewhere = e.bindings()?.len() - local.len();
+                Ok((local, elsewhere))
+            },
+        )?;
+        engine.into_inner().close()
     })();
-    // Drop the flock first, then tidy the file away. Order matters: unlinking
-    // while still holding it would let a second watcher create a NEW file and
-    // take a lock on it, and two watchers would scan the same forest.
-    drop(_lock);
-    let _ = std::fs::remove_file(&lock_path);
+    lock.release();
     result
+}
+
+/// PVOS D199 — the daemon's watcher, on its one writer: [`run`]'s loop, but
+/// each pass is `pvfs_core::fs::scan_catalogues` — the walk, the reads and
+/// the hashing with no lock held, the rows in steps of the writer — and the
+/// thread reads through a view of its own. No engine is opened and the log
+/// is not folded to start it. A box that binds folders of the node model
+/// (none on the fleet) is watched by [`run`], with an engine of its own, as
+/// before: that scan interleaves hashing with its writes.
+pub fn run_shared(
+    writer: std::sync::Arc<pvfs_core::Writer>,
+    reconcile_secs: u64,
+    debounce_ms: u64,
+    ceiling_ms: u64,
+    stop: &std::sync::Arc<AtomicBool>,
+    mut notify_cb: impl FnMut(WatchEvent),
+) -> Result<(), PvfsError> {
+    let data_dir = writer.data_dir().to_path_buf();
+    let db = pvfs_core::SharedDb::new(writer, "watch")?;
+    let local = db.view().local_bindings()?;
+    if local.iter().any(|b| !db.view().is_catalogue_region(&b.folder_id).unwrap_or(false)) {
+        eprintln!(
+            "pvfsd: watch: this box binds folders of the node model; the watch scans them with an \
+             engine of its own (PVOS D199)"
+        );
+        drop(db);
+        return run(&data_dir, reconcile_secs, debounce_ms, ceiling_ms, stop, notify_cb);
+    }
+    let lock = ServeLock::take(&data_dir)?;
+    let mut ctx = pvfs_core::fs::CatalogueCtx::new(Some(std::sync::Arc::clone(stop)));
+    let is_replica = db.view().is_replica();
+    let mut route = crate::advertise::replica_route(&data_dir, is_replica).unwrap_or(None);
+    let result = drive(
+        reconcile_secs,
+        debounce_ms,
+        ceiling_ms,
+        stop,
+        &mut notify_cb,
+        &mut || {
+            let r = scan_pass_db(&db, &mut ctx, &mut route, pvfs_core::WATCH_SETTLE_MS);
+            if r.is_err() {
+                route = None;
+            }
+            r
+        },
+        &|| {
+            let e = db.view();
+            let local = e.local_bindings()?;
+            let elsewhere = e.bindings()?.len() - local.len();
+            Ok((local, elsewhere))
+        },
+    );
+    lock.release();
+    result
+}
+
+/// D86 — the watcher's `serve.lock`: liveness, not existence.
+///
+/// This used to be `create_new`, so the LOCK WAS THE FILE: any watcher that
+/// died without unlinking it — a crash, an OOM kill, the `kill -9` it takes
+/// to roll a daemon that will not stand down — left the next one refusing to
+/// start, forever, with "delete the file if stale". The box then looks
+/// rolled and healthy while doing NO scanning at all, which is exactly what
+/// the NAS holder did after its swap: `watch error`, a lock file dated two
+/// days earlier, and nothing hashing.
+///
+/// An flock is released by the KERNEL when the holder dies, so a stale lock
+/// cannot exist — the same reason `writer.lock` is one. The file is now just
+/// somewhere to hang the lock; whether it already exists means nothing.
+struct ServeLock {
+    lock: nix::fcntl::Flock<std::fs::File>,
+    path: std::path::PathBuf,
+}
+
+impl ServeLock {
+    fn take(data_dir: &Path) -> Result<ServeLock, PvfsError> {
+        let path = data_dir.join("serve.lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| PvfsError::io("open serve.lock", e))?;
+        let lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|(_, e)| {
+            PvfsError::BadInput {
+                field: "watch".into(),
+                reason: format!(
+                    "another watcher IS running and holds {} ({e}) — this is liveness, \
+                     not a leftover file, so deleting it will not help",
+                    path.display()
+                ),
+            }
+        })?;
+        Ok(ServeLock { lock, path })
+    }
+
+    /// Drop the flock first, then tidy the file away. Order matters:
+    /// unlinking while still holding it would let a second watcher create a
+    /// NEW file and take a lock on it, and two watchers would scan the same
+    /// forest.
+    fn release(self) {
+        drop(self.lock);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The watcher's loop, whatever a pass runs on (PVOS D199 shares it between
+/// [`run`] and [`run_shared`]): the startup pass, then THIS machine's
+/// bindings watched, then a pass on each settled change, on the reconcile
+/// and on a retry — until `stop`. `pass` drops its own route when it fails,
+/// so the next one reconnects.
+fn drive(
+    reconcile_secs: u64,
+    debounce_ms: u64,
+    ceiling_ms: u64,
+    stop: &AtomicBool,
+    notify_cb: &mut dyn FnMut(WatchEvent),
+    pass: &mut dyn FnMut() -> Result<Vec<pvfs_core::ScanReport>, PvfsError>,
+    bindings: &dyn Fn() -> Result<(Vec<pvfs_core::Binding>, usize), PvfsError>,
+) -> Result<(), PvfsError> {
+    // initial reconciliation
+    notify_cb(WatchEvent::PassStarted);
+    match pass() {
+        // D156 — the same events as every later pass. This had its own copy
+        // (`Ingested` per report, never `Quiet`), so the first pass after each
+        // daemon start never said `NeedsAttention`: the lab's first pass after
+        // the roll skipped a file with a real EIO and told nobody.
+        Ok(reports) => {
+            for ev in pass_events(&reports) {
+                notify_cb(ev);
+            }
+        }
+        Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
+    }
+
+    // THIS machine's bindings only (D71 W1). A binding made on another box
+    // names a directory that does not exist here, so registering a watch on
+    // it fails — which used to abort the whole watcher on any replica.
+    let (local, elsewhere) = bindings()?;
+    let mut watched = Vec::new();
+    for b in local {
+        if !b.auto_index {
+            continue;
+        }
+        let path = pvfs_core::storage::uri_to_path(&b.source_uri)?;
+        let mode = if b.recursive {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        };
+        watched.push((path, mode));
+    }
+    // D180 — the handler, not the loop, drops what does not count, so a
+    // copy's thousands of writes a second into `.pvfs-incoming` never queue
+    // up behind a long pass.
+    let roots: Vec<PathBuf> = watched.iter().map(|(p, _)| p.clone()).collect();
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if counts(&res, &roots) {
+            let _ = tx.send(res);
+        }
+    })
+    .map_err(|e| PvfsError::BadInput {
+        field: "watcher".into(),
+        reason: e.to_string(),
+    })?;
+    for (path, mode) in &watched {
+        notify::Watcher::watch(&mut watcher, path, *mode).map_err(|e| PvfsError::BadInput {
+            field: "watcher".into(),
+            reason: format!("{}: {e}", path.display()),
+        })?;
+    }
+    notify_cb(WatchEvent::Watching(watched.len(), elsewhere));
+
+    let debounce = Duration::from_millis(debounce_ms);
+    let ceiling = Duration::from_millis(ceiling_ms.max(debounce_ms));
+    let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
+    let mut pending: Option<Pending> = None;
+    let mut last_reconcile = Instant::now();
+    // A failed pass must come back SOON, not at the next reconcile — that is
+    // an hour on the daemon, which is no kind of autocorrect. A scan is
+    // idempotent, so retrying is free of consequence; back off so a genuinely
+    // stuck forest does not spin.
+    let mut retry_at: Option<Instant> = None;
+    let mut backoff = RETRY_MIN;
+
+    while !stop.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(_) => pending = Some(Pending::saw(pending, Instant::now())),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let due_debounce = pending.is_some_and(|p| p.due(Instant::now(), debounce, ceiling));
+        let due_reconcile = last_reconcile.elapsed() >= reconcile_every;
+        let due_retry = retry_at.is_some_and(|t| Instant::now() >= t);
+        if due_debounce || due_reconcile || due_retry {
+            pending = None;
+            last_reconcile = Instant::now();
+            notify_cb(WatchEvent::PassStarted);
+            match pass() {
+                Ok(reports) => {
+                    retry_at = None;
+                    backoff = RETRY_MIN;
+                    // D71 W6: files still being written were deferred, not
+                    // dropped. Nothing will re-trigger us once the copy stops
+                    // (the last inotify event is the last write), so schedule
+                    // the pass that will pick them up.
+                    if reports.iter().any(|r| r.stats.settling > 0) {
+                        retry_at = Some(Instant::now() + SETTLE_RECHECK);
+                    }
+                    for ev in pass_events(&reports) {
+                        notify_cb(ev);
+                    }
+                }
+                Err(e) => {
+                    // Loud, and self-correcting: say so, then come back
+                    // shortly rather than waiting out the reconcile. The pass
+                    // dropped its route, so the next one reconnects: the
+                    // connection was opened once at startup, an owner restart
+                    // kills it (every upgrade), and retrying against a dead
+                    // socket cannot succeed however patient we are — the lab
+                    // wedged exactly this way, the owner restarted twice and
+                    // the ingest box never catalogued another file until its
+                    // OWN daemon was restarted.
+                    notify_cb(WatchEvent::ScanError(e.to_string()));
+                    retry_at = Some(Instant::now() + backoff);
+                    backoff = (backoff * 2).min(RETRY_MAX);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// D180 — changes no pass has answered yet: when the first came, and the
@@ -449,6 +552,62 @@ pub fn scan_once(
     scan_pass(engine, route, settle_ms)
 }
 
+/// PVOS D199 — [`scan_pass`] on the daemon's writer: the same route
+/// handling (reconnect, catalogue here with no route, D183's pending heads
+/// first, the catch-up after), each binding's pass in steps
+/// (`pvfs_core::fs::scan_catalogues`).
+fn scan_pass_db(
+    db: &pvfs_core::SharedDb,
+    ctx: &mut pvfs_core::fs::CatalogueCtx,
+    route: &mut Option<(crate::Client, crate::advertise::BoxedSign)>,
+    settle_ms: u64,
+) -> Result<Vec<pvfs_core::ScanReport>, PvfsError> {
+    let data_dir = db.writer().data_dir().to_path_buf();
+    if route.is_none() && db.view().is_replica() {
+        match crate::advertise::replica_route(&data_dir, true) {
+            Ok(r) => *route = r,
+            // PVOS D196 — unreachable, or fenced (`replica_route` says which).
+            Err(e) if db.view().catalogues_only()? => {
+                eprintln!(
+                    "pvfs: watch: no route through the owner ({e}) — cataloguing here; \
+                     the head is published locally and committed when a writer answers"
+                );
+                let mut away = pvfs_core::OwnerAway;
+                return pvfs_core::fs::scan_catalogues(db, ctx, Some(&mut away), settle_ms);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match route {
+        Some((client, sign)) => {
+            let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &**sign;
+            let mut w = crate::advertise::RoutedScanWriter::new(&data_dir, client, signer);
+            let settled = commit_pending_heads_db(db, &mut w)?;
+            let reports = pvfs_core::fs::scan_catalogues(db, ctx, Some(&mut w), settle_ms)?;
+            // Read-your-writes, as `scan_pass` (the F5.0 precedent).
+            if settled > 0
+                || reports.iter().any(|r| {
+                    r.stats.added + r.stats.changed + r.stats.removed + r.stats.unlinked > 0
+                })
+            {
+                crate::advertise::catch_up_db(db, client);
+            }
+            Ok(reports)
+        }
+        None => pvfs_core::fs::scan_catalogues(db, ctx, None, settle_ms),
+    }
+}
+
+/// PVOS D199 — [`commit_pending_heads`], reading the pending heads through
+/// `db` (a read view, in the daemon).
+pub fn commit_pending_heads_db<D: pvfs_core::Db>(
+    db: &D,
+    w: &mut dyn pvfs_core::ScanWriter,
+) -> Result<usize, PvfsError> {
+    let pending = db.read(|e| e.pending_region_heads())?;
+    commit_heads(&pending, w)
+}
+
 /// PVOS D183 — commit this box's pending heads (published while the owner was
 /// away) through `w`: one routed `CommitRegionHead` per region, the newest.
 /// A head the owner already holds (committed by an earlier pass or the
@@ -458,8 +617,12 @@ pub fn commit_pending_heads(
     engine: &Engine,
     w: &mut dyn pvfs_core::ScanWriter,
 ) -> Result<usize, PvfsError> {
-    let pending = engine.pending_region_heads()?;
-    for (region, seq, hash) in &pending {
+    commit_heads(&engine.pending_region_heads()?, w)
+}
+
+/// The routed commits of `pending` (see [`commit_pending_heads`]).
+fn commit_heads(pending: &[(String, u64, String)], w: &mut dyn pvfs_core::ScanWriter) -> Result<usize, PvfsError> {
+    for (region, seq, hash) in pending {
         let short = &region[..region.len().min(8)];
         match w.commit_region_head(region, *seq, hash) {
             Ok(()) => eprintln!("pvfs: committed head {seq} of {short} — published while the owner was away"),

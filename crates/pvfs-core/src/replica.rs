@@ -380,14 +380,26 @@ impl ReplicaStore {
         if rows.is_empty() {
             return self.tip();
         }
-        // Same race as `append_region`: the follow job and a manual sync
-        // legitimately ship the same tail concurrently. Write lock first,
-        // tip inside the transaction, overlap verified-then-skipped.
         self.conn
             .busy_timeout(std::time::Duration::from_secs(10))
             .map_err(crate::error::map_db("replica busy timeout"))?;
-        let tx = self
-            .conn
+        append_shipped(&mut self.conn, rows)
+    }
+}
+
+/// [`ReplicaStore::append`] on any connection to the forest's databases —
+/// the store's own, or (PVOS D199) the daemon's writer engine's, so the
+/// follow job ingests through the one writer instead of a second connection
+/// whose `BEGIN IMMEDIATE` took `index.db`'s write lock too.
+pub(crate) fn append_shipped(conn: &mut Connection, rows: &[EventRow]) -> Result<u64> {
+    if rows.is_empty() {
+        return log_store::max_seq(conn);
+    }
+    {
+        // Same race as `append_region`: the follow job and a manual sync
+        // legitimately ship the same tail concurrently. Write lock first,
+        // tip inside the transaction, overlap verified-then-skipped.
+        let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(crate::error::map_db("begin replica ingest"))?;
         let tip: i64 = tx
@@ -479,7 +491,8 @@ impl ReplicaStore {
             prev = step;
         }
         // The projection now lags the log; the next open's startup check
-        // replays (and fully verifies) the new tail.
+        // replays (and fully verifies) the new tail — or, in the daemon,
+        // the follow job's fold step (D199).
         tx.commit()
             .map_err(crate::error::map_db("commit replica ingest"))?;
         Ok(expect_seq)

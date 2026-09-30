@@ -61,6 +61,32 @@ will and will not touch — and the difference is where the surprises live.
   two were the only purge, so a box running neither (mediabox) kept its
   trash forever.
 
+### How the jobs reach the database: one writer (PVOS D199, 2026-09-30)
+
+A daemon writes `index.db` through **one** connection, `pvfs_core::Writer`
+(the daemon's engine and its lock). Serving and every job take it for one
+database step at a time and hold it for nothing else — no disk walk, no
+hashing, no network, no file moves. A job reads through a read view of its
+own, never the serving pool. Two parts of one daemon that want the database
+at once queue on the writer, so neither waits out SQLite's busy timeout and
+fails; and since no job opens an engine, none folds the log to open one.
+
+| Job | Its steps of the writer | Everything else, with no lock |
+|---|---|---|
+| **watch** | each batch of rows (≤1,000), each sweep chunk, the snapshot row (and an owner's head commit); a replica's catch-up: rows (≤256 a step), the fold | the walk, the rows read once at the pass's start, hashing, the manifest and its file, the routed head |
+| **catalogue** | each accepted claim; an install's rows (≤500 a step: upserts, then removals, then `region_fetched`) | claims and manifests fetched, hash, parse, the delta |
+| **follow** | per batch (≤512 events): the ingest, the fold | the long-poll, region generation files |
+| **receive, resolve, reclaim**, the trash step | none — they write files; the watch catalogues them | everything |
+| **health** | none (a read view since D188) | everything |
+| sync, export, tier, evict (node model) | — they keep their own engines, as before; no fleet box runs them | |
+
+**Serving goes first:** a job about to take the writer lets a waiting served
+op go first, so a served write waits for the one step in progress at most.
+A hold over 1 s, and a wait over 1 s, are said in the journal; each hour
+the runner says how many holds there were, the longest and whose, and how
+many engines, read views and folds the process opened (`pvfsd: the writer,
+last hour: …`).
+
 **The interaction that surprises people:** owner-side `tier` retires, and evict
 only acts on LIVE locations — so if tier retires first, **evict does nothing and
 the edge bytes are never reclaimed**. The production fleet cannot hit this (the

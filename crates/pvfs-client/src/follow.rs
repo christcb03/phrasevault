@@ -124,16 +124,132 @@ fn stop_sleep(total: Duration, stop: &AtomicBool) {
 /// not a replica, no client identity). `poll_ms` is the per-request long-poll
 /// window: the CLI uses a long one; the daemon job a short one so disable/
 /// shutdown are honored promptly.
+///
+/// This follower ingests on a connection of its own and folds by opening an
+/// engine (the CLI's `pvfs replica follow`); the daemon's follow job runs
+/// [`run_shared`] (PVOS D199).
 pub fn run(
     data_dir: &Path,
     poll_ms: u64,
     stop: &AtomicBool,
-    mut notify: impl FnMut(FollowEvent),
+    notify: impl FnMut(FollowEvent),
 ) -> Result<(), PvfsError> {
     let dial = ReplicaSource::load(data_dir)?;
+    follow(data_dir, &dial, poll_ms, stop, notify, &mut OwnStore { data_dir })
+}
+
+/// PVOS D199 — the daemon's follower, on its one writer: each batch the
+/// source ships (≤512 events) is one ingest step and one fold step, and the
+/// long-poll holds nothing. It used to ingest on a `ReplicaStore` connection
+/// of its own — whose `BEGIN IMMEDIATE` took `index.db`'s write lock too, so
+/// a catalogue install on the NAS made it fail — and to open (and fold, and
+/// close) an engine per batch. The tip is read on a view of its own.
+pub fn run_shared(
+    writer: std::sync::Arc<pvfs_core::Writer>,
+    poll_ms: u64,
+    stop: &AtomicBool,
+    notify: impl FnMut(FollowEvent),
+) -> Result<(), PvfsError> {
+    let data_dir = writer.data_dir().to_path_buf();
+    let dial = ReplicaSource::load(&data_dir)?;
+    let view = writer.read_view()?;
+    let mut store = SharedStore { writer, view, fold_due: false, said: None };
+    follow(&data_dir, &dial, poll_ms, stop, notify, &mut store)
+}
+
+/// Where a follower lands what it is shipped, and how it folds it.
+trait Ingest {
+    /// The local log's tip.
+    fn tip(&mut self) -> Result<u64, PvfsError>;
+    /// Append shipped rows (chain-verified); the new tip.
+    fn append(&mut self, rows: &[EventRow]) -> Result<u64, PvfsError>;
+    /// Fold what was appended, so local reads and a serving daemon see it
+    /// (best-effort: what cannot be folded now is folded later).
+    fn fold(&mut self);
+    /// Called on every quiet tick: a fold that could not run earlier runs now.
+    fn settle(&mut self) {}
+}
+
+/// A store of the follower's own (the CLI): a `ReplicaStore` per request and
+/// an engine opened to fold.
+struct OwnStore<'a> {
+    data_dir: &'a Path,
+}
+
+impl Ingest for OwnStore<'_> {
+    fn tip(&mut self) -> Result<u64, PvfsError> {
+        ReplicaStore::open(self.data_dir).and_then(|s| s.tip())
+    }
+
+    fn append(&mut self, rows: &[EventRow]) -> Result<u64, PvfsError> {
+        ReplicaStore::open(self.data_dir).and_then(|mut s| s.append(rows))
+    }
+
+    fn fold(&mut self) {
+        // fold now (best-effort), so local reads and any serving daemon see
+        // it; the next open folds anyway
+        let _ = Engine::open(self.data_dir).and_then(|e| e.close());
+    }
+}
+
+/// PVOS D199 — the daemon's writer: an ingest step and a fold step per batch.
+struct SharedStore {
+    writer: std::sync::Arc<pvfs_core::Writer>,
+    view: Engine,
+    /// A fold that could not run (another process held the fold lock):
+    /// every tick tries it again until it does.
+    fold_due: bool,
+    /// The last fold failure said, so a lasting one is said once.
+    said: Option<String>,
+}
+
+impl Ingest for SharedStore {
+    fn tip(&mut self) -> Result<u64, PvfsError> {
+        self.view.log_tip()
+    }
+
+    fn append(&mut self, rows: &[EventRow]) -> Result<u64, PvfsError> {
+        let tip = self.writer.step("follow: ingest", |e| e.ingest_log_rows(rows))?;
+        self.fold_due = true;
+        Ok(tip)
+    }
+
+    fn fold(&mut self) {
+        match self.writer.step("follow: fold", |e| e.catch_up()) {
+            Ok(_) => {
+                self.fold_due = false;
+                self.said = None;
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if self.said.as_deref() != Some(e.as_str()) {
+                    eprintln!("pvfsd: follow: the fold waits ({e}); the next tick tries again");
+                    self.said = Some(e);
+                }
+            }
+        }
+    }
+
+    fn settle(&mut self) {
+        if self.fold_due {
+            self.fold();
+        }
+    }
+}
+
+/// The follower's loop, whatever it lands in (PVOS D199 shares it between
+/// [`run`] and [`run_shared`]).
+fn follow(
+    data_dir: &Path,
+    dial: &ReplicaSource,
+    poll_ms: u64,
+    stop: &AtomicBool,
+    mut notify: impl FnMut(FollowEvent),
+    store: &mut dyn Ingest,
+) -> Result<(), PvfsError> {
     let mut backoff = Backoff::new();
     while !stop.load(Ordering::SeqCst) {
-        let mut client = match dial_source(&dial) {
+        let mut client = match dial_source(dial) {
             Ok(c) => {
                 notify(FollowEvent::Connected {
                     target: &dial.target,
@@ -151,7 +267,7 @@ pub fn run(
         while !stop.load(Ordering::SeqCst) {
             // transient lock contention (a local command folding concurrently)
             // must not kill the follower
-            let from = match ReplicaStore::open(data_dir).and_then(|s| s.tip()) {
+            let from = match store.tip() {
                 Ok(t) => t + 1,
                 Err(e) => {
                     notify(FollowEvent::Retrying {
@@ -184,6 +300,7 @@ pub fn run(
                     // promoted and this one is its ghost. That used to read as
                     // healthy; it is an error, so the fleet sees it.
                     Ok(0) if source_tip + 1 == from => {
+                        store.settle();
                         backoff.reset();
                         notify(FollowEvent::UpToDate { tip: from - 1 })
                     }
@@ -199,12 +316,10 @@ pub fn run(
                         });
                         break;
                     }
-                    Ok(0) => {}
+                    Ok(0) => store.settle(),
                     Ok(_) => {
-                        let _ = Engine::open(data_dir).and_then(|e| e.close());
-                        let tip = ReplicaStore::open(data_dir)
-                            .and_then(|s| s.tip())
-                            .unwrap_or(0);
+                        store.fold();
+                        let tip = store.tip().unwrap_or(0);
                         backoff.reset();
                         notify(FollowEvent::CaughtUp { tip });
                     }
@@ -226,7 +341,7 @@ pub fn run(
                     break;
                 }
             };
-            let tip = match ReplicaStore::open(data_dir).and_then(|mut s| s.append(&rows)) {
+            let tip = match store.append(&rows) {
                 Ok(t) => t,
                 // PVOS D182 — say what a broken chain means: the source is not
                 // the writer this replica has been following.
@@ -254,9 +369,7 @@ pub fn run(
                 });
                 break;
             }
-            // fold now (best-effort), so local reads and any serving daemon
-            // see it; the next open folds anyway
-            let _ = Engine::open(data_dir).and_then(|e| e.close());
+            store.fold();
             backoff.reset();
             notify(FollowEvent::CaughtUp { tip });
         }

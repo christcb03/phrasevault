@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pvfs_core::{identity, Engine, PvfsError, ReplicaSource};
+use pvfs_core::{identity, Db, Engine, OwnDb, PvfsError, ReplicaSource};
 
 use crate::ClientError;
 
@@ -52,22 +52,32 @@ pub fn fetch_pass_on(
     cancel: &AtomicBool,
     only: Option<&str>,
 ) -> Result<CatalogueReport, PvfsError> {
+    fetch_pass_db(&OwnDb::new(engine), cancel, only)
+}
+
+/// PVOS D199 — one pass through `db`. The daemon's catalogue job hands it
+/// its one writer and a read view: the claims asked of every box, the
+/// manifests fetched, their hashes and the deltas computed with no lock
+/// held; each accepted claim and each install's rows are steps of the
+/// writer. It used to open an engine of its own every 60 s — and fold the
+/// log to do it — beside the daemon's.
+pub fn fetch_pass_db<D: Db>(db: &D, cancel: &AtomicBool, only: Option<&str>) -> Result<CatalogueReport, PvfsError> {
     let mut report = CatalogueReport::default();
+    let (replica, data_dir) = db.read(|e| Ok((e.is_replica(), e.data_dir().to_path_buf())))?;
     // PVOS D183 — first, this box's own heads published while the owner was
     // away: committed now if the owner answers (quietly left for the next
     // pass if it does not).
-    if engine.is_replica() && !engine.pending_region_heads()?.is_empty() {
-        if let Ok(Some((mut client, sign))) = crate::advertise::replica_route(engine.data_dir(), true) {
+    if replica && !db.read(|e| e.pending_region_heads())?.is_empty() {
+        if let Ok(Some((mut client, sign))) = crate::advertise::replica_route(&data_dir, true) {
             let signer: &dyn Fn(&[u8; 32]) -> Vec<u8> = &*sign;
-            let data_dir = engine.data_dir().to_path_buf();
             let committed = {
                 let mut w = crate::advertise::RoutedScanWriter::new(&data_dir, &mut client, signer);
-                crate::watch::commit_pending_heads(engine, &mut w)
+                crate::watch::commit_pending_heads_db(db, &mut w)
             };
             match committed {
                 Ok(n) => {
                     report.committed = n;
-                    crate::advertise::catch_up(&data_dir, &mut client);
+                    crate::advertise::catch_up_db(db, &mut client);
                 }
                 Err(e) => eprintln!("pvfs: catalogue: pending heads not committed yet: {e}"),
             }
@@ -76,8 +86,8 @@ pub fn fetch_pass_on(
     // PVOS D183 — then every peer's signed claims for the regions it owns,
     // taken as provisional heads on the fold's own rule; each remembered with
     // the box that made it, which is the box that holds the manifest.
-    let claimed_by = collect_claims(engine, &mut report)?;
-    let status = engine.catalogue_status()?;
+    let claimed_by = collect_claims(db, &data_dir, &mut report)?;
+    let status = db.read(|e| e.catalogue_status())?;
     let wanted: Vec<(String, u64)> = status
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.region))
@@ -93,8 +103,9 @@ pub fn fetch_pass_on(
         return Ok(report);
     }
     // Endpoints: pin → address, minus ourselves, in a stable order.
-    let own_pin = pvfs_core::storage::host_pin(engine.data_dir());
-    let mut endpoints: Vec<(String, String)> = crate::fetch::catalog_endpoints(engine)
+    let own_pin = pvfs_core::storage::host_pin(&data_dir);
+    let mut endpoints: Vec<(String, String)> = db
+        .read(|e| Ok(crate::fetch::catalog_endpoints(e)))?
         .into_iter()
         .filter(|(pin, _)| own_pin.as_deref() != Some(pin.as_str()))
         .collect();
@@ -138,7 +149,7 @@ pub fn fetch_pass_on(
                 }
             };
             match client.region_manifest(&region, seq) {
-                Ok(bytes) => match engine.install_region_snapshot_delta(&region, seq, &bytes, addr) {
+                Ok(bytes) => match pvfs_core::fs::install_region_snapshot_db(db, &region, seq, &bytes, addr, || {}) {
                     Ok(n) => {
                         report.fetched.push((region.clone(), seq, n));
                         done = true;
@@ -169,13 +180,15 @@ pub fn fetch_pass_on(
 /// claims (`RegionClaims`, proto 12; an older daemon is skipped) and take each
 /// the fold's rule accepts as the region's provisional head. Returns, per
 /// region taken, the address that claimed it.
-fn collect_claims(
-    engine: &Engine,
+fn collect_claims<D: Db>(
+    db: &D,
+    data_dir: &Path,
     report: &mut CatalogueReport,
 ) -> Result<std::collections::HashMap<String, String>, PvfsError> {
     let mut claimed_by = std::collections::HashMap::new();
-    let own_pin = pvfs_core::storage::host_pin(engine.data_dir());
-    let mut endpoints: Vec<(String, String)> = crate::fetch::catalog_endpoints(engine)
+    let own_pin = pvfs_core::storage::host_pin(data_dir);
+    let mut endpoints: Vec<(String, String)> = db
+        .read(|e| Ok(crate::fetch::catalog_endpoints(e)))?
         .into_iter()
         .filter(|(pin, _)| own_pin.as_deref() != Some(pin.as_str()))
         .collect();
@@ -200,7 +213,7 @@ fn collect_claims(
                 report.claims_refused.push((addr.clone(), "claim body is not hex".into()));
                 continue;
             };
-            match engine.accept_region_claim(&body, addr)? {
+            match db.write("claim", |e| e.accept_region_claim(&body, addr))? {
                 pvfs_core::ClaimOutcome::Accepted { region, seq } => {
                     claimed_by.insert(region.clone(), addr.clone());
                     report.claims_taken.push((region, seq, addr.clone()));

@@ -252,7 +252,7 @@ pub struct Engine {
     /// hashes every unhashed file it meets, so "between passes" is the wrong
     /// granularity for a stop: on the NAS holder that meant SIGTERM was ignored
     /// for hours and the box could not be rolled at all.
-    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// D154 — a catalogue pass commits its rows every this many rows or this
     /// many milliseconds, whichever comes first (`set_catalogue_batch`).
     pub(crate) catalogue_batch: (usize, u64),
@@ -313,14 +313,6 @@ impl Engine {
     #[doc(hidden)]
     pub fn on_catalogue_read(&mut self, hook: Option<CatalogueReadHook>) {
         self.catalogue_read_hook = hook;
-    }
-
-    /// Raise the stop flag, as SIGTERM does — the one `set_cancel` gave, or a
-    /// new one if none was (the D154 seam's stop).
-    pub(crate) fn raise_cancel(&mut self) {
-        self.cancel
-            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Has a stop been asked for?
@@ -756,6 +748,7 @@ impl Engine {
             return Self::open_replica(data_dir);
         }
         let device = DeviceKeyCache::load(data_dir)?;
+        crate::writer::COUNTERS.engine_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let others = probe_other_writers(data_dir);
         let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
@@ -875,10 +868,19 @@ impl Engine {
     /// errors instead of rebuilding). Read methods behave identically; any
     /// mutating call fails at the SQLite layer, so misuse cannot corrupt.
     /// Open views only while a writer `Engine` has the forest open.
+    ///
+    /// PVOS D199 — a replica's view too. It used to load the forest's device
+    /// key, which a replica does not have (it runs on an ephemeral key), so on
+    /// every replica the daemon's read pool came up EMPTY without a word and
+    /// every read — `serve status`, view listings, the manifests and bytes
+    /// peers fetch — took the writer lock. A replica's view carries the same
+    /// ephemeral key and `replica` flag as `open_replica`.
     pub fn open_read_view(data_dir: &Path) -> Result<Engine> {
-        let device = DeviceKeyCache::load(data_dir)?;
+        let replica = crate::replica::marker_path(data_dir).exists();
+        let device = if replica { DeviceKeyCache::ephemeral()? } else { DeviceKeyCache::load(data_dir)? };
         let conn = open_connection_read_only(data_dir)?;
         let identity = projection::read_view_check(&conn)?;
+        crate::writer::COUNTERS.read_views.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Engine {
             conn,
             data_dir: data_dir.to_path_buf(),
@@ -887,7 +889,7 @@ impl Engine {
             // `closed: true` keeps Drop from touching the clean-shutdown flag —
             // shutdown bookkeeping belongs to the writer engine alone.
             closed: true,
-            replica: false,
+            replica,
             _writer_lock: None,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
@@ -905,6 +907,7 @@ impl Engine {
     /// engine plumbing and every log write is refused.
     pub fn open_replica(data_dir: &Path) -> Result<Engine> {
         let device = DeviceKeyCache::ephemeral()?;
+        crate::writer::COUNTERS.engine_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let others = probe_other_writers(data_dir);
         let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
@@ -1397,6 +1400,34 @@ impl Engine {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// D194 — SQLite's `data_version` on this connection: it moves whenever
+    /// ANOTHER connection commits to `index.db`, never for this connection's
+    /// own writes. PVOS D199: in the daemon every in-process write is this
+    /// connection's, so it moves only for another process (a CLI, a mount).
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .map_err(map_db("data version"))
+    }
+
+    /// PVOS D199 — a replica's shipped log rows, appended on THIS connection
+    /// (the daemon's writer) exactly as `ReplicaStore::append` appends them:
+    /// chain-verified from the tip, overlap verified then skipped. The
+    /// projection lags until [`Engine::catch_up`] folds them. Returns the new
+    /// tip.
+    pub fn ingest_log_rows(&mut self, rows: &[crate::log_store::EventRow]) -> Result<u64> {
+        crate::replica::append_shipped(&mut self.conn, rows)
+    }
+
+    /// PVOS D199 — fold what the logs hold past the applied marks, now: the
+    /// follow job's fold, as one step of the daemon's writer instead of an
+    /// engine opened (and its log folded) to be closed again. The fold lock
+    /// is tried, not waited for (`Busy`: another process is folding; try
+    /// again with the writer released). Returns the top-log events folded.
+    pub fn catch_up(&mut self) -> Result<u64> {
+        projection::fold_tail_now(&mut self.conn, &self.data_dir, &mut self.identity)
     }
 
     pub fn device_pubkey(&self) -> Vec<u8> {
