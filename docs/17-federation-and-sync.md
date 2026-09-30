@@ -1,8 +1,13 @@
 # PVFS — P4 federation & sync: the plan, phased (17)
 
-Status: **F0–F3 and F5.0–F5.4 built; F4 built except standby failover** (region logs P7.2, FUSE
-P7.3, swarm P9 — docs 20/22); ingest sessions (P10, [doc 23](23-ingest-sessions-and-the-bt-bridge.md))
-extend the arc. Drafted 2026-08-08 as the phasing proposal.
+Status: **every phase here is built** — F0–F3, F5.0–F5.8, and all of F4: region logs (P7.2),
+FUSE (P7.3), the swarm (P9) — docs 20/22 — and standby failover as explicit promotion (D128,
+then PVOS D182: the fence, `promote.sh`, dated copies of the log — doc 28). Ingest sessions (P10,
+[doc 23](23-ingest-sessions-and-the-bt-bridge.md)) extend the arc. The media fleet no longer
+runs this doc's per-file catalogue: since 2026-09-12 each box catalogues its own disk
+([doc 26](26-regions-own-their-files.md), the cutover in doc 29); replicas, instances, pins,
+follow and the swarm described here are what that model still rides on. Drafted 2026-08-08 as
+the phasing proposal.
 Depends on: [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md) (data model —
 decided), [13-pvos-driven-requirements.md](13-pvos-driven-requirements.md) §A–§D (write model +
 region design — decided), [04](04-p1-storage-and-fs-ops-spec.md)/[05](05-instance-registry-and-mounts.md)
@@ -556,8 +561,7 @@ no new wire ops, no schema change, no CLI surface.
    **Built as P7.3's unprivileged `pvfs mount` (doc 20 §3).**
 3. ✅ **Swarm data plane**: multi-source fetch-by-hash (doc 03 §2.1's future schemes; P2-F's seam).
    **Built as P9 (doc 22).**
-4. ☑ **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic: D128, then PVOS D182 (the fence, the standby, `promote.sh`, companion promotion, dated copies; doc 28). What remains is doc 08's availability track (D, B, C, E).
-   dual-writers. **The only remaining F4 item.**
+4. ✅ **Standby failover** (doc 03 §6 Q3) — explicit promotion protocol, never automatic: D128, then PVOS D182 (the fence, the standby, `promote.sh`, companion promotion, dated copies; doc 28). Used in production on 2026-09-29 (PVOS D186: mediabox became the owner). What remains is doc 08's availability track (B, C, E; A and D are built).
 
 ---
 

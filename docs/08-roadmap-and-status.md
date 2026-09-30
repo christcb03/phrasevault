@@ -1,31 +1,29 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document** — update as phases land. Last updated 2026-08-13 (1.4.0 cut).
+Status: **Living document.** Last updated 2026-09-30 (PVOS D203): the banner below and §6 are
+current; §1–§5 are the record up to the 1.4.0 release (2026-08-13) and stay as they were written.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
-docs 02–23; this is the index + the honest "what's not done yet."
+docs 02–31; this is the index + the honest "what's not done yet."
 
-> **This document stopped tracking reality around D29 (2026-07-22).** The tree
-> is at D146 as of 2026-09-13 — more than a hundred milestones and a whole
-> fleet deployment later — and none of D71–D146 is reflected below. Treat
-> everything here as history unless it agrees with `CHANGELOG.md`, which IS
-> current.
->
-> The live state, for anyone reading this first (banner refreshed 2026-09-13):
+> **The live state (2026-09-30).**
 >
 > | | |
 > |---|---|
-> | fleet | owner (VM 310) / ingest (feederbox) / holder (QNAP) on the **new model** (doc 26) since the 2026-09-12 cutover (doc 29, forest alias `media2`); all three on `v1.4-312`, verified by `pvfs --version` AND `pvfsd --version` (D110) |
-> | projection schema | **18** |
-> | wire proto | **8**, degrading to 3 |
-> | the mover | the holder's `receive` job pulls several files at once, several ranges each (D144); feederbox's `resolve` drains staging only after the library holds the same bytes (D145) |
-> | monitoring | the owner's `health` job observes every peer (D131), supervises the NAS (D135) and notifies Home Assistant on transitions (D142); `follow` reports honestly since D146 — the whole picture is **doc 30** |
-> | the old forest | kept on disk as the cutover's rollback (doc 29 §8) until its conditions are met |
-> | re-genesis | runbook written **and rehearsed** — doc 25, including its §11 close-out |
+> | the fleet | **mediabox owns the Media forest** since 2026-09-29 (PVOS D186): `/opt/pvfs/media`, alias `media`, forest `ae60b1db…`, and it catalogues its own two disks. feederbox is the ingest box (region `staging`, drains); the NAS holds the library (`library`, receives; `library-ext`). VM 310, the owner from the 2026-09-12 cutover to the move, is retired. |
+> | the build | every box on **`v1.4-495-gc17ae29`**, rolled 2026-09-27 (D186). Main is ahead with D198 and D203, which ride the next roll. No release since `v1.4` ([VERSIONING.md](../VERSIONING.md)). |
+> | wire protocol | **15**, talking back to 3 — every step since 4 additive, so a roll goes box by box |
+> | projection schema | **20**, every step since v7 migrated in place |
+> | the model | **the region model** (doc 26) since the cutover of 2026-09-12 (doc 29): each box catalogues its own disk; the log carries regions, grants and heads. The old node-model forest was deleted on 2026-09-21 — there is no way back to it. |
+> | the mover | the library's `receive` pulls by hash what only staging holds, several files and ranges at once; staging's `resolve` drains a copy only once the library serves the same bytes back |
+> | what programs read | the merged view, mounted: Sonarr and Radarr through feederbox's union (2026-09-17), Plex on mediabox in stream mode (2026-09-22) |
+> | availability | A and D of the availability track (§3) are built: the owner can be lost, fenced and replaced (doc 28), and an owner outage stops no catalogue. The move itself ran on production on 2026-09-29. B, C and E are roadmap. |
+> | monitoring | the owner's `health` job, Home Assistant notifications and a status page — doc 30 |
+> | what is next | PVOS `docs/BACKLOG.md` (suggested order: one writer per daemon, skipping unchanged catalogue rows, progress while a pass runs, …) |
 >
-> Rewriting this file's history would lose the record of how decisions were
-> reached, which is most of its value. What it needs instead is a maintainer
-> willing to append the D71+ era; flagged rather than faked.
+> Where the detail is: §6 below (the D71+ era, by arc); [CHANGELOG.md](../CHANGELOG.md) "Unreleased"
+> (every change since 1.4.0); PVOS `docs/milestones/` (one doc per milestone); the
+> [user manual](USER-MANUAL.md) §7.13 (the region model, how to use it).
 
 ---
 
@@ -456,13 +454,61 @@ menu-bar "Restart agent" item. Doc 14 §2.
 
 | Crate | Role | Depends on |
 |-------|------|------------|
-| `pvfs-core` (~16k LOC) | the kernel — log, nodes, links, ACLs/tags, identity/devices, mounts, storage, projection | — |
-| `pvfs-proto` | daemon/client wire protocol (JSON frames, challenge digest, message types) | pvfs-core |
-| `pvfsd` | per-user daemon — socket, challenge-response auth, ACL-enforced read/write/admin serving | pvfs-core, pvfs-proto |
-| `pvfs-client` | client library — connect, handshake, read/write/admin requests | pvfs-core, pvfs-proto |
-| `pvfs-cli` | the `pvfs` CLI (forest/tree/acl/tag/device admin + `whoami`/`remote`) | pvfs-core, pvfs-client, pvfs-companion |
-| `pvfs-companion` | key vault + tiered signer + loopback identity agent (`pvfs-companion` binary) | pvfs-core |
-| `pvfs-fuse` | streaming FUSE mount + ingest proxy (`pvfs mount`) | pvfs-core, pvfs-proto, pvfs-client |
+| `pvfs-core` (~29k lines) | the kernel — log, nodes, links, ACLs/tags, identity/devices, regions and catalogues, the merged view, mounts, storage, projection | — |
+| `pvfs-proto` | daemon/client wire protocol (JSON frames, raw data frames, challenge digest, message types) | pvfs-core |
+| `pvfsd` | per-user daemon — Unix socket and TCP+TLS listener, challenge-response auth, ACL-enforced read/write/admin serving, the serve jobs | pvfs-core, pvfs-proto, pvfs-client |
+| `pvfs-client` | client library — connect, handshake, requests; the fetchers, the mover, the watch, follow, catalogue, health and notify loops the jobs run | pvfs-core, pvfs-proto |
+| `pvfs-cli` | the `pvfs` CLI | pvfs-core, pvfs-client, pvfs-companion, pvfs-fuse (Linux) |
+| `pvfs-companion` | key vault + tiered signer + loopback identity agent (`pvfs-companion` binary; the macOS app wraps it) | pvfs-core |
+| `pvfs-fuse` | streaming FUSE mount of a node or of the merged view (`pvfs mount --view`), with its read-through cache | pvfs-core, pvfs-client |
 
 Build/test via the Ansible pipeline to a Linux host (`deploy/ansible/`); CI mirrors it on GitHub.
-See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); status: this doc; design: docs 02–23.
+See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); status: this doc; design: docs 02–31.
+
+---
+
+## 6. The D71+ era — the media fleet (2026-08-16 → 2026-09-30)
+
+After 1.4.0 the work moved from building phases to running a fleet: PVOS's media boxes, where
+PVFS replaced rclone and cloudplow. Milestones are numbered in PVOS (`docs/milestones/`); D87–D121
+have no milestone doc there and are recorded in the CHANGELOG and docs 24 and 27. Wire and schema
+steps are tabled in [VERSIONING.md](../VERSIONING.md).
+
+### 6.1 The arcs
+
+| arc | dates | milestones | what it did |
+|---|---|---|---|
+| **The node-model fleet goes live** | 08-16 → 08-29 | D71–D86 | The forest watches the library instead of an arr hook (D71); names moved onto links, and log and wire learned to accept newer formats, so upgrades roll one box at a time (D72, D73 — protocol 4, `PROTO_COMPATIBLE_WITH` 3); feederbox and the QNAP went live (D74, 2026-08-19/20), the NAS became a holder that pulls (D80); signed media quality and the copy ladder (D76); one library, many roots (D81); a first PVFS mount for the library, reverted (D82); the monitoring requirements (D83); hashing where the bytes are (D84, D85); empty directories as content (D86). |
+| **Fleet review and repair** | 08-29 → 09-10 | D87–D124, docs 24, 25, 27 | The fleet review (doc 24): durable dotfile sidecars and parallel hashing (D88, D91, D93, D103), lazy hashing removed (D94, D95), the mover's memory and quarantine (D98, D99, D102), a default-deny rights check (D100), build ids in both binaries (D100, D110), duplicates merged and islands dropped (D113–D119), the re-genesis runbook (doc 25). The D102 external review answered (doc 27; D122–D124). |
+| **Regions own their files** | 09-09 → 09-12 | D125–D140, docs 26, 28, 29 | The new model (doc 26): catalogue regions (D125), the merged view (D126), resolution and drain flags (D127), moving the owner (D128), catalogue replication (D129), the view mount (D130), fleet health (D131), `receive` (D133), the fleet play (D134), the owner supervising the NAS (D135). The pipeline fell from 51 to ~10 minutes (D132). Rehearsed on a lab fleet (D138, D139), then **the production cutover on 2026-09-12** (D140): a fresh forest, one catalogue region per box, no import. |
+| **Running it** | 09-12 → 09-16 | D141–D163 | Busy-owner retries (D141); alerts and a status page in Home Assistant (D142, D143); a mover that pulls several files and ranges at once (D144) and a drain that confirms before it discards (D145); an honest `follow` (D146); mediabox joins with two catalogue-only regions (D147); trash retention (D148); stamped manifests (D149, D150); errors judged by time and reaching the journal (D151, D157–D159); catalogue rows in batches (D154); an unreadable file no longer stops a pass (D156); alerts say when they clear (D161); one client identity per box (D163). |
+| **The presentation layer** | 09-16 → 09-22 | D164–D181 | The arrs and then Plex read the merged view instead of rclone: read-through by the piece with a bounded cache (D165), dotfiles are content (D166), `pvfs trash` (D167), deletes, renames and folders through the view (D169, D170 — protocols 9, 10), lookups from an index (D171), a replay that keeps the catalogue (D173), a status page that asks the running daemon (D174 — protocol 11), every box purging its own trash (D176, D177), the watch's 30 s ceiling (D180). The duplicates were cleaned (D168) and the old forest deleted (2026-09-21). **Plex reads the view since 2026-09-22** (D181), and a roll no longer ends a stream. |
+| **Availability and the move** | 09-23 → 09-29 | D182, D183, D185, D186–D188, D191, D194, D196, D198 | The owner can be lost: the fence, promotion through the companion, dated log copies, `promote.sh` (D182); an owner outage stops no catalogue (D183 — protocol 12, schema 20); an owner that holds regions (D185); the Media app reads the forest through its daemon, and one write per frame ends a ~0.5 s stall per request (D187 — protocol 13); serving at normal priority with background work below it (D191); catalogue installs that write only what changed (D194). **Rolled 2026-09-27; mediabox promoted to owner on 2026-09-29** (D186). D198 then stopped the CLI from waiting on a question nobody could see (it hung the promotion ~9 minutes). |
+| **Keys and forests** | 09-25 → 09-26 | D184, D189, D190, D192, D193, D197 | One companion serves several phrases (D189); root certificates bound to their forest, `bind-certs` (D192 — protocol 14); personal forests rooted in a person's own phrase, signed in by companion or passkey (D193 — protocol 15; D190 is the model); the companion keeps its runtime files (D197). PVOS side: a fresh PVOS rooted in the companion (D184). |
+
+### 6.2 Production rolls
+
+Each box verified by content after the roll (VERSIONING.md). The builds that reached every box (dates Eastern):
+
+| build | rolled | carried |
+|---|---|---|
+| `v1.4-190` | 2026-09-08 | the doc 24 repairs (D103–D118) |
+| `v1.4-285` | 2026-09-12, morning | the region model (D119–D137); the cutover followed that day |
+| `v1.4-292` … `v1.4-312` | 2026-09-12 → 13 | D141–D146 (mediabox joined on `v1.4-312`, D147) |
+| `v1.4-316`, `v1.4-322` | 2026-09-14 | D148; D149, D150 |
+| `v1.4-330` … `v1.4-348` | 2026-09-14 → 16 | D151–D162 |
+| `v1.4-359`, `v1.4-363`, `v1.4-385`, `v1.4-391`, `v1.4-398` | 2026-09-17 → 18 | D163, D165–D167, D169–D171, D173–D178 |
+| `v1.4-420` | 2026-09-22 | D168's `trash put`, D179, D180, D181 |
+| **`v1.4-495`** | **2026-09-27** | D182, D183, D185, D187–D189, D191–D194, D196, D193's PVFS part, the stream-readahead fix — the fleet today |
+
+### 6.3 What the era changed in this document's terms
+
+- **§1's model is no longer what production runs.** The node model (P0–P9: a node per file, locations,
+  `tier`/`evict`) still works and is what a private forest uses; the media fleet runs the region model.
+- **F4's last item, standby failover, is built** as explicit promotion (D128, D182); §3's availability
+  track has A and D built.
+- **§4 items still open**: 3 (Mode B crosslink), 8 (named groups and explicit deny), 9 (sockets in
+  `/run/pvfs`: INSTALL.md's user unit sets it; the fleet's units keep the default `/tmp/pvfs`), 15 (compaction, deferred
+  by decision). Everything else in §4 is resolved.
+- **The roadmap now lives in PVOS `docs/BACKLOG.md`**, including the long-range items from this doc
+  (availability B/C/E, retention for conflicting versions, "nearest", compaction, WASM modules).
