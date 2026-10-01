@@ -1,7 +1,10 @@
 ---
 # PVFS build/test/deploy pipeline.
 #
-# Stages (tags): prepare → deploy → build → test → smoke → install → daemon → report
+# Stages (tags): prepare → reap → deploy → build → test → smoke → install → daemon → report
+#
+# PVOS D201: the reap (idle slots — never a roll slot or one with a `.keep`
+# file — then a free-space check) runs with every `deploy`, before the sync.
 #
 #   ansible-playbook -i inventory.ini pipeline.yml
 #   ansible-playbook -i inventory.ini pipeline.yml --tags test,smoke   # re-run checks only
@@ -43,8 +46,10 @@
     clippy_results: "/tmp/pvfs-clippy-results{{ pvfs_suffix }}.txt"
     smoke_results: "/tmp/pvfs-smoke-results{{ pvfs_suffix }}.txt"
     smoke_script: "/tmp/pvfs-smoke-test{{ pvfs_suffix }}.sh"
-    # How idle a build slot must be before the pipeline reclaims it (D121).
+    # How idle a build slot must be before the pipeline reclaims it (D121),
+    # and the free space a run needs once the reaping is done (PVOS D201).
     reap_after_days: 2
+    min_free_gb: 15
     pvfs_bin: /usr/local/bin/pvfs
     pvfs_user_bin: "{{ ansible_facts.env.HOME }}/.local/bin"
     # The systemd user-service stage (tag: daemon) — INSTALL.md Option C, automated.
@@ -157,6 +162,93 @@
       register: toolchain_install
       changed_when: "'unchanged' not in toolchain_install.stdout and 'is up to date' not in toolchain_install.stdout"
       tags: [prepare]
+
+    # ---- reap (D121; PVOS D201: FIRST, and never a roll slot) --------------
+    # DELETE THE SLOTS NOBODY IS USING.
+    #
+    # Each session slot is a full source + target tree, 6-11 GB. CLAUDE.md says
+    # to delete yours when the work merges, and that rule has now failed twice
+    # in one project: presubuntu hit 96G/96G on 2026-08-16 and 100% again on
+    # 2026-09-08, the second time taking the smoke suite down with a disk-space
+    # error that looked nothing like one ("declared 12588912 B ... exceeds
+    # 105365504 B free"). Doc 24 section 14 item 5 asked for this to be
+    # automated; a rule that depends on remembering is not a rule.
+    #
+    # PVOS D201 — it runs BEFORE the sync now. As the last stage it never ran
+    # for a run that failed earlier, and presubuntu reached 16 MB free (D182).
+    #
+    # Conservative on purpose: only slots whose tree has not been touched in
+    # REAP_AFTER_DAYS, never the one this run is using, never the canonical
+    # /opt/pvfs — and never a ROLL slot (/opt/pvfs-roll*) or one holding a
+    # `.keep` file. A roll slot is the build the fleet runs, or the one it
+    # rolls back to (D186: /opt/pvfs-roll-495 and /opt/pvfs-roll); it sits
+    # idle for weeks by design, and this reaper would have deleted both. An old
+    # slot is worth 7 GB; a slot someone is mid-build in is worth an afternoon;
+    # the fleet's own build is worth a rebuild from the right commit.
+    - name: Reap idle build slots
+      ansible.builtin.shell: |
+        set -o pipefail
+        this="{{ pvfs_root }}"
+        reaped=""; kept=""
+        for d in /opt/pvfs-*; do
+          [ -d "$d" ] || continue
+          [ "$d" = "$this" ] && continue
+          [ "$d" = "/opt/pvfs" ] && continue
+          case "$(basename "$d")" in pvfs-roll*) kept="$kept $d(roll, $(du -sh "$d" 2>/dev/null | cut -f1))"; continue ;; esac
+          if [ -e "$d/.keep" ]; then
+            kept="$kept $d(.keep, $(du -sh "$d" 2>/dev/null | cut -f1))"
+            continue
+          fi
+          # Anything still being written to is in use, whatever its age.
+          if [ -n "$(find "$d" -mindepth 1 -mmin -{{ reap_after_days | int * 1440 }} -print -quit 2>/dev/null)" ]; then
+            continue
+          fi
+          sz=$(du -sh "$d" 2>/dev/null | cut -f1)
+          rm -rf "$d" && reaped="$reaped $d($sz)"
+        done
+        echo "reaped:${reaped:- none}"
+        echo "kept:${kept:- none}"
+      args:
+        executable: /bin/bash
+      become: true
+      register: reap_out
+      changed_when: "'reaped: none' not in reap_out.stdout"
+      tags: [deploy, reap]
+
+    - name: Say what was reaped
+      ansible.builtin.debug:
+        msg: "{{ reap_out.stdout_lines }}"
+      tags: [deploy, reap]
+
+    # PVOS D201 — stop HERE, not mid-build, when the disk is short, listing
+    # every slot (PVFS's and PVOS's) with its size and last change.
+    - name: Enough free space for this run, after the reap
+      ansible.builtin.shell: |
+        set -o pipefail
+        free=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+        if [ "$free" -ge {{ min_free_gb | int }} ]; then
+          echo "free: ${free} GB on / (a run needs about {{ min_free_gb }})"
+          exit 0
+        fi
+        echo "only ${free} GB free on / after the reap; a PVFS run needs about {{ min_free_gb }} GB (-e min_free_gb=… to change)."
+        echo "The build slots (a .keep file keeps one from the reaper; roll slots are always kept):"
+        for d in /opt/pvfs* /opt/pvos*; do
+          [ -d "$d" ] || continue
+          newest=$(find "$d" -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
+          printf '  %-44s %6s  last change %s%s\n' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)" \
+            "$(TZ=America/New_York date -d "@${newest:-0}" '+%Y-%m-%d %-I:%M %p %Z')" "$([ -e "$d/.keep" ] && echo '  (.keep)')"
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: free_out
+      changed_when: false
+      tags: [deploy, reap]
+
+    - name: Free space
+      ansible.builtin.debug:
+        msg: "{{ free_out.stdout_lines }}"
+      tags: [deploy, reap]
 
     # ---- deploy ---------------------------------------------------------------
     - name: Create source directory
@@ -521,51 +613,6 @@
       environment: "{{ user_systemd_env }}"
       changed_when: false
       tags: [daemon]
-
-        # ---- reap (D121) -------------------------------------------------------
-    # DELETE THE SLOTS NOBODY IS USING.
-    #
-    # Each session slot is a full source + target tree, 6-8 GB. CLAUDE.md says
-    # to delete yours when the work merges, and that rule has now failed twice
-    # in one project: presubuntu hit 96G/96G on 2026-08-16 and 100% again on
-    # 2026-09-08, the second time taking the smoke suite down with a disk-space
-    # error that looked nothing like one ("declared 12588912 B ... exceeds
-    # 105365504 B free"). Doc 24 section 14 item 5 asked for this to be
-    # automated; a rule that depends on remembering is not a rule.
-    #
-    # Conservative on purpose: only slots whose target tree has not been
-    # touched in REAP_AFTER_DAYS, never the one this run is using, and never
-    # the canonical /opt/pvfs. An old slot is worth 7 GB; a slot someone is
-    # mid-build in is worth an afternoon.
-    - name: Reap idle build slots
-      ansible.builtin.shell: |
-        set -o pipefail
-        keep="{{ pvfs_root }}"
-        reaped=""
-        for d in /opt/pvfs-*; do
-          [ -d "$d" ] || continue
-          [ "$d" = "$keep" ] && continue
-          [ "$d" = "/opt/pvfs" ] && continue
-          # Anything still being written to is in use, whatever its age.
-          if [ -n "$(find "$d" -mindepth 1 -mmin -{{ reap_after_days | int * 1440 }} -print -quit 2>/dev/null)" ]; then
-            continue
-          fi
-          sz=$(du -sh "$d" 2>/dev/null | cut -f1)
-          rm -rf "$d" && reaped="$reaped $d($sz)"
-        done
-        echo "reaped:${reaped:- none}"
-        df -h / | tail -1
-      args:
-        executable: /bin/bash
-      become: true
-      register: reap_out
-      changed_when: "'reaped: none' not in reap_out.stdout"
-      tags: [reap, report]
-
-    - name: Say what was reaped
-      ansible.builtin.debug:
-        msg: "{{ reap_out.stdout_lines }}"
-      tags: [reap, report]
 
 # ---- report ----------------------------------------------------------------------
     - name: Fetch test results to control machine

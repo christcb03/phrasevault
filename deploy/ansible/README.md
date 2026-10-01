@@ -43,7 +43,7 @@ Stages (also usable as `--tags`):
 | `build` | `cargo build --release --workspace` |
 | `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure** |
 | `lint` | `cargo clippy --all-targets --workspace -- -D warnings` (D121; also runs under `test`) |
-| `reap` | delete `/opt/pvfs-<session>` slots idle for 2+ days, never this run's or `/opt/pvfs` (D121; also runs under `report`) |
+| `reap` | FIRST, before the sync (PVOS D201; it also runs under `deploy`): delete `/opt/pvfs-<session>` slots idle for 2+ days — never this run's, `/opt/pvfs`, a roll slot (`/opt/pvfs-roll*`, the build the fleet runs or rolls back to) or one holding a `.keep` file; then stop the run if `/` has less than `min_free_gb` (15) free, listing every slot (D121) |
 | `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts |
 | `install` | copy the release binary to `/usr/local/bin/pvfs` |
 | `daemon` | run `pvfsd` as a **systemd user service** (INSTALL.md Option C, automated): installs `pvfs`/`pvfsd`/`pvfs-companion` to `~/.local/bin`, the `pvfsd@` user unit + `/run/pvfs` tmpfiles snippet, inits a test forest at `~/pvfs-mounts/smoke`, then proves the lifecycle — enable → client answers over `/run/pvfs` → clean stop (socket removed) → restart. **Leaves the service enabled + running** as a standing daemon testbed |
