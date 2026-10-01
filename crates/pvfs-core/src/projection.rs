@@ -4027,7 +4027,66 @@ fn catch_up_tail(
     // F5.8: exclusive with every other folder for the whole multi-segment
     // walk. The guard drops on return — a failure routed to `full_rebuild`
     // by the caller re-acquires there, sequentially.
-    let _folds = lock_folds(data_dir)?;
+    let folds = lock_folds(data_dir)?;
+    catch_up_tail_locked(conn, data_dir, identity, folds).map(|_| ())
+}
+
+/// PVOS D199 — the fold step of the daemon's one writer: what the logs hold
+/// past the applied marks (a replica's shipped rows), folded now. The fold
+/// lock is TRIED, not waited for: the daemon's own folds all come through
+/// its writer, so a held lock is another process's (a CLI, a view mount),
+/// and waiting for it would hold the writer — every served write behind it
+/// — for up to five seconds. `Busy` instead; the caller tries again with
+/// the writer released. A fold that fails otherwise is the cache lying, and
+/// the whole log is replayed, as `startup_check` routes it (D69). Returns
+/// how many top-log events it folded.
+pub(crate) fn fold_tail_now(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    identity: &mut ForestIdentity,
+) -> Result<u64> {
+    let folds = try_lock_folds(data_dir)?;
+    match catch_up_tail_locked(conn, data_dir, identity, folds) {
+        Ok(n) => Ok(n),
+        Err(e @ PvfsError::Busy { .. }) => Err(e),
+        Err(e) => {
+            eprintln!(
+                "pvfs: incremental fold failed ({e}); discarding the projection cache and \
+                 replaying the full log"
+            );
+            let (before, _) = applied_get(conn, "").unwrap_or((0, String::new()));
+            *identity = full_rebuild(conn, data_dir, "incremental fold failed")?;
+            let (after, _) = applied_get(conn, "").unwrap_or((0, String::new()));
+            Ok(after.saturating_sub(before))
+        }
+    }
+}
+
+/// D199 — the fold lock if it is free this instant; `Busy` (and no "waiting"
+/// line) if another process holds it.
+fn try_lock_folds(data_dir: &std::path::Path) -> Result<FoldLock> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("fold.lock"))
+        .map_err(|e| PvfsError::io("open fold.lock", e))?;
+    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map(FoldLock)
+        .map_err(|_| PvfsError::Busy {
+            op: "fold lock (another pvfs process is folding this forest)".into(),
+            retries: 0,
+        })
+}
+
+/// The Step-4 walk under a fold lock the caller took. Returns how many
+/// top-log events it folded, and counts the fold (D199's hourly figure).
+fn catch_up_tail_locked(
+    conn: &mut Connection,
+    data_dir: &std::path::Path,
+    identity: &ForestIdentity,
+    _folds: FoldLock,
+) -> Result<u64> {
+    let (before, _) = applied_get(conn, "")?;
     replay_log(conn, data_dir, identity, "", 0)?;
     check_pending_moves(conn, data_dir)?;
     // Actives whose baseline lives in a sealed generation are unreachable
@@ -4056,7 +4115,14 @@ fn catch_up_tail(
         detach_log(conn, &rid)?;
         res?;
     }
-    Ok(())
+    let (after, _) = applied_get(conn, "")?;
+    let folded = after.saturating_sub(before);
+    if folded > 0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::writer::COUNTERS.folds.fetch_add(1, Relaxed);
+        crate::writer::COUNTERS.folded_events.fetch_add(folded, Relaxed);
+    }
+    Ok(folded)
 }
 
 // ---- replay-time author-authorization enforcement (doc 06 §3.3) -------------------

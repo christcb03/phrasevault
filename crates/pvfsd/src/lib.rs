@@ -23,7 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pvfs_core::acl::{self, Principal};
 use pvfs_core::ingest::{self, IngestClose, IngestSessionRec};
 use pvfs_core::{
-    crypto, Engine, FilePayload, NodeId, NodeSpec, PreparedEvent, PvfsError, TYPE_FILE, TYPE_FOLDER,
+    crypto, Engine, FilePayload, Held, NodeId, NodeSpec, PreparedEvent, PvfsError, Writer, TYPE_FILE,
+    TYPE_FOLDER,
 };
 use pvfs_proto::{
     auth_digest, read_data_frame, read_frame, read_msg, write_data_frame, write_msg, ChildInfo,
@@ -97,10 +98,19 @@ struct HotRange {
 /// purpose — personal/small-team scale; each view is one SQLite connection.
 const READ_POOL: usize = 4;
 
+/// PVOS D199 — how often the checkpoint thread checkpoints the WAL.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
+
 /// One forest served by the daemon: the writer engine, a pool of read-only
 /// views, its forest id (challenge binding), and in-flight prepared writes.
 pub struct Daemon {
-    engine: Mutex<Engine>,
+    /// PVOS D199 — the daemon's ONE writer: serving and every job's database
+    /// steps take it in turn (see `pvfs_core::writer`).
+    writer: Arc<Writer>,
+    /// PVOS D199 — renames and folder removals through the view, one at a
+    /// time and in order: their disk work runs outside the writer now, and
+    /// two of them on one path must still happen as they were asked.
+    view_ops: Mutex<()>,
     /// Read-only WAL views for concurrent metadata reads. May be empty (view
     /// open failed) — then reads fall back to the writer lock, the pre-pool
     /// behavior.
@@ -191,8 +201,29 @@ impl Daemon {
             .map_while(|_| Engine::open_read_view(engine.data_dir()).ok())
             .map(Mutex::new)
             .collect();
+        let writer = Arc::new(Writer::new(engine));
+        // PVOS D199 §2.8 — a job lowered below serving (D191) is raised for
+        // the length of each hold of the writer.
+        if priority::background_lowered() {
+            writer.set_hold_raise(Some((priority::raise_for_hold, priority::restore_after_hold)));
+        }
+        // PVOS D199 — WAL checkpoints on a thread of their own, never inside
+        // a step of the writer (a served write waits for the step), and the
+        // writer's commits of derived state without an fsync each: index.db
+        // always, and a replica's copy of the owner's log; the owner's log,
+        // the forest's truth, keeps one.
+        // The checkpoint thread keeps the daemon's priority: the writer can
+        // wait on a lock a checkpoint holds, and a lowered checkpoint starved
+        // by load held one for seconds (measured: a served commit 0.9 s).
+        if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {}) {
+            eprintln!("pvfsd: checkpoints stay on the writer's commits: {e}");
+        }
+        if let Err(e) = writer.lock_serving("index sync: normal").set_index_sync_normal() {
+            eprintln!("pvfsd: index.db keeps an fsync per commit: {e}");
+        }
         Daemon {
-            engine: Mutex::new(engine),
+            writer,
+            view_ops: Mutex::new(()),
             readers,
             next_reader: AtomicUsize::new(0),
             forest_id,
@@ -241,7 +272,7 @@ impl Daemon {
                 _ => return false,
             }
         };
-        let e = self.engine.lock().unwrap();
+        let e = self.reader();
         let mut cur = node.to_string();
         // Bounded: a cycle in the link graph must not spin here.
         for _ in 0..64 {
@@ -311,7 +342,12 @@ impl Daemon {
     /// runs) and starve concurrent commits on a slow box — found by the
     /// pvos-test pipeline.
     pub fn commit_region_heads(&self) -> pvfs_core::Result<usize> {
-        self.engine.lock().unwrap().commit_region_heads()
+        self.writer.lock_job("heads").commit_region_heads()
+    }
+
+    /// PVOS D199 — the daemon's one writer, which its jobs share.
+    pub fn writer(&self) -> &Arc<Writer> {
+        &self.writer
     }
 
     /// D127 — conflicting paths in the merged view this box holds, for
@@ -372,7 +408,7 @@ impl Daemon {
         // §3.3a: only a key with admin on the forest root may fence this
         // owner by its word; anyone else's longer log is not believed.
         let judged = {
-            let e = self.engine.lock().unwrap();
+            let e = self.writer.lock_serving("serve: judge a write's tip");
             let trusted = e.may_fence_owner(author).unwrap_or(false);
             e.judge_peer_tip(&who, t.seq, &hash, trusted).map(|v| (v, trusted))
         };
@@ -555,26 +591,43 @@ impl Daemon {
     /// D136 — hold the WRITER lock from outside, for the test that proves
     /// `serve status` never waits on it. Not for production callers.
     #[doc(hidden)]
-    pub fn hold_writer_for_test(&self) -> MutexGuard<'_, Engine> {
-        self.engine.lock().unwrap()
+    pub fn hold_writer_for_test(&self) -> Held<'_> {
+        self.writer.lock_serving("test: hold")
     }
 
     /// Check out an engine for a **read**: round-robin over the read pool, so
     /// up to `READ_POOL` metadata reads run concurrently (plus writes on the
     /// writer). Falls back to the writer lock when the pool is empty.
-    fn reader(&self) -> MutexGuard<'_, Engine> {
+    fn reader(&self) -> Reader<'_> {
         if self.readers.is_empty() {
-            return self.engine.lock().unwrap();
+            return Reader::Writer(self.writer.lock_serving("serve: read (no read pool)"));
         }
         let i = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[i].lock().unwrap()
+        Reader::Pool(self.readers[i].lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Flush the WAL and record a clean shutdown (doc 08 §4 item 4). Called by the
     /// daemon binary after the accept loop stops on SIGTERM/SIGINT, while in-flight
     /// connection threads are best-effort allowed to finish.
     pub fn shutdown_checkpoint(&self) -> Result<(), PvfsError> {
-        self.engine.lock().unwrap().shutdown_checkpoint()
+        self.writer.lock_serving("shutdown checkpoint").shutdown_checkpoint()
+    }
+}
+
+/// A checked-out engine for a read: a pool view, or — with no pool — the
+/// writer itself.
+enum Reader<'a> {
+    Pool(MutexGuard<'a, Engine>),
+    Writer(Held<'a>),
+}
+
+impl std::ops::Deref for Reader<'_> {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        match self {
+            Reader::Pool(g) => g,
+            Reader::Writer(h) => h,
+        }
     }
 }
 
@@ -1168,10 +1221,30 @@ fn do_rename_path(
         (false, Some(hash)) => pvfs_core::RenameExpect::File { hash, size },
         (false, None) => return err("bad_input", "a file is renamed by the hash it was seen with"),
     };
-    // The WRITER: the rows follow the rename at once (bytes are found by
-    // hash → row → path), and a reader is a read-only view. Passes run on
-    // their own connections, so this lock is never held for one.
-    let renamed = daemon.engine.lock().unwrap().rename_region_path(&region.to_string(), from, to, &expect);
+    // PVOS D199 — the checks and reads on a read view, the rename itself with
+    // no engine held, then the rows as ONE step of the writer: they follow
+    // the rename at once (bytes are found by hash → row → path). It used to
+    // run `rename(2)` and the sidecars' renames under the writer. The
+    // view-ops lock keeps renames and removals in the order they came.
+    let region_id = region.to_string();
+    let renamed = {
+        let _order = daemon.view_ops.lock().unwrap_or_else(|p| p.into_inner());
+        let start = daemon.reader().rename_region_plan(&region_id, from, to, &expect);
+        match start {
+            Ok(pvfs_core::fs::RenameStart::Done(r)) => Ok(r),
+            Ok(pvfs_core::fs::RenameStart::Plan(plan)) => {
+                let moved = pvfs_core::fs::rename_in_region(&plan, from, to, &expect);
+                if matches!(moved, Ok(pvfs_core::RenamedHere::Moved)) {
+                    let e = daemon.writer.lock_serving("serve: rename rows");
+                    if let Err(e) = e.rows_follow_rename(&region_id, from, to, plan.is_dir()) {
+                        eprintln!("pvfsd: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+                    }
+                }
+                moved
+            }
+            Err(e) => Err(e),
+        }
+    };
     match renamed {
         Ok(pvfs_core::RenamedHere::Moved) => {
             eprintln!("pvfsd: renamed {from} → {to} in {} for {}", &region[..8], principal.display());
@@ -1189,7 +1262,24 @@ fn do_remove_dir(daemon: &Daemon, principal: &Principal, region: &str, rel_path:
     if let Err(reply) = view_write_gate(daemon, principal, region, "removing a folder") {
         return reply;
     }
-    let removed = daemon.engine.lock().unwrap().remove_region_dir(&region.to_string(), rel_path);
+    // PVOS D199 — as a rename: the reads on a view, the disk with no engine
+    // held, the row as one step of the writer.
+    let region_id = region.to_string();
+    let removed = {
+        let _order = daemon.view_ops.lock().unwrap_or_else(|p| p.into_inner());
+        let roots = daemon.reader().remove_region_dir_plan(&region_id, rel_path);
+        match roots {
+            Ok(None) => Ok(pvfs_core::DirRemovedHere::NotHere),
+            Ok(Some(roots)) => {
+                let r = pvfs_core::fs::remove_dir_in_region(&roots, rel_path);
+                if matches!(r, Ok(pvfs_core::DirRemovedHere::Removed)) {
+                    daemon.writer.lock_serving("serve: folder row").forget_region_dir(&region_id, rel_path);
+                }
+                r
+            }
+            Err(e) => Err(e),
+        }
+    };
     match removed {
         Ok(pvfs_core::DirRemovedHere::Removed) => {
             eprintln!("pvfsd: removed folder {rel_path} of {} for {}", &region[..8], principal.display());
@@ -1806,7 +1896,7 @@ fn do_secure_put<S: io::Read + io::Write>(
     // managed location on first write, and resolve the path. Prepare BEFORE any
     // bytes move, so an unauthorized write is rejected without touching storage.
     let (prepared, path) = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.writer.lock_serving("serve: secure put");
         match e.prepare_secure_write(&author, &id, &hash, ciphertext.len() as u64) {
             Ok(pw) => pw,
             Err(pve) => {
@@ -1956,7 +2046,7 @@ fn do_ingest_begin(
     }
     let session = random_id();
     let (prepared, plan) = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.writer.lock_serving("serve: ingest begin");
         match e.prepare_ingest_begin(
             &author, &parent.to_string(), name, kind, infohash, piece_size, &session, &specs,
         ) {
@@ -2235,7 +2325,7 @@ fn do_ingest_commit(daemon: &Daemon, principal: &Principal, session: &str, file:
                 }
             };
             let prepared = {
-                let e = daemon.engine.lock().unwrap();
+                let e = daemon.writer.lock_serving("serve: ingest commit");
                 e.prepare_ingest_commit(&author, &file.to_string(), &hash, size, &chunks, close.as_ref())
             };
             match prepared {
@@ -2271,7 +2361,7 @@ fn do_ingest_commit(daemon: &Daemon, principal: &Principal, session: &str, file:
                     // file missed it. Resolve the successor and retry-publish.
                     unfreeze();
                     let successor = {
-                        let e = daemon.engine.lock().unwrap();
+                        let e = daemon.writer.lock_serving("serve: ingest successor");
                         e.ingest_successor(&file.to_string())
                     };
                     match successor {
@@ -2314,12 +2404,25 @@ fn ingest_retry_publish(
     part: &std::path::Path,
 ) -> ServerMsg {
     if part.exists() {
-        let manifest = match pvfs_core::sync::compute_manifest(part) {
-            Ok(m) => m,
+        // PVOS D199 — the whole-file hash and the manifest BEFORE the writer
+        // (one read), then under it only the check, the rename and the row.
+        // The hash used to be taken under the writer, and every other write
+        // waited for a whole file to be read (BACKLOG, D136 §4). The size
+        // and mtime seen before the read are checked again under the lock:
+        // bytes that moved meanwhile get the old full re-read instead.
+        let seen = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()));
+        let before = seen(part);
+        let (hash, manifest) = match pvfs_core::sync::hash_with_manifest(part) {
+            Ok(x) => x,
             Err(pve) => return err_from(pve),
         };
-        let mut e = daemon.engine.lock().unwrap();
-        if let Err(pve) = e.swarm_commit(&new.to_string(), part, &manifest) {
+        let mut e = daemon.writer.lock_serving("serve: ingest publish");
+        let published = if before.is_some() && seen(part) == before {
+            e.swarm_commit_hashed(&new.to_string(), part, &manifest, &hash)
+        } else {
+            e.swarm_commit(&new.to_string(), part, &manifest)
+        };
+        if let Err(pve) = published {
             return err_from(pve);
         }
     }
@@ -2362,7 +2465,7 @@ fn do_ingest_abort(
         (s.parent.clone(), s.root.clone(), s.origin.clone())
     };
     let prepared = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.writer.lock_serving("serve: ingest abort");
         let mut pw = match e.prepare_add_node(
             &author,
             &parent,
@@ -2682,7 +2785,7 @@ fn do_prepare_write(
         }
     }
     let prepared = {
-        let e = daemon.engine.lock().unwrap();
+        let e = daemon.writer.lock_serving("serve: prepare");
         match op {
             WriteOp::Mkdir { parent, label } => e.prepare_add_node(
                 &author,
@@ -2889,12 +2992,14 @@ fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEven
             Err(pve) => return err_from(pve),
         }
     }
-    let mut e = daemon.engine.lock().unwrap();
-    // The same bounded Busy retry as a two-phase commit (see do_commit).
+    // The same bounded Busy retry as a two-phase commit (see do_commit),
+    // with the writer released while it sleeps (D199).
     let mut attempt = 0;
     let outcome = loop {
+        let mut e = daemon.writer.lock_serving("serve: commit signed");
         match e.commit_member_write(events.clone()) {
             Err(PvfsError::Busy { .. }) if attempt < 4 => {
+                drop(e);
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
             }
@@ -2936,7 +3041,6 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
         ev.set_author_sig(sig);
         events.push(ev);
     }
-    let mut e = daemon.engine.lock().unwrap();
     // A member write must not fail merely because the projection was busy for a
     // moment. The owner's serve jobs (tier, evict, reclaim) take the write lock
     // on a timer, and a replica's write landing in that window used to come back
@@ -2948,15 +3052,19 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
     // means nothing was applied, so there is no half-write to reconcile.
     //
     // Bounded, because a lock held for seconds is a real problem and should be
-    // reported rather than waited out forever.
+    // reported rather than waited out forever. PVOS D199: in-process writers
+    // queue on the one writer now, so a `Busy` here is another process's
+    // lock — and the writer is released while this sleeps.
     let mut attempt = 0;
-    let outcome = loop {
+    let (outcome, e) = loop {
+        let mut e = daemon.writer.lock_serving("serve: commit");
         match e.commit_member_write(events.clone()) {
             Err(PvfsError::Busy { .. }) if attempt < 4 => {
+                drop(e);
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
             }
-            other => break other,
+            other => break (other, e),
         }
     };
     match outcome {
@@ -2987,7 +3095,7 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
 /// sessions file is touched.
 fn finish_ingest_followup(
     daemon: &Daemon,
-    mut e: MutexGuard<'_, Engine>,
+    mut e: Held<'_>,
     followup: IngestFollowup,
     result_id: String,
 ) -> ServerMsg {

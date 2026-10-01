@@ -2101,17 +2101,34 @@ impl Engine {
         part: &Path,
         manifest: &[[u8; 32]],
     ) -> Result<PathBuf> {
+        let mut f = std::fs::File::open(part).map_err(|e| PvfsError::io("open swarm part", e))?;
+        let mut hasher = blake3::Hasher::new();
+        std::io::copy(&mut f, &mut hasher).map_err(|e| PvfsError::io("hash swarm part", e))?;
+        drop(f);
+        let actual = hasher.finalize().to_hex().to_string();
+        self.swarm_commit_hashed(id, part, manifest, &actual)
+    }
+
+    /// PVOS D199 — [`Engine::swarm_commit`] for bytes the caller has already
+    /// hashed (`actual`, the whole-file blake3 of `part`), so the daemon's
+    /// ingest publish-retry reads the file BEFORE it takes the writer: the
+    /// read was the whole hold, and every other write waited for it. The
+    /// caller keeps `part` from changing meanwhile (the retry checks its
+    /// size and mtime again under the writer).
+    pub fn swarm_commit_hashed(
+        &mut self,
+        id: &NodeId,
+        part: &Path,
+        manifest: &[[u8; 32]],
+        actual: &str,
+    ) -> Result<PathBuf> {
         let n = fetch_node(&self.conn, id)?.ok_or(PvfsError::NotFound {
             kind: "node",
             id: id.clone(),
         })?;
         let payload = FilePayload::decode(&n.payload)?;
         let dest = sync_store_path(&self.data_dir, id)?;
-        let mut f = std::fs::File::open(part).map_err(|e| PvfsError::io("open swarm part", e))?;
-        let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut f, &mut hasher).map_err(|e| PvfsError::io("hash swarm part", e))?;
-        drop(f);
-        let actual = hasher.finalize().to_hex().to_string();
+        let actual = actual.to_string();
         if payload.content_hash.is_empty() {
             // the fetcher only swarms hashed files; refuse a bypass
             return Err(bad("sync", "swarm publish requires a hashed file"));

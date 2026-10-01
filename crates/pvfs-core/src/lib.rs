@@ -54,6 +54,7 @@ pub mod serve;
 pub mod storage;
 pub mod sync;
 pub mod walk;
+pub mod writer;
 
 pub use acl::{Principal, ACL_A, ACL_R, ACL_RWA, ACL_W};
 pub use engine::{
@@ -117,3 +118,4 @@ pub use orderkey::OrderKey;
 pub use storage::ByteRange;
 pub use sync::SyncSink;
 pub use walk::{TreeWalk, WalkEntry};
+pub use writer::{Db, Held, OwnDb, SharedDb, Writer, WriterStats};

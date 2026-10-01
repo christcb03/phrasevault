@@ -210,6 +210,45 @@ pub fn catch_up(data_dir: &Path, client: &mut Client) {
     })();
 }
 
+/// PVOS D199 — [`catch_up`] through `db`: the tail pulled with no lock held,
+/// its rows in steps (≤256, as the reads come), the region generations on
+/// their own files, then one fold step. In the daemon that is its one
+/// writer — no `ReplicaStore` connection beside it and no engine opened to
+/// fold. Best-effort, as `catch_up`: a fold another process holds the lock
+/// for is left to the follow job's next tick.
+pub fn catch_up_db<D: pvfs_core::Db>(db: &D, client: &mut Client) {
+    let _ = (|| -> Result<()> {
+        let mut from = db.read(|e| e.log_tip())? + 1;
+        loop {
+            let (_tip, events) = client.log_read(from, 256, "").map_err(remote_err)?;
+            if events.is_empty() {
+                break;
+            }
+            let rows: Vec<pvfs_core::log_store::EventRow> = events
+                .iter()
+                .map(|w| -> Result<pvfs_core::log_store::EventRow> {
+                    Ok(pvfs_core::log_store::EventRow {
+                        seq: w.seq,
+                        kind: w.kind.clone(),
+                        body: hex_decode(&w.body)?,
+                        chain_hash: hex_decode(&w.chain_hash)?,
+                        written_at: w.written_at,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            from = db.write("catch-up: rows", |e| e.ingest_log_rows(&rows))? + 1;
+        }
+        let data_dir = db.read(|e| Ok(e.data_dir().to_path_buf()))?;
+        let scope = pvfs_core::ReplicaSource::load(&data_dir)
+            .map(|s| s.region)
+            .unwrap_or_default();
+        let scope = if scope.is_empty() { None } else { Some(scope) };
+        crate::regions::sync_generations(client, &data_dir, scope.as_deref())?;
+        db.write("catch-up: fold", |e| e.catch_up())?;
+        Ok(())
+    })();
+}
+
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
     hex::decode(s).map_err(|e| PvfsError::BadInput {
         field: "advertise".into(),

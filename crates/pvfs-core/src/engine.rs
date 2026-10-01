@@ -17,8 +17,8 @@ use crate::orderkey::OrderKey;
 use crate::projection::{self, ForestIdentity};
 use crate::walk::{TreeWalk, WalkEntry};
 
-const LOG_FILE: &str = "log.db";
-const INDEX_FILE: &str = "index.db";
+pub(crate) const LOG_FILE: &str = "log.db";
+pub(crate) const INDEX_FILE: &str = "index.db";
 
 /// Caller-provided inputs for `add_node`; the engine fills id/sig/created_at.
 #[derive(Debug, Clone)]
@@ -252,7 +252,7 @@ pub struct Engine {
     /// hashes every unhashed file it meets, so "between passes" is the wrong
     /// granularity for a stop: on the NAS holder that meant SIGTERM was ignored
     /// for hours and the box could not be rolled at all.
-    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// D154 — a catalogue pass commits its rows every this many rows or this
     /// many milliseconds, whichever comes first (`set_catalogue_batch`).
     pub(crate) catalogue_batch: (usize, u64),
@@ -313,14 +313,6 @@ impl Engine {
     #[doc(hidden)]
     pub fn on_catalogue_read(&mut self, hook: Option<CatalogueReadHook>) {
         self.catalogue_read_hook = hook;
-    }
-
-    /// Raise the stop flag, as SIGTERM does — the one `set_cancel` gave, or a
-    /// new one if none was (the D154 seam's stop).
-    pub(crate) fn raise_cancel(&mut self) {
-        self.cancel
-            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Has a stop been asked for?
@@ -756,6 +748,7 @@ impl Engine {
             return Self::open_replica(data_dir);
         }
         let device = DeviceKeyCache::load(data_dir)?;
+        crate::writer::COUNTERS.engine_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let others = probe_other_writers(data_dir);
         let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
@@ -875,10 +868,19 @@ impl Engine {
     /// errors instead of rebuilding). Read methods behave identically; any
     /// mutating call fails at the SQLite layer, so misuse cannot corrupt.
     /// Open views only while a writer `Engine` has the forest open.
+    ///
+    /// PVOS D199 — a replica's view too. It used to load the forest's device
+    /// key, which a replica does not have (it runs on an ephemeral key), so on
+    /// every replica the daemon's read pool came up EMPTY without a word and
+    /// every read — `serve status`, view listings, the manifests and bytes
+    /// peers fetch — took the writer lock. A replica's view carries the same
+    /// ephemeral key and `replica` flag as `open_replica`.
     pub fn open_read_view(data_dir: &Path) -> Result<Engine> {
-        let device = DeviceKeyCache::load(data_dir)?;
+        let replica = crate::replica::marker_path(data_dir).exists();
+        let device = if replica { DeviceKeyCache::ephemeral()? } else { DeviceKeyCache::load(data_dir)? };
         let conn = open_connection_read_only(data_dir)?;
         let identity = projection::read_view_check(&conn)?;
+        crate::writer::COUNTERS.read_views.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Engine {
             conn,
             data_dir: data_dir.to_path_buf(),
@@ -887,7 +889,7 @@ impl Engine {
             // `closed: true` keeps Drop from touching the clean-shutdown flag —
             // shutdown bookkeeping belongs to the writer engine alone.
             closed: true,
-            replica: false,
+            replica,
             _writer_lock: None,
             own_pin: std::sync::OnceLock::new(),
             cancel: None,
@@ -905,6 +907,7 @@ impl Engine {
     /// engine plumbing and every log write is refused.
     pub fn open_replica(data_dir: &Path) -> Result<Engine> {
         let device = DeviceKeyCache::ephemeral()?;
+        crate::writer::COUNTERS.engine_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let others = probe_other_writers(data_dir);
         let lock = take_writer_lock(data_dir);
         let mut conn = open_connection(data_dir)?;
@@ -1397,6 +1400,84 @@ impl Engine {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// D194 — SQLite's `data_version` on this connection: it moves whenever
+    /// ANOTHER connection commits to `index.db`, never for this connection's
+    /// own writes. PVOS D199: in the daemon every in-process write is this
+    /// connection's, so it moves only for another process (a CLI, a mount).
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .map_err(map_db("data version"))
+    }
+
+    /// PVOS D199 — how many WAL pages this connection lets build up before a
+    /// commit of its own checkpoints them (SQLite's default 1,000; 0 = never:
+    /// the daemon checkpoints from a thread of its own, `Writer::offload_checkpoints`).
+    pub fn set_wal_autocheckpoint(&self, pages: u32) -> Result<()> {
+        self.conn
+            .query_row(&format!("PRAGMA wal_autocheckpoint = {pages}"), [], |_| Ok(()))
+            .map_err(map_db("wal autocheckpoint"))
+    }
+
+    /// PVOS D199 — commits of derived state on this connection without an
+    /// fsync each (`synchronous = NORMAL`). WAL stays atomic and consistent;
+    /// what an OS crash or a power cut can cost is the last commits:
+    ///
+    /// - `index.db`, always: everything in it is derived — the projection
+    ///   from the log (the startup check catches it up; an index ahead of its
+    ///   log is its full-rebuild case), a box's own catalogue rows from its
+    ///   disk (the next pass), fetched snapshots from their boxes, published
+    ///   heads from the log's attested ones (D173);
+    /// - `log.db` on a **replica**: a verified copy of the owner's log, so a
+    ///   lost tail is fetched again, and a log that went back is behind its
+    ///   owner, never ahead (D182 fences only on ahead). The owner's log —
+    ///   the forest's truth — keeps FULL, and so does a promoted box's at its
+    ///   next start.
+    ///
+    /// The daemon's writer sets it: on presubuntu's disk an fsync is 65–80 ms,
+    /// and every step held the writer at least that long.
+    pub fn set_index_sync_normal(&self) -> Result<()> {
+        let log = if self.replica { "NORMAL" } else { "FULL" };
+        self.conn
+            .execute_batch(&format!("PRAGMA main.synchronous = NORMAL; PRAGMA log.synchronous = {log};"))
+            .map_err(map_db("synchronous"))
+    }
+
+    /// D199 — the `index.db` and `log.db` sync levels (SQLite's numbers:
+    /// 1 NORMAL, 2 FULL).
+    #[doc(hidden)]
+    pub fn sync_levels(&self) -> Result<(i64, i64)> {
+        let main: i64 = self.conn.query_row("PRAGMA main.synchronous", [], |r| r.get(0)).map_err(map_db("synchronous"))?;
+        let log: i64 = self.conn.query_row("PRAGMA log.synchronous", [], |r| r.get(0)).map_err(map_db("synchronous"))?;
+        Ok((main, log))
+    }
+
+    /// D199 — the setting [`Engine::set_wal_autocheckpoint`] made.
+    #[doc(hidden)]
+    pub fn wal_autocheckpoint(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .map_err(map_db("wal autocheckpoint"))
+    }
+
+    /// PVOS D199 — a replica's shipped log rows, appended on THIS connection
+    /// (the daemon's writer) exactly as `ReplicaStore::append` appends them:
+    /// chain-verified from the tip, overlap verified then skipped. The
+    /// projection lags until [`Engine::catch_up`] folds them. Returns the new
+    /// tip.
+    pub fn ingest_log_rows(&mut self, rows: &[crate::log_store::EventRow]) -> Result<u64> {
+        crate::replica::append_shipped(&mut self.conn, rows)
+    }
+
+    /// PVOS D199 — fold what the logs hold past the applied marks, now: the
+    /// follow job's fold, as one step of the daemon's writer instead of an
+    /// engine opened (and its log folded) to be closed again. The fold lock
+    /// is tried, not waited for (`Busy`: another process is folding; try
+    /// again with the writer released). Returns the top-log events folded.
+    pub fn catch_up(&mut self) -> Result<u64> {
+        projection::fold_tail_now(&mut self.conn, &self.data_dir, &mut self.identity)
     }
 
     pub fn device_pubkey(&self) -> Vec<u8> {
