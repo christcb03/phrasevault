@@ -98,6 +98,15 @@ fn strict() -> bool {
     std::env::var("PVFS_D199_STRICT").is_ok_and(|v| v == "1")
 }
 
+/// `PVFS_D199_NO_RAISE=1`: job threads keep their lowered priority while they
+/// hold the writer (D199 §2.8 off), for the measurement with and without.
+fn no_raise_if_asked(w: &pvfs_core::Writer) {
+    if std::env::var("PVFS_D199_NO_RAISE").is_ok_and(|v| v == "1") {
+        w.set_hold_raise(None);
+        println!("D199: holds are NOT raised (PVFS_D199_NO_RAISE=1)");
+    }
+}
+
 /// Run a job's load as the daemon runs its jobs: on a thread lowered below
 /// serving (D191 — nice +10 and the idle disk class), so a step that holds
 /// the writer holds it at background priority, the inversion D191 §8 named.
@@ -207,7 +216,22 @@ fn pct(v: &[Duration], p: f64) -> Duration {
 
 /// The verdict on one load: what the probe saw, and what the writer says the
 /// served ops waited for it.
-fn judge(label: &str, probe: (Vec<Duration>, Vec<String>), waits: Vec<(String, Duration)>) {
+fn judge(label: &str, probe: (Vec<Duration>, Vec<String>), waits: Vec<(String, Duration)>, holds: Vec<(String, Duration)>) {
+    // What held the writer, by kind of step (the job's, the served ops').
+    let mut kinds: std::collections::BTreeMap<String, Vec<Duration>> = std::collections::BTreeMap::new();
+    for (who, d) in holds {
+        let kind = who.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        kinds.entry(kind).or_default().push(d);
+    }
+    for (kind, v) in &kinds {
+        println!(
+            "D199 {label}: held by {kind}: {} holds, p50 {:?} p99 {:?} max {:?}",
+            v.len(),
+            pct(v, 0.5),
+            pct(v, 0.99),
+            pct(v, 1.0)
+        );
+    }
     let (lat, errs) = probe;
     let served: Vec<Duration> = waits.into_iter().filter(|(who, _)| who.starts_with("serve: ")).map(|(_, d)| d).collect();
     println!(
@@ -293,6 +317,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
     let daemon = Arc::new(Daemon::new(owner));
     serve_on(Arc::clone(&daemon), &sock);
     let writer = Arc::clone(daemon.writer());
+    no_raise_if_asked(&writer);
     let mkdirs = |tag: &'static str| {
         let (sock, key, pubkey, parent) = (sock.clone(), ckey.clone(), cpub.clone(), probes.clone());
         Probe::start(move |i| {
@@ -332,7 +357,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
             (first, first_took, second)
         })
     };
-    judge("watch", probe.finish(), writer.take_waits());
+    judge("watch", probe.finish(), writer.take_waits(), writer.take_holds());
     assert_eq!(first[0].stats.added, files as u64);
     assert_eq!(second[0].stats.changed, files.div_ceil(10) as u64);
     println!("D199 watch: first pass over {files} files took {first_took:?}");
@@ -347,6 +372,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
     let bytes2 = Engine::region_manifest_bytes(&far, 2, &head2);
     let hash2 = blake3::hash(&bytes2).to_hex().to_string();
     writer.take_waits();
+    writer.take_holds();
     let probe = mkdirs("install");
     std::thread::sleep(Duration::from_millis(100));
     let (got1, install_took, got2) = {
@@ -363,7 +389,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
     };
     assert_eq!((got1.rows, got1.added, got1.changed, got1.removed), (rows, rows, 0, 0));
     assert_eq!((got2.added, got2.changed, got2.removed), (0, 2, 0));
-    judge("catalogue install", probe.finish(), writer.take_waits());
+    judge("catalogue install", probe.finish(), writer.take_waits(), writer.take_holds());
     println!("D199 catalogue: a first install of {rows} rows took {install_took:?}");
     writer.trace_waits(false);
 }
@@ -413,6 +439,7 @@ fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
     let replica = Arc::new(Daemon::new(Engine::open(&rdata).unwrap()));
     serve_on(Arc::clone(&replica), &rsock);
     let writer = Arc::clone(replica.writer());
+    no_raise_if_asked(&writer);
     writer.trace_waits(true);
 
     let probe = {
@@ -450,7 +477,7 @@ fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
     let caught_up = t.elapsed();
     stop.store(true, Ordering::SeqCst);
     follower.join().unwrap().unwrap();
-    judge("follow", probe.finish(), writer.take_waits());
+    judge("follow", probe.finish(), writer.take_waits(), writer.take_holds());
     println!("D199 follow: a backlog of {backlog} events caught up in {caught_up:?}");
     // What follow landed is folded: the replica's projection holds the backlog.
     let view = Engine::open_read_view(&rdata).unwrap();

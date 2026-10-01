@@ -93,6 +93,13 @@ pub struct WriterStats {
     pub longest_wait_by: String,
 }
 
+/// D199 §2.8 — how a job thread the daemon lowered below serving (D191) is
+/// raised while it holds the writer, and put back after: `raise` runs when a
+/// job takes the writer and returns what `restore` needs when the hold ends
+/// (`None`: nothing was changed). A served write waiting on a step must not
+/// wait on a thread the disk and CPU schedulers are told to starve.
+pub type HoldRaise = (fn() -> Option<u64>, fn(u64));
+
 /// The daemon's one writer engine and its lock (D199).
 pub struct Writer {
     engine: Mutex<Engine>,
@@ -109,8 +116,11 @@ pub struct Writer {
     last_holder: Mutex<Option<Cow<'static, str>>>,
     stats: Mutex<WriterStats>,
     poison_said: AtomicBool,
-    /// Test seam (`trace_waits`): every acquisition's name and wait.
+    /// Test seam (`trace_waits`): every acquisition's name and wait, and
+    /// every hold's name and length.
     trace: Mutex<Option<Vec<(String, Duration)>>>,
+    holds: Mutex<Option<Vec<(String, Duration)>>>,
+    hold_raise: Mutex<Option<HoldRaise>>,
 }
 
 /// One hold of the writer: the engine, for as long as this lives.
@@ -119,6 +129,8 @@ pub struct Held<'a> {
     writer: &'a Writer,
     what: Cow<'static, str>,
     since: Instant,
+    /// A job thread raised for this hold, and how to put it back.
+    raised: Option<(fn(u64), u64)>,
 }
 
 impl std::ops::Deref for Held<'_> {
@@ -138,6 +150,9 @@ impl Drop for Held<'_> {
     fn drop(&mut self) {
         // Still held while this runs: the engine's guard drops after it.
         self.writer.released(&self.what, self.since.elapsed());
+        if let Some((restore, token)) = self.raised.take() {
+            restore(token);
+        }
     }
 }
 
@@ -156,6 +171,8 @@ impl Writer {
             stats: Mutex::new(WriterStats::default()),
             poison_said: AtomicBool::new(false),
             trace: Mutex::new(None),
+            holds: Mutex::new(None),
+            hold_raise: Mutex::new(None),
         }
     }
 
@@ -207,7 +224,17 @@ impl Writer {
             }
         }
         let engine = self.take();
-        self.acquired(engine, what, asked)
+        let raise = *self.hold_raise.lock().unwrap_or_else(|p| p.into_inner());
+        let raised = raise.and_then(|(raise, restore)| raise().map(|token| (restore, token)));
+        let mut held = self.acquired(engine, what, asked);
+        held.raised = raised;
+        held
+    }
+
+    /// D199 §2.8 — raise job threads for their holds (`None`: leave them as
+    /// they are). pvfsd sets it when its background runs lowered.
+    pub fn set_hold_raise(&self, raise: Option<HoldRaise>) {
+        *self.hold_raise.lock().unwrap_or_else(|p| p.into_inner()) = raise;
     }
 
     /// One step of a background job: the writer for as long as `f` runs.
@@ -222,6 +249,18 @@ impl Writer {
     #[doc(hidden)]
     pub fn trace_waits(&self, on: bool) {
         *self.trace.lock().unwrap_or_else(|p| p.into_inner()) = on.then(Vec::new);
+        *self.holds.lock().unwrap_or_else(|p| p.into_inner()) = on.then(Vec::new);
+    }
+
+    /// Test seam: the holds recorded since the last call (name, length).
+    #[doc(hidden)]
+    pub fn take_holds(&self) -> Vec<(String, Duration)> {
+        self.holds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Test seam: the waits recorded since the last call.
@@ -290,13 +329,16 @@ impl Writer {
                 self.last_holder.lock().unwrap_or_else(|p| p.into_inner()).as_deref().unwrap_or("nobody")
             );
         }
-        Held { engine, writer: self, what, since: Instant::now() }
+        Held { engine, writer: self, what, since: Instant::now(), raised: None }
     }
 
     fn released(&self, what: &str, held: Duration) {
         {
             let mut h = self.holder.lock().unwrap_or_else(|p| p.into_inner());
             *self.last_holder.lock().unwrap_or_else(|p| p.into_inner()) = h.take();
+        }
+        if let Some(t) = self.holds.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            t.push((what.to_string(), held));
         }
         let mut s = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         s.steps += 1;

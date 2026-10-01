@@ -99,6 +99,83 @@ mod imp {
         Ok((nice, (io as u32) >> IOPRIO_CLASS_SHIFT))
     }
 
+    const IOPRIO_BE_NORMAL: libc::c_int =
+        ((super::IO_CLASS_BEST_EFFORT << IOPRIO_CLASS_SHIFT) | 4) as libc::c_int;
+    const IO_RAISED: u64 = 1 << 63;
+    const NICE_RAISED: u64 = 1 << 62;
+    static NICE_DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn ioprio_raw(tid: i32) -> io::Result<libc::c_int> {
+        // SAFETY: ioprio_get takes two integers and reads no memory of ours.
+        let v = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, tid as libc::c_int) };
+        if v < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(v as libc::c_int)
+    }
+
+    fn set_ioprio(tid: i32, v: libc::c_int) -> io::Result<()> {
+        // SAFETY: ioprio_set takes integers and reads no memory of ours.
+        if unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, tid as libc::c_int, v) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn set_nice(tid: i32, nice: i32) -> io::Result<()> {
+        // SAFETY: setpriority takes integers; with this thread's id it
+        // changes this thread alone.
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// PVOS D199 — this (lowered) thread, for a hold of the daemon's
+    /// writer: out of the idle disk class (no privilege needed), and back to
+    /// the process's nice value when its limit allows (`LimitNICE=`); the
+    /// first refusal is said once and not tried again. The token says what
+    /// to put back.
+    pub fn raise_for_hold() -> Option<u64> {
+        let tid = current_tid();
+        let mut token = 0u64;
+        if let Ok(io) = ioprio_raw(tid) {
+            if (io as u32) >> IOPRIO_CLASS_SHIFT == super::IO_CLASS_IDLE && set_ioprio(tid, IOPRIO_BE_NORMAL).is_ok() {
+                token |= IO_RAISED | (io as u64 & 0xffff);
+            }
+        }
+        if !NICE_DENIED.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: getpid takes no arguments and cannot fail.
+            let base = nice_of(unsafe { libc::getpid() });
+            if let (Ok(nice), Ok(base)) = (nice_of(tid), base) {
+                if base < nice {
+                    match set_nice(tid, base) {
+                        Ok(()) => token |= NICE_RAISED | (((nice + 20) as u64 & 0xff) << 32),
+                        Err(e) => {
+                            NICE_DENIED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "pvfsd: a job holding the writer keeps its lowered CPU priority ({e}; \
+                                 raising it back needs LimitNICE=); its disk class is raised for the hold"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        (token != 0).then_some(token)
+    }
+
+    /// Put back what [`raise_for_hold`] raised (lowering needs no privilege).
+    pub fn restore_after_hold(token: u64) {
+        let tid = current_tid();
+        if token & IO_RAISED != 0 {
+            let _ = set_ioprio(tid, (token & 0xffff) as libc::c_int);
+        }
+        if token & NICE_RAISED != 0 {
+            let _ = set_nice(tid, ((token >> 32) & 0xff) as i32 - 20);
+        }
+    }
+
     pub fn lower_this_thread(step: i32) -> io::Result<()> {
         let tid = current_tid();
         let target = (nice_of(tid)? + step).min(19);
@@ -130,6 +207,12 @@ mod imp {
     pub fn lower_this_thread(_step: i32) -> io::Result<()> {
         Ok(())
     }
+
+    pub fn raise_for_hold() -> Option<u64> {
+        None
+    }
+
+    pub fn restore_after_hold(_token: u64) {}
 }
 
 /// The calling thread's kernel id (Linux; 0 elsewhere).
@@ -148,6 +231,21 @@ pub fn thread_priority(tid: i32) -> std::io::Result<(i32, u32)> {
 /// but background work call this. A no-op off Linux.
 pub fn lower_this_thread(step: i32) -> std::io::Result<()> {
     imp::lower_this_thread(step)
+}
+
+/// PVOS D199 §2.8 — for `Writer::set_hold_raise`: a lowered job thread that
+/// holds the daemon's writer runs at serving's priority for the hold — out
+/// of the idle disk class always, and at the process's nice value when the
+/// unit's `LimitNICE=` allows. A served write waiting on that step would
+/// otherwise wait on a thread the disk scheduler is told to starve (under
+/// mq-deadline an idle-class write can wait ten seconds, D191 §1.6).
+pub fn raise_for_hold() -> Option<u64> {
+    imp::raise_for_hold()
+}
+
+/// Put back what [`raise_for_hold`] raised.
+pub fn restore_after_hold(token: u64) {
+    imp::restore_after_hold(token)
 }
 
 /// Lower the calling thread if the policy says so; a failure is said, never
@@ -215,5 +313,26 @@ mod tests {
         assert_eq!(sibling, me, "a thread that never lowered keeps the process's priority");
         assert_eq!(thread_priority(current_tid()).unwrap(), me, "and so does the caller");
         assert_ne!(me.1, IO_CLASS_IDLE, "the test itself does not run in the idle class");
+    }
+
+    /// PVOS D199 — a lowered thread raised for a hold leaves the idle disk
+    /// class, and goes back to it after; its nice value is back where it was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hold_raises_a_lowered_thread_and_puts_it_back() {
+        let (lowered, raised, restored) = std::thread::spawn(|| {
+            lower_this_thread(BACKGROUND_NICE).unwrap();
+            let lowered = thread_priority(current_tid()).unwrap();
+            let token = raise_for_hold().expect("the idle class is left, which needs no privilege");
+            let raised = thread_priority(current_tid()).unwrap();
+            restore_after_hold(token);
+            (lowered, raised, thread_priority(current_tid()).unwrap())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(lowered.1, IO_CLASS_IDLE);
+        assert_eq!(raised.1, IO_CLASS_BEST_EFFORT, "the hold runs in the best-effort class");
+        assert!(raised.0 <= lowered.0, "and no lower on the CPU");
+        assert_eq!(restored, lowered, "put back after the hold");
     }
 }

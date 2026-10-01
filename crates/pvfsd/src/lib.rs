@@ -198,8 +198,14 @@ impl Daemon {
             .map_while(|_| Engine::open_read_view(engine.data_dir()).ok())
             .map(Mutex::new)
             .collect();
+        let writer = Arc::new(Writer::new(engine));
+        // PVOS D199 §2.8 — a job lowered below serving (D191) is raised for
+        // the length of each hold of the writer.
+        if priority::background_lowered() {
+            writer.set_hold_raise(Some((priority::raise_for_hold, priority::restore_after_hold)));
+        }
         Daemon {
-            writer: Arc::new(Writer::new(engine)),
+            writer,
             view_ops: Mutex::new(()),
             readers,
             next_reader: AtomicUsize::new(0),

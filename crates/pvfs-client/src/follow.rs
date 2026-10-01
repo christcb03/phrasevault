@@ -13,6 +13,14 @@ use pvfs_core::{crypto, identity, Engine, PvfsError, ReplicaSource, ReplicaStore
 
 use crate::Client;
 
+/// How many events the CLI's follower asks for at a time.
+const BATCH: u32 = 512;
+
+/// PVOS D199 — how many the daemon's follower asks for at a time: each batch
+/// is one ingest step and one fold step of the daemon's writer, so a long
+/// backlog after an outage lands in short holds (a fold costs per event).
+pub const SHARED_BATCH: u32 = 128;
+
 /// Reconnect/backoff delay between failed sessions: 2 s doubling to 30 s
 /// (PVOS D196). It was a flat 2 s, so a follower pointed at a fenced or
 /// behind owner, or at another branch, dialled 1,800 times an hour (D182).
@@ -135,7 +143,7 @@ pub fn run(
     notify: impl FnMut(FollowEvent),
 ) -> Result<(), PvfsError> {
     let dial = ReplicaSource::load(data_dir)?;
-    follow(data_dir, &dial, poll_ms, stop, notify, &mut OwnStore { data_dir })
+    follow(data_dir, &dial, poll_ms, BATCH, stop, notify, &mut OwnStore { data_dir })
 }
 
 /// PVOS D199 — the daemon's follower, on its one writer: each batch the
@@ -154,7 +162,7 @@ pub fn run_shared(
     let dial = ReplicaSource::load(&data_dir)?;
     let view = writer.read_view()?;
     let mut store = SharedStore { writer, view, fold_due: false, said: None };
-    follow(&data_dir, &dial, poll_ms, stop, notify, &mut store)
+    follow(&data_dir, &dial, poll_ms, SHARED_BATCH, stop, notify, &mut store)
 }
 
 /// Where a follower lands what it is shipped, and how it folds it.
@@ -243,6 +251,7 @@ fn follow(
     data_dir: &Path,
     dial: &ReplicaSource,
     poll_ms: u64,
+    batch: u32,
     stop: &AtomicBool,
     mut notify: impl FnMut(FollowEvent),
     store: &mut dyn Ingest,
@@ -276,7 +285,7 @@ fn follow(
                     break; // back off + retry
                 }
             };
-            let (source_tip, events) = match client.log_wait(from, 512, poll_ms, "") {
+            let (source_tip, events) = match client.log_wait(from, batch, poll_ms, "") {
                 Ok(r) => r,
                 Err(e) => {
                     notify(FollowEvent::Retrying {
