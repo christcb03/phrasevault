@@ -125,7 +125,7 @@ fn the_view_mount_lists_the_union_and_serves_admitted_bytes() {
     e.close().unwrap();
 
     let mnt = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_view_mount(&data_dir, mnt.path()).unwrap();
+    let session = pvfs_fuse::MountGuard::new(pvfs_fuse::spawn_view_mount(&data_dir, mnt.path()).unwrap(), mnt.path());
 
     // The union, one level at a time; the unhashed region's file is absent.
     assert_eq!(names(mnt.path()), vec!["Movies"]);
@@ -157,5 +157,5 @@ fn the_view_mount_lists_the_union_and_serves_admitted_bytes() {
     assert!(std::fs::write(same.with_file_name("new.mkv"), b"x").is_err(), "a write is refused");
     assert!(std::fs::OpenOptions::new().write(true).open(&same).is_err(), "and so is opening a file to write");
     assert_eq!(std::fs::read(&same).unwrap(), b"identical bytes");
-    drop(session);
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

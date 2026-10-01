@@ -60,6 +60,7 @@ pub mod receive;
 pub mod supervise;
 pub mod regions;
 pub mod relocate;
+pub mod remote_probe;
 pub mod watch;
 
 /// The client's transport: both arms speak identical frames.
@@ -649,6 +650,40 @@ impl Client {
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
             Some(other) => Err(unexpected("DirRemoved", &other)),
             None => Err(ClientError::Protocol("connection closed before DirRemoved".into())),
+        }
+    }
+
+    /// PVOS D211 — tell the box that holds `region` what a header probe of
+    /// its copy of `rel_path` observed (`quality`: a measurement's encoding
+    /// or `MediaQuality::probe_failure()`'s). `Ok((written, now))`;
+    /// `not_found` = this box does not hold that region (ask another),
+    /// `conflict` = its copy is not the one probed, `forbidden` = no write
+    /// rights on the region.
+    pub fn set_region_quality(
+        &mut self,
+        region: &str,
+        rel_path: &str,
+        hash: &str,
+        size: u64,
+        mtime_ms: u64,
+        quality: &str,
+    ) -> Result<(bool, Option<String>)> {
+        write_msg(
+            &mut self.stream,
+            &ClientMsg::SetRegionQuality {
+                region: region.into(),
+                rel_path: rel_path.into(),
+                hash: hash.into(),
+                size,
+                mtime_ms,
+                quality: quality.into(),
+            },
+        )?;
+        match read_msg::<_, ServerMsg>(&mut self.stream)? {
+            Some(ServerMsg::RegionQualitySet { written, quality }) => Ok((written, quality)),
+            Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
+            Some(other) => Err(unexpected("RegionQualitySet", &other)),
+            None => Err(ClientError::Protocol("connection closed before RegionQualitySet".into())),
         }
     }
 

@@ -97,7 +97,7 @@ fn statfs_reports_the_tree_and_refuses_to_offer_space() {
     let sizes = [4096u64, 8192, 1500];
     let (_d, _b, data_dir, root) = forest_with_files(&sizes);
     let mnt = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_mount(&data_dir, &root, mnt.path()).unwrap();
+    let session = pvfs_fuse::MountGuard::new(pvfs_fuse::spawn_mount(&data_dir, &root, mnt.path()).unwrap(), mnt.path());
 
     let st = statvfs(mnt.path());
 
@@ -118,7 +118,7 @@ fn statfs_reports_the_tree_and_refuses_to_offer_space() {
     assert_eq!(st.f_files, sizes.len() as u64, "one inode per live file");
     assert_eq!(st.f_namemax, 255, "NAME_MAX");
 
-    drop(session);
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }
 
 /// A file the catalog remembers but nothing links is not in the filesystem, so

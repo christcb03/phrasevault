@@ -17,6 +17,7 @@ fn q(w: u32, h: u32, depth: u8, hdr: &str, dur: u64) -> MediaQuality {
         duration_s: dur,
         decoded_ok: None,
         probe_failed: false,
+        probe_suspect_ms: 0,
     }
 }
 

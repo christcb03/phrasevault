@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use pvfs_core::fs::{scan_catalogues, CatalogueCtx, ProbeCtx, ProbeSetting};
-use pvfs_core::media::{choose, Candidate, MediaQuality, Rules};
+use pvfs_core::media::{choose, Candidate, MediaQuality, Observed, Rules};
 use pvfs_core::probe::Prober;
 use pvfs_core::writer::OwnDb;
 use pvfs_core::{BindSpec, Engine, HashPolicy, NodeSpec, TYPE_FOLDER};
@@ -96,6 +96,8 @@ impl Rig {
             max_files,
             max_time: Duration::from_secs(60),
             timeout,
+            now_ms: None,
+            errored: Default::default(),
         })
     }
 
@@ -143,6 +145,7 @@ fn measured() -> MediaQuality {
         duration_s: 1342,
         decoded_ok: None,
         probe_failed: false,
+        probe_suspect_ms: 0,
     }
 }
 
@@ -217,11 +220,13 @@ fn a_failed_probe_is_recorded_reported_and_not_repeated() {
     let mut r = rig(&["good.mkv", "bad.mkv"]);
     let s = r.pass(r.probing(300, Duration::from_secs(10)));
     assert_eq!((s.probed, s.probe_failed, s.probe_pending), (1, 1, 0));
+    // PVOS D211 — the first "invalid data" is a SUSPECT, not yet a failure
+    // (`d211_unreadable_loses.rs` has the second probe that confirms it).
     let q = MediaQuality::decode(&r.quality("bad.mkv").unwrap()).unwrap();
-    assert!(q.probe_failed && !q.measured());
+    assert!(q.suspect() && !q.unreadable() && !q.measured());
     let sum = r.e.region_quality_summary(&r.region).unwrap();
-    assert_eq!((sum.measured, sum.failed, sum.unmeasured), (1, 1, 0));
-    assert_eq!(sum.failed_paths, vec!["bad.mkv"]);
+    assert_eq!((sum.measured, sum.failed, sum.suspect, sum.unmeasured), (1, 0, 1, 0));
+    assert_eq!(sum.suspect_paths, vec!["bad.mkv"]);
     r.pass(r.probing(300, Duration::from_secs(10)));
     assert_eq!(r.probed().iter().filter(|p| *p == "bad.mkv").count(), 1, "not probed every pass");
     // The file changes: probed again.
@@ -267,13 +272,15 @@ fn a_measurement_never_lands_on_a_row_that_changed() {
     // The file changes and a pass rewrites its row before the write lands.
     std::fs::write(r.media.join("a.mkv"), "other, longer bytes").unwrap();
     r.pass(ProbeSetting::Off);
-    let n = r.e.write_region_quality(&r.region, &[(rel.clone(), size, mtime, measured().encode())]).unwrap();
+    let n = r.e.write_region_quality(&r.region, &[(rel.clone(), size, mtime, Observed::Measured(measured()))]).unwrap();
     assert_eq!(n, 0, "the probed file is no longer the row's");
     assert_eq!(r.quality("a.mkv"), None);
     // Against the row as it is now, it lands — once.
     let (rel, size, mtime) = r.e.quality_candidates(&r.region).unwrap()[0].clone();
-    assert_eq!(r.e.write_region_quality(&r.region, &[(rel.clone(), size, mtime, measured().encode())]).unwrap(), 1);
-    assert_eq!(r.e.write_region_quality(&r.region, &[(rel, size, mtime, "{}".into())]).unwrap(), 0, "never over a measurement");
+    assert_eq!(r.e.write_region_quality(&r.region, &[(rel.clone(), size, mtime, Observed::Measured(measured()))]).unwrap(), 1);
+    let other = MediaQuality { width: 640, height: 480, ..Default::default() };
+    assert_eq!(r.e.write_region_quality(&r.region, &[(rel.clone(), size, mtime, Observed::Measured(other))]).unwrap(), 0, "never over a measurement");
+    assert_eq!(r.e.write_region_quality(&r.region, &[(rel, size, mtime, Observed::Broken)]).unwrap(), 0, "nor a failure over one");
 }
 
 #[test]
@@ -317,9 +324,10 @@ fn hdr_decides_only_between_two_measured_copies() {
     let (a_wins, v) = choose(&cand("hdr", hdr.clone(), 1_000), &cand("sdr", sdr, 1_500), &rules);
     assert!(a_wins, "{v:?}");
     assert!(v.reason().starts_with("HDR"), "{v:?}");
-    // A failed probe carries no numbers: it does not decide (size does).
-    let (a_wins, _) = choose(&cand("hdr", hdr, 1_000), &cand("failed", MediaQuality::probe_failure(), 1_500), &rules);
-    assert!(!a_wins, "a recorded failure is not used by the ladder (D208 Q6)");
+    // A failed probe carries no numbers. PVOS D211 (Chris: "Yes"): a
+    // confirmed failure loses to a measured copy, whatever the sizes.
+    let (a_wins, v) = choose(&cand("hdr", hdr, 1_000), &cand("failed", MediaQuality::probe_failure(), 1_500), &rules);
+    assert!(a_wins, "an unreadable copy loses to a measured one (D211): {v:?}");
 }
 
 #[test]

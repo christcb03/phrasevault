@@ -72,7 +72,7 @@ fn mount_lists_and_streams_bytes() {
     e.close().unwrap();
 
     let mnt = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_mount(&data_dir, &root, mnt.path()).unwrap();
+    let session = pvfs_fuse::MountGuard::new(pvfs_fuse::spawn_mount(&data_dir, &root, mnt.path()).unwrap(), mnt.path());
 
     // readdir + lookup through the kernel
     let names: Vec<String> = std::fs::read_dir(mnt.path())
@@ -89,5 +89,5 @@ fn mount_lists_and_streams_bytes() {
     // read-only: writes refuse
     assert!(std::fs::write(mnt.path().join("albums/clip.mkv"), b"x").is_err());
 
-    drop(session); // unmount
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

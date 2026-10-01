@@ -42,11 +42,90 @@ pub struct MediaQuality {
     /// write this as a side effect of work it was doing anyway.
     pub decoded_ok: Option<bool>,
     /// PVOS D208 — a header probe of this file FAILED (ffprobe could not
-    /// read it: an unreadable header, all-zero bytes). Recorded so the probe
-    /// is not repeated every pass, and reported; the ladder does not use it
-    /// (yet — a decision for Chris). Encoded only when set, so every
-    /// encoding made before it is byte-identical.
+    /// read it: an unreadable header, all-zero bytes). Encoded only when
+    /// set, so every encoding made before it is byte-identical.
+    ///
+    /// PVOS D211 — set only once the failure was CONFIRMED: ffprobe said
+    /// "invalid data" twice, on probes at least [`SUSPECT_RECHECK_MS`]
+    /// apart ([`quality_after`]). Then, and only against a copy that was
+    /// measured, the ladder lets this copy lose (Chris, 2026-10-01).
     pub probe_failed: bool,
+    /// PVOS D211 — the first "invalid data" probe of this file, not yet
+    /// confirmed: when it was seen (ms, the holder's clock). 0 = none. A
+    /// suspect is UNKNOWN to the ladder; it is probed again once
+    /// [`SUSPECT_RECHECK_MS`] has passed.
+    pub probe_suspect_ms: u64,
+}
+
+/// PVOS D211 — how long after a first "invalid data" probe the second one
+/// may confirm it. A transient state (a file mid-copy that settled early, a
+/// disk or network hiccup) gets this long to go away.
+pub const SUSPECT_RECHECK_MS: u64 = 30 * 60 * 1000;
+
+/// PVOS D211 — what one header probe observed, as the holder records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    /// ffprobe read the file.
+    Measured(MediaQuality),
+    /// ffprobe ran and said the file's data is invalid.
+    Broken,
+}
+
+impl Observed {
+    /// The observation as it travels on the wire (a routed write, D211):
+    /// a measurement's canonical encoding, or a bare failure.
+    pub fn encode(&self) -> String {
+        match self {
+            Observed::Measured(q) => q.encode(),
+            Observed::Broken => MediaQuality::probe_failure().encode(),
+        }
+    }
+
+    /// Read an observation a caller sent. Only the two canonical shapes are
+    /// taken: a measurement with no probe state and no decode verdict (a
+    /// header probe does not decode), or a bare failure. Anything else —
+    /// a `suspect`, a `probe_at`, a `decoded` — is the holder's to write,
+    /// never a caller's.
+    pub fn decode_wire(s: &str) -> Option<Observed> {
+        let q = MediaQuality::decode(s).ok()?;
+        if q.encode() != s {
+            return None;
+        }
+        if q.probe_failed {
+            return (q == MediaQuality::probe_failure()).then_some(Observed::Broken);
+        }
+        if q.probe_suspect_ms != 0 || q.decoded_ok.is_some() {
+            return None;
+        }
+        Some(Observed::Measured(q))
+    }
+}
+
+/// PVOS D211 — the row's quality after a probe observed `observed`, given
+/// the quality it has now (`None` = never measured), at `now_ms` on the
+/// holder's clock. `None` = leave the row as it is.
+///
+/// * nothing yet → a measurement, or a SUSPECT stamped now;
+/// * a suspect → a measurement (it read this time), or FAILED when the
+///   second "invalid data" comes [`SUSPECT_RECHECK_MS`] or more after the
+///   first (sooner: unchanged);
+/// * a measurement or a confirmed failure → never overwritten here (a
+///   changed file loses its quality in the row write, D208 Q8).
+pub fn quality_after(current: Option<&str>, observed: &Observed, now_ms: u64) -> Option<String> {
+    let cur = match current {
+        None => None,
+        Some(s) => Some(MediaQuality::decode(s).ok()?),
+    };
+    match (cur, observed) {
+        (None, Observed::Measured(q)) => Some(q.encode()),
+        (None, Observed::Broken) => {
+            Some(MediaQuality { probe_suspect_ms: now_ms.max(1), ..Default::default() }.encode())
+        }
+        (Some(c), _) if c.probe_failed || c.probe_suspect_ms == 0 => None,
+        (Some(_), Observed::Measured(q)) => Some(q.encode()),
+        (Some(c), Observed::Broken) => (now_ms >= c.probe_suspect_ms.saturating_add(SUSPECT_RECHECK_MS))
+            .then(|| MediaQuality::probe_failure().encode()),
+    }
 }
 
 impl MediaQuality {
@@ -68,6 +147,16 @@ impl MediaQuality {
     /// PVOS D208 — the record of a header probe that failed.
     pub fn probe_failure() -> Self {
         MediaQuality { probe_failed: true, ..Default::default() }
+    }
+
+    /// PVOS D211 — confirmed unreadable: ffprobe said "invalid data" twice.
+    pub fn unreadable(&self) -> bool {
+        self.probe_failed
+    }
+
+    /// PVOS D211 — a first "invalid data" probe waits for its second.
+    pub fn suspect(&self) -> bool {
+        !self.probe_failed && self.probe_suspect_ms != 0
     }
 
     pub fn is_empty(&self) -> bool {
@@ -103,6 +192,9 @@ impl MediaQuality {
         if self.probe_failed {
             out.pop();
             out.push_str(",\"probe\":\"failed\"}");
+        } else if self.probe_suspect_ms != 0 {
+            out.pop();
+            out.push_str(&format!(",\"probe\":\"suspect\",\"probe_at\":{}}}", self.probe_suspect_ms));
         }
         out
     }
@@ -126,6 +218,7 @@ impl MediaQuality {
                     }
                 }
                 "probe" => q.probe_failed = v == "failed",
+                "probe_at" => q.probe_suspect_ms = v.parse().unwrap_or(0),
                 _ => {} // tolerate fields a newer binary added
             }
         }
@@ -297,6 +390,41 @@ pub fn choose(a: &Candidate, b: &Candidate, rules: &Rules) -> (bool, Verdict) {
                 true,
                 Verdict::Quality {
                     reason: format!("{} failed to decode", b.label),
+                },
+            )
+        }
+        _ => {}
+    }
+
+    // PVOS D211 — a copy ffprobe could not read (twice, 30+ minutes apart)
+    // loses to a copy it measured (Chris, 2026-10-01: "Yes"). Only that
+    // pairing: two unreadable copies, or an unreadable copy against one
+    // nothing has measured (or only suspected), fall through to the rest
+    // of the ladder exactly as before — a readable copy must exist for an
+    // unreadable one to lose.
+    match (
+        a.quality.unreadable() && b.quality.measured(),
+        b.quality.unreadable() && a.quality.measured(),
+    ) {
+        (true, false) => {
+            return (
+                false,
+                Verdict::Quality {
+                    reason: format!(
+                        "{} could not be read by ffprobe (twice, 30+ min apart); {} measured {}x{}",
+                        a.label, b.label, b.quality.width, b.quality.height
+                    ),
+                },
+            )
+        }
+        (false, true) => {
+            return (
+                true,
+                Verdict::Quality {
+                    reason: format!(
+                        "{} could not be read by ffprobe (twice, 30+ min apart); {} measured {}x{}",
+                        b.label, a.label, a.quality.width, a.quality.height
+                    ),
                 },
             )
         }

@@ -115,8 +115,11 @@ one exists. *(PVOS D208, 2026-10-01: the daemon's watch fills it — each
 video file with no quality is probed with ffprobe on the box whose disk
 holds it, newest first, within each pass's budget, off the writer; a
 changed file's quality is cleared and measured again; a failed probe is
-recorded and reported, and not used by the ladder. `pvfs region
-quality` reports it.)* The scan writes these rows locally, at disk speed, with no signing
+recorded and reported. `pvfs region quality` reports it. PVOS D211: a
+failure counts only when ffprobe said "invalid data" twice, 30+ minutes
+apart, and then the copy loses to a measured copy; a box with ffprobe can
+measure a region another box holds (mediabox for the NAS, over the LAN,
+`pvfs region probe-remote`), and the holder writes its own row.)* The scan writes these rows locally, at disk speed, with no signing
 per row. Sidecars stay exactly as they are — the hash cache beside the bytes,
 which is what made the 2026-09-08 rehearsal import 152 GB in 26 seconds.
 

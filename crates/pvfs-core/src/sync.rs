@@ -1397,6 +1397,60 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     crate::storage::atomic_overwrite(&placement_path(data_dir), text.as_bytes())
 }
 
+// ---- PVOS D211: regions this box probes for their holder -------------------
+
+const PROBE_REMOTE_FILE: &str = "probe-remote";
+const PROBE_REMOTE_HEADER: &str = "pvfs-probe-remote 1";
+
+/// PVOS D211 — the file naming the catalogue regions THIS box measures with
+/// ffprobe for the box that holds them (mediabox for the NAS, which has no
+/// ffprobe), reading the bytes from the holder over the LAN. Its own file,
+/// not a `placement` line: an older binary refuses a placement line it does
+/// not know (a rollback would then fail), and ignores this file.
+pub fn probe_remote_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROBE_REMOTE_FILE)
+}
+
+/// PVOS D211 — the regions this box probes for their holders. None (no
+/// file) is the default: nothing is probed for anyone.
+pub fn probe_remote_regions(data_dir: &Path) -> Result<Vec<NodeId>> {
+    let text = match std::fs::read_to_string(probe_remote_path(data_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(PvfsError::io("read probe-remote", e)),
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(PROBE_REMOTE_HEADER) {
+        return Err(bad("probe-remote", "unrecognized probe-remote file"));
+    }
+    let mut out: Vec<NodeId> = Vec::new();
+    for line in lines.map(str::trim).filter(|l| !l.is_empty()) {
+        if line.len() != 64 || !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(bad("probe-remote", &format!("not a region id: {line:?}")));
+        }
+        if !out.iter().any(|r| r == line) {
+            out.push(line.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// PVOS D211 — add (or remove) a region this box probes for its holder.
+pub fn set_probe_remote(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
+    let mut regions = probe_remote_regions(data_dir)?;
+    regions.retain(|r| r != id);
+    if on {
+        regions.push(id.clone());
+    }
+    let mut text = String::from(PROBE_REMOTE_HEADER);
+    text.push('\n');
+    for r in &regions {
+        text.push_str(r);
+        text.push('\n');
+    }
+    crate::storage::atomic_overwrite(&probe_remote_path(data_dir), text.as_bytes())
+}
+
 /// D133 — declare (or undeclare) a receiving region on this box.
 pub fn set_region_receive(data_dir: &Path, id: &NodeId, on: bool) -> Result<()> {
     let mut p = load_placement_full(data_dir)?;

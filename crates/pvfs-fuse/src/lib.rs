@@ -2074,6 +2074,89 @@ pub fn spawn_view_mount_with(
     }
 }
 
+/// PVOS D211 — is something mounted at `at` (by `/proc/mounts`)?
+pub fn is_mounted(at: &Path) -> bool {
+    // /proc/mounts writes a space, tab, newline and backslash as octal.
+    let unescape = |p: &str| p.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
+    let want = at.to_string_lossy();
+    std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split(' ').nth(1))
+        .any(|m| unescape(m) == want)
+}
+
+/// PVOS D211 — a background mount that is gone before its mountpoint is.
+///
+/// Dropping a fuser 0.14 `BackgroundSession` mounted with `AutoUnmount`
+/// does not unmount: it closes the socket of the `fusermount3` helper,
+/// which unmounts LATER. A test that then removes the mountpoint's
+/// `TempDir` deletes THROUGH the still-mounted view (D210's hang), and a
+/// test killed meanwhile leaves the mount for good — presubuntu had ~249 of
+/// them by 2026-10-01. Dropping this (also while a failed test unwinds)
+/// drops the session, waits up to a second, then `fusermount3 -u`, then
+/// `-uz`, until `/proc/mounts` no longer lists it. Declare it AFTER the
+/// mountpoint's `TempDir`, so it is dropped first.
+pub struct MountGuard {
+    session: Option<fuser::BackgroundSession>,
+    at: PathBuf,
+}
+
+impl MountGuard {
+    pub fn new(session: fuser::BackgroundSession, at: &Path) -> MountGuard {
+        MountGuard { session: Some(session), at: at.to_path_buf() }
+    }
+
+    /// Where it is mounted.
+    pub fn path(&self) -> &Path {
+        &self.at
+    }
+
+    /// Unmount now and wait; `true` once the kernel has let go.
+    pub fn unmount(mut self) -> bool {
+        self.release()
+    }
+
+    fn release(&mut self) -> bool {
+        let Some(session) = self.session.take() else { return !is_mounted(&self.at) };
+        drop(session);
+        let wait = |limit: Duration| {
+            let deadline = std::time::Instant::now() + limit;
+            while is_mounted(&self.at) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(Duration::from_secs(1));
+        for flags in ["-u", "-uz"] {
+            if is_mounted(&self.at) {
+                for tool in ["fusermount3", "fusermount"] {
+                    let ran = std::process::Command::new(tool)
+                        .arg(flags)
+                        .arg(&self.at)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    if ran.is_ok() {
+                        break;
+                    }
+                }
+                wait(Duration::from_secs(5));
+            }
+        }
+        let gone = !is_mounted(&self.at);
+        if !gone {
+            eprintln!("pvfs-fuse: {} is still mounted after fusermount -uz", self.at.display());
+        }
+        gone
+    }
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

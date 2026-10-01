@@ -694,7 +694,8 @@ pvfs region ls        # on the library's box
 #   7ea45c8e…  catalogue  drains  head 3120  held 3120  1204 rows
 #   fe38175f…  catalogue  head 4410  live  27290 rows  receives
 pvfs region entries <folder-id>   # the rows, and the last head this box published
-pvfs region quality               # video files measured / unmeasured / probe failed, per region (D208)
+pvfs region quality               # video files measured / unmeasured / unreadable / suspect, per region (D208, D211)
+pvfs region probe-remote          # regions this box measures for the box that holds them (D211; bare asks)
 pvfs region fetch                 # fetch now what this box is behind on (the job does it every minute)
 ```
 
@@ -1091,7 +1092,8 @@ second copy of the index while it runs.
 | `pvfs region mark\|ls\|unmark <node>` | Make a subtree its own signed-log replication/audit unit (§6.3). |
 | `pvfs region mark <node> --catalogue --owner key:<hex>` | Make a folder a catalogue region, owned by the box that holds its disk — the region model (§7.13). |
 | `pvfs region entries <region>` · `pvfs region fetch [region]` | A catalogue region's rows · fetch now the catalogues this box is behind on (§7.13). |
-| `pvfs region quality [region]` | What is known of each catalogue region's video quality: measured, unmeasured, probe failed (and which), and whether this box has ffprobe. The daemon's watch measures (PVOS D208). |
+| `pvfs region quality [region]` | What is known of each catalogue region's video quality: measured, unmeasured, unreadable (ffprobe said "invalid data" twice, 30+ min apart — it loses to a measured copy) and suspect (once), and whether this box has ffprobe. The daemon's watch measures (PVOS D208, D211). |
+| `pvfs region probe-remote [region] [on\|off]` | The regions THIS box measures with ffprobe for the box that holds them, reading the bytes from it over the LAN (a holder further than 10 ms is skipped); the holder writes its own rows. For a holder with no ffprobe (the NAS). Bare: lists them and asks (PVOS D211). |
 | `pvfs region drain <region> on\|off` · `receive <region> on\|off` · `retention <region> <days>` | Staging (fleet-wide) · this box's receiving library region · how long its trash is kept (§7.13). |
 | `pvfs view ls [dir]` · `pvfs view conflicts` | The merged view, one level at a time · every path where two regions disagree (§7.13). |
 | `pvfs view receive [--dry-run]` · `pvfs view resolve [--dry-run]` | Run the mover's two halves now (§7.13). |
