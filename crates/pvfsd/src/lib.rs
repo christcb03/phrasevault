@@ -208,11 +208,16 @@ impl Daemon {
             writer.set_hold_raise(Some((priority::raise_for_hold, priority::restore_after_hold)));
         }
         // PVOS D199 — WAL checkpoints on a thread of their own, never inside
-        // a step of the writer (a served write waits for the step).
+        // a step of the writer (a served write waits for the step), and the
+        // writer's commits to index.db — derived state, every byte of it —
+        // without an fsync each; log.db, the forest's truth, keeps one.
         if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {
             priority::enter_background("WAL checkpoints")
         }) {
             eprintln!("pvfsd: checkpoints stay on the writer's commits: {e}");
+        }
+        if let Err(e) = writer.lock_serving("index sync: normal").set_index_sync_normal() {
+            eprintln!("pvfsd: index.db keeps an fsync per commit: {e}");
         }
         Daemon {
             writer,

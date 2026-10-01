@@ -1421,6 +1421,30 @@ impl Engine {
             .map_err(map_db("wal autocheckpoint"))
     }
 
+    /// PVOS D199 — commits to `index.db` on this connection without an fsync
+    /// each (`synchronous = NORMAL`; `log.db` keeps FULL). WAL stays atomic
+    /// and consistent; what an OS crash or a power cut can cost is the last
+    /// commits, and everything in `index.db` is derived — the projection
+    /// from the log (the startup check catches it up), a box's own catalogue
+    /// rows from its disk (the next pass), fetched snapshots from their boxes,
+    /// published heads from the log's attested ones (D173). The daemon's
+    /// writer sets it: on presubuntu's disk an fsync is 65–80 ms, and every
+    /// step held the writer at least that long.
+    pub fn set_index_sync_normal(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA main.synchronous = NORMAL; PRAGMA log.synchronous = FULL;")
+            .map_err(map_db("synchronous"))
+    }
+
+    /// D199 — the `index.db` and `log.db` sync levels (SQLite's numbers:
+    /// 1 NORMAL, 2 FULL).
+    #[doc(hidden)]
+    pub fn sync_levels(&self) -> Result<(i64, i64)> {
+        let main: i64 = self.conn.query_row("PRAGMA main.synchronous", [], |r| r.get(0)).map_err(map_db("synchronous"))?;
+        let log: i64 = self.conn.query_row("PRAGMA log.synchronous", [], |r| r.get(0)).map_err(map_db("synchronous"))?;
+        Ok((main, log))
+    }
+
     /// D199 — the setting [`Engine::set_wal_autocheckpoint`] made.
     #[doc(hidden)]
     pub fn wal_autocheckpoint(&self) -> Result<i64> {

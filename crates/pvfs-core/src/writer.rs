@@ -567,6 +567,8 @@ mod tests {
         let (_dir, w) = writer();
         Writer::offload_checkpoints(&w, Duration::from_millis(100), || {}).unwrap();
         assert_eq!(w.lock_serving("test: read").wal_autocheckpoint().unwrap(), 0, "the writer's commits no longer checkpoint");
+        w.lock_serving("test: sync").set_index_sync_normal().unwrap();
+        assert_eq!(w.lock_serving("test: read").sync_levels().unwrap(), (1, 2), "index.db NORMAL, log.db FULL");
         let before = COUNTERS.checkpoints();
         let t = Instant::now();
         while COUNTERS.checkpoints() < before + 2 {
