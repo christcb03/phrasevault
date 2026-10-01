@@ -186,6 +186,7 @@ fn the_payload_carries_the_clear_and_every_other_event_is_unchanged() {
         up: 3,
         down: 0,
         until_ms: Some(12 * MIN),
+        forest: None,
     };
     let (body, _) = notify::payload(&nas(), &ev);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();

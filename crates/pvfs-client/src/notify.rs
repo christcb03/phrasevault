@@ -119,6 +119,32 @@ pub struct Event {
     /// Absent from every other event's payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ms: Option<u64>,
+    /// PVOS D206 — the forest the event is about: its registry alias, else
+    /// its mount directory's name (`forest_name`). Lab and production events
+    /// differed only by address, so the lab notifier stayed off (D142).
+    /// Stamped by `emit` and the test; absent from the payload when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forest: Option<String>,
+}
+
+/// PVOS D206 — the name a person knows this forest by: the alias it is
+/// registered under (`pvfs forest register --alias`, the system registry),
+/// else the name of its mount directory. `data_dir` is the forest's
+/// `.pvfs` state directory.
+pub fn forest_name(data_dir: &Path) -> Option<String> {
+    forest_name_in(&pvfs_core::mount::Registry::system(), data_dir)
+}
+
+/// [`forest_name`] against a given registry (tests use a scratch one).
+pub fn forest_name_in(registry: &pvfs_core::mount::Registry, data_dir: &Path) -> Option<String> {
+    let mount = data_dir.parent()?;
+    let mount = std::fs::canonicalize(mount).unwrap_or_else(|_| mount.to_path_buf());
+    let alias = registry
+        .find(&mount.to_string_lossy())
+        .ok()
+        .flatten()
+        .and_then(|f| f.alias);
+    alias.or_else(|| mount.file_name().map(|n| n.to_string_lossy().into_owned())).filter(|n| !n.is_empty())
 }
 
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -219,6 +245,7 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
         up,
         down,
         until_ms: None,
+        forest: None,
     };
     for (pin, r) in &next.peers {
         let p = prev.and_then(|p| p.peers.get(pin));
@@ -276,6 +303,7 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
         up,
         down,
         until_ms: None,
+        forest: None,
     };
     match (&next.fenced, was_fenced) {
         (Some(f), false) => {
@@ -357,6 +385,7 @@ pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Eve
                 up,
                 down,
                 until_ms: None,
+                forest: None,
             });
             let first_seen_ms = seen.first_seen_ms;
             state.reported_since_ms.entry(key.clone()).or_insert(first_seen_ms);
@@ -383,6 +412,7 @@ pub fn job_errors(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Eve
                 up,
                 down,
                 until_ms: Some(gone_ms),
+                forest: None,
             });
             // not in `live`: every memory of this episode goes below
         }
@@ -424,6 +454,7 @@ pub fn heartbeat(state: &mut State, next: &FleetHealth, now_ms: u64) -> Option<E
         up,
         down,
         until_ms: None,
+        forest: None,
     })
 }
 
@@ -438,6 +469,7 @@ pub fn test_event(now_ms: u64) -> Event {
         up: 0,
         down: 0,
         until_ms: None,
+        forest: None,
     }
 }
 
@@ -545,8 +577,17 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
 }
 
 /// One line a person can read, for the chat-shaped formats.
+/// PVOS D206 — with the forest's name when the event carries one.
 pub fn line(n: &Notify, ev: &Event) -> String {
-    format!("PVFS: {}", summary(n, ev))
+    format!("{}: {}", title(ev), summary(n, ev))
+}
+
+/// PVOS D206 — "PVFS", or "PVFS <forest>" when the event names its forest.
+fn title(ev: &Event) -> String {
+    match ev.forest.as_deref() {
+        Some(f) => format!("PVFS {f}"),
+        None => "PVFS".into(),
+    }
 }
 
 /// The request body and its headers for the configured format. The JSON
@@ -561,7 +602,7 @@ pub fn payload(n: &Notify, ev: &Event) -> (String, Vec<(String, String)>) {
             summary(n, ev),
             vec![
                 ("Content-Type".to_string(), "text/plain".to_string()),
-                ("Title".to_string(), format!("PVFS {}", ev.event)),
+                ("Title".to_string(), format!("{} {}", title(ev), ev.event)),
             ],
         ),
         _ => {
@@ -624,6 +665,11 @@ pub fn emit(data_dir: &Path, prev: Option<&FleetHealth>, next: &FleetHealth, now
     }
     if let Some(h) = heartbeat(&mut state, next, now_ms) {
         events.push(h);
+    }
+    // PVOS D206 — every event names its forest.
+    let forest = forest_name(data_dir);
+    for ev in &mut events {
+        ev.forest = forest.clone();
     }
     let mut lines = Vec::new();
     for ev in &events {

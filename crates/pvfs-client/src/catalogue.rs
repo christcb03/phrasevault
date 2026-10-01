@@ -29,10 +29,26 @@ pub struct CatalogueReport {
     pub cancelled: bool,
     /// PVOS D183: claims taken as provisional heads — `(region, seq, from)`.
     pub claims_taken: Vec<(String, u64, String)>,
-    /// PVOS D183: claims refused — `(from, why)`.
+    /// PVOS D183: claims refused — `(from, why)`; since PVOS D206 `why`
+    /// starts with the region's short id (`<region8>: <why>`).
     pub claims_refused: Vec<(String, String)>,
     /// PVOS D183: this box's own pending heads committed through the owner.
     pub committed: usize,
+}
+
+impl CatalogueReport {
+    /// PVOS D206 — the refused claims as one note for the catalogue job's
+    /// row (`last_error`, D156's attention): the owner's health probe reads
+    /// it, the notifier says it once it has stood (D151) and when it clears
+    /// (D161), and the page lists it. `None` when nothing was refused.
+    pub fn claims_note(&self) -> Option<String> {
+        if self.claims_refused.is_empty() {
+            return None;
+        }
+        let each: Vec<String> =
+            self.claims_refused.iter().map(|(from, why)| format!("refused a region claim from {from}: {why}")).collect();
+        Some(each.join("; "))
+    }
 }
 
 /// One pass over every stale, non-local catalogue region (doc 26 §8).
@@ -210,7 +226,7 @@ fn collect_claims<D: Db>(
         let Ok(claims) = client.region_claims() else { continue };
         for c in claims {
             let Ok(body) = hex::decode(&c.body) else {
-                report.claims_refused.push((addr.clone(), "claim body is not hex".into()));
+                report.claims_refused.push((addr.clone(), format!("{}: claim body is not hex", short_region(&c.region))));
                 continue;
             };
             match db.write("claim", |e| e.accept_region_claim(&body, addr))? {
@@ -222,11 +238,39 @@ fn collect_claims<D: Db>(
                     claimed_by.entry(c.region.clone()).or_insert_with(|| addr.clone());
                 }
                 pvfs_core::ClaimOutcome::Refused(why) => {
-                    eprintln!("pvfs: catalogue: a claim from {addr} for {} refused: {why}", &c.region[..c.region.len().min(8)]);
-                    report.claims_refused.push((addr.clone(), why));
+                    eprintln!("pvfs: catalogue: a claim from {addr} for {} refused: {why}", short_region(&c.region));
+                    report.claims_refused.push((addr.clone(), format!("{}: {why}", short_region(&c.region))));
                 }
             }
         }
     }
     Ok(claimed_by)
+}
+
+/// A region's short id for a person (its first 8 characters).
+fn short_region(region: &str) -> &str {
+    region.get(..8).unwrap_or(region)
+}
+
+#[cfg(test)]
+mod d206_tests {
+    use super::*;
+
+    // PVOS D206 — a refused claim is a note on the catalogue job's row: none
+    // when nothing was refused, every refusal with its box and region.
+    #[test]
+    fn refused_claims_become_one_note() {
+        let mut r = CatalogueReport::default();
+        assert_eq!(r.claims_note(), None);
+        r.claims_refused.push(("192.168.1.142:7433".into(), "a1b2c3d4: its signature does not verify (bad)".into()));
+        assert_eq!(
+            r.claims_note().unwrap(),
+            "refused a region claim from 192.168.1.142:7433: a1b2c3d4: its signature does not verify (bad)"
+        );
+        r.claims_refused.push(("192.168.1.237:7433".into(), "e5f6a7b8: claim body is not hex".into()));
+        let note = r.claims_note().unwrap();
+        assert!(note.contains("; refused a region claim from 192.168.1.237:7433: e5f6a7b8"), "{note}");
+        assert_eq!(short_region("abc"), "abc");
+        assert_eq!(short_region("0123456789abcdef"), "01234567");
+    }
 }

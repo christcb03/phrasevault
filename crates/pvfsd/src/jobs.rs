@@ -488,6 +488,20 @@ impl JobsState {
         self.with_row(name, |r| r.last_error = Some(note));
     }
 
+    /// PVOS D206 — `mark_attention` for a pass that may have met something
+    /// a person should hear of (the catalogue's refused region claims): the
+    /// note, if any, on an enabled row. The owner's health probe reads it and
+    /// the notifier says it as a job error (D151's wait, D161's clear).
+    fn note_attention(&self, name: &str, note: Option<String>) {
+        if let Some(note) = note {
+            self.with_row(name, |r| {
+                if r.enabled {
+                    r.last_error = Some(note);
+                }
+            });
+        }
+    }
+
     /// A transient failure: the job retries by itself.
     fn mark_retry(&self, name: &str, reason: &str) {
         self.with_row(name, |r| {
@@ -1127,6 +1141,8 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                         eprintln!("pvfsd: catalogue {}: {why}", &region[..8]);
                     }
                     st.pass_done("catalogue", None);
+                    // PVOS D206 — a refused claim on the row, for the fleet.
+                    st.note_attention("catalogue", rep.claims_note());
                 }
                 Err(e) => {
                     st.pass_failed("catalogue", e.to_string());
@@ -2074,6 +2090,38 @@ mod tests {
         let receive = row("receive");
         assert_eq!(receive.state, "overdue");
         assert!(receive.last_error.unwrap().contains("overdue, which is not the same as stuck"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PVOS D206 — a catalogue pass that completed but refused a region
+    /// claim: the row keeps the pass's stamp and state (the stall detector
+    /// hears nothing) and says the refusal; the next clean pass clears it; a
+    /// disabled row stays silent.
+    #[test]
+    fn a_refused_claim_is_a_note_on_a_completed_pass() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d206-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        st.with_row("catalogue", |r| r.enabled = true);
+        let mut rep = pvfs_client::catalogue::CatalogueReport::default();
+        rep.claims_refused.push(("192.168.1.142:7433".into(), "a1b2c3d4: its signature does not verify (x)".into()));
+        st.pass_done("catalogue", None);
+        st.note_attention("catalogue", rep.claims_note());
+        let row = st.snapshot().into_iter().find(|r| r.name == "catalogue").unwrap();
+        assert_eq!(row.state, "idle");
+        assert!(row.last_ok_ms.is_some(), "the pass completed: stamped");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("refused a region claim from 192.168.1.142:7433: a1b2c3d4: its signature does not verify (x)")
+        );
+        st.pass_done("catalogue", None);
+        st.note_attention("catalogue", pvfs_client::catalogue::CatalogueReport::default().claims_note());
+        let row = st.snapshot().into_iter().find(|r| r.name == "catalogue").unwrap();
+        assert_eq!(row.last_error, None, "a clean pass clears it");
+        st.with_row("catalogue", |r| r.enabled = false);
+        st.note_attention("catalogue", rep.claims_note());
+        let row = st.snapshot().into_iter().find(|r| r.name == "catalogue").unwrap();
+        assert_eq!(row.last_error, None, "a disabled job says nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

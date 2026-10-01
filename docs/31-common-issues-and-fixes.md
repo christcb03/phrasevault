@@ -19,6 +19,7 @@ whenever a fix is found, not only when it recurs.**
 | After a promotion, a box still points at the old owner | [§10](#10-after-a-promotion-a-box-still-points-at-the-old-owner) |
 | When did a line in the NAS's `pvfsd.log` happen? | [§11](#11-dating-a-line-in-the-nass-pvfsdlog) |
 | `watch pass failed: I/O error during routed write: …` | [§12](#12-a-routed-write-fails-io-error-during-routed-write) |
+| `the catalogue job reports an error: refused a region claim from …` | [§13](#13-a-box-refuses-a-region-claim) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -369,3 +370,35 @@ box. An owner that has just started answers `busy` until it has heard its
 followers (D185): that is waited out, and only a hold longer than the six
 tries fails one pass (`SQLite is busy/locked during routed scan write
 (retried 6x)` — the owner's word was `busy`, not always SQLite's).
+
+## 13. A box refuses a region claim
+
+**What it looks like.** On the phone (since PVOS D206): *"On feederbox, the
+catalogue job reports an error: refused a region claim from
+192.168.1.142:7433: a1b2c3d4: its author may not publish this region (…)"*,
+and the same line under that box on the page. Its journal says, every
+minute, `pvfs: catalogue: a claim from <addr> for <region> refused: <why>`.
+
+**Why.** Each box's catalogue job asks the others for the region heads they
+signed (PVOS D183) and takes those the fold's rule accepts, so a region's
+new files reach every box even while the owner is down. A claim is refused
+when its signature does not verify, its author has no grant to publish the
+region, it is not a catalogue region, or it offers another hash at a seq the
+forest log (or an earlier claim) already holds. The pass itself completes;
+the refusal is a note on its row, said once it has stood about four minutes
+and cleared when it stops.
+
+**Fix.** By the reason:
+
+- *another hash at seq N, which the forest log already holds* / *two
+  different heads at seq N*: the claiming box published a head the owner
+  settled otherwise. Usually it clears by itself when that box's next head
+  commits. If it stands, look at the claiming box's `pvfs region ls` (a
+  head `pending the owner`) and the owner's.
+- *its author may not publish this region* / *its signature does not
+  verify*: the claiming box signs with a key that has no admin grant on the
+  region (a re-seeded box, a replaced key). Check the region's grants on the
+  owner (`pvfs acl ls <region>`) against the claiming box's key.
+- A refusal on the owner itself shows on the page only: the owner does not
+  poll itself.
+
