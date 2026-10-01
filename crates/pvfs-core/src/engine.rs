@@ -1421,18 +1421,27 @@ impl Engine {
             .map_err(map_db("wal autocheckpoint"))
     }
 
-    /// PVOS D199 — commits to `index.db` on this connection without an fsync
-    /// each (`synchronous = NORMAL`; `log.db` keeps FULL). WAL stays atomic
-    /// and consistent; what an OS crash or a power cut can cost is the last
-    /// commits, and everything in `index.db` is derived — the projection
-    /// from the log (the startup check catches it up), a box's own catalogue
-    /// rows from its disk (the next pass), fetched snapshots from their boxes,
-    /// published heads from the log's attested ones (D173). The daemon's
-    /// writer sets it: on presubuntu's disk an fsync is 65–80 ms, and every
-    /// step held the writer at least that long.
+    /// PVOS D199 — commits of derived state on this connection without an
+    /// fsync each (`synchronous = NORMAL`). WAL stays atomic and consistent;
+    /// what an OS crash or a power cut can cost is the last commits:
+    ///
+    /// - `index.db`, always: everything in it is derived — the projection
+    ///   from the log (the startup check catches it up; an index ahead of its
+    ///   log is its full-rebuild case), a box's own catalogue rows from its
+    ///   disk (the next pass), fetched snapshots from their boxes, published
+    ///   heads from the log's attested ones (D173);
+    /// - `log.db` on a **replica**: a verified copy of the owner's log, so a
+    ///   lost tail is fetched again, and a log that went back is behind its
+    ///   owner, never ahead (D182 fences only on ahead). The owner's log —
+    ///   the forest's truth — keeps FULL, and so does a promoted box's at its
+    ///   next start.
+    ///
+    /// The daemon's writer sets it: on presubuntu's disk an fsync is 65–80 ms,
+    /// and every step held the writer at least that long.
     pub fn set_index_sync_normal(&self) -> Result<()> {
+        let log = if self.replica { "NORMAL" } else { "FULL" };
         self.conn
-            .execute_batch("PRAGMA main.synchronous = NORMAL; PRAGMA log.synchronous = FULL;")
+            .execute_batch(&format!("PRAGMA main.synchronous = NORMAL; PRAGMA log.synchronous = {log};"))
             .map_err(map_db("synchronous"))
     }
 

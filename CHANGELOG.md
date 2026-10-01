@@ -14,13 +14,14 @@ file tracks Layer 0, the file-system engine.
   "another pvfs process folding this forest".
   - **The jobs.** `watch` (`watch::run_shared`, `fs::scan_catalogues`): the
     walk, the rows read once at the pass's start, the hashing and the
-    manifest outside the writer; each batch (≤1,000 rows), each sweep chunk
-    and the snapshot row a step. `catalogue` (`catalogue::fetch_pass_db`):
-    claims a step each; an install (`fs::install_region_snapshot_db`)
-    computes its delta off the writer and writes it in steps of ≤500 rows —
-    the upserts first, the removals after, `region_fetched` last — so a
-    first install of 55,000 rows is ~110 short steps, not one hold of
-    seconds; another process's commit meanwhile is put right in the last
+    manifest outside the writer; each batch (≤250 rows, `fs::STEP_ROWS`),
+    each sweep chunk and the snapshot row a step. `catalogue`
+    (`catalogue::fetch_pass_db`): claims a step each; an install
+    (`fs::install_region_snapshot_db`) computes its delta off the writer and
+    writes it in steps of ≤250 rows — the upserts first, the removals
+    after, `region_fetched` last — so a first install of 55,000 rows is
+    ~220 short steps, not one hold of seconds; another process's commit
+    meanwhile is put right in the last
     step (D194's rule). `follow` (`follow::run_shared`): an ingest step
     and a fold step per batch of at most 128 events (`Engine::ingest_log_rows`,
     `Engine::catch_up`; the fold lock is tried, not waited for). `receive`,
@@ -41,6 +42,18 @@ file tracks Layer 0, the file-system engine.
     (`priority::raise_for_hold`). A rename or folder removal through the view does its
     disk work outside the writer (in order, among themselves) and its rows
     in one step; the ingest publish-retry hashes before it takes the writer.
+  - **The writer's commits stay short on a slow disk.** WAL checkpoints
+    run on a thread of the daemon's own (`Writer::offload_checkpoints`,
+    PASSIVE every 2 s, at the daemon's priority) instead of inside
+    whichever step crosses SQLite's 1,000-page mark; and the daemon's
+    writer commits `index.db` with `synchronous = NORMAL`
+    (`Engine::set_index_sync_normal`) — `log.db`, the forest's truth, keeps
+    FULL, and everything in `index.db` is derived (an OS crash can cost its
+    last commits; the startup check, the next pass or the next fetch puts
+    them back). On presubuntu's disk (65–80 ms an fsync) these took a
+    30,000-row first install from 19.8 s to 1.8 s, and a served write's
+    wait behind it from p99 524 ms to 16 ms. The CLI and the mount keep
+    SQLite's defaults.
   - **A replica's read pool.** `Engine::open_read_view` works on a replica
     (it needed the forest's device key, which a replica does not have), so
     feederbox's and the NAS's daemons have a read pool for the first time:
@@ -50,6 +63,9 @@ file tracks Layer 0, the file-system engine.
     with who held it; hourly: `pvfsd: the writer, last hour: N hold(s), …
     in all (longest … by …); …; engine opens N, read views N, folds N (N
     events)`. A step that panics no longer takes the writer with it.
+  - **The unit's `LimitNICE=+0`** (PVOS fleet template) lets the hold raise
+    lower a job's nice value back to the daemon's (nothing above normal):
+    under CPU load a fold at nice 10 held the writer 200 ms, 39 ms raised.
   - **The watch's startup pass schedules the settle recheck**, as every
     later pass does: files still being written when a daemon started
     waited for the next change, or the hourly reconcile.

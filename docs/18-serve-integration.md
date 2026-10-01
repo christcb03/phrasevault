@@ -73,15 +73,20 @@ fails; and since no job opens an engine, none folds the log to open one.
 
 | Job | Its steps of the writer | Everything else, with no lock |
 |---|---|---|
-| **watch** | each batch of rows (≤1,000), each sweep chunk, the snapshot row (and an owner's head commit); a replica's catch-up: rows (≤256 a step), the fold | the walk, the rows read once at the pass's start, hashing, the manifest and its file, the routed head |
-| **catalogue** | each accepted claim; an install's rows (≤500 a step: upserts, then removals, then `region_fetched`) | claims and manifests fetched, hash, parse, the delta |
-| **follow** | per batch (≤512 events): the ingest, the fold | the long-poll, region generation files |
+| **watch** | each batch of rows (≤250), each sweep chunk, the snapshot row (and an owner's head commit); a replica's catch-up: rows (≤256 a step), the fold | the walk, the rows read once at the pass's start, hashing, the manifest and its file, the routed head |
+| **catalogue** | each accepted claim; an install's rows (≤250 a step: upserts, then removals, then `region_fetched`) | claims and manifests fetched, hash, parse, the delta |
+| **follow** | per batch (≤128 events, as the daemon asks): the ingest, the fold | the long-poll, region generation files |
 | **receive, resolve, reclaim**, the trash step | none — they write files; the watch catalogues them | everything |
 | **health** | none (a read view since D188) | everything |
 | sync, export, tier, evict (node model) | — they keep their own engines, as before; no fleet box runs them | |
 
 **Serving goes first:** a job about to take the writer lets a waiting served
-op go first, so a served write waits for the one step in progress at most.
+op go first, so a served write waits for the one step in progress at most;
+the job's thread is raised to the daemon's priority for the hold (the disk
+class always; the CPU where the unit's `LimitNICE=+0` allows). The steps
+stay short on a slow disk: WAL checkpoints run on a thread of their own,
+never inside a step, and the writer commits `index.db` (derived state)
+without an fsync each — `log.db` keeps one.
 A hold over 1 s, and a wait over 1 s, are said in the journal; each hour
 the runner says how many holds there were, the longest and whose, and how
 many engines, read views and folds the process opened (`pvfsd: the writer,

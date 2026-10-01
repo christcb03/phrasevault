@@ -151,6 +151,9 @@ fn a_replica_reads_while_its_writer_is_held() {
     let view = Engine::open_read_view(&rdata).expect("a replica opens a read view (D199)");
     assert!(view.is_replica());
     drop(view);
+    // A replica's writer commits its derived state — the index, and its copy
+    // of the owner's log — without an fsync each (SQLite: 1 = NORMAL).
+    assert_eq!(daemon.hold_writer_for_test().sync_levels().unwrap(), (1, 1));
     serve_on(Arc::clone(&daemon), &sock);
     let mut member = connect(&sock, &ckey, &cpub);
     member.serve_status_full().expect("the premise: the probe answers");
@@ -412,7 +415,7 @@ fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
     for i in 0..backlog {
         folder(&mut owner, &bulk, &format!("n{i}"));
     }
-    let target = owner.log_tip().unwrap();
+    let backlog_tip = owner.log_tip().unwrap();
     let socks = tempfile::tempdir().unwrap();
     let owner_sock: PathBuf = socks.path().join("owner.sock");
     serve_on(Arc::new(Daemon::new(owner)), &owner_sock);
@@ -470,17 +473,42 @@ fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
         })
     };
     let t = Instant::now();
-    while tip.load(Ordering::SeqCst) < target {
+    while tip.load(Ordering::SeqCst) < backlog_tip {
         assert!(t.elapsed() < Duration::from_secs(300), "follow did not catch up");
         std::thread::sleep(Duration::from_millis(50));
     }
     let caught_up = t.elapsed();
+    // Then live: the owner keeps writing (a folder about every 10 ms, through
+    // its daemon) while the replica follows each one, for `PVFS_D199_LIVE_SECS`.
+    let live = Duration::from_secs(load("LIVE_SECS", 5) as u64);
+    let (made, target) = {
+        let (sock, key, pubkey, parent) = (owner_sock.clone(), ckey.clone(), cpub.clone(), bulk.clone());
+        std::thread::spawn(move || {
+            let mut c = connect(&sock, &key, &pubkey);
+            let (t, mut n) = (Instant::now(), 0usize);
+            while t.elapsed() < live {
+                let k = key.clone();
+                c.mkdir(&parent, &format!("live {n}"), move |d| crypto::sign_digest(&k, d).unwrap()).unwrap();
+                n += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (n, c.log_info("").unwrap())
+        })
+        .join()
+        .unwrap()
+    };
+    assert!(target > backlog_tip);
+    let t = Instant::now();
+    while tip.load(Ordering::SeqCst) < target {
+        assert!(t.elapsed() < Duration::from_secs(120), "follow did not keep up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     stop.store(true, Ordering::SeqCst);
     follower.join().unwrap().unwrap();
     judge("follow", probe.finish(), writer.take_waits(), writer.take_holds());
-    println!("D199 follow: a backlog of {backlog} events caught up in {caught_up:?}");
-    // What follow landed is folded: the replica's projection holds the backlog.
+    println!("D199 follow: a backlog of {backlog} events caught up in {caught_up:?}, then {made} live ones followed");
+    // What follow landed is folded: the replica's projection holds them all.
     let view = Engine::open_read_view(&rdata).unwrap();
     assert_eq!(view.log_tip().unwrap(), target);
-    assert_eq!(view.children(&bulk).unwrap().len(), backlog, "every folder folded");
+    assert_eq!(view.children(&bulk).unwrap().len(), backlog + made, "every folder folded");
 }

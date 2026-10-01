@@ -209,8 +209,9 @@ impl Daemon {
         }
         // PVOS D199 — WAL checkpoints on a thread of their own, never inside
         // a step of the writer (a served write waits for the step), and the
-        // writer's commits to index.db — derived state, every byte of it —
-        // without an fsync each; log.db, the forest's truth, keeps one.
+        // writer's commits of derived state without an fsync each: index.db
+        // always, and a replica's copy of the owner's log; the owner's log,
+        // the forest's truth, keeps one.
         // The checkpoint thread keeps the daemon's priority: the writer can
         // wait on a lock a checkpoint holds, and a lowered checkpoint starved
         // by load held one for seconds (measured: a served commit 0.9 s).
