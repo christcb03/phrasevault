@@ -211,9 +211,10 @@ impl Daemon {
         // a step of the writer (a served write waits for the step), and the
         // writer's commits to index.db — derived state, every byte of it —
         // without an fsync each; log.db, the forest's truth, keeps one.
-        if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {
-            priority::enter_background("WAL checkpoints")
-        }) {
+        // The checkpoint thread keeps the daemon's priority: the writer can
+        // wait on a lock a checkpoint holds, and a lowered checkpoint starved
+        // by load held one for seconds (measured: a served commit 0.9 s).
+        if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {}) {
             eprintln!("pvfsd: checkpoints stay on the writer's commits: {e}");
         }
         if let Err(e) = writer.lock_serving("index sync: normal").set_index_sync_normal() {
