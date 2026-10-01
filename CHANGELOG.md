@@ -5,6 +5,31 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Small fleet fixes (PVOS D206).**
+  - **`pvfs serve enable|disable` bare asks which job.** At a terminal it
+    lists the jobs (enabled here or not, and what each does) and takes a
+    name or its number. Anywhere else (a script, `--json`, Ansible's pty
+    with stderr redirected) it is refused at once, exit 2, naming every job:
+    it never waits on stdin (D198). It was clap's "required arguments were
+    not provided".
+  - **Every notifier event names its forest** (`forest`: the owner's
+    registry alias, else its mount directory's name; omitted when neither
+    can be read). The chat formats say `PVFS media: …`, ntfy's title `PVFS
+    media peer_down`; `summary` is unchanged. Lab and production events
+    differed only by address (D142). `pvfs fleet notify --test` names it
+    too.
+  - **`pvfs region ls` shows a receiving region's tuning**: `receives 2×4`
+    (files at once × ranges of each, D144), and `receive_parallel` /
+    `receive_streams` in `--json` (`null` where the region does not
+    receive here).
+  - **A refused region claim reaches the fleet.** The catalogue job puts the
+    refusal on its row as a note (`last_error`, D156's attention: the pass
+    still completed, `last_ok` is stamped). The owner's health probe reads
+    it, so the notifier says it as that box's `job_error` once it stands
+    (D151) and clears it (D161), and the page lists it. It was a journal
+    line once a minute (D183). `CatalogueReport.claims_refused`' reason now
+    starts with the region's short id.
+
 - **Each box says its build; a routed write's failure is judged by its type
   (PVOS D200).**
   - **`serve status` carries `build`**, the build the daemon runs

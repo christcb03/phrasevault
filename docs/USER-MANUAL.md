@@ -542,6 +542,9 @@ pvfs serve enable tier
 
 # the ingest box: reclaim retired bytes as the folds arrive
 pvfs serve enable evict
+
+# bare, at a terminal: lists the jobs (enabled here or not, what each does) and asks
+pvfs serve enable
 ```
 
 A follow fold nudges sync, export, and evict immediately (a fetching sync re-nudges
@@ -774,6 +777,7 @@ declarations:
 pvfs region drain <staging-region> on       # on the owner, daemon stopped: fleet-wide, a log event
 pvfs region receive <library-region> on     # on the library's box: local to it
 pvfs region receive <library-region> on --parallel 2 --streams 4   # files at once, ranges per file
+pvfs region ls                              # a receiving region says `receives 2×4` (files × ranges)
 ```
 
 And two jobs, each every five minutes:

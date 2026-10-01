@@ -101,6 +101,7 @@ never walks a disk (D136): the figure is the last step's.
 | no entries | the box holds no catalogue region, or its daemon started less than a step ago | that the trash is empty: a daemon older than D176 reports only after a `receive`/`resolve` pass |
 | a bucket older than its retention + 1 day | the purge is not running, or it is failing: the journal says `pvfsd: trash purge failed: …` once per run | — |
 | `measured_ms` more than 30 minutes (six steps) old when the box answered | the step has stopped (a wedged daemon, a purge stuck on a disk, or it could not list the box's regions) or keeps failing for that region (`trash purge failed`); the page raises it (§2.2) | anything, on a daemon older than D176: it measures only at the end of a `receive`/`resolve` pass, and a `receive` pass can take hours |
+| a region in the box's `stores` with no entry, for 30 minutes as the page sees it (PVOS D206) | that region's purge has failed every time since the daemon started (`trash purge failed` in the journal says why), so it was never measured; the page raises it (§2.2) | a slow step: the first runs within five minutes of the daemon's start |
 
 ### 1.2 The owner's view: the `health` job and `pvfs fleet health` (D131, D136)
 
@@ -212,8 +213,15 @@ Payload (format `ha`/`json`):
 {"event": "peer_down", "severity": "critical",
  "summary": "the NAS is down. It has not answered for 4 minutes. …",
  "name": "the NAS", "at_ms": 0, "peer": "93fc7ff2", "addr": "<holder-ip>:7433",
- "since_ms": 0, "detail": "…", "up": 2, "down": 1}
+ "since_ms": 0, "detail": "…", "up": 2, "down": 1, "forest": "media"}
 ```
+
+`forest` (PVOS D206) names the forest the event is about: the alias it is
+registered under on the owner (`pvfs forest register --alias`), else its
+mount directory's name; it is absent only when neither can be read. The
+chat formats lead with it (`PVFS media: …`), and ntfy's title carries it
+(`PVFS media peer_down`). A lab owner's events can then go to the same
+phone as production's and say which they are. `summary` is unchanged.
 
 `summary` is one plain sentence naming the box — the only thing a person
 should have to read. The first version sent the raw fields
@@ -378,6 +386,21 @@ the machines; and the recent fleet events.
   setting: a box that reports its build has the step by construction, every
   box on the fleet runs v1.4-495 or later, and the roll guard refuses a
   downgrade (D153). Every box is held to it.
+- **A region never measured (PVOS D206).** A region whose purge has failed
+  every time since its daemon started has no `trash` entry at all, so the
+  test above can never fire for it (D177 left this out). The collector
+  compares each answering box's `stores` (the catalogue regions on each of
+  its filesystems) with its `trash`, remembers when it first saw a region
+  missing, and after 30 minutes says: *"Mediabox's trash in mediabox-local2
+  has never been measured (31 min since this page first saw it missing): its
+  trash step is failing for it (its journal says why)."* A restarted daemon
+  fills its list within five minutes, so restarts raise nothing.
+- **A refused region claim (PVOS D206).** A box's catalogue job that refuses
+  another box's signed region head (D183) puts the refusal on its row as a
+  note (`last_error`; the pass still completed). The page lists it under the
+  box, and the notifier says it as that box's `job_error` once it has stood
+  ~four minutes, and its clear when it goes. A refusal the owner's commit
+  settles within minutes never reaches the phone.
 - **Each box's build, from the box (PVOS D200).** The Build column is each
   daemon's own word — the peer's `build` in `fleet-health.json`, the owner's
   from its `serve status` — so a box a roll missed, or one whose daemon was

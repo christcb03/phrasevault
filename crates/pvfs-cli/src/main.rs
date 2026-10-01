@@ -1337,15 +1337,17 @@ enum ServeCmd {
     /// Enable a job in `serve.jobs`; the daemon picks it up on SIGHUP or
     /// restart
     Enable {
-        /// The job (`--help` says what each one does)
+        /// The job (`--help` says what each one does); bare, at a terminal,
+        /// it lists the jobs and asks
         #[arg(value_parser = serve_job_parser())]
-        job: String,
+        job: Option<String>,
     },
     /// Disable a job in `serve.jobs`
     Disable {
-        /// The job (`--help` says what each one does)
+        /// The job (`--help` says what each one does); bare, at a terminal,
+        /// it lists the jobs and asks
         #[arg(value_parser = serve_job_parser())]
-        job: String,
+        job: Option<String>,
     },
     /// List the jobs this data dir is configured to run
     Ls,
@@ -6180,6 +6182,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         ServeCmd::Disable { job } => (job, false),
                         _ => unreachable!(),
                     };
+                    let verb_now = if enable { "enable" } else { "disable" };
+                    let job = match job {
+                        Some(j) => j,
+                        None => ask_job(&data_dir, verb_now)?,
+                    };
                     let changed = pvfs_core::serve::set_job(&data_dir, &job, enable)?;
                     let verb = if enable { "enabled" } else { "disabled" };
                     if json {
@@ -7176,6 +7183,20 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         .collect();
                     // D133: this box's local declarations.
                     let receiving = pvfs_core::sync::receiving_regions(engine.data_dir())?;
+                    // PVOS D206 — a receiving region's tuning (D144): files at
+                    // once × ranges of each, as `.pvfs/placement` holds them.
+                    let tuning = |id: &str| -> Option<(u32, u32)> {
+                        if !receiving.iter().any(|r| r == id) {
+                            return None;
+                        }
+                        let d = engine.data_dir();
+                        Some((
+                            pvfs_core::sync::region_receive_parallel(d, &id.to_string())
+                                .unwrap_or(pvfs_core::sync::RECEIVE_PARALLEL_DEFAULT),
+                            pvfs_core::sync::region_receive_streams(d, &id.to_string())
+                                .unwrap_or(pvfs_core::sync::RECEIVE_STREAMS_DEFAULT),
+                        ))
+                    };
                     if json {
                         let rows: Vec<String> = regions
                             .iter()
@@ -7183,7 +7204,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 let drains = engine.region_drains(id).unwrap_or(false);
                                 let cat = status.get(id).map(|s| {
                                     format!(
-                                        ",\"head\":{},\"committed\":{},\"provisional\":{},\"pending\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{},\"receives\":{},\"retention_days\":{}",
+                                        ",\"head\":{},\"committed\":{},\"provisional\":{},\"pending\":{},\"held\":{},\"local\":{},\"stale\":{},\"fetched_at\":{},\"entries\":{},\"receives\":{},\"receive_parallel\":{},\"receive_streams\":{},\"retention_days\":{}",
                                         s.head_seq,
                                         s.committed_seq,
                                         s.provisional,
@@ -7194,6 +7215,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                         s.fetched_at.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
                                         s.entries,
                                         receiving.contains(id),
+                                        tuning(id).map(|t| t.0.to_string()).unwrap_or_else(|| "null".into()),
+                                        tuning(id).map(|t| t.1.to_string()).unwrap_or_else(|| "null".into()),
                                         pvfs_core::sync::region_retention_days(engine.data_dir(), id).unwrap_or(pvfs_core::sync::TRASH_KEEP_DAYS_DEFAULT)
                                     )
                                 }).unwrap_or_default();
@@ -7226,7 +7249,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                         head,
                                         s.entries,
                                         if s.stale { "\tSTALE" } else { "" },
-                                        if receiving.contains(id) { "\treceives" } else { "" }
+                                        tuning(id).map(|(f, r)| format!("\treceives {f}×{r}")).unwrap_or_default()
                                     )
                                 })
                                 .unwrap_or_default();
@@ -7359,7 +7382,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                pvfs_client::notify::send(&n, &pvfs_client::notify::test_event(now))?;
+                // PVOS D206 — the test names its forest, as every event does.
+                let mut ev = pvfs_client::notify::test_event(now);
+                ev.forest = pvfs_client::notify::forest_name(&data_dir);
+                pvfs_client::notify::send(&n, &ev)?;
                 println!("test event sent to {}", n.url);
             }
             Ok(())
@@ -10426,6 +10452,41 @@ fn print_sidecar_upgrade(r: &pvfs_core::UpgradeReport, json: bool) {
     }
 }
 
+/// PVOS D206 — `pvfs serve enable|disable` bare: at a terminal, list the
+/// jobs (with their state here and what each does) and ask which; anywhere
+/// else, refuse at once naming them (never wait on a script's stdin, D198).
+fn ask_job(data_dir: &std::path::Path, verb: &str) -> Result<String, PvfsError> {
+    let names = pvfs_core::serve::JOB_NAMES;
+    if !interactive() {
+        return Err(PvfsError::BadInput {
+            field: "job".into(),
+            reason: format!("which job to {verb}? one of: {} (pvfs serve {verb} <job>)", names.join(", ")),
+        });
+    }
+    let enabled = pvfs_core::serve::load_jobs(data_dir)?;
+    for (i, n) in names.iter().enumerate() {
+        let state = if enabled.iter().any(|j| j == n) { "enabled" } else { "-" };
+        eprintln!("  {:>2}. {n:<9} {state:<8} {}", i + 1, pvfs_core::serve::job_summary(n).unwrap_or(""));
+    }
+    pick_job(&prompt_line(&format!("Which job to {verb} (a name or its number)"), None)?)
+}
+
+/// PVOS D206 — a job named by name or by its number in `JOB_NAMES`' list.
+fn pick_job(answer: &str) -> Result<String, PvfsError> {
+    let names = pvfs_core::serve::JOB_NAMES;
+    let a = answer.trim();
+    if let Some(n) = names.iter().find(|n| **n == a) {
+        return Ok((*n).to_string());
+    }
+    match a.parse::<usize>() {
+        Ok(i) if (1..=names.len()).contains(&i) => Ok(names[i - 1].to_string()),
+        _ => Err(PvfsError::BadInput {
+            field: "job".into(),
+            reason: format!("{a:?} is not a job — one of: {}", names.join(", ")),
+        }),
+    }
+}
+
 fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {
     use std::io::Write;
     if !interactive() {
@@ -10907,6 +10968,19 @@ mod tests {
         assert!(!interactive_when(true, true, true), "--json never asks");
         assert!(!interactive_when(false, false, true), "a pipe or /dev/null on stdin");
         assert!(!interactive_when(false, true, false), "stderr redirected: nobody sees the question");
+    }
+
+    // PVOS D206 — a bare `serve enable|disable` takes a job's name or its
+    // number in the list it printed, and nothing else.
+    #[test]
+    fn a_job_is_picked_by_name_or_number() {
+        let names = pvfs_core::serve::JOB_NAMES;
+        assert_eq!(pick_job("receive").unwrap(), "receive");
+        assert_eq!(pick_job(" 1 ").unwrap(), names[0]);
+        assert_eq!(pick_job(&names.len().to_string()).unwrap(), names[names.len() - 1]);
+        for bad in ["", "0", "12", "defrag", "Receive", "-1"] {
+            assert!(pick_job(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 
     // PVOS D198 — `forest promote <dir>` routes the companion by <dir>, not by
