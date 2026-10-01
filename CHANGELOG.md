@@ -5,6 +5,26 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Each job's pass says how far it has got; stalls are judged by it (PVOS
+  D207).** `pvfs_core::progress::JobProgress` — a pass's own account: when it
+  began, when it last moved, files and bytes done, its phase, the files in
+  hand. The daemon's stepped watch reports its walk, its hashing (8 MiB at a
+  time, `sync::hash_with_manifest_progress`), files taken from rows or
+  sidecars, and its steps (`CatalogueCtx.progress`); the receive reports
+  each pulled file (`receive::receive_pass_progress`,
+  `pull_into_partial_progress`). `serve status` carries it per job
+  (`ServeJobWire.progress`, defaulted — no proto bump), the health record
+  too (`JobHealth.progress`); `pvfs serve status` prints a line under a
+  job with a pass in flight (and `--json` carries it), `pvfs fleet status`
+  a note. The stall check: a pass that reports and advances is `running`
+  however long it runs; one that has not advanced for 30 min is `stalled`,
+  with where it stopped. Jobs that do not report are judged as before.
+  Tests: `d207_quiet_pass` (every kind of change through the daemon's
+  stepped pass writes exactly its rows — D199's skip-unchanged-rows — and a
+  pass's progress while it hashes), `d207_measure` (ignored: the quiet-pass
+  measurement), `d207_progress` (a pull's progress; `serve status` over the
+  socket), jobs and wire tests.
+
 - **Catalogue rows carry video quality (PVOS D208).** The daemon's `watch`
   measures each video file (`.mkv`, `.mp4`, … — not audio) that has no
   `quality` with ffprobe, on the box whose disk holds it: after the sweep

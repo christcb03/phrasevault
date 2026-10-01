@@ -17,7 +17,7 @@ fn receive(err: Option<&str>) -> PeerHealth {
     PeerHealth {
         reachable: true,
         forest_ok: true,
-        jobs: vec![JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: err.map(str::to_string) }],
+        jobs: vec![JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: err.map(str::to_string), progress: None }],
         ..Default::default()
     }
 }

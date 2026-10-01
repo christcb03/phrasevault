@@ -7573,10 +7573,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 if r.last.ok() {
                     let mut notes: Vec<String> = Vec::new();
                     for j in &r.last.jobs {
+                        // PVOS D207 — a stall says where it stopped (its
+                        // pass's progress, or how long past its usual length).
                         if j.state == "stalled" {
-                            notes.push(format!("{} stalled (for tier/watch check progress by artifact, not this)", j.name));
+                            notes.push(format!("{} stalled: {}", j.name, j.last_error.as_deref().unwrap_or("no detail")));
                         } else if let Some(e) = &j.last_error {
                             notes.push(format!("{} error: {e}", j.name));
+                        }
+                        if let Some(p) = &j.progress {
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                            notes.push(format!("{} {}", j.name, pass_progress_line(p, now)));
                         }
                     }
                     if r.last.conflicts > 0 {
@@ -10342,6 +10348,39 @@ fn print_receive_plan(plan: &pvfs_client::ReceivePlanReply, json: bool) {
     }
 }
 
+/// PVOS D207 — one line for a pass in flight: how long it has run, what it
+/// has done, what it is doing, and when it last moved.
+fn pass_progress_line(p: &pvfs_client::PassProgressWire, now_ms: u64) -> String {
+    let dur = |ms: u64| {
+        let s = ms / 1000;
+        if s < 120 {
+            format!("{s} s")
+        } else if s < 7200 {
+            format!("{} min", s / 60)
+        } else {
+            format!("{} h {} min", s / 3600, s / 60 % 60)
+        }
+    };
+    let mut line = format!(
+        "pass {}: {} file(s), {}",
+        dur(now_ms.saturating_sub(p.started_ms)),
+        p.files_done,
+        fmt_bytes(p.bytes_done)
+    );
+    if let Some(phase) = &p.phase {
+        line.push_str(&format!(" — {phase}"));
+    }
+    for f in &p.current {
+        let of = f.size.map(|s| format!(" of {}", fmt_bytes(s))).unwrap_or_default();
+        line.push_str(&format!(" {} ({}{of})", f.path, fmt_bytes(f.bytes)));
+    }
+    let still = now_ms.saturating_sub(p.advanced_ms);
+    if still >= 60_000 {
+        line.push_str(&format!("; last moved {} ago", dur(still)));
+    }
+    line
+}
+
 fn serve_status_print(
     state_dir: &std::path::Path,
     sock: &std::path::Path,
@@ -10364,7 +10403,7 @@ fn serve_status_print(
             .iter()
             .map(|j| {
                 format!(
-                    "{{\"job\":\"{}\",\"enabled\":{},\"state\":\"{}\",\"last_ok_ms\":{},\"last_error\":{}}}",
+                    "{{\"job\":\"{}\",\"enabled\":{},\"state\":\"{}\",\"last_ok_ms\":{},\"last_error\":{},\"progress\":{}}}",
                     json_escape(&j.name),
                     j.enabled,
                     json_escape(&j.state),
@@ -10373,6 +10412,8 @@ fn serve_status_print(
                         .as_ref()
                         .map(|e| format!("\"{}\"", json_escape(e)))
                         .unwrap_or_else(|| "null".into()),
+                    // PVOS D207 — the pass in flight, as the job reports it.
+                    serde_json::to_string(&j.progress).unwrap_or_else(|_| "null".into()),
                 )
             })
             .collect();
@@ -10434,12 +10475,17 @@ fn serve_status_print(
                 t.retention_days
             );
         }
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         for j in &jobs {
             let mut line = format!("{:<8} {}", j.name, j.state);
             if let Some(e) = &j.last_error {
                 line.push_str(&format!("  (last error: {e})"));
             }
             println!("{line}");
+            // PVOS D207 — a pass in flight, in its own words.
+            if let Some(p) = &j.progress {
+                println!("         {}", pass_progress_line(p, now_ms));
+            }
         }
     }
     Ok(())

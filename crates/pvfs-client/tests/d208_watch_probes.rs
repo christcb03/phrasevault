@@ -61,7 +61,7 @@ fn the_daemons_watch_measures_what_it_catalogues() {
     let stop = Arc::new(AtomicBool::new(false));
     let watch = {
         let (w, stop) = (Arc::clone(&writer), Arc::clone(&stop));
-        std::thread::spawn(move || pvfs_client::watch::run_shared(w, 3600, 200, 2000, &stop, |_| {}))
+        std::thread::spawn(move || pvfs_client::watch::run_shared(w, 3600, 200, 2000, &stop, None, |_| {}))
     };
     let db = SharedDb::new(Arc::clone(&writer), "test").unwrap();
     let quality = |rel: &str| -> Option<Option<String>> {

@@ -294,3 +294,32 @@ fn a_prepare_write_tip_is_optional_both_ways() {
         OldClientMsg::PrepareWrite { op: got } => assert_eq!(got, op),
     }
 }
+
+/// PVOS D207 — a job row from an older daemon (no `progress`) decodes; a
+/// row with a pass in flight carries it, and one without leaves it out.
+#[test]
+fn a_job_row_with_and_without_progress() {
+    let old = r#"{"name":"watch","enabled":true,"state":"running","last_ok_ms":1,"last_error":null}"#;
+    let row: pvfs_proto::ServeJobWire = serde_json::from_str(old).unwrap();
+    assert_eq!(row.progress, None);
+    assert!(!serde_json::to_string(&row).unwrap().contains("progress"), "absent when no pass is in flight");
+    let with = pvfs_proto::ServeJobWire {
+        progress: Some(pvfs_proto::PassProgressWire {
+            started_ms: 1,
+            advanced_ms: 2,
+            files_done: 3,
+            bytes_done: 4,
+            phase: Some("pulling".into()),
+            current: vec![pvfs_proto::FileProgressWire {
+                path: "Shows/e01.mkv".into(),
+                hash: Some("ab".into()),
+                bytes: 5,
+                size: Some(6),
+                advanced_ms: 2,
+            }],
+        }),
+        ..row
+    };
+    let json = serde_json::to_string(&with).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServeJobWire>(&json).unwrap(), with);
+}
