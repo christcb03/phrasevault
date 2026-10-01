@@ -979,6 +979,26 @@ impl PvfsFs {
         }
     }
 
+    /// PVOS D210 — the boxes that hold `hash` for this entry, as endpoint
+    /// addresses: each copy with that hash names its region, and the
+    /// catalogue knows which box serves that region's manifest (in the
+    /// view's order of the copies). Empty when the catalogue does not know —
+    /// the read then asks the fleet in turn, as before.
+    fn holders_of(&self, entry: &pvfs_core::ViewEntry, hash: &str) -> Vec<String> {
+        let Ok(by_region) = self.engine.region_holders() else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for c in entry.sources.iter().filter(|c| c.content_hash.as_deref() == Some(hash)) {
+            if let Some(addr) = by_region.get(&c.region) {
+                if !out.contains(addr) {
+                    out.push(addr.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// D130 §3.2 — open a view file: this box's own disk, the hash store,
     /// else a read-through. D165: the read-through fetches the pieces a
     /// read asks for, not the file — `open` starts nothing.
@@ -995,8 +1015,9 @@ impl PvfsFs {
             self.handles.insert(fh, f);
             return Ok(fh);
         }
+        let prefer = self.holders_of(&entry, &hash);
         let cache = self.hash_cache.as_ref().ok_or(libc::EIO)?;
-        match cache.open(&hash, size).map_err(|_| libc::EIO)? {
+        match cache.open_preferring(&hash, size, &prefer).map_err(|_| libc::EIO)? {
             Opened::Local(path) => {
                 let f = match std::fs::File::open(&path) {
                     Ok(f) => f,

@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A cold read through the view asks the region's holder first (PVOS
+  D210).** The view mount's read-through asked the fleet's boxes in pin
+  order, from the box that served last — a dial and a `not_found` per box
+  asked in vain, and up to the 10 s dial timeout for one that is down. Now
+  `view_open` takes the regions of the copies with the served hash, the
+  catalogue's `Engine::region_holders()` (the box each region's manifest
+  was fetched from, `region_fetched.source`, else the box that claimed its
+  provisional head) and opens with `HashCache::open_preferring`: the fetch
+  starts at the first holder the fleet announces, then goes round in
+  today's order (a stale holder costs one `not_found`). No protocol change.
+  Measured on the lab LAN (v1.4-518): a cold read whose holder sorted
+  second took 0.23–0.28 s against 0.21–0.22 s holder-first. Tests:
+  `d210_holder_first` (pvfs-fuse: a silent box listed before the holder is
+  never dialed when the holder is known; an unknown holder keeps today's
+  order), `start_at` unit test.
+
 - **Each job's pass says how far it has got; stalls are judged by it (PVOS
   D207).** `pvfs_core::progress::JobProgress` — a pass's own account: when it
   began, when it last moved, files and bytes done, its phase, the files in
