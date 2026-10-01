@@ -172,7 +172,8 @@ fn a_pass_reports_its_progress_while_it_runs() {
 
     // Seen from the pass's own thread, before each file is read: the phase,
     // and the files done so far.
-    let seen: Arc<Mutex<Vec<(Option<String>, u64)>>> = Arc::default();
+    type Seen = Arc<Mutex<Vec<(Option<String>, u64)>>>;
+    let seen: Seen = Arc::default();
     let db = SharedDb::new(Arc::clone(&writer), "watch").unwrap();
     let mut ctx = pvfs_core::fs::CatalogueCtx::new(None);
     ctx.progress = Some(Arc::clone(&progress));
