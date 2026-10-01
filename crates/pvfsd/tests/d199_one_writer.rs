@@ -10,8 +10,8 @@
 //!    up a backlog: no served write fails, none is refused "busy", none waits
 //!    seconds; the waits and latencies are printed. `PVFS_D199_STRICT=1` (the
 //!    release run on presubuntu's disk, D199 §4.3) also asserts that the
-//!    writer wait's p99 is under 100 ms, and `PVFS_D199_SCALE` multiplies the
-//!    loads.
+//!    writer wait's p99 is under 100 ms; `PVFS_D199_FILES`, `_ROWS` and
+//!    `_EVENTS` size the loads.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -89,9 +89,11 @@ fn connect(sock: &Path, key: &SigningKey, pubkey: &[u8]) -> Client {
     Client::connect_signed(sock, pubkey, move |d| crypto::sign_digest(&k, d).unwrap()).unwrap()
 }
 
-/// How much bigger than the defaults the loads are (`PVFS_D199_SCALE`).
-fn scale() -> usize {
-    std::env::var("PVFS_D199_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+/// A load's size: `default`, or what `PVFS_D199_<name>` says (the release
+/// runs on presubuntu's disk use smaller watch and follow loads: every file
+/// hashed there writes a sidecar, and every event made costs two fsyncs).
+fn load(name: &str, default: usize) -> usize {
+    std::env::var(format!("PVFS_D199_{name}")).ok().and_then(|v| v.parse().ok()).unwrap_or(default).max(1)
 }
 
 fn strict() -> bool {
@@ -287,7 +289,6 @@ fn manifest_rows(n: usize, bump: u64) -> Vec<RegionEntry> {
 #[test]
 fn served_writes_wait_one_short_step_while_jobs_work() {
     let (ckey, cpub) = client_key();
-    let n = scale();
     let odir = tempfile::tempdir().unwrap();
     let (mut owner, mn) = Engine::init(odir.path().join("forest").as_path()).unwrap();
     let root = owner.identity.root_node_id.clone();
@@ -296,7 +297,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
     let probes = folder(&mut owner, &root, "Probes");
     // The owner's own catalogue region, for the watch.
     let media = odir.path().join("media");
-    let files = 3_000 * n;
+    let files = load("FILES", 3_000);
     for i in 0..files {
         let dir = media.join(format!("Show {:02}/Season {:02}", i % 40, i % 7));
         std::fs::create_dir_all(&dir).unwrap();
@@ -363,7 +364,7 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
     println!("D199 watch: first pass over {files} files took {first_took:?}");
 
     // (b) the catalogue: a first install of many rows, then a two-row bump.
-    let rows = 30_000 * n;
+    let rows = load("ROWS", 30_000);
     let head1 = manifest_rows(rows, 0);
     let bytes1 = Engine::region_manifest_bytes(&far, 1, &head1);
     let hash1 = blake3::hash(&bytes1).to_hex().to_string();
@@ -397,7 +398,6 @@ fn served_writes_wait_one_short_step_while_jobs_work() {
 #[test]
 fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
     let (ckey, cpub) = client_key();
-    let n = scale();
     let odir = tempfile::tempdir().unwrap();
     let (mut owner, mn) = Engine::init(odir.path().join("forest").as_path()).unwrap();
     let root = owner.identity.root_node_id.clone();
@@ -407,7 +407,7 @@ fn a_replicas_served_writes_wait_one_short_step_while_follow_catches_up() {
     owner.region_mark_as(&region, "catalogue", Some(&Principal::Key(cpub.clone()))).unwrap();
     let seed = owner.log_events(1, owner.log_tip().unwrap() as usize).unwrap();
     // The backlog the replica will follow: events it has not seen.
-    let backlog = 1_500 * n;
+    let backlog = load("EVENTS", 1_500);
     let bulk = folder(&mut owner, &root, "Bulk");
     for i in 0..backlog {
         folder(&mut owner, &bulk, &format!("n{i}"));

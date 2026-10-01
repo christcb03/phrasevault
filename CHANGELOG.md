@@ -22,7 +22,7 @@ file tracks Layer 0, the file-system engine.
     first install of 55,000 rows is ~110 short steps, not one hold of
     seconds; another process's commit meanwhile is put right in the last
     step (D194's rule). `follow` (`follow::run_shared`): an ingest step
-    and a fold step per batch (`Engine::ingest_log_rows`,
+    and a fold step per batch of at most 128 events (`Engine::ingest_log_rows`,
     `Engine::catch_up`; the fold lock is tried, not waited for). `receive`,
     `resolve` and `reclaim` read through a view and write only files. A
     replica's catch-up after routed writes: `advertise::catch_up_db`. None
@@ -35,7 +35,10 @@ file tracks Layer 0, the file-system engine.
     now it writes none.
   - **Serving goes first.** A job about to take the writer lets a waiting
     served op go first, so a served write waits for the one step in
-    progress at most. A rename or folder removal through the view does its
+    progress at most — and a job thread lowered below serving (D191) is
+    raised for each hold: out of the idle disk class always, and to the
+    process's nice value where the unit's `LimitNICE=` allows
+    (`priority::raise_for_hold`). A rename or folder removal through the view does its
     disk work outside the writer (in order, among themselves) and its rows
     in one step; the ingest publish-retry hashes before it takes the writer.
   - **A replica's read pool.** `Engine::open_read_view` works on a replica
@@ -47,6 +50,9 @@ file tracks Layer 0, the file-system engine.
     with who held it; hourly: `pvfsd: the writer, last hour: N hold(s), …
     in all (longest … by …); …; engine opens N, read views N, folds N (N
     events)`. A step that panics no longer takes the writer with it.
+  - **The watch's startup pass schedules the settle recheck**, as every
+    later pass does: files still being written when a daemon started
+    waited for the next change, or the hourly reconcile.
 
   No wire, schema or protocol change.
 
