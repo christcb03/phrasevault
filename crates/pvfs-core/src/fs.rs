@@ -404,6 +404,10 @@ pub struct RegionEntry {
     pub seen_at: u64,
 }
 
+/// PVOS D211 — a file the probe step may measure: `(rel_path, size,
+/// mtime_ms, content hash when known)`.
+pub type QualityCandidate = (String, u64, u64, Option<String>);
+
 /// PVOS D211 — what the holder makes of a quality another box sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityPlan {
@@ -2174,7 +2178,7 @@ impl Engine {
         &self,
         region: &NodeId,
         now_ms: u64,
-    ) -> Result<Vec<(String, u64, u64, Option<String>)>> {
+    ) -> Result<Vec<QualityCandidate>> {
         let mut stmt = self
             .conn
             .prepare(
