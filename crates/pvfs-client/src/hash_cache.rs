@@ -276,6 +276,9 @@ struct FetchSt {
     cursors: Vec<Cursor>,
     prefetch: Option<(usize, usize)>,
     swept: usize,
+    /// PVOS D210 — the boxes that hold this file's region (endpoint
+    /// addresses, as the view's catalogue knows them): asked first.
+    prefer: Vec<String>,
 }
 
 /// One file being read through: its piece map, its waiting reads, its worker.
@@ -720,10 +723,22 @@ fn worker(cache: Arc<CacheInner>, fetch: Arc<HashFetch>) {
     }
 }
 
+/// PVOS D210 — where a fetch starts asking: the first of `prefer` (the boxes
+/// that hold the file's region) among `sources`, else `hint` (the box that
+/// served last). Only a starting point: [`fetch_run`] goes round the rest in
+/// today's order, so a wrong or stale preference costs one `not_found`.
+fn start_at(sources: &[ReplicaSource], prefer: &[String], hint: usize) -> usize {
+    prefer
+        .iter()
+        .find_map(|p| sources.iter().position(|s| &s.target == p))
+        .unwrap_or(hint)
+}
+
 fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
     let sources = cache.sources();
+    let prefer = fetch.st.lock().unwrap().prefer.clone();
     let mut run = Run {
-        cur: cache.hint.load(Ordering::Relaxed),
+        cur: start_at(&sources, &prefer, cache.hint.load(Ordering::Relaxed)),
         bad: HashSet::new(),
         served: HashSet::new(),
         file: None,
@@ -1343,6 +1358,15 @@ impl HashCache {
     /// Open `hash` (`size` bytes) for reading: the kept file if the store
     /// has it, else its read-through — the same one for every handle on it.
     pub fn open(&self, hash: &str, size: u64) -> Result<Opened, String> {
+        self.open_preferring(hash, size, &[])
+    }
+
+    /// PVOS D210 — [`HashCache::open`], asking the boxes in `prefer` (endpoint
+    /// addresses: the holders of the file's region, as the view knows them)
+    /// before the rest. A cold read used to ask the fleet in pin order from
+    /// the box that served last — a dial and a `not_found` per box asked in
+    /// vain, and up to the dial timeout for one that is down.
+    pub fn open_preferring(&self, hash: &str, size: u64, prefer: &[String]) -> Result<Opened, String> {
         let final_path = pvfs_core::sync::hash_store_path(&self.inner.data_dir, hash).map_err(|e| e.to_string())?;
         let mut map = self.inner.fetches.lock().unwrap();
         if final_path.is_file() {
@@ -1383,6 +1407,7 @@ impl HashCache {
                         cursors: Vec::new(),
                         prefetch: None,
                         swept: 0,
+                        prefer: prefer.to_vec(),
                     }),
                     cv: Condvar::new(),
                 });
@@ -1391,6 +1416,12 @@ impl HashCache {
                 f
             }
         };
+        {
+            let mut st = fetch.st.lock().unwrap();
+            if st.prefer.is_empty() && !prefer.is_empty() {
+                st.prefer = prefer.to_vec();
+            }
+        }
         fetch.handle_opened();
         Ok(Opened::Stream(fetch))
     }
@@ -1545,7 +1576,28 @@ mod tests {
             cursors: Vec::new(),
             prefetch: None,
             swept: 0,
+            prefer: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_fetch_starts_at_the_regions_holder_else_where_the_last_one_served() {
+        let src = |t: &str| ReplicaSource {
+            transport: "tcp".into(),
+            target: t.into(),
+            pin: String::new(),
+            region: String::new(),
+        };
+        let sources = vec![src("feeder:7432"), src("nas:7433"), src("plex:7434")];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(start_at(&sources, &s(&["nas:7433"]), 2), 1, "the holder beats the hint");
+        assert_eq!(start_at(&sources, &[], 2), 2, "no preference: the box that served last");
+        assert_eq!(start_at(&sources, &s(&["gone:1"]), 2), 2, "a holder the fleet no longer announces: the hint");
+        assert_eq!(
+            start_at(&sources, &s(&["gone:1", "plex:7434", "feeder:7432"]), 0),
+            2,
+            "the first preferred box the fleet announces"
+        );
     }
 
     #[test]

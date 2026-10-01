@@ -2529,6 +2529,37 @@ impl Engine {
         Ok(out.into_iter().map(|(_, s)| s).collect())
     }
 
+    /// PVOS D210 — the box that holds each catalogue region this box does
+    /// not catalogue itself, as an endpoint address (`host:port`, the form
+    /// `.fleet/endpoints` announces): the box whose manifest this box
+    /// installed (`region_fetched.source` — only a box that published a
+    /// region's head serves its manifest), else the box that claimed its
+    /// provisional head (`region_provisional.source`, D183). A read through
+    /// the view asks it first instead of the fleet in pin order. Regions
+    /// with neither are absent.
+    pub fn region_holders(&self) -> Result<HashMap<NodeId, String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.node_id, COALESCE(NULLIF(f.source, ''), NULLIF(p.source, ''))
+                   FROM regions r
+                   LEFT JOIN region_fetched f ON f.region_id = r.node_id
+                   LEFT JOIN region_provisional p ON p.region_id = r.node_id
+                  WHERE r.kind = 'catalogue'",
+            )
+            .map_err(map_db("region holders"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(map_db("region holders"))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            if let (region, Some(addr)) = row.map_err(map_db("region holders"))? {
+                out.insert(region, addr);
+            }
+        }
+        Ok(out)
+    }
+
     /// D129 — every catalogue region as this box sees it: the head the log
     /// attests, what this box holds of it (its own live rows, or a fetched
     /// snapshot), and whether that is behind. `stale` means the log attests
