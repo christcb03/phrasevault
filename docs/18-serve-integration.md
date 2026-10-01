@@ -257,6 +257,25 @@ until D100 and was wrong all three times it fired. Distinguishing "advancing
 slowly" from "wedged" needs a progress signal out of `scan_routed` and
 `tier_pass` that does not exist yet.
 
+**Progress, and stalls judged by it (PVOS D207, 2026-10-01).** The signal
+exists now for the two jobs whose passes run for hours on the fleet: the
+daemon's stepped `watch` and `receive`. Each keeps a
+`pvfs_core::JobProgress` for the runner's life; a pass reports into it —
+the watch a tick per folder walked, the bytes of each file it hashes (8 MiB
+at a time), each file whose hash comes from its row or a sidecar, each
+database step; the receive each file it pulls from its first byte (a
+resumed partial from its length) to its placing. `serve status` carries it
+on the job's row (`ServeJobWire.progress`: started, last advanced, files and
+bytes done, the phase, the files in hand), and so does the owner's health
+record (`JobHealth.progress`). For a job with a pass in flight that
+reports, the stall check is progress alone: advancing within 30 minutes
+(`PROGRESS_STALL`), it is `running` however long the pass has run — never
+`overdue`, never `stalled`; not advancing for longer, it is `stalled`, and
+says where it stopped (the phase, the file and how far into it). That reason
+never contains "overdue", so the notifier and the page report it. Jobs that
+do not report (catalogue, follow, resolve, reclaim, health, the node model —
+and a node-model box's watch) are judged as before.
+
 **`follow` is continuous, so it stamps itself (D146).** A tail never completes
 a pass, so its row is stamped on every long-poll that proves it current —
 events folded (`CaughtUp`), or an empty reply whose source tip is not ahead of

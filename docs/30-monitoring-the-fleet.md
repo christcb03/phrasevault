@@ -42,8 +42,15 @@ last run failed.
 | `backoff` | a transient failure; the job retries by itself (`last_error` says why) | that anyone must act yet |
 | `error` | the job's thread exited; the supervisor restarts it later | — |
 | `disabled` | not configured on this box | — |
-| `stalled` | a pass has been in flight far past **this job's own measured** typical duration (D81/D85) — evidence of being stuck | — |
-| `overdue` | no pass has completed for 3 × the job's interval (floored per job: tier/receive 6 h, watch 36 h) | that it is stuck: a long pass over a large library is normal (D100) |
+| `stalled` | a job that reports progress (`watch`, `receive`; PVOS D207): its pass has not advanced for 30 minutes, and the error says where it stopped. Any other job: a pass has been in flight far past **this job's own measured** typical duration (D81/D85). Either is evidence of being stuck | — |
+| `overdue` | no pass has completed for 3 × the job's interval (floored per job: tier/receive 6 h, watch 36 h). Never said of a pass that reports progress and is advancing (PVOS D207) | that it is stuck: a long pass over a large library is normal (D100) |
+
+**A running pass's own account (PVOS D207).** While a `watch` or `receive`
+pass is in flight, its row in `serve status` (and in the owner's health
+record) carries `progress`: when the pass began and last moved, the files and
+bytes done, its phase (`walking`, `hashing`, `writing`, `sweeping`,
+`publishing`, `pulling`) and the files in hand with their bytes and sizes.
+`pvfs serve status` prints it under the job.
 
 **`follow` is special, and honest since D146.** It is a continuous tail
 (long-poll the source's log, 5 s window; fold what arrives). It stamps its row
@@ -350,7 +357,10 @@ the machines; and the recent fleet events.
   `.partial` in order (D144, even with several ranges in flight), so a
   partial's size *is* that file's progress. With several files at once, the
   rate is the **sum** of their growth — taking "the newest partial" as the
-  current file under-read the rate and over-read the ETA.
+  current file under-read the rate and over-read the ETA. *Since PVOS D207*
+  the page reads the holder's own account instead — its receive pass's files
+  in hand, from the health record — and stats partials only on a holder
+  whose daemon predates it.
 - **Moved and deleted come from diffing catalogues**, not logs: a path new to
   a library that staging held was moved (or an upgrade, if other bytes were
   there); the same bytes at a new path were renamed; a path gone from a
