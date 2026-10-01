@@ -50,6 +50,43 @@ file tracks Layer 0, the file-system engine.
 
   No wire, schema or protocol change.
 
+- **Each box says its build; a routed write's failure is judged by its type
+  (PVOS D200).**
+  - **`serve status` carries `build`**, the build the daemon runs
+    (`v1.4-495-gc17ae29`; defaulted, so an older daemon's reply still
+    decodes). The owner's health job records it per peer in
+    `fleet-health.json` — `last.build` for the probe, `build` beside
+    `version` for the last one heard, kept while a box is down — and `pvfs
+    serve status` and `pvfs fleet health` print it. What a box announces
+    (crate version, proto, schema) could not tell two builds apart (D177).
+  - **A routed write's failure is classified by type, not words.**
+    `retry_routed` read the error's text for eleven words (busy, timeout,
+    connection, …). A network failure without one — this client's own idle
+    timeout (`Resource temporarily unavailable`, EAGAIN on Linux), an EOF
+    inside a frame, a TLS alert, the owner's full disk — came back as a
+    refusal, and a refusal that happened to contain one was retried (D182
+    worded the fence's refusal around the list). Now: the owner's `busy` is
+    waited out on the same connection; a failed connection (`Io`,
+    `Protocol`) or the owner's own trouble (`internal`, `io`) fails the
+    pass at once, and the next pass dials again — nothing is retried on a
+    connection that may be dead or out of step; every other code is a
+    refusal of this write, permanent as before, with the same text.
+  - **The daemon sends `busy` for a busy database** (`PvfsError::Busy`),
+    which went out as `internal`; D182 and D185 already sent `busy` for
+    theirs. An older client finds its word in the text, as before.
+- **`pvfs serve enable --help` names every job (PVOS D203).** It listed 7 of
+  the 11 by hand (`follow|watch|sync|export|tier|evict|reclaim`), missing
+  `resolve`, `catalogue`, `health` and `receive`. `serve enable` and `serve
+  disable` now take the job from `JOB_NAMES` through clap's possible values:
+  `-h` lists the names, `--help` each with one line on what it does
+  (`serve::job_summary`, beside `JOB_NAMES`; a job without a line fails a
+  test). An unknown name is refused before the command runs — exit 2 as
+  before, now with clap's "did you mean" and, under `--json`, clap's plain
+  text like every other restricted argument. `load_jobs` still refuses an
+  unknown name in the file. Also: `pvfs --help` described `ingest` with
+  `ssh`'s text (the paragraph sat above the wrong variant) and `ssh` by its
+  examples run into one line; each has its own again, and `ssh`'s examples
+  follow its options.
 - **The CLI never waits on a question nobody can see, and `forest promote`
   signs for the forest it names (PVOS D198).**
   - **One rule for asking**: only when not `--json` and stdin **and** stderr

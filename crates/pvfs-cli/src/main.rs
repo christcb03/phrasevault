@@ -620,10 +620,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
     },
-    /// SSH to a host with this machine's companion socket reverse-forwarded
-    /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
-    /// actually your desktop agent — approvals appear on this machine.
-    ///
     /// External-ingest sessions (P10, doc 23): catalog a download now,
     /// stream bytes in as they verify, commit through the usual gates.
     /// Bare `pvfs ingest` lists the live sessions.
@@ -631,9 +627,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<IngestCmd>,
     },
-    /// Examples:
-    ///   pvfs ssh chris@presubuntu
-    ///   pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion
+    /// SSH to a host with this machine's companion socket reverse-forwarded
+    /// (desktop SSO). Remote `pvfs` sees a local companion socket that is
+    /// actually your desktop agent — approvals appear on this machine.
+    // PVOS D203: this paragraph sat above `Ingest`, so `pvfs --help` gave
+    // `ingest` the ssh text and `ssh` the examples run into one line.
+    #[command(after_help = "Examples:\n  pvfs ssh chris@presubuntu\n  \
+                            pvfs ssh chris@presubuntu -- pvfs forest init --mount ~/media --via-companion")]
     Ssh {
         /// SSH destination (`user@host` or an ssh config Host)
         target: String,
@@ -1323,14 +1323,30 @@ enum ReplicaCmd {
     },
 }
 
+/// PVOS D203 — `serve enable|disable` take a job from `JOB_NAMES`, each with
+/// what it does: `-h` lists the names, `--help` the names and their lines.
+/// The help once listed 7 of the 11 jobs by hand.
+fn serve_job_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(pvfs_core::serve::JOB_NAMES.map(|n| {
+        clap::builder::PossibleValue::new(n).help(pvfs_core::serve::job_summary(n).unwrap_or(""))
+    }))
+}
+
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// Enable a job in `serve.jobs` (follow|watch|sync|export|tier|evict|reclaim).
-    /// The
-    /// daemon picks it up on SIGHUP or restart.
-    Enable { job: String },
+    /// Enable a job in `serve.jobs`; the daemon picks it up on SIGHUP or
+    /// restart
+    Enable {
+        /// The job (`--help` says what each one does)
+        #[arg(value_parser = serve_job_parser())]
+        job: String,
+    },
     /// Disable a job in `serve.jobs`
-    Disable { job: String },
+    Disable {
+        /// The job (`--help` says what each one does)
+        #[arg(value_parser = serve_job_parser())]
+        job: String,
+    },
     /// List the jobs this data dir is configured to run
     Ls,
     /// List the exports the export job keeps fresh (`pvfs export --keep-fresh`)
@@ -7452,11 +7468,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 } else {
                     "never seen".to_string()
                 };
+                // PVOS D200 — the build its daemon last said it runs; the
+                // announced version (crate, proto, schema) from an older one.
                 println!(
                     "  {}  {}  {}  {}",
                     &pin[..8.min(pin.len())],
                     r.addr,
-                    r.version.as_deref().unwrap_or("version ?"),
+                    r.build.as_deref().or(r.version.as_deref()).unwrap_or("version ?"),
                     state
                 );
                 if r.last.ok() {
@@ -10244,6 +10262,9 @@ fn serve_status_print(
     // PVOS D188 — the owner's own row on the Home Assistant page reads these
     // from here (a peer's come through the health record, in the same shape).
     let (mounts, backup) = (st.mounts, st.backup);
+    // PVOS D200 — the build the daemon runs (not this CLI's: after a roll
+    // that has not restarted it, the two differ). None from an older daemon.
+    let build = st.build;
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -10263,7 +10284,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -10275,6 +10296,7 @@ fn serve_status_print(
             serde_json::to_string(&fenced).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&backup).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&build).unwrap_or_else(|_| "null".into()),
         );
     } else {
         // PVOS D182 — first, because nothing else matters while it holds.
@@ -10282,6 +10304,9 @@ fn serve_status_print(
             println!("FENCED: {} — this owner writes nothing until a person looks (pvfs forest fence)", f.reason);
         }
         println!("runner: {runner}");
+        if let Some(b) = &build {
+            println!("build: {b}  (the running daemon's; D200)");
+        }
         if let Some(t) = &log {
             println!("log: seq {}  (this box's copy of the forest log; D182)", t.seq);
         }

@@ -371,18 +371,6 @@ fn store_ids(data_dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Map a remote failure for the SCAN path, preserving whether it is transient.
-///
-/// The wire flattens errors to text, and `remote_err` turns every one of them
-/// into `BadInput` — which `is_transient` correctly reads as "retrying will
-/// never help". For a routed scan that is exactly wrong: a busy database or a
-/// dropped connection is the most ordinary thing that can happen, and it must
-/// come back as retryable or the file is quarantined forever. The D71 lab
-/// showed this precisely — every routed write failing on `SQLite is busy` was
-/// filed as permanent, so the pass never recovered.
-///
-/// Sniffing the text is not elegant; it is what the wire leaves us. Anything
-/// unrecognised stays `BadInput`, so the default is still "ask a human".
 /// D141 — how many times a routed write waits out a busy owner before the
 /// pass is failed, and the cap on one wait. 100 ms doubling to 4 s, six
 /// retries: ~14 s in total, which covers a 30 000-row catalogue snapshot
@@ -398,9 +386,9 @@ const ROUTED_WRITE_BACKOFF_MAX_MS: u64 = 4_000;
 /// the watcher then came back after 5 s doubling to 300 s — and on an owner
 /// re-installing a large snapshot every minute, every retry met the next one.
 /// Retrying the single write here costs seconds; failing the pass cost the
-/// head. Permanent errors return at once, unchanged.
-pub(crate) fn retry_routed<T, E: std::fmt::Display>(
-    mut call: impl FnMut() -> std::result::Result<T, E>,
+/// head. Anything but a busy owner returns at once ([`routed_fault`]).
+pub(crate) fn retry_routed<T>(
+    mut call: impl FnMut() -> std::result::Result<T, crate::ClientError>,
 ) -> pvfs_core::Result<T> {
     let mut attempt = 0u32;
     loop {
@@ -408,35 +396,73 @@ pub(crate) fn retry_routed<T, E: std::fmt::Display>(
             Ok(v) => return Ok(v),
             Err(e) => {
                 let err = scan_remote_err(e);
-                let transient = matches!(err, PvfsError::Busy { .. });
-                if transient && attempt < ROUTED_WRITE_RETRIES {
+                if matches!(err, PvfsError::Busy { .. }) && attempt < ROUTED_WRITE_RETRIES {
                     attempt += 1;
                     let ms = (100u64 << attempt).min(ROUTED_WRITE_BACKOFF_MAX_MS);
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                     continue;
                 }
-                return Err(match err {
-                    PvfsError::Busy { op, .. } => PvfsError::Busy { op, retries: attempt },
-                    other => other,
-                });
+                return Err(err.with_retries(attempt));
             }
         }
     }
 }
 
-fn scan_remote_err(e: impl std::fmt::Display) -> PvfsError {
-    let msg = e.to_string();
-    let low = msg.to_ascii_lowercase();
-    let transient = [
-        "busy", "locked", "timeout", "timed out", "connection", "broken pipe",
-        "reset", "refused", "unreachable", "eof", "closed",
-    ]
-    .iter()
-    .any(|k| low.contains(k));
-    if transient {
-        PvfsError::Busy { op: "routed scan write".into(), retries: 0 }
-    } else {
-        PvfsError::BadInput { field: "scan".into(), reason: msg }
+/// PVOS D200 — what one routed write's failure means to the pass that made
+/// it, judged by the error's TYPE: the client's own (`Io`, `Protocol`) or the
+/// code the owner sent. Never by words in the message: those lists missed
+/// the ordinary network failures (this client's own idle timeout reads
+/// `Resource temporarily unavailable` on Linux, an EOF inside a frame `failed
+/// to fill whole buffer`), took them for refusals, and retried any refusal
+/// that happened to contain a word (D182 worded the fence's around them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutedFault {
+    /// The owner answered `busy` (SQLite busy, or an owner that has just
+    /// started and holds network writes, D185): wait, and try this write
+    /// again on the same connection (D141).
+    Wait,
+    /// The connection failed or is out of step (`Io`, `Protocol`), or the
+    /// owner hit trouble of its own (`internal`, `io`: its disk, its
+    /// database). Not this write's fault, and nothing to retry on this
+    /// connection — it may be dead, and after a timeout a late reply would be
+    /// read as the answer to the retry. The pass fails; the watch drops the
+    /// route and dials again at its next pass.
+    Pass,
+    /// Any other code: the owner refused THIS write (`bad_input`,
+    /// `forbidden` — a fenced owner's refusal included — `not_found`,
+    /// `already_exists`, `integrity`, or a code this client does not know).
+    /// Permanent: a node-model scan quarantines the file, a head commit fails
+    /// its pass (D71 W4).
+    Refused,
+}
+
+fn routed_fault(e: &crate::ClientError) -> RoutedFault {
+    use crate::ClientError;
+    match e {
+        ClientError::Io(_) | ClientError::Protocol(_) => RoutedFault::Pass,
+        ClientError::Server { code, .. } => match code.as_str() {
+            "busy" => RoutedFault::Wait,
+            "internal" | "io" => RoutedFault::Pass,
+            _ => RoutedFault::Refused,
+        },
+    }
+}
+
+/// A routed write's failure as the scan reads it (`pvfs_core`'s
+/// `is_transient`): `Busy` to wait out, `Io` to fail the pass, `BadInput`
+/// for a refusal — its text as before, `<code>: <message>`, which is what
+/// [`crate::watch::commit_pending_heads`] reads "does not advance" from.
+fn scan_remote_err(e: crate::ClientError) -> PvfsError {
+    match routed_fault(&e) {
+        RoutedFault::Wait => PvfsError::Busy { op: "routed scan write".into(), retries: 0 },
+        RoutedFault::Pass => PvfsError::Io {
+            op: "routed write".into(),
+            source: match e {
+                crate::ClientError::Io(source) => source,
+                other => std::io::Error::other(other.to_string()),
+            },
+        },
+        RoutedFault::Refused => PvfsError::BadInput { field: "scan".into(), reason: e.to_string() },
     }
 }
 
@@ -531,29 +557,34 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
 
 #[cfg(test)]
 mod routed_retry_tests {
+    //! PVOS D200 — a routed write's failure is judged by its type. These pass
+    //! `ClientError` values, which the generic `retry_routed` before D200 also
+    //! accepted, so they can be run against it to see which it gets wrong.
     use super::retry_routed;
+    use crate::ClientError;
     use pvfs_core::PvfsError;
+    use std::io;
+
+    fn server(code: &str, message: &str) -> ClientError {
+        ClientError::Server { code: code.into(), message: message.into() }
+    }
+
+    /// Transient for the scan (`pvfs_core`'s `is_transient`: everything but a
+    /// refusal, a bad input or an identity failure) — the pass fails and the
+    /// file is never quarantined for it.
+    fn fails_the_pass(e: &PvfsError) -> bool {
+        !matches!(e, PvfsError::Forbidden { .. } | PvfsError::BadInput { .. } | PvfsError::Identity { .. })
+    }
 
     #[test]
     fn a_busy_owner_is_waited_out_and_the_count_is_honest() {
         let mut calls = 0u32;
         let r: pvfs_core::Result<u8> = retry_routed(|| {
             calls += 1;
-            if calls < 3 { Err("SQLite is busy/locked during fold event".to_string()) } else { Ok(7) }
+            if calls < 3 { Err(server("busy", "SQLite is busy/locked during fold event (retried 4x)")) } else { Ok(7) }
         });
         assert_eq!(r.unwrap(), 7);
         assert_eq!(calls, 3, "two busy answers, then the write");
-    }
-
-    #[test]
-    fn a_permanent_refusal_is_not_retried() {
-        let mut calls = 0u32;
-        let r: pvfs_core::Result<u8> = retry_routed(|| {
-            calls += 1;
-            Err::<u8, _>("no such node".to_string())
-        });
-        assert!(matches!(r, Err(PvfsError::BadInput { .. })));
-        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -561,12 +592,99 @@ mod routed_retry_tests {
         let mut calls = 0u32;
         let r: pvfs_core::Result<u8> = retry_routed(|| {
             calls += 1;
-            Err::<u8, _>("database is locked".to_string())
+            Err::<u8, _>(server(
+                "busy",
+                "the owner has just started and hears its followers' logs before it takes a write",
+            ))
         });
         match r {
             Err(PvfsError::Busy { retries, .. }) => assert_eq!(retries, super::ROUTED_WRITE_RETRIES),
             other => panic!("expected Busy, got {other:?}"),
         }
         assert_eq!(calls, super::ROUTED_WRITE_RETRIES + 1);
+    }
+
+    /// Every failure of the connection fails the pass at once, whatever its
+    /// text says — including the ones no word matched: this client's own idle
+    /// timeout (`SO_RCVTIMEO` fails a read with EAGAIN on Linux), an EOF inside
+    /// a frame, a host with no route. None is retried on the same connection.
+    #[test]
+    fn a_connection_failure_fails_the_pass_once_whatever_it_says() {
+        let failures: Vec<fn() -> ClientError> = vec![
+            || ClientError::Io(io::Error::from_raw_os_error(11)),
+            || ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")),
+            || ClientError::Io(io::Error::from_raw_os_error(113)),
+            || ClientError::Io(io::Error::new(io::ErrorKind::InvalidData, "received fatal alert: DecryptError")),
+            || ClientError::Protocol("expected Committed, got Ls { children: [] }".into()),
+            || ClientError::Protocol("connection closed".into()),
+        ];
+        for make in failures {
+            let text = make().to_string();
+            let mut calls = 0u32;
+            let r: pvfs_core::Result<u8> = retry_routed(|| {
+                calls += 1;
+                Err::<u8, _>(make())
+            });
+            let e = r.expect_err("a failed connection is no write");
+            assert!(fails_the_pass(&e), "{text}: must fail the pass, not quarantine a file — got {e:?}");
+            assert!(!matches!(e, PvfsError::Busy { .. }), "{text}: a dead connection is not a busy owner — got {e:?}");
+            assert_eq!(calls, 1, "{text}: nothing is retried on a failed connection");
+        }
+    }
+
+    /// The owner's own trouble (its disk, its database) is not this write's:
+    /// the pass fails, as a local writer's I/O error does (D162's full disk
+    /// reached a routed writer as `internal`).
+    #[test]
+    fn the_owners_own_trouble_fails_the_pass() {
+        let mut calls = 0u32;
+        let r: pvfs_core::Result<u8> = retry_routed(|| {
+            calls += 1;
+            Err::<u8, _>(server("internal", "database error during fold event: database or disk is full"))
+        });
+        let e = r.expect_err("no write");
+        assert!(fails_the_pass(&e) && !matches!(e, PvfsError::Busy { .. }), "{e:?}");
+        assert!(e.to_string().contains("database or disk is full"), "the owner's words are kept: {e}");
+        assert_eq!(calls, 1);
+    }
+
+    /// A refusal is never retried, whatever words it happens to contain — the
+    /// fence's own, with every word the old list retried on appended.
+    #[test]
+    fn a_refusal_is_never_retried_whatever_its_words() {
+        let fence = pvfs_core::fence::Fence {
+            reason: pvfs_core::fence::Fence::evidence_sentence("192.168.1.142:7435", 3480, 3472),
+            ..Default::default()
+        };
+        let words = "busy locked timeout timed out connection broken pipe reset refused unreachable eof closed";
+        for (code, message) in [
+            ("forbidden", format!("{} ({words})", fence.refusal())),
+            ("not_found", format!("node not found: ab12 ({words})")),
+            ("a_code_from_a_newer_owner", format!("something new ({words})")),
+        ] {
+            let mut calls = 0u32;
+            let r: pvfs_core::Result<u8> = retry_routed(|| {
+                calls += 1;
+                Err::<u8, _>(server(code, &message))
+            });
+            assert!(matches!(r, Err(PvfsError::BadInput { .. })), "{code}: a refusal is permanent — got {r:?}");
+            assert_eq!(calls, 1, "{code}: a refusal is not retried");
+        }
+    }
+
+    /// D183's `commit_pending_heads` reads a settled head from a refusal's
+    /// text; the refusal keeps it.
+    #[test]
+    fn a_refusal_keeps_its_text() {
+        let r: pvfs_core::Result<u8> = retry_routed(|| {
+            Err::<u8, _>(server("bad_input", "invalid input for region head: head 3 does not advance past 5"))
+        });
+        match r {
+            Err(PvfsError::BadInput { reason, .. }) => {
+                assert!(reason.contains("does not advance"), "{reason}");
+                assert!(reason.starts_with("bad_input: "), "{reason}");
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
     }
 }

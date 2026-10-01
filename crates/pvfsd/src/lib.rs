@@ -866,6 +866,8 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),
                         backup: daemon.backup_wire().map(Box::new),
+                        // PVOS D200 — the build this daemon runs.
+                        build: Some(Box::new(env!("PVFS_BUILD").to_string())),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: "off".into(),
@@ -879,6 +881,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),
                         backup: daemon.backup_wire().map(Box::new),
+                        build: Some(Box::new(env!("PVFS_BUILD").to_string())),
                     },
                 }
             }
@@ -3232,6 +3235,10 @@ fn err_from(e: PvfsError) -> ServerMsg {
         PvfsError::Forbidden { .. } => "forbidden",
         PvfsError::Integrity { .. } => "integrity",
         PvfsError::AlreadyExists { .. } => "already_exists",
+        // PVOS D200 — the one answer a routed writer waits out, typed on the
+        // wire (it went out as `internal`, and a writer had to find the word
+        // "busy" in its text). The same code D182 and D185 already send.
+        PvfsError::Busy { .. } => "busy",
         _ => "internal",
     };
     err(code, &e.to_string())
@@ -3258,5 +3265,24 @@ mod tests {
         assert!(daemon.consume_nonce(&nonce), "first use passes");
         assert!(!daemon.consume_nonce(&nonce), "replay is refused");
         assert!(!daemon.consume_nonce(&[0u8; 16]), "unissued nonce is refused");
+    }
+
+    // PVOS D200 — a busy database is `busy` on the wire, the code a routed
+    // writer waits out; the other families keep their codes.
+    #[test]
+    fn a_busy_database_is_typed_busy_on_the_wire() {
+        let code = |e: PvfsError| match err_from(e) {
+            ServerMsg::Error { code, .. } => code,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(code(PvfsError::Busy { op: "fold event".into(), retries: 4 }), "busy");
+        assert_eq!(code(PvfsError::BadInput { field: "f".into(), reason: "r".into() }), "bad_input");
+        assert_eq!(code(PvfsError::Forbidden { action: "a".into(), reason: "r".into() }), "forbidden");
+        assert_eq!(code(PvfsError::NotFound { kind: "node", id: "x".into() }), "not_found");
+        assert_eq!(
+            code(PvfsError::io("fold event", std::io::Error::other("disk"))),
+            "internal",
+            "an I/O error on the owner stays `internal`: its own trouble"
+        );
     }
 }

@@ -1,10 +1,10 @@
 # 29 — The cutover to the new model (doc 26 phase 8)
 
-**Status: written 2026-09-11 (PVOS D137). Rehearsed only as its parts: the
-D134 lab pair ran the play from a wiped forest through the receive → drain →
-purge loop; the D128/D135 rehearsals covered the owner move and the NAS
-supervisor. The whole sequence has not yet been run on the live fleet — §10
-says what that costs.** Doc 25 remains the record of the old-model
+**Status: DONE — run on the live fleet on 2026-09-12 (PVOS D140).** Written
+2026-09-11 (PVOS D137) and rehearsed end to end the same night (D139, §9).
+The old forest was deleted on 2026-09-21 (§8), so there is no way back to the
+node model: this is now the record of how the fleet was built, and the
+runbook for building another. Doc 25 remains the record of the old-model
 re-genesis and of what a rehearsal teaches; this document replaces its
 sequence, not its lessons.
 

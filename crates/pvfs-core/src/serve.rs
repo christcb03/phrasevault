@@ -21,6 +21,27 @@ const JOBS_HEADER: &str = "pvfs-serve-jobs 1";
 /// silently running zero jobs is exactly the failure mode we refuse.
 pub const JOB_NAMES: [&str; 11] = ["follow", "watch", "sync", "export", "tier", "evict", "reclaim", "resolve", "catalogue", "health", "receive"];
 
+/// PVOS D203 — what each job does, in one line, for `pvfs serve enable
+/// --help`. That help once listed 7 of the 11 jobs by hand; it is built from
+/// `JOB_NAMES` now, and a job added there without a line here fails
+/// `every_job_has_a_summary`.
+pub fn job_summary(job: &str) -> Option<&'static str> {
+    Some(match job {
+        "follow" => "on a replica, keep this box's copy of the forest log current with its source",
+        "watch" => "catalogue the folders bound on this box as their files change, and in full hourly",
+        "sync" => "fetch missing bytes for subtrees placed `sync` (node model)",
+        "export" => "keep `pvfs export --keep-fresh` directories current (node model)",
+        "tier" => "on the owner, move subtrees placed `central` into the central store (node model)",
+        "evict" => "delete local bytes the mover has retired, never a file's last copy (node model)",
+        "reclaim" => "trash bytes whose node is no longer linked anywhere (node model)",
+        "resolve" => "on a staging box, trash its draining copies once the library holds the same bytes",
+        "catalogue" => "fetch and install other boxes' catalogues when their heads move (every 60 s)",
+        "health" => "on the owner, poll every announced box every 2 minutes, restart the ones it supervises, send alerts",
+        "receive" => "on a library box, pull by content hash what only staging holds into its receiving regions",
+        _ => return None,
+    })
+}
+
 pub fn jobs_path(data_dir: &Path) -> PathBuf {
     data_dir.join(JOBS_FILE)
 }
@@ -194,6 +215,15 @@ mod tests {
         // corrupt file refuses
         std::fs::write(exports_path(dir.path()), "wrong\n").unwrap();
         assert!(load_exports(dir.path()).is_err());
+    }
+
+    #[test]
+    fn every_job_has_a_summary() {
+        for job in JOB_NAMES {
+            let s = job_summary(job).unwrap_or_else(|| panic!("job {job:?} has no summary"));
+            assert!(!s.is_empty());
+        }
+        assert_eq!(job_summary("nope"), None);
     }
 
     #[test]

@@ -17,6 +17,8 @@ whenever a fix is found, not only when it recurs.**
 | A show Sonarr numbers by segment (whole broadcasts beside segment files) | [§8](#8-a-show-sonarr-numbers-by-segment) |
 | A job on the NAS fails for two minutes: "SQLite is busy/locked" | [§9](#9-a-job-fails-for-two-minutes-sqlite-is-busylocked) |
 | After a promotion, a box still points at the old owner | [§10](#10-after-a-promotion-a-box-still-points-at-the-old-owner) |
+| When did a line in the NAS's `pvfsd.log` happen? | [§11](#11-dating-a-line-in-the-nass-pvfsdlog) |
+| `watch pass failed: I/O error during routed write: …` | [§12](#12-a-routed-write-fails-io-error-during-routed-write) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -167,18 +169,21 @@ them; without it, a rename would strip them.
 catalogue (`pvfs region entries`, the view) for as long as a copy is running
 — up to an hour.
 
-**Why.** The watch is recursive inotify over the region's root and starts a
-pass after 2 s with no events; its fallback is an hourly reconcile. Every
-write to a file anywhere under the root is an event — including a `.pvfs-*`
-folder the catalogue walk ignores — so a long copy keeps resetting the
-2 seconds and no pass starts. (Found in D168: 46 files placed, none hashed,
-until the copies stopped.)
+**Why (before PVOS D180).** The watch is recursive inotify over the region's
+root and starts a pass after 2 s with no events; its fallback is an hourly
+reconcile. Every write to a file anywhere under the root was an event —
+including a `.pvfs-*` folder the catalogue walk ignores — so a long copy kept
+resetting the 2 seconds and no pass started. (Found in D168: 46 files
+placed, none hashed, until the copies stopped.)
 
-**Fix.** Stage copies on the same filesystem but outside the region's root,
-then rename them in; where the region is the whole filesystem, copy one file
-at a time with a few seconds' quiet after each. A PVFS fix (a ceiling on the
-debounce, or ignoring events under `.pvfs-` names) is tracked separately;
-`receive` stages its partials inside the library root the same way.
+**Fix — built.** PVOS D180 (PVFS `v1.4-402`, on the fleet since the
+v1.4-420 roll of 2026-09-22) does both: the watch ignores events on what its
+walk passes over (`.pvfs-*` names such as `receive`'s partials and the
+trash, sidecars, litter), and a pass starts at most 30 s after the first
+change however many keep coming (`pvfs serve watch --ceiling-ms`). A copy
+into a region now delays its catalogue by half a minute, not the hour.
+Staging outside the root and renaming in is still the tidy way on an older
+build, and it keeps half-copied files out of a pass.
 
 ## 5. Sonarr upgrades take minutes: the recycle bin
 
@@ -315,3 +320,47 @@ box it knows (doc 28 §4): `pvfs instance add <alias>-src <new-owner>:<port>
 <pin>`, `pvfs replica repoint <mount> --instance <alias>-src`, restart its
 daemon. The next pass routes through the new owner and the pending heads
 commit.
+
+## 11. Dating a line in the NAS's `pvfsd.log`
+
+**What it looks like.** The NAS (QTS, no systemd, so no journal) keeps its
+daemon's output in `<nas_home>/pvfsd.log`. Lines from before PVOS D200's
+roll carry no date: D173 dated them by the owner's journal, D174 and D194 by
+the catalogue head numbers they name.
+
+**Fix.** Since PVOS D200 the NAS play's start script (`bin/start-pvfs.sh`)
+runs the daemon through BusyBox `awk`, which puts the NAS's local time and
+offset in front of every line: `2026-09-30 18:11:08 -0400 pvfsd: …`. Nothing
+to do but roll the NAS; the first dated line is the daemon's start in the
+roll's down window. Undated lines after that date mean `awk` was killed and
+`cat` took over the pipe (by design: the daemon's stderr never breaks); the
+next start of the daemon dates them again. `watchdog.log` beside it was
+always dated, by the same clock.
+
+## 12. A routed write fails: "I/O error during routed write"
+
+**What it looks like.** A replica's watch logs `watch pass failed: I/O error
+during routed write: …` — for example `Resource temporarily unavailable (os
+error 11)` (this box's own 180 s idle timeout on the connection to the
+owner), `failed to fill whole buffer` (the owner went away inside an
+answer), or `internal: … database or disk is full` (the owner's own
+trouble) — then `watch recovered …` once the owner answers again.
+
+**Why.** A write a replica routes through the owner (its catalogue head; on
+an old-model binding, each file's node) is judged by the failure's type
+since PVOS D200, never by words in its message: the owner's `busy` is
+waited out on the same connection (six tries, D141); a failed connection,
+or trouble of the owner's own (`internal`), fails the pass, and the next
+pass dials again (5 s, backing off); only a refusal of the write itself
+(`bad_input`, `forbidden` — a fenced owner's included — `not_found`, …) is
+permanent. Before D200 the classifier looked for eleven words (busy,
+timeout, connection, …); a network failure without one came back as a
+refusal, and on an old-model binding every remaining file of the pass was
+quarantined while the dead connection was kept.
+
+**Fix.** Nothing, if it recovers: that is the design. If it does not, the
+owner is the place to look — its daemon, its disk, its database — not this
+box. An owner that has just started answers `busy` until it has heard its
+followers (D185): that is waited out, and only a hold longer than the six
+tries fails one pass (`SQLite is busy/locked during routed scan write
+(retried 6x)` — the owner's word was `busy`, not always SQLite's).
