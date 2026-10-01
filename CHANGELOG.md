@@ -47,10 +47,12 @@ file tracks Layer 0, the file-system engine.
     PASSIVE every 2 s, at the daemon's priority) instead of inside
     whichever step crosses SQLite's 1,000-page mark; and the daemon's
     writer commits `index.db` with `synchronous = NORMAL`
-    (`Engine::set_index_sync_normal`) — `log.db`, the forest's truth, keeps
-    FULL, and everything in `index.db` is derived (an OS crash can cost its
-    last commits; the startup check, the next pass or the next fetch puts
-    them back). On presubuntu's disk (65–80 ms an fsync) these took a
+    (`Engine::set_index_sync_normal`) — everything in it is derived (an OS
+    crash can cost its last commits; the startup check, the next pass or
+    the next fetch puts them back) — and so does a replica's writer with
+    its copy of the owner's log (fetched again if lost; a log that went
+    back is behind its owner, never ahead). The owner's `log.db`, the
+    forest's truth, keeps FULL. On presubuntu's disk (65–80 ms an fsync) these took a
     30,000-row first install from 19.8 s to 1.8 s, and a served write's
     wait behind it from p99 524 ms to 16 ms. The CLI and the mount keep
     SQLite's defaults.

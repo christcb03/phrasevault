@@ -19,6 +19,7 @@ set -u
 STORE=192.168.1.121 INGEST=192.168.1.158
 OWNER_UNIT=pvfsd-lab5-plex FEEDER_UNIT=pvfsd-lab5-feeder
 LOCAL=/srv/sim-lab5/local/Media STAGING=/srv/sim-lab5/staging/Media
+OWNER_FOREST=/opt/pvfs/lab5m FEEDER_FOREST=/srv/pvfs/lab5-feeder
 ok=0 bad=0
 check() { if eval "$2"; then echo "ok   $1"; ok=$((ok+1)); else echo "FAIL $1"; bad=$((bad+1)); fi; }
 on() { ssh -o BatchMode=yes -o ConnectTimeout=8 "chris@$1" "$2" </dev/null; }
@@ -48,14 +49,12 @@ plant() {
 
 after() {
   local o f
-  o=$(on $STORE "pvfs --json region ls 2>/dev/null | head -c 4000")
-  f=$(on $INGEST "pvfs --json region ls 2>/dev/null | head -c 4000")
-  echo "owner region ls: $o" | head -c 1500; echo
-  echo "feeder region ls: $f" | head -c 1500; echo
-  check "the owner catalogued the planted folder (its rows hold D199/)" \
-    "on $STORE \"pvfs view ls D199/Season\\\\ 01 2>/dev/null | grep -c e | grep -qx 300\""
-  check "the feeder's view shows them (installed from the owner's head)" \
-    "on $INGEST \"pvfs view ls D199/Season\\\\ 01 2>/dev/null | grep -c e | grep -qx 300\""
+  local own feed
+  own=$(on $STORE "pvfs --forest $OWNER_FOREST view ls 'D199/Season 01' 2>&1 | grep -c '\\.mkv'")
+  feed=$(on $INGEST "pvfs --forest $FEEDER_FOREST view ls 'D199/Season 01' 2>&1 | grep -c '\\.mkv'")
+  echo "the owner's view lists $own of the 300 planted episodes; the feeder's lists $feed"
+  check "the owner catalogued the planted folder" "[ '$own' = 300 ]"
+  check "the feeder's view shows them (installed from the owner's head)" "[ '$feed' = 300 ]"
   observe
 }
 

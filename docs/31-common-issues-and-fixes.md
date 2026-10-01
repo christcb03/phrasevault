@@ -296,7 +296,12 @@ failure on a daemon's own jobs, or a fold-lock wait, means another process
 — a CLI command, a view mount — holds the database. Any hold of the writer
 over a second is logged with who held it (`pvfsd: the writer was held …
 by …`), and the hourly `pvfsd: the writer, last hour: …` line gives the
-longest hold and whose.
+longest hold and whose. Two settings keep the holds short on a slow disk:
+the daemon checkpoints the WAL on a thread of its own (`a checkpoint took …
+(off the writer)` when one is slow), and its writer commits derived state
+— `index.db`, and on a replica its copy of the owner's log — without an
+fsync each; an OS crash can cost those last commits, which the next start,
+pass or fetch puts back.
 
 ## 10. After a promotion, a box still points at the old owner
 
