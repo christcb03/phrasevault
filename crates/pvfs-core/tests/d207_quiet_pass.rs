@@ -205,3 +205,62 @@ fn a_pass_reports_its_progress_while_it_runs() {
     let end = progress.snapshot().unwrap();
     assert_eq!((end.files_done, end.bytes_done), (40, total));
 }
+
+/// D208's probe step is a phase of the pass: while a probe runs, its file is
+/// in hand (and not counted among the files done, which are the hashing's).
+#[test]
+fn the_probe_step_reports_its_file_in_hand() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut e, _) = Engine::init(tmp.path().join("forest").as_path()).unwrap();
+    let media = tmp.path().join("media");
+    std::fs::create_dir_all(media.join("Films")).unwrap();
+    std::fs::write(media.join("Films/slow.mkv"), "a film").unwrap();
+    let root = e.identity.root_node_id.clone();
+    let local = folder(&mut e, &root, "Local");
+    e.region_mark_as(&local, "catalogue", None).unwrap();
+    e.bind_folder(
+        &local,
+        BindSpec {
+            source_uri: format!("file://{}", media.display()),
+            recursive: true,
+            auto_index: true,
+            extensions: String::new(),
+            hash_policy: HashPolicy::OnAdd,
+        },
+    )
+    .unwrap();
+    let script = tmp.path().join("fake-ffprobe");
+    std::fs::write(&script, "#!/bin/sh\nsleep 1\necho codec_name=hevc\necho width=1920\necho height=1080\necho duration=60\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let writer = Arc::new(Writer::new(e));
+    let progress = Arc::new(JobProgress::new());
+    let watcher = {
+        let p = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_secs(10) {
+                if let Some(s) = p.snapshot() {
+                    if s.phase.as_deref() == Some("probing") && !s.current.is_empty() {
+                        return Some((s.current[0].path.clone(), s.files_done));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None
+        })
+    };
+    let db = SharedDb::new(Arc::clone(&writer), "watch").unwrap();
+    let mut ctx = pvfs_core::fs::CatalogueCtx::new(None);
+    ctx.progress = Some(Arc::clone(&progress));
+    ctx.probe = pvfs_core::fs::ProbeSetting::On(pvfs_core::fs::ProbeCtx::with(pvfs_core::probe::Prober { program: script }));
+    progress.begin_pass();
+    let r = pvfs_core::fs::scan_catalogues(&db, &mut ctx, None, 0).unwrap();
+    let (path, files_done) = watcher.join().unwrap().expect("the probe's file was seen in hand");
+    assert!(path.ends_with("Films/slow.mkv"), "{path}");
+    assert_eq!(files_done, 1, "the hashing's one file; the probe adds none");
+    assert_eq!(r[0].stats.probed, 1);
+    let end = progress.snapshot().unwrap();
+    assert!(end.current.is_empty());
+    assert_eq!((end.files_done, end.phase.as_deref()), (1, Some("publishing")));
+}
