@@ -227,8 +227,11 @@ Payload (format `ha`/`json`):
 registered under on the owner (`pvfs forest register --alias`), else its
 mount directory's name; it is absent only when neither can be read. The
 chat formats lead with it (`PVFS media: …`), and ntfy's title carries it
-(`PVFS media peer_down`). A lab owner's events can then go to the same
-phone as production's and say which they are. `summary` is unchanged.
+(`PVFS media peer_down`). `summary` is unchanged. Chris's fleet (PVOS
+D211) routes by it in Home Assistant: an event with no `forest`, an empty
+one or `media` is production and may reach the phone; any other (the lab
+owner's `lab5m`) goes to the page's event list and HA's logbook only — a
+test system never notifies a person.
 
 `summary` is one plain sentence naming the box — the only thing a person
 should have to read. The first version sent the raw fields
