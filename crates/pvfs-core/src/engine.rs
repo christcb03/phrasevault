@@ -17,8 +17,8 @@ use crate::orderkey::OrderKey;
 use crate::projection::{self, ForestIdentity};
 use crate::walk::{TreeWalk, WalkEntry};
 
-const LOG_FILE: &str = "log.db";
-const INDEX_FILE: &str = "index.db";
+pub(crate) const LOG_FILE: &str = "log.db";
+pub(crate) const INDEX_FILE: &str = "index.db";
 
 /// Caller-provided inputs for `add_node`; the engine fills id/sig/created_at.
 #[derive(Debug, Clone)]
@@ -1410,6 +1410,23 @@ impl Engine {
         self.conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))
             .map_err(map_db("data version"))
+    }
+
+    /// PVOS D199 — how many WAL pages this connection lets build up before a
+    /// commit of its own checkpoints them (SQLite's default 1,000; 0 = never:
+    /// the daemon checkpoints from a thread of its own, `Writer::offload_checkpoints`).
+    pub fn set_wal_autocheckpoint(&self, pages: u32) -> Result<()> {
+        self.conn
+            .query_row(&format!("PRAGMA wal_autocheckpoint = {pages}"), [], |_| Ok(()))
+            .map_err(map_db("wal autocheckpoint"))
+    }
+
+    /// D199 — the setting [`Engine::set_wal_autocheckpoint`] made.
+    #[doc(hidden)]
+    pub fn wal_autocheckpoint(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .map_err(map_db("wal autocheckpoint"))
     }
 
     /// PVOS D199 — a replica's shipped log rows, appended on THIS connection

@@ -98,6 +98,9 @@ struct HotRange {
 /// purpose — personal/small-team scale; each view is one SQLite connection.
 const READ_POOL: usize = 4;
 
+/// PVOS D199 — how often the checkpoint thread checkpoints the WAL.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
+
 /// One forest served by the daemon: the writer engine, a pool of read-only
 /// views, its forest id (challenge binding), and in-flight prepared writes.
 pub struct Daemon {
@@ -203,6 +206,13 @@ impl Daemon {
         // the length of each hold of the writer.
         if priority::background_lowered() {
             writer.set_hold_raise(Some((priority::raise_for_hold, priority::restore_after_hold)));
+        }
+        // PVOS D199 — WAL checkpoints on a thread of their own, never inside
+        // a step of the writer (a served write waits for the step).
+        if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {
+            priority::enter_background("WAL checkpoints")
+        }) {
+            eprintln!("pvfsd: checkpoints stay on the writer's commits: {e}");
         }
         Daemon {
             writer,

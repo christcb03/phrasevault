@@ -130,10 +130,11 @@ impl Writers {
 
 /// PVOS D199 — the hourly line: what the writer did, and the process's
 /// engine opens, read views and folds since the last line (`last`).
-fn writer_report(w: &Writer, last: &mut (u64, u64, u64, u64)) -> String {
+fn writer_report(w: &Writer, last: &mut (u64, u64, u64, u64, u64)) -> String {
     let st = w.take_stats();
-    let now = pvfs_core::writer::COUNTERS.read();
-    let d = (now.0 - last.0, now.1 - last.1, now.2 - last.2, now.3 - last.3);
+    let c = pvfs_core::writer::COUNTERS.read();
+    let now = (c.0, c.1, c.2, c.3, pvfs_core::writer::COUNTERS.checkpoints());
+    let d = (now.0 - last.0, now.1 - last.1, now.2 - last.2, now.3 - last.3, now.4 - last.4);
     *last = now;
     let longest = if st.steps == 0 {
         String::new()
@@ -152,13 +153,14 @@ fn writer_report(w: &Writer, last: &mut (u64, u64, u64, u64)) -> String {
     };
     format!(
         "pvfsd: the writer, last hour: {} hold(s), {} in all{longest}; {waits}; engine opens {}, \
-         read views {}, folds {} ({} events)",
+         read views {}, folds {} ({} events), checkpoints {}",
         st.steps,
         pvfs_core::writer::secs(st.held),
         d.0,
         d.1,
         d.2,
-        d.3
+        d.3,
+        d.4
     )
 }
 
@@ -1580,7 +1582,10 @@ pub fn run(
         daemon.as_ref().map(|d| Arc::clone(d.writer())),
     ));
     let mut report_at = Instant::now() + WRITER_REPORT_EVERY;
-    let mut counted = pvfs_core::writer::COUNTERS.read();
+    let mut counted = {
+        let c = pvfs_core::writer::COUNTERS.read();
+        (c.0, c.1, c.2, c.3, pvfs_core::writer::COUNTERS.checkpoints())
+    };
 
     while !shutdown.load(Ordering::SeqCst) {
         if Instant::now() >= report_at {

@@ -506,9 +506,16 @@ fn data_version(conn: &rusqlite::Connection) -> Result<i64> {
 /// `(rel_path, kind, size, mtime_ms, changed_ms, content_hash)`.
 pub(crate) type CatalogueRow = (String, &'static str, u64, u64, u64, Option<String>);
 
-/// PVOS D199 — the most rows the stale-row sweep deletes in one step of the
-/// writer (a folder of a thousand episodes deleted at once is several).
-const SWEEP_STEP: usize = 1_000;
+/// PVOS D199 — the most rows one step of the daemon's writer writes for a
+/// catalogue: a batch of a pass (the daemon's watch), a chunk of the sweep, a
+/// chunk of an install. On presubuntu's disk (65–80 ms a commit) a step of
+/// 250 rows holds the writer about one commit; 500 held it longer, and a
+/// served write waits for the step in progress.
+pub const STEP_ROWS: usize = 250;
+
+/// The most rows the stale-row sweep deletes in one step (a folder of a
+/// thousand episodes deleted at once is several).
+const SWEEP_STEP: usize = STEP_ROWS;
 
 /// D199 — what one catalogue pass carries beside its database handle: its
 /// stop flag (D86) and the D154/D156 test seams, which lived on the engine
@@ -523,9 +530,10 @@ pub struct CatalogueCtx {
 }
 
 impl CatalogueCtx {
-    /// A pass with `cancel` as its stop flag and the production batches.
+    /// A pass of the daemon's watch with `cancel` as its stop flag: batches
+    /// of `STEP_ROWS` (an engine's own scan keeps D154's 1,000, set on it).
     pub fn new(cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> CatalogueCtx {
-        CatalogueCtx { cancel, batch: (CATALOGUE_BATCH_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None }
+        CatalogueCtx { cancel, batch: (STEP_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None }
     }
 
     fn cancelled(&self) -> bool {
@@ -6087,7 +6095,7 @@ pub fn remove_dir_in_region(roots: &[std::path::PathBuf], rel_path: &str) -> Res
 /// install of a big catalogue (30,000–55,000 rows, all additions) is many
 /// short steps instead of one hold of seconds; a served write waits for one
 /// of them at most.
-const INSTALL_STEP: usize = 500;
+const INSTALL_STEP: usize = STEP_ROWS;
 
 /// D129 (doc 26 §8), D194, D199 — install a fetched catalogue snapshot as
 /// this box's rows for `region` (see [`Engine::install_region_snapshot`]),

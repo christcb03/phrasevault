@@ -34,6 +34,8 @@ pub struct Counters {
     pub read_views: AtomicU64,
     pub folds: AtomicU64,
     pub folded_events: AtomicU64,
+    /// Checkpoints made off the writer (`Writer::offload_checkpoints`).
+    pub checkpoints: AtomicU64,
 }
 
 pub static COUNTERS: Counters = Counters {
@@ -41,6 +43,7 @@ pub static COUNTERS: Counters = Counters {
     read_views: AtomicU64::new(0),
     folds: AtomicU64::new(0),
     folded_events: AtomicU64::new(0),
+    checkpoints: AtomicU64::new(0),
 };
 
 impl Counters {
@@ -52,6 +55,11 @@ impl Counters {
             self.folds.load(Ordering::Relaxed),
             self.folded_events.load(Ordering::Relaxed),
         )
+    }
+
+    /// Checkpoints made off the writer so far.
+    pub fn checkpoints(&self) -> u64 {
+        self.checkpoints.load(Ordering::Relaxed)
     }
 }
 
@@ -229,6 +237,54 @@ impl Writer {
         let mut held = self.acquired(engine, what, asked);
         held.raised = raised;
         held
+    }
+
+    /// PVOS D199 — WAL checkpoints off the writer's steps. SQLite checkpoints
+    /// on commit: once the WAL holds 1,000 pages, the commit that crosses it
+    /// copies them into the database file and syncs it, inside that step.
+    /// On presubuntu's disk that was ~250 ms in every second or third
+    /// 500-row install step, and a served write waits for the step in
+    /// progress. So the writer stops (`wal_autocheckpoint = 0`) and a thread
+    /// of its own, on a connection of its own, checkpoints both databases
+    /// every `every` — PASSIVE, which never waits for the writer or makes
+    /// it wait. `on_start` runs first on that thread (pvfsd lowers it: it is
+    /// background work). The thread ends once the writer is dropped.
+    pub fn offload_checkpoints(this: &Arc<Writer>, every: Duration, on_start: fn()) -> Result<()> {
+        let conn = rusqlite::Connection::open(this.data_dir.join(crate::engine::INDEX_FILE))
+            .map_err(crate::error::map_db("open index.db for checkpoints"))?;
+        let log = this.data_dir.join(crate::engine::LOG_FILE).to_string_lossy().into_owned();
+        conn.execute("ATTACH DATABASE ?1 AS log", rusqlite::params![log])
+            .map_err(crate::error::map_db("attach log.db for checkpoints"))?;
+        this.lock_serving("checkpoints: hand off").set_wal_autocheckpoint(0)?;
+        let alive = Arc::downgrade(this);
+        let spawned = std::thread::Builder::new().name("pvfsd-checkpoint".into()).spawn(move || {
+            on_start();
+            loop {
+                let next = Instant::now() + every;
+                while Instant::now() < next {
+                    if alive.strong_count() == 0 {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250).min(every));
+                }
+                let t = Instant::now();
+                for db in ["main", "log"] {
+                    // Busy (another process checkpointing) is a skip, not an error.
+                    let _ = conn.query_row(&format!("PRAGMA {db}.wal_checkpoint(PASSIVE)"), [], |_| Ok(()));
+                }
+                COUNTERS.checkpoints.fetch_add(1, Ordering::Relaxed);
+                let took = t.elapsed();
+                if took >= log_threshold() {
+                    eprintln!("pvfsd: a checkpoint took {} (off the writer)", secs(took));
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            // No thread: the writer checkpoints on commit again, as before.
+            let _ = this.lock_serving("checkpoints: take back").set_wal_autocheckpoint(1000);
+            return Err(crate::error::PvfsError::io("start the checkpoint thread", e));
+        }
+        Ok(())
     }
 
     /// D199 §2.8 — raise job threads for their holds (`None`: leave them as
@@ -502,6 +558,21 @@ mod tests {
         let waits = w.take_waits();
         assert!(waits.iter().any(|(who, d)| who == "serve: commit" && *d >= Duration::from_millis(100)), "{waits:?}");
         assert_eq!(w.take_stats().steps, 0, "taking the figure starts a fresh one");
+    }
+
+    /// D199 — with checkpoints offloaded, the writer's commits no longer
+    /// checkpoint, and the thread does.
+    #[test]
+    fn checkpoints_run_off_the_writer() {
+        let (_dir, w) = writer();
+        Writer::offload_checkpoints(&w, Duration::from_millis(100), || {}).unwrap();
+        assert_eq!(w.lock_serving("test: read").wal_autocheckpoint().unwrap(), 0, "the writer's commits no longer checkpoint");
+        let before = COUNTERS.checkpoints();
+        let t = Instant::now();
+        while COUNTERS.checkpoints() < before + 2 {
+            assert!(t.elapsed() < Duration::from_secs(10), "the checkpoint thread never ran");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// D199 — a step that panics does not take the daemon's writer with it.
