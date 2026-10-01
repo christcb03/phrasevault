@@ -254,19 +254,35 @@ fn drive(
     pass: &mut dyn FnMut() -> Result<Vec<pvfs_core::ScanReport>, PvfsError>,
     bindings: &dyn Fn() -> Result<(Vec<pvfs_core::Binding>, usize), PvfsError>,
 ) -> Result<(), PvfsError> {
+    // A failed pass must come back SOON, not at the next reconcile — that is
+    // an hour on the daemon, which is no kind of autocorrect. A scan is
+    // idempotent, so retrying is free of consequence; back off so a genuinely
+    // stuck forest does not spin.
+    let mut retry_at: Option<Instant> = None;
+    let mut backoff = RETRY_MIN;
+
     // initial reconciliation
     notify_cb(WatchEvent::PassStarted);
     match pass() {
         // D156 — the same events as every later pass. This had its own copy
         // (`Ingested` per report, never `Quiet`), so the first pass after each
         // daemon start never said `NeedsAttention`: the lab's first pass after
-        // the roll skipped a file with a real EIO and told nobody.
+        // the roll skipped a file with a real EIO and told nobody. PVOS D199 —
+        // and the same settle recheck (D71 W6): files still being written at
+        // startup waited for the next change, or the hourly reconcile.
         Ok(reports) => {
+            if reports.iter().any(|r| r.stats.settling > 0) {
+                retry_at = Some(Instant::now() + SETTLE_RECHECK);
+            }
             for ev in pass_events(&reports) {
                 notify_cb(ev);
             }
         }
-        Err(e) => notify_cb(WatchEvent::ScanError(e.to_string())),
+        Err(e) => {
+            notify_cb(WatchEvent::ScanError(e.to_string()));
+            retry_at = Some(Instant::now() + backoff);
+            backoff = (backoff * 2).min(RETRY_MAX);
+        }
     }
 
     // THIS machine's bindings only (D71 W1). A binding made on another box
@@ -313,12 +329,6 @@ fn drive(
     let reconcile_every = Duration::from_secs(reconcile_secs.max(1));
     let mut pending: Option<Pending> = None;
     let mut last_reconcile = Instant::now();
-    // A failed pass must come back SOON, not at the next reconcile — that is
-    // an hour on the daemon, which is no kind of autocorrect. A scan is
-    // idempotent, so retrying is free of consequence; back off so a genuinely
-    // stuck forest does not spin.
-    let mut retry_at: Option<Instant> = None;
-    let mut backoff = RETRY_MIN;
 
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(500)) {

@@ -132,14 +132,14 @@ fn a_replica_reads_while_its_writer_is_held() {
     }
     .save(&rdata)
     .unwrap();
-    // A replica's read view says so, and carries no forest key.
-    let view = Engine::open_read_view(&rdata).expect("a replica opens a read view (D199)");
-    assert!(view.is_replica());
-    drop(view);
-
     let socks = tempfile::tempdir().unwrap();
     let sock = socks.path().join("replica.sock");
     let daemon = Arc::new(Daemon::new(Engine::open(&rdata).unwrap()));
+    // With the daemon's engine open (and the projection built), a replica's
+    // read view opens, says it is a replica, and carries no forest key.
+    let view = Engine::open_read_view(&rdata).expect("a replica opens a read view (D199)");
+    assert!(view.is_replica());
+    drop(view);
     serve_on(Arc::clone(&daemon), &sock);
     let mut member = connect(&sock, &ckey, &cpub);
     member.serve_status_full().expect("the premise: the probe answers");
