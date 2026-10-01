@@ -335,6 +335,16 @@ pub fn hash_with_manifest_until(
     path: &Path,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
+    hash_with_manifest_progress(path, cancel, &mut |_| ())
+}
+
+/// PVOS D207 — as [`hash_with_manifest_until`], telling `read` how many bytes
+/// each read took, as it goes: the watch's progress while it hashes a film.
+pub fn hash_with_manifest_progress(
+    path: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    read: &mut dyn FnMut(u64),
+) -> Result<Option<(String, Vec<[u8; 32]>)>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| PvfsError::io("open for hash", e))?;
     let mut whole = blake3::Hasher::new();
@@ -355,6 +365,7 @@ pub fn hash_with_manifest_until(
         if n == 0 {
             break;
         }
+        read(n as u64);
         whole.update_rayon(&buf[..n]);
         let mut off = 0usize;
         while off < n {

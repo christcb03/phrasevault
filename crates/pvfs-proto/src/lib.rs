@@ -406,6 +406,48 @@ pub struct ServeJobWire {
     pub last_ok_ms: Option<u64>,
     /// The last failure message, cleared by the next success.
     pub last_error: Option<String>,
+    /// PVOS D207: the pass in flight, as it reports itself — present while a
+    /// pass of a job that reports (the watch, the receive) runs; absent
+    /// otherwise, and from an older daemon (defaulted, not a proto bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<PassProgressWire>,
+}
+
+/// PVOS D207 — a running pass's own account: when it began, when it last
+/// moved, what it has done, and the files it has in hand now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassProgressWire {
+    pub started_ms: u64,
+    /// The last time anything in the pass moved — a folder walked, 8 MiB
+    /// hashed or received, a step written. The stall check reads this.
+    pub advanced_ms: u64,
+    /// Files finished this pass (hashed, taken from a row or a sidecar,
+    /// received).
+    pub files_done: u64,
+    /// Their bytes, plus the bytes done so far of the files in hand.
+    pub bytes_done: u64,
+    /// What the pass is doing: `walking`, `hashing`, `writing`, `sweeping`,
+    /// `publishing`, `pulling`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current: Vec<FileProgressWire>,
+}
+
+/// PVOS D207 — one file a pass has in hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProgressWire {
+    /// The path as the pass knows it (relative to its region for a receive,
+    /// the file's path on this box for the watch).
+    pub path: String,
+    /// The content hash, when the pass knows it before the bytes (a receive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// Bytes of it done: hashed, or present in its partial.
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub advanced_ms: u64,
 }
 
 /// D181 — one running view mount, as its status file describes it.

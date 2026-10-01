@@ -29,6 +29,11 @@ pub struct JobHealth {
     pub state: String,
     pub last_ok_ms: Option<u64>,
     pub last_error: Option<String>,
+    /// PVOS D207: the pass in flight, as that box's job reports it (absent
+    /// between passes, for a job that does not report, and from an older
+    /// daemon). The page's mover reads the holder's receive from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<pvfs_proto::PassProgressWire>,
 }
 
 /// What one probe saw — or why it saw nothing.
@@ -241,6 +246,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
                     state: j.state,
                     last_ok_ms: j.last_ok_ms,
                     last_error: j.last_error,
+                    progress: j.progress,
                 })
                 .collect();
             h.conflicts = s.conflicts;

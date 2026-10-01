@@ -527,17 +527,40 @@ pub struct CatalogueCtx {
     pub batch: (usize, u64),
     pub(crate) interrupt: Option<(u64, bool)>,
     pub(crate) read_hook: Option<crate::engine::CatalogueReadHook>,
+    /// PVOS D207 — where the pass says how far it has got (the daemon's
+    /// watch job); `None` for a pass nobody watches (the CLI's scan).
+    pub progress: Option<std::sync::Arc<crate::progress::JobProgress>>,
 }
 
 impl CatalogueCtx {
     /// A pass of the daemon's watch with `cancel` as its stop flag: batches
     /// of `STEP_ROWS` (an engine's own scan keeps D154's 1,000, set on it).
     pub fn new(cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> CatalogueCtx {
-        CatalogueCtx { cancel, batch: (STEP_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None }
+        CatalogueCtx { cancel, batch: (STEP_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None, progress: None }
     }
 
     fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A seam for tests: `hook` is asked before each file is read for its
+    /// hash (an error it returns is that read's error), on the pass's thread.
+    pub fn on_read(&mut self, hook: crate::engine::CatalogueReadHook) {
+        self.read_hook = Some(hook);
+    }
+
+    /// PVOS D207 — the pass's phase, when someone is watching it.
+    fn phase(&self, phase: &str) {
+        if let Some(p) = &self.progress {
+            p.phase(phase);
+        }
+    }
+
+    /// PVOS D207 — the pass moved (a step written, a sweep chunk).
+    fn tick(&self) {
+        if let Some(p) = &self.progress {
+            p.tick();
+        }
     }
 
     /// The D154 seam's stop: the flag the pass was given, or a new one.
@@ -601,6 +624,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
         .filter(|d| !dirs_with_files.contains(d.as_slice()))
         .count() as u64;
     let held = db.read(|e| held_region_rows(&e.conn, &b.folder_id))?;
+    ctx.phase("hashing");
 
     let (batch_rows, batch_ms) = ctx.batch;
     let batch_every = std::time::Duration::from_millis(batch_ms);
@@ -641,8 +665,14 @@ fn catalogue_region_pass<D: crate::writer::Db>(
         // A present sidecar is free and is read whatever the policy; only a
         // MISSING one is where the policy decides whether bytes are read —
         // the same split ingest makes (D103, D94).
+        let progress = ctx.progress.clone();
         let hash = match known {
-            Some(h) => Some(h),
+            Some(h) => {
+                if let Some(p) = &progress {
+                    p.file_done(f.size);
+                }
+                Some(h)
+            }
             None => match b.hash_policy {
                 // D154 — the stop lands inside the read, not after it: a film
                 // can be tens of GB, and a stop that waits for one overruns
@@ -651,7 +681,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
                     let injected = ctx.read_hook.as_mut().and_then(|h| h(f.path.as_path()));
                     let read = match injected {
                         Some(e) => Err(PvfsError::io("read for hash", e)),
-                        None => hash_reusing_sidecar_until(&f.path, f.size, ctx.cancel.as_deref()),
+                        None => hash_reusing_sidecar_until(&f.path, f.size, ctx.cancel.as_deref(), progress.as_deref()),
                     };
                     match read {
                         Ok(Some((h, _))) => Some(h),
@@ -687,7 +717,12 @@ fn catalogue_region_pass<D: crate::writer::Db>(
                         },
                     }
                 }
-                HashPolicy::Never => crate::sync::sidecar_whole_hash(&f.path, f.size),
+                HashPolicy::Never => {
+                    if let Some(p) = &progress {
+                        p.file_done(f.size);
+                    }
+                    crate::sync::sidecar_whole_hash(&f.path, f.size)
+                }
             },
         };
         match prior {
@@ -705,6 +740,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
         }
         if pending.len() >= batch_rows || last_commit.elapsed() >= batch_every {
             commit_catalogue_rows(db, region, pass, &mut pending)?;
+            ctx.tick();
             last_commit = std::time::Instant::now();
         }
     }
@@ -714,6 +750,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
     if ctx.cancelled() {
         return stop_catalogue_pass(db, region, pass, &mut pending, stats);
     }
+    ctx.phase("writing");
     commit_catalogue_rows(db, region, pass, &mut pending)?;
 
     // D156 — the volume is still the one the pass began on: an unmount
@@ -725,6 +762,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
     // merely unseen (settling, unreadable, quarantined). Only the first is a
     // deletion, and only the disk's own "not there" says so (D156). Read
     // fresh: the rows now, this pass's batches and any rename's included.
+    ctx.phase("sweeping");
     let gone: Vec<String> = db
         .read(|e| e.region_rel_paths(&b.folder_id))?
         .into_iter()
@@ -733,7 +771,9 @@ fn catalogue_region_pass<D: crate::writer::Db>(
     for chunk in gone.chunks(SWEEP_STEP) {
         db.write(&format!("sweep {}", short_id(region)), |e| e.delete_region_rows(&b.folder_id, chunk))?;
         stats.removed += chunk.len() as u64;
+        ctx.tick();
     }
+    ctx.phase("publishing");
     // Item 4 — a changed catalogue publishes its head; an unchanged one
     // publishes nothing.
     publish_region_snapshot_db(db, &b.folder_id, writer)?;
@@ -3546,6 +3586,7 @@ impl Engine {
                 batch: self.catalogue_batch,
                 interrupt: self.catalogue_interrupt.take(),
                 read_hook: self.catalogue_read_hook.take(),
+                progress: None,
             };
             let r = catalogue_region_pass(&crate::writer::OwnDb::new(self), &mut ctx, b, &root, &files, &dirs, stats, writer);
             // D156 — the hook stays until replaced; D154 — the seam's stop
@@ -5036,7 +5077,7 @@ impl Engine {
         size: u64,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
-        hash_reusing_sidecar_until(path, size, cancel)
+        hash_reusing_sidecar_until(path, size, cancel, None)
     }
 
     fn fill_hash_if_needed(
@@ -6301,6 +6342,15 @@ pub(crate) fn publish_region_snapshot_db<D: crate::writer::Db>(
 type Walked = (PathBuf, Vec<DiskFile>, Vec<Vec<String>>, ScanStats);
 
 fn walk_binding(b: &Binding, settle_ms: u64) -> Result<Walked> {
+    walk_binding_progress(b, settle_ms, None)
+}
+
+/// PVOS D207 — [`walk_binding`], ticking `progress` at each folder.
+fn walk_binding_progress(
+    b: &Binding,
+    settle_ms: u64,
+    progress: Option<&crate::progress::JobProgress>,
+) -> Result<Walked> {
     let root = uri_to_path(&b.source_uri)?;
     let st = LocalBackend.stat(&b.source_uri)?;
     if !st.exists || !st.is_dir {
@@ -6321,10 +6371,14 @@ fn walk_binding(b: &Binding, settle_ms: u64) -> Result<Walked> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     let mut visited = HashSet::new();
+    if let Some(p) = progress {
+        p.phase("walking");
+    }
     let ctx = WalkCtx {
         binding: b,
         settle_ms,
         orphans: std::cell::RefCell::new(Vec::new()),
+        progress,
     };
     walk_disk(&root, Vec::new(), &mut visited, &mut files, &mut dirs, &mut stats, &ctx)?;
     // D149 — a sidecar whose file something else renamed or deleted. To the
@@ -6364,7 +6418,7 @@ pub fn scan_catalogues<D: crate::writer::Db>(
                 ),
             ));
         }
-        let (root, files, dirs, stats) = walk_binding(&b, settle_ms)?;
+        let (root, files, dirs, stats) = walk_binding_progress(&b, settle_ms, ctx.progress.as_deref())?;
         let stats = catalogue_region_pass(db, ctx, &b, &root, &files, &dirs, stats, &mut writer)?;
         let stopped = stats.cancelled;
         reports.push(ScanReport { folder_id: b.folder_id.clone(), stats });
@@ -6381,18 +6435,28 @@ pub fn scan_catalogues<D: crate::writer::Db>(
 /// `hash_with_manifest_until`, for the catalogue pass (D154). A sidecar is
 /// still taken whatever the flag says; it costs nothing. PVOS D199: no engine
 /// — a pass hashes with no lock held.
+///
+/// PVOS D207 — with `progress`, the file is counted done (a sidecar: at
+/// once), or held in hand while its bytes are read, 8 MiB at a time.
 fn hash_reusing_sidecar_until(
     path: &std::path::Path,
     size: u64,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<&crate::progress::JobProgress>,
 ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
     if let Some(known) = crate::sync::sidecar_hashes(path, size) {
         eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
+        if let Some(p) = progress {
+            p.file_done(size);
+        }
         return Ok(Some(known));
     }
     if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
         // Whole hash only still saves the whole read, which is the cost.
         eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
+        if let Some(p) = progress {
+            p.file_done(size);
+        }
         return Ok(Some((w, Vec::new())));
     }
     // D150 — the file as it was BEFORE the read: the manifest records this
@@ -6400,7 +6464,16 @@ fn hash_reusing_sidecar_until(
     let seen = std::fs::metadata(path)
         .map(|md| (md.len(), crate::storage::mtime_ms(&md)))
         .ok();
-    let Some((content_hash, chunks)) = crate::sync::hash_with_manifest_until(path, cancel)? else {
+    let token = progress.map(|p| p.begin_file(&path.display().to_string(), None, Some(size), 0));
+    let read = crate::sync::hash_with_manifest_progress(path, cancel, &mut |n| {
+        if let (Some(p), Some(t)) = (progress, token) {
+            p.file_bytes(t, n);
+        }
+    });
+    if let (Some(p), Some(t)) = (progress, token) {
+        p.end_file(t, matches!(read, Ok(Some(_))));
+    }
+    let Some((content_hash, chunks)) = read? else {
         return Ok(None);
     };
     // Leave the note for the next forest. Best-effort: a read-only store
@@ -6614,6 +6687,8 @@ struct WalkCtx<'a> {
     /// Collected by the walk and acted on by `scan_binding` after it: the walk
     /// only looks.
     orphans: std::cell::RefCell<Vec<(PathBuf, u64)>>,
+    /// PVOS D207 — ticked at each folder, so a long walk is seen to move.
+    progress: Option<&'a crate::progress::JobProgress>,
 }
 
 fn walk_disk(
@@ -6631,6 +6706,9 @@ fn walk_disk(
     }
     let uri = path_to_uri(dir)?;
     let entries = LocalBackend.list(&uri)?;
+    if let Some(p) = ctx.progress {
+        p.tick();
+    }
     // D149 — a sidecar is an orphan when the file it names is not in this same
     // listing, so the names are needed before the loop reaches it.
     let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();

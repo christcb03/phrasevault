@@ -143,12 +143,19 @@ pub fn run(
 /// is not folded to start it. A box that binds folders of the node model
 /// (none on the fleet) is watched by [`run`], with an engine of its own, as
 /// before: that scan interleaves hashing with its writes.
+///
+/// PVOS D207 — each pass says how far it has got through `progress`: in
+/// flight from its start to its end, its walk, its hashing and its steps. A
+/// node-model box's watch ([`run`]) keeps no account, and is judged as
+/// before.
+#[allow(clippy::too_many_arguments)]
 pub fn run_shared(
     writer: std::sync::Arc<pvfs_core::Writer>,
     reconcile_secs: u64,
     debounce_ms: u64,
     ceiling_ms: u64,
     stop: &std::sync::Arc<AtomicBool>,
+    progress: Option<std::sync::Arc<pvfs_core::JobProgress>>,
     mut notify_cb: impl FnMut(WatchEvent),
 ) -> Result<(), PvfsError> {
     let data_dir = writer.data_dir().to_path_buf();
@@ -164,6 +171,7 @@ pub fn run_shared(
     }
     let lock = ServeLock::take(&data_dir)?;
     let mut ctx = pvfs_core::fs::CatalogueCtx::new(Some(std::sync::Arc::clone(stop)));
+    ctx.progress = progress;
     let is_replica = db.view().is_replica();
     let mut route = crate::advertise::replica_route(&data_dir, is_replica).unwrap_or(None);
     let result = drive(
@@ -173,7 +181,15 @@ pub fn run_shared(
         stop,
         &mut notify_cb,
         &mut || {
+            // PVOS D207 — the pass's account, from its start to its end.
+            let progress = ctx.progress.clone();
+            if let Some(p) = &progress {
+                p.begin_pass();
+            }
             let r = scan_pass_db(&db, &mut ctx, &mut route, pvfs_core::WATCH_SETTLE_MS);
+            if let Some(p) = &progress {
+                p.end_pass();
+            }
             if r.is_err() {
                 route = None;
             }

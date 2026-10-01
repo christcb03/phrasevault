@@ -62,7 +62,7 @@ fn a_supervise_action_and_a_new_job_error_are_each_said_once() {
     assert!(notify::transitions(Some(&r1), &r1, 3_000).is_empty(), "the same action is not repeated");
 
     let mut with_err = up();
-    with_err.jobs.push(JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: Some("boom".into()) });
+    with_err.jobs.push(JobHealth { name: "receive".into(), state: "idle".into(), last_ok_ms: None, last_error: Some("boom".into()), progress: None });
     // D151 — timed from the first sighting, two-minute passes (d151_job_error_debounce).
     let mut st = notify::State::default();
     let mut r2 = r1.clone();
@@ -134,7 +134,7 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     assert_eq!(notify::severity(&hb), "info");
     // an "overdue" notice from the stall detector is not an error anyone can act on
     let mut overdue = up();
-    overdue.jobs.push(JobHealth { name: "watch".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 2160 min (interval is 3600s) — overdue, which is not the same as stuck".into()) });
+    overdue.jobs.push(JobHealth { name: "watch".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 2160 min (interval is 3600s) — overdue, which is not the same as stuck".into()), progress: None });
     let mut o1 = r0.clone();
     o1.observe(&a, "10.0.0.9:7433", None, 401_000, overdue.clone());
     let mut o2 = o1.clone();
@@ -147,7 +147,7 @@ fn every_event_reads_as_a_sentence_that_names_the_box() {
     // hung"; one not yet rolled still says the generic "… overdue …", and
     // the owner's notifier (rolled first) must report that too.
     let mut hung = up();
-    hung.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 15 min (interval is 300s) — overdue, which is not the same as stuck".into()) });
+    hung.jobs.push(JobHealth { name: "follow".into(), state: "overdue".into(), last_ok_ms: None, last_error: Some("no pass has completed in 15 min (interval is 300s) — overdue, which is not the same as stuck".into()), progress: None });
     let mut h1 = r0.clone();
     h1.observe(&a, "10.0.0.9:7433", None, 401_000, hung.clone());
     let mut h2 = h1.clone();

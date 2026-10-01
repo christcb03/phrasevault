@@ -207,7 +207,22 @@ pub struct JobsState {
     /// It outlives a job's thread, which is what keeps a restart that fails
     /// the same way quiet.
     failing: Mutex<HashMap<Fault, FailingRun>>,
+    /// PVOS D207 — the jobs whose passes say how far they have got: one
+    /// account each, for the runner's life (`PROGRESS_JOBS`).
+    progress: HashMap<&'static str, Arc<pvfs_core::JobProgress>>,
 }
+
+/// PVOS D207 — the jobs whose passes report progress: the daemon's stepped
+/// watch (every fleet box) and the receive (the NAS). The rest are short, or
+/// judged otherwise (follow by its stamps, D196), or the node model.
+pub const PROGRESS_JOBS: [&str; 2] = ["watch", "receive"];
+
+/// PVOS D207 — a pass that reports progress and has not advanced for this
+/// long is `stalled`. Every reporting step is small (a folder, 8 MiB hashed
+/// or received, one database step), so this is generous by orders of
+/// magnitude; and a pass that does advance is never called stalled or
+/// overdue, however long it runs.
+pub const PROGRESS_STALL: Duration = Duration::from_secs(30 * 60);
 
 /// D157, D159 — a continuous job's failures, as the journal hears of them.
 /// Each is its own run, because each ends on its own evidence: a failed pass
@@ -298,6 +313,7 @@ impl JobsState {
             trash: Mutex::new(Vec::new()),
             purging: Mutex::new(()),
             failing: Mutex::new(HashMap::new()),
+            progress: PROGRESS_JOBS.iter().map(|j| (*j, Arc::new(pvfs_core::JobProgress::new()))).collect(),
         };
         s.reload()?;
         Ok(s)
@@ -363,6 +379,7 @@ impl JobsState {
                     } else {
                         prev.and_then(|p| p.last_error.clone())
                     },
+                    progress: None,
                 }
             })
             .collect();
@@ -396,6 +413,21 @@ impl JobsState {
                 // mostly a measure of how quiet the library has been.
                 let in_flight = self.pass_started.lock().unwrap().get(&r.name).copied();
                 let typical = self.pass_dur.lock().unwrap().get(&r.name).copied();
+                // PVOS D207 — a pass that says how far it has got is judged
+                // by whether it is still getting anywhere: advancing, it is
+                // working however long it has run (no `overdue`, no
+                // `stalled`); not advancing for `PROGRESS_STALL`, it is
+                // stalled, and says where it stopped.
+                if let Some(p) = self.progress.get(r.name.as_str()).and_then(|p| p.snapshot()) {
+                    r.progress = Some(progress_wire(&p));
+                    if r.state == "running" {
+                        if let Some(why) = progress_stalled_reason(&p, now, PROGRESS_STALL) {
+                            r.state = "stalled".into();
+                            r.last_error = Some(why);
+                        }
+                        return r;
+                    }
+                }
                 if r.state == "running" {
                     if let Some(started) = in_flight {
                         if let Some(why) =
@@ -438,6 +470,11 @@ impl JobsState {
         if let Some(r) = rows.iter_mut().find(|r| r.name == name) {
             f(r);
         }
+    }
+
+    /// PVOS D207 — the progress account of a job that keeps one.
+    pub fn progress(&self, name: &str) -> Option<Arc<pvfs_core::JobProgress>> {
+        self.progress.get(name).cloned()
     }
 
     fn set_state(&self, name: &str, state: &str) {
@@ -679,6 +716,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) 
                         WATCH_DEBOUNCE.as_millis() as u64,
                         WATCH_CEILING.as_millis() as u64,
                         &flag,
+                        cb.progress("watch"),
                         |ev| {
                             for line in watch_event(&cb, ev) {
                                 eprintln!("{line}");
@@ -1151,6 +1189,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
         }),
         "receive" => job_thread(name, move || {
             st.set_state("receive", "running");
+            // PVOS D207 — the pass's account, ended however the pass ends.
+            let progress = st.progress("receive");
+            let _pass = progress.as_deref().map(PassInFlight::begin);
             // PVOS D199 — a receive writes files, not rows (the watch
             // catalogues what it places): a read view is all it needs. It
             // used to open two engines a pass, each folding the log.
@@ -1161,12 +1202,13 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                     return;
                 }
             };
-            let r = pvfs_client::receive::receive_pass_on(
+            let r = pvfs_client::receive::receive_pass_progress(
                 &view,
                 &pvfs_core::media::Rules::default(),
                 false,
                 pvfs_client::receive::MIN_FREE_BYTES,
                 &cancel,
+                progress.as_deref(),
             );
             // D148 — then the library copies this box's receive replaced (its
             // regions' trash) are purged by each region's retention: D133
@@ -1302,6 +1344,80 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
         other => unreachable!("no pass body for job {other}"),
     };
     Managed { stop, handle }
+}
+
+/// PVOS D207 — a periodic pass's account: begun when made, ended when
+/// dropped, so an early return or a panic cannot leave a pass "in flight".
+struct PassInFlight<'a>(&'a pvfs_core::JobProgress);
+
+impl<'a> PassInFlight<'a> {
+    fn begin(p: &'a pvfs_core::JobProgress) -> PassInFlight<'a> {
+        p.begin_pass();
+        PassInFlight(p)
+    }
+}
+
+impl Drop for PassInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.end_pass();
+    }
+}
+
+/// PVOS D207 — a pass's account, as `serve status` carries it.
+pub fn progress_wire(p: &pvfs_core::PassProgress) -> pvfs_proto::PassProgressWire {
+    pvfs_proto::PassProgressWire {
+        started_ms: p.started_ms,
+        advanced_ms: p.advanced_ms,
+        files_done: p.files_done,
+        bytes_done: p.bytes_done,
+        phase: p.phase.clone(),
+        current: p
+            .current
+            .iter()
+            .map(|f| pvfs_proto::FileProgressWire {
+                path: f.path.clone(),
+                hash: f.hash.clone(),
+                bytes: f.bytes,
+                size: f.size,
+                advanced_ms: f.advanced_ms,
+            })
+            .collect(),
+    }
+}
+
+/// PVOS D207 — is a pass that reports its progress stuck? Only if it has not
+/// advanced for `limit`; how long it has run says nothing (a first pass over
+/// a library hashes for a day). Pure, so the test drives it with a clock.
+/// The reason names where it stopped. Never the word the notifier filters
+/// (`overdue`): this is evidence, and it should reach a person.
+pub fn progress_stalled_reason(p: &pvfs_core::PassProgress, now_ms: u64, limit: Duration) -> Option<String> {
+    let still = now_ms.saturating_sub(p.advanced_ms);
+    if still <= limit.as_millis() as u64 {
+        return None;
+    }
+    let at = match (p.current.first(), p.phase.as_deref()) {
+        (Some(f), phase) => {
+            let of = f.size.map(|s| format!(" of {}", gb(s))).unwrap_or_default();
+            format!(" ({} {}, {}{of})", phase.unwrap_or("at"), f.path, gb(f.bytes))
+        }
+        (None, Some(phase)) => format!(" ({phase})"),
+        (None, None) => String::new(),
+    };
+    Some(format!(
+        "a pass running for {} has not advanced for {}{at}: {} file(s), {} done — it is stuck, not working",
+        failing_span(now_ms.saturating_sub(p.started_ms)),
+        failing_span(still),
+        p.files_done,
+        gb(p.bytes_done)
+    ))
+}
+
+fn gb(b: u64) -> String {
+    if b >= 1_000_000_000 {
+        format!("{:.1} GB", b as f64 / 1e9)
+    } else {
+        format!("{:.1} MB", b as f64 / 1e6)
+    }
 }
 
 /// Is a job that claims to be `running` actually stuck?
@@ -2132,5 +2248,91 @@ mod tests {
             follow_hung_reason(16 * 60_000 + 30_000),
             "no word from the source in 16 min — its long-poll never came back: the follower is hung"
         );
+    }
+
+    /// PVOS D207 — a pass that reports progress is judged by it, through
+    /// `snapshot` as `serve status` reads it: a receive seven hours past its
+    /// last completed pass (the D196 test's "overdue") is `running` with no
+    /// error while its pass advances, and carries the pass's account.
+    #[test]
+    fn a_pass_that_advances_is_neither_stalled_nor_overdue() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d207-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let now = now_ms();
+        for job in ["receive", "watch"] {
+            st.with_row(job, |r| {
+                r.enabled = true;
+                r.state = "running".into();
+                r.last_ok_ms = Some(now - 40 * 3_600_000);
+            });
+        }
+        // The watch's pass has been in flight for 40 h by the old clock.
+        st.mark_pass_start("watch");
+        st.pass_started.lock().unwrap().insert("watch".into(), now - 40 * 3_600_000);
+        st.pass_dur.lock().unwrap().insert("watch".into(), 60_000);
+        let p = st.progress("receive").unwrap();
+        p.begin_pass();
+        p.phase("pulling");
+        let t = p.begin_file("Shows/S01E01.mkv", Some("ab12"), Some(3_000_000_000), 8_388_608);
+        p.file_bytes(t, 8_388_608);
+        st.progress("watch").unwrap().begin_pass();
+        let snap = st.snapshot();
+        let row = |name: &str| snap.iter().find(|r| r.name == name).unwrap().clone();
+        let receive = row("receive");
+        assert_eq!((receive.state.as_str(), receive.last_error.as_deref()), ("running", None));
+        let pw = receive.progress.expect("the pass's account");
+        assert_eq!((pw.phase.as_deref(), pw.bytes_done, pw.files_done), (Some("pulling"), 8_388_608, 0));
+        assert_eq!(pw.current.len(), 1);
+        assert_eq!(pw.current[0].path, "Shows/S01E01.mkv");
+        assert_eq!((pw.current[0].bytes, pw.current[0].size), (16_777_216, Some(3_000_000_000)));
+        assert_eq!(pw.current[0].hash.as_deref(), Some("ab12"));
+        let watch = row("watch");
+        assert_eq!((watch.state.as_str(), watch.last_error.as_deref()), ("running", None), "progress, not the pass's age");
+        // Once the passes end, the old checks are back (D196's test says what they say).
+        p.end_pass();
+        st.progress("watch").unwrap().end_pass();
+        let snap = st.snapshot();
+        assert!(snap.iter().all(|r| r.progress.is_none()));
+        assert_eq!(snap.iter().find(|r| r.name == "receive").unwrap().state, "overdue");
+        assert_eq!(snap.iter().find(|r| r.name == "watch").unwrap().state, "stalled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PVOS D207 — the stall test itself: how long the pass has run says
+    /// nothing; how long since it last moved does, and the reason says where
+    /// it stopped — never with the word the notifier filters.
+    #[test]
+    fn a_pass_that_stops_advancing_is_stalled_and_says_where() {
+        let now = 100 * 3_600_000;
+        let p = |advanced_ago: u64, current: bool| pvfs_core::PassProgress {
+            started_ms: now - 26 * 3_600_000,
+            advanced_ms: now - advanced_ago,
+            files_done: 14_210,
+            bytes_done: 1_200_000_000_000,
+            phase: Some("hashing".into()),
+            current: if current {
+                vec![pvfs_core::progress::FileProgress {
+                    path: "/mnt/local/Media/TV/Show/S01/e05.mkv".into(),
+                    hash: None,
+                    bytes: 12_100_000_000,
+                    size: Some(40_200_000_000),
+                    advanced_ms: now - advanced_ago,
+                }]
+            } else {
+                Vec::new()
+            },
+        };
+        assert_eq!(progress_stalled_reason(&p(29 * 60_000, true), now, PROGRESS_STALL), None, "a day in, still moving");
+        assert_eq!(progress_stalled_reason(&p(30 * 60_000, true), now, PROGRESS_STALL), None, "at the limit is not past it");
+        let why = progress_stalled_reason(&p(31 * 60_000, true), now, PROGRESS_STALL).expect("stalled");
+        assert_eq!(
+            why,
+            "a pass running for 26 h 0 min has not advanced for 31 min (hashing /mnt/local/Media/TV/Show/S01/e05.mkv, \
+             12.1 GB of 40.2 GB): 14210 file(s), 1200.0 GB done — it is stuck, not working"
+        );
+        assert!(!why.contains("overdue"), "the notifier filters `overdue`; a stall must reach a person");
+        let why = progress_stalled_reason(&p(3 * 3_600_000, false), now, PROGRESS_STALL).unwrap();
+        assert!(why.contains("not advanced for 3 h 0 min (hashing)"), "{why}");
     }
 }

@@ -60,6 +60,21 @@ pub fn receive_pass_on(
     min_free: u64,
     cancel: &AtomicBool,
 ) -> Result<ReceiveReport, PvfsError> {
+    receive_pass_progress(engine, rules, dry_run, min_free, cancel, None)
+}
+
+/// PVOS D207 — [`receive_pass_on`], saying how far it has got: each file
+/// pulled is in hand from its first byte (a resumed partial from its
+/// length) to its placing, its bytes counted as each range lands. The
+/// daemon's receive job; the runner begins and ends the pass.
+pub fn receive_pass_progress(
+    engine: &Engine,
+    rules: &Rules,
+    dry_run: bool,
+    min_free: u64,
+    cancel: &AtomicBool,
+    progress: Option<&pvfs_core::JobProgress>,
+) -> Result<ReceiveReport, PvfsError> {
     let mut report = ReceiveReport { dry_run, ..Default::default() };
     // D145 — folders only staging has, first: the drain removes a staging
     // folder only once the library holds it.
@@ -115,6 +130,9 @@ pub fn receive_pass_on(
         return Ok(report);
     }
     let workers = (parallel.max(1) as usize).min(queue.len());
+    if let Some(p) = progress {
+        p.phase("pulling");
+    }
     let queue = std::sync::Mutex::new(queue);
     let out = std::sync::Mutex::new(&mut report);
     std::thread::scope(|s| {
@@ -125,17 +143,21 @@ pub fn receive_pass_on(
                     break;
                 }
                 let Some((it, local, streams)) = queue.lock().unwrap().pop_front() else { break };
-                match pull_into_partial(&it, local.as_deref(), &sources, cancel, streams) {
-                    Ok(Some(chunks)) => match place(&it, &chunks) {
-                        Ok(()) => {
-                            let mut r = out.lock().unwrap();
-                            r.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
-                            if it.replaces {
-                                r.replaced.push(it.rel_path.clone());
-                            }
+                let token = progress.map(|p| (p, p.begin_file(&it.rel_path, Some(&it.hash), Some(it.size_bytes), 0)));
+                // Ok(Some(())) placed, Ok(None) cancelled, Err why not.
+                let r = pull_into_partial_progress(&it, local.as_deref(), &sources, cancel, streams, token)
+                    .and_then(|pulled| pulled.map(|chunks| place(&it, &chunks)).transpose());
+                if let Some((p, t)) = token {
+                    p.end_file(t, matches!(r, Ok(Some(()))));
+                }
+                match r {
+                    Ok(Some(())) => {
+                        let mut r = out.lock().unwrap();
+                        r.received.push((it.rel_path.clone(), it.hash.clone(), it.dest_region.clone()));
+                        if it.replaces {
+                            r.replaced.push(it.rel_path.clone());
                         }
-                        Err(e) => out.lock().unwrap().failed.push((it.rel_path.clone(), e)),
-                    },
+                    }
                     Ok(None) => {
                         out.lock().unwrap().cancelled = true;
                         break;
@@ -183,10 +205,27 @@ pub fn pull_into_partial(
     cancel: &AtomicBool,
     streams: u32,
 ) -> Result<Option<Vec<[u8; 32]>>, String> {
+    pull_into_partial_progress(it, local, sources, cancel, streams, None)
+}
+
+/// PVOS D207 — [`pull_into_partial`], counting into the file `progress`
+/// holds in hand: the partial's resumed length, then each range appended
+/// (a local copy, its size once copied).
+pub fn pull_into_partial_progress(
+    it: &ReceiveItem,
+    local: Option<&Path>,
+    sources: &[ReplicaSource],
+    cancel: &AtomicBool,
+    streams: u32,
+    progress: Option<(&pvfs_core::JobProgress, pvfs_core::progress::FileToken)>,
+) -> Result<Option<Vec<[u8; 32]>>, String> {
     let part = partial_path(it);
     std::fs::create_dir_all(part.parent().unwrap()).map_err(|e| format!("incoming dir: {e}"))?;
     if let Some(src) = local {
         std::fs::copy(src, &part).map_err(|e| format!("local copy: {e}"))?;
+        if let Some((p, t)) = progress {
+            p.file_bytes(t, it.size_bytes);
+        }
         let (whole, chunks) = hash_file(&part).map_err(|e| format!("hash local copy: {e}"))?;
         if whole != it.hash {
             let _ = std::fs::remove_file(&part);
@@ -220,6 +259,9 @@ pub fn pull_into_partial(
             left -= n as u64;
         }
         file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    }
+    if let Some((p, t)) = progress {
+        p.file_have(t, have);
     }
     // D144 — the remaining ranges, several in flight at once. Workers fetch
     // ranges in index order from a shared counter, each over its own
@@ -311,6 +353,9 @@ pub fn pull_into_partial(
                     whole.update(&buf);
                     chunks.push(*blake3::hash(&buf).as_bytes());
                     off += buf.len() as u64;
+                    if let Some((p, t)) = progress {
+                        p.file_bytes(t, buf.len() as u64);
+                    }
                     want += 1;
                 }
             }
