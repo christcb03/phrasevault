@@ -6,7 +6,7 @@
 //! waits on the silent box until it hangs up, then the holder serves it.
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,35 @@ fn socket(path: &std::path::Path) -> ReplicaSource {
         pin: String::new(),
         region: String::new(),
     }
+}
+
+/// Drop a mount and wait until the kernel has let go of it: a TempDir
+/// removed while its mount is still there deletes THROUGH the view (a
+/// routed trash, which would dial the silent box).
+fn unmount(session: fuser::BackgroundSession, at: &std::path::Path) {
+    drop(session);
+    let mounted = || {
+        std::fs::read_to_string("/proc/mounts")
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.split(' ').nth(1) == Some(at.to_str().unwrap()))
+    };
+    // Dropping the session does not always unmount at once (fuser 0.14):
+    // give it a second, then unmount it ourselves.
+    let wait = |limit: Duration| {
+        let deadline = Instant::now() + limit;
+        while mounted() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    wait(Duration::from_secs(1));
+    for flags in ["-u", "-uz"] {
+        if mounted() {
+            let _ = std::process::Command::new("fusermount3").arg(flags).arg(at).status();
+            wait(Duration::from_secs(5));
+        }
+    }
+    assert!(!mounted(), "{} is still mounted", at.display());
 }
 
 fn row(rel: &str, kind: &str, size: u64, hash: Option<String>) -> RegionEntry {
@@ -138,15 +167,25 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
     let silent = UnixListener::bind(&silent_sock).unwrap();
     let held: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
     let dialed = Arc::new(AtomicUsize::new(0));
+    // Once set, the silent box hangs up on everyone: no read is left
+    // waiting on it when an assertion fails (a mount torn down under a
+    // waiting read hangs the test instead of failing it).
+    let hangup = Arc::new(AtomicBool::new(false));
     {
-        let (held, dialed) = (Arc::clone(&held), Arc::clone(&dialed));
+        let (held, dialed, hangup) = (Arc::clone(&held), Arc::clone(&dialed), Arc::clone(&hangup));
         std::thread::spawn(move || {
             for conn in silent.incoming().flatten() {
                 dialed.fetch_add(1, Ordering::SeqCst);
-                held.lock().unwrap().push(conn);
+                if !hangup.load(Ordering::SeqCst) {
+                    held.lock().unwrap().push(conn);
+                }
             }
         });
     }
+    let release = || {
+        hangup.store(true, Ordering::SeqCst);
+        held.lock().unwrap().clear();
+    };
 
     // ---- the reader: two regions' rows, no bytes. Far's manifest came
     // from the holder; Near's from a box the fleet no longer announces.
@@ -194,10 +233,21 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
     let mnt = tempfile::tempdir().unwrap();
     let session = pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), opts.clone(), sources()).unwrap();
     let t = Instant::now();
-    assert_eq!(std::fs::read(mnt.path().join("Movies/Far (2006)/far.mkv")).unwrap(), far);
-    assert!(t.elapsed() < Duration::from_secs(5), "the holder answered in {:?}", t.elapsed());
-    assert_eq!(dialed.load(Ordering::SeqCst), 0, "the silent box was never dialed");
-    drop(session);
+    let far_file = mnt.path().join("Movies/Far (2006)/far.mkv");
+    let reading = std::thread::spawn(move || std::fs::read(far_file));
+    while !reading.is_finished() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let took = t.elapsed();
+    let asked_silent = dialed.load(Ordering::SeqCst);
+    release();
+    let got = reading.join().unwrap();
+    eprintln!("far: {took:?}, silent box dialed {asked_silent} time(s), read ok: {}", got.is_ok());
+    assert_eq!(asked_silent, 0, "the silent box was never dialed");
+    assert!(took < Duration::from_secs(5), "the holder answered in {took:?}");
+    assert_eq!(got.unwrap(), far);
+    unmount(session, mnt.path());
+    hangup.store(false, Ordering::SeqCst);
 
     // ---- a fresh mount, a region whose holder is not announced: today's
     // order — the silent box is asked first, and the read waits on it
@@ -206,18 +256,18 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
     let near_file = mnt2.path().join("Movies/Near (2007)/near.mkv");
     let waiting = std::thread::spawn(move || std::fs::read(near_file));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while dialed.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "the silent box was never asked");
+    while dialed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(!waiting.is_finished(), "premise: the read waits on the silent box");
+    std::thread::sleep(Duration::from_millis(300));
+    let asked_silent = dialed.load(Ordering::SeqCst);
+    let was_waiting = !waiting.is_finished();
     // It hangs up: the dial fails, the holder is asked next and serves.
-    let release = Instant::now() + Duration::from_secs(20);
-    while !waiting.is_finished() {
-        held.lock().unwrap().clear();
-        assert!(Instant::now() < release, "the waiting read never ended");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(waiting.join().unwrap().unwrap(), near, "then the holder served it");
-    drop(session);
+    release();
+    let got = waiting.join().unwrap();
+    eprintln!("near: silent box dialed {asked_silent} time(s), waiting on it: {was_waiting}, read ok: {}", got.is_ok());
+    assert!(asked_silent > 0, "the silent box was asked first (today's order)");
+    assert!(was_waiting, "premise: the read waited on the silent box");
+    assert_eq!(got.unwrap(), near, "then the holder served it");
+    unmount(session, mnt2.path());
 }
