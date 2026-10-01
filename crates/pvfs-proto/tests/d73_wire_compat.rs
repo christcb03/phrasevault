@@ -118,6 +118,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         log: None,
         fenced: None,
         backup: None,
+        build: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -150,6 +151,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
         log: None,
         fenced: None,
         backup: None,
+        build: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -184,6 +186,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
         log: None,
         fenced: None,
         backup: None,
+        build: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -219,8 +222,42 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
             at_ms: 9,
         })),
         backup: Some(Box::new(pvfs_proto::BackupWire { at_ms: 7, ok: true, seq: Some(3472), error: None })),
+        build: None,
     };
     let s = serde_json::to_string(&new).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+
+/// PVOS D200 — `serve status` gains the daemon's build. A reply from a daemon
+/// before it (every field up to D182's, no `build`) decodes with none; a new
+/// one round-trips, and says the build on the wire under that name (the page
+/// and the health record read it).
+#[test]
+fn an_older_serve_jobs_reply_without_build_decodes() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[],"conflicts":0,"stale":0,"trash":[],"stores":[],"mounts":[],"log":{"seq":3,"hash":"ab"}}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { build, log, .. } => {
+            assert!(build.is_none());
+            assert!(log.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    let new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: Box::default(),
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: Box::default(),
+        stores: Box::default(),
+        mounts: Box::default(),
+        log: None,
+        fenced: None,
+        backup: None,
+        build: Some(Box::new("v1.4-495-gc17ae29".into())),
+    };
+    let s = serde_json::to_string(&new).unwrap();
+    assert!(s.contains(r#""build":"v1.4-495-gc17ae29""#), "{s}");
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
 }
 

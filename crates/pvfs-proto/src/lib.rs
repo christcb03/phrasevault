@@ -214,6 +214,14 @@ pub enum ServerMsg {
         /// no copy has ever been made, and on older daemons.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backup: Option<Box<BackupWire>>,
+        /// PVOS D200: the build this daemon runs (`PVFS_BUILD`, D110 — e.g.
+        /// `v1.4-495-gc17ae29`). What a box announces (crate version, proto,
+        /// schema) cannot tell two builds apart (D177), so this is how the
+        /// owner's health job, and the page, learn which build each box
+        /// serves. Absent on older daemons, so defaulted rather than a proto
+        /// bump. Boxed like the rest (the variant must stay small).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<Box<String>>,
     },
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and

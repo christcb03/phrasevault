@@ -7468,11 +7468,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 } else {
                     "never seen".to_string()
                 };
+                // PVOS D200 — the build its daemon last said it runs; the
+                // announced version (crate, proto, schema) from an older one.
                 println!(
                     "  {}  {}  {}  {}",
                     &pin[..8.min(pin.len())],
                     r.addr,
-                    r.version.as_deref().unwrap_or("version ?"),
+                    r.build.as_deref().or(r.version.as_deref()).unwrap_or("version ?"),
                     state
                 );
                 if r.last.ok() {
@@ -10260,6 +10262,9 @@ fn serve_status_print(
     // PVOS D188 — the owner's own row on the Home Assistant page reads these
     // from here (a peer's come through the health record, in the same shape).
     let (mounts, backup) = (st.mounts, st.backup);
+    // PVOS D200 — the build the daemon runs (not this CLI's: after a roll
+    // that has not restarted it, the two differ). None from an older daemon.
+    let build = st.build;
     let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     if json {
         let rows: Vec<String> = jobs
@@ -10279,7 +10284,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -10291,6 +10296,7 @@ fn serve_status_print(
             serde_json::to_string(&fenced).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&backup).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&build).unwrap_or_else(|_| "null".into()),
         );
     } else {
         // PVOS D182 — first, because nothing else matters while it holds.
@@ -10298,6 +10304,9 @@ fn serve_status_print(
             println!("FENCED: {} — this owner writes nothing until a person looks (pvfs forest fence)", f.reason);
         }
         println!("runner: {runner}");
+        if let Some(b) = &build {
+            println!("build: {b}  (the running daemon's; D200)");
+        }
         if let Some(t) = &log {
             println!("log: seq {}  (this box's copy of the forest log; D182)", t.seq);
         }

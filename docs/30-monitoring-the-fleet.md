@@ -60,7 +60,8 @@ follower that fails retries in backoff, 2 s doubling to 30 s, back to 2 s at
 the next contact that proves it current.
 
 **A failed pass reaches the log (PVOS D196).** Every job's failures are in
-its row; the journal (on the NAS, `pvfsd.log`) hears each run of them once:
+its row; the journal (on the NAS, `pvfsd.log`, each line dated by the start
+script since PVOS D200) hears each run of them once:
 `pvfsd: <job> pass failed: <error>; the next pass tries again` at the first
 failure and whenever the text changes, then `pvfsd: <job> recovered: a pass
 completed after N failed pass(es) over <span>`. The watch, the follower, a
@@ -80,8 +81,10 @@ dir's filesystem), **`stores`** (PVOS D178: every filesystem the box stores
 on — the data dir's first, then each one under the roots of the catalogue
 regions it catalogues from its own disk, once per device, with the regions
 on it; a holder's files are rarely on the data dir's disk, so `capacity`
-alone said mediabox had 339 GB free while both its stores were 98 % full) and
-**`trash`** (D148). `trash` has one entry per catalogue region the box holds:
+alone said mediabox had 339 GB free while both its stores were 98 % full),
+**`build`** (PVOS D200: the build the daemon runs, e.g. `v1.4-495-gc17ae29`
+— not the CLI's, which after a roll that did not restart the daemon is
+another; absent from an older daemon) and **`trash`** (D148). `trash` has one entry per catalogue region the box holds:
 the bytes in its `.pvfs-trash`, the number of day buckets, the oldest
 bucket's day (days since the epoch), the region's retention, what the last
 purge freed, and when it was measured (`measured_ms`).
@@ -109,10 +112,11 @@ keeps the record in `<data>/fleet-health.json`:
 polled_at_ms
 peers: { <transport pin>: {
     addr, version,                     # version from the catalog's .fleet/versions
+    build,                             # PVOS D200: the last build its daemon said
     last_attempt_ms, last_ok_ms,
     unreachable_since_ms, misses,      # DOWN after 2 consecutive misses
     last: { reachable, forest_ok, runner, jobs: [{name, state, last_ok_ms, last_error}],
-            conflicts, stale, capacity: [free, total],
+            build, conflicts, stale, capacity: [free, total],
             stores: [{path, regions, free_bytes, total_bytes}],   # D178
             trash: [{region, bytes, buckets, oldest_day, retention_days,
                      freed_bytes, measured_ms}], error },   # §1.1
@@ -122,9 +126,13 @@ peers: { <transport pin>: {
 `version` is what the box announced (`pvfs fleet announce`, D72): the crate
 version, wire proto and schema, **not the build**. Two builds with the same
 proto and schema read the same (v1.4-391 and v1.4-393 are both
-`{"pvfs":"1.4.0","proto":11,"schema":19}`), and nothing else in the record
-carries a peer's build. `last` is the latest probe's answer, successful or
-not, taken at `last_attempt_ms`; `last_ok_ms` is the latest that succeeded.
+`{"pvfs":"1.4.0","proto":11,"schema":19}`). *Since PVOS D200* the probe
+records the build the peer's daemon says in `serve status`: `last.build` is
+this probe's, and `build` beside `version` is the last one heard — kept while
+the box is down, so its row still says what it ran. A daemon older than D200
+says nothing, and its row has only `version`. `last` is the latest probe's
+answer, successful or not, taken at `last_attempt_ms`; `last_ok_ms` is the
+latest that succeeded.
 
 `pvfs fleet health` prints it (`--now` polls first; `--json` for scripts).
 Two misses before "down" is the hysteresis: a daemon restarting — a minute,
@@ -286,8 +294,8 @@ a systemd timer every minute, **read-only everywhere**:
 
 | reads | for |
 |---|---|
-| `fleet-health.json` | each peer: up/down, announced version (§1.2: not its build), jobs with last run, free space, trash |
-| `pvfs serve status --json` | the owner's own jobs |
+| `fleet-health.json` | each peer: up/down, its build (PVOS D200; the announced version, §1.2, from an older daemon), jobs with last run, free space, trash |
+| `pvfs serve status --json` | the owner's own jobs, and its daemon's build |
 | `pvfs region ls --json` | each catalogue region's head and entries; since PVOS D183 also `committed` (the log's head), `provisional` (the head was taken from the region's own box while the owner was away) and, for a region this box catalogues, `pending` (a head published here that the owner has not committed yet) |
 | `pvfs region entries <id> --json` (only when a head moves) | the file lists diffed into "moved / deleted" |
 | the holder's `progress` verb (§1.3, the supervise key) | the mover: partial sizes + the receive plan |
@@ -322,7 +330,7 @@ that turns on after 5 minutes without a snapshot — the entities cannot say
 "no snapshot has come" themselves.
 
 **The page** (`/pvfs-forest`, a sections view): the forest headline and
-problems; the boxes (daemon answering, version, free space, trash and its
+problems; the boxes (daemon answering, build, free space, trash and its
 oldest bucket's age); **jobs — last run**
 (✅ how long ago it last succeeded, ❌ the error, ⏳ the stall detector's
 notice); the mover (each file in flight with its %, the aggregate rate, the
@@ -364,11 +372,17 @@ the machines; and the recent fleet events.
   a failing region only itself. It is measured against the probe
   (`last_attempt_ms`), not the clock: a health job that stops polling is
   already a problem, and must not become one more per box. A daemon older
-  than D176 measures only at the end of a `receive`/`resolve` pass, and the
-  record cannot say which build a peer runs (§1.2), so the collector exempts
-  the hosts in `PVFS_HA_TRASH_EXEMPT` (comma-separated; in PVOS,
-  `pvfs_status_trash_exempt` on the owner's row) until they are rolled.
-  Empty, every box is held to it.
+  than D176 measured only at the end of a `receive`/`resolve` pass, and
+  while the record could not say which build a peer ran, PVOS D177 exempted
+  such boxes by host (`PVFS_HA_TRASH_EXEMPT`). PVOS D200 retired the
+  setting: a box that reports its build has the step by construction, every
+  box on the fleet runs v1.4-495 or later, and the roll guard refuses a
+  downgrade (D153). Every box is held to it.
+- **Each box's build, from the box (PVOS D200).** The Build column is each
+  daemon's own word — the peer's `build` in `fleet-health.json`, the owner's
+  from its `serve status` — so a box a roll missed, or one whose daemon was
+  not restarted, shows the build it is really running. A box whose daemon
+  predates D200 shows its announced version instead.
 
 ### 2.3 A sidebar on honest numbers: hypervisor memory
 
