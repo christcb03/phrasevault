@@ -41,6 +41,12 @@ pub struct MediaQuality {
     /// the re-encoder is already decoding every file it touches — so it can
     /// write this as a side effect of work it was doing anyway.
     pub decoded_ok: Option<bool>,
+    /// PVOS D208 — a header probe of this file FAILED (ffprobe could not
+    /// read it: an unreadable header, all-zero bytes). Recorded so the probe
+    /// is not repeated every pass, and reported; the ladder does not use it
+    /// (yet — a decision for Chris). Encoded only when set, so every
+    /// encoding made before it is byte-identical.
+    pub probe_failed: bool,
 }
 
 impl MediaQuality {
@@ -50,6 +56,18 @@ impl MediaQuality {
     /// Comparing labels would call those equal; comparing pixels does not.
     pub fn pixels(&self) -> u64 {
         self.width as u64 * self.height as u64
+    }
+
+    /// PVOS D208 — something measured this file's picture: its resolution
+    /// is known. A rung that compares a property of the picture (HDR) needs
+    /// this on BOTH copies; an unmeasured copy is unknown, not SDR.
+    pub fn measured(&self) -> bool {
+        self.pixels() > 0
+    }
+
+    /// PVOS D208 — the record of a header probe that failed.
+    pub fn probe_failure() -> Self {
+        MediaQuality { probe_failed: true, ..Default::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -67,7 +85,7 @@ impl MediaQuality {
     /// Canonical JSON — stable field order, so the same measurement always
     /// signs to the same bytes.
     pub fn encode(&self) -> String {
-        format!(
+        let mut out = format!(
             "{{\"w\":{},\"h\":{},\"depth\":{},\"hdr\":\"{}\",\"bitrate\":{},\"codec\":\"{}\",\"dur\":{},\"decoded\":\"{}\"}}",
             self.width,
             self.height,
@@ -81,7 +99,12 @@ impl MediaQuality {
                 Some(false) => "bad",
                 None => "",
             }
-        )
+        );
+        if self.probe_failed {
+            out.pop();
+            out.push_str(",\"probe\":\"failed\"}");
+        }
+        out
     }
 
     pub fn decode(s: &str) -> Result<Self> {
@@ -102,6 +125,7 @@ impl MediaQuality {
                         _ => None,
                     }
                 }
+                "probe" => q.probe_failed = v == "failed",
                 _ => {} // tolerate fields a newer binary added
             }
         }
@@ -306,8 +330,11 @@ pub fn choose(a: &Candidate, b: &Candidate, rules: &Rules) -> (bool, Verdict) {
             },
         );
     }
+    // PVOS D208 — only between two MEASURED copies: an unmeasured copy's
+    // empty `hdr` means "unknown", and reading it as SDR made any measured
+    // HDR copy beat it before size was asked.
     let (ha, hb) = (!a.quality.hdr.is_empty(), !b.quality.hdr.is_empty());
-    if ha != hb {
+    if ha != hb && a.quality.measured() && b.quality.measured() {
         return (
             ha,
             Verdict::Quality {
@@ -419,6 +446,16 @@ pub fn is_media_file(label: &str, mime: &str) -> bool {
     ]
     .iter()
     .any(|e| lower.ends_with(e))
+}
+
+/// PVOS D208 — a video file by its name: what the catalogue's probe step
+/// measures. Audio is left out on purpose: ffprobe's first "video" stream in
+/// an mp3 or flac is its cover art, and comparing cover art is not quality.
+pub fn is_video_file(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    [".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts", ".webm"]
+        .iter()
+        .any(|e| lower.ends_with(e))
 }
 
 /// A non-media file has no quality ladder to climb: newest wins, per Chris's

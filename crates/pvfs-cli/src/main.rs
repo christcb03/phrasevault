@@ -1464,6 +1464,11 @@ enum RegionCmd {
     /// D125: a catalogue region's own index — one row per file and folder on
     /// disk under its root — and the last head it published
     Entries { target: String },
+    /// PVOS D208: what is known of the video quality in each catalogue
+    /// region this box holds rows for (or one): files measured, unmeasured
+    /// and whose probe failed, and whether this box has ffprobe to measure
+    /// its own regions. The daemon's watch measures; this only reports.
+    Quality { target: Option<String> },
     /// D127: declare a catalogue region draining (staging — its copies drain
     /// into the library) or not. Fleet-visible. Prompts when omitted.
     Drain {
@@ -7158,6 +7163,68 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 r.content_hash.as_deref().unwrap_or("-"),
                                 r.rel_path
                             );
+                        }
+                    }
+                    engine.close()
+                }
+                RegionCmd::Quality { target } => {
+                    let (engine, only) = match target {
+                        Some(t) => {
+                            let (e, id) = engine_and_node_reading(ctx, &t)?;
+                            if !e.is_catalogue_region(&id)? {
+                                return Err(PvfsError::BadInput {
+                                    field: "target".into(),
+                                    reason: format!("{id} is not a catalogue region (see `region ls`)"),
+                                });
+                            }
+                            (e, Some(id))
+                        }
+                        None => (open_for_reading(&ctx?)?, None),
+                    };
+                    let prober = pvfs_core::probe::Prober::detect();
+                    let regions: Vec<(String, bool)> = engine
+                        .catalogue_status()?
+                        .into_iter()
+                        .filter(|s| only.as_deref().is_none_or(|o| o == s.region.as_str()))
+                        .filter(|s| s.local || s.held_seq.is_some())
+                        .map(|s| (s.region.to_string(), s.local))
+                        .collect();
+                    let mut sums = Vec::new();
+                    for (id, local) in &regions {
+                        sums.push((id.clone(), *local, engine.region_quality_summary(&id.to_string())?));
+                    }
+                    if json {
+                        let out = serde_json::json!({
+                            "ffprobe": prober.as_ref().map(|p| p.program.display().to_string()),
+                            "regions": sums.iter().map(|(id, local, q)| serde_json::json!({
+                                "region": id, "local": local, "video_files": q.video_files,
+                                "measured": q.measured, "unmeasured": q.unmeasured,
+                                "probe_failed": q.failed, "failed_paths": q.failed_paths,
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{out}");
+                    } else {
+                        match &prober {
+                            Some(p) => println!("this box measures with {}", p.program.display()),
+                            None => println!(
+                                "this box has no ffprobe (PATH, or PVFS_FFPROBE): its own regions are not measured"
+                            ),
+                        }
+                        if sums.is_empty() {
+                            println!("no catalogue region held here");
+                        }
+                        for (id, local, q) in &sums {
+                            println!(
+                                "{id}\t{}\t{} video\t{} measured\t{} unmeasured\t{} probe failed",
+                                if *local { "live" } else { "fetched" },
+                                q.video_files,
+                                q.measured,
+                                q.unmeasured,
+                                q.failed
+                            );
+                            for p in &q.failed_paths {
+                                println!("  probe failed: {p}");
+                            }
                         }
                     }
                     engine.close()
