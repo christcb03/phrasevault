@@ -94,6 +94,7 @@ pub use fs::{
     RenameExpect,
     RenamedHere,
     DirRemovedHere,
+    QualityPlan,
     RegionSnapshot,
     SnapshotInstall,
     ResolveAction,

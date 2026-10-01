@@ -65,6 +65,11 @@ const RECEIVE_INTERVAL: Duration = Duration::from_secs(300);
 /// every box's trash in `serve status` is at most this old.
 /// `PVFS_TRASH_EVERY_MS` shortens it for tests.
 const TRASH_EVERY: Duration = Duration::from_secs(300);
+/// PVOS D211 — how often the remote probe step runs (`PVFS_PROBE_REMOTE_EVERY_MS`
+/// shortens it for tests), and how long after the daemon starts the first
+/// one waits (the catalogue job installs the holders' heads first).
+const PROBE_REMOTE_EVERY: Duration = Duration::from_secs(600);
+const PROBE_REMOTE_FIRST: Duration = Duration::from_secs(120);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1586,6 +1591,14 @@ fn interval(name: &str) -> Duration {
     }
 }
 
+/// PVOS D211 — the remote probe step's cadence and first delay.
+fn probe_remote_every() -> (Duration, Duration) {
+    match std::env::var("PVFS_PROBE_REMOTE_EVERY_MS").ok().and_then(|v| v.parse().ok()) {
+        Some(ms) => (Duration::from_millis(ms), Duration::from_millis(ms)),
+        None => (PROBE_REMOTE_EVERY, PROBE_REMOTE_FIRST),
+    }
+}
+
 /// D176 — how often the runner's trash step runs (`TRASH_EVERY`, or the
 /// test's `PVFS_TRASH_EVERY_MS`).
 fn trash_every() -> Duration {
@@ -1707,6 +1720,17 @@ pub fn run(
     let trash_every = trash_every();
     let mut trash_at = Instant::now();
     let mut trashing: Option<Managed> = None;
+    // PVOS D211 — the remote probe step: this box measures, with ffprobe,
+    // the video files of the regions its `probe-remote` file names, reading
+    // them from their holder over the LAN (mediabox for the NAS). Like the
+    // trash step it is the runner's, not a job in `serve.jobs`: an older
+    // binary refuses a job name it does not know, and a rollback must not
+    // stop a daemon. Nothing is listed by default; nothing is probed.
+    let (probe_every, probe_first) = probe_remote_every();
+    let mut probe_at = Instant::now() + probe_first;
+    let mut probing: Option<Managed> = None;
+    let mut remote: Option<Arc<pvfs_client::remote_probe::RemoteProbe>> = None;
+    let mut said_no_prober = false;
     // PVOS D199 — every job's writes go through one writer: the daemon's, or
     // one the runner opens itself when it has no daemon (tests).
     let writers = Arc::new(Writers::new(
@@ -1752,6 +1776,61 @@ pub fn run(
                     }
                 });
                 trashing = Some(Managed { stop, handle });
+            }
+        }
+        if let Some(d) = &daemon {
+            let idle = probing.as_ref().is_none_or(|m| m.handle.is_finished());
+            if idle && Instant::now() >= probe_at {
+                probe_at = Instant::now() + probe_every;
+                if let Some(m) = probing.take() {
+                    let _ = m.handle.join();
+                }
+                let listed = match pvfs_core::sync::probe_remote_regions(state.data_dir()) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("pvfsd: probe: {e}");
+                        Vec::new()
+                    }
+                };
+                if !listed.is_empty() && remote.is_none() {
+                    match pvfs_core::probe::Prober::detect() {
+                        Some(p) => {
+                            eprintln!(
+                                "pvfsd: probe: measuring {} region(s) for their holders with {}",
+                                listed.len(),
+                                p.program.display()
+                            );
+                            remote = Some(Arc::new(pvfs_client::remote_probe::RemoteProbe::new(p)));
+                        }
+                        None if !said_no_prober => {
+                            said_no_prober = true;
+                            eprintln!(
+                                "pvfsd: probe: probe-remote names {} region(s), but this box has no ffprobe (PATH, or PVFS_FFPROBE): nothing is measured",
+                                listed.len()
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                if let (false, Some(rp)) = (listed.is_empty(), &remote) {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let (d, flag, rp) = (Arc::clone(d), Arc::clone(&stop), Arc::clone(rp));
+                    let handle = job_thread("probe", move || {
+                        let r = d.writer().read_view().and_then(|view| {
+                            let sources = pvfs_client::receive::announced_sources(&view);
+                            pvfs_client::remote_probe::remote_probe_regions(&view, &listed, &sources, &rp, &flag)
+                        });
+                        match r {
+                            Ok(reports) => {
+                                for line in pvfs_client::remote_probe::report_lines(&reports) {
+                                    eprintln!("{line}");
+                                }
+                            }
+                            Err(e) => eprintln!("pvfsd: probe: pass failed: {e}"),
+                        }
+                    });
+                    probing = Some(Managed { stop, handle });
+                }
             }
         }
         // punch A: `serve enable` takes effect within a tick — the runner
@@ -1843,6 +1922,10 @@ pub fn run(
         m.stop.store(true, Ordering::SeqCst);
     }
     if let Some(m) = trashing {
+        m.stop.store(true, Ordering::SeqCst);
+        let _ = m.handle.join();
+    }
+    if let Some(m) = probing {
         m.stop.store(true, Ordering::SeqCst);
         let _ = m.handle.join();
     }

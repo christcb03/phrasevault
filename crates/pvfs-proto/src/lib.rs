@@ -53,7 +53,11 @@ use serde::{Deserialize, Serialize};
 ///          elsewhere, delivered by the box that hosts the forest (a
 ///          person's session certificate, signed in their browser).
 ///          Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 15;
+///   15 → 16: PVOS D211 `SetRegionQuality` — a box that probed another
+///          box's copy of a video file (mediabox for the NAS, over the LAN)
+///          hands the holder what ffprobe saw; the holder checks the copy
+///          and writes its own row. Additive; compatible-with stays.
+pub const PROTO_VERSION: u32 = 16;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -143,6 +147,15 @@ pub enum ServerMsg {
     /// D170: the answer to `ClientMsg::RemoveDir` — `removed` is false when
     /// the folder was not on this box's disk (not an error).
     DirRemoved { removed: bool },
+    /// PVOS D211: the answer to `ClientMsg::SetRegionQuality` — `written`
+    /// is false when the row already said all it can (a measurement, a
+    /// confirmed failure, or a suspect too recent to confirm); `quality` is
+    /// the row's quality now (`None` = still unmeasured).
+    RegionQualitySet {
+        written: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+    },
     /// A typed failure; `code` mirrors a `PvfsError` family.
     Error { code: String, message: String },
     /// P9 (doc 22): the chunk manifest for a file this holder can read —
@@ -759,6 +772,22 @@ pub enum ClientMsg {
     /// of the operator's (PVFS's own names and litter go to the trash).
     /// **Write-gated** on the region. `not_found` as above; `not_empty`.
     RemoveDir { region: String, rel_path: String },
+    /// PVOS D211: what a header probe of THIS box's copy of `rel_path` in
+    /// catalogue region `region` observed, made by another box that read
+    /// the bytes (the holder has no ffprobe). `quality` is a canonical
+    /// measurement or a bare failure (`"probe":"failed"`); the holder
+    /// applies its own rule (a first failure is only a suspect) to its row.
+    /// **Write-gated** on the region. `not_found` when this box does not
+    /// catalogue that region from its own disk; `conflict` when the copy is
+    /// not the one probed (`hash`, `size`, `mtime_ms`).
+    SetRegionQuality {
+        region: String,
+        rel_path: String,
+        hash: String,
+        size: u64,
+        mtime_ms: u64,
+        quality: String,
+    },
     /// P9 (doc 22): the file's chunk manifest — BLAKE3 per 8 MiB chunk,
     /// computed from the holder's bytes (sidecar-cached). UNSIGNED and
     /// advisory: it steers parallel pulls and resume; the catalog hash

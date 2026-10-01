@@ -402,3 +402,34 @@ and cleared when it stops.
 - A refusal on the owner itself shows on the page only: the owner does not
   poll itself.
 
+
+## 14. Video quality: an unreadable file, and the NAS's files
+
+**Symptom.** `pvfs region quality` lists a file as *unreadable* or
+*suspect*; or the journal of the box that measures for the NAS (mediabox)
+says `pvfsd: probe: region XXXXXXXX skipped: …`.
+
+**What it means** (PVOS D208, D211). A box's watch measures each video file
+on its own disk with ffprobe; mediabox measures the NAS's (which has no
+ffprobe) through its `probe-remote` file, reading ranges from the NAS over
+the LAN. When ffprobe says the data is invalid the file is a *suspect*; a
+second probe 30 minutes or more later that says the same makes it
+*unreadable*, and from then on it loses to any copy of that path that was
+measured (the served copy, the drain). An I/O or permission error is never
+"unreadable": nothing is recorded and the file is tried again after six
+hours.
+
+**Fix.**
+
+- *unreadable*: play it. If it really is broken, replace it (an arr search);
+  the new file is measured afresh. A copy elsewhere that reads is already
+  the one served.
+- *skipped: its holder … looks remote*: the NAS took over 10 ms to accept a
+  connection — a network problem between mediabox and the NAS, or a holder
+  that is not on the LAN (the probe never reads across the WAN).
+- *skipped: … no holder known*: mediabox has not fetched that region's head
+  yet (`pvfs region ls`); it clears with the catalogue job.
+- *the holder refused … forbidden*: mediabox's client identity has no `w` on
+  the region (`pvfs acl ls <region>` on the owner).
+- `probe-remote names N region(s), but this box has no ffprobe`:
+  `apt install ffmpeg` on the measuring box (not on the NAS).

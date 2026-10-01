@@ -162,8 +162,10 @@ fn a_file_held_elsewhere_reads_by_the_piece_and_a_waiting_read_does_not_stop_the
         burst: 8 * PIECE,
         ..CacheOpts::default()
     };
-    let session =
-        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), opts, Some(vec![socket(&sock), socket(&silent_sock)])).unwrap();
+    let session = pvfs_fuse::MountGuard::new(
+        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), opts, Some(vec![socket(&sock), socket(&silent_sock)])).unwrap(),
+        mnt.path(),
+    );
 
     // ---- the tail, then the head: what a media analysis reads
     let far_file = mnt.path().join("Movies/Far (2006)/far.mkv");
@@ -208,5 +210,5 @@ fn a_file_held_elsewhere_reads_by_the_piece_and_a_waiting_read_does_not_stop_the
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(waiting.join().unwrap().is_err(), "nobody holds those bytes");
-    drop(session);
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

@@ -105,6 +105,7 @@ been kept for every op since protocol 5.
 | 13 | `ViewLs`, `ViewEntry`, `CatalogueStatus` — the merged view over the socket | PVOS D187 | `v1.4-443` |
 | 14 | `BindCertificates`, and forest-bound certificates understood (a forest binds only when every box is at 14) | PVOS D192 | `v1.4-468` |
 | 15 | `CommitSigned` — events their authors signed elsewhere (a session certificate signed in a browser) | PVOS D193 | `v1.4-488` |
+| 16 | `SetRegionQuality` — what another box's header probe saw of this box's copy (mediabox probing the NAS's video) | PVOS D211 | (next roll) |
 
 Every release tag, v1.0 to v1.4, shipped at protocol 2.
 

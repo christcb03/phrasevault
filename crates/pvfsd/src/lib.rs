@@ -1085,6 +1085,9 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             do_rename_path(daemon, principal, &region, &from, &to, dir, hash, size)
         }
         ClientMsg::RemoveDir { region, rel_path } => do_remove_dir(daemon, principal, &region, &rel_path),
+        ClientMsg::SetRegionQuality { region, rel_path, hash, size, mtime_ms, quality } => {
+            do_set_region_quality(daemon, principal, &region, &rel_path, &hash, size, mtime_ms, &quality)
+        }
         // Cat / SecureCat / SecurePut / IngestWrite are handled in
         // serve_connection (data plane).
         ClientMsg::Cat { .. }
@@ -1254,6 +1257,67 @@ fn do_rename_path(
         Ok(pvfs_core::RenamedHere::Changed) => err("conflict", "what is here is not what was seen (its hash, size or kind changed); nothing was renamed"),
         Ok(pvfs_core::RenamedHere::InTheWay) => err("exists", "something is already at the new path here; nothing was renamed"),
         Ok(pvfs_core::RenamedHere::NotHere) => err("not_found", "this box does not catalogue that region from its own disk"),
+        Err(pve) => err_from(pve),
+    }
+}
+
+/// PVOS D211 — what another box's header probe saw of this box's copy of
+/// `rel_path` in `region` (mediabox probing the NAS's files over the LAN:
+/// the NAS has no ffprobe). Default deny: `w` on the region, as a trash or
+/// a rename through the view — a box that may trash a file may say it does
+/// not read. The copy must be the one probed; only a canonical measurement
+/// or a bare failure is taken; and the row's own rule decides what lands
+/// (`media::quality_after`: a first failure is a suspect, confirmed only by
+/// a second 30+ minutes later; a measurement or a failure is never
+/// overwritten). The checks on a read view, the row as ONE step of the
+/// writer (D199). The next watch pass publishes it.
+#[allow(clippy::too_many_arguments)]
+fn do_set_region_quality(
+    daemon: &Daemon,
+    principal: &Principal,
+    region: &str,
+    rel_path: &str,
+    hash: &str,
+    size: u64,
+    mtime_ms: u64,
+    quality: &str,
+) -> ServerMsg {
+    if let Err(reply) = view_write_gate(daemon, principal, region, "recording a file's quality") {
+        return reply;
+    }
+    let Some(observed) = pvfs_core::media::Observed::decode_wire(quality) else {
+        return err("bad_input", "quality must be a measurement or a bare probe failure, in canonical form");
+    };
+    let region_id = region.to_string();
+    match daemon.reader().region_quality_plan(&region_id, rel_path, hash, size, mtime_ms) {
+        Ok(pvfs_core::QualityPlan::Write) => {}
+        Ok(pvfs_core::QualityPlan::Changed) => {
+            return err("conflict", "the copy here is not the one that was probed (its hash, size or mtime changed); nothing was written")
+        }
+        Ok(pvfs_core::QualityPlan::NotHere) => {
+            return err("not_found", "this box does not catalogue that region from its own disk")
+        }
+        Err(pve) => return err_from(pve),
+    }
+    let rows = [(rel_path.to_string(), size, mtime_ms, observed.clone())];
+    let written = {
+        let mut e = daemon.writer.lock_serving("serve: quality");
+        e.write_region_quality(&region_id, &rows)
+    };
+    match written {
+        Ok(n) => {
+            let now = daemon.reader().region_row_quality(&region_id, rel_path).ok().flatten();
+            if n > 0 {
+                let what = match (&observed, now.as_deref().and_then(|q| pvfs_core::media::MediaQuality::decode(q).ok())) {
+                    (_, Some(q)) if q.unreadable() => "unreadable (confirmed)".to_string(),
+                    (_, Some(q)) if q.suspect() => "suspect (ffprobe could not read it once)".to_string(),
+                    (pvfs_core::media::Observed::Measured(q), _) => format!("measured {}x{}", q.width, q.height),
+                    _ => "recorded".to_string(),
+                };
+                eprintln!("pvfsd: quality of {rel_path} in {} for {}: {what}", &region[..8], principal.display());
+            }
+            ServerMsg::RegionQualitySet { written: n > 0, quality: now }
+        }
         Err(pve) => err_from(pve),
     }
 }

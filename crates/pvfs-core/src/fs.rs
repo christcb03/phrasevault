@@ -296,12 +296,16 @@ pub struct ScanStats {
     /// way: no node, no location, tried again every pass.
     pub needs_attention: u64,
     pub quarantined: Vec<(String, String)>,
-    /// PVOS D208 — video files the pass's probe step measured, recorded
-    /// as failed (ffprobe could not read them), and left for a later pass
-    /// (the step's budget ran out). All zero where nothing probes.
+    /// PVOS D208 — video files the pass's probe step measured, found
+    /// broken (ffprobe said "invalid data": a suspect the first time, a
+    /// confirmed failure the second — D211), and left for a later pass (the
+    /// step's budget ran out). All zero where nothing probes.
     pub probed: u64,
     pub probe_failed: u64,
     pub probe_pending: u64,
+    /// PVOS D211 — probes that could not run (an I/O or permission error, a
+    /// signal): nothing recorded, tried again after a while.
+    pub probe_errors: u64,
     /// D149 — manifest sidecars moved to the trash because the file beside
     /// them was gone: renamed or deleted by something other than PVFS (Sonarr
     /// adding an episode title, rclone renaming its upload temp). PVFS takes a
@@ -400,16 +404,35 @@ pub struct RegionEntry {
     pub seen_at: u64,
 }
 
+/// PVOS D211 — a file the probe step may measure: `(rel_path, size,
+/// mtime_ms, content hash when known)`.
+pub type QualityCandidate = (String, u64, u64, Option<String>);
+
+/// PVOS D211 — what the holder makes of a quality another box sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityPlan {
+    /// The copy is the one the caller saw: write the observation.
+    Write,
+    /// The row or the file is not what the caller saw.
+    Changed,
+    /// This box does not catalogue that region from its own disk.
+    NotHere,
+}
+
 /// PVOS D208 — a catalogue region's video files by what is known of their
 /// quality (`pvfs region quality`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionQualitySummary {
     pub video_files: u64,
     pub measured: u64,
-    /// A header probe failed: probably not a playable file.
+    /// ffprobe said "invalid data" twice, 30+ minutes apart (D211): not a
+    /// playable file, and it loses to a measured copy in the ladder.
     pub failed: u64,
+    /// PVOS D211 — said once; waiting for the second probe.
+    pub suspect: u64,
     pub unmeasured: u64,
     pub failed_paths: Vec<String>,
+    pub suspect_paths: Vec<String>,
 }
 
 /// One published snapshot of a catalogue region (D125 `region_snapshots`):
@@ -564,6 +587,37 @@ pub struct ProbeCtx {
     pub max_time: std::time::Duration,
     /// One file's probe is killed after this, and not recorded.
     pub timeout: std::time::Duration,
+    /// PVOS D211 — a test's clock (ms); `None` = the system's.
+    pub now_ms: Option<u64>,
+    /// PVOS D211 — files whose probe could not run, and when: left out of
+    /// the passes for [`PROBE_ERROR_BACKOFF`] so one cannot eat the budget.
+    /// Shared by the clones a pass makes; lives as long as the watch.
+    pub errored: std::sync::Arc<std::sync::Mutex<HashMap<(String, String), std::time::Instant>>>,
+}
+
+/// PVOS D211 — how long a file whose probe could not run is left alone.
+pub const PROBE_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+impl ProbeCtx {
+    /// The clock the step stamps and compares with.
+    pub fn now(&self) -> u64 {
+        self.now_ms.unwrap_or_else(crate::engine::now_ms)
+    }
+
+    /// PVOS D211 — is `(region, rel)` resting after a probe that errored?
+    pub fn resting(&self, region: &str, rel: &str) -> bool {
+        let mut m = self.errored.lock().unwrap_or_else(|p| p.into_inner());
+        m.retain(|_, at| at.elapsed() < PROBE_ERROR_BACKOFF);
+        m.contains_key(&(region.to_string(), rel.to_string()))
+    }
+
+    /// PVOS D211 — remember a probe of `(region, rel)` that could not run.
+    pub fn errored(&self, region: &str, rel: &str) {
+        self.errored
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((region.to_string(), rel.to_string()), std::time::Instant::now());
+    }
 }
 
 impl ProbeCtx {
@@ -574,6 +628,8 @@ impl ProbeCtx {
             max_files: PROBE_MAX_FILES,
             max_time: std::time::Duration::from_secs(PROBE_MAX_SECS),
             timeout: std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+            now_ms: None,
+            errored: Default::default(),
         }
     }
 }
@@ -900,7 +956,7 @@ fn probe_region_quality<D: crate::writer::Db>(
         ProbeSetting::Off => return Ok(()),
         ProbeSetting::Missing(named) => {
             if !named.contains(region) {
-                let n = db.read(|e| e.quality_candidates(&b.folder_id))?.len();
+                let n = db.read(|e| e.quality_candidates_at(&b.folder_id, crate::engine::now_ms()))?.len();
                 if n > 0 {
                     named.insert(region.to_string());
                     eprintln!(
@@ -913,7 +969,12 @@ fn probe_region_quality<D: crate::writer::Db>(
         }
         ProbeSetting::On(p) => p.clone(),
     };
-    let candidates = db.read(|e| e.quality_candidates(&b.folder_id))?;
+    let now = p.now();
+    let candidates: Vec<(String, u64, u64)> = db
+        .read(|e| e.quality_candidates_at(&b.folder_id, now))?
+        .into_iter()
+        .filter(|(rel, ..)| !p.resting(region, rel))
+        .collect();
     if candidates.is_empty() {
         return Ok(());
     }
@@ -923,7 +984,7 @@ fn probe_region_quality<D: crate::writer::Db>(
     ctx.phase("probing");
     let progress = ctx.progress.clone();
     let started = std::time::Instant::now();
-    let mut done: Vec<(String, u64, u64, String)> = Vec::new();
+    let mut done: Vec<(String, u64, u64, crate::media::Observed)> = Vec::new();
     let mut tried = 0usize;
     for (rel, size, mtime) in &candidates {
         if tried >= p.max_files || started.elapsed() >= p.max_time || ctx.cancelled() {
@@ -943,12 +1004,26 @@ fn probe_region_quality<D: crate::writer::Db>(
         match outcome {
             crate::probe::ProbeOutcome::Measured(q) => {
                 stats.probed += 1;
-                done.push((rel.clone(), *size, *mtime, q.encode()));
+                done.push((rel.clone(), *size, *mtime, crate::media::Observed::Measured(q)));
             }
-            crate::probe::ProbeOutcome::Failed(why) => {
+            // PVOS D211 — ffprobe said the data is invalid: a suspect the
+            // first time, confirmed by a probe 30+ minutes later
+            // (`media::quality_after`, applied by the write).
+            crate::probe::ProbeOutcome::Broken(why) => {
                 stats.probe_failed += 1;
-                eprintln!("catalogue: probe failed for {}: {why}", path.display());
-                done.push((rel.clone(), *size, *mtime, crate::media::MediaQuality::probe_failure().encode()));
+                eprintln!("catalogue: ffprobe could not read {}: {why}", path.display());
+                done.push((rel.clone(), *size, *mtime, crate::media::Observed::Broken));
+            }
+            // PVOS D211 — the probe could not run: says nothing about the
+            // file. Not recorded; left alone for a while.
+            crate::probe::ProbeOutcome::Error(why) => {
+                stats.probe_errors += 1;
+                p.errored(region, rel);
+                eprintln!(
+                    "catalogue: probe of {} could not run ({why}); nothing recorded, tried again in {} h",
+                    path.display(),
+                    PROBE_ERROR_BACKOFF.as_secs() / 3600
+                );
             }
             crate::probe::ProbeOutcome::TimedOut => {
                 eprintln!(
@@ -964,20 +1039,22 @@ fn probe_region_quality<D: crate::writer::Db>(
             }
         }
         if done.len() >= STEP_ROWS {
-            db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality(&b.folder_id, &done))?;
+            db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality_at(&b.folder_id, &done, now))?;
             done.clear();
         }
     }
     if !done.is_empty() {
-        db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality(&b.folder_id, &done))?;
+        db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality_at(&b.folder_id, &done, now))?;
     }
-    stats.probe_pending = (candidates.len() as u64).saturating_sub(stats.probed + stats.probe_failed);
-    if stats.probed + stats.probe_failed > 0 {
+    stats.probe_pending =
+        (candidates.len() as u64).saturating_sub(stats.probed + stats.probe_failed + stats.probe_errors);
+    if stats.probed + stats.probe_failed + stats.probe_errors > 0 {
         eprintln!(
-            "catalogue: region {}: probed {} video files ({} failed), {} left for later passes",
+            "catalogue: region {}: probed {} video files ({} broken, {} could not run), {} left for later passes",
             short_id(region),
-            stats.probed + stats.probe_failed,
+            stats.probed + stats.probe_failed + stats.probe_errors,
             stats.probe_failed,
+            stats.probe_errors,
             stats.probe_pending
         );
     }
@@ -2080,17 +2157,46 @@ impl Engine {
     /// PVOS D208 — the probe step's read: `region`'s video files with no
     /// quality, newest first, as `(rel_path, size, mtime_ms)`.
     pub fn quality_candidates(&self, region: &NodeId) -> Result<Vec<(String, u64, u64)>> {
+        self.quality_candidates_at(region, crate::engine::now_ms())
+    }
+
+    /// PVOS D211 — [`Engine::quality_candidates`] at `now_ms`: the files
+    /// with no quality, and the SUSPECTS whose second probe is due
+    /// ([`crate::media::SUSPECT_RECHECK_MS`] after the first).
+    pub fn quality_candidates_at(&self, region: &NodeId, now_ms: u64) -> Result<Vec<(String, u64, u64)>> {
+        Ok(self
+            .quality_candidates_hashed_at(region, now_ms)?
+            .into_iter()
+            .map(|(rel, size, mtime, _)| (rel, size, mtime))
+            .collect())
+    }
+
+    /// PVOS D211 — [`Engine::quality_candidates_at`] with each row's hash
+    /// (a remote probe reads the bytes by it; a row not hashed yet is left
+    /// out there).
+    pub fn quality_candidates_hashed_at(
+        &self,
+        region: &NodeId,
+        now_ms: u64,
+    ) -> Result<Vec<QualityCandidate>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT rel_path, size_bytes, mtime_ms FROM region_entries
-                  WHERE region_id = ?1 AND kind = 'file' AND quality IS NULL
+                "SELECT rel_path, size_bytes, mtime_ms, quality, content_hash FROM region_entries
+                  WHERE region_id = ?1 AND kind = 'file'
+                    AND (quality IS NULL OR quality LIKE '%\"probe\":\"suspect\"%')
                   ORDER BY mtime_ms DESC, rel_path",
             )
             .map_err(map_db("quality candidates"))?;
         let rows = stmt
             .query_map(params![region], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
             })
             .map_err(map_db("quality candidates"))?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -2098,28 +2204,65 @@ impl Engine {
         Ok(rows
             .into_iter()
             .filter(|(rel, ..)| crate::media::is_video_file(rel.rsplit('/').next().unwrap_or(rel)))
+            .filter(|(_, _, _, q, _)| match q {
+                None => true,
+                Some(q) => crate::media::MediaQuality::decode(q).is_ok_and(|m| {
+                    m.suspect() && now_ms >= m.probe_suspect_ms.saturating_add(crate::media::SUSPECT_RECHECK_MS)
+                }),
+            })
+            .map(|(rel, size, mtime, _, hash)| (rel, size, mtime, hash))
             .collect())
     }
 
     /// PVOS D208 — one step of the probe step's writes: each
-    /// `(rel_path, size, mtime_ms, quality)` lands only on a row that still
-    /// has that size and mtime and no quality (a file that changed while it
-    /// was probed keeps its row as the pass wrote it). Returns rows written.
+    /// `(rel_path, size, mtime_ms, observed)` lands only on a row that still
+    /// has that size and mtime (a file that changed while it was probed
+    /// keeps its row as the pass wrote it). D211: what lands is
+    /// [`crate::media::quality_after`] — a first "invalid data" is a
+    /// suspect, the second (30+ minutes on) a failure, and a measurement or
+    /// a failure is never overwritten. Returns rows written.
     #[doc(hidden)]
-    pub fn write_region_quality(&mut self, region: &NodeId, rows: &[(String, u64, u64, String)]) -> Result<usize> {
+    pub fn write_region_quality(
+        &mut self,
+        region: &NodeId,
+        rows: &[(String, u64, u64, crate::media::Observed)],
+    ) -> Result<usize> {
+        self.write_region_quality_at(region, rows, crate::engine::now_ms())
+    }
+
+    /// [`Engine::write_region_quality`] at `now_ms` (the holder's clock).
+    #[doc(hidden)]
+    pub fn write_region_quality_at(
+        &mut self,
+        region: &NodeId,
+        rows: &[(String, u64, u64, crate::media::Observed)],
+        now_ms: u64,
+    ) -> Result<usize> {
         let tx = self.conn.transaction().map_err(map_db("begin quality"))?;
         let mut n = 0;
         {
+            let mut get = tx
+                .prepare_cached(
+                    "SELECT quality FROM region_entries
+                      WHERE region_id = ?1 AND rel_path = ?2 AND size_bytes = ?3 AND mtime_ms = ?4 AND kind = 'file'",
+                )
+                .map_err(map_db("write quality"))?;
             let mut put = tx
                 .prepare_cached(
                     "UPDATE region_entries SET quality = ?5
                       WHERE region_id = ?1 AND rel_path = ?2 AND size_bytes = ?3 AND mtime_ms = ?4
-                        AND kind = 'file' AND quality IS NULL",
+                        AND kind = 'file' AND quality IS ?6",
                 )
                 .map_err(map_db("write quality"))?;
-            for (rel, size, mtime, q) in rows {
+            for (rel, size, mtime, observed) in rows {
+                let current: Option<Option<String>> = get
+                    .query_row(params![region, rel, *size as i64, *mtime as i64], |r| r.get(0))
+                    .optional()
+                    .map_err(map_db("write quality"))?;
+                let Some(current) = current else { continue };
+                let Some(next) = crate::media::quality_after(current.as_deref(), observed, now_ms) else { continue };
                 n += put
-                    .execute(params![region, rel, *size as i64, *mtime as i64, q])
+                    .execute(params![region, rel, *size as i64, *mtime as i64, next, current])
                     .map_err(map_db("write quality"))?;
             }
         }
@@ -2148,14 +2291,96 @@ impl Engine {
             out.video_files += 1;
             match q.as_deref().map(crate::media::MediaQuality::decode) {
                 None => out.unmeasured += 1,
-                Some(Ok(m)) if m.probe_failed => {
+                Some(Ok(m)) if m.unreadable() => {
                     out.failed += 1;
                     out.failed_paths.push(rel);
+                }
+                Some(Ok(m)) if m.suspect() => {
+                    out.suspect += 1;
+                    out.suspect_paths.push(rel);
                 }
                 Some(_) => out.measured += 1,
             }
         }
         Ok(out)
+    }
+
+    /// PVOS D211 — a measurement of these bytes, if any row this box holds
+    /// (any region) with `hash` carries one: quality belongs to the bytes,
+    /// so a remote probe sends it without reading anything.
+    pub fn measured_quality_by_hash(&self, hash: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT quality FROM region_entries
+                  WHERE content_hash = ?1 AND kind = 'file' AND quality IS NOT NULL",
+            )
+            .map_err(map_db("quality by hash"))?;
+        let qs = stmt
+            .query_map(params![hash], |r| r.get::<_, String>(0))
+            .map_err(map_db("quality by hash"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("quality by hash"))?;
+        Ok(qs.into_iter().find(|q| {
+            crate::media::Observed::decode_wire(q).is_some_and(|o| matches!(o, crate::media::Observed::Measured(m) if m.measured()))
+        }))
+    }
+
+    /// PVOS D211 — the quality of one row (`None`: no row, or unmeasured).
+    pub fn region_row_quality(&self, region: &NodeId, rel_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT quality FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
+                params![region, rel_path],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_db("row quality"))?
+            .flatten())
+    }
+
+    /// PVOS D211 — a quality observation another box sent for this box's
+    /// copy of `rel_path` in `region` (`SetRegionQuality`). The caller's
+    /// rights are checked by the daemon; here the copy: catalogued from this
+    /// box's own disk (else `NotHere`), a file row with the caller's size,
+    /// mtime and hash, the file on disk still that size (else `Changed`).
+    /// Read-only: the daemon writes [`QualityPlan::rows`] as one step.
+    pub fn region_quality_plan(
+        &self,
+        region: &NodeId,
+        rel_path: &str,
+        hash: &str,
+        size: u64,
+        mtime_ms: u64,
+    ) -> Result<QualityPlan> {
+        Self::check_region_rel(rel_path)?;
+        let Some(roots) = self.own_region_roots(region)? else {
+            return Ok(QualityPlan::NotHere);
+        };
+        match self.region_row(region, rel_path)? {
+            Some((kind, rsize, rhash)) if kind == "file" && rsize == size && rhash.as_deref() == Some(hash) => {}
+            _ => return Ok(QualityPlan::Changed),
+        }
+        let mtime: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT mtime_ms FROM region_entries WHERE region_id = ?1 AND rel_path = ?2",
+                params![region, rel_path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db("quality plan"))?;
+        if mtime != Some(mtime_ms as i64) {
+            return Ok(QualityPlan::Changed);
+        }
+        let on_disk = roots
+            .iter()
+            .any(|root| std::fs::metadata(root.join(rel_path)).is_ok_and(|m| m.is_file() && m.len() == size));
+        if !on_disk {
+            return Ok(QualityPlan::Changed);
+        }
+        Ok(QualityPlan::Write)
     }
 
     /// Every path this box holds a row for in `region` (the sweep's read).
@@ -3354,10 +3579,39 @@ impl Engine {
             let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
             let staged: Vec<&ViewCopy> = hashed.iter().copied().filter(|c| draining(&c.region)).collect();
             if !staged.is_empty() && staged.len() < hashed.len() {
-                return Self::ladder_best(&entry.rel_path, &staged, rules);
+                let best = Self::ladder_best(&entry.rel_path, &staged, rules);
+                // PVOS D211 — except a draining copy ffprobe could not read
+                // (confirmed) against a library copy it measured: the
+                // readable library copy stays, and nothing moves.
+                if best.is_some_and(|b| Self::unreadable_against_measured(b, &hashed, &draining)) {
+                    let library: Vec<&ViewCopy> = hashed.iter().copied().filter(|c| !draining(&c.region)).collect();
+                    return Self::ladder_best(&entry.rel_path, &library, rules);
+                }
+                return best;
             }
         }
         Self::served_copy(entry, rules)
+    }
+
+    /// PVOS D211 — `copy` is confirmed unreadable and a library copy among
+    /// `copies` (not draining) was measured.
+    fn unreadable_against_measured(copy: &ViewCopy, copies: &[&ViewCopy], draining: &dyn Fn(&str) -> bool) -> bool {
+        let q = |c: &ViewCopy| c.quality.as_deref().and_then(|q| crate::media::MediaQuality::decode(q).ok()).unwrap_or_default();
+        q(copy).unreadable() && copies.iter().any(|c| !draining(&c.region) && q(c).measured())
+    }
+
+    /// PVOS D211 — the drain kept a library copy because the draining
+    /// winner could not be read (`receive-plan` says why nothing moves).
+    pub fn drain_kept_readable(entry: &ViewEntry, rules: &crate::media::Rules, draining: &dyn Fn(&str) -> bool) -> bool {
+        if !matches!(entry.state, ViewState::ConflictHashes(_)) {
+            return false;
+        }
+        let hashed: Vec<&ViewCopy> = entry.sources.iter().filter(|c| c.content_hash.is_some()).collect();
+        let staged: Vec<&ViewCopy> = hashed.iter().copied().filter(|c| draining(&c.region)).collect();
+        !staged.is_empty()
+            && staged.len() < hashed.len()
+            && Self::ladder_best(&entry.rel_path, &staged, rules)
+                .is_some_and(|b| Self::unreadable_against_measured(b, &hashed, draining))
     }
 
     /// D133 — this box's receiving regions with their local roots, most free
@@ -3437,6 +3691,12 @@ impl Engine {
                 ViewState::ConflictHashes(_) => {
                     let Some(winner) = Self::drain_winner(&entry, rules, &draining) else { continue };
                     if !draining(&winner.region) {
+                        if Self::drain_kept_readable(&entry, rules, &draining) {
+                            skips.push(ReceiveSkip {
+                                rel_path: entry.rel_path.clone(),
+                                why: "the staging copy could not be read by ffprobe; the library's measured copy stays".into(),
+                            });
+                        }
                         continue; // library copies only: the ladder serves one, nothing moves
                     }
                     // D145 — a library region already holds the winner's

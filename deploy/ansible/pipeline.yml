@@ -46,6 +46,9 @@
     clippy_results: "/tmp/pvfs-clippy-results{{ pvfs_suffix }}.txt"
     smoke_results: "/tmp/pvfs-smoke-results{{ pvfs_suffix }}.txt"
     smoke_script: "/tmp/pvfs-smoke-test{{ pvfs_suffix }}.sh"
+    # PVOS D211 — the leaked-mount check and its "before" list.
+    fuse_leaks_script: "/tmp/pvfs-fuse-leaks{{ pvfs_suffix }}.sh"
+    fuse_leaks_before: "/tmp/pvfs-fuse-mounts-before{{ pvfs_suffix }}.txt"
     # How idle a build slot must be before the pipeline reclaims it (D121),
     # and the free space a run needs once the reaping is done (PVOS D201).
     reap_after_days: 2
@@ -322,19 +325,43 @@
     # the same time on the same storage slowed both runs about 2x and proved
     # nothing the first did not. Such a host still builds and installs, which
     # is what the two-box lab pairs need from it.
-    - name: Run cargo test suite
-      ansible.builtin.shell: |
-        set -o pipefail
-        mkdir -p "$XDG_CONFIG_HOME"
-        cargo test --workspace 2>&1 | tee {{ test_results }}
-      args:
-        chdir: "{{ pvfs_src }}"
-        executable: /bin/bash
-      environment: "{{ cargo_env | combine(suite_env) }}"
-      register: test_out
+    # PVOS D211 — the pvfs FUSE mounts present before the tests: a test that
+    # leaves one behind (a view mounted in a TempDir and never unmounted)
+    # is reported after the stage, unmounted, and fails the run.
+    - name: Upload the leaked-mount check
+      ansible.builtin.copy:
+        src: files/fuse-leaks.sh
+        dest: "{{ fuse_leaks_script }}"
+        mode: "0755"
+      when: pvfs_runs_suite | default(true) | bool
+      tags: [test, smoke]
+
+    - name: The pvfs FUSE mounts before the tests
+      ansible.builtin.command: "{{ fuse_leaks_script }} snapshot {{ fuse_leaks_before }}"
       changed_when: false
       when: pvfs_runs_suite | default(true) | bool
+      tags: [test, smoke]
+
+    - name: Tests, then the mounts they left
+      when: pvfs_runs_suite | default(true) | bool
       tags: [test]
+      block:
+        - name: Run cargo test suite
+          ansible.builtin.shell: |
+            set -o pipefail
+            mkdir -p "$XDG_CONFIG_HOME"
+            cargo test --workspace 2>&1 | tee {{ test_results }}
+          args:
+            chdir: "{{ pvfs_src }}"
+            executable: /bin/bash
+          environment: "{{ cargo_env | combine(suite_env) }}"
+          register: test_out
+          changed_when: false
+      always:
+        - name: No pvfs FUSE mount left behind by the tests
+          ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
+          register: fuse_leaks_test
+          changed_when: false
 
     # ---- lint (D121) -------------------------------------------------------
     # CLIPPY IS PART OF THE PIPELINE NOW.
@@ -397,6 +424,13 @@
       environment:
         TMPDIR: /dev/shm
       register: smoke_out
+      changed_when: false
+      when: pvfs_runs_suite | default(true) | bool
+      tags: [smoke]
+
+    - name: No pvfs FUSE mount left behind by the smoke run
+      ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
+      register: fuse_leaks_smoke
       changed_when: false
       when: pvfs_runs_suite | default(true) | bool
       tags: [smoke]
@@ -657,6 +691,7 @@
           - "clippy  : {{ 'clean (-D warnings, --all-targets)' if clippy_out is defined and not clippy_out.skipped | default(false) else 'NOT RUN here' }}"
           - "tests   : {{ test_totals.stdout | default('see artifacts') }}"
           - "smoke   : {{ smoke_out.stdout_lines | default([]) | select('match', '^smoke results') | list | last | default('see artifacts') }}"
+          - "mounts  : tests {{ fuse_leaks_test.stdout_lines | default(['not checked']) | select('match', '^fuse leaks') | list | last | default('not checked') }}; smoke {{ fuse_leaks_smoke.stdout_lines | default(['not checked']) | select('match', '^fuse leaks') | list | last | default('not checked') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"
           - "daemon  : {{ daemon_info2.stdout | default('not run') }}"
       tags: [report]

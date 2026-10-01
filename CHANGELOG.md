@@ -5,6 +5,40 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **An unreadable copy loses to a readable one; mediabox measures the NAS's
+  video over the LAN; view tests unmount (PVOS D211).** Chris's decisions of
+  2026-10-01.
+  - **The ladder.** A probe now tells "ffprobe said the data is invalid"
+    (`ProbeOutcome::Broken`: `Invalid data found when processing input`,
+    `moov atom not found`, `EBML header parsing failed`, and no I/O words)
+    from "the probe could not run" (`ProbeOutcome::Error`: permission, I/O,
+    a signal, a network fetch that failed — nothing recorded, the file rests
+    6 h). A first `Broken` is a SUSPECT (`"probe":"suspect","probe_at":ms`);
+    a second at least 30 minutes later CONFIRMS it (`"probe":"failed"`);
+    `media::quality_after` is that rule, applied by every write of a
+    quality. A confirmed-unreadable copy loses to a MEASURED copy (a new
+    rung after decode); two unreadable copies, or unreadable vs unmeasured
+    or suspect, change nothing. The drain: an unreadable draining winner no
+    longer replaces a measured library copy (`receive-plan` says why).
+  - **Probing for another box.** A box with ffprobe measures the regions
+    named in its `probe-remote` file (`pvfs region probe-remote`), held by
+    another box: the daemon runner's probe step (every 10 min, like the
+    trash step — not a `serve.jobs` job, so a rollback is safe) checks the
+    holder is on the LAN (a TCP connect under 10 ms), serves ffprobe the
+    file's ranges from `127.0.0.1` (`probe::RangeServer`: `CatHash` from
+    the holder as ffprobe asks, ≤64 MiB a probe; a fault is an error), and
+    sends the result with the new `SetRegionQuality` (proto 16, `w` on the
+    region; the holder checks its copy and writes its own row in one
+    writer step). A measurement of the same hash elsewhere is sent without a
+    read. With a real ffprobe a 150 MB film read 3–5 MB over HTTP.
+  - **Tests**: `pvfs_fuse::MountGuard` unmounts a test's mount and waits
+    before its directory goes (fuser 0.14's `AutoUnmount` drop does not);
+    all seven mounting tests use it; the pipeline reports pvfs FUSE mounts
+    the tests or smoke left and fails the run.
+  Tests: `d211_unreadable_loses`, `d211_remote_probe`,
+  `d211_probe_remote_cli`, the range server's unit tests,
+  `d211_real_ffprobe` (ignored; run where ffprobe is).
+
 - **A cold read through the view asks the region's holder first (PVOS
   D210).** The view mount's read-through asked the fleet's boxes in pin
   order, from the box that served last — a dial and a `not_found` per box

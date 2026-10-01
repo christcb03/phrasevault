@@ -72,6 +72,7 @@ fn quality_survives_the_successor_node_that_attestation_mints() {
         duration_s: 5400,
         decoded_ok: Some(true),
         probe_failed: false,
+        probe_suspect_ms: 0,
     };
     engine.set_media_quality(&id, &measured, "probe").unwrap();
 

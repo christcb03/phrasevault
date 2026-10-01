@@ -49,35 +49,6 @@ fn socket(path: &std::path::Path) -> ReplicaSource {
     }
 }
 
-/// Drop a mount and wait until the kernel has let go of it: a TempDir
-/// removed while its mount is still there deletes THROUGH the view (a
-/// routed trash, which would dial the silent box).
-fn unmount(session: fuser::BackgroundSession, at: &std::path::Path) {
-    drop(session);
-    let mounted = || {
-        std::fs::read_to_string("/proc/mounts")
-            .unwrap_or_default()
-            .lines()
-            .any(|l| l.split(' ').nth(1) == Some(at.to_str().unwrap()))
-    };
-    // Dropping the session does not always unmount at once (fuser 0.14):
-    // give it a second, then unmount it ourselves.
-    let wait = |limit: Duration| {
-        let deadline = Instant::now() + limit;
-        while mounted() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
-    wait(Duration::from_secs(1));
-    for flags in ["-u", "-uz"] {
-        if mounted() {
-            let _ = std::process::Command::new("fusermount3").arg(flags).arg(at).status();
-            wait(Duration::from_secs(5));
-        }
-    }
-    assert!(!mounted(), "{} is still mounted", at.display());
-}
-
 fn row(rel: &str, kind: &str, size: u64, hash: Option<String>) -> RegionEntry {
     RegionEntry {
         rel_path: rel.into(),
@@ -231,7 +202,13 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
 
     // ---- a fresh mount, a region whose holder is known: read at once
     let mnt = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), opts.clone(), sources()).unwrap();
+    // PVOS D211 — the guard unmounts (and waits) before the TempDir goes,
+    // also when an assertion fails: removing the directory through a live
+    // view would route a trash to the silent box.
+    let session = pvfs_fuse::MountGuard::new(
+        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), opts.clone(), sources()).unwrap(),
+        mnt.path(),
+    );
     let t = Instant::now();
     let far_file = mnt.path().join("Movies/Far (2006)/far.mkv");
     let reading = std::thread::spawn(move || std::fs::read(far_file));
@@ -246,13 +223,16 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
     assert_eq!(asked_silent, 0, "the silent box was never dialed");
     assert!(took < Duration::from_secs(5), "the holder answered in {took:?}");
     assert_eq!(got.unwrap(), far);
-    unmount(session, mnt.path());
+    assert!(session.unmount(), "{} is still mounted", mnt.path().display());
     hangup.store(false, Ordering::SeqCst);
 
     // ---- a fresh mount, a region whose holder is not announced: today's
     // order — the silent box is asked first, and the read waits on it
     let mnt2 = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_view_mount_with(&data_dir, mnt2.path(), opts, sources()).unwrap();
+    let session = pvfs_fuse::MountGuard::new(
+        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt2.path(), opts, sources()).unwrap(),
+        mnt2.path(),
+    );
     let near_file = mnt2.path().join("Movies/Near (2007)/near.mkv");
     let waiting = std::thread::spawn(move || std::fs::read(near_file));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -269,5 +249,5 @@ fn a_cold_read_asks_the_regions_holder_first_and_an_unknown_region_keeps_todays_
     assert!(asked_silent > 0, "the silent box was asked first (today's order)");
     assert!(was_waiting, "premise: the read waited on the silent box");
     assert_eq!(got.unwrap(), near, "then the holder served it");
-    unmount(session, mnt2.path());
+    assert!(session.unmount(), "{} is still mounted", mnt2.path().display());
 }

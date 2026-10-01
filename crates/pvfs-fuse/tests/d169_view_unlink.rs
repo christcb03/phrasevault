@@ -113,7 +113,10 @@ fn a_delete_through_the_mount_is_a_trip_to_the_trash_and_the_path_is_gone_at_onc
 
     let mnt = tempfile::tempdir().unwrap();
     // No box to ask: the far file's delete must fail and hide nothing.
-    let session = pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), CacheOpts::default(), Some(Vec::new())).unwrap();
+    let session = pvfs_fuse::MountGuard::new(
+        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), CacheOpts::default(), Some(Vec::new())).unwrap(),
+        mnt.path(),
+    );
 
     let season = mnt.path().join("TV/Show/Season 01");
     assert_eq!(names(&season), vec!["Show - s01e01.mkv", "Show - s01e02.mkv"]);
@@ -155,5 +158,5 @@ fn a_delete_through_the_mount_is_a_trip_to_the_trash_and_the_path_is_gone_at_onc
     std::thread::sleep(std::time::Duration::from_secs(6)); // the mount's 5 s listing cache
     assert_eq!(names(&season), vec!["Show - s01e01.mkv", "Show - s01e02.mkv"], "a restored file is not hidden by the memory of its delete");
     assert_eq!(std::fs::read(season.join("Show - s01e01.mkv")).unwrap(), b"the copy an upgrade replaces");
-    drop(session);
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

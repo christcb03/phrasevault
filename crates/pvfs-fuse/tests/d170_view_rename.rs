@@ -131,7 +131,10 @@ fn an_arr_renames_files_and_folders_through_the_mount_and_sees_it_at_once() {
     e.close().unwrap();
 
     let mnt = tempfile::tempdir().unwrap();
-    let session = pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), CacheOpts::default(), Some(Vec::new())).unwrap();
+    let session = pvfs_fuse::MountGuard::new(
+        pvfs_fuse::spawn_view_mount_with(&data_dir, mnt.path(), CacheOpts::default(), Some(Vec::new())).unwrap(),
+        mnt.path(),
+    );
     let m = |rel: &str| mnt.path().join(rel);
 
     // ---- "Rename files": a verified move, in place
@@ -250,5 +253,5 @@ fn an_arr_renames_files_and_folders_through_the_mount_and_sees_it_at_once() {
             "TV/Show/Season 02/Show - S02E01.mkv",
         ]
     );
-    drop(session);
+    assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

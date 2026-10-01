@@ -1469,6 +1469,16 @@ enum RegionCmd {
     /// and whose probe failed, and whether this box has ffprobe to measure
     /// its own regions. The daemon's watch measures; this only reports.
     Quality { target: Option<String> },
+    /// PVOS D211: the catalogue regions THIS box measures with ffprobe for
+    /// the box that holds them (mediabox for the NAS, which has no ffprobe),
+    /// reading the bytes from the holder over the LAN; the holder writes its
+    /// own rows. Local to this box; nothing by default. Bare: lists them and,
+    /// at a terminal, asks which region to add or remove.
+    ProbeRemote {
+        target: Option<String>,
+        /// on | off
+        state: Option<String>,
+    },
     /// D127: declare a catalogue region draining (staging — its copies drain
     /// into the library) or not. Fleet-visible. Prompts when omitted.
     Drain {
@@ -7057,6 +7067,119 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     engine.close()
                 }
+                RegionCmd::ProbeRemote { target, state } => {
+                    let dir = ctx?;
+                    let engine = open_for_reading(&dir)?;
+                    let status = engine.catalogue_status()?;
+                    let holders = engine.region_holders()?;
+                    let listed = pvfs_core::sync::probe_remote_regions(engine.data_dir())?;
+                    let label = |id: &str| engine.get_node(&id.to_string()).ok().flatten().map(|n| n.label).unwrap_or_default();
+                    let target = match target {
+                        Some(t) => Some(t),
+                        None => {
+                            if json {
+                                let out = serde_json::json!({
+                                    "probe_remote": listed.iter().map(|r| serde_json::json!({
+                                        "region": r, "label": label(r), "holder": holders.get(r),
+                                    })).collect::<Vec<_>>(),
+                                });
+                                println!("{out}");
+                            } else {
+                                if listed.is_empty() {
+                                    println!("this box measures no other box's regions");
+                                }
+                                for r in &listed {
+                                    println!(
+                                        "{r}\t{}\tholder {}",
+                                        label(r),
+                                        holders.get(r).map(String::as_str).unwrap_or("unknown")
+                                    );
+                                }
+                            }
+                            if !interactive() {
+                                return engine.close();
+                            }
+                            let others: Vec<&pvfs_core::CatalogueStatus> = status.iter().filter(|s| !s.local).collect();
+                            if others.is_empty() {
+                                println!("no catalogue region held by another box is known here");
+                                return engine.close();
+                            }
+                            println!("catalogue regions other boxes hold:");
+                            for (i, s) in others.iter().enumerate() {
+                                println!(
+                                    "  {}. {}  {}  holder {}{}",
+                                    i + 1,
+                                    &s.region[..8],
+                                    label(&s.region),
+                                    holders.get(&s.region).map(String::as_str).unwrap_or("unknown"),
+                                    if listed.contains(&s.region) { "  (measured from here)" } else { "" }
+                                );
+                            }
+                            let pick = prompt_line("region to change (its number, or blank for none)", Some(""))?;
+                            if pick.trim().is_empty() {
+                                return engine.close();
+                            }
+                            let n: usize = pick.trim().parse().map_err(|_| PvfsError::BadInput {
+                                field: "region".into(),
+                                reason: format!("{pick:?} — a number from the list"),
+                            })?;
+                            match others.get(n.wrapping_sub(1)) {
+                                Some(s) => Some(s.region.clone()),
+                                None => {
+                                    return Err(PvfsError::BadInput {
+                                        field: "region".into(),
+                                        reason: format!("{n} is not in the list"),
+                                    })
+                                }
+                            }
+                        }
+                    };
+                    let target = target.unwrap_or_default();
+                    engine.close()?;
+                    let (engine, id) = engine_and_node_reading(Ok(dir.clone()), &target)?;
+                    if !engine.is_catalogue_region(&id)? {
+                        return Err(PvfsError::BadInput {
+                            field: "region".into(),
+                            reason: format!("{id} is not a catalogue region"),
+                        });
+                    }
+                    if engine.catalogue_status()?.iter().any(|s| s.region == id && s.local) {
+                        return Err(PvfsError::BadInput {
+                            field: "region".into(),
+                            reason: format!("{id} is catalogued by this box: its own watch measures it"),
+                        });
+                    }
+                    let was = pvfs_core::sync::probe_remote_regions(engine.data_dir())?.contains(&id);
+                    let state = match state {
+                        Some(s) => s,
+                        None => prompt_line(
+                            "measure it for its holder over the LAN — on or off",
+                            Some(if was { "off" } else { "on" }),
+                        )?,
+                    };
+                    let on = match state.trim() {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            return Err(PvfsError::BadInput {
+                                field: "state".into(),
+                                reason: format!("{other:?} — say on or off"),
+                            })
+                        }
+                    };
+                    pvfs_core::sync::set_probe_remote(engine.data_dir(), &id, on)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"probe_remote\":{on}}}");
+                    } else if on {
+                        println!(
+                            "{id} is measured from here for its holder {} — the daemon's probe step, every 10 minutes, LAN only (it needs ffprobe here)",
+                            engine.region_holders()?.get(&id).map(String::as_str).unwrap_or("(not known yet)")
+                        );
+                    } else {
+                        println!("{id} is no longer measured from here");
+                    }
+                    engine.close()
+                }
                 RegionCmd::Receive { target, state, parallel, streams } => {
                     let (engine, id) = engine_and_node(ctx, &target)?;
                     if !engine.is_catalogue_region(&id)? {
@@ -7200,6 +7323,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                                 "region": id, "local": local, "video_files": q.video_files,
                                 "measured": q.measured, "unmeasured": q.unmeasured,
                                 "probe_failed": q.failed, "failed_paths": q.failed_paths,
+                                "probe_suspect": q.suspect, "suspect_paths": q.suspect_paths,
                             })).collect::<Vec<_>>(),
                         });
                         println!("{out}");
@@ -7215,15 +7339,21 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         }
                         for (id, local, q) in &sums {
                             println!(
-                                "{id}\t{}\t{} video\t{} measured\t{} unmeasured\t{} probe failed",
+                                "{id}\t{}\t{} video\t{} measured\t{} unmeasured\t{} unreadable\t{} suspect",
                                 if *local { "live" } else { "fetched" },
                                 q.video_files,
                                 q.measured,
                                 q.unmeasured,
-                                q.failed
+                                q.failed,
+                                q.suspect
                             );
+                            // PVOS D211 — unreadable: ffprobe said "invalid
+                            // data" twice; it loses to a measured copy.
                             for p in &q.failed_paths {
-                                println!("  probe failed: {p}");
+                                println!("  unreadable (ffprobe, twice): {p}");
+                            }
+                            for p in &q.suspect_paths {
+                                println!("  suspect (ffprobe once; probed again after 30 min): {p}");
                             }
                         }
                     }
