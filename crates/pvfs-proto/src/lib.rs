@@ -427,7 +427,7 @@ pub struct PassProgressWire {
     /// Their bytes, plus the bytes done so far of the files in hand.
     pub bytes_done: u64,
     /// What the pass is doing: `walking`, `hashing`, `writing`, `sweeping`,
-    /// `publishing`, `pulling`.
+    /// `probing` (D208), `publishing`, `pulling`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

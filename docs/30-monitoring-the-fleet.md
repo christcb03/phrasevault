@@ -49,7 +49,7 @@ last run failed.
 pass is in flight, its row in `serve status` (and in the owner's health
 record) carries `progress`: when the pass began and last moved, the files and
 bytes done, its phase (`walking`, `hashing`, `writing`, `sweeping`,
-`publishing`, `pulling`) and the files in hand with their bytes and sizes.
+`probing`, `publishing`, `pulling`) and the files in hand with their bytes and sizes.
 `pvfs serve status` prints it under the job.
 
 **`follow` is special, and honest since D146.** It is a continuous tail

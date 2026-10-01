@@ -263,7 +263,7 @@ daemon's stepped `watch` and `receive`. Each keeps a
 `pvfs_core::JobProgress` for the runner's life; a pass reports into it —
 the watch a tick per folder walked, the bytes of each file it hashes (8 MiB
 at a time), each file whose hash comes from its row or a sidecar, each
-database step; the receive each file it pulls from its first byte (a
+database step, each file D208's probe step measures (`probing`); the receive each file it pulls from its first byte (a
 resumed partial from its length) to its placing. `serve status` carries it
 on the job's row (`ServeJobWire.progress`: started, last advanced, files and
 bytes done, the phase, the files in hand), and so does the owner's health

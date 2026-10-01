@@ -25,6 +25,23 @@ file tracks Layer 0, the file-system engine.
   measurement), `d207_progress` (a pull's progress; `serve status` over the
   socket), jobs and wire tests.
 
+- **Catalogue rows carry video quality (PVOS D208).** The daemon's `watch`
+  measures each video file (`.mkv`, `.mp4`, … — not audio) that has no
+  `quality` with ffprobe, on the box whose disk holds it: after the sweep
+  and before the publish of the same pass, newest first, one file at a time
+  with no lock held, at most 300 files or 60 s a pass (30 s a file, killed
+  after), written in short steps that land only on a row still the file
+  probed. The measurement travels in the manifest, so the copy ladder
+  (served copy, drain, `receive`) compares resolution, HDR, bit depth and
+  duration before size wherever both copies are measured. A file that
+  changes loses its quality and is measured again. A probe that fails is
+  recorded (`"probe":"failed"`), logged and listed by `pvfs region
+  quality`, and not repeated until the file changes; the ladder does not
+  use it. No ffprobe (PATH, or `PVFS_FFPROBE`): nothing is measured, the
+  daemon says so once per region, and the ladder falls back to size as
+  before. The CLI's `pvfs scan` does not probe. The ladder's HDR rung now
+  needs both copies measured (an unmeasured copy is unknown, not SDR).
+  New: `pvfs region quality [region]`.
 - **One writer per daemon: jobs share the daemon's engine (PVOS D199).**
   A pvfsd process now writes `index.db` through ONE connection
   (`pvfs_core::Writer`). Serving and every region-model job take its lock

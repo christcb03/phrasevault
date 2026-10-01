@@ -296,6 +296,12 @@ pub struct ScanStats {
     /// way: no node, no location, tried again every pass.
     pub needs_attention: u64,
     pub quarantined: Vec<(String, String)>,
+    /// PVOS D208 — video files the pass's probe step measured, recorded
+    /// as failed (ffprobe could not read them), and left for a later pass
+    /// (the step's budget ran out). All zero where nothing probes.
+    pub probed: u64,
+    pub probe_failed: u64,
+    pub probe_pending: u64,
     /// D149 — manifest sidecars moved to the trash because the file beside
     /// them was gone: renamed or deleted by something other than PVFS (Sonarr
     /// adding an episode title, rclone renaming its upload temp). PVFS takes a
@@ -392,6 +398,18 @@ pub struct RegionEntry {
     pub quality: Option<String>,
     /// The pass that last confirmed this row.
     pub seen_at: u64,
+}
+
+/// PVOS D208 — a catalogue region's video files by what is known of their
+/// quality (`pvfs region quality`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegionQualitySummary {
+    pub video_files: u64,
+    pub measured: u64,
+    /// A header probe failed: probably not a playable file.
+    pub failed: u64,
+    pub unmeasured: u64,
+    pub failed_paths: Vec<String>,
 }
 
 /// One published snapshot of a catalogue region (D125 `region_snapshots`):
@@ -530,13 +548,88 @@ pub struct CatalogueCtx {
     /// PVOS D207 — where the pass says how far it has got (the daemon's
     /// watch job); `None` for a pass nobody watches (the CLI's scan).
     pub progress: Option<std::sync::Arc<crate::progress::JobProgress>>,
+    /// PVOS D208 — whether the pass measures video quality, and with what.
+    /// Off unless the caller turns it on: the daemon's watch does
+    /// (`ProbeSetting::detect`); the CLI's scan and tests' passes do not.
+    pub probe: ProbeSetting,
+}
+
+/// PVOS D208 — the catalogue pass's probe step: the prober and its budget.
+#[derive(Debug, Clone)]
+pub struct ProbeCtx {
+    pub prober: crate::probe::Prober,
+    /// The most files one pass probes.
+    pub max_files: usize,
+    /// The longest one pass's probe step runs (checked between files).
+    pub max_time: std::time::Duration,
+    /// One file's probe is killed after this, and not recorded.
+    pub timeout: std::time::Duration,
+}
+
+impl ProbeCtx {
+    /// The watch's budget: 300 files or 60 s a pass, 30 s a file.
+    pub fn with(prober: crate::probe::Prober) -> ProbeCtx {
+        ProbeCtx {
+            prober,
+            max_files: PROBE_MAX_FILES,
+            max_time: std::time::Duration::from_secs(PROBE_MAX_SECS),
+            timeout: std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// PVOS D208 — the most files one catalogue pass probes.
+pub const PROBE_MAX_FILES: usize = 300;
+/// PVOS D208 — the longest one pass's probe step runs, in seconds.
+pub const PROBE_MAX_SECS: u64 = 60;
+/// PVOS D208 — one probe is killed after this many seconds.
+pub const PROBE_TIMEOUT_SECS: u64 = 30;
+
+/// PVOS D208 — the probe step's setting for a pass.
+#[derive(Debug, Clone, Default)]
+pub enum ProbeSetting {
+    /// Nothing is measured, and nothing said (the CLI's scan, tests).
+    #[default]
+    Off,
+    /// The box has no prober: nothing is measured, and each region with
+    /// unmeasured video is named once in the log (the set: regions named).
+    Missing(HashSet<String>),
+    /// Measure, within the budget.
+    On(ProbeCtx),
+}
+
+impl ProbeSetting {
+    /// The daemon watch's setting: `On` with this box's prober, else
+    /// `Missing` — and the line that says so.
+    pub fn detect() -> ProbeSetting {
+        match crate::probe::Prober::detect() {
+            Some(p) => {
+                eprintln!("catalogue: video quality is measured with {}", p.program.display());
+                ProbeSetting::On(ProbeCtx::with(p))
+            }
+            None => {
+                eprintln!(
+                    "catalogue: no ffprobe on this box (PATH, or PVFS_FFPROBE) — video quality is \
+                     not measured here; the copy ladder falls back to size for these regions"
+                );
+                ProbeSetting::Missing(HashSet::new())
+            }
+        }
+    }
 }
 
 impl CatalogueCtx {
     /// A pass of the daemon's watch with `cancel` as its stop flag: batches
     /// of `STEP_ROWS` (an engine's own scan keeps D154's 1,000, set on it).
     pub fn new(cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> CatalogueCtx {
-        CatalogueCtx { cancel, batch: (STEP_ROWS, CATALOGUE_BATCH_MS), interrupt: None, read_hook: None, progress: None }
+        CatalogueCtx {
+            cancel,
+            batch: (STEP_ROWS, CATALOGUE_BATCH_MS),
+            interrupt: None,
+            read_hook: None,
+            probe: ProbeSetting::Off,
+            progress: None,
+        }
     }
 
     fn cancelled(&self) -> bool {
@@ -773,11 +866,122 @@ fn catalogue_region_pass<D: crate::writer::Db>(
         stats.removed += chunk.len() as u64;
         ctx.tick();
     }
+    // PVOS D208 — measure what has no quality yet, within the budget, so
+    // this pass's head carries it.
+    probe_region_quality(db, ctx, b, root, &mut stats)?;
+    if ctx.cancelled() {
+        stats.cancelled = true;
+        return Ok(stats);
+    }
     ctx.phase("publishing");
     // Item 4 — a changed catalogue publishes its head; an unchanged one
     // publishes nothing.
     publish_region_snapshot_db(db, &b.folder_id, writer)?;
     Ok(stats)
+}
+
+/// PVOS D208 — the catalogue pass's probe step (milestone Q2–Q4): the
+/// region's video files with no quality, newest first, probed one at a time
+/// with NO lock held (D199) — the region's own files under its root, never
+/// the view — and written in short steps, each row only if it is still the
+/// one that was probed. Stops at the budget, at a stop, or when the prober
+/// cannot be started; what is left waits for the next pass. A probe that
+/// fails is recorded as failed (not probed again until the file changes); a
+/// timed-out one is not recorded.
+fn probe_region_quality<D: crate::writer::Db>(
+    db: &D,
+    ctx: &mut CatalogueCtx,
+    b: &Binding,
+    root: &std::path::Path,
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let region = b.folder_id.as_str();
+    let p = match &mut ctx.probe {
+        ProbeSetting::Off => return Ok(()),
+        ProbeSetting::Missing(named) => {
+            if !named.contains(region) {
+                let n = db.read(|e| e.quality_candidates(&b.folder_id))?.len();
+                if n > 0 {
+                    named.insert(region.to_string());
+                    eprintln!(
+                        "catalogue: no ffprobe on this box — {n} video files in region {} are not measured",
+                        short_id(region)
+                    );
+                }
+            }
+            return Ok(());
+        }
+        ProbeSetting::On(p) => p.clone(),
+    };
+    let candidates = db.read(|e| e.quality_candidates(&b.folder_id))?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // PVOS D207 — the probe step is a phase of the pass, each file in hand
+    // while its probe runs (not counted among the files done: those are the
+    // pass's hashing).
+    ctx.phase("probing");
+    let progress = ctx.progress.clone();
+    let started = std::time::Instant::now();
+    let mut done: Vec<(String, u64, u64, String)> = Vec::new();
+    let mut tried = 0usize;
+    for (rel, size, mtime) in &candidates {
+        if tried >= p.max_files || started.elapsed() >= p.max_time || ctx.cancelled() {
+            break;
+        }
+        let path = root.join(rel);
+        // Gone or changed since the walk: the next pass's row decides.
+        if !std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == *size) {
+            continue;
+        }
+        tried += 1;
+        let token = progress.as_ref().map(|pr| pr.begin_file(&path.display().to_string(), None, Some(*size), 0));
+        let outcome = p.prober.probe(&path, p.timeout, ctx.cancel.as_deref());
+        if let (Some(pr), Some(t)) = (&progress, token) {
+            pr.end_file(t, false);
+        }
+        match outcome {
+            crate::probe::ProbeOutcome::Measured(q) => {
+                stats.probed += 1;
+                done.push((rel.clone(), *size, *mtime, q.encode()));
+            }
+            crate::probe::ProbeOutcome::Failed(why) => {
+                stats.probe_failed += 1;
+                eprintln!("catalogue: probe failed for {}: {why}", path.display());
+                done.push((rel.clone(), *size, *mtime, crate::media::MediaQuality::probe_failure().encode()));
+            }
+            crate::probe::ProbeOutcome::TimedOut => {
+                eprintln!(
+                    "catalogue: probe of {} still running after {} s; killed, tried again next pass",
+                    path.display(),
+                    p.timeout.as_secs()
+                );
+            }
+            crate::probe::ProbeOutcome::Cancelled => break,
+            crate::probe::ProbeOutcome::Unavailable(why) => {
+                eprintln!("catalogue: the prober would not start ({why}); measuring stops for this pass");
+                break;
+            }
+        }
+        if done.len() >= STEP_ROWS {
+            db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality(&b.folder_id, &done))?;
+            done.clear();
+        }
+    }
+    if !done.is_empty() {
+        db.write(&format!("quality {}", short_id(region)), |e| e.write_region_quality(&b.folder_id, &done))?;
+    }
+    stats.probe_pending = (candidates.len() as u64).saturating_sub(stats.probed + stats.probe_failed);
+    if stats.probed + stats.probe_failed > 0 {
+        eprintln!(
+            "catalogue: region {}: probed {} video files ({} failed), {} left for later passes",
+            short_id(region),
+            stats.probed + stats.probe_failed,
+            stats.probe_failed,
+            stats.probe_pending
+        );
+    }
+    Ok(())
 }
 
 /// D154 — end a catalogue pass that was told to stop: commit what it holds
@@ -1831,7 +2035,14 @@ impl Engine {
                      ON CONFLICT(region_id, rel_path) DO UPDATE SET
                        kind = excluded.kind, size_bytes = excluded.size_bytes,
                        mtime_ms = excluded.mtime_ms, changed_ms = excluded.changed_ms,
-                       content_hash = excluded.content_hash, seen_at = excluded.seen_at",
+                       content_hash = excluded.content_hash, seen_at = excluded.seen_at,
+                       quality = CASE
+                         WHEN region_entries.kind = excluded.kind
+                          AND region_entries.size_bytes = excluded.size_bytes
+                          AND region_entries.mtime_ms = excluded.mtime_ms
+                          AND (region_entries.content_hash IS excluded.content_hash
+                               OR region_entries.content_hash IS NULL)
+                         THEN region_entries.quality ELSE NULL END",
                 )
                 .map_err(map_db("upsert region entry"))?;
             for (rel, kind, size, mtime, changed, hash) in rows {
@@ -1864,6 +2075,87 @@ impl Engine {
             }
         }
         tx.commit().map_err(map_db("commit catalogue sweep"))
+    }
+
+    /// PVOS D208 — the probe step's read: `region`'s video files with no
+    /// quality, newest first, as `(rel_path, size, mtime_ms)`.
+    pub fn quality_candidates(&self, region: &NodeId) -> Result<Vec<(String, u64, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rel_path, size_bytes, mtime_ms FROM region_entries
+                  WHERE region_id = ?1 AND kind = 'file' AND quality IS NULL
+                  ORDER BY mtime_ms DESC, rel_path",
+            )
+            .map_err(map_db("quality candidates"))?;
+        let rows = stmt
+            .query_map(params![region], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+            })
+            .map_err(map_db("quality candidates"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("quality candidates"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|(rel, ..)| crate::media::is_video_file(rel.rsplit('/').next().unwrap_or(rel)))
+            .collect())
+    }
+
+    /// PVOS D208 — one step of the probe step's writes: each
+    /// `(rel_path, size, mtime_ms, quality)` lands only on a row that still
+    /// has that size and mtime and no quality (a file that changed while it
+    /// was probed keeps its row as the pass wrote it). Returns rows written.
+    #[doc(hidden)]
+    pub fn write_region_quality(&mut self, region: &NodeId, rows: &[(String, u64, u64, String)]) -> Result<usize> {
+        let tx = self.conn.transaction().map_err(map_db("begin quality"))?;
+        let mut n = 0;
+        {
+            let mut put = tx
+                .prepare_cached(
+                    "UPDATE region_entries SET quality = ?5
+                      WHERE region_id = ?1 AND rel_path = ?2 AND size_bytes = ?3 AND mtime_ms = ?4
+                        AND kind = 'file' AND quality IS NULL",
+                )
+                .map_err(map_db("write quality"))?;
+            for (rel, size, mtime, q) in rows {
+                n += put
+                    .execute(params![region, rel, *size as i64, *mtime as i64, q])
+                    .map_err(map_db("write quality"))?;
+            }
+        }
+        tx.commit().map_err(map_db("commit quality"))?;
+        Ok(n)
+    }
+
+    /// PVOS D208 — what `pvfs region quality` reports for `region`: its
+    /// video files, how many carry a measurement, how many a failed probe,
+    /// and the paths of the failed ones.
+    pub fn region_quality_summary(&self, region: &NodeId) -> Result<RegionQualitySummary> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rel_path, quality FROM region_entries WHERE region_id = ?1 AND kind = 'file' ORDER BY rel_path")
+            .map_err(map_db("quality summary"))?;
+        let rows = stmt
+            .query_map(params![region], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(map_db("quality summary"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("quality summary"))?;
+        let mut out = RegionQualitySummary::default();
+        for (rel, q) in rows {
+            if !crate::media::is_video_file(rel.rsplit('/').next().unwrap_or(&rel)) {
+                continue;
+            }
+            out.video_files += 1;
+            match q.as_deref().map(crate::media::MediaQuality::decode) {
+                None => out.unmeasured += 1,
+                Some(Ok(m)) if m.probe_failed => {
+                    out.failed += 1;
+                    out.failed_paths.push(rel);
+                }
+                Some(_) => out.measured += 1,
+            }
+        }
+        Ok(out)
     }
 
     /// Every path this box holds a row for in `region` (the sweep's read).
@@ -3587,6 +3879,7 @@ impl Engine {
                 interrupt: self.catalogue_interrupt.take(),
                 read_hook: self.catalogue_read_hook.take(),
                 progress: None,
+                probe: ProbeSetting::Off,
             };
             let r = catalogue_region_pass(&crate::writer::OwnDb::new(self), &mut ctx, b, &root, &files, &dirs, stats, writer);
             // D156 — the hook stays until replaced; D154 — the seam's stop

@@ -71,6 +71,7 @@ fn quality_survives_the_successor_node_that_attestation_mints() {
         video_codec: "hevc".into(),
         duration_s: 5400,
         decoded_ok: Some(true),
+        probe_failed: false,
     };
     engine.set_media_quality(&id, &measured, "probe").unwrap();
 
