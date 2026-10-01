@@ -164,6 +164,9 @@ pub fn run_shared(
     }
     let lock = ServeLock::take(&data_dir)?;
     let mut ctx = pvfs_core::fs::CatalogueCtx::new(Some(std::sync::Arc::clone(stop)));
+    // PVOS D208 — the daemon's watch measures video quality where the bytes
+    // are (ffprobe, within each pass's budget); a box with none says so once.
+    ctx.probe = pvfs_core::fs::ProbeSetting::detect();
     let is_replica = db.view().is_replica();
     let mut route = crate::advertise::replica_route(&data_dir, is_replica).unwrap_or(None);
     let result = drive(

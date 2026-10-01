@@ -102,6 +102,7 @@ pub fn parse_ffprobe(text: &str) -> MediaQuality {
         // whether every frame decodes, which is Chris's actual corruption
         // worry — so it stays unknown until something has really looked.
         decoded_ok: None,
+        probe_failed: false,
     }
 }
 
@@ -118,4 +119,131 @@ pub fn decode_check(path: &Path) -> Result<bool> {
         .output()
         .map_err(|e| PvfsError::io("run ffmpeg", e))?;
     Ok(out.status.success() && out.stderr.is_empty())
+}
+
+/// PVOS D208 — what one probe of the catalogue's probe step came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// ffprobe read the file: its measurement (resolution may be unknown —
+    /// a container with no video stream — and is recorded as it is).
+    Measured(MediaQuality),
+    /// ffprobe ran and could not read the file, with its first error line.
+    Failed(String),
+    /// Still running at the timeout: killed, nothing learned, not recorded.
+    TimedOut,
+    /// The pass was asked to stop: killed, not recorded.
+    Cancelled,
+    /// The prober could not be started at all (gone since it was found).
+    Unavailable(String),
+}
+
+/// PVOS D208 — the header prober the catalogue's probe step runs: ffprobe,
+/// or the binary `PVFS_FFPROBE` names (a static build on a box with no
+/// package; a test's stand-in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prober {
+    pub program: std::path::PathBuf,
+}
+
+/// The arguments [`probe_headers`] passes, shared so both read the same
+/// fields.
+const PROBE_ARGS: &[&str] = &[
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries",
+    "stream=width,height,codec_name,bits_per_raw_sample,color_transfer:format=duration,size",
+    "-of", "default=noprint_wrappers=1",
+];
+
+impl Prober {
+    /// The prober this box has: `PVFS_FFPROBE` if set, else `ffprobe` on
+    /// PATH — `None` when it does not answer `-version`.
+    pub fn detect() -> Option<Prober> {
+        let program = std::env::var_os("PVFS_FFPROBE")
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("ffprobe"));
+        let prober = Prober { program };
+        prober.available().then_some(prober)
+    }
+
+    /// Does this prober run?
+    pub fn available(&self) -> bool {
+        std::process::Command::new(&self.program)
+            .arg("-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Probe `path`'s headers, killing the child at `timeout` or as soon as
+    /// `cancel` is raised (checked every 20 ms). Its output is read on
+    /// threads of its own, so a child with a lot to say on stderr (a corrupt
+    /// file's error per packet) never blocks on a full pipe.
+    pub fn probe(
+        &self,
+        path: &Path,
+        timeout: std::time::Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> ProbeOutcome {
+        use std::io::Read;
+        let child = std::process::Command::new(&self.program)
+            .args(PROBE_ARGS)
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => return ProbeOutcome::Unavailable(format!("{}: {e}", self.program.display())),
+        };
+        fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                if let Some(mut r) = r {
+                    // Bounded: a runaway stderr is cut at 64 KiB.
+                    let _ = r.by_ref().take(64 * 1024).read_to_end(&mut b);
+                    let _ = std::io::copy(&mut r, &mut std::io::sink());
+                }
+                String::from_utf8_lossy(&b).into_owned()
+            })
+        }
+        let out_t = drain(child.stdout.take());
+        let err_t = drain(child.stderr.take());
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return ProbeOutcome::Failed(format!("wait for ffprobe: {e}"));
+                }
+            }
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeOutcome::Cancelled;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeOutcome::TimedOut;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let out = out_t.join().unwrap_or_default();
+        let err = err_t.join().unwrap_or_default();
+        if status.success() {
+            ProbeOutcome::Measured(parse_ffprobe(&out))
+        } else {
+            let first = err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no message");
+            ProbeOutcome::Failed(format!("{status}: {first}"))
+        }
+    }
 }

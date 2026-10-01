@@ -343,7 +343,11 @@ the fetch-and-verify of a 27,000-row manifest is a few megabytes.
 2. **The `watch` job on the NAS** is not in the inventory example's job
    list for the holder; §4 D adds it. The example should carry it once the
    holder has a region.
-3. **Quality re-measurement** on the new model (§3).
+3. ~~**Quality re-measurement** on the new model (§3).~~ — PVOS D208: the
+   daemon's `watch` measures each video file with ffprobe where its bytes
+   are, within each pass's budget (300 files or 60 s), and the row's
+   `quality` travels in the manifest. A box without ffprobe measures
+   nothing and says so (`pvfs region quality`).
 4. ~~§7 and §8 have not run anywhere~~ — rehearsed in D139 (§9).
 5. ~~**A drain leaves the sidecar behind** (D138)~~ — fixed in D145: the
    sidecar goes to the trash with its file; a staging folder goes once it is
