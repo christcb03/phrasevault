@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use pvfs_companion::{
     AgentRequest, AgentResponse, ApprovalContext, ApprovalPolicy, ConfirmFields, GenesisFields, PairingRegistry,
-    Prompter, RelayPayload, SessionCertFields, RELAY_DOMAIN,
+    Prompter, RelayPayload, SessionCertFields, RELAY_DOMAIN, SESSION_GRANT_MS,
 };
 use pvfs_core::acl::{Principal, ACL_A, ACL_R, ACL_W};
 use pvfs_core::personal::{attach_sigs, init_signed_genesis, prepare_personal_genesis_with, session_cert_events};
@@ -160,6 +160,9 @@ fn a_personal_forest_and_its_sessions_through_the_companion() {
     };
     assert_eq!(pubkey, owner);
     assert_eq!(w.said.lock().unwrap().len(), 1, "a session certificate asks nothing");
+    // PVOS D212 (Chris): the grant lasts 7 days.
+    assert_eq!(SESSION_GRANT_MS, 7 * 24 * 60 * 60 * 1000);
+    assert_eq!(expires_at - at, SESSION_GRANT_MS, "a 7-day grant");
     let prepared = session_cert_events(&SessionCert {
         forest_id: forest_id.clone(),
         root_node_id: root_node.clone(),
@@ -176,6 +179,39 @@ fn a_personal_forest_and_its_sessions_through_the_companion() {
         ACL_R | ACL_W,
         "rw, never admin"
     );
+    let grant_end = |engine: &pvfs_core::Engine| -> u64 {
+        let key = crypto::pubkey_bytes(&session);
+        engine
+            .acl_entries(&root_node)
+            .unwrap()
+            .into_iter()
+            .find(|(p, _, _, _)| matches!(p, Principal::Key(k) if *k == key))
+            .map(|(_, _, _, exp)| exp)
+            .expect("the session key's grant")
+    };
+    assert_eq!(grant_end(&engine), expires_at);
+    // PVOS D212: a RENEWAL is the same certificate for the same key, signed
+    // again later — the repeated admission is a no-op, the grant's end moves.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let AgentResponse::Certified { at: at2, expires_at: end2, sigs: sigs2, .. } = cert(ORIGIN, "pvos.example", &forest_id, &binding_sig)
+    else {
+        panic!("expected a second certificate");
+    };
+    assert!(at2 > at && end2 > expires_at, "a later grant");
+    let prepared = session_cert_events(&SessionCert {
+        forest_id: forest_id.clone(),
+        root_node_id: root_node.clone(),
+        owner_pub: hex::decode(&owner).unwrap(),
+        session_pub: crypto::pubkey_bytes(&session),
+        at: at2,
+        expires_at: end2,
+    })
+    .unwrap();
+    let events = attach_sigs(prepared, sigs2.iter().map(|s| hex::decode(s).unwrap()).collect()).unwrap();
+    engine.commit_member_write(events).expect("the renewal verifies in the forest");
+    assert_eq!(grant_end(&engine), end2, "the renewal moved the grant's end");
+    assert_eq!(engine.effective_rights(&Principal::Key(crypto::pubkey_bytes(&session)), &root_node).unwrap(), ACL_R | ACL_W);
+    assert_eq!(w.said.lock().unwrap().len(), 1, "a renewal asks nothing more than a sign-in's certificate");
     engine.close().unwrap();
 
     // Another site than the page asking; a forest this phrase never bound.

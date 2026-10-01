@@ -54,9 +54,12 @@ pub fn invite_acceptance_digest(
     h.finalize().into()
 }
 
-/// PVOS D193: how long a session certificate's `rw` grant lives (pvosd takes
-/// an hour to 31 days) — the page picks the same.
-const SESSION_GRANT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// PVOS D193: how long a session certificate's `rw` grant lives — the page
+/// picks the same. PVOS D212 (Chris, 2026-10-01): 7 days, matching a
+/// session's 7-unused-days lapse — a sign-out cannot revoke the grant (only
+/// the person's key could), so it must not outlive the session by much. A
+/// session in use is renewed before its end with this same certificate.
+pub const SESSION_GRANT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
