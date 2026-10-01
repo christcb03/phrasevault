@@ -72,6 +72,10 @@ pub struct PeerHealth {
     /// PVOS D182: that box's last dated copy of the log, when it makes them.
     #[serde(default)]
     pub backup: Option<pvfs_proto::BackupWire>,
+    /// PVOS D200: the build that box's daemon runs, as it said (absent from
+    /// an older daemon, and when the probe got no answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     pub error: Option<String>,
 }
 
@@ -85,8 +89,14 @@ impl PeerHealth {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub addr: String,
-    /// From `.fleet/versions/<pin>`, when announced.
+    /// From `.fleet/versions/<pin>`, when announced: the crate version, proto
+    /// and schema — not the build (D177).
     pub version: Option<String>,
+    /// PVOS D200: the build that box's daemon last said it runs (`serve
+    /// status`). Kept through a failed probe, so a box that is down still
+    /// shows what it ran; replaced when it answers again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     pub last_attempt_ms: u64,
     pub last_ok_ms: Option<u64>,
     /// The first miss of the current streak.
@@ -171,6 +181,9 @@ impl FleetHealth {
         if version.is_some() {
             rec.version = version;
         }
+        if health.build.is_some() {
+            rec.build = health.build.clone();
+        }
         rec.last_attempt_ms = now_ms;
         if health.ok() {
             rec.last_ok_ms = Some(now_ms);
@@ -239,6 +252,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.log = s.log;
             h.fenced = s.fenced;
             h.backup = s.backup;
+            h.build = s.build;
         }
         Err(e) => h.error = Some(format!("serve status: {e}")),
     }
