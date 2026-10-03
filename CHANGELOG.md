@@ -5,6 +5,20 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A copy the arrs remove mid-pass no longer fails `resolve`, and a missing
+  source stops reading as a broken trash.** `resolve` guards with `is_file`,
+  but then reads the file's tail and asks the holder to confirm the bytes — a
+  network round trip — before moving it to the trash, and the arrs delete and
+  replace in these roots all day. A file that went inside that window aborted
+  the whole pass, abandoning its remaining candidates and raising a job error;
+  it is now the same nothing-to-do as a row that outlived its file. And
+  `move_to_trash`'s copy+remove fallback, for a store on another mount, ran
+  on EVERY rename error, so the vanished file came back as `copy to trash: No
+  such file or directory` — as though writing to the trash had failed, when
+  the trash was fine. The fallback is now `EXDEV` only; anything else says
+  `move to trash`. Seen on feederbox 2026-10-03 11:09 AM ET, cleared by the
+  next pass, while Sonarr upgraded five episodes of one show.
+
 - **An unreadable copy loses to a readable one; mediabox measures the NAS's
   video over the LAN; view tests unmount (PVOS D211).** Chris's decisions of
   2026-10-01.

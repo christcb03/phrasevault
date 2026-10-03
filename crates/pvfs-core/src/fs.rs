@@ -3976,7 +3976,23 @@ impl Engine {
                     continue;
                 }
                 if !dry_run {
-                    crate::sync::move_to_trash_with_sidecar(root, &file)?;
+                    match crate::sync::move_to_trash_with_sidecar(root, &file) {
+                        Ok(_) => {}
+                        // The file can go between the `is_file` guard above and
+                        // this move, and the window is not small: the holder
+                        // confirmation in between is a network round trip. The
+                        // arrs delete and replace in these roots all day (on
+                        // 2026-10-03 Sonarr's upgrade of five episodes raced
+                        // this). Gone is gone — the same nothing-to-do as a row
+                        // that outlived its file, not an error that abandons
+                        // the rest of the pass and pages a person.
+                        Err(PvfsError::Io { ref source, .. })
+                            if source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 report.trashed.push((entry.rel_path.clone(), c.region.clone()));
             }

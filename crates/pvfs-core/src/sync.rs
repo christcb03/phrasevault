@@ -797,14 +797,27 @@ pub fn move_to_trash(root: &Path, file: &Path) -> Result<PathBuf> {
     }
     // Same filesystem ⇒ instant. If it is not (a store on another mount), fall
     // back to copy+remove rather than silently leaving the file in place.
+    //
+    // Only for that case: the fallback used to catch EVERY rename error, so a
+    // file that had gone (the arrs delete and replace under us) came back as
+    // `copy to trash: No such file or directory` — which reads as though
+    // writing to the trash broke, when the trash was fine and the source was
+    // the thing missing. That cost an evening's diagnosis on 2026-10-03.
     match std::fs::rename(file, &dest) {
         Ok(()) => Ok(dest),
-        Err(_) => {
+        Err(e) if is_cross_device(&e) => {
             std::fs::copy(file, &dest).map_err(|e| PvfsError::io("copy to trash", e))?;
             std::fs::remove_file(file).map_err(|e| PvfsError::io("remove after trash copy", e))?;
             Ok(dest)
         }
+        Err(e) => Err(PvfsError::io("move to trash", e)),
     }
+}
+
+/// `EXDEV` — the one rename failure a copy+remove can answer. `ErrorKind`
+/// only names it on nightly (`CrossesDevices`), so the raw code is the test.
+fn is_cross_device(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(nix::errno::Errno::EXDEV as i32)
 }
 
 /// D145 — [`move_to_trash`] for a file and its sidecar together, so a drain

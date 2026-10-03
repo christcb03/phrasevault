@@ -284,3 +284,66 @@ fn folders_drain_like_files_and_the_top_level_stays() {
     assert!(library.join("TV/Show (2020)/Season 01").is_dir(), "the library's folders never move");
     e.close().unwrap();
 }
+
+/// 2026-10-03 — the arrs delete and replace in these roots while a pass runs,
+/// and the window is real: the `is_file` guard, then a tail read, then a
+/// network round trip to the holder, and only then the move. Sonarr's upgrade
+/// of five episodes landed inside it and the `resolve` job reported
+/// `I/O error during copy to trash: No such file or directory` — a file that
+/// had gone, told as though the trash were broken, and the whole pass (and
+/// its remaining candidates) abandoned with it.
+///
+/// A copy that goes while it is being resolved is nothing to do, exactly as a
+/// row that outlived its file is. The confirmation callback IS that window,
+/// so this deletes the file from inside it.
+#[test]
+fn a_copy_that_goes_while_the_holder_is_asked_is_nothing_to_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let library = tmp.path().join("library");
+    let gone = "TV/Upgraded (2015)/Season 11/Upgraded - s11e06 - Get Baked.mkv";
+    let stays = "Movies/Still Here (2002)/Still Here (2002).mkv";
+    let bytes = b"the-same-bytes-on-both-boxes";
+    for rel in [gone, stays] {
+        write(&staging, rel, bytes, 60);
+        write(&library, rel, bytes, 60);
+    }
+    let (mut e, _mn) = Engine::init(tmp.path().join("forest").as_path()).unwrap();
+    let rs = region(&mut e, "Staging", &staging);
+    let rl = region(&mut e, "Library", &library);
+    e.set_region_drain(&rs, true).unwrap();
+    // The library is another box's: its rows stay and the holder is asked.
+    e.unbind_folder(&rl, None).unwrap();
+
+    let staged_gone = staging.join(gone);
+    let rep = e
+        .resolve_conflicts(false, &never(), &mut |c: &DrainCheck| {
+            if c.rel_path == gone {
+                // what Sonarr did, in the same window
+                std::fs::remove_file(&staged_gone).unwrap();
+            }
+            true
+        })
+        .unwrap();
+
+    // The pass completes: the file that went is not trashed and not an error,
+    // and the other candidate is still resolved.
+    assert_eq!(rep.trashed, vec![(stays.to_string(), rs.clone())], "{rep:?}");
+    assert!(rep.unconfirmed.is_empty(), "{rep:?}");
+    assert!(!staging.join(stays).exists() && in_trash(&staging, stays));
+    assert!(!in_trash(&staging, gone), "it was already gone: nothing to put in the trash");
+    e.close().unwrap();
+}
+
+/// …and a rename that fails for any other reason still says what it was: the
+/// copy+remove fallback is for a store on another mount (`EXDEV`) only.
+#[test]
+fn a_missing_source_is_a_move_error_not_a_trash_write_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("staging");
+    std::fs::create_dir_all(&root).unwrap();
+    let err = sync::move_to_trash(&root, &root.join("Movies/Never Was (2024).mkv")).unwrap_err();
+    let said = err.to_string();
+    assert!(said.contains("move to trash"), "{said}");
+    assert!(!said.contains("copy to trash"), "the trash was never the problem: {said}");
+}
