@@ -120,3 +120,23 @@ fn an_unset_floor_is_a_share_of_the_disk_capped() {
     // And an unmeasurable disk asks for nothing rather than blocking writes.
     assert_eq!(default_floor_for(0), 0);
 }
+
+#[test]
+fn a_split_folder_sends_a_file_to_its_own_sibling() {
+    // A season with one episode on each disk: the folder alone cannot say
+    // which disk a new subtitle belongs on, and free space picked the wrong
+    // one on the lab (2026-10-04). The file it belongs to decides.
+    let tmp = tempfile::tempdir().unwrap();
+    let e = engine(tmp.path());
+    let dests = roots(tmp.path(), &["disk_a", "disk_b"]);
+    for (i, ep) in [(0usize, "e01"), (1usize, "e02")] {
+        let season = dests[i].1.join("TV/Show/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join(format!("Show - s01{ep}.mkv")), b"x").unwrap();
+    }
+    let (a, _) = e.placement_for_with_floor("TV/Show/Season 01/Show - s01e01.en.srt", &dests, 0);
+    let (b, _) = e.placement_for_with_floor("TV/Show/Season 01/Show - s01e02.en.srt", &dests, 0);
+    assert_eq!((a.as_str(), b.as_str()), ("disk_a", "disk_b"),
+               "each subtitle lands with its own episode, not with the roomier disk");
+    e.close().unwrap();
+}

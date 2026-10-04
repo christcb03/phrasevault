@@ -3712,17 +3712,43 @@ impl Engine {
         floors: &[u64],
     ) -> (NodeId, std::path::PathBuf) {
         let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        if !parent.is_empty() {
-            for (i, (region, root)) in dests.iter().enumerate() {
-                let floor = floors.get(i).copied().unwrap_or(0);
-                if root.join(parent).is_dir()
-                    && crate::ingest::free_space_at(root).unwrap_or(0) >= floor
-                {
-                    return (region.clone(), root.clone());
+        if parent.is_empty() {
+            return dests[0].clone();
+        }
+        let has_room = |i: usize, root: &std::path::Path| {
+            crate::ingest::free_space_at(root).unwrap_or(0) >= floors.get(i).copied().unwrap_or(0)
+        };
+        let holds_folder: Vec<(usize, &(NodeId, std::path::PathBuf))> = dests
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, root))| root.join(parent).is_dir() && has_room(*i, root))
+            .collect();
+        if holds_folder.is_empty() {
+            return dests[0].clone();
+        }
+        // D216 — a folder can be split across disks (a season with one episode
+        // on each). Then the folder alone does not say which disk, and picking
+        // by free space put a subtitle away from its own episode on the lab
+        // (2026-10-04). So prefer the region that holds the file this one
+        // BELONGS to: same stem up to the first dot — `S01E02.en.srt` joins
+        // `S01E02.mkv`, not its neighbour.
+        let name = rel_path.rsplit_once('/').map(|(_, n)| n).unwrap_or(rel_path);
+        let stem = name.split_once('.').map(|(s, _)| s).unwrap_or(name);
+        if !stem.is_empty() {
+            for (_, (region, root)) in &holds_folder {
+                let dir = root.join(parent);
+                let sibling = std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n != name && n.starts_with(stem)
+                });
+                if sibling {
+                    return ((*region).clone(), root.clone());
                 }
             }
         }
-        dests[0].clone()
+        let (_, (region, root)) = holds_folder[0];
+        (region.clone(), root.clone())
     }
 
     /// D217 — the disks this box may create new files on: every catalogue
