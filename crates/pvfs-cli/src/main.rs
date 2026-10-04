@@ -349,6 +349,14 @@ enum Cmd {
         /// by hash — instead of a node. `pvfs mount --view <dir>`.
         #[arg(long)]
         view: bool,
+        /// D217, with --view: allow EDITS of files this box already holds,
+        /// and new files, through the mount. A new file lands in the region
+        /// that already holds its folder (D216). Off by default: a file held
+        /// on another box is still refused rather than copied here, and
+        /// turning this on changes what the arrs and Plex may do to the
+        /// library through this path.
+        #[arg(long)]
+        writable: bool,
         /// D165, with --view: the most the read-through cache may hold —
         /// `500G`, `1.5T`, or bytes. The least recently read goes first.
         #[arg(long, default_value = "500G")]
@@ -1506,6 +1514,15 @@ enum RegionCmd {
     Retention {
         target: String,
         days: Option<u64>,
+    },
+    /// D216: how much free space this box keeps in reserve on a region's disk.
+    /// While the disk has less than this, the region stops attracting new
+    /// files even when it already holds the folder they belong in — so a disk
+    /// that backups or anything else needs room on keeps it. Local to this
+    /// box, like retention. `500G`, `1T`, or bytes. Prompts when omitted.
+    Floor {
+        target: String,
+        size: Option<String>,
     },
     /// D129: fetch the catalogue snapshots this box is behind on — every
     /// stale region, or one — from the fleet's announced endpoints, each
@@ -6682,6 +6699,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             cache_max,
             cache_age,
             cache_mode,
+            writable,
         } => {
             let cache = pvfs_client::hash_cache::CacheOpts {
                 mode: cache_mode,
@@ -6742,7 +6760,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 let started_ms = now_ms();
                 write_mount_status(&data_dir, &dir, cache_mode, started_ms, None);
                 watch_catalogue_schema(data_dir.clone(), dir.clone(), cache_mode, started_ms);
-                let mounted = pvfs_fuse::mount_view_with(&data_dir, &dir, allow_other, cache);
+                let mounted =
+                    pvfs_fuse::mount_view_writable(&data_dir, &dir, allow_other, cache, writable);
                 mount_status::remove(&data_dir, &dir);
                 mounted?;
             } else {
@@ -7247,6 +7266,30 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         println!("{{\"region\":\"{id}\",\"retention_days\":{days}}}");
                     } else {
                         println!("{id} keeps its trash {days} day(s)");
+                    }
+                    engine.close()
+                }
+                RegionCmd::Floor { target, size } => {
+                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    if !engine.is_catalogue_region(&id)? {
+                        return Err(PvfsError::BadInput {
+                            field: "region".into(),
+                            reason: format!("{id} is not a catalogue region"),
+                        });
+                    }
+                    let text = match size {
+                        Some(s) => s,
+                        None => prompt_line(
+                            "free space to keep on this region's disk (e.g. 500G, 1T)",
+                            Some("500G"),
+                        )?,
+                    };
+                    let bytes = parse_size(text.trim())?;
+                    pvfs_core::sync::set_region_floor(engine.data_dir(), &id, bytes)?;
+                    if json {
+                        println!("{{\"region\":\"{id}\",\"floor_bytes\":{bytes}}}");
+                    } else {
+                        println!("{id} keeps {bytes} bytes free before it takes new files");
                     }
                     engine.close()
                 }

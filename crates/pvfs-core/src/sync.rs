@@ -1258,12 +1258,24 @@ pub struct Placement {
     /// than this, it stops attracting new files even when it already holds
     /// the folder they belong in, so headroom survives (Chris wants ~1 TB on
     /// mediabox's /mnt/local for backups, ~500 GB elsewhere). Absent =
-    /// [`PLACEMENT_FLOOR_DEFAULT`].
+    /// a share of the disk, capped ([`default_floor_for`]).
     pub floor: Vec<(NodeId, u64)>,
 }
 
-/// D216 — the free-space floor a region keeps when it has not declared one.
-pub const PLACEMENT_FLOOR_DEFAULT: u64 = 500_000_000_000;
+/// D216 — the most an undeclared floor is ever set to. The default is a share
+/// of the disk ([`PLACEMENT_FLOOR_SHARE_PCT`]) so a small disk is not written
+/// off entirely, capped here so an 80 TB volume is not asked to hold 4 TB back
+/// for no reason. Chris, 2026-10-04.
+pub const PLACEMENT_FLOOR_CAP: u64 = 500_000_000_000;
+
+/// D216 — the share of a disk kept free when no floor was declared for it.
+pub const PLACEMENT_FLOOR_SHARE_PCT: u64 = 5;
+
+/// D216 — the floor for a disk of `total` bytes with nothing configured:
+/// 5% of it, never more than 500 GB.
+pub fn default_floor_for(total_bytes: u64) -> u64 {
+    (total_bytes / 100 * PLACEMENT_FLOOR_SHARE_PCT).min(PLACEMENT_FLOOR_CAP)
+}
 
 /// D133 — default trash retention, in days.
 pub const TRASH_KEEP_DAYS_DEFAULT: u64 = 7;
@@ -1562,15 +1574,14 @@ pub fn set_region_floor(data_dir: &Path, id: &NodeId, bytes: u64) -> Result<()> 
     save_placement(data_dir, &p)
 }
 
-/// D216 — the free space this region keeps in reserve (the default when it
-/// has not declared one).
-pub fn region_floor_bytes(data_dir: &Path, id: &str) -> Result<u64> {
+/// D216 — the free space this region was TOLD to keep, if any. `None` means
+/// nothing was configured and [`default_floor_for`] decides from the disk.
+pub fn region_floor_setting(data_dir: &Path, id: &str) -> Result<Option<u64>> {
     Ok(load_placement_full(data_dir)?
         .floor
         .into_iter()
         .find(|(r, _)| r == id)
-        .map(|(_, b)| b)
-        .unwrap_or(PLACEMENT_FLOOR_DEFAULT))
+        .map(|(_, b)| b))
 }
 
 /// D133 — a region's trash retention in days (the default when undeclared).

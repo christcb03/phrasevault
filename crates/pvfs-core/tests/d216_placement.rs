@@ -108,3 +108,15 @@ fn a_region_under_the_floor_stops_attracting_files() {
     assert_eq!(no_room, "roomy", "under the floor, the default pool takes it");
     e.close().unwrap();
 }
+
+#[test]
+fn an_unset_floor_is_a_share_of_the_disk_capped() {
+    use pvfs_core::sync::default_floor_for;
+    // A small disk keeps a little, so the folder rule still works there — a
+    // flat 500 GB default made it silently never fire on the 58 GB lab box.
+    assert_eq!(default_floor_for(58_000_000_000), 2_900_000_000);
+    // A big one keeps the cap, not 5% of 80 TB.
+    assert_eq!(default_floor_for(80_000_000_000_000), 500_000_000_000);
+    // And an unmeasurable disk asks for nothing rather than blocking writes.
+    assert_eq!(default_floor_for(0), 0);
+}

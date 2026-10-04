@@ -416,6 +416,25 @@ impl PvfsFs {
                     list.push(overlay::remembered_dir(&d));
                 }
             }
+            // D217 — a file created through this mount is in the listing from
+            // the moment it exists, not from the moment the watch job hashes
+            // it: `ls` right after a write has to show it.
+            for f in o.remembered_files_in(dir) {
+                if list.iter().any(|e| e.rel_path == f) {
+                    continue;
+                }
+                if let Some(path) = o.remembers_file(&f) {
+                    if let Ok(m) = std::fs::metadata(&path) {
+                        let mtime_ms = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        list.push(overlay::remembered_file(&f, m.len(), mtime_ms));
+                    }
+                }
+            }
             list.retain(|e| !o.is_gone(&e.rel_path));
             list.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
             list
@@ -455,6 +474,18 @@ impl PvfsFs {
         };
         let Some(e) = found.filter(Self::view_shown) else {
             self.tombstones.lock().unwrap().remove(rel); // the catalogue has caught up
+            // D217 — a file this mount created, before the watch job has it.
+            if let Some(path) = o.remembers_file(rel) {
+                if let Ok(m) = std::fs::metadata(&path) {
+                    let mtime_ms = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    return Some(overlay::remembered_file(rel, m.len(), mtime_ms));
+                }
+            }
             return o.remembers_dir(rel).then(|| overlay::remembered_dir(rel));
         };
         self.without_the_deleted(e)
@@ -1017,6 +1048,15 @@ impl PvfsFs {
         let entry = self.view_entry_of(rel).ok_or(libc::ENOENT)?;
         if entry.kind == "dir" {
             return Err(libc::EISDIR);
+        }
+        // D217 — a file created through this mount has no catalogued hash yet;
+        // its bytes are where `create` put them.
+        if let Some(path) = self.overlay.lock().unwrap().remembers_file(rel) {
+            let f = std::fs::File::open(&path).map_err(|_| libc::EIO)?;
+            let fh = self.next_fh;
+            self.next_fh += 1;
+            self.handles.insert(fh, f);
+            return Ok(fh);
         }
         let (hash, size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
         let fh = self.next_fh;
@@ -1677,6 +1717,67 @@ impl Filesystem for PvfsFs {
         }
     }
 
+    /// D217 — create a new file through the view.
+    ///
+    /// This is the half that takes mergerfs out of the decision: the file is
+    /// made on the disk D216's rule picks — the region that already holds its
+    /// folder, else the emptiest with room — instead of on whichever branch
+    /// happened to be writable. Until the `watch` job catalogues it, the
+    /// overlay answers for it, so a tool that writes a subtitle and reads it
+    /// straight back finds it.
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        if !self.writable || !self.view {
+            return reply.error(libc::EROFS);
+        }
+        let Some(name) = name.to_str() else { return reply.error(libc::EINVAL) };
+        self.sync_overlay();
+        let Some(dir) = self.ino_to_path.get(&parent).cloned() else {
+            return reply.error(libc::ENOENT);
+        };
+        let rel = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+        if !pvfs_core::Engine::safe_rel_path(&rel) {
+            return reply.error(libc::EINVAL);
+        }
+        if self.view_entry_of(&rel).is_some() {
+            return reply.error(libc::EEXIST);
+        }
+        let dests = match self.engine.writable_roots() {
+            Ok(d) if !d.is_empty() => d,
+            _ => return reply.error(libc::EROFS),
+        };
+        let (_region, root) = self.engine.placement_for(&rel, &dests);
+        let path = root.join(&rel);
+        if let Some(p) = path.parent() {
+            if std::fs::create_dir_all(p).is_err() {
+                return reply.error(libc::EIO);
+            }
+        }
+        let f = match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.write_handles.insert(fh, f);
+        self.overlay.lock().unwrap().remember_file(&rel, path);
+        let ino = self.view_ino(&rel);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let attr = self.plain_attr(ino, FileType::RegularFile, 0, now_ms, 0o644);
+        reply.created(&TTL, &attr, 0, fh, 0);
+    }
+
     /// D217 tier 1 — the write itself. The bytes go to the real file in the
     /// region this box holds, and the `watch` job re-hashes it afterwards:
     /// the catalogue is briefly stale rather than wrong, which is the same
@@ -2097,13 +2198,19 @@ impl PvfsFs {
         if entry.kind == "dir" {
             return Err(libc::EISDIR);
         }
-        let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
-        // The gate: local bytes, which is also what makes the edit cheap.
-        let local = self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?;
+        let made = self.overlay.lock().unwrap().remembers_file(&rel);
+        let target = match made {
+            Some(path) => path,
+            None => {
+                let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
+                // The gate: local bytes, which is what makes the edit cheap.
+                self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?.path
+            }
+        };
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&local.path)
+            .open(&target)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
         let fh = self.next_fh;
         self.next_fh += 1;
@@ -2165,11 +2272,25 @@ pub fn mount_view_with(
     allow_other: bool,
     cache: CacheOpts,
 ) -> Result<(), PvfsError> {
-    let fs = PvfsFs::new_view_with(data_dir, cache.clone(), None)?;
+    mount_view_writable(data_dir, mountpoint, allow_other, cache, false)
+}
+
+/// D217 — [`mount_view_with`], saying whether edits and new files are allowed
+/// (tier 1: only for files whose bytes this box already holds).
+pub fn mount_view_writable(
+    data_dir: &Path,
+    mountpoint: &Path,
+    allow_other: bool,
+    cache: CacheOpts,
+    writable: bool,
+) -> Result<(), PvfsError> {
+    let mut fs = PvfsFs::new_view_with(data_dir, cache.clone(), None)?;
+    fs.set_writable(writable);
     match fuser::mount2(fs, mountpoint, &opts(true, allow_other)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let fs = PvfsFs::new_view_with(data_dir, cache, None)?;
+            let mut fs = PvfsFs::new_view_with(data_dir, cache, None)?;
+            fs.set_writable(writable);
             if allow_other {
                 return fuser::mount2(fs, mountpoint, &opts(false, true)).map_err(allow_other_denied);
             }

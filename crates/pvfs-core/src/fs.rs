@@ -3651,7 +3651,7 @@ impl Engine {
     /// started on, and a disk backups live on must keep its headroom. The
     /// floor is per region, from the placement file
     /// ([`crate::sync::set_region_floor`]), defaulting to
-    /// [`crate::sync::PLACEMENT_FLOOR_DEFAULT`] — Chris, 2026-10-03: ~1 TB on
+    /// a share of its disk capped at 500 GB — Chris, 2026-10-03: ~1 TB on
     /// mediabox's /mnt/local for backups, ~500 GB on most mounts.
     ///
     /// The receiving region that ALREADY HOLDS the folder it belongs in wins,
@@ -3672,12 +3672,24 @@ impl Engine {
     ) -> (NodeId, std::path::PathBuf) {
         let floors: Vec<u64> = dests
             .iter()
-            .map(|(r, _)| {
-                crate::sync::region_floor_bytes(&self.data_dir, r)
-                    .unwrap_or(crate::sync::PLACEMENT_FLOOR_DEFAULT)
-            })
+            .map(|(r, root)| self.floor_for(r, root))
             .collect();
         self.placement_for_with_floors(rel_path, dests, &floors)
+    }
+
+    /// D216 — the free space a region keeps in reserve: what it was told to
+    /// keep, else a share of its own disk capped at 500 GB. A fixed default
+    /// would either write off a small disk entirely (500 GB on a 58 GB lab
+    /// box means the folder rule never fires) or hold back absurd amounts of
+    /// an 80 TB one — Chris, 2026-10-04.
+    pub fn floor_for(&self, region: &NodeId, root: &std::path::Path) -> u64 {
+        if let Ok(Some(set)) = crate::sync::region_floor_setting(&self.data_dir, region) {
+            return set;
+        }
+        let total = nix::sys::statvfs::statvfs(root)
+            .map(|st| st.blocks() * st.fragment_size())
+            .unwrap_or(0);
+        crate::sync::default_floor_for(total)
     }
 
     /// [`Self::placement_for`] with one floor for every region — the shape the
@@ -3702,7 +3714,7 @@ impl Engine {
         let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if !parent.is_empty() {
             for (i, (region, root)) in dests.iter().enumerate() {
-                let floor = floors.get(i).copied().unwrap_or(crate::sync::PLACEMENT_FLOOR_DEFAULT);
+                let floor = floors.get(i).copied().unwrap_or(0);
                 if root.join(parent).is_dir()
                     && crate::ingest::free_space_at(root).unwrap_or(0) >= floor
                 {
@@ -3711,6 +3723,37 @@ impl Engine {
             }
         }
         dests[0].clone()
+    }
+
+    /// D217 — the disks this box may create new files on: every catalogue
+    /// region bound here that is not draining, most free first (the same
+    /// per-filesystem measurement [`Self::receiving_roots`] uses, so two
+    /// regions on one disk tie and the id decides).
+    ///
+    /// `receiving_roots` is not the right set for this: a box can hold library
+    /// regions without declaring any of them a receiving region — mediabox
+    /// does — and a file created through its mount still has to land
+    /// somewhere.
+    pub fn writable_roots(&self) -> Result<Vec<(NodeId, std::path::PathBuf)>> {
+        let mut out: Vec<(NodeId, std::path::PathBuf, u64)> = Vec::new();
+        let mut by_dev: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for b in self.local_bindings()? {
+            if !self.is_catalogue_region(&b.folder_id)? || self.region_drains(&b.folder_id)? {
+                continue;
+            }
+            let root = uri_to_path(&b.source_uri)?;
+            let measure = || crate::ingest::free_space_at(&root).unwrap_or(0);
+            let free = match std::fs::metadata(&root) {
+                Ok(m) => {
+                    use std::os::unix::fs::MetadataExt;
+                    *by_dev.entry(m.dev()).or_insert_with(measure)
+                }
+                Err(_) => measure(),
+            };
+            out.push((b.folder_id.clone(), root, free));
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(out.into_iter().map(|(r, p, _)| (r, p)).collect())
     }
 
     /// D133 — a relative path this box will write under a root: no `..`, no

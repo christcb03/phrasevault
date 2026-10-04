@@ -43,6 +43,13 @@ pub struct MadeDir {
     pub regions: HashSet<String>,
 }
 
+/// D217 — a file created through this mount: when, and where its bytes are.
+#[derive(Clone, Debug)]
+pub struct MadeFile {
+    pub at: Instant,
+    pub path: std::path::PathBuf,
+}
+
 /// A folder removed through this mount: when, and the seqs held then.
 #[derive(Clone, Debug)]
 pub struct GoneDir {
@@ -57,6 +64,11 @@ pub struct Overlay {
     /// Folders made through this mount that no catalogue lists (mergerfs
     /// clones a path onto our branch before a rename into a new folder).
     pub made_dirs: HashMap<String, MadeDir>,
+    /// D217 — files created through this mount that no catalogue lists yet.
+    /// The `watch` job needs a moment to see and hash a new file; until it
+    /// has, the view answers from here, so a tool that writes a subtitle and
+    /// reads it straight back finds it.
+    pub made_files: HashMap<String, MadeFile>,
     pub gone_dirs: HashMap<String, GoneDir>,
     /// Renames the inode table has not followed yet — a remote rename
     /// finishes on its own thread, and the table is the session thread's.
@@ -105,7 +117,10 @@ pub fn held_seqs(engine: &Engine) -> HashMap<String, u64> {
 impl Overlay {
     /// Nothing is remembered: the catalogue is the view.
     pub fn is_empty(&self) -> bool {
-        self.moves.is_empty() && self.made_dirs.is_empty() && self.gone_dirs.is_empty()
+        self.moves.is_empty()
+            && self.made_dirs.is_empty()
+            && self.gone_dirs.is_empty()
+            && self.made_files.is_empty()
     }
 
     /// The catalogue paths whose rows may show at view path `rel`: itself,
@@ -200,6 +215,26 @@ impl Overlay {
 
     /// `rel` is a folder this mount vouches for: made here, or on the way
     /// to something renamed here.
+    /// D217 — a file this mount made that the catalogue has not caught up to.
+    pub fn remembers_file(&self, rel: &str) -> Option<std::path::PathBuf> {
+        self.made_files.get(rel).map(|m| m.path.clone())
+    }
+
+    /// D217 — remember a file just created at `rel`, with its bytes at `path`.
+    pub fn remember_file(&mut self, rel: &str, path: std::path::PathBuf) {
+        self.made_files.insert(rel.to_string(), MadeFile { at: Instant::now(), path });
+        self.dirty = true;
+    }
+
+    /// D217 — the files this mount made directly inside `dir`.
+    pub fn remembered_files_in(&self, dir: &str) -> Vec<String> {
+        self.made_files
+            .keys()
+            .filter(|f| parent_of(f) == dir && !f.is_empty())
+            .cloned()
+            .collect()
+    }
+
     pub fn remembers_dir(&self, rel: &str) -> bool {
         self.made_dirs.contains_key(rel)
             || (0..self.moves.len()).any(|i| {
@@ -307,6 +342,11 @@ impl Overlay {
             }
         }
         self.moves = kept;
+        // D217 — a created file is remembered only until the catalogue lists
+        // it, or for the same grace as the rest of the overlay.
+        self.made_files.retain(|rel, m| {
+            m.at.elapsed() < PENDING_TTL && engine.view_entry(rel).ok().flatten().is_none()
+        });
         let before = self.made_dirs.len() + self.gone_dirs.len();
         // A made folder the catalogue now lists is simply a folder.
         self.made_dirs.retain(|d, m| m.at.elapsed() <= PENDING_TTL && !listed(d));
@@ -332,6 +372,23 @@ impl Overlay {
 }
 
 /// The entry for a folder only this mount knows.
+/// D217 — a file this mount just created, as the view should answer for it
+/// until the `watch` job has hashed it. No content hash yet: reads come from
+/// the path the overlay remembers, not from the store.
+pub fn remembered_file(rel: &str, size: u64, mtime_ms: u64) -> ViewEntry {
+    ViewEntry {
+        rel_path: rel.to_string(),
+        kind: "file".into(),
+        size_bytes: size,
+        mtime_ms,
+        content_hash: None,
+        quality: None,
+        state: ViewState::Admitted,
+        copies: 1,
+        sources: Vec::new(),
+    }
+}
+
 pub fn remembered_dir(rel: &str) -> ViewEntry {
     ViewEntry {
         rel_path: rel.to_string(),
