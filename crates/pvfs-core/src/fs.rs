@@ -3644,18 +3644,20 @@ impl Engine {
         Ok(out.into_iter().map(|(r, p, _)| (r, p)).collect())
     }
 
-    /// D216 — a region under this much free space stops attracting new files
-    /// even when it already holds the folder: a show must not fill the disk it
-    /// started on and then fail. Chris, 2026-10-03.
-    pub const PLACEMENT_FLOOR_BYTES: u64 = 50_000_000_000;
-
     /// D216 — where a new file goes.
+    ///
+    /// A region under its free-space floor stops attracting new files even
+    /// when it already holds the folder: a show must not fill the disk it
+    /// started on, and a disk backups live on must keep its headroom. The
+    /// floor is per region, from the placement file
+    /// ([`crate::sync::set_region_floor`]), defaulting to
+    /// [`crate::sync::PLACEMENT_FLOOR_DEFAULT`] — Chris, 2026-10-03: ~1 TB on
+    /// mediabox's /mnt/local for backups, ~500 GB on most mounts.
     ///
     /// The receiving region that ALREADY HOLDS the folder it belongs in wins,
     /// so an episode joins its season and a subtitle joins its episode instead
-    /// of landing wherever the writable branch happens to be. A region under
-    /// [`Self::PLACEMENT_FLOOR_BYTES`] is passed over even when it holds the
-    /// folder, and with no holder at all the emptiest region takes it —
+    /// of landing wherever the writable branch happens to be. With no holder
+    /// at all the emptiest region takes it —
     /// `dests` arrives from [`Self::receiving_roots`] in most-free-first order,
     /// which is what makes a filling disk hand new work to its roomier sibling
     /// with no migration by hand (Chris: library -> library-ext).
@@ -3668,21 +3670,39 @@ impl Engine {
         rel_path: &str,
         dests: &[(NodeId, std::path::PathBuf)],
     ) -> (NodeId, std::path::PathBuf) {
-        self.placement_for_with_floor(rel_path, dests, Self::PLACEMENT_FLOOR_BYTES)
+        let floors: Vec<u64> = dests
+            .iter()
+            .map(|(r, _)| {
+                crate::sync::region_floor_bytes(&self.data_dir, r)
+                    .unwrap_or(crate::sync::PLACEMENT_FLOOR_DEFAULT)
+            })
+            .collect();
+        self.placement_for_with_floors(rel_path, dests, &floors)
     }
 
-    /// [`Self::placement_for`] with the floor given, so a test can say what
-    /// "nearly full" means instead of inheriting whatever the build host has
-    /// free — and so the floor can become a setting without touching callers.
+    /// [`Self::placement_for`] with one floor for every region — the shape the
+    /// tests use, so a build host's own free space cannot decide the answer.
     pub fn placement_for_with_floor(
         &self,
         rel_path: &str,
         dests: &[(NodeId, std::path::PathBuf)],
         floor: u64,
     ) -> (NodeId, std::path::PathBuf) {
+        let floors = vec![floor; dests.len()];
+        self.placement_for_with_floors(rel_path, dests, &floors)
+    }
+
+    /// [`Self::placement_for`] with each region's floor given positionally.
+    pub fn placement_for_with_floors(
+        &self,
+        rel_path: &str,
+        dests: &[(NodeId, std::path::PathBuf)],
+        floors: &[u64],
+    ) -> (NodeId, std::path::PathBuf) {
         let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if !parent.is_empty() {
-            for (region, root) in dests {
+            for (i, (region, root)) in dests.iter().enumerate() {
+                let floor = floors.get(i).copied().unwrap_or(crate::sync::PLACEMENT_FLOOR_DEFAULT);
                 if root.join(parent).is_dir()
                     && crate::ingest::free_space_at(root).unwrap_or(0) >= floor
                 {

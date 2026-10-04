@@ -62,6 +62,15 @@ pub struct PvfsFs {
     /// D130 (doc 26 phase 6) — the VIEW mount: inodes are relative paths in
     /// the merged view, not nodes. `view` picks the mode for every handler.
     view: bool,
+    /// D217 tier 1 — edits are allowed for files whose bytes this box already
+    /// holds in a region bound here. Off unless the mount was told otherwise:
+    /// a write to a file held elsewhere still gets `EROFS`, because the honest
+    /// alternative is copying the whole file across the network to change a
+    /// header, and a person should ask for that explicitly.
+    writable: bool,
+    /// D217 — handles opened for writing, so `write`/`setattr` cannot touch a
+    /// read handle, and `read` keeps its existing path.
+    write_handles: HashMap<u64, std::fs::File>,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     /// Directory listings, cached briefly: a library scan issues thousands
@@ -139,6 +148,8 @@ impl PvfsFs {
             node_to_ino: HashMap::new(),
             next_ino: 2,
             handles: HashMap::new(),
+            writable: false,
+            write_handles: HashMap::new(),
             streaming: HashMap::new(),
             active: HashMap::new(),
             own_pin: pvfs_core::storage::host_pin(data_dir),
@@ -1185,7 +1196,14 @@ impl Filesystem for PvfsFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
-            return reply.error(libc::EROFS);
+            // D217 tier 1 — an edit is allowed only where this box already
+            // holds the bytes: the write then goes straight to the real file
+            // and the `watch` job re-hashes it, with no fetch and no copy-up.
+            // Anything else stays EROFS, deliberately (see D217 §4).
+            return match self.open_for_write(ino) {
+                Ok(fh) => reply.opened(fh, 0),
+                Err(e) => reply.error(e),
+            };
         }
         if self.view {
             self.sync_overlay();
@@ -1454,8 +1472,13 @@ impl Filesystem for PvfsFs {
         if !self.view {
             return reply.error(libc::ENOSYS);
         }
-        if size.is_some() {
-            return reply.error(libc::EROFS);
+        if let Some(new_len) = size {
+            // D217 tier 1 — truncate is an edit like any other, and gated the
+            // same way: this box must already hold the bytes.
+            match self.truncate_local(ino, new_len) {
+                Ok(()) => return self.getattr(_req, ino, reply),
+                Err(e) => return reply.error(e),
+            }
         }
         self.getattr(_req, ino, reply)
     }
@@ -1654,6 +1677,52 @@ impl Filesystem for PvfsFs {
         }
     }
 
+    /// D217 tier 1 — the write itself. The bytes go to the real file in the
+    /// region this box holds, and the `watch` job re-hashes it afterwards:
+    /// the catalogue is briefly stale rather than wrong, which is the same
+    /// window any local edit outside PVFS already has.
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        use std::os::unix::fs::FileExt;
+        let Some(f) = self.write_handles.get(&fh) else {
+            return reply.error(libc::EBADF);
+        };
+        match f.write_at(data, offset as u64) {
+            Ok(n) => reply.written(n as u32),
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _datasync: bool, reply: fuser::ReplyEmpty) {
+        match self.write_handles.get(&fh) {
+            Some(f) => match f.sync_all() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            },
+            None => reply.ok(),
+        }
+    }
+
+    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock_owner: u64, reply: fuser::ReplyEmpty) {
+        match self.write_handles.get(&fh) {
+            Some(f) => match f.sync_all() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            },
+            None => reply.ok(),
+        }
+    }
+
     fn release(
         &mut self,
         _req: &Request<'_>,
@@ -1664,6 +1733,9 @@ impl Filesystem for PvfsFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        // D217 — a write handle closes here too; the `watch` job picks the
+        // changed bytes up and re-hashes them.
+        self.write_handles.remove(&fh);
         self.handles.remove(&fh);
         self.streaming.remove(&fh);
         self.proxy.remove(&fh);
@@ -1979,6 +2051,67 @@ impl PvfsFs {
     }
 }
 
+
+impl PvfsFs {
+    /// D217 tier 1 — open a file for writing, if this box holds its bytes.
+    ///
+    /// `EROFS` when the mount was not told to allow edits, and `EROFS` with
+    /// nothing attempted when the bytes live on another box: copying a whole
+    /// film across the network to change a header is a decision for a person,
+    /// not a side effect of `open`.
+    /// D217 tier 1 — allow edits of files whose bytes this box already holds.
+    /// Off by default: turning it on is a mount decision (`pvfs mount
+    /// --writable`), because it changes what the arrs and Plex can do to the
+    /// library through this path.
+    pub fn set_writable(&mut self, yes: bool) {
+        self.writable = yes;
+    }
+
+    /// D217 tier 1 — shorten a file this box holds.
+    fn truncate_local(&mut self, ino: u64, new_len: u64) -> Result<(), i32> {
+        if !self.writable {
+            return Err(libc::EROFS);
+        }
+        let rel = self.ino_to_path.get(&ino).cloned().ok_or(libc::ENOENT)?;
+        let entry = self.view_entry_of(&rel).ok_or(libc::ENOENT)?;
+        let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
+        let local = self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&local.path)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        f.set_len(new_len).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    }
+
+    fn open_for_write(&mut self, ino: u64) -> Result<u64, i32> {
+        if !self.writable {
+            return Err(libc::EROFS);
+        }
+        let rel = if self.view {
+            self.sync_overlay();
+            self.ino_to_path.get(&ino).cloned().ok_or(libc::ENOENT)?
+        } else {
+            return Err(libc::EROFS);
+        };
+        let entry = self.view_entry_of(&rel).ok_or(libc::ENOENT)?;
+        if entry.kind == "dir" {
+            return Err(libc::EISDIR);
+        }
+        let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
+        // The gate: local bytes, which is also what makes the edit cheap.
+        let local = self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&local.path)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.write_handles.insert(fh, f);
+        Ok(fh)
+    }
+}
+
 fn opts(auto_unmount: bool, allow_other: bool) -> Vec<MountOption> {
     // D71 W2: NOT `MountOption::RO`. The kernel enforces that flag before any
     // handler runs, so `unlink`/`rmdir`/`rename` never saw the call — the lab
@@ -2062,11 +2195,25 @@ pub fn spawn_view_mount_with(
     cache: CacheOpts,
     sources: Option<Vec<ReplicaSource>>,
 ) -> Result<fuser::BackgroundSession, PvfsError> {
-    let fs = PvfsFs::new_view_with(data_dir, cache.clone(), sources.clone())?;
+    spawn_view_mount_writable(data_dir, mountpoint, cache, sources, false)
+}
+
+/// D217 tier 1 — [`spawn_view_mount_with`], saying whether edits of locally
+/// held files are allowed.
+pub fn spawn_view_mount_writable(
+    data_dir: &Path,
+    mountpoint: &Path,
+    cache: CacheOpts,
+    sources: Option<Vec<ReplicaSource>>,
+    writable: bool,
+) -> Result<fuser::BackgroundSession, PvfsError> {
+    let mut fs = PvfsFs::new_view_with(data_dir, cache.clone(), sources.clone())?;
+    fs.set_writable(writable);
     match fuser::spawn_mount2(fs, mountpoint, &opts(true, false)) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let fs = PvfsFs::new_view_with(data_dir, cache, sources)?;
+            let mut fs = PvfsFs::new_view_with(data_dir, cache, sources)?;
+            fs.set_writable(writable);
             fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }

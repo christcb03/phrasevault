@@ -1254,7 +1254,16 @@ pub struct Placement {
     /// D133 — days a region's `.pvfs-trash` is kept before `resolve` purges
     /// it (doc 26 §7.4's trash-age part). Absent = `TRASH_KEEP_DAYS_DEFAULT`.
     pub retention: Vec<(NodeId, u64)>,
+    /// D216 — bytes to keep free on a region's disk. While a region has less
+    /// than this, it stops attracting new files even when it already holds
+    /// the folder they belong in, so headroom survives (Chris wants ~1 TB on
+    /// mediabox's /mnt/local for backups, ~500 GB elsewhere). Absent =
+    /// [`PLACEMENT_FLOOR_DEFAULT`].
+    pub floor: Vec<(NodeId, u64)>,
 }
+
+/// D216 — the free-space floor a region keeps when it has not declared one.
+pub const PLACEMENT_FLOOR_DEFAULT: u64 = 500_000_000_000;
 
 /// D133 — default trash retention, in days.
 pub const TRASH_KEEP_DAYS_DEFAULT: u64 = 7;
@@ -1296,6 +1305,17 @@ pub fn load_placement_full(data_dir: &Path) -> Result<Placement> {
             // a directory with spaces survives a round trip.
             match rest.split_once(' ') {
                 Some((id, uri)) => out.staging_roots.push((id.to_string(), uri.to_string())),
+                None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
+            }
+        } else if let Some(rest) = line.strip_prefix("floor ") {
+            // D216 — `floor <region> <bytes>`
+            match rest.split_once(' ') {
+                Some((id, bytes)) => out.floor.push((
+                    id.to_string(),
+                    bytes.parse::<u64>().map_err(|_| {
+                        bad("placement", &format!("corrupt placement line: {line:?}"))
+                    })?,
+                )),
                 None => return Err(bad("placement", &format!("corrupt placement line: {line:?}"))),
             }
         } else if let Some(id) = line.strip_prefix("central-tree ") {
@@ -1384,6 +1404,9 @@ fn save_placement(data_dir: &Path, p: &Placement) -> Result<()> {
     }
     for (r, d) in &p.central {
         text.push_str(&format!("central {r} {}\n", d.display()));
+    }
+    for (r, b) in &p.floor {
+        text.push_str(&format!("floor {r} {b}\n"));
     }
     for (r, u) in &p.staging_roots {
         text.push_str(&format!("staging-root {r} {u}\n"));
@@ -1529,6 +1552,25 @@ pub fn set_region_retention(data_dir: &Path, id: &NodeId, days: u64) -> Result<(
     p.retention.retain(|(r, _)| r != id);
     p.retention.push((id.clone(), days));
     save_placement(data_dir, &p)
+}
+
+/// D216 — set the free space a region keeps in reserve, in bytes.
+pub fn set_region_floor(data_dir: &Path, id: &NodeId, bytes: u64) -> Result<()> {
+    let mut p = load_placement_full(data_dir)?;
+    p.floor.retain(|(r, _)| r != id);
+    p.floor.push((id.clone(), bytes));
+    save_placement(data_dir, &p)
+}
+
+/// D216 — the free space this region keeps in reserve (the default when it
+/// has not declared one).
+pub fn region_floor_bytes(data_dir: &Path, id: &str) -> Result<u64> {
+    Ok(load_placement_full(data_dir)?
+        .floor
+        .into_iter()
+        .find(|(r, _)| r == id)
+        .map(|(_, b)| b)
+        .unwrap_or(PLACEMENT_FLOOR_DEFAULT))
 }
 
 /// D133 — a region's trash retention in days (the default when undeclared).
