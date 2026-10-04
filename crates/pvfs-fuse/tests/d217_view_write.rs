@@ -149,6 +149,17 @@ fn a_writable_mount_edits_what_this_box_holds_and_creates_beside_the_folder() {
         "a just-created file is in the listing: {listed:?}"
     );
 
+    // ---- and it can be deleted again straight away, before any scan.
+    // Refusing that cost an `rm` an I/O error on the fleet (2026-10-04).
+    let scratch = season.join("Show - s01e01.scratch.srt");
+    std::fs::write(&scratch, b"temporary").expect("create");
+    std::fs::remove_file(&scratch).expect("a just-created file deletes again");
+    assert!(!scratch.exists(), "gone from the mount");
+    assert!(
+        !lib.join("TV/Show/Season 01/Show - s01e01.scratch.srt").exists(),
+        "and gone from the disk"
+    );
+
     // ---- edit: a file this box holds takes a write in place
     let ep = season.join("Show - s01e01.mkv");
     {

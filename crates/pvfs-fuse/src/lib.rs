@@ -589,6 +589,24 @@ impl PvfsFs {
         if entry.kind == "dir" {
             return reply.error(libc::EISDIR);
         }
+        // D217 — a file created through this mount has no catalogued copy for
+        // the first half-minute of its life (the `watch` job has not hashed it
+        // yet). Deleting it then is a plain unlink of the bytes `create` wrote,
+        // not a trip to a region's trash: there is nothing yet to restore it
+        // from, and refusing cost an `rm` an I/O error (found on the fleet,
+        // 2026-10-04, by a tool doing exactly that).
+        let made = self.overlay.lock().unwrap().remembers_file(&rel);
+        if let Some(path) = made {
+            if std::fs::remove_file(&path).is_err() && path.exists() {
+                return reply.error(libc::EIO);
+            }
+            let mut o = self.overlay.lock().unwrap();
+            o.made_files.remove(&rel);
+            o.dirty = true;
+            drop(o);
+            self.view_cache.clear();
+            return reply.ok();
+        }
         let copies: Vec<(String, String)> = entry
             .sources
             .iter()
