@@ -3644,6 +3644,55 @@ impl Engine {
         Ok(out.into_iter().map(|(r, p, _)| (r, p)).collect())
     }
 
+    /// D216 — a region under this much free space stops attracting new files
+    /// even when it already holds the folder: a show must not fill the disk it
+    /// started on and then fail. Chris, 2026-10-03.
+    pub const PLACEMENT_FLOOR_BYTES: u64 = 50_000_000_000;
+
+    /// D216 — where a new file goes.
+    ///
+    /// The receiving region that ALREADY HOLDS the folder it belongs in wins,
+    /// so an episode joins its season and a subtitle joins its episode instead
+    /// of landing wherever the writable branch happens to be. A region under
+    /// [`Self::PLACEMENT_FLOOR_BYTES`] is passed over even when it holds the
+    /// folder, and with no holder at all the emptiest region takes it —
+    /// `dests` arrives from [`Self::receiving_roots`] in most-free-first order,
+    /// which is what makes a filling disk hand new work to its roomier sibling
+    /// with no migration by hand (Chris: library -> library-ext).
+    ///
+    /// The folder test is the disk's own answer — does that directory exist
+    /// under this region's root — because that is the thing a person means by
+    /// "the show is on that mount", and it needs no catalogue read per file.
+    pub fn placement_for(
+        &self,
+        rel_path: &str,
+        dests: &[(NodeId, std::path::PathBuf)],
+    ) -> (NodeId, std::path::PathBuf) {
+        self.placement_for_with_floor(rel_path, dests, Self::PLACEMENT_FLOOR_BYTES)
+    }
+
+    /// [`Self::placement_for`] with the floor given, so a test can say what
+    /// "nearly full" means instead of inheriting whatever the build host has
+    /// free — and so the floor can become a setting without touching callers.
+    pub fn placement_for_with_floor(
+        &self,
+        rel_path: &str,
+        dests: &[(NodeId, std::path::PathBuf)],
+        floor: u64,
+    ) -> (NodeId, std::path::PathBuf) {
+        let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if !parent.is_empty() {
+            for (region, root) in dests {
+                if root.join(parent).is_dir()
+                    && crate::ingest::free_space_at(root).unwrap_or(0) >= floor
+                {
+                    return (region.clone(), root.clone());
+                }
+            }
+        }
+        dests[0].clone()
+    }
+
     /// D133 — a relative path this box will write under a root: no `..`, no
     /// empty component, nothing that begins with `.pvfs-` (rows come from
     /// other boxes' attested manifests; the disk is ours).
@@ -3729,7 +3778,9 @@ impl Engine {
                     None => continue,
                 }
             } else {
-                dests[0].clone()
+                // D216 — join the folder this file belongs to, if a receiving
+                // region already has it and has room; else the emptiest.
+                self.placement_for(&entry.rel_path, &dests)
             };
             items.push(ReceiveItem {
                 rel_path: entry.rel_path.clone(),
