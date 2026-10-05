@@ -23,6 +23,10 @@ NOT being cleaned up by hand (doc 24 §7 B6) because re-genesis drops it for
 free; and the hash must become portable (`pvfs-manifest 2`, doc 24 §6) or a
 fresh forest re-reads all 23 TB. Option **C first** is unchanged.
 
+> **Status 2026-10-04 (D218):** what happened next. On 2026-09-12 the fresh forest came as the
+> region-model cutover (docs 26, 29), not as a re-genesis of this model; the old forest was
+> deleted on 2026-09-21. Compaction itself is still unbuilt.
+
 Date: 2026-06-21
 Depends on: [02 (P0 core / log & chain)](02-p0-core-engine-spec.md), [03 (federation & trust)](03-federation-trust-and-uris.md), [06 (access control)](06-access-control-and-daemon.md)
 Roadmap: [08 §4 item 15](08-roadmap-and-status.md) (Compaction row)

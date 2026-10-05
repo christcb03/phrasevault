@@ -1,5 +1,7 @@
 # PVFS — PhraseVault Filesystem Architecture
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 ## Overview
 
 PVFS is a content-addressed, multi-tree filesystem built on the PhraseVault forest DAG. It provides a virtual filesystem abstraction over arbitrary storage backends — local disk, NAS mounts, peer-to-peer nodes, IPFS, or BitTorrent — with deduplication, signed provenance, and a staged path toward a native `pvfs://` protocol for inter-node file transfer.

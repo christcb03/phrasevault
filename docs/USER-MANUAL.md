@@ -6,9 +6,10 @@ This manual covers everyday use of the `pvfs` command-line tool and sharing fore
 > Status: covers **PVFS 1.4** (forests, ACLs/tags, full daemon read/write/admin, secure blobs,
 > companion, key replacement, federation + replicas, serve jobs, regions, the streaming mount,
 > attachment kinds, and the swarm data plane) **and what main has added since, unreleased**, up to
-> the build the media fleet runs (`v1.4-495`, rolled 2026-09-27): ingest sessions (§7.12) and the
-> **region model** — each box catalogues its own disk, the merged view and its mount, the mover,
-> the trash, copies of the log and moving the owner (§7.13). Future work is under
+> the build the media fleet runs (`v1.4-549`, rolled 2026-10-04): ingest sessions (§7.12) and the
+> **region model** — each box catalogues its own disk, the merged view and its mount (writable
+> since that roll, with known problems: §7.13), the mover, the trash, copies of the log and moving
+> the owner (§7.13). Future work is under
 > [Roadmap](#11-roadmap).
 
 ---
@@ -45,8 +46,9 @@ Your real files stay where they are on disk; PVFS *indexes and binds* them into 
 
 ## 3. Installation
 
-See [INSTALL.md](INSTALL.md). In short, you get two binaries: `pvfs` (the CLI) and `pvfsd` (the
-daemon). The examples below assume both are on your `PATH`.
+See [INSTALL.md](INSTALL.md). In short, you get three binaries: `pvfs` (the CLI), `pvfsd` (the
+daemon) and `pvfs-companion` (the key vault and signing agent). The examples below assume they are
+on your `PATH`.
 
 ---
 
@@ -57,7 +59,7 @@ daemon). The examples below assume both are on your `PATH`.
 cd ~/media
 pvfs forest init
 #   → prints the forest id, root node id, and your RECOVERY PHRASE (write it down!)
-#   → offers to import the existing files in ~/media into the forest
+#   → imports the existing files in ~/media into the forest (it does not ask; --no-import skips it)
 
 # see what's in the tree
 pvfs ls ~/media            # children of the forest root
@@ -87,7 +89,7 @@ PVFS follows ordinary filesystem ownership:
 If a forest's `.pvfs/` ever ends up owned by the wrong account (e.g. a mistaken `sudo`), repair it:
 
 ```bash
-sudo pvfs forest fix-permissions ~/media     # reassigns .pvfs/ back to you
+sudo pvfs forest fix-permissions --mount ~/media     # reassigns .pvfs/ back to you
 ```
 
 Importing respects read permission: `forest init` / `pvfs scan` **skip files you can't read** and
@@ -169,7 +171,11 @@ empty would soft-remove every location under it.
 ### 6.2 The live mount (`pvfs mount`, Linux)
 
 Where an export materializes a snapshot, `pvfs mount <node> <dir>` presents the tree as a **live
-read-only filesystem** (FUSE): browse with `ls`, open files with anything. Bytes resolve at open —
+filesystem** (FUSE) whose **file data is read-only**: browse with `ls`, open files with anything.
+The namespace is not read-only: `rm`, `rmdir` and `mv` through the mount write through to the
+catalog — they unlink, move or rename the node (on a replica, through the owner). The mount itself
+touches no bytes: a holder's `reclaim` job trashes the bytes of a node that is no longer linked
+anywhere. Bytes resolve at open —
 local path, sync store, or a verified fetch from a serving holder — so a pointer-mode library
 streams on demand. Files whose chunk layout the owner has attested (automatic for anything hashed
 since P9.1) **stream while they fetch**: playback starts as soon as the first chunks verify, with
@@ -494,7 +500,8 @@ migrates it, it fills the hash and attests the chunk manifest from the bytes
 it just fetched, and the central copy lands under the new, attested id. From
 then on every box can stream, heal, and verify it. Files already satisfied in
 place are deliberately left alone — hash a library in bulk only when you ask:
-`pvfs loc hash <file>` (owner-side).
+`pvfs loc hash <file>`, run on the box that holds the bytes (a replica
+included: it hashes locally and routes the write through the owner).
 
 **Let the store's machine serve it (F5.5).** When the store directory lives on
 another box (the NAS, NFS-mounted here), tell the mover so it logs each store
@@ -522,8 +529,9 @@ ingest box:  pvfs replica sync && pvfs evict              (3 TB stays free)
 ### 7.11 The fleet runs itself — daemon jobs (doc 18)
 
 Every recurring loop above can run inside `pvfsd` instead of cron. Jobs are per-box
-deployment state (`serve.jobs`, edited by `pvfs serve enable|disable`, reloaded on
-SIGHUP or restart); `pvfs serve status` shows live state — running/idle/backoff, the
+deployment state (`serve.jobs`, edited by `pvfs serve enable|disable`; the running
+daemon notices the changed file by itself within a tick — SIGHUP and a restart
+reload it too); `pvfs serve status` shows live state — running/idle/backoff, the
 last success, the last error:
 
 ```bash
@@ -558,15 +566,20 @@ Jobs dial with the box's client identity: enroll it first (§7.9).
 state, `last_ok` (the last success) and `last_error` — cleared by the next
 success, so a present error means the last run failed. The states: `running`,
 `idle`, `backoff` (a transient failure; the job retries by itself), `error`
-(the thread exited; the supervisor restarts it), `disabled`, `stalled` (a
-pass in flight far past its own typical length — evidence), `overdue` (no
-pass finished lately — for the pass-based jobs usually just a long pass).
+(the thread exited; the supervisor restarts it), `disabled`, `stalled` (for
+`watch` and `receive`, which report progress: a pass that has not advanced
+for 30 minutes, with where it stopped; for the others: a pass in flight far
+past the job's typical length), `overdue` (no pass finished lately — never
+said of a pass that reports progress and is advancing; PVOS D207).
 `follow` is continuous: its `last_ok` is refreshed every few seconds while it
 is current with its source, so an `overdue` follow really has not been able
-to confirm for 15 minutes (D146).
+to confirm for 15 minutes (D146). `pvfs serve status` also prints the build
+the daemon itself runs (PVOS D200 — after a roll that did not restart it, not
+the CLI's) and, under a job with a pass in flight, a line of that pass's
+progress.
 
 On the owner, the `health` job (`pvfs serve enable health`) polls every
-announced peer every two minutes:
+announced peer (`pvfs fleet announce`, §7.13) every two minutes:
 
 ```bash
 pvfs fleet health            # every peer: up, or down since when; job errors; free space
@@ -692,7 +705,7 @@ batch; a file it cannot read is skipped and named, and its old row kept.
 ```bash
 pvfs region ls        # on the library's box
 #   7ea45c8e…  catalogue  drains  head 3120  held 3120  1204 rows
-#   fe38175f…  catalogue  head 4410  live  27290 rows  receives
+#   fe38175f…  catalogue  head 4410  live  27290 rows  receives 2×4
 pvfs region entries <folder-id>   # the rows, and the last head this box published
 pvfs region quality               # video files measured / unmeasured / unreadable / suspect, per region (D208, D211)
 pvfs region probe-remote          # regions this box measures for the box that holds them (D211; bare asks)
@@ -702,7 +715,26 @@ pvfs region fetch                 # fetch now what this box is behind on (the jo
 `region ls` says, for each region: its head; `live` (this box catalogues it),
 `held N` (a fetched copy at head N) or `not fetched`; how many rows; `STALE`
 when the log attests a newer head than the one held (an offline box's region
-is old, not stale: nothing newer exists); `drains` and `receives` (below).
+is old, not stale: nothing newer exists); `drains`, and `receives 2×4` on a
+region that receives here — files at once × ranges of each (below).
+
+**Announcing a box.** "Announced", here and in §7.11, means a box has
+published its dial address in the forest (`.fleet/endpoints/<its pin>`): that
+is how the other boxes' jobs — `catalogue`, `receive`, the view's
+read-through, the owner's `health` — find it, with no `pvfs instance add` on
+each of them.
+
+```bash
+pvfs fleet announce 192.168.1.20:7433   # this box's address as the fleet should dial it; bare, it asks
+pvfs fleet announce --retract           # remove this box's endpoint record instead
+```
+
+It needs a transport pin (run `pvfsd --listen` once), and on a replica it
+writes through the owner. The same command records what the box runs —
+release, protocol, schema — which is what `pvfs fleet versions` reads, so run
+it again after an upgrade; an unchanged record is a no-op. The pin still
+gates every connection: the address is only a hint. PVOS's fleet play
+announces each box.
 
 **When the owner is down**, nothing daily stops: each box keeps cataloguing,
 publishes its heads locally and hands them to its peers directly, signed
@@ -755,14 +787,79 @@ ones as a whole before they are kept.
   the same network.
 - `--allow-other` lets other users read it (root, mergerfs, containers); it
   needs `user_allow_other` in `/etc/fuse.conf`.
+- `--writable` (PVOS D217; off by default) also lets files be created and
+  edited through the mount — below, with its known problems.
 
 What the view accepts, because a media manager importing an upgrade needs it:
 **delete** a file (the box that holds each copy at that path moves it to its
 region's trash — every copy, on every box), **rename** a file or a folder,
 **`mkdir`** and **`rmdir`** (done by the box that holds the files, on its own
-disk); `chmod`, `chown` and `touch` are accepted and ignored. What it refuses:
-creating or writing a file. New bytes arrive on a region's own disk and are
-catalogued there.
+disk); `chmod`, `chown` and `touch` are accepted and ignored. Creating or
+writing a file is refused (`EROFS`, "Read-only file system") unless the mount
+was started with `--writable`: without it, new bytes arrive on a region's own
+disk and are catalogued there.
+
+#### Writing through the view (`pvfs mount --view --writable`)
+
+```bash
+pvfs --forest media mount --view /mnt/pvfs/Media --allow-other --cache-mode stream --writable
+```
+
+Off by default, because it changes what Plex and the arrs may do to the
+library through this path (PVOS D217; on the fleet since `v1.4-549`,
+2026-10-04). With it:
+
+- **Edit a file this box already holds.** It can be opened for writing,
+  written and truncated in place: the bytes go to the real file in its region
+  on this box, and the `watch` job hashes it again afterwards — until then the
+  catalogue still lists the old hash.
+- **A file held only on another box is still refused** (`EROFS`). Nothing is
+  copied here to be edited.
+- **Create a file.** It is made on this box, in one of the catalogue regions
+  this box holds that does not drain — the one that already holds the file's
+  folder (the placement rule, below) — and it is listed and readable through
+  this mount at once. Other boxes see it once this box's watch has hashed it
+  and published. A box with no such region (an ingest box whose only region
+  drains) still refuses creates.
+- **Delete a file created this way before it is catalogued** and it is
+  removed outright: there is no catalogued copy yet to send to a trash.
+
+The mount's start-up line still says `read-only` with `--writable`, and `df`
+on the mount still reports no free space.
+
+**Known problems (2026-10-04, PVOS D218 §2.1).** All six are open in
+`v1.4-549`, the build the fleet runs. Read them before turning `--writable`
+on, and before editing anything through a mount that has it:
+
+1. **An edit can change the wrong file.** An edit or a truncate is applied to
+   the first file on this box *with the same content* — not to the file that
+   was opened. If the file has a byte-identical twin on this box (the same
+   subtitle or episode filed twice; every empty file is a twin of every other
+   empty file), the twin is changed and the file you opened is not. Until
+   this is fixed, do not edit through the mount a file that may have an
+   identical copy on the same box.
+2. **The free-space floor is not always kept.** A new file at the view's
+   root, or in a folder that no region with room holds — created through the
+   mount, or pulled by `receive` — goes to the region with the most free
+   space, and that region's floor (below) is not checked.
+3. **A created file can drop out of the listing.** If the `watch` job has not
+   catalogued a new file within 10 minutes of its creation — a large or slow
+   copy — the mount stops showing it (`No such file or directory`) until it
+   is catalogued. Its bytes are still on the disk, in the region's folder.
+4. **Deleting a new file is a hard delete.** Until a created file is
+   catalogued, `rm` through the mount removes it for good: no trash, nothing
+   to restore — for as long as that takes, up to the 10 minutes above.
+5. **Truncating or renaming a new file fails.** Until a created file is
+   catalogued, both answer `Input/output error` (`EIO`). A tool that writes a
+   temporary file and renames it into place fails, and leaves the temporary
+   file behind.
+6. **The mount checks no per-user permissions.** With `--allow-other`, any
+   local user can create, overwrite, truncate, delete and rename library
+   files through the mount, with the rights of the user who mounted it.
+
+Mounting without `--writable` (PVOS's fleet play: `pvfs_mount_writable`)
+removes problems 1 and 3–5, and 2 for creates. It does not remove 6 for
+deletes and renames, which the view accepts either way.
 
 Restarting the daemon does not end a stream open through the mount;
 restarting the mount does. So a mount may stay on an older build across an
@@ -799,6 +896,39 @@ And two jobs, each every five minutes:
 With those cadences a file that lands in staging reaches the library's disk
 within about seven minutes, and leaves staging within about five more (doc 29
 §4 F).
+
+**Where a new file goes (PVOS D216).** `receive`, and a create through a
+writable view (above), choose among the regions on this box that may take
+the file — for `receive` its receiving regions, for a create every catalogue
+region it holds that does not drain:
+
+- a region whose root already has the file's folder, and whose disk has free
+  space at or above its **floor**, takes it;
+- when several do (a folder split across disks), the one that holds a file
+  with the same stem wins — `S01E02.en.srt` joins `S01E02.mkv` — else the one
+  with the most free space;
+- when none does, the region with the most free space takes it.
+
+So an episode joins its season and a subtitle its episode, and a disk that
+has reached its floor hands new work to a roomier one. Nothing already placed
+is moved, and a box only ever chooses among its own regions.
+
+The **floor** is the free space a region's disk keeps in reserve: per region,
+local to this box.
+
+```bash
+pvfs region floor <region> 1T      # 500G, 1T, or bytes
+pvfs region floor <region>         # bare: asks
+```
+
+With nothing set, the floor is 5 % of the disk, capped at 500 GB. A set floor
+is the line `floor <region> <bytes>` in this box's `.pvfs/placement` file.
+Two things to know. The bare prompt offers `[500G]`, so pressing Enter
+**writes an explicit 500 GB floor**, not the default: a region whose disk has
+less than 500 GB free then stops attracting files by their folder — on a disk
+smaller than that, for good. And no command shows a floor or returns a region
+to the default. The floor is not checked in every case: known problem 2,
+above.
 
 #### The trash
 
@@ -899,18 +1029,29 @@ build that has this command is born bound.
 | `sync`, `export`, `tier`, `evict` | the node model's mover and views (§7.8–§7.11) | — |
 
 `pvfs serve enable --help` lists the same. `pvfs serve status` shows each
-job's state, and also the view's conflicts, stale catalogues, whether the
-box is fenced, the free space of every disk it stores on, its trash, its
-running mounts and its last log copy. `pvfs fleet versions` shows what every
-box runs (release, protocol, schema), read from the catalog.
+job's state, and also the daemon's build, its log's tip, the view's conflicts
+and stale catalogues (each line only when the count is not zero), whether the
+box is fenced, the free space of every disk it stores on and its trash.
+`--json` adds its running mounts and its last log copy. `pvfs fleet versions`
+shows what every box runs (release, protocol, schema), read from the catalog.
 
-**The media fleet (2026-09-30)** — the worked example the design docs use:
+**The media fleet (2026-10-04)** — the worked example the design docs use.
+The build and the mounts were read that day; the regions and the job lists
+are as recorded on 2026-09-30:
 
 | box | role | regions | jobs |
 |---|---|---|---|
 | mediabox | owner (`/opt/pvfs/media`, alias `media`) and Plex's box | `mediabox-local`, `mediabox-local2` | `reclaim,health,catalogue,watch` |
 | feederbox | ingest | `staging` (drains) | `follow,watch,catalogue,resolve` |
 | the NAS | library | `library` (receives), `library-ext` | `follow,watch,catalogue,receive` |
+
+All three run `v1.4-549-gea84559`, rolled 2026-10-04 at about 1:00 PM
+(`v1.4-495` before that, from 2026-09-27). mediabox's library mount is
+writable — `pvfs --forest /opt/pvfs/media mount --allow-other --view
+/mnt/pvfs/Media --cache-mode stream --writable` — so the known problems
+above apply to it; feederbox's view mount has neither `--writable` nor a
+`--cache-mode`. `mediabox-local`, on `/mnt/local`, keeps a 1 TB floor (set
+with `pvfs region floor`; from the roll session's summary, not read back).
 
 ## 8. Secure blobs (encrypted-at-rest storage)
 
@@ -1020,10 +1161,10 @@ pvfs versions            # bare works; --json for scripts
 ```
 ```
 pvfs             : 1.4.0
-wire proto       : 15 (talks back to 3)
+wire proto       : 16 (talks back to 3)
 projection schema: 20 (this binary)
 this forest      : 19 — will upgrade on next open (per-box cache; the fleet does not need to stop)
-build            : v1.4-495-gc17ae29 (mount compat 1)
+build            : v1.4-549-gea84559 (mount compat 1)
 opening it here  : migrates in place from v19 (…)
 ```
 
@@ -1038,9 +1179,10 @@ Read the first three lines like this:
   the log and **every box has its own**, so a schema-only change is a *per-box*
   concern. Upgrade one machine at a time; the others keep serving throughout,
   and readers simply fall through to them. The fleet never has to stop.
-- **wire proto** — how boxes talk to each other. A change here is **fleet-wide**:
-  mixed versions have to negotiate, so plan it deliberately rather than rolling
-  it machine by machine.
+- **wire proto** — how boxes talk. Every bump since protocol 4 has been additive:
+  any two boxes between the `talks back to` number and the current one work
+  together, so a protocol bump rolls box by box, owner first. Only a change of
+  the `talks back to` floor is fleet-wide ([VERSIONING.md](../VERSIONING.md)).
 - **pvfs** — the release; **build** names the exact commit, which is what to
   compare between boxes while main runs ahead of the last release.
 
@@ -1085,33 +1227,47 @@ second copy of the index while it runs.
 | `pvfs ls [target]` | No target: list registered forests. With target: list children. |
 | `pvfs walk <target>` · `pvfs node <target>` | Walk a tree · show one node. |
 | `pvfs add <parent> --kind … --label …` | Add a node. |
-| `pvfs loc add\|rm\|ls\|verify <file> …` | Manage where a file's bytes live. |
+| `pvfs loc add\|rm\|ls\|verify\|hash <file> …` | Manage where a file's bytes live; `hash` fills an empty content hash from the bytes, on the box that holds them (prints the successor node's id). |
+| `pvfs loc move <target> [--to <root>] [--dry-run]` | Node model: move a file's or a folder's BYTES to another root of its library — place, verify, then retire the source (D81). Asks for the root when omitted. |
+| `pvfs loc retire [prefix] [--dry-run]` | Node model: retire every location under a URI prefix whose file is also held somewhere else; a file with no other trusted copy is refused and listed (D80). |
+| `pvfs stat <target>` | A node and the availability of each of its locations. |
+| `pvfs tree create <label>` | Create a new tree (a root folder node). |
+| `pvfs unbind <folder> [--root <dir>] [--retire-locations \| --keep-locations]` | Remove a folder's directory binding; it asks which root when there are several, and whether to retire the locations recorded under it. |
+| `pvfs hash <target>` | Node model: fill a file node's empty content hash (prints the successor node's id). |
+| `pvfs changes` | Node model: list the nodes flagged changed-on-disk (settle one with `pvfs resolve`). |
+| `pvfs missing [--forget] [--yes]` | Node model: files the catalog claims that nobody holds — a report; `--forget` unlinks them (D81). |
+| `pvfs sidecar-backfill [--dry-run]` | Node model: write the catalog's hashes beside the files that have no sidecar, without reading file content (D93). |
+| `pvfs sidecar-upgrade [--dry-run] [--yes]` | Bring the manifests beside this box's catalogued files up to v3, from the catalogue; says what it would re-read and asks first (D150). |
 | `pvfs bind <folder> <dir> [--kind in-place\|migrate\|mirror --to <store>]` · `pvfs scan <folder>` | Enroll a real directory — as-is, self-draining staging, or mirrored backup (§6.1b) · index it. |
 | `pvfs export <target> <dir> [--mode symlink\|hardlink\|copy] [--prune]` | Materialize a tree as a native directory for non-PVFS apps (§6.1). |
-| `pvfs mount <target> <dir>` · `pvfs umount <dir>` | Live read-only FUSE view — bytes stream on demand (§6.2, Linux). |
+| `pvfs mount <target> <dir> [--allow-other]` · `pvfs umount <dir>` | Live FUSE view of a node's tree — bytes stream on demand; file data is read-only, while `rm`, `rmdir` and `mv` write through to the catalog (§6.2, Linux). |
 | `pvfs region mark\|ls\|unmark <node>` | Make a subtree its own signed-log replication/audit unit (§6.3). |
 | `pvfs region mark <node> --catalogue --owner key:<hex>` | Make a folder a catalogue region, owned by the box that holds its disk — the region model (§7.13). |
 | `pvfs region entries <region>` · `pvfs region fetch [region]` | A catalogue region's rows · fetch now the catalogues this box is behind on (§7.13). |
 | `pvfs region quality [region]` | What is known of each catalogue region's video quality: measured, unmeasured, unreadable (ffprobe said "invalid data" twice, 30+ min apart — it loses to a measured copy) and suspect (once), and whether this box has ffprobe. The daemon's watch measures (PVOS D208, D211). |
 | `pvfs region probe-remote [region] [on\|off]` | The regions THIS box measures with ffprobe for the box that holds them, reading the bytes from it over the LAN (a holder further than 10 ms is skipped); the holder writes its own rows. For a holder with no ffprobe (the NAS). Bare: lists them and asks (PVOS D211). |
 | `pvfs region drain <region> on\|off` · `receive <region> on\|off` · `retention <region> <days>` | Staging (fleet-wide) · this box's receiving library region · how long its trash is kept (§7.13). |
+| `pvfs region floor <region> [size]` | The free space this box keeps in reserve on a region's disk (`500G`, `1T`, bytes): under it, the region stops attracting new files (PVOS D216; §7.13). Default 5 % of the disk, capped at 500 GB. Bare, it asks, and Enter writes an explicit 500 GB. |
 | `pvfs view ls [dir]` · `pvfs view conflicts` | The merged view, one level at a time · every path where two regions disagree (§7.13). |
 | `pvfs view receive [--dry-run]` · `pvfs view resolve [--dry-run]` | Run the mover's two halves now (§7.13). |
-| `pvfs mount --view <dir> [--cache-mode keep\|stream] [--allow-other]` | The merged view as a filesystem; bytes from this box or read through by hash (§7.13). |
+| `pvfs mount --view <dir> [--cache-mode keep\|stream] [--cache-max <size>] [--cache-age <age>] [--allow-other] [--writable]` | The merged view as a filesystem; bytes from this box or read through by hash. `--cache-max` (500G) and `--cache-age` (1d) bound what `keep` keeps. `--writable` (PVOS D217; off by default) allows edits of files this box holds, and new files — read its known problems first (§7.13). |
 | `pvfs trash ls\|restore [path]` · `pvfs trash put <path> --region <id>` | What was moved aside on this box, and putting it back · one region's copy to its trash (§7.13). |
 | `pvfs forest tip` · `pvfs forest fence [--clear]` | This box's copy of the log (seq, hash, owner or replica, fenced?) · an owner's fence (§7.13). |
 | `pvfs forest backup [--to <dir>] [--keep <days>]` · `pvfs forest restore <copy> <dir>` | A dated copy of the log, verified by a full replay · a replica directory from one (§7.13). |
 | `pvfs forest promote <dir> [--via-companion]` · `pvfs replica repoint <dir> --instance <name>` | Make this replica the forest's owner · follow the new owner (§7.13; doc 28). |
 | `pvfs forest bind-certs` · `pvfs fleet forget <pin>` | Bind the forest's root certificates to it · forget a box that is gone for good (§7.13). |
 | `pvfs fleet versions` · `pvfs fleet health [--now]` | What every box runs · every box up, or down since when (§9.5, §7.11). |
+| `pvfs fleet announce [host:port] [--retract]` | Publish this box's dial address, and what it runs, into the forest so the fleet's jobs find it; `--retract` removes the record. Bare, it asks (§7.13). |
 | `pvfs serve receive-plan` | Ask the running daemon what its mover has left to pull (§7.13). |
 | `pvfs verify <id>` · `pvfs orphans` · `pvfs purge <ids…>` | Integrity · orphan management. |
 | `pvfs link <parent> <child> [--type contains\|ref]` | Create an explicit link. Defaults to `ref`; `--type contains` is what re-attaches an island (§ `islands`). |
-| `pvfs mv <node> <new-parent>` | Move a node to a new containing parent. The NAME is unchanged — use `relabel` to rename. Prompts for anything omitted. |
-| `pvfs relabel <link> <name>` | Set a link's display label: the name **this parent** uses for this child. Renaming happens on the EDGE, not the node, so the same file can be called different things in different places (D72). |
-| `pvfs reorder <link> <key>` | Change a link's sibling order key. |
+| `pvfs unlink <link> [--yes]` | Soft-remove a link. It does NOT cascade: removing a folder's only inbound link strands everything beneath it, so it counts the subtree and asks first (`--yes` skips the question); `pvfs islands` finds what was stranded. |
+| `pvfs mv <node> --to <new-parent>` | Move a node to a new containing parent. The NAME is unchanged — use `relabel` to rename. Prompts for anything omitted. |
+| `pvfs relabel <link> --label <name>` | Set a link's display label: the name **this parent** uses for this child. Renaming happens on the EDGE, not the node, so the same file can be called different things in different places (D72). |
+| `pvfs reorder <link> --key <key>` | Change a link's sibling order key. |
 | `pvfs roots <folder> [...]` | Declare which directories are roots of a folder's library, and which of them DRAIN (D81) — a staging root empties, a library root keeps. |
-| `pvfs quality <node> [...]` | What a media file IS — record it, or read it back (D76). Capture it while the source still knows; an arr forgets. |
+| `pvfs quality show <node>` · `quality probe <target> [--deep] [--force] [--dry-run]` · `quality set <node> …` · `quality import <file> --under <folder>` | Node model. What a media file IS — read it back · measure files by reading them, where the bytes are · record one by hand · backfill from a Sonarr/Radarr export (D76, D81). Capture it while the source still knows; an arr forgets. |
+| `pvfs forest carry-quality --from <old forest> [--dry-run]` | Node model: carry quality measurements from a previous forest onto this one, matched by tree path; run on the owner once the new forest is scanned (D104). |
 | `pvfs collide` | Resolve path collisions: two live nodes at one tree path (D84). |
 | `pvfs explain <a> <b>` | Which of two copies would survive, and why — **without touching either**. The dry run for an upgrade decision. |
 | `pvfs duplicates [--merge]` | Files the catalogue holds MORE THAN ONCE at the same place — same parent, same name. Reports by default and names the keeper before anything moves; `--merge` moves every location onto that node, retires it from the others, carries MediaQuality, then unlinks. Soft removes, so it is reversible. Production held 588 such groups (D113/D114). A group is **CONTESTED** when more than one member holds live bytes AND their sizes disagree — two boxes at two versions of one path, an upgrade in flight — and `--merge` skips it (D119); the box holding a copy settles it on its next scan. |
@@ -1130,6 +1286,9 @@ second copy of the index while it runs.
 | `pvfs forest recovery-key [--forest F]` | Register an offline rotation recovery key (phrase on stdin; prints a paper phrase). |
 | `pvfs forest rotate-root [--forest F]` | Rotate the root after seed compromise (phrase on stdin; prints a new phrase). |
 | `pvfs identity replace` · `pvfs member replace <file>` | Replace a compromised identity key · adopt a member's replacement from a handoff. |
+| `pvfs identity reissue <old-pubkey>` | Re-home the grants a replaced key authored onto your current identity key — a repair; `replace` already does it in its own forest. |
+| `pvfs device authorize-identity` | Authorize your identity key as an owner: fetched from a running companion and root-signed through it, no phrase typed (doc 14; INSTALL.md Option D). |
+| `pvfs ssh <user@host> [-- <remote command>]` | SSH to a host with this machine's companion socket forwarded, so `pvfs … --via-companion` there is approved here (INSTALL.md Option D §3b). |
 | `pvfs acl set <node> public\|any\|tag:<name>\|key:<hex> <rights> [--expires 7d\|@ms]` | Grant/clear rights (`-` clears); `--expires` makes the grant lapse after a duration (`45s`/`30m`/`12h`/`7d`/`2w`) or at `@<unix-ms>`. |
 | `pvfs acl ls\|check <node> [principal]` | List grants · show effective rights. |
 | `pvfs tag add\|rm <member-pubkey> <tag>` · `pvfs tag ls <member-pubkey>` | Assign/remove/list membership tags. |
@@ -1153,6 +1312,7 @@ second copy of the index while it runs.
 | `pvfsd --mount <dir> --socket <path>` | Serve a forest over a Unix socket. |
 | `pvfsd --mount <dir> --listen <addr:port>` | Also serve TCP+TLS; prints the transport pin clients must pin. |
 | `pvfs serve enable\|disable\|ls\|status [job]` | Configure/inspect the daemon's background jobs (§7.11, §7.13; `serve enable --help` lists every job and what it does); bare `pvfs serve` = status. |
+| `pvfs serve exports` · `pvfs serve watch` | List the exports the `export` job keeps fresh (§7.11) · run the watcher in the foreground, ad hoc (as a daemon job: `pvfs serve enable watch`). |
 | `pvfs fleet enroll <pubkey> [--rights r\|rw\|rwa]` | Admit a box: membership + rights in one logged step (§7.9). |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a

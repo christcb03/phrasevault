@@ -27,6 +27,11 @@ Also: hashing is now parallel (`update_rayon`) and reads a full swarm chunk per
 pass. BLAKE3 only parallelises WITHIN an update call, so the buffer size was the
 width of the hash — see doc 24 §5b for the measurements.
 
+> **Status 2026-10-04 (D218):** both fixes the amendment says "should" happen are done: the
+> sidecar is a dotfile, `.<name>.manifest`, and `pvfs-manifest 2` puts the whole-file BLAKE3 in
+> the header (D91, 2026-08-30); `pvfs-manifest 3` also records the file's mtime (D150). §3's
+> `<store>/<xx>/<id>.manifest` is the old name (`crates/pvfs-core/src/sync.rs`).
+
 Prerequisite reading: doc 20 §6 (the promoted arc + Chris's requirement,
 verbatim: reads pull **from every known holder in parallel, BitTorrent-style,
 for the fastest possible read**), doc 21 §3.3 (mirror copies join the seed

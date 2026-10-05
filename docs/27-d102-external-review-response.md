@@ -11,6 +11,10 @@ since 2026-09-08 23:17. Verdicts first, then the fixes, grouped into three
 proposed milestones. **This branch changes documents only**; the code
 proposals in §6 are for Chris to accept, reorder, or drop.
 
+> **Status 2026-10-04 (D218):** the three proposed milestones were all built and merged on
+> 2026-09-10 (D122–D124, `f20ae4b`); the fleet measured here was replaced at the region-model
+> cutover on 2026-09-12 (doc 29).
+
 Evidence conventions: `file:line` is `main` at `906c39b`. "QNAP log N" is a
 line number in `/share/Data_ext/pvfs/pvfsd.log` on the holder (72,510 lines,
 appended across restarts; the current run starts at line 72,478).

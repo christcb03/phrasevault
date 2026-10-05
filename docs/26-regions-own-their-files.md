@@ -224,6 +224,14 @@ box holds, but still only from `resolve` and `receive`, so a box running
 neither — mediabox — never purged. Since PVOS D176 every daemon applies it
 to its own regions every five minutes, whatever jobs it runs; doc 18 §1.)*
 
+*(PVOS D216, 2026-10-03, with the same-stem rule and the floor's default
+added 2026-10-04: which receiving region `receive` puts a file in. The
+receiving region is the one that already holds the file's folder — among
+several, the one holding a file with the same stem; a region under its
+free-space floor is passed over (`pvfs region floor`; default 5 % of the
+disk, at most 500 GB); else the emptiest. D217's `create` through the view
+uses the same rule, §10 phase 6.)*
+
 *D167 (2026-09-17): the trash can be read and undone.* `pvfs trash ls [PATH]`
 lists, for every folder bound on the box it runs on, each trashed file — the
 day, the days until the purge takes it, its size, its path as it was — and
@@ -367,7 +375,9 @@ the forest owner with ONE routed op, `WriteOp::CommitRegionHead` (proto 4→5),
 which the owner prepares under that grant and refuses for anyone else. A
 catalogue region holds rows, never nodes: it is marked once, on an empty
 folder, and refuses unmark and re-mark. *Still to run:* the two-box lab pair
-(D125 item 9), the milestone's exit criterion.
+(D125 item 9), the milestone's exit criterion. *(D218, 2026-10-04: run
+2026-09-10 on presubuntu and pvos-test, 27/27 — `deploy/d125-lab-pair.sh`,
+PVOS D125 item 9.)*
 
 **Phase 3 — the merged view. BUILT (PVOS D126).** `merged_view(dir)` and
 `view_conflicts()` union every catalogue region's rows by relative path, one
@@ -433,7 +443,9 @@ shown as its served copy, unhashed files and kind conflicts not admitted
 (`local_path_for_hash` — a region it catalogues, size-checked), the hash
 store (`sync/by-hash/`), else a read-through — `CatHash` on the wire (proto
 8, read-gated on the region that holds the file) from the first announced
-endpoint that serves it, into the hash store, served from the growing file
+endpoint that serves it *(PVOS D210, 2026-10-01: the region's holder first —
+the box its catalogue copy came from, else the box whose D183 claim it took —
+then the announced order)*, into the hash store, served from the growing file
 and verified whole before it is kept; a box that serves other bytes is
 refused and named. Sequential and single-source: the parallel chunked pull
 by hash — doc 22's swarm over N regions — is the next milestone. The
@@ -475,7 +487,14 @@ the files does it on its own disk (`RenamePath` / `RemoveDir`, proto 10,
 write-gated), its rows follow at once so the bytes stay findable by hash,
 and the mount remembers its own changes until the catalogue agrees
 (`overlay.rs`). Byte writes — create, write-open, truncate — are still
-refused: new bytes arrive through `/mnt/local` and `receive`. **D181
+refused: new bytes arrive through `/mnt/local` and `receive`. *(PVOS D217,
+2026-10-04: not on a mount started with `--writable`, which is off by
+default. There write-open, write, truncate and fsync act on the real file
+when this box holds its bytes; `create` puts a new file in the region
+D216's rule picks among this box's regions that do not drain, and the
+watch hashes it afterwards; a file held only elsewhere still answers
+`EROFS`. mediabox's production view mount runs `--writable` since that
+day's roll.)* **D181
 (2026-09-21): the view for Plex — `--cache-mode stream`.** Plex on the LAN
 wants no cache (Chris), and a watched movie stays OPEN for as long as it
 plays, so "drop at close" alone would leave a whole remux on disk. Stream
@@ -510,12 +529,15 @@ health [--now]` shows each box up, or DOWN with when it stopped answering
 (two consecutive misses, dated from the first, so a restart is not an
 outage), its jobs' errors and stalls, conflicts, stale catalogues, free
 space. Read-only, no new authority. Notification and remote restart (D83
-§4.2–4.3) are not built — they are decisions, not code. The original spec
-follows.
+§4.2–4.3) are not built — they are decisions, not code. *(D218, 2026-10-04:
+both built since — remote restart as PVOS D135, the owner starting a silent
+NAS's daemon, and notification as D142, transitions posted to Home
+Assistant; doc 30.)* The original spec follows.
 Conflicts and capacity into D83, and in band.
 
 **Phase 8 — migration. RUNBOOK WRITTEN (doc 29, PVOS D137); the cutover
-itself is Chris's.** The planned re-genesis (doc 25) becomes THIS: a fresh
+itself is Chris's.** *(D218, 2026-10-04: DONE 2026-09-12 — PVOS D140, as
+the header says.)* The planned re-genesis (doc 25) becomes THIS: a fresh
 start on the new model rather than a fresh start on the old one — no import,
 no carry, a catalogue region per box marked and bound by the fleet play
 (D134), the watch jobs cataloguing from sidecars, the merged view verified
@@ -540,10 +562,14 @@ single production file is touched. The order of 3 and 4 could swap.
 
 ## 11. Open questions, collected
 
-1. Snapshot cadence (§5).
+1. Snapshot cadence (§5). *(D218, 2026-10-04: answered by phase 1 — a
+   pass that changed the catalogue publishes one head; an unchanged pass
+   publishes nothing.)*
 2. Retention policy shape (§7.4).
 3. The full set of what a region declares (§3).
 4. "Nearest" for the swarm's copy selection — latency-measured, declared
    priority, or both.
 5. Whether a region may keep a per-event log for provenance as an opt-in.
-6. What the presentation layer shows for a conflict, concretely.
+6. What the presentation layer shows for a conflict, concretely. *(D218,
+   2026-10-04: answered by phase 6 — the mount shows a hash conflict as its
+   served copy; `pvfs view conflicts` lists every copy, phase 3.)*

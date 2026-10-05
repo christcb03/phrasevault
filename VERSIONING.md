@@ -5,8 +5,8 @@ PVFS carries five version numbers, each answering a different question:
 | number | today | answers | where |
 |---|---|---|---|
 | the release | `1.4.0` | which release this is | `Cargo.toml` (`[workspace.package]`), the `v1.x` tags |
-| the build id | e.g. `v1.4-495-gc17ae29` | which commit, exactly | `--version` of every binary, `pvfs versions` |
-| the wire protocol | **15**, talks back to **3** | can two boxes talk, and which ops can one ask of the other | `pvfs_proto::PROTO_VERSION`, `PROTO_COMPATIBLE_WITH` |
+| the build id | e.g. `v1.4-549-gea84559` | which commit, exactly | `--version` of every binary, `pvfs versions` |
+| the wire protocol | **16**, talks back to **3** | can two boxes talk, and which ops can one ask of the other | `pvfs_proto::PROTO_VERSION`, `PROTO_COMPATIBLE_WITH` |
 | the projection schema | **20** | can this binary open this box's catalogue, and how | `pvfs_core::projection::SCHEMA_VERSION` |
 | the mount compatibility | **1** | can a running view mount stay up across an upgrade | `pvfs_core::MOUNT_COMPAT` |
 
@@ -49,7 +49,7 @@ build has — is still how a roll proves what landed (doc 24 §7 A2–A4).
 
 ### Reading a build id
 
-`v1.4-495-gc17ae29` is `<nearest tag>-<N>-g<commit>[-dirty]`. **The commit is
+`v1.4-549-gea84559` is `<nearest tag>-<N>-g<commit>[-dirty]`. **The commit is
 the identity.** N counts every commit since the tag, merged branches'
 included, so it orders builds only along one line of history. `-dirty` means
 the checkout that named the build had uncommitted changes, which the rsync
@@ -70,7 +70,7 @@ A single monotonic integer, sent in every connect `Challenge`.
 - **`PROTO_COMPATIBLE_WITH` (3, since D73)** is the oldest protocol a binary
   still talks to. Since D73 a peer that receives an op it does not know
   answers `unknown_op` and keeps the connection open, so every change
-  between 3 and today has been additive: any two boxes in `[3, 15]` work
+  between 3 and today has been additive: any two boxes in `[3, 16]` work
   together, and a fleet upgrade rolls box by box. PVOS's roll refuses only a
   build whose floor is above what a box runs. Moving this number would be the
   fleet-wide event.
@@ -105,7 +105,7 @@ been kept for every op since protocol 5.
 | 13 | `ViewLs`, `ViewEntry`, `CatalogueStatus` — the merged view over the socket | PVOS D187 | `v1.4-443` |
 | 14 | `BindCertificates`, and forest-bound certificates understood (a forest binds only when every box is at 14) | PVOS D192 | `v1.4-468` |
 | 15 | `CommitSigned` — events their authors signed elsewhere (a session certificate signed in a browser) | PVOS D193 | `v1.4-488` |
-| 16 | `SetRegionQuality` — what another box's header probe saw of this box's copy (mediabox probing the NAS's video) | PVOS D211 | (next roll) |
+| 16 | `SetRegionQuality` — what another box's header probe saw of this box's copy (mediabox probing the NAS's video) | PVOS D211 | `v1.4-541` |
 
 Every release tag, v1.0 to v1.4, shipped at protocol 2.
 
@@ -191,12 +191,16 @@ right to left, each component is the next layer up.
   the tiered mover — doc 17). 1.4 = serve jobs (doc 18), the region arc and
   the streaming FUSE mount (doc 20), attachment kinds (doc 21), and the swarm
   data plane (doc 22).
-- **Main has run ahead with no release since** — about 500 commits, protocol
-  2 → 15, schema 7 → 20: ingest sessions (doc 23), the doc 24 fleet repairs,
+- **Main has run ahead with no release since** — about 550 commits, protocol
+  2 → 16, schema 7 → 20: ingest sessions (doc 23), the doc 24 fleet repairs,
   the region model and its view mount (doc 26; the fleet's model since the
   2026-09-12 cutover, doc 29), moving the owner and dated log copies (doc 28),
-  monitoring (doc 30), forest-bound certificates and personal forests. The
-  **media fleet runs `v1.4-495-gc17ae29`** (rolled 2026-09-27; PVOS D186). See
+  monitoring (doc 30), forest-bound certificates and personal forests, one
+  writer per daemon (PVOS D199), video quality in the catalogue and probing
+  for another box (D208, D211), placement by folder with a free-space floor
+  (D216), and creates and edits through the view mount (D217). The
+  **media fleet runs `v1.4-549-gea84559`** (rolled 2026-10-04, about 1:00 PM
+  Eastern; `v1.4-495-gc17ae29` before that, from 2026-09-27). See
   [CHANGELOG.md](CHANGELOG.md), whose "Unreleased" section is the record.
   Whether to cut a release past v1.4 is Chris's decision (PVOS BACKLOG,
   "Decisions needed").

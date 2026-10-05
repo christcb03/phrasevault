@@ -1,5 +1,7 @@
 # Security Policy
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 ## Threat Model
 
 PhraseVault follows Kerckhoffs's principle: the system is secure even if

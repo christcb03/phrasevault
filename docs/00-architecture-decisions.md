@@ -4,6 +4,15 @@ Status: **Accepted** (foundational ADR; engine 1.x implements the core direction
 Date: 2026-06-06
 Scope: Foundational decisions and module boundaries for a from-scratch PVFS. Intentionally lean — locks direction. WASM modules, FUSE mounts, and federation wire protocols remain future work as noted in the body.
 
+> **Status 2026-10-04 (D218):** this is the June direction; parts were built differently. FUSE
+> mounts (doc 20 §3) and the federation wire protocols (doc 17) are built, not future work. No
+> WASM module host exists: `secure` is a type in the core (`crates/pvfs-core/src/node.rs`),
+> against §4's "No other node type is hard-coded". Private data is encrypted with
+> XChaCha20-Poly1305, not AES-256-GCM (§3, §6). Lazy hashing (§2) was removed (PVOS D94). §7's P2
+> and P3 name other deliverables than doc 08 §1's P2 and P3. §8's questions 1, 4 and 6 are
+> answered: FUSE on Linux shipped first (doc 20 §3), the daemon authenticates by challenge-response
+> on its socket (doc 07 §2), and the wire protocols are doc 17's.
+
 ---
 
 ## 1. Context, Vision, Non-Goals

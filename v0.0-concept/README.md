@@ -1,5 +1,7 @@
 # PhraseVault
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 A distributed encrypted knowledge network where a passphrase is simultaneously
 the storage address, the encryption key, and the namespace for your data.
 

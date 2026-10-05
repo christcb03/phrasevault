@@ -14,6 +14,13 @@ region design — decided), [04](04-p1-storage-and-fs-ops-spec.md)/[05](05-insta
 (storage & mounts), [07](07-daemon-protocol.md) (daemon protocol), [11](11-compaction-and-verifiable-snapshots.md)
 + [15](15-key-replacement.md) (compaction/lineage edges).
 
+> **Status 2026-10-04 (D218):** the status above is current; some lines below predate it. §1's
+> "❌ failover only" and §2's F4 row "only failover left": failover is built (§8 item 4). §2's
+> F0.1 is built — `pvfs export --keep-fresh` and the serve jobs came with P5 (doc 18), `export
+> --fetch` with F3. Of §6's deferred items, `--to <dir>` was built in P6 (doc 19) and the
+> background sync job in P5 (doc 18); `local_only` regions are still unbuilt. §7.1's unrouted
+> `link`/`unlink`/`reorder` and `loc rm` go over the wire since P6 (doc 19).
+
 This doc turns the decided P4 model into an implementation order, driven by one concrete scenario.
 It adds **no new trust decisions** — where doc 03/13 decided, this doc only sequences.
 

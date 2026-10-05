@@ -4,6 +4,14 @@ Status: **Decided for data model** (P4 implements protocols; P0 implements trust
 Date: 2026-06-10
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md)
 
+> **Status 2026-10-04 (D218):** decided 2026-06-10; P4 has been built since. Doc 17: replicas
+> (Mode A), the network transport and address discovery (§6 Q1), and remote writes as
+> member-signed daemon ops — the crosslink grant §6 Q4 asks for is still unbuilt (doc 17 §6). Doc
+> 20: sub-forest regions (§1.5), region-scoped replicas (Q5) and the per-region proof (Q7; top-log
+> filtering for lesser-privilege replicas is still open). Doc 28: failover (Q3). Doc 26: catalogue
+> regions. Unbuilt: Mode B and Mode C, the `pvfs:` catalog-URI resolver, compaction (doc 11).
+> §1.5's "P4 protocols (not yet designed)" are docs 17 and 20.
+
 This document locks decisions from the federation and trust review. It does **not** specify wire protocols (those belong to the sync/file-server layer, version `1.0.#`).
 
 ---

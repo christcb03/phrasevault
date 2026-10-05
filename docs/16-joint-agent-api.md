@@ -1,8 +1,14 @@
 # PVFS ⇄ PVOS — Joint Companion Agent API (16)
 
 Status: **PVFS side implemented** (phase 7 items 1, 2, 4 done in 1.0); **`pvos.sso` remains PVOS-repo work**. Coordination doc for PVFS companion §7 (doc 14) and PVOS D7/D19. Drafted 2026-07-02.
-Depends on: [14 (companion)](14-companion-app.md), [12 (secure blobs)](12-secure-node-type.md); PVOS [10 (companion requirements)](../../PVOS/docs/10-companion-requirements.md), [02 (delegation)](../../PVOS/docs/02-delegation-and-revocation.md), [04 (control socket)](../../PVOS/docs/04-control-socket-protocol.md), [07 §3.5 (`pvos.sso`)](../../PVOS/docs/07-built-in-services.md).
+Depends on: [14 (companion)](14-companion-app.md), [12 (secure blobs)](12-secure-node-type.md); PVOS [10 (companion requirements)](../../PVOS/docs/10-companion-requirements.md), [02 (delegation)](../../PVOS/docs/02-delegation-and-revocation.md), [04 (control socket)](../../PVOS/docs/04-control-socket-protocol.md), [07 §3.5 (`pvos.sso`)](../../PVOS/docs/07-built-in-services.md). *(These four PVOS links leave this repository: they resolve only beside a sibling checkout named `PVOS`.)*
 Resolves: PVOS **D7** (one shared companion — coordinate the API) and **D19** (the SSSO context protocol).
+
+> **Status 2026-10-04 (D218):** §7 item 3's "built in the PVOS repo" does not hold: `pvos.sso` and
+> `sign_as_user` exist nowhere in PVOS's `crates/` or `web/`, as the status line above says. The
+> non-owner path that §5 and §8 defer to PVOS D18 shipped differently: personal forests and session
+> certificates the person signs in their browser or companion (PVOS D193, `CommitSigned`).
+> `API_VERSION` is 4 (PVOS D189).
 
 > **One companion serves PVFS, PVOS, and every app** (PVOS D7 ✅). This doc pins the surface that companion exposes so both projects — and third-party apps — build to one contract. It is the buildable form of PVFS doc 14 §7's "superset API."
 
@@ -157,7 +163,7 @@ The only new code is a **consumer/example** proving steps 1→4 against a runnin
 1. ☑ **`ApprovalContext` on the sign surface** — the optional `context` field on `AgentRequest::Sign` and the tenant sign ops; the `Prompter` renders it (`approve_with_context`, doc 16 §3.2 wording in the terminal/desktop backends); the audit log records the full context; new `user_action` request type signed by the identity key, **prompt-by-default** (§3.3's allow-list is broker-side only). A context whose `digest_hex` disagrees with the digest being signed is refused as `bad_input` before any prompt, on both the local agent and the tenant ops. *Built.*
 2. ☑ **`pvfsd` challenge consumer** — `crates/pvfs-companion/tests/signin_pvfsd.rs` proves the §6 loop 1→4 against a live `pvfsd`: challenge → loopback `POST /sign-in` → identity-key signature → daemon `Auth` verifies the member, and ACLs bind to the signed-in principal. The signing closure in that test is the app-side reference. *Built.*
 3. ☐ **`pvos.sso` service** — `whoami` / `session` / `sign_as_user`, the policy engine (§3.3), and the digest+context construction (§3.1). *PVOS-side, in `pvosd` — built in the PVOS repo, consuming this API.*
-4. ☑ **`api_version` handshake** — `API_VERSION` (= 1 at phase 7; **3 today**: 1 = phase-7 handshake, 2 = relay/pairing, 3 = key-based url trust grants) in `pvfs_companion::proto`, answered by the new `api_version` op on **both** the local agent and the tenant socket; answered even while locked, so negotiation never requires an unlock. *Built.*
+4. ☑ **`api_version` handshake** — `API_VERSION` (= 1 at phase 7; **4 today**: 1 = phase-7 handshake, 2 = relay/pairing, 3 = key-based url trust grants, 4 = several phrases, PVOS D189) in `pvfs_companion::proto`, answered by the new `api_version` op on **both** the local agent and the tenant socket; answered even while locked, so negotiation never requires an unlock. *Built.*
 
 PVFS's phase-7 work (items 1, 2, 4) is **done**; item 3 is PVOS's, and this doc is the contract it builds to.
 

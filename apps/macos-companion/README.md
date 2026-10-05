@@ -10,6 +10,8 @@ Native menu-bar app for the **Rust** `pvfs-companion` agent (not the old Node ag
 | **Keychain first** | Seals with macOS Keychain; vault password only if Keychain fails |
 | **Menu bar** | Custom shield icon; start/stop/lock; open at login toggle |
 | **Console window** | Status, connected **origins** (revoke), **audit** log, settings |
+| **Phrases & keys** | Settings → Phrases & keys (PVOS D189): every recovery phrase the companion holds, its public keys, and what each is used for — forests, paired servers, sign-ins and approvals, root signatures. What `pvfs-companion keys --json` reports; public keys only |
+| **Several phrases** | Every other keychain-sealed `*.vault` beside `companion.vault` in `~/.config/pvfs/` is served by the same agent (the app passes each as a `--vault`); a request picks its phrase by the key it names. Password-sealed extra vaults are left out |
 | **Approvals** | High-authority prompts via macOS system dialogs (`--prompt desktop`) |
 | **Open at login** | `SMAppService` (may need System Settings approval) |
 | **SSH with companion** | Menu item reverse-forwards the local agent socket into an SSH session (desktop SSO) |
@@ -17,12 +19,46 @@ Native menu-bar app for the **Rust** `pvfs-companion` agent (not the old Node ag
 
 ## Build & run
 
+Needs, on the Mac that builds it:
+
+- **Apple Silicon** — `build.sh` compiles the Swift side for `arm64` only;
+- **macOS 13 or later** (the app's minimum);
+- **Rust** (`cargo`, via [rustup](https://rustup.rs)) for the embedded `pvfs-companion`;
+- **Xcode, or the Command Line Tools** (`swiftc`, `xcrun`). With only the
+  Command Line Tools, the newest SDK's SwiftUI may not compile (its macro
+  plugins ship with Xcode): `build.sh` then tries the next older installed
+  SDK by itself. `PVFS_MACOS_SDK=<path to an SDK>` names one outright and
+  turns that fallback off.
+
+Run from the repo root:
+
 ```bash
 ./apps/macos-companion/build.sh
 open "dist/PVFS Companion.app"
 ```
 
 Optional: copy to `/Applications` (recommended for login items).
+
+### Updating an installed copy
+
+`updateCompanion.sh`, at the repo root, rebuilds the app, replaces
+`/Applications/PVFS Companion.app` with it and opens it. Run it from the repo
+root:
+
+```bash
+./updateCompanion.sh
+```
+
+Two things to know (2026-10-04):
+
+- **The old agent keeps running.** The script quits the app with `killall`,
+  which does not stop the `pvfs-companion serve` the old app started, and the
+  new app starts an agent only when none is running. So the old build goes on
+  serving until you choose **Restart agent** in the menu.
+- **A failed build still replaces the app.** The script does not stop on an
+  error: when `build.sh` fails it goes on to delete the installed app and
+  copy whatever is in `dist/`. If the build printed an error, build again
+  before trusting what is in `/Applications`.
 
 ## DMG
 

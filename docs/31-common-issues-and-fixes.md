@@ -20,6 +20,10 @@ whenever a fix is found, not only when it recurs.**
 | When did a line in the NAS's `pvfsd.log` happen? | [§11](#11-dating-a-line-in-the-nass-pvfsdlog) |
 | `watch pass failed: I/O error during routed write: …` | [§12](#12-a-routed-write-fails-io-error-during-routed-write) |
 | `the catalogue job reports an error: refused a region claim from …` | [§13](#13-a-box-refuses-a-region-claim) |
+| `pvfs region quality` lists a file as unreadable or suspect; a probe of the NAS's files is skipped | [§14](#14-video-quality-an-unreadable-file-and-the-nass-files) |
+| Subtitles and `.nfo` files on a different disk from their media | [§15](#15-subtitles-and-nfo-files-on-a-different-disk-from-their-media) |
+| `resolve` reports `copy to trash: No such file or directory` | [§16](#16-resolve-fails-copy-to-trash-no-such-file-or-directory) |
+| `rm` of a file just created through the view: `Input/output error` | [§17](#17-rm-of-a-file-just-created-through-the-view-inputoutput-error) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -433,3 +437,80 @@ hours.
   the region (`pvfs acl ls <region>` on the owner).
 - `probe-remote names N region(s), but this box has no ffprobe`:
   `apt install ffmpeg` on the measuring box (not on the NAS).
+
+## 15. Subtitles and `.nfo` files on a different disk from their media
+
+**What it looks like.** A show's video files are in one region (`library`
+on the NAS, or `mediabox-local2`) and its subtitles, `.nfo` files and
+artwork in another (`mediabox-local`). Nothing is broken — the view shows
+them side by side and Plex plays them — but the files are on different
+disks, and each move of the media leaves the others behind. Counted on
+2026-10-03: 8,723 such files, 6,805 of them on `mediabox-local` beside
+video the NAS's `library` holds (PVOS `docs/milestones/D216-placement-follows-the-folder.md` §1).
+
+**Why.** Two mechanisms. `receive` put every new file in the receiving
+region with the most free space, not the one that already held its season.
+And a file an app creates through a mergerfs union lands on the union's
+writable branch — on mediabox `/mnt/local`, the only one — wherever its
+media is: Bazarr's subtitles above all.
+
+**Fix — built for what PVFS places; open for what bypasses it.** PVOS D216
+and D217 (PVFS `f78587b`, `59eb640`, `9b314d1`; on the fleet since
+`v1.4-549`, 2026-10-04): a file PVFS places — a `receive` pull, or a create
+through a view mounted `--writable` — goes to the region that already holds
+its folder and has room above its floor, and in a split folder to the one
+holding a file with the same stem (user manual §7.13, "Where a new file
+goes"). The files already split were moved by the session that built it:
+8,705 moved, none failed (its own summary of 2026-10-04; not counted again
+since). Still open:
+
+- A file written through the mergerfs union instead of the view lands on
+  the union's writable branch as before. About 40 subtitles Bazarr wrote
+  during that migration did (the same summary).
+- A create through a box's view lands on that box's own disks: a subtitle
+  made on mediabox for an episode only the NAS holds stays on mediabox.
+- PVFS has no command that finds or moves split files (D216 §5's reconcile
+  pass was not built as a command).
+
+## 16. `resolve` fails: "copy to trash: No such file or directory"
+
+**What it looks like.** The ingest box's `resolve` row (`pvfs serve
+status`, the forest page) shows an error ending `copy to trash: No such
+file or directory`, gone at the next pass. feederbox, 2026-10-03 11:09 AM:
+cleared four minutes later, while Sonarr upgraded five episodes of one show.
+
+**Why.** `resolve` checks that a staging copy is a file, then reads its
+tail and asks the library's box to confirm the bytes — a network round trip
+— before it moves the copy to the trash. The arrs delete and replace files
+in staging all day; one that went inside that window aborted the whole
+pass and left its remaining candidates for the next. And the move's
+copy-then-remove fallback, meant for a trash on another filesystem, ran on
+every rename error, so a source that had vanished read as a trash that
+could not be written. The trash was never at fault.
+
+**Fix — built** (PVFS `2d804ba`, 2026-10-03; on the fleet since `v1.4-549`,
+2026-10-04). A copy that goes mid-pass is nothing to do and the pass
+carries on; the fallback runs only across filesystems (`EXDEV`), and any
+other failure says `move to trash`. On an older build there is nothing to
+do: the next pass, five minutes later, clears it.
+
+## 17. `rm` of a file just created through the view: "Input/output error"
+
+**What it looks like.** On a view mounted `--writable`, a tool writes a
+file and removes it straight away, as an arr does, and the `rm` fails with
+`Input/output error`. Found on the fleet on 2026-10-04, minutes after the
+roll to `v1.4-548`.
+
+**Why.** A delete through the view sends each catalogued copy of the file
+to its region's trash. A file created through the mount has no catalogued
+copy until the `watch` job has hashed it, so there was nothing to send and
+the delete answered `EIO`.
+
+**Fix — built** (PVFS `ea84559`, `v1.4-549`, on the fleet since 2026-10-04
+about 1:00 PM). Deleting such a file removes the bytes the create wrote,
+outright: no trash, because nothing is catalogued to restore from. **Still
+open** (PVOS D218 §2.1): truncating or renaming a file in the same state
+answers `Input/output error` too, so a tool that writes a temporary file
+and renames it into place fails and leaves the temporary file behind; and
+after 10 minutes uncatalogued the file drops out of the mount's listing,
+though its bytes are on disk (user manual §7.13, known problems).

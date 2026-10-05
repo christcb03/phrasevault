@@ -3,6 +3,12 @@
 Working journal for the Phase B build (doc 06 §4). Written **before** implementation
 so the plan survives if the session ends mid-way. Update the Progress Log as steps land.
 
+> **Status 2026-10-04 (D218):** a historical build journal (June 2026). Since then `public` and
+> `tag:` principals, the `authority` column (doc 10), expiring grants, path and URI arguments and a
+> `Forbidden` error all exist, so §2's principal and table shapes, the node-id-only CLI and the
+> `Forbidden` to-do are superseded; named groups and explicit deny are still unbuilt. The current
+> model is doc 06 §4 with docs 09 and 10.
+
 Status legend: ☐ todo · ◑ in progress · ☑ done & verified on presubuntu
 
 ---

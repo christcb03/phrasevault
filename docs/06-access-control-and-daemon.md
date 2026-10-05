@@ -4,6 +4,16 @@ Status: **Implemented** (P2 A–G; model doc — phases A/B/C below are historic
 Date: 2026-06-15
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md), [05-instance-registry-and-mounts.md](05-instance-registry-and-mounts.md)
 
+> **Status 2026-10-04 (D218):** later changes to this model. A device certificate is valid from
+> the root **or an admin device** (doc 09 §2.2), so "root-signed" and "root-only" in §3, §9 and
+> §12 are the June rule. Replay judges an author as of the row's `written_at` against
+> `authorized_at`/`revoked_at` (doc 20 §2.3), not by fold order as §3.3 says. A bound forest's
+> certificates are signed for that forest (PVOS D192). The registry never gained `owner`/`socket`
+> (§7, §10 C): an entry holds `mount`, `alias` and `enabled`, and the socket is
+> `$PVFS_SOCKET_DIR/<forest_id>.sock` (doc 09 §7). §12's "FUSE (admin/`sudo`)" is the June
+> framing — the mount shipped unprivileged (§6, §10 D); §10 A's `forest authorize` shipped as
+> `pvfs device authorize-member`.
+
 This document locks **how multiple users share one forest with per-component read/write control**, how those writes stay **cryptographically attributable to the actual writer**, and the **runtime** that enforces it. It is the long-term model for PVFS as a multi-user file server. It does not change P0 log encodings; it **adds** event kinds and a projection table, and a new process (the daemon).
 
 ---

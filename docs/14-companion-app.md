@@ -4,6 +4,13 @@ Status: **Implemented** (phases 1–7 shipped in 1.0; joint API in doc 16) — d
 Depends on: [01 (identity)](01-core-engine-design.md), [06 (ACLs & daemon)](06-access-control-and-daemon.md), [07 (daemon protocol)](07-daemon-protocol.md), [09 §6 (the companion sketch)](09-tags-and-the-live-daemon.md), [10 §9.1 (identity = tag authority)](10-per-key-tag-authority.md), [12 (encryption at rest)](12-secure-node-type.md), [13 (PVOS superset API)](13-pvos-driven-requirements.md)
 Motivation: give the **root/identity key** a strong home (a hardware-wallet / `ssh-agent` posture) so root-strength authorization needs no typed phrase, a human's tag authority is stable across machines, and PVFS-backed apps can "Sign in with PVFS." Decisions in §0 are settled; the rest is the buildable design.
 
+> **Status 2026-10-04 (D218):** since 1.0, one companion serves several phrases (PVOS D189,
+> `API_VERSION` 4); certificates are signed for one forest (D192); a sign-in signs a session
+> certificate for the person's own forest, granted 7 days and renewed by signing it again (D193,
+> D212; `crates/pvfs-companion/src/agent.rs`); the companion keeps its runtime files, checking them
+> hourly (D197). §13's server custody is unused by PVOS since passkeys replaced the hosted-password
+> tier (PVOS D190 §1.9); PVOS stopped using `serve-tenant` in D193.
+
 ---
 
 ## 0. Decisions (settled 2026-06-29)

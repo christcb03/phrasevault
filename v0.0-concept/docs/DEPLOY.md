@@ -1,5 +1,7 @@
 # PhraseVault deployment (test server)
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 ## Test host
 
 **presubuntu** — `192.168.0.184` (public: `95.216.117.242`)

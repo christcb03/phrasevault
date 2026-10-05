@@ -1,5 +1,7 @@
 # MediaForest Companion — Install Guide
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 The companion is a small background app that holds your identity key and signs logins automatically. Once it's running, opening MediaForest in any browser on your machine logs you in instantly — no passphrase or password needed.
 
 ## Requirements

@@ -1,5 +1,7 @@
 # Admin factory reset
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 Clears **all forest and PVFS data** in this PhraseVault instance. Intended to be called by **MediaForest** during an owner-initiated server factory reset, or by a authenticated client with the service token.
 
 **Does not delete `file://` media on the host** — only SQLite rows (`truth_nodes`, `truth_links`, `pvfs_scan_jobs`) and files under `PV_DATA_DIR/pvfs/` (copied blobs). NAS/library paths registered as `file://` locations remain on disk.
