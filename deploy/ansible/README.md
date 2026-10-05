@@ -39,15 +39,15 @@ Stages (also usable as `--tags`):
 | Tag | What it does |
 |---|---|
 | `prepare` | apt build deps + rustup pinned to **1.96.0** (matches CI; minimal profile) — installed only when cargo is absent; an existing host keeps whatever toolchain it has (doc 26, D124) |
-| `deploy` | rsync the repo to `/opt/pvfs/src` — or `/opt/pvfs-<session>/src`, see above (excludes `.git`, `old/`, `v0.0-concept/`, `target/`, `.claude/`) |
+| `deploy` | rsync the repo to `/opt/pvfs/src` — or `/opt/pvfs-<session>/src`, see above (excludes `.git`, `old/`, `v0.0-concept/`, `target/`, `.pvfs/`, `artifacts/`, `.claude/`) |
 | `build` | `cargo build --release --workspace` |
-| `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure** |
+| `test` | `cargo test --workspace` — the full spec §14 suite; **fails the pipeline on any failure**. Then the leaked-mount check (PVOS D211, `files/fuse-leaks.sh`): a pvfs FUSE mount the tests left behind under a temp directory is listed, unmounted, and **fails the run** |
 | `lint` | `cargo clippy --all-targets --workspace -- -D warnings` (D121; also runs under `test`) |
 | `reap` | FIRST, before the sync (PVOS D201; it also runs under `deploy`): delete `/opt/pvfs-<session>` slots idle for 2+ days — never this run's, `/opt/pvfs`, a roll slot (`/opt/pvfs-roll*`, the build the fleet runs or rolls back to) or one holding a `.keep` file; then stop the run if `/` has less than `min_free_gb` (15) free, listing every slot (D121) |
-| `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts |
+| `smoke` | `files/smoke-test.sh` — every CLI function end-to-end incl. exit-code contracts; followed by the same leaked-mount check, which fails the run (PVOS D211) |
 | `install` | copy the release binary to `/usr/local/bin/pvfs` |
 | `daemon` | run `pvfsd` as a **systemd user service** (INSTALL.md Option C, automated): installs `pvfs`/`pvfsd`/`pvfs-companion` to `~/.local/bin`, the `pvfsd@` user unit + `/run/pvfs` tmpfiles snippet, inits a test forest at `~/pvfs-mounts/smoke`, then proves the lifecycle — enable → client answers over `/run/pvfs` → clean stop (socket removed) → restart. **Leaves the service enabled + running** as a standing daemon testbed |
-| `report` | fetch `pvfs-test-results.txt` / `pvfs-smoke-results.txt` / `pvfsd-journal.txt` into `./artifacts/<host>/` |
+| `report` | fetch `pvfs-test-results.txt` / `pvfs-clippy-results.txt` / `pvfs-smoke-results.txt` / `pvfsd-journal.txt` into `./artifacts/<host>/` — with `-e session=<name>` each is named `…-<name>.txt` (`pvfs-test-results-<name>.txt`), so two sessions never read each other's totals; the summary also says how many mounts the tests and the smoke run leaked |
 
 Re-run just the checks after a code change:
 

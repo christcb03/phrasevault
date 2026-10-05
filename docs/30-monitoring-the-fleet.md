@@ -1,9 +1,12 @@
 # 30 — Monitoring the fleet: what PVFS tells you, and a worked Home Assistant build
 
-**Status: current (2026-09-18).** Pulls together what grew across PVOS
-milestones D83, D131, D135, D136, D142, D143, D146, D148, D176 and D177. The PVFS side (§1) is
+**Status: current (2026-10-04).** Pulls together what grew across PVOS
+milestones D83, D131, D135, D136, D142, D143, D146, D148, D176, D177, D178,
+D181, D182, D183, D196, D200, D206, D207 and D211. The PVFS side (§1) is
 product; the Home Assistant side (§2) is one deployment of it, described as a
-worked example you can copy or translate to another system.
+worked example you can copy or translate to another system. (PVOS D218,
+2026-10-04, read §1 against the code; §2's Home Assistant side was not
+checked against the running system.)
 
 Addresses below are placeholders: `<owner>` is the forest owner's host,
 `<holder>` a NAS-style holder, `<ha>` the Home Assistant host.
@@ -80,7 +83,8 @@ To prove "caught up" without trusting any status: compare
 `select max(seq) from events` in the owner's and the replica's `log.db`,
 opened read-only.
 
-**Beside the rows**, `serve status` carries five facts about the box, each
+**Beside the rows**, `serve status` carries seven facts about the box (and
+the log's tip, the fence and the last log copy: §1.3b), each
 defaulted so an older daemon's reply still decodes: `conflicts` (D127, paths
 in conflict in the merged view), `stale` (D129, catalogue regions held at a
 superseded head), `capacity` (D131, the free and total bytes of the data
@@ -91,7 +95,12 @@ on it; a holder's files are rarely on the data dir's disk, so `capacity`
 alone said mediabox had 339 GB free while both its stores were 98 % full),
 **`build`** (PVOS D200: the build the daemon runs, e.g. `v1.4-495-gc17ae29`
 — not the CLI's, which after a roll that did not restart the daemon is
-another; absent from an older daemon) and **`trash`** (D148). `trash` has one entry per catalogue region the box holds:
+another; absent from an older daemon), **`mounts`** (PVOS D181: the view
+mounts running on the box, each with its `mountpoint`, the `build` the mount
+process runs, `behind` — it is on an older build than the daemon and waits
+for a minute with nothing open through it — `stale`, why it can no longer
+read the catalogue when it says so, and `started_ms`; in `--json` and in the
+owner's health record, not in the plain output) and **`trash`** (D148). `trash` has one entry per catalogue region the box holds:
 the bytes in its `.pvfs-trash`, the number of day buckets, the oldest
 bucket's day (days since the epoch), the region's retention, what the last
 purge freed, and when it was measured (`measured_ms`).
@@ -126,6 +135,7 @@ peers: { <transport pin>: {
     last: { reachable, forest_ok, runner, jobs: [{name, state, last_ok_ms, last_error}],
             build, conflicts, stale, capacity: [free, total],
             stores: [{path, regions, free_bytes, total_bytes}],   # D178
+            mounts: [{mountpoint, build, behind, stale, started_ms}],   # D181
             trash: [{region, bytes, buckets, oldest_day, retention_days,
                      freed_bytes, measured_ms}], error },   # §1.1
     actions: [...], attempts } }       # what supervision did (D135)
@@ -173,8 +183,10 @@ backed off from 10 minutes doubling to 2 hours, recorded under `actions`.
 fenced owner, `fenced: {reason, peer, peer_seq, own_seq, at_ms}`; a box that
 makes dated copies adds `backup: {at_ms, ok, seq, error}`. The owner's health
 job judges every peer's tip against its own log and records the verdict per
-peer (`log_verdict`: `consistent`, `ahead` — this owner is stale and fences
-itself — or `diverged`), with its own `fenced`, `self_addr` and
+peer (`log_verdict`: `consistent`; `ahead` — this owner is stale and fences
+itself; `ahead-unproven` — a longer log claimed by a peer whose announcing
+key has no admin on the forest root: marked, not believed, and the owner
+does not fence; or `diverged`), with its own `fenced`, `self_addr` and
 `self_log_seq`, in `fleet-health.json`. `pvfs forest tip [<mount>]` prints
 one box's tip read-only (beside a running daemon); `pvfs forest fence` shows
 and lifts a fence. *Since PVOS D196* a replica asks its owner's `serve status`

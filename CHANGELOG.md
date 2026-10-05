@@ -5,6 +5,75 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Docs (PVOS D218, 2026-10-04).** A full review of the user docs against
+  the code at `ea84559`; no code changed. `docs/INSTALL.md`: both
+  walkthroughs run again (`ROOT=` came out empty; `pvfs recover` takes
+  `--mnemonic` and does not prompt; `bind --recursive`, `scan <root> <dir>`
+  and `serve --bind` never parsed), `libdbus-1-dev`, `fuse3` and ffprobe
+  named, several phrases in one companion (`pvfs-companion keys`, repeated
+  `--vault`), `PVFS_COMPANION_KEY` and `PVFS_FFPROBE`.
+  `docs/USER-MANUAL.md`: `pvfs mount --view --writable` with its known
+  problems, placement and `pvfs region floor`, `pvfs fleet announce`, the
+  `stalled`/`overdue` rules since D207, a protocol bump rolls box by box,
+  four reference rows that did not parse (`mv`, `relabel`, `reorder`,
+  `quality`) and the rows that were missing. `VERSIONING.md`: protocol 16
+  and the fleet's build. This file: the four entries below that were never
+  written (D217, D216, D212, D201). `README.md`, docs 28, 30 and 31, and
+  the companion's and the pipeline's READMEs corrected; docs 25 and 29,
+  historical runbooks, carry dated notes.
+
+- **Files can be created and edited through the view mount: `pvfs mount
+  --view --writable` (PVOS D217).** Off by default, because it changes what
+  Plex and the arrs may do to the library through that path. With it, a
+  file whose bytes this box already holds opens for writing: `write`,
+  `fsync`, `flush` and truncate work on the real file in its region, and the
+  `watch` job hashes it again afterwards — no fetch, no copy, no new wire
+  op. A file held only on another box still answers `EROFS`. `create` makes
+  a new file on this box, in the catalogue region D216's rule picks among
+  those it holds that do not drain (`Engine::writable_roots`), and the
+  mount answers for it from memory (lookup, read, a second write-open,
+  listings) until the catalogue lists it, for at most 10 minutes. A file
+  created this way and deleted before it is catalogued is unlinked
+  outright, since there is no catalogued copy to send to a trash (it
+  answered `EIO`: found on the fleet minutes after the roll). On the fleet
+  since `v1.4-549`, 2026-10-04; mediabox's library mount runs with it.
+  **Known problems, all open** (PVOS D218 §2.1; user manual §7.13): an edit
+  or a truncate lands on the first local file with the same content hash,
+  not on the file opened; the free-space floor is not checked for a file at
+  the view's root or when no holder of the folder has room; a created file
+  drops out of the listing when it is not catalogued within 10 minutes;
+  truncating or renaming a just-created file answers `EIO`; the mount
+  checks no per-user permissions. Tests: `d217_view_write` (pvfs-fuse).
+  Commits `790436c`, `9b314d1`, `ea84559`.
+
+- **A new file goes where its folder already is, and each region keeps a
+  free-space floor (PVOS D216).** `receive` took the receiving region with
+  the most free space for every file, so an episode could land away from
+  its season, and whatever was written through a union landed on the
+  union's writable branch: on the fleet, 8,723 subtitles, `.nfo` files and
+  artwork sat on a different disk from their media (counted 2026-10-03).
+  `Engine::placement_for` prefers the region whose root already has the
+  file's parent folder — the disk's own answer, no catalogue read per file
+  — and, where a folder is split across regions, the one that holds a file
+  with the same stem (`S01E02.en.srt` joins `S01E02.mkv`; the lab had put a
+  subtitle away from its episode). With no holder the region with the most
+  free space takes it. A region whose disk has less free space than its
+  floor is passed over even when it holds the folder, so a show cannot fill
+  the disk it started on and a filling disk hands new work to a roomier
+  one. The floor is per region and local to the box: `pvfs region floor
+  <region> [size]` (`500G`, `1T`, bytes; bare asks), kept as `floor <region>
+  <bytes>` in the placement file. With nothing set it is 5 % of the disk,
+  capped at 500 GB — a flat 500 GB had switched the folder rule off on
+  every smaller disk without saying so. `receive` uses the rule, and so
+  does a create through a writable view (D217). Open (PVOS D218 §2.1): the
+  fallback — a file at the view's root, or one whose folder no region with
+  room holds — takes the region with the most free space without checking
+  that region's floor; bare `pvfs region floor` offers `[500G]`, so Enter
+  writes an explicit 500 GB; and no command shows a floor or returns a
+  region to the default. Tests: `d216_placement`. Commits `f78587b`,
+  `59eb640`; the floor in `790436c` and `9b314d1`. On the fleet since
+  `v1.4-549`, 2026-10-04.
+
 - **A copy the arrs remove mid-pass no longer fails `resolve`, and a missing
   source stops reading as a broken trash.** `resolve` guards with `is_file`,
   but then reads the file's tail and asks the holder to confirm the bytes — a
@@ -18,6 +87,16 @@ file tracks Layer 0, the file-system engine.
   the trash was fine. The fallback is now `EXDEV` only; anything else says
   `move to trash`. Seen on feederbox 2026-10-03 11:09 AM ET, cleared by the
   next pass, while Sonarr upgraded five episodes of one show.
+
+- **The companion's session grant lasts 7 days (PVOS D212).** It was 30. A
+  sign-out cannot revoke the grant a session certificate gives in the
+  person's own forest, so the grant now lasts no longer than a session's
+  7-unused-days lapse (`SESSION_GRANT_MS`, `pvfs-companion`'s `agent.rs`).
+  A session in use is renewed by signing the same certificate again: the
+  repeated admission is a no-op, the grant's end moves, and nothing is
+  asked. Test: `d193_structured_relays` pins the 7 days and the renewal.
+  Commit `e294ddf`. It needs the companion rebuilt (the Mac app carries it
+  since 2026-10-02); nothing changes on the fleet.
 
 - **An unreadable copy loses to a readable one; mediabox measures the NAS's
   video over the LAN; view tests unmount (PVOS D211).** Chris's decisions of
@@ -79,7 +158,7 @@ file tracks Layer 0, the file-system engine.
   `pull_into_partial_progress`). `serve status` carries it per job
   (`ServeJobWire.progress`, defaulted — no proto bump), the health record
   too (`JobHealth.progress`); `pvfs serve status` prints a line under a
-  job with a pass in flight (and `--json` carries it), `pvfs fleet status`
+  job with a pass in flight (and `--json` carries it), `pvfs fleet health`
   a note. The stall check: a pass that reports and advances is `running`
   however long it runs; one that has not advanced for 30 min is `stalled`,
   with where it stopped. Jobs that do not report are judged as before.
@@ -199,6 +278,16 @@ file tracks Layer 0, the file-system engine.
     line once a minute (D183). `CatalogueReport.claims_refused`' reason now
     starts with the region's short id.
 
+- **The pipeline reaps idle build slots first, and never a roll slot (PVOS
+  D201).** The reap was the last stage, so it never ran for a run that
+  failed earlier, and presubuntu reached 16 MB free (D182). It now runs
+  before the sync (tag `reap`, and under `deploy`): a slot idle for two
+  days goes — never this run's, `/opt/pvfs`, a roll slot (`/opt/pvfs-roll*`:
+  the build the fleet runs, or rolls back to) or one holding a `.keep` file
+  — and the run then stops, listing every slot with its size and last
+  change, when `/` has less than `min_free_gb` (15) free. D121's entry
+  below says "reaped at report time": that is how it was until this.
+  Commit `0ccfd8a`.
 - **Each box says its build; a routed write's failure is judged by its type
   (PVOS D200).**
   - **`serve status` carries `build`**, the build the daemon runs
@@ -1359,7 +1448,9 @@ while the fetch ran).
 Validated end to end: the Ansible pipeline on two hosts (194 tests + 268
 smoke checks, clippy clean) and the two-machine fleet test
 (`deploy/fleet-test.sh`, 40/40, including a 3 GiB tier/evict/stream cycle
-over the LAN) — see [HANDOFF.md](docs/HANDOFF.md) §2.
+over the LAN) — see `docs/HANDOFF.md` §2 as it was then (this repo's
+HANDOFF was retired on 2026-08-10, `c176336`, and is in its history; today's
+handoff is PVOS's `docs/HANDOFF.md`).
 
 - **Tail-subscribe (P4 F5.4, doc 17 §7.5):** the `LogWait` long-poll — the
   daemon holds a gated log read (up to a server-capped 60 s) until new

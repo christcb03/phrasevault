@@ -16,7 +16,8 @@ it and changes which box may append to it.
 ## 1. What an owner is, and why it can move
 
 The owner is the forest's one writer: every box dials it to publish, it
-appends to the log, everyone else follows (doc 03 §1, doc 69 §9 in PVOS).
+appends to the log, everyone else follows (doc 03 §1; PVOS
+`docs/milestones/D69-media-fleet.md` §9).
 It may hold no bytes (production's did, until PVOS D185) or catalogue regions
 of its own like any holder. Its authority is not the box — it is a device certificate
 on the log, signed by the root key the recovery phrase derives. So a replica,
@@ -104,13 +105,16 @@ instead of calling itself up to date.
   box's lag; `pvfs forest tip` on each box says it).
 - The new owner reachable by the fleet on its port: feederbox dials the owner
   from outside (WireGuard, `wg0`), and the NAS and mediabox on the LAN.
-- `deploy-respects-active-work` (memory): a planned move waits for an ingest
-  session in flight to finish.
+- A planned move waits for an ingest session in flight to finish (Chris's
+  standing rule: a deploy respects active work).
 
 ## 4. The move: `promote.sh`
 
+`promote.sh` and `promote.yml` are in the **PVOS** repo, not this one
+(`deploy/ansible/fleet/` there), beside the fleet play and its inventories:
+
 ```bash
-cd deploy/ansible/fleet
+cd <PVOS checkout>/deploy/ansible/fleet
 ./promote.sh
 ```
 

@@ -1,5 +1,11 @@
 # 25 — The re-genesis runbook
 
+> **Status 2026-10-04 (D218): SUPERSEDED (2026-09-12).** Rehearsed (§11),
+> never run: the fleet moved to the region model by doc 29 on 2026-09-12 and
+> the old forest was deleted on 2026-09-21. The boxes, paths, ports, units,
+> `tier` and `sync --advertise` below describe a fleet that no longer exists;
+> kept for what the rehearsal taught.
+
 **Status: written 2026-09-08. REHEARSED end to end on the live fleet the same
 night over a real subset — see §11, which is where the numbers and the four
 things this document got wrong are recorded.**
@@ -219,6 +225,11 @@ cd /srv/pvfs/feeder2
 pvfs bind "$NEW_MEDIA" /mnt/local/Media
 ```
 
+*(D218, 2026-10-04: `:7421` here and in Phase D is the OLD forest's port
+(doc 29 §4 A: "the old daemon keeps 7421"). The new forest's listener is the
+one Phase A starts on `:7431`, added to this document after the rehearsal;
+that is the port these two `instance add` lines should name.)*
+
 **Do NOT run `pvfs scan` here.** It will be refused, correctly. Start the
 `watch` job as a daemon job and let its reconcile pass do the import:
 
@@ -384,6 +395,11 @@ cloudplow cycle, a NAS reboot, and an *arr import — and after `pvfs islands`,
 3. **§7 assumes the mount has no consumers.** True on 2026-09-08 and checked;
    re-check on the day, because the D82 union mount being live-but-forgotten
    is exactly the kind of thing that changes without anyone recording it.
+
+*(D218, 2026-10-04: items 1 and 2 were overtaken the night they were
+written. §11's rehearsal ran every phase of §4 on the live fleet over a real
+subset and answered the timing question; what stayed untested is §11's last
+list. The full sequence was never run: doc 29 replaced it.)*
 
 
 ## 11. The rehearsal (2026-09-08) — it works, and four things here were wrong

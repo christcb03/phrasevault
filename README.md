@@ -2,11 +2,11 @@
 
 PVFS is a standalone, cross-platform command-line service that provides a **real filesystem abstraction layer** over any accessible storage. Data is organized as a **forest** of **trees** of content-addressed, signed **nodes**. A small core engine handles identity, integrity, and traversal; further domain behavior (media, configuration, search, …) is intended to arrive through sandboxed **WASM extension modules** (future — encryption-at-rest is built into the core today).
 
-This is a ground-up implementation. It is designed to run as a single binary on Windows, Linux, and macOS — no container or language runtime required.
+This is a ground-up implementation in Rust: three native binaries — `pvfs` (the CLI), `pvfsd` (the per-forest daemon) and `pvfs-companion` (the key vault and signing agent) — with no container or language runtime required. They build and run on Linux and macOS (the code uses Unix sockets and signals; there is no Windows build), and `pvfs mount` is Linux-only (FUSE).
 
 ## Status
 
-**Version `1.4.0` (tag `v1.4`, 2026-08-13; `v1.2`/`v1.3` tagged along the way).** 1.3 shipped the federation & sync line (replicas, write-through, TLS transport, placement + the tiered mover); 1.4 shipped serve jobs, the region arc, the streaming FUSE mount, attachment kinds, and the swarm data plane. Unreleased on main: external-ingest sessions & in-flight streaming (the BT bridge, doc 23). See the [CHANGELOG](CHANGELOG.md); ongoing work is tracked in [doc 08](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11).
+**Version `1.4.0` (tag `v1.4`, 2026-08-13; `v1.2`/`v1.3` tagged along the way).** 1.3 shipped the federation & sync line (replicas, write-through, TLS transport, placement + the tiered mover); 1.4 shipped serve jobs, the region arc, the streaming FUSE mount, attachment kinds, and the swarm data plane. Unreleased on main, about 550 commits past `v1.4` and what the media fleet runs: ingest sessions (doc 23) and the region model — catalogue regions, the view mount, the mover, the trash, moving the owner, monitoring (docs 26, 28–31). See the [CHANGELOG](CHANGELOG.md) and [VERSIONING.md](VERSIONING.md); ongoing work is tracked in [doc 08](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11).
 
 | Phase | What | State |
 |-------|------|--------|
@@ -39,6 +39,9 @@ Build locally with `cargo test --workspace`, or on a remote Linux host — see *
 - [`crates/pvfs-proto`](crates/pvfs-proto) — daemon/client wire protocol
 - [`crates/pvfsd`](crates/pvfsd) — `pvfsd` per-user daemon (socket, auth, ACL-enforced serving)
 - [`crates/pvfs-client`](crates/pvfs-client) — client library for the daemon
+- [`crates/pvfs-fuse`](crates/pvfs-fuse) — the FUSE filesystem behind `pvfs mount` (a node's tree, or the merged view)
+- [`crates/pvfs-companion`](crates/pvfs-companion) — `pvfs-companion`, the key vault and signing agent (doc 14)
+- [`apps/macos-companion/`](apps/macos-companion/) — the macOS menu-bar app around `pvfs-companion`
 - [`deploy/ansible/`](deploy/ansible/) — optional remote build, test, smoke, install pipeline (+ `pvfsd@.service`, tmpfiles)
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — Rust CI on push
 
@@ -66,7 +69,7 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [20-f4-regions-and-streaming.md](docs/20-f4-regions-and-streaming.md) | Region logs + the streaming FUSE mount (1.4) |
 | [21–22](docs/21-attachment-policies.md) | Attachment kinds; the swarm data plane + serve-while-fetching (1.4) |
 | [23-ingest-sessions-and-the-bt-bridge.md](docs/23-ingest-sessions-and-the-bt-bridge.md) | External-ingest sessions & the BT bridge (unreleased) |
-| [24–25](docs/24-fleet-review-and-re-genesis.md) | The fleet review and re-genesis; the re-genesis runbook (rehearsed) |
+| [24–25](docs/24-fleet-review-and-re-genesis.md) | The fleet review and re-genesis; the re-genesis runbook (rehearsed, never run: superseded by doc 29) |
 | [26-regions-own-their-files.md](docs/26-regions-own-their-files.md) | **The region model** — catalogue regions, the merged view, resolution, receive, fleet health (running the production fleet) |
 | [27-d102-external-review-response.md](docs/27-d102-external-review-response.md) | Response to the D102 external review |
 | [28-moving-the-owner.md](docs/28-moving-the-owner.md) | Moving the forest owner (`pvfs forest promote`) |

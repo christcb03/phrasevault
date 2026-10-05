@@ -2,7 +2,7 @@
 
 This guide is for someone comfortable with a terminal, SSH, and copying commands — you do not need to be a Rust developer.
 
-**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). The latest release is **`1.4.0`** (tag `v1.4`, 2026-08-13; `v1.0` to `v1.3` are tagged too). Main has moved on since without a new release: `pvfs --version` prints the release and the build, e.g. `1.4.0 (v1.4-495-gc17ae29)`, the build the media fleet has run since 2026-09-27 ([VERSIONING.md](../VERSIONING.md)). It includes:
+**PVFS** is a command-line program (`pvfs`) plus an optional per-user daemon (`pvfsd`), a companion signing agent (`pvfs-companion`), and a data directory (SQLite log + index). The latest release is **`1.4.0`** (tag `v1.4`, 2026-08-13; `v1.0` to `v1.3` are tagged too). Main has moved on since without a new release: `pvfs --version` prints the release and the build, e.g. `1.4.0 (v1.4-549-gea84559)`, the build the media fleet has run since 2026-10-04 ([VERSIONING.md](../VERSIONING.md)). It includes:
 
 - **P0–P1.5** — core engine (forest, signed nodes/links, event log), storage ops (bind/scan/verified reads/watcher), mounts & host registry
 - **P2** — multi-user access: per-node ACLs, per-key tags, member-signed writes and live admin over `pvfsd`, concurrent raw-bytes `cat`, `pvfs audit`, graceful daemon shutdown
@@ -12,7 +12,7 @@ This guide is for someone comfortable with a terminal, SSH, and copying commands
 - **1.2** — expiring ACL grants, companion trust/singleton/https upgrades, concurrent daemon reads, `remote` paths + typed records, fuller `pvfs audit` (see [CHANGELOG.md](../CHANGELOG.md))
 - **1.3** — federation & sync (doc 17): `pvfs export`, TCP+TLS transport with pinned instances, verified replicas + live follow, placement/sync, write-through ingest, instance-qualified locations, read-through, tiered storage (`tier`/`evict`); plus companion invite redemption, tenant custody, sd_notify (see [CHANGELOG.md](../CHANGELOG.md))
 - **1.4** — the daemon's serve jobs (doc 18), write-through completeness (doc 19), region logs and the streaming FUSE mount (doc 20), attachment kinds (doc 21), the swarm (doc 22)
-- **Since 1.4, on main** — ingest sessions (doc 23); the region model, in production since 2026-09-12: each box catalogues its own disk, the merged view and its mount, the mover (`receive`/`resolve`), the trash (docs 26 and 29); moving the owner and dated copies of the log (doc 28); fleet monitoring (doc 30); forest-bound root certificates and personal forests (see [CHANGELOG.md](../CHANGELOG.md) and the [user manual](USER-MANUAL.md) §6.4)
+- **Since 1.4, on main** — ingest sessions (doc 23); the region model, in production since 2026-09-12: each box catalogues its own disk, the merged view and its mount, the mover (`receive`/`resolve`), the trash (docs 26 and 29); moving the owner and dated copies of the log (doc 28); fleet monitoring (doc 30); forest-bound root certificates and personal forests (see [CHANGELOG.md](../CHANGELOG.md) and the [user manual](USER-MANUAL.md) §7.13)
 
 Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with your values.
 
@@ -22,10 +22,15 @@ Replace placeholders such as `<repository-url>`, `<user>`, and `<host>` with you
 
 | Platform | Requirements |
 |----------|----------------|
-| **Linux or macOS** (local dev) | Git, a C compiler (`build-essential` / Xcode CLI tools), `curl`, `pkg-config`, **Rust** (via [rustup](https://rustup.rs)) |
+| **Linux or macOS** (local dev) | Git, a C compiler (`build-essential` / Xcode CLI tools), `curl`, `pkg-config`, **Rust** (via [rustup](https://rustup.rs)). On Linux also `libdbus-1-dev`: the companion's OS-keychain support links against it at build time |
 | **Remote Linux server** (optional) | SSH access, same build deps (or use the [Ansible pipeline](../deploy/ansible/README.md)) |
 
-There is no Docker image for the new PVFS — you build one native binary from source.
+Optional, at run time:
+
+- **`fuse3`** (Linux) — `pvfs mount` needs its `fusermount3`.
+- **`ffprobe`** (the `ffmpeg` package) — on a box that should measure the video quality of the files it holds (the daemon's `watch` job; `pvfs region quality` reports). Without it nothing is measured and the daemon says so; everything else works.
+
+There is no Docker image for the new PVFS — you build the native binaries from source.
 
 ---
 
@@ -69,7 +74,7 @@ export PVFS_DATA_DIR="$HOME/pvfs-test-forest"
 pvfs init
 
 # Add a folder and file under the root tree
-ROOT=$(pvfs info | sed -n 's/root_node_id: //p')
+ROOT=$(pvfs info | awk '/^root node/ { print $4 }')
 DIR=$(pvfs add "$ROOT" --kind folder --label docs)
 FILE=$(pvfs add "$DIR" --kind file --label readme.txt --size 0)
 
@@ -88,11 +93,12 @@ export PVFS_DATA_DIR="$HOME/pvfs-test-forest"
 pvfs info    # uses the device key stored in the data dir
 ```
 
-If you lose the data dir but kept the mnemonic:
+To re-derive this machine's device key from the mnemonic (the data dir, with
+its log, must be there — copied back, or still in place):
 
 ```bash
 export PVFS_DATA_DIR="$HOME/pvfs-test-forest"
-pvfs recover   # prompts for the 24 words
+pvfs recover --mnemonic "<your 24 words>"   # the flag is required: recover does not prompt
 ```
 
 Run the automated CLI smoke suite locally:
@@ -124,8 +130,13 @@ Install build dependencies once (Debian/Ubuntu):
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config curl git
+sudo apt install -y build-essential pkg-config curl git libdbus-1-dev fuse3
 ```
+
+`libdbus-1-dev` is what the companion's default OS-keychain support links
+against at build time; `fuse3` is what `pvfs mount` needs at run time. (The
+Ansible pipeline installs both.) Add `ffmpeg` on a box that should measure its
+video files' quality with ffprobe — optional.
 
 Install Rust if needed — see [rustup.rs](https://rustup.rs) — then:
 
@@ -156,12 +167,12 @@ PVFS_BIN=target/release/pvfs bash deploy/ansible/files/smoke-test.sh
 ```bash
 export PVFS_DATA_DIR="$HOME/pvfs-data/my-forest"
 pvfs init
-ROOT=$(pvfs info | awk '/root_node_id/ { print $2 }')
+ROOT=$(pvfs info | awk '/^root node/ { print $4 }')
 
 mkdir -p ~/test-data && echo hello > ~/test-data/sample.txt
 
-pvfs bind "$ROOT" ~/test-data --recursive
-pvfs scan "$ROOT" ~/test-data
+pvfs bind "$ROOT" ~/test-data    # recursive by default (--no-recursive turns it off)
+pvfs scan "$ROOT"                # index the bound folder
 
 pvfs ls "$ROOT"
 pvfs walk "$ROOT"
@@ -170,8 +181,8 @@ pvfs walk "$ROOT"
 pvfs stat <node-id>
 pvfs cat <node-id>
 
-# optional background watcher
-pvfs serve --bind "$ROOT" ~/test-data
+# optional: the watcher in the foreground (live indexing of the bound folders; Ctrl-C stops it)
+pvfs serve watch
 ```
 
 Use `pvfs --help` and `pvfs <command> --help` for all subcommands.
@@ -293,6 +304,34 @@ You'll see `serving on …/pvfs-companion.sock`. Keychain vaults unlock silently
 passphrase vaults prompt once. Leave it running (a user systemd unit works the
 same way as `pvfsd@` — see Option C).
 
+### 2b. More than one recovery phrase (optional)
+
+One companion can serve several phrases (PVOS D189). Seal each into a vault of
+its own, then name every vault at `serve`:
+
+```bash
+pvfs-companion init --vault ~/.config/pvfs/media2.vault    # prompts for that phrase
+pvfs-companion serve --vault ~/.config/pvfs/companion.vault --vault ~/.config/pvfs/media2.vault
+```
+
+The first `--vault` is the default phrase. A request picks another by naming
+one of its public keys; the `pvfs` CLI does that by itself, with the root key
+of the forest the command runs on. A vault after the first that cannot be
+opened is left out, and said; the rest are served. (The macOS app passes every
+keychain-sealed `*.vault` beside the default one by itself.)
+
+```bash
+pvfs-companion keys          # each phrase: its public keys, the forests that used them,
+                             # the paired servers, the web origins, the approvals given
+pvfs-companion keys --json   # the same, for a program
+pvfs-companion keys link     # record a forest made before the companion kept this list
+```
+
+`keys` shows public data only. `keys link` asks for the forest's root key, its
+id and a name to show (`--key`, `--forest-id`, `--label` for scripts) and is
+refused unless a phrase here holds that key; `pvfs --json forest tip <forest
+dir>`, on a box that has the forest, prints its id and root.
+
 ### 3. Use it (no phrase, no flags)
 
 ```bash
@@ -402,8 +441,10 @@ from the instance currently holding the socket.
 | `PVFS_SOCKET_DIR` | Directory holding daemon sockets (`<forest_id>.sock`). The daemon binds here and clients look here; both default to `/tmp/pvfs`. Set the **same** value on both sides (e.g. `/run/pvfs`). |
 | `PVFS_REGISTRY_DIR` | Override the host forest registry (default `/etc/pvfs`, which needs `sudo` to write). A user-writable path gives a rootless registry. |
 | `PVFS_COMPANION_VAULT` | Companion vault file (default `~/.config/pvfs/companion.vault`). For scripts; interactive use never needs it. |
-| `PVFS_COMPANION_SOCKET` | Companion signer socket (default `$XDG_RUNTIME_DIR/pvfs-companion.sock`). Both `pvfs-companion serve` and the `pvfs` CLI honor it. |
+| `PVFS_COMPANION_SOCKET` | Companion signer socket. Default `$XDG_RUNTIME_DIR/pvfs-companion.sock`; where `XDG_RUNTIME_DIR` is unset — every Mac — `/tmp/pvfs-companion-<user>.sock`. Both `pvfs-companion serve` and the `pvfs` CLI honor it. |
 | `PVFS_COMPANION_PASSPHRASE` | Vault passphrase for **non-interactive** use (pipelines, systemd). Interactive use prompts instead. |
+| `PVFS_COMPANION_KEY` | A public key (hex) naming which of a companion's phrases a `pvfs` command should use (PVOS D189; Option D §2b). Normally unset: `pvfs` names the root key of the forest the command runs on. Set it where there is no forest yet — `pvfs forest init --via-companion` against a companion that holds several phrases — or the companion answers with its default phrase. `pvfs-companion keys` prints each phrase's keys. |
+| `PVFS_FFPROBE` | Path to the `ffprobe` the daemon measures video quality with (PVOS D208). Default: `ffprobe` on `PATH`. With neither, nothing is measured. |
 | `PVFS_BIN` | Used only by `smoke-test.sh` — path to the `pvfs` binary to test. |
 
 ---

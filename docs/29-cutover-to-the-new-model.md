@@ -48,6 +48,10 @@ of the two holders' roots and feederbox's staging root, with:
   staging upgrade waiting for `receive`), and none of kind `file vs folder`;
 - `pvfs serve status` on every box: `conflicts 0` (or the expected few),
   `stale 0`, every job enabled and clean;
+  *(D218, 2026-10-04: plain `pvfs serve status` prints its `conflicts:` and
+  `stale catalogues:` lines only when the count is not zero — no line means
+  0; `--json` always carries `conflicts` and `stale`. The same goes for §4
+  E's check.)*
 - `pvfs fleet health` on the owner: every box up, no action pending;
 - a file written on feederbox lands on the NAS's library root by itself,
   its staging copy drains, and the view shows one copy — the D134 lab loop,
@@ -185,6 +189,9 @@ owned by the NAS's key, binds `Data/Media`, declares it receiving, enables
 `follow,catalogue,receive`, starts the daemon on 7433, installs the
 supervise script and the forced-command key, and registers the channel on
 the owner.
+*(D218, 2026-10-04: the jobs it enables are Phase A's list,
+`follow,watch,catalogue,receive` — `watch` included, as the paragraph after
+the next block says.)*
 
 **The second root is by hand.** The play declares one region per box
 (D134's open item); `Data_ext/Media` is a second library region on the same
@@ -340,9 +347,15 @@ the fetch-and-verify of a 27,000-row manifest is a few megabytes.
 
 1. **The play declares one region per box.** The holder's second root is a
    hand step (§4 D). Making `pvfs_region` a list is a small follow-up.
+   *(D218, 2026-10-04: done for the boxes the play runs under systemd —
+   `pvfs_regions`, a list, PVOS D147; mediabox's row uses it. Still open
+   for the NAS play, which takes one region: `library-ext` is added by
+   hand.)*
 2. **The `watch` job on the NAS** is not in the inventory example's job
    list for the holder; §4 D adds it. The example should carry it once the
    holder has a region.
+   *(D218, 2026-10-04: done — PVOS `deploy/ansible/fleet/fleet-prod.ini.example`
+   lists the NAS's jobs as `follow,watch,catalogue,receive`.)*
 3. ~~**Quality re-measurement** on the new model (§3).~~ — PVOS D208: the
    daemon's `watch` measures each video file with ffprobe where its bytes
    are, within each pass's budget (300 files or 60 s), and the row's
