@@ -19,7 +19,11 @@ file tracks Layer 0, the file-system engine.
   first asked, reused for a minute, rebuilt on a miss once two seconds old.
   No protocol bump: the field is optional, and an older holder ignores it
   and says `not_found`, as before. `Client::cat_hash_range_from`,
-  `sync::trashed_with_hash`, `Engine::trashed_bytes_for_hash`.
+  `sync::trashed_with_hash`, `Engine::trashed_bytes_for_hash`. And the
+  view's `getattr` answers for a file open here whose path has left the view
+  with its attributes at the open (`fstat` after an unlink): the kernel asks
+  at a read that reaches the end, so a stream that outlived its path failed
+  there with ENOENT (found on the lab).
 
 - **A read through the view of a file its holder no longer has answers
   "no such file", and a box fetches a new catalogue head when it lands
