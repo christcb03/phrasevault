@@ -1,8 +1,9 @@
 //! PVOS D207 — the measurement: what a quiet catalogue pass writes, on a
-//! library of fleet shape (shows / seasons / episodes). Ignored by the
-//! suite; run in release on presubuntu's disk:
+//! library of fleet shape (shows / seasons / episodes). A manual run, not a
+//! test (PVOS D221: nothing in the suite is ignored); run it in release on
+//! presubuntu's disk:
 //!
-//!   PVFS_D207_FILES=29500 cargo test --release -p pvfs-core --test d207_measure -- --ignored --nocapture
+//!   PVFS_D207_FILES=29500 cargo run --release -p pvfs-core --example d207_measure
 //!
 //! It uses only the engine API PVFS had before D199, so the same file runs
 //! on the commit before D199 for the "before".
@@ -18,9 +19,7 @@ fn count(c: &rusqlite::Connection) -> (i64, i64) {
     got
 }
 
-#[test]
-#[ignore]
-fn a_quiet_pass_at_fleet_scale() {
+fn main() {
     let files: usize = std::env::var("PVFS_D207_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000);
     let base = std::env::var("PVFS_D207_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     let tmp = tempfile::tempdir_in(base).unwrap();
