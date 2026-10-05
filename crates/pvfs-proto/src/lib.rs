@@ -737,6 +737,13 @@ pub enum ClientMsg {
         offset: u64,
         #[serde(default, skip_serializing_if = "is_zero")]
         len: u64,
+        /// PVOS D220 — the reader was already reading these bytes: if this
+        /// box's live copy has gone to the region's trash since, serve the
+        /// trashed one (a file open on a local disk stays readable after its
+        /// unlink). Sent only when true; a holder before D220 ignores it and
+        /// says `not_found`, as it always did.
+        #[serde(default, skip_serializing_if = "is_false")]
+        trashed: bool,
     },
     /// D169: a delete that came through a view mount. Move THIS box's copy
     /// of `rel_path` in catalogue region `region` into that region's trash
@@ -1143,6 +1150,10 @@ pub fn read_data_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 
 fn is_zero(v: &u64) -> bool {
     *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 fn invalid<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {

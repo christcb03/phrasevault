@@ -809,8 +809,8 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 do_cat(daemon, &principal, &mut stream, &node, offset, len)?;
                 continue;
             }
-            ClientMsg::CatHash { hash, offset, len } => {
-                do_cat_hash(daemon, &principal, &mut stream, &hash, offset, len)?;
+            ClientMsg::CatHash { hash, offset, len, trashed } => {
+                do_cat_hash(daemon, &principal, &mut stream, &hash, offset, len, trashed)?;
                 continue;
             }
             ClientMsg::SecureCat { node } => {
@@ -1661,11 +1661,19 @@ fn do_cat_hash<S: io::Read + io::Write>(
     hash: &str,
     offset: u64,
     len: u64,
+    trashed: bool,
 ) -> io::Result<()> {
     let held = {
         let e = daemon.reader();
-        match e.local_path_for_hash(hash) {
-            Ok(Some(lb)) => {
+        // PVOS D220 — the live copy first; a reader that was already reading
+        // (`trashed`) may then have the copy this box moved to a region's
+        // trash since, under the same read check on that region.
+        let found = match e.local_path_for_hash(hash) {
+            Ok(None) if trashed => e.trashed_bytes_for_hash(hash).map(|t| t.map(|lb| (lb, true))),
+            other => other.map(|l| l.map(|lb| (lb, false))),
+        };
+        match found {
+            Ok(Some((lb, from_trash))) => {
                 match e.effective_rights(principal, &lb.region) {
                     Ok(r) if r & acl::ACL_R != 0 => {}
                     Ok(_) => {
@@ -1676,6 +1684,9 @@ fn do_cat_hash<S: io::Read + io::Write>(
                         write_msg(stream, &err_from(pve))?;
                         return Ok(());
                     }
+                }
+                if from_trash {
+                    say_served_from_trash(hash, &lb.region, principal);
                 }
                 lb
             }
@@ -1690,6 +1701,25 @@ fn do_cat_hash<S: io::Read + io::Write>(
         }
     }; // engine lock released here
     stream_local_file(stream, &held.path, offset, len)
+}
+
+/// PVOS D220 — say once an hour per file that a reader is being served a
+/// trashed copy: it means a stream spanned a delete (an upgrade, a resolve).
+fn say_served_from_trash(hash: &str, region: &str, principal: &Principal) {
+    static SAID: std::sync::Mutex<std::collections::BTreeMap<String, std::time::Instant>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+    said.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(3600));
+    if said.contains_key(hash) {
+        return;
+    }
+    said.insert(hash.to_string(), std::time::Instant::now());
+    eprintln!(
+        "pvfsd: {} served from {}'s trash to {} — its live copy went while it was being read",
+        &hash[..hash.len().min(8)],
+        &region[..region.len().min(8)],
+        principal.display()
+    );
 }
 
 /// The data-plane tail shared by `Cat` and `CatHash`: `CatStart`, the

@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A file being read through the view keeps reading after its holder
+  trashes it (PVOS D220).** A Plex stream of an episode Sonarr upgrades
+  broke the moment the holder moved the old copy to its region's trash; a
+  file open on a local disk stays readable after its unlink. A read-through
+  that has already been served bytes now asks with `CatHash { trashed: true
+  }`, and a holder whose live copy has gone serves the trashed one — found by
+  its sidecar's hash at the sidecar's size, in a region this box catalogues
+  from its own disk, under the same read check on that region — for as long
+  as it is in the trash. A reader that opens the file after the delete still
+  gets ENOENT (D219). The holder says so once an hour per file (`pvfsd:
+  <hash> served from <region>'s trash …`). The trash is indexed by hash when
+  first asked, reused for a minute, rebuilt on a miss once two seconds old.
+  No protocol bump: the field is optional, and an older holder ignores it
+  and says `not_found`, as before. `Client::cat_hash_range_from`,
+  `sync::trashed_with_hash`, `Engine::trashed_bytes_for_hash`.
+
 - **A read through the view of a file its holder no longer has answers
   "no such file", and a box fetches a new catalogue head when it lands
   (PVOS D219).** When every box a read-through asks says it holds no such

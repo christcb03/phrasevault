@@ -853,6 +853,9 @@ fn fetch_run(
     // nothing, and the read stays an I/O error.
     let mut all_said_no = !sources.is_empty() && run.bad.is_empty();
     run.gone = false;
+    // PVOS D220 — a fetch already served bytes was being read: its holder
+    // may answer from the trash if the live copy has gone there since.
+    let trashed = fetch.st.lock().unwrap().fetched > 0;
     for _ in 0..sources.len() {
         let idx = run.cur % sources.len();
         let src = &sources[idx];
@@ -883,7 +886,7 @@ fn fetch_run(
                 written: 0,
                 next: first,
             };
-            let streamed = client.cat_hash_range(&fetch.hash, off, len, &mut sink);
+            let streamed = client.cat_hash_range_from(&fetch.hash, off, len, trashed, &mut sink);
             let written = sink.written;
             match streamed {
                 Ok(_) if written == len => {
