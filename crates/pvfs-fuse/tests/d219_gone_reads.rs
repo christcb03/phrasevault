@@ -87,7 +87,7 @@ fn region(e: &mut Engine, mn: &pvfs_core::Mnemonic, label: &str) -> (String, pvf
 fn head(e: &mut Engine, r: &str, seed: &pvfs_core::Mnemonic, seq: u64, rows: &[RegionEntry], source: &str) {
     let key = identity::device_key(seed, "", 0).unwrap();
     let key_pub = crypto::pubkey_bytes(&key);
-    let manifest = Engine::region_manifest_bytes(&r.to_string(), seq, rows);
+    let manifest = Engine::region_manifest_bytes(r, seq, rows);
     let prep = e
         .prepare_commit_region_head(&key_pub, &r.to_string(), seq, blake3::hash(&manifest).to_hex().as_str())
         .unwrap();
