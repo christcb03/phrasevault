@@ -576,11 +576,26 @@ impl Client {
         len: u64,
         out: &mut dyn std::io::Write,
     ) -> Result<u64> {
+        self.cat_hash_range_from(hash, offset, len, false, out)
+    }
+
+    /// PVOS D220 — [`Client::cat_hash_range`] for a reader that was already
+    /// reading these bytes (`trashed`): a holder whose live copy has gone to
+    /// its region's trash since serves the trashed one.
+    pub fn cat_hash_range_from(
+        &mut self,
+        hash: &str,
+        offset: u64,
+        len: u64,
+        trashed: bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64> {
         self.cat_with(
             ClientMsg::CatHash {
                 hash: hash.into(),
                 offset,
                 len,
+                trashed,
             },
             out,
         )

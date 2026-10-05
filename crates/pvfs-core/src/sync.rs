@@ -990,6 +990,89 @@ pub fn list_trash(root: &Path) -> Vec<TrashEntry> {
     out
 }
 
+/// PVOS D220 — a region root's trash by content hash: each trashed file whose
+/// sidecar (moved with it, mtime kept) names its whole hash.
+struct TrashIndex {
+    built: std::time::Instant,
+    by_hash: std::collections::HashMap<String, (PathBuf, u64)>,
+}
+
+/// How long a built index is used as it is.
+const TRASH_INDEX_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
+/// A miss rebuilds an index older than this — a trash another process made a
+/// moment ago (`pvfs trash put`) is found on the next request, and a burst of
+/// misses walks the trash once.
+const TRASH_INDEX_REBUILD: std::time::Duration = std::time::Duration::from_secs(2);
+
+static TRASH_INDEXES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, TrashIndex>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn index_trash(root: &Path) -> std::collections::HashMap<String, (PathBuf, u64)> {
+    let mut by_hash = std::collections::HashMap::new();
+    let Ok(buckets) = std::fs::read_dir(trash_root(root)) else {
+        return by_hash;
+    };
+    for b in buckets.flatten() {
+        if b.file_name().to_str().and_then(|n| n.parse::<u64>().ok()).is_none() {
+            continue;
+        }
+        let mut stack = vec![b.path()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let Ok(kind) = e.file_type() else { continue };
+                if kind.is_dir() {
+                    stack.push(e.path());
+                    continue;
+                }
+                if !kind.is_file() || is_sidecar_name(&e.file_name().to_string_lossy()) {
+                    continue;
+                }
+                let path = e.path();
+                let Ok(size) = e.metadata().map(|m| m.len()) else { continue };
+                if let Some(hash) = sidecar_whole_hash(&path, size) {
+                    by_hash.insert(hash, (path, size));
+                }
+            }
+        }
+    }
+    by_hash
+}
+
+/// PVOS D220 — the file in `root`'s trash with content `hash`, and its size:
+/// what a holder serves a reader that was reading it when it went to the
+/// trash. Only a file whose sidecar names the hash and whose size is the
+/// sidecar's. The index is built when first asked, used for a minute, and
+/// rebuilt on a miss once it is two seconds old; a hit whose file has gone
+/// (purged, restored) is a miss.
+pub fn trashed_with_hash(root: &Path, hash: &str) -> Option<(PathBuf, u64)> {
+    let still_there = |(p, size): &(PathBuf, u64)| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == *size);
+    let (found, age) = {
+        let all = TRASH_INDEXES.lock().unwrap_or_else(|p| p.into_inner());
+        match all.get(root) {
+            Some(ix) => (ix.by_hash.get(hash).cloned(), Some(ix.built.elapsed())),
+            None => (None, None),
+        }
+    };
+    if let (Some(hit), Some(a)) = (&found, age) {
+        if a < TRASH_INDEX_KEEP && still_there(hit) {
+            return found;
+        }
+    }
+    if age.is_some_and(|a| a < TRASH_INDEX_REBUILD) {
+        return None;
+    }
+    // The walk runs with no lock held: other roots' (and this root's) lookups
+    // go on meanwhile; two walks at once cost a walk, not a wrong answer.
+    let by_hash = index_trash(root);
+    let found = by_hash.get(hash).cloned().filter(still_there);
+    TRASH_INDEXES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(root.to_path_buf(), TrashIndex { built: std::time::Instant::now(), by_hash });
+    found
+}
+
 /// D167 — what a restore did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TrashRestore {

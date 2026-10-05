@@ -3936,6 +3936,19 @@ impl Engine {
             .collect()
     }
 
+    /// PVOS D220 — this box's TRASHED copy of `hash`, in any catalogue region
+    /// it holds locally: what a holder serves a reader that was reading the
+    /// file when it went to the trash. `region` is the one to check rights
+    /// on. Only reads; the disk walk is [`crate::sync::trashed_with_hash`]'s.
+    pub fn trashed_bytes_for_hash(&self, hash: &str) -> Result<Option<LocalBytes>> {
+        for (region, root, _days) in self.trash_roots()? {
+            if let Some((path, size)) = crate::sync::trashed_with_hash(&root, hash) {
+                return Ok(Some(LocalBytes { path, size, region }));
+            }
+        }
+        Ok(None)
+    }
+
     /// D176 — what [`Engine::purge_region_trash`] purges: every catalogue
     /// region this box holds locally, with its root and its retention in
     /// days. Only reads, so the daemon answers it from a read view and does

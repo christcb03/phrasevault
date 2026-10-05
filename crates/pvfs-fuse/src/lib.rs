@@ -82,6 +82,13 @@ pub struct PvfsFs {
     hash_cache: Option<HashCache>,
     hash_streams: HashMap<u64, HashStream>,
     hash_pins: HashMap<u64, String>,
+    /// PVOS D220 — a view file open here: its attributes as they were at the
+    /// open, and how many handles hold it (by inode); and each handle's
+    /// inode. `getattr` answers from these once the path has gone from the
+    /// view, as `fstat` on an open file does on a disk after its unlink —
+    /// the kernel asks at a read that reaches the end of the file.
+    open_attrs: HashMap<u64, (FileAttr, usize)>,
+    open_inos: HashMap<u64, u64>,
     /// D169 — the boxes a view delete asks (tests, the lab); `None` = the
     /// fleet's announced endpoints.
     view_sources: Option<Vec<ReplicaSource>>,
@@ -217,6 +224,8 @@ impl PvfsFs {
             hash_cache: None,
             hash_streams: HashMap::new(),
             hash_pins: HashMap::new(),
+            open_attrs: HashMap::new(),
+            open_inos: HashMap::new(),
             view_sources: None,
             tombstones: Arc::new(std::sync::Mutex::new(HashMap::new())),
             overlay: Arc::new(std::sync::Mutex::new(Overlay::default())),
@@ -1109,6 +1118,16 @@ impl PvfsFs {
         out
     }
 
+    /// PVOS D220 — remember an open view file's attributes for `getattr`
+    /// (see `open_attrs`).
+    fn note_open(&mut self, ino: u64, fh: u64) {
+        let Some(rel) = self.ino_to_path.get(&ino).cloned() else { return };
+        let Some(entry) = self.view_entry_of(&rel) else { return };
+        let attr = self.view_attr(&entry);
+        self.open_attrs.entry(ino).or_insert((attr, 0)).1 += 1;
+        self.open_inos.insert(fh, ino);
+    }
+
     /// D130 §3.2 — open a view file: this box's own disk, the hash store,
     /// else a read-through. D165: the read-through fetches the pieces a
     /// read asks for, not the file — `open` starts nothing.
@@ -1248,7 +1267,11 @@ impl Filesystem for PvfsFs {
                     let attr = self.view_attr(&e);
                     reply.attr(&TTL, &attr)
                 }
-                None => reply.error(libc::ENOENT),
+                // PVOS D220 — gone from the view but open here: what it was.
+                None => match self.open_attrs.get(&ino) {
+                    Some((attr, _)) => reply.attr(&TTL, attr),
+                    None => reply.error(libc::ENOENT),
+                },
             };
         }
         let Some(node) = self.ino_to_node.get(&ino).cloned() else {
@@ -1331,7 +1354,10 @@ impl Filesystem for PvfsFs {
             // and the `watch` job re-hashes it, with no fetch and no copy-up.
             // Anything else stays EROFS, deliberately (see D217 §4).
             return match self.open_for_write(ino) {
-                Ok(fh) => reply.opened(fh, 0),
+                Ok(fh) => {
+                    self.note_open(ino, fh);
+                    reply.opened(fh, 0)
+                }
                 Err(e) => reply.error(e),
             };
         }
@@ -1341,7 +1367,10 @@ impl Filesystem for PvfsFs {
                 return reply.error(libc::ENOENT);
             };
             return match self.view_open(&rel) {
-                Ok(fh) => reply.opened(fh, 0),
+                Ok(fh) => {
+                    self.note_open(ino, fh);
+                    reply.opened(fh, 0)
+                }
                 Err(code) => reply.error(code),
             };
         }
@@ -1936,6 +1965,14 @@ impl Filesystem for PvfsFs {
         // D217 — a write handle closes here too; the `watch` job picks the
         // changed bytes up and re-hashes them.
         self.write_handles.remove(&fh);
+        if let Some(ino) = self.open_inos.remove(&fh) {
+            if let Some((_, n)) = self.open_attrs.get_mut(&ino) {
+                *n -= 1;
+                if *n == 0 {
+                    self.open_attrs.remove(&ino);
+                }
+            }
+        }
         self.handles.remove(&fh);
         self.streaming.remove(&fh);
         self.proxy.remove(&fh);
