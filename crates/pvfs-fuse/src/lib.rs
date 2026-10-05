@@ -107,6 +107,9 @@ struct Tomb {
     dead: HashSet<String>,
     at: std::time::Instant,
     held: HashMap<String, u64>,
+    /// How long it is trusted: [`TOMBSTONE_TTL`] for a delete through this
+    /// mount, [`GONE_TTL`] for a copy a read found gone (PVOS D219).
+    ttl: Duration,
 }
 
 /// How long a tombstone hides a path the catalogue still lists. It only has
@@ -117,11 +120,57 @@ struct Tomb {
 /// head — stayed hidden on the box that had deleted it.
 const TOMBSTONE_TTL: Duration = Duration::from_secs(600);
 
+/// PVOS D219 — how long a copy a READ found gone (every box asked said it
+/// holds no such bytes) stays hidden at most. Shorter than a delete's: this
+/// box did not make the change, it only saw its effect, so the catalogue
+/// should overtake it within a minute (the holder's watch pass plus our
+/// nudged fetch take seconds) — and if the box was wrong, the file is back
+/// soon.
+const GONE_TTL: Duration = Duration::from_secs(120);
+
+/// PVOS D219 — hide `hash` at `rel`: a read found that every box asked holds
+/// no such bytes (deleted or replaced since this box's catalogue last moved).
+/// `held` is what this box held of the copies' regions at the open; a head
+/// beyond it that still lists the copy brings it back (D169's rule). Joins a
+/// tombstone already there. Callable off the session thread.
+fn bury_gone(tombs: &Tombstones, rel: &str, hash: &str, held: &HashMap<String, u64>) {
+    let mut t = tombs.lock().unwrap();
+    match t.get_mut(rel) {
+        Some(tomb) if tomb.dead.contains(hash) => {}
+        Some(tomb) => {
+            tomb.dead.insert(hash.to_string());
+            for (r, q) in held {
+                tomb.held.entry(r.clone()).or_insert(*q);
+            }
+        }
+        None => {
+            t.insert(
+                rel.to_string(),
+                Tomb {
+                    dead: HashSet::from([hash.to_string()]),
+                    at: std::time::Instant::now(),
+                    held: held.clone(),
+                    ttl: GONE_TTL,
+                },
+            );
+            eprintln!(
+                "mount: {rel} is gone ({}) — hidden until this box's catalogue catches up",
+                &hash[..hash.len().min(8)]
+            );
+        }
+    }
+}
+
 /// One handle on a read-through: its fetch, and the file it reads from,
 /// opened once (the partial becomes the kept file by rename — one inode).
 struct HashStream {
     fetch: Arc<HashFetch>,
     file: Option<std::fs::File>,
+    /// PVOS D219 — the view path it was opened at, and what this box held of
+    /// the regions of the copies with its hash then: a read that finds the
+    /// bytes gone hides that copy ([`bury_gone`]).
+    rel: String,
+    held: HashMap<String, u64>,
 }
 
 /// How long a read waits for its pieces before it is an I/O error.
@@ -561,7 +610,7 @@ impl PvfsFs {
                 .iter()
                 .any(|c| now.get(&c.region).copied().unwrap_or(0) > tomb.held.get(&c.region).copied().unwrap_or(u64::MAX))
         };
-        if lingering.is_empty() || republished || tomb.at.elapsed() > TOMBSTONE_TTL {
+        if lingering.is_empty() || republished || tomb.at.elapsed() > tomb.ttl {
             tombs.remove(&e.rel_path); // the catalogue has caught up, the file is back, or it is too old to trust
             return Some(e);
         }
@@ -645,6 +694,7 @@ impl PvfsFs {
                 dead,
                 at: std::time::Instant::now(),
                 held,
+                ttl: TOMBSTONE_TTL,
             };
             tombs.lock().unwrap().insert(rel, tomb);
         };
@@ -813,7 +863,7 @@ impl PvfsFs {
                     dead.retain(|h| !moved.contains(h)); // its twin: the same bytes, showing either is right
                 }
                 if !dead.is_empty() {
-                    let tomb = Tomb { dead, at: std::time::Instant::now(), held: held.clone() };
+                    let tomb = Tomb { dead, at: std::time::Instant::now(), held: held.clone(), ttl: TOMBSTONE_TTL };
                     tombs.lock().unwrap().insert(to.clone(), tomb);
                 }
                 if moved_hashes.is_none() {
@@ -1085,6 +1135,16 @@ impl PvfsFs {
             return Ok(fh);
         }
         let prefer = self.holders_of(&entry, &hash);
+        // PVOS D219 — what this box holds of the regions the read may find gone.
+        let held: HashMap<String, u64> = {
+            let fetched = self.engine.fetched_seqs().unwrap_or_default();
+            entry
+                .sources
+                .iter()
+                .filter(|c| c.content_hash.as_deref() == Some(hash.as_str()))
+                .filter_map(|c| fetched.get(&c.region).map(|q| (c.region.clone(), *q)))
+                .collect()
+        };
         let cache = self.hash_cache.as_ref().ok_or(libc::EIO)?;
         match cache.open_preferring(&hash, size, &prefer).map_err(|_| libc::EIO)? {
             Opened::Local(path) => {
@@ -1099,7 +1159,7 @@ impl PvfsFs {
                 self.hash_pins.insert(fh, hash);
             }
             Opened::Stream(fetch) => {
-                self.hash_streams.insert(fh, HashStream { fetch, file: None });
+                self.hash_streams.insert(fh, HashStream { fetch, file: None, rel: rel.to_string(), held });
             }
         }
         self.next_fh += 1;
@@ -1116,6 +1176,18 @@ fn reply_read_at(f: &std::fs::File, offset: u64, size: u32, reply: ReplyData) {
             reply.data(&buf);
         }
         Err(_) => reply.error(libc::EIO),
+    }
+}
+
+/// PVOS D219 — the errno for a read-through read that failed: ENOENT when
+/// every box said the bytes are gone (the copy is hidden from then on),
+/// else EIO.
+fn read_failed(tombs: &Tombstones, hs: &HashStream) -> i32 {
+    if hs.fetch.gone() {
+        bury_gone(tombs, &hs.rel, hs.fetch.hash(), &hs.held);
+        libc::ENOENT
+    } else {
+        libc::EIO
     }
 }
 
@@ -1416,14 +1488,23 @@ impl Filesystem for PvfsFs {
                         None => reply.error(libc::EIO),
                     };
                 }
-                Some(Err(_)) => return reply.error(libc::EIO),
+                Some(Err(_)) => {
+                    let errno = read_failed(&self.tombstones, hs);
+                    return reply.error(errno);
+                }
                 None => {
                     let fetch = Arc::clone(&hs.fetch);
+                    let tombs = Arc::clone(&self.tombstones);
+                    let (rel, held) = (hs.rel.clone(), hs.held.clone());
                     std::thread::spawn(move || match fetch.wait_range(off, len, READ_WAIT) {
                         Ok(path) => match std::fs::File::open(&path) {
                             Ok(f) => reply_read_at(&f, off, size, reply),
                             Err(_) => reply.error(libc::EIO),
                         },
+                        Err(_) if fetch.gone() => {
+                            bury_gone(&tombs, &rel, fetch.hash(), &held);
+                            reply.error(libc::ENOENT)
+                        }
                         Err(_) => reply.error(libc::EIO),
                     });
                     return;

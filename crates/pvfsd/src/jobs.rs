@@ -56,6 +56,13 @@ const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 /// D129 — a catalogue region's head moves at most once per watch pass on
 /// its box, so a minute keeps the fleet's view within a pass of live.
 const CATALOGUE_INTERVAL: Duration = Duration::from_secs(60);
+/// PVOS D219 — a new head landing here (the owner's commit of a holder's
+/// head; a replica's follow catching up) runs a QUICK catalogue pass at once
+/// instead of at the next minute — but no sooner than this after the last
+/// pass began. Heads move about once a minute, so the manifests fetched stay
+/// what they were; in a mass change this caps a 6 MB library manifest at six
+/// a minute (feederbox pulls it over the home uplink).
+const CATALOGUE_NUDGE_FLOOR: Duration = Duration::from_secs(10);
 /// D131 — a fleet poll every two minutes: "ten hours unnoticed" becomes
 /// "four minutes" (two misses) without paging on a daemon's own restart.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(120);
@@ -184,6 +191,11 @@ pub struct JobsState {
     nudge_evict: AtomicBool,
     /// Punch H: the daemon's own commits (write-through ingest) wake the mover.
     nudge_tier: AtomicBool,
+    /// PVOS D219 — a catalogue head landed here: fetch it now, not at the
+    /// minute. And whether the catalogue pass being started is a nudged
+    /// (quick) one.
+    nudge_catalogue: AtomicBool,
+    catalogue_quick: AtomicBool,
     /// D81 — when each job's CURRENT pass began; absent means none in flight.
     /// Local to the daemon: `ServeJobWire` is on the wire and this is not worth
     /// a proto bump, since it only ever feeds `state` and `last_error`.
@@ -311,6 +323,8 @@ impl JobsState {
             nudge_export: AtomicBool::new(false),
             nudge_evict: AtomicBool::new(false),
             nudge_tier: AtomicBool::new(false),
+            nudge_catalogue: AtomicBool::new(false),
+            catalogue_quick: AtomicBool::new(false),
             pass_started: Mutex::new(std::collections::HashMap::new()),
             pass_dur: Mutex::new(std::collections::HashMap::new()),
             tier_unfetchable: Mutex::new(std::collections::HashSet::new()),
@@ -604,6 +618,7 @@ impl JobsState {
             "export" => self.nudge_export.swap(false, Ordering::SeqCst),
             "evict" => self.nudge_evict.swap(false, Ordering::SeqCst),
             "tier" => self.nudge_tier.swap(false, Ordering::SeqCst),
+            "catalogue" => self.nudge_catalogue.swap(false, Ordering::SeqCst),
             _ => false,
         }
     }
@@ -612,6 +627,18 @@ impl JobsState {
     /// owner should migrate without waiting out the interval.
     pub(crate) fn nudge_tier(&self) {
         self.nudge_tier.store(true, Ordering::SeqCst);
+    }
+
+    /// PVOS D219 — called where a catalogue head lands on this box (the
+    /// owner's commit of a `SubRegionHead`; a replica's follow folding new
+    /// events): fetch the stale regions now rather than at the minute.
+    pub(crate) fn nudge_catalogue(&self) {
+        self.nudge_catalogue.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a catalogue nudge is waiting (tests: the commit path's).
+    pub fn catalogue_nudged(&self) -> bool {
+        self.nudge_catalogue.load(Ordering::SeqCst)
     }
 
     /// A completed pass: back to idle, stamped; issues (per-file failures or
@@ -777,6 +804,9 @@ fn follow_event(cb: &JobsState, ev: FollowEvent<'_>) -> Vec<String> {
             log.extend(cb.recovered(Fault::FollowSession));
             // fresh content — the consuming passes should run now
             cb.nudge_content();
+            // PVOS D219 — and a holder's new head may be among it: a quick
+            // catalogue pass fetches it now (it dials nobody when none is).
+            cb.nudge_catalogue();
         }
         // D146 — current with the source on a quiet log: stamp the row (it is
         // healthy) but nudge nothing (nothing is new).
@@ -1157,12 +1187,15 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
         }),
         "catalogue" => job_thread(name, move || {
             st.set_state("catalogue", "running");
+            // PVOS D219 — a nudged pass is quick: the stale regions only, no
+            // claims asked of every box (the minute's full pass does that).
+            let claims = !st.catalogue_quick.load(Ordering::SeqCst);
             // PVOS D199 — on the daemon's one writer, reading through a view
             // of its own: no engine opened (and no log folded) every minute.
             let r = w
                 .get()
                 .and_then(|writer| pvfs_core::SharedDb::new(writer, "catalogue"))
-                .and_then(|db| pvfs_client::catalogue::fetch_pass_db(&db, &cancel, None));
+                .and_then(|db| pvfs_client::catalogue::fetch_pass_db_with(&db, &cancel, None, claims));
             match r {
                 Ok(rep) => {
                     // PVOS D183 — a head taken from the region's own box
@@ -1569,6 +1602,34 @@ pub fn follow_hung_reason(waited_ms: u64) -> String {
     )
 }
 
+/// PVOS D219 — how a periodic pass starts: whether it moves the job's next
+/// interval pass, and whether it is a nudged (quick) catalogue pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeriodicStart {
+    moves_due: bool,
+    quick: bool,
+}
+
+/// Whether a periodic job starts a pass now. Every job: when its interval is
+/// due, or when it was nudged (`take_nudge` — consumed only when asked). The
+/// catalogue job (PVOS D219): a nudge that is not due is a QUICK pass, held
+/// back (left set) until [`CATALOGUE_NUDGE_FLOOR`] after the last pass began,
+/// and it never moves the minute's full pass — a stream of heads must not
+/// starve the claims only the full pass collects.
+fn periodic_start(name: &str, due: bool, since_last: Option<Duration>, take_nudge: impl FnOnce() -> bool) -> Option<PeriodicStart> {
+    if name != "catalogue" {
+        return (take_nudge() || due).then_some(PeriodicStart { moves_due: true, quick: false });
+    }
+    if due {
+        let _ = take_nudge(); // the full pass covers it
+        return Some(PeriodicStart { moves_due: true, quick: false });
+    }
+    if since_last.is_some_and(|d| d < CATALOGUE_NUDGE_FLOOR) {
+        return None;
+    }
+    take_nudge().then_some(PeriodicStart { moves_due: false, quick: true })
+}
+
 fn interval(name: &str) -> Duration {
     match name {
         "sync" => SYNC_INTERVAL,
@@ -1706,6 +1767,9 @@ pub fn run(
     let mut draining: Vec<Managed> = Vec::new();
     let mut retry_at: HashMap<String, Instant> = HashMap::new();
     let mut next_due: HashMap<String, Instant> = HashMap::new();
+    // PVOS D219 — when each periodic job's last pass began (the catalogue
+    // nudge's floor).
+    let mut last_start: HashMap<String, Instant> = HashMap::new();
     let jobs_file = serve::jobs_path(state.data_dir());
     let mtime_of = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut last_mtime = mtime_of(&jobs_file);
@@ -1905,10 +1969,18 @@ pub fn run(
                 let _ = m.handle.join();
             }
             let due = next_due.get(name).is_none_or(|t| Instant::now() >= *t);
-            if state.take_nudge(name) || due {
+            let since = last_start.get(name).map(Instant::elapsed);
+            let Some(start) = periodic_start(name, due, since, || state.take_nudge(name)) else {
+                continue;
+            };
+            if start.moves_due {
                 next_due.insert(name.to_string(), Instant::now() + interval(name));
-                running.insert(name.to_string(), spawn_pass(name, &state, &writers));
             }
+            if name == "catalogue" {
+                state.catalogue_quick.store(start.quick, Ordering::SeqCst);
+            }
+            last_start.insert(name.to_string(), Instant::now());
+            running.insert(name.to_string(), spawn_pass(name, &state, &writers));
         }
 
         std::thread::sleep(RUNNER_POLL);
@@ -2417,5 +2489,57 @@ mod tests {
         assert!(!why.contains("overdue"), "the notifier filters `overdue`; a stall must reach a person");
         let why = progress_stalled_reason(&p(3 * 3_600_000, false), now, PROGRESS_STALL).unwrap();
         assert!(why.contains("not advanced for 3 h 0 min (hashing)"), "{why}");
+    }
+
+    /// PVOS D219 — the catalogue job's start rule: the minute's full pass when
+    /// due (a waiting nudge is spent on it); otherwise a nudge is a quick pass
+    /// that leaves the minute alone, held back (not spent) inside the floor.
+    /// Every other job keeps "nudged or due, and the interval restarts".
+    #[test]
+    fn a_catalogue_nudge_is_a_quick_pass_behind_a_floor_and_never_moves_the_minute() {
+        let full = Some(PeriodicStart { moves_due: true, quick: false });
+        let quick = Some(PeriodicStart { moves_due: false, quick: true });
+        let secs = |s| Some(Duration::from_secs(s));
+        let spent = std::cell::Cell::new(false);
+        let nudge = |set: bool| {
+            let spent = &spent;
+            move || {
+                spent.set(set);
+                set
+            }
+        };
+        assert_eq!(periodic_start("catalogue", true, secs(3), nudge(false)), full, "due: full");
+        assert_eq!(periodic_start("catalogue", true, secs(3), nudge(true)), full, "due and nudged: one full pass");
+        assert!(spent.get(), "the nudge is spent on the full pass");
+        assert_eq!(periodic_start("catalogue", false, secs(30), nudge(true)), quick, "nudged: quick");
+        assert_eq!(periodic_start("catalogue", false, None, nudge(true)), quick, "nudged before any pass: quick");
+        assert_eq!(periodic_start("catalogue", false, secs(30), nudge(false)), None, "neither: nothing");
+        spent.set(false);
+        let held = periodic_start("catalogue", false, secs(4), || {
+            spent.set(true);
+            true
+        });
+        assert_eq!(held, None, "inside the floor: held back");
+        assert!(!spent.get(), "…and the nudge is left set for later");
+        assert_eq!(periodic_start("catalogue", false, Some(CATALOGUE_NUDGE_FLOOR), nudge(true)), quick, "at the floor: quick");
+        assert_eq!(periodic_start("sync", false, secs(1), nudge(true)), full, "other jobs: a nudge runs and moves the interval");
+        assert_eq!(periodic_start("sync", true, secs(1), nudge(false)), full);
+        assert_eq!(periodic_start("sync", false, secs(1), nudge(false)), None);
+    }
+
+    /// PVOS D219 — a follow that folded new events may carry a holder's new
+    /// head: it nudges the catalogue job. Being current on a quiet log does not.
+    #[test]
+    fn a_follow_that_caught_up_nudges_the_catalogue_and_a_quiet_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("pvfsd-d219-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        follow_event(&st, FollowEvent::UpToDate { tip: 7 });
+        assert!(!st.catalogue_nudged(), "nothing new: no nudge");
+        follow_event(&st, FollowEvent::CaughtUp { tip: 9 });
+        assert!(st.catalogue_nudged(), "new events: nudged");
+        assert!(st.take_nudge("catalogue"), "the runner spends it");
+        assert!(!st.catalogue_nudged());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

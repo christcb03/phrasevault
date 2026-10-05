@@ -3071,8 +3071,23 @@ fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEven
         }
     };
     match outcome {
-        Ok(()) => ServerMsg::Committed { id: String::new() },
+        Ok(()) => {
+            nudge_catalogue_on_heads(daemon, &events);
+            ServerMsg::Committed { id: String::new() }
+        }
         Err(pve) => err_from(pve),
+    }
+}
+
+/// PVOS D219 — a holder's catalogue head just committed here (it commits each
+/// one to the owner in the watch pass that made it): fetch its manifest now,
+/// not at the catalogue job's next minute. A read through this box's view of
+/// a file the holder has deleted since was an I/O error for up to that minute.
+fn nudge_catalogue_on_heads(daemon: &Daemon, events: &[pvfs_core::event::Event]) {
+    if events.iter().any(|e| matches!(e, pvfs_core::event::Event::SubRegionHead { .. })) {
+        if let Some(j) = daemon.jobs.get() {
+            j.nudge_catalogue();
+        }
     }
 }
 
@@ -3138,6 +3153,7 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
             if let Some(j) = daemon.jobs.get() {
                 j.nudge_tier();
             }
+            nudge_catalogue_on_heads(daemon, &events);
             match state.followup {
                 None => ServerMsg::Committed { id: state.result_id },
                 Some(f) => finish_ingest_followup(daemon, e, f, state.result_id),

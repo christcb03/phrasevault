@@ -79,6 +79,10 @@ impl std::fmt::Display for CacheMode {
 const CURSOR_IDLE: Duration = Duration::from_secs(300);
 /// Sequential readers tracked per file (Plex's player, its analysers).
 const MAX_CURSORS: usize = 16;
+/// PVOS D219 — how long a file every box said it does not hold answers its
+/// reads at once, before a read asks again. An app retrying a dead handle
+/// (ffprobe tried nine times) costs one round of questions, not nine.
+const GONE_REST: Duration = Duration::from_secs(5);
 
 /// The cache's knobs. `Default` is production (PVOS D164 §3, Chris's numbers
 /// for the bound: 500 GB, one day); tests shrink them.
@@ -271,6 +275,12 @@ struct FetchSt {
     fail_gen: u64,
     last_err: String,
     last_fail: Option<Instant>,
+    /// PVOS D219 — when a request last failed with EVERY box asked saying it
+    /// holds no such bytes: the file was deleted or replaced since this box's
+    /// catalogue last moved. Cleared by any piece that lands.
+    gone: Option<Instant>,
+    /// Whether the worker has said so for this file yet (it says it once).
+    gone_said: bool,
     /// Stream mode: the readers, the window kept ahead of them, and the
     /// piece below which the last sweep dropped everything.
     cursors: Vec<Cursor>,
@@ -298,6 +308,11 @@ impl HashFetch {
         self.size
     }
 
+    /// The content hash this fetch reads.
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
     /// Pieces on disk (tests, and the mount's log).
     pub fn pieces_have(&self) -> usize {
         self.st.lock().unwrap().pieces.have
@@ -320,6 +335,13 @@ impl HashFetch {
     /// open rather than serving its error until remount).
     pub fn failed(&self) -> bool {
         self.st.lock().unwrap().finished.as_ref().is_some_and(|r| r.is_err())
+    }
+
+    /// PVOS D219 — the last request failed because every box asked said it
+    /// holds no such bytes (none unreachable, none refusing another way):
+    /// the file is gone, not merely out of reach.
+    pub fn gone(&self) -> bool {
+        self.st.lock().unwrap().gone.is_some()
     }
 
     /// Why the fetch failed for good, else why its last request did.
@@ -487,6 +509,9 @@ impl HashFetch {
         if let Some(fin) = &st.finished {
             return Some(fin.clone());
         }
+        if st.gone.is_some_and(|t| t.elapsed() < GONE_REST) {
+            return Some(Err(st.last_err.clone()));
+        }
         let became_consumer = self.note_read(&mut st, off, len);
         // A completing fetch whose worker ended on a failed request picks
         // up again with the reads — not at the rate of them.
@@ -540,6 +565,9 @@ impl HashFetch {
         let deadline = Instant::now() + timeout;
         let (first, last) = self.span(off, len);
         let mut st = self.st.lock().unwrap();
+        if st.finished.is_none() && st.gone.is_some_and(|t| t.elapsed() < GONE_REST) {
+            return Err(st.last_err.clone());
+        }
         let id = st.next_demand;
         st.next_demand += 1;
         let ahead = self.ahead(&st);
@@ -599,6 +627,7 @@ impl HashFetch {
         let mut st = self.st.lock().unwrap();
         st.pieces.set(idx);
         st.fetched += bytes;
+        st.gone = None;
         self.cv.notify_all();
     }
 
@@ -682,6 +711,9 @@ struct Run {
     served: HashSet<String>,
     file: Option<std::fs::File>,
     last: String,
+    /// PVOS D219 — the last failed request was answered `not_found` by
+    /// every box (see [`fetch_run`]).
+    gone: bool,
 }
 
 /// Writes a ranged stream at its offset and marks each piece as it is whole.
@@ -743,6 +775,7 @@ fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
         served: HashSet::new(),
         file: None,
         last: "no announced endpoint holds these bytes".into(),
+        gone: false,
     };
     loop {
         let job = {
@@ -769,8 +802,18 @@ fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
         match job {
             Job::Fetch { first, end, demand } => {
                 if let Err(e) = fetch_run(cache, fetch, &sources, &mut run, first, end, demand) {
-                    eprintln!("mount: read-through of {} failed: {e}", &fetch.hash[..8]);
                     let mut st = fetch.st.lock().unwrap();
+                    if !run.gone {
+                        eprintln!("mount: read-through of {} failed: {e}", &fetch.hash[..8]);
+                    } else if !st.gone_said {
+                        eprintln!(
+                            "mount: {} is gone — every box asked says it holds no such bytes \
+                             (deleted or replaced since this box's catalogue last moved)",
+                            &fetch.hash[..8]
+                        );
+                        st.gone_said = true;
+                    }
+                    st.gone = run.gone.then(Instant::now);
                     st.fail_gen += 1;
                     st.last_err = e;
                     st.last_fail = Some(Instant::now());
@@ -804,6 +847,12 @@ fn fetch_run(
         run.file = Some(fetch.open_part()?);
     }
     let file = run.file.as_ref().expect("opened above");
+    // PVOS D219 — whether every box asked says it holds no such bytes. Only
+    // that is "gone": a box that cannot be reached, refuses another way or
+    // once served wrong bytes (it holds SOMETHING under the hash) proves
+    // nothing, and the read stays an I/O error.
+    let mut all_said_no = !sources.is_empty() && run.bad.is_empty();
+    run.gone = false;
     for _ in 0..sources.len() {
         let idx = run.cur % sources.len();
         let src = &sources[idx];
@@ -822,6 +871,7 @@ fn fetch_run(
                     Ok(c) => c,
                     Err(e) => {
                         run.last = format!("{}: {e}", src.target);
+                        all_said_no = false;
                         break;
                     }
                 },
@@ -845,6 +895,7 @@ fn fetch_run(
                 }
                 Ok(_) => {
                     run.last = format!("{}: short stream, {written} of {len} bytes", src.target);
+                    all_said_no = false;
                     break;
                 }
                 Err(ClientError::Server { code, message }) => {
@@ -852,12 +903,14 @@ fn fetch_run(
                     cache.checkin(&src.target, client);
                     if code != "not_found" {
                         run.last = format!("{}: {code}: {message}", src.target);
+                        all_said_no = false;
                     }
                     break;
                 }
                 Err(e) => {
                     run.last = format!("{}: {e}", src.target);
                     if !from_pool {
+                        all_said_no = false;
                         break;
                     }
                 }
@@ -865,6 +918,7 @@ fn fetch_run(
         }
         run.cur += 1;
     }
+    run.gone = all_said_no;
     Err(run.last.clone())
 }
 
@@ -1404,6 +1458,8 @@ impl HashCache {
                         fail_gen: 0,
                         last_err: String::new(),
                         last_fail: None,
+                        gone: None,
+                        gone_said: false,
                         cursors: Vec::new(),
                         prefetch: None,
                         swept: 0,
@@ -1421,6 +1477,9 @@ impl HashCache {
             if st.prefer.is_empty() && !prefer.is_empty() {
                 st.prefer = prefer.to_vec();
             }
+            // PVOS D219 — "gone" spares a handle's retries; a NEW open is
+            // asked again (the view shows the file, so its catalogue moved).
+            st.gone = None;
         }
         fetch.handle_opened();
         Ok(Opened::Stream(fetch))
@@ -1573,6 +1632,8 @@ mod tests {
             fail_gen: 0,
             last_err: String::new(),
             last_fail: None,
+            gone: None,
+            gone_said: false,
             cursors: Vec::new(),
             prefetch: None,
             swept: 0,

@@ -5,6 +5,27 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A read through the view of a file its holder no longer has answers
+  "no such file", and a box fetches a new catalogue head when it lands
+  (PVOS D219).** When every box a read-through asks says it holds no such
+  bytes — none unreachable, none refusing another way — the file was
+  deleted or replaced since this box's catalogue last moved: the read
+  answers `ENOENT` (it was `EIO`), the mount hides that copy of the path
+  (D169's tombstone, at most 2 minutes, gone earlier when the catalogue
+  catches up or the holder publishes again still listing it), another copy
+  at the path with another hash shows at once, and the handle's later reads
+  fail at once for 5 s instead of asking every box again (Bazarr's ffprobe
+  of a file Sonarr had just upgraded was nine `read-through … failed` lines
+  and an I/O error; it is now two lines and "No such file or directory").
+  An unreachable box, a dial or stream failure, or no box at all stay `EIO`.
+  `HashFetch::gone()`, `Engine::fetched_seqs()`. On the daemon: a
+  `SubRegionHead` committed on the owner, and a replica's follow folding new
+  events, nudge the catalogue job; a nudged pass is quick (the stale regions
+  only, no claims from every box, the region's last holder asked first) and
+  runs at most every 10 s without moving the minute's full pass —
+  `catalogue::fetch_pass_db_with`. A holder's head reached mediabox 53–58 s
+  after the holder published it; now ~a second (plus the floor).
+
 - **Docs (PVOS D218, 2026-10-04).** A full review of the user docs against
   the code at `ea84559`; no code changed. `docs/INSTALL.md`: both
   walkthroughs run again (`ROOT=` came out empty; `pvfs recover` takes
