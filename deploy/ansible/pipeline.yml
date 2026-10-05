@@ -95,7 +95,9 @@
         # libdbus-1-dev: the Linux secret-service backend of pvfs-companion
         # (feature os-keychain) links against libdbus at build time.
         # fuse3: fusermount3 for the P7.3 streaming mount (doc 20 §3)
-        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev, fuse3]
+        # ffmpeg: ffprobe for D211's real-probe test, and ffmpeg to make the
+        # media it probes (PVOS D221: that test ran ignored without them)
+        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev, fuse3, ffmpeg]
         state: present
         update_cache: true
       tags: [prepare]
@@ -357,6 +359,19 @@
           environment: "{{ cargo_env | combine(suite_env) }}"
           register: test_out
           changed_when: false
+
+        # PVOS D221 (Chris, 2026-10-05): no test is reported as ignored. A
+        # manual run lives outside the suite (a cargo example); a test that
+        # needs a tool gets the tool (above). Any `ignored` fails the run.
+        - name: No test is ignored
+          ansible.builtin.shell: |
+            set -o pipefail
+            awk -F'[ ;]+' '/^test result:/{i+=$8} END {print i+0}' {{ test_results }}
+          args:
+            executable: /bin/bash
+          register: ignored_out
+          changed_when: false
+          failed_when: ignored_out.stdout | int != 0
       always:
         - name: No pvfs FUSE mount left behind by the tests
           ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
@@ -672,7 +687,7 @@
         if [ "{{ pvfs_runs_suite | default(true) | bool }}" = "False" ]; then echo "not run here (pvfs_runs_suite=false)"; exit 0; fi
         awk -F'[ ;]+' '/^test result:/{p+=$4; f+=$6; i+=$8; n++}
                        END {if (n==0) print "NO SUITES RAN — suspect a stale build";
-                            else printf "%d passed, %d failed, %d ignored (%d suites)", p, f, i, n}' \
+                            else printf "%d passed, %d failed (%d suites)%s", p, f, n, (i ? sprintf("; %d IGNORED — not allowed (D221)", i) : "")}' \
           {{ test_results }}
       args:
         executable: /bin/bash
