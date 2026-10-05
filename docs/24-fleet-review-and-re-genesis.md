@@ -10,6 +10,11 @@ Prerequisite reading: doc 17 §5/§7 (replica + write-through), doc 19
 (write-through completeness), doc 11 (compaction), doc 22 (swarm/chunk
 manifests).
 
+> **Status 2026-10-04 (D218):** §0's finding was fixed on 2026-08-30 (§7 A1: `main`
+> fast-forwarded to the branch the fleet ran). What happened next: the re-genesis that §7 F and
+> §20 leave pending never ran on this model — doc 26 replaced the model, the fleet cut over to a
+> fresh forest on 2026-09-12 (doc 29), and this forest was deleted on 2026-09-21.
+
 ---
 
 ## 0. The one finding that changes how everything else is read

@@ -5,6 +5,10 @@ Date: 2026-06-07
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md)
 Scope: Phase **P0**, the first thing we build — the core engine that everything else plugs into.
 
+> **Status 2026-10-04 (D218):** as doc 00's banner says, parts of the June plan were built
+> differently: the phase list in §1 is doc 00's (no WASM module host exists, and doc 08 §1's P2–P4
+> mean other things), and the "lazy hashing by default" for new files was removed (PVOS D94).
+
 ---
 
 ## 1. Why this is the first thing we build
@@ -318,7 +322,7 @@ P0 has no scanning, but the model for picking up files added to a tracked folder
 
   **D81 gave it a way to tell** (`.pvfs-root`, a marker proving the mount is live), and **D105 acted on it**: once the mount is proven and no other box holds the file, the node leaves the tree as well. Keeping it had a cost that only showed at scale — production carried 1,849 node records from one removed folder for a fortnight, in no report anyone reads, because "surfaced for review" means nothing if the surface is a report nobody runs.
 
-  **D112 then put a day's grace in front of the unlink**, because on a fleet whose mover works outside the catalogue, "held nowhere" is a routine transient state rather than a verdict. Full contract in doc 04 §11 item 4.
+  **D112 then put a day's grace in front of the unlink**, because on a fleet whose mover works outside the catalogue, "held nowhere" is a routine transient state rather than a verdict. Full contract in doc 04 §10 item 4.
 
   Still no cascade: unlinking a folder does not unlink its children (that is what `pvfs islands` reports and `--drop` resolves), and a file another box holds is never touched.
 - A **manual scan** command remains available as the fallback when no daemon/watcher is running.

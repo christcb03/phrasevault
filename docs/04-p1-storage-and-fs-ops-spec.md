@@ -5,6 +5,12 @@ Date: 2026-06-11
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [02-p0-core-engine-spec.md](02-p0-core-engine-spec.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 Scope: Phase **P1** — reading/resolving actual bytes, scanning real storage into trees, bound-folder auto-indexing, read-path integrity, and the managed-temp spool. Builds on the P0 kernel; **no P0 encoding or schema changes**.
 
+> **Status 2026-10-04 (D218):** two rules below were overtaken. §3's "one active binding per
+> folder" and §8's `folder_bindings` keyed by `folder_id` alone: since PVOS D81 one folder may have
+> many roots, keyed by `(folder_id, source_uri)` (`crates/pvfs-core/src/projection.rs`). §4 item
+> 5 keeps a disk-deleted file's node; since D105 and D112 the node goes once the file is held
+> nowhere for a day, as §10 item 4 says.
+
 ---
 
 ## 1. What P1 delivers
@@ -16,7 +22,7 @@ On top of the P0 kernel (`pvfs-core`):
 - **`stat`** — node metadata joined with live backend info.
 - **`cat`** — stream a file node's bytes, with **read-path integrity verification**.
 - **`hash`** — compute/fill a file node's missing `content_hash`.
-- **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes the location, and takes the node out of the tree too once the file is held nowhere for a day (§11 item 4; design doc §8.5).
+- **Bound folders** — a folder tied to a real directory, kept current by a **live watcher** (daemon) plus a **reconciliation scan** (startup/schedule/manual). On-disk deletion soft-removes the location, and takes the node out of the tree too once the file is held nowhere for a day (§10 item 4; design doc §8.5).
 - **`pvfs serve`** — minimal daemon: filesystem watcher + scheduled reconciliation. No HTTP (that's P3). *(Since P5, doc 18: `pvfs serve` is the job supervisor; the P1 watcher lives on as the `watch` job.)*
 - **Managed temp spool** — `<data_dir>/tmp/`, with the startup cleanup sweep (design doc §6.3).
 

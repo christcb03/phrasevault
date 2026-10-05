@@ -4,7 +4,10 @@ Status: **Implemented** (P1.5; tests in `p15_mounts.rs`) — primary CLI model; 
 Date: 2026-06-11
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 
-This document locks **how operators address forests on a host** (registry, mount layout, CLI). It does **not** change P0 log encodings. Federation **node catalog URIs** remain as defined in doc 03 §3; this doc adds a separate **mount URI** class for day-to-day CLI use.
+> **Status 2026-10-04 (D218):** §3's `/etc/pvfs/config.toml` was never built: no code reads or
+> writes it, and the registry is `forests.d/*.toml` alone.
+
+This document locks **how operators address forests on a host** (registry, mount layout, CLI). It does **not** change P0 log encodings. Federation **node catalog URIs** remain as defined in doc 03 §2.2; this doc adds a separate **mount URI** class for day-to-day CLI use.
 
 ---
 
@@ -112,7 +115,7 @@ pvfs://archive@backup-server/             # remote read — @server form unimple
 |-------|---------|-----|
 | **Mount URI** (this doc) | `pvfs://pvfshome@local/docs/x` | CLI, local daemon, “which forest + where in tree” |
 | **Storage URI** (doc 03 §2.1) | `file:///var/data/x` | Bytes on disk — `FileLocationAdded` |
-| **Node catalog URI** (doc 03 §3) | `pvfs:<instance_id>/<forest_id>/node/<node_id>` | Federation, dedupe, cross-instance identity |
+| **Node catalog URI** (doc 03 §2.2) | `pvfs:<instance_id>/<forest_id>/node/<node_id>` | Federation, dedupe, cross-instance identity |
 
 Mount URIs are **operator-facing**. Node catalog URIs are **identity-facing**. A mount URI resolves to a subtree; a catalog URI resolves to one content-addressed node.
 

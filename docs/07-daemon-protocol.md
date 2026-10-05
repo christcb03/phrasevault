@@ -3,6 +3,14 @@
 Status: **Implemented** (`pvfsd` + `pvfs-proto` + `pvfs-client`; PROTO_VERSION 2) — design locked 2026-06-16; live status in [doc 08](08-roadmap-and-status.md)
 Depends on: [06-access-control-and-daemon.md](06-access-control-and-daemon.md)
 
+> **Status 2026-10-04 (D218):** this is the Phase C design (protocol 2). The wire is at 16,
+> compatible back to 3 ([VERSIONING.md](../VERSIONING.md)); TCP+TLS is doc 17 §4. §3's "current
+> `ClientMsg` set" lacks eleven later ops: `CatHash`, `RegionManifest`, `TrashPath`,
+> `RenamePath`, `RemoveDir`, `SetRegionQuality`, `ViewLs`, `ViewEntry`, `CatalogueStatus`,
+> `CommitSigned`, `ClaimWriteLease`. §7's registry fields `owner` and `socket` were never built:
+> an entry holds `mount`, `alias` and `enabled`, and the socket is found at
+> `$PVFS_SOCKET_DIR/<forest_id>.sock` (doc 09 §7).
+
 Phase C of doc 06: how another user's process talks to a forest it doesn't own. All six open
 questions (Q-C1…Q-C6) are now resolved — see §8 for the decisions and rationale.
 
@@ -47,7 +55,7 @@ No uid→key table. The connecting **key** is the principal, proven cryptographi
   rest of PVFS.
 
 ### Member identity
-A member holds a generated standalone key at `~/.config/pvfs/identity.key` (0600, created on first
+A member holds a generated standalone key at `~/.config/pvfs/identity.phrase` (0600, created on first
 run; `pvfs whoami` prints the pubkey to hand to a forest owner). A member need **not** own a forest.
 Lost key → owner re-authorizes a new one; stolen key → owner revokes (`DeviceRevoked`, Phase A).
 

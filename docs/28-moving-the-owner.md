@@ -9,7 +9,9 @@ HOLDER become the owner — one daemon, owner and holder — and let the owner
 serve reads while it hears its peers. **Run on the live fleet on 2026-09-29
 (PVOS D186):** `promote.sh` made mediabox, a holder, the owner at 5:40 PM
 (two approvals on Chris's Mac companion), then the forest moved to
-`/opt/pvfs/media` under the alias `media`; VM 310, the old owner, is retired.**
+`/opt/pvfs/media` under the alias `media`; VM 310, the old owner, was retired
+(and deleted on 2026-10-04, its PVFS state kept in
+`mediabox:/opt/pvfs/retired-vm310/`).**
 The sibling of doc 25: that one rebuilds a forest, this one keeps
 it and changes which box may append to it.
 

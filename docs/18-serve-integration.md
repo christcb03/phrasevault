@@ -4,6 +4,10 @@
 Prerequisite reading: doc 17 (the built federation arc; §9 Q5 is the identity finding
 this milestone resolved — originally recorded in the since-retired HANDOFF.md).
 
+> **Status 2026-10-04 (D218):** §7's "`ServeStatus` answers Info-tier (anon-readable …)" was
+> superseded the same day by Punch F (§2): `ServeStatus` is member-gated, and the daemon refuses
+> it to anyone else (`crates/pvfsd/src/lib.rs`).
+
 ## 1. Goal
 
 The 1.3.0 fleet works end to end, but every recurring motion is a cron line or a

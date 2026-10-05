@@ -4,6 +4,13 @@ Status: **Implemented** (cases A/B/C shipped in 1.0; §6 decisions resolved 2026
 Depends on: [01 (identity & derivation)](01-core-engine-design.md), [03 (federation trust)](03-federation-trust-and-uris.md), [10 (per-key tag authority)](10-per-key-tag-authority.md), [11 (compaction & snapshots)](11-compaction-and-verifiable-snapshots.md), [13 §B (multi-region logs)](13-pvos-driven-requirements.md), [14 (companion)](14-companion-app.md)
 Motivation: the companion makes a human's identity **one stable key everywhere** (doc 10 §9.1). The accepted cost is that a compromise of that key — or, worse, of the seed — cannot be contained by revoking one machine. This spec is the mitigation that makes the tradeoff acceptable: a clean, verifiable path to replace **any** key in the system, up to and including the root.
 
+> **Status 2026-10-04 (D218):** three statements below differ from what was built. §4's
+> "`root_lineage` table" was built as `projection_meta.identity_root_pubkey`, the current lineage
+> root (§5 item 4). C3's "doc 03 gets a short amendment": doc 03 has none. C5 and §6 decision 4
+> have `forest init` generate and offer the rotation recovery phrase by default; as built,
+> `forest init` does not — only `pvfs forest recovery-key` registers one
+> (`crates/pvfs-cli/src/main.rs`). Which of the two should change is a code decision, not made here.
+
 ---
 
 ## 0. The principle, and the three cases

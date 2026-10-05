@@ -11,6 +11,9 @@ completes. (That is exactly what happened: **shipped in 1.4.0, 2026-08-13, tag
 Prerequisite reading: doc 17 §7 (the write-through model), doc 18 (the job supervisor
 these ops ultimately serve).
 
+> **Status 2026-10-04 (D218):** a node-model feature; the media fleet stopped using it at the
+> 2026-09-12 cutover (doc 26, doc 08 §6.3).
+
 ## 1. Goal
 
 F5.0 deliberately left three things unrouted on replica mounts — `loc rm`, the link

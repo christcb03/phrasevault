@@ -4,6 +4,9 @@
 Approved by Chris 2026-08-11; §3 resolved below. Supersedes the narrow
 "sync --to migrator" question.
 
+> **Status 2026-10-04 (D218):** a node-model feature; the media fleet stopped using it at the
+> 2026-09-12 cutover (doc 26, doc 08 §6.3).
+
 ## 1. The requirement (Chris, verbatim intent)
 
 When a storage space (a directory/disk) is enrolled into a tree, its **kind** is

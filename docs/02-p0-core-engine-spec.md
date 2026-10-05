@@ -5,6 +5,15 @@ Date: 2026-06-07
 Depends on: [00-architecture-decisions.md](00-architecture-decisions.md), [01-core-engine-design.md](01-core-engine-design.md), [03-federation-trust-and-uris.md](03-federation-trust-and-uris.md)
 Scope: The exact specification for **P0** — encodings, schemas, projection rules, identity, and function signatures.
 
+> **Status 2026-10-04 (D218):** the code now differs from this spec in places. Never built: §9.3's
+> `verify_full`, Step 6's `--salvage-log` and `--recover-from-filesystem`, and §14's tests 14
+> (recovery ladder) and 18 (catalog-URI parse) — no parser for doc 03's `pvfs:` catalog URIs exists.
+> Superseded: replay checks an event's author and rights (doc 06 §3.3, doc 09 §2.2), not
+> "signature validity alone" (§6), and enforces the one-home rule itself rather than assuming the
+> owner did (§5.2). Incomplete: §6's digest table lists only `:v1:` forms — a bound forest signs
+> `:v2:` digests with the forest id first (PVOS D192) — and §6 lists 13 event kinds of today's 33.
+> §7's `seq` has no `AUTOINCREMENT` in the code.
+
 > How to read this: each section is meant to be reviewed on its own. **Decided** items are locked; the checklist in §16 matches the implementation. To build or test, start with [INSTALL.md](INSTALL.md).
 
 ---
@@ -409,7 +418,7 @@ wait. Every node added made every open slower.
   is sound before trusting it. Unreadable/corrupt or chain broken ⇒ **stop**
   (Step 6). Do not auto-truncate or silently repair the truth log.
 
-On the happy path the log's integrity rests on its **hash chain** (§8), which
+On the happy path the log's integrity rests on its **hash chain** (§7.1), which
 Steps 3 and 3b verify at the applied point and per region log. That is a
 cryptographic statement, strictly stronger than SQLite's structural one — the
 scan was insurance on top of it, not the thing establishing it.

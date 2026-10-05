@@ -7,6 +7,12 @@ closed.**
 Prerequisite reading: doc 13 §B (the *decided* region architecture), doc 17 §8
 (F4's order), doc 11 (compaction — the per-region beneficiary), doc 03 §1.5/§6.
 
+> **Status 2026-10-04 (D218):** §3's "read-only … write semantics belong to a later arc if ever"
+> no longer holds for the merged view (§3's last note stops at D165). The view takes unlink
+> (D169) and rename, mkdir and rmdir (D170). Since PVOS D217 (2026-10-04) a view mount started
+> with `--writable` also writes to files this box holds, and creates new ones (doc 26 §10
+> phase 6).
+
 ## 1. Goal
 
 Two capabilities, in doc 17 §8's order:

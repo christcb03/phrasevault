@@ -1,6 +1,6 @@
 # PVFS — Per-key tag authority (multi-tenant tags) (10)
 
-Status: **Implemented** (shipped at `SCHEMA_VERSION` 2 — current schema is 7; doc 08 P2-G) — proposed 2026-06-20, landed 2026-06-21
+Status: **Implemented** (shipped at `SCHEMA_VERSION` 2 — current schema is 20; doc 08 P2-G) — proposed 2026-06-20, landed 2026-06-21
 Date: 2026-06-20
 Depends on: [02 (P0 spec)](02-p0-core-engine-spec.md), [06 (ACLs & daemon)](06-access-control-and-daemon.md), [09 (tags & live daemon)](09-tags-and-the-live-daemon.md)
 Motivation: PVOS hosts **many apps in one forest**. The current tag model assumes a single administrative domain per forest and breaks under multi-tenancy.

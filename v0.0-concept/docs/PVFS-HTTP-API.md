@@ -1,5 +1,7 @@
 # PVFS HTTP API (implemented)
 
+> **Archived (2026-06-10).** The v0.0 concept prototype, kept for history. Nothing here describes the current PVFS — see the repository's README.md and docs/.
+
 MediaForest consumer reference: [mediaforest `docs/PVFS-API-WISHLIST.md`](https://github.com/christcb03/mediaforest/blob/main/docs/PVFS-API-WISHLIST.md).
 
 Deploy: push `main` → GHCR → Watchtower on presubuntu. See [DEPLOY.md](DEPLOY.md).

@@ -1,6 +1,6 @@
 # PVFS — tags, and the daemon as the single live instance (09)
 
-Status: **Implemented** (P2-D/E tags + live daemon; model doc — §5 is historical build order; live status in [doc 08](08-roadmap-and-status.md))
+Status: **Implemented** (P2-D/E tags + live daemon; model doc — §7 is historical build order; live status in [doc 08](08-roadmap-and-status.md))
 Date: 2026-06-18
 Depends on: [06-access-control-and-daemon.md](06-access-control-and-daemon.md), [07-daemon-protocol.md](07-daemon-protocol.md)
 
@@ -166,5 +166,5 @@ it does not block the live-daemon work.
 Kernel **event encodings** unchanged: the `MemberTagged` event was additive, and per-key tags
 (doc 10, P2-G) added no wire fields (the authority is the existing author). The **projection** schema
 did bump to `SCHEMA_VERSION` 2 for P2-G's `authority` columns — older projections self-heal by
-replaying from the log; the schema is 7 today (v5 region logs, v6 cross-region moves, v7 chunk
-manifests).
+replaying from the log; the schema is 20 today (v5 region logs, v6 cross-region moves, v7 chunk
+manifests; the later steps are tabled in [VERSIONING.md](../VERSIONING.md)).

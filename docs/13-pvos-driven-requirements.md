@@ -4,6 +4,13 @@ Status: **Foundation decisions RESOLVED (§A–§F, 2026-06-21)** — the consol
 Date: 2026-06-21 (status refreshed 2026-07-11)
 Related: doc 03 (federation — shipped, doc 17), doc 10 (per-key tags — done, P2-G), doc 11 (compaction — deferred by decision), doc 12 (secure node — shipped), doc 16 (joint agent API — PVFS side done).
 
+> **Status 2026-10-04 (D218):** two answers below were overtaken. §F's "no new PVFS primitive" for
+> non-owner users: PVOS D193 added personal forests, rooted in a person's own phrase
+> (`crates/pvfs-core/src/personal.rs`), and `CommitSigned` (protocol 15), events their authors
+> signed elsewhere. §H's pairing that pins `origins[]` at pair time, and its "API_VERSION 2": since
+> PVOS D27/D29 a pairing is bound to the server's key and each url is a trust grant learned on first
+> contact (`crates/pvfs-companion/src/pairings.rs`; API 3); the API is at 4 since PVOS D189.
+
 Most of what PVOS needs already exists (P0–P2-G). The PVFS-impacting work concentrates in **two big workstreams (P3 secure node, P4 federation)** plus **three smaller additions** — *both big workstreams delivered: P3 in 1.0, P4 through 1.4*. This doc enumerates every open question; §A is flagged as the **most impactful** (settle it first).
 
 ---
