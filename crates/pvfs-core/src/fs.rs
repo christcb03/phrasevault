@@ -2785,6 +2785,27 @@ impl Engine {
         Ok(out)
     }
 
+    /// PVOS D219 — region → the seq of the snapshot this box holds of it
+    /// (`region_fetched`): what a gone read's tombstone must see beaten
+    /// before it believes the holder still has the file. One small table,
+    /// cheap enough for every read-through open (`catalogue_status` counts
+    /// every region's rows).
+    pub fn fetched_seqs(&self) -> Result<HashMap<NodeId, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT region_id, seq FROM region_fetched")
+            .map_err(map_db("fetched seqs"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+            .map_err(map_db("fetched seqs"))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (region, seq) = row.map_err(map_db("fetched seqs"))?;
+            out.insert(region, seq);
+        }
+        Ok(out)
+    }
+
     /// D129 — every catalogue region as this box sees it: the head the log
     /// attests, what this box holds of it (its own live rows, or a fetched
     /// snapshot), and whether that is behind. `stale` means the log attests

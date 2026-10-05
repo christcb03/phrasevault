@@ -78,6 +78,20 @@ pub fn fetch_pass_on(
 /// writer. It used to open an engine of its own every 60 s — and fold the
 /// log to do it — beside the daemon's.
 pub fn fetch_pass_db<D: Db>(db: &D, cancel: &AtomicBool, only: Option<&str>) -> Result<CatalogueReport, PvfsError> {
+    fetch_pass_db_with(db, cancel, only, true)
+}
+
+/// PVOS D219 — [`fetch_pass_db`], with or without asking every box for its
+/// claims. Without is the daemon's QUICK pass, run when a head lands here
+/// (the owner's commit, a replica's follow): only the stale regions, and a
+/// pass with none dials nobody. Claims are for heads published while the
+/// owner was away; the minute's full pass still collects them.
+pub fn fetch_pass_db_with<D: Db>(
+    db: &D,
+    cancel: &AtomicBool,
+    only: Option<&str>,
+    claims: bool,
+) -> Result<CatalogueReport, PvfsError> {
     let mut report = CatalogueReport::default();
     let (replica, data_dir) = db.read(|e| Ok((e.is_replica(), e.data_dir().to_path_buf())))?;
     // PVOS D183 — first, this box's own heads published while the owner was
@@ -102,7 +116,11 @@ pub fn fetch_pass_db<D: Db>(db: &D, cancel: &AtomicBool, only: Option<&str>) -> 
     // PVOS D183 — then every peer's signed claims for the regions it owns,
     // taken as provisional heads on the fold's own rule; each remembered with
     // the box that made it, which is the box that holds the manifest.
-    let claimed_by = collect_claims(db, &data_dir, &mut report)?;
+    let claimed_by = if claims {
+        collect_claims(db, &data_dir, &mut report)?
+    } else {
+        std::collections::HashMap::new()
+    };
     let status = db.read(|e| e.catalogue_status())?;
     let wanted: Vec<(String, u64)> = status
         .iter()
@@ -133,6 +151,10 @@ pub fn fetch_pass_db<D: Db>(db: &D, cancel: &AtomicBool, only: Option<&str>) -> 
         }
         return Ok(report);
     }
+    // PVOS D219 — without a claim naming the box, the one this region's last
+    // manifest came from (D210's table) is asked first: a quick pass has no
+    // claims, and asking feederbox for the NAS's region is a WAN dial in vain.
+    let holders = db.read(|e| e.region_holders()).unwrap_or_default();
     // The client identity dials; a member with read on the region is served.
     let mn = identity::client_identity_mnemonic()?;
     let key = identity::device_key(&mn, "", 0)?;
@@ -147,7 +169,7 @@ pub fn fetch_pass_db<D: Db>(db: &D, cancel: &AtomicBool, only: Option<&str>) -> 
         let mut done = false;
         // The box that claimed a provisional head holds its manifest: ask it first.
         let mut order: Vec<&(String, String)> = endpoints.iter().collect();
-        if let Some(from) = claimed_by.get(&region) {
+        if let Some(from) = claimed_by.get(&region).or_else(|| holders.get(&region)) {
             order.sort_by_key(|(_, addr)| addr != from);
         }
         for (pin, addr) in order {
