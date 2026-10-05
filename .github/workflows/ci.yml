@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install libdbus (Linux secret-service backend of pvfs-companion)
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Install libdbus (Linux secret-service backend of pvfs-companion), and ffmpeg (D211's real-probe test makes and probes media; PVOS D221)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config ffmpeg
       # Pinned to match the PVOS repo's CI and the presubuntu test server
       # (both 1.96.0). Floating on @stable meant clippy here ran a NEWER
       # lint set than the box the work is actually gated on, so a change
