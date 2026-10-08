@@ -258,6 +258,28 @@ owner's daemon is down (the notifier lives inside that daemon).
 
 ---
 
+### 1.5 The log itself (PVOS D222)
+
+Every line the daemons write — pvfsd, the `pvfs mount` view, the companion's
+`serve` — is a record with a severity, a stable event name, a category
+(`system`, `audit`, `security`) and named fields
+([doc 32](32-log-events.md) lists the names). The text is the same as
+before. Under systemd the journal gets the record's parts as fields
+(`PRIORITY` and `PV_EVENT`, `PV_CATEGORY`, `PV_<FIELD>` …), so:
+
+```bash
+journalctl -u pvfsd-replica2 PV_EVENT=pvfs.job.failed
+journalctl -u pvfsd-replica2 -p warning
+journalctl -u pvfsd-replica2 -o json | jq 'select(.PV_EVENT != null) | {PV_EVENT, MESSAGE}'
+```
+
+The NAS's `pvfsd.log` is plain text, as before. `PVFS_LOG_FORMAT`
+(`auto`/`text`/`journal`/`json`/`logfmt`), `PVFS_LOG_LEVEL` and
+`PVFS_LOG_PRIVACY` in a unit change that. Shipping the records to a log
+server, Splunk or a SIEM is [doc 33](33-shipping-logs.md) (PVOS D222d); our
+own log server reads the journal fields with Alloy (HomeLab
+`docs/LOGGING.md`).
+
 ## 2. Worked example: the Home Assistant build
 
 Three feeds, one pattern: **the thing being watched pushes JSON to a
