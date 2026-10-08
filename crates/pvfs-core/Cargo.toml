@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# PVOS D222 — every line through one log record (levels, event names, fields).
+# The CLI never sets the logger up, so its lines read as they always did.
+pvfs-log = { path = "../pvfs-log" }
 blake3.workspace = true
 k256.workspace = true
 chacha20poly1305.workspace = true

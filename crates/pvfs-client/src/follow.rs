@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use pvfs_core::log_store::EventRow;
 use pvfs_core::{crypto, identity, Engine, PvfsError, ReplicaSource, ReplicaStore};
+use pvfs_log::{content, pv_warn};
 
 use crate::Client;
 
@@ -231,7 +232,8 @@ impl Ingest for SharedStore {
             Err(e) => {
                 let e = e.to_string();
                 if self.said.as_deref() != Some(e.as_str()) {
-                    eprintln!("pvfsd: follow: the fold waits ({e}); the next tick tries again");
+                    pv_warn!("pvfs.replica.fold_deferred", job = "follow", error = content(&e);
+                        "pvfsd: follow: the fold waits ({e}); the next tick tries again");
                     self.said = Some(e);
                 }
             }

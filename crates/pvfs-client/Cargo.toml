@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+# PVOS D222: every daemon-side line goes through the pv_* macros.
+pvfs-log = { path = "../pvfs-log" }
 # punch E: the shared watcher loop (live indexing of bound folders)
 notify.workspace = true
 blake3.workspace = true

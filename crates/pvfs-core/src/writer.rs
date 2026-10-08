@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use pvfs_log::{pv_error, pv_warn};
+
 use crate::engine::Engine;
 use crate::error::Result;
 
@@ -275,7 +277,8 @@ impl Writer {
                 COUNTERS.checkpoints.fetch_add(1, Ordering::Relaxed);
                 let took = t.elapsed();
                 if took >= log_threshold() {
-                    eprintln!("pvfsd: a checkpoint took {} (off the writer)", secs(took));
+                    pv_warn!("pvfs.writer.checkpoint_slow", duration_ms = took.as_millis() as u64;
+                        "pvfsd: a checkpoint took {} (off the writer)", secs(took));
                 }
             }
         });
@@ -351,7 +354,7 @@ impl Writer {
             Ok(g) => g,
             Err(poisoned) => {
                 if !self.poison_said.swap(true, Ordering::SeqCst) {
-                    eprintln!(
+                    pv_error!("pvfs.writer.panicked";
                         "pvfsd: a step panicked while it held the writer; its transaction was \
                          rolled back and the writer carries on"
                     );
@@ -379,7 +382,7 @@ impl Writer {
         if waited >= log_threshold() {
             // The last holder is the one it waited out (the last of several,
             // when several went before it).
-            eprintln!(
+            pv_warn!("pvfs.writer.waited", step = &*what, duration_ms = waited.as_millis() as u64;
                 "pvfsd: {what} waited {} for the writer (last held by {})",
                 secs(waited),
                 self.last_holder.lock().unwrap_or_else(|p| p.into_inner()).as_deref().unwrap_or("nobody")
@@ -405,7 +408,8 @@ impl Writer {
         }
         drop(s);
         if held >= log_threshold() {
-            eprintln!("pvfsd: the writer was held {} by {what}", secs(held));
+            pv_warn!("pvfs.writer.held", step = what, duration_ms = held.as_millis() as u64;
+                "pvfsd: the writer was held {} by {what}", secs(held));
         }
     }
 }

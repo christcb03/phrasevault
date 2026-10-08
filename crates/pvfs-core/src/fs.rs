@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use pvfs_log::{content, pv_info, pv_notice, pv_warn};
 use rusqlite::{params, OptionalExtension};
 
 use crate::engine::{active_home, bad, fetch_link, fetch_node, now_ms, Engine};
@@ -660,11 +661,12 @@ impl ProbeSetting {
     pub fn detect() -> ProbeSetting {
         match crate::probe::Prober::detect() {
             Some(p) => {
-                eprintln!("catalogue: video quality is measured with {}", p.program.display());
+                pv_notice!("pvfs.quality.prober_found", path = content(p.program.display());
+                    "catalogue: video quality is measured with {}", p.program.display());
                 ProbeSetting::On(ProbeCtx::with(p))
             }
             None => {
-                eprintln!(
+                pv_notice!("pvfs.quality.prober_missing";
                     "catalogue: no ffprobe on this box (PATH, or PVFS_FFPROBE) — video quality is \
                      not measured here; the copy ladder falls back to size for these regions"
                 );
@@ -840,7 +842,7 @@ fn catalogue_region_pass<D: crate::writer::Db>(
                             // Renamed or deleted since the walk: not in
                             // `produced`, so the sweep asks the disk.
                             ReadFault::Gone => {
-                                eprintln!(
+                                pv_info!("pvfs.scan.file_gone", path = content(f.path.display());
                                     "catalogue: {} went away before it could be read; the sweep decides",
                                     f.path.display()
                                 );
@@ -959,7 +961,7 @@ fn probe_region_quality<D: crate::writer::Db>(
                 let n = db.read(|e| e.quality_candidates_at(&b.folder_id, crate::engine::now_ms()))?.len();
                 if n > 0 {
                     named.insert(region.to_string());
-                    eprintln!(
+                    pv_info!("pvfs.quality.unmeasured", region = short_id(region), files = n;
                         "catalogue: no ffprobe on this box — {n} video files in region {} are not measured",
                         short_id(region)
                     );
@@ -1011,7 +1013,8 @@ fn probe_region_quality<D: crate::writer::Db>(
             // (`media::quality_after`, applied by the write).
             crate::probe::ProbeOutcome::Broken(why) => {
                 stats.probe_failed += 1;
-                eprintln!("catalogue: ffprobe could not read {}: {why}", path.display());
+                pv_warn!("pvfs.quality.probe_broken", region = short_id(region), path = content(path.display()), error = content(&why);
+                    "catalogue: ffprobe could not read {}: {why}", path.display());
                 done.push((rel.clone(), *size, *mtime, crate::media::Observed::Broken));
             }
             // PVOS D211 — the probe could not run: says nothing about the
@@ -1019,14 +1022,14 @@ fn probe_region_quality<D: crate::writer::Db>(
             crate::probe::ProbeOutcome::Error(why) => {
                 stats.probe_errors += 1;
                 p.errored(region, rel);
-                eprintln!(
+                pv_warn!("pvfs.quality.probe_error", region = short_id(region), path = content(path.display()), error = content(&why);
                     "catalogue: probe of {} could not run ({why}); nothing recorded, tried again in {} h",
                     path.display(),
                     PROBE_ERROR_BACKOFF.as_secs() / 3600
                 );
             }
             crate::probe::ProbeOutcome::TimedOut => {
-                eprintln!(
+                pv_warn!("pvfs.quality.probe_timeout", region = short_id(region), path = content(path.display());
                     "catalogue: probe of {} still running after {} s; killed, tried again next pass",
                     path.display(),
                     p.timeout.as_secs()
@@ -1034,7 +1037,8 @@ fn probe_region_quality<D: crate::writer::Db>(
             }
             crate::probe::ProbeOutcome::Cancelled => break,
             crate::probe::ProbeOutcome::Unavailable(why) => {
-                eprintln!("catalogue: the prober would not start ({why}); measuring stops for this pass");
+                pv_warn!("pvfs.quality.prober_failed", error = content(&why);
+                    "catalogue: the prober would not start ({why}); measuring stops for this pass");
                 break;
             }
         }
@@ -1049,7 +1053,9 @@ fn probe_region_quality<D: crate::writer::Db>(
     stats.probe_pending =
         (candidates.len() as u64).saturating_sub(stats.probed + stats.probe_failed + stats.probe_errors);
     if stats.probed + stats.probe_failed + stats.probe_errors > 0 {
-        eprintln!(
+        pv_info!("pvfs.quality.report", region = short_id(region),
+            probed = stats.probed + stats.probe_failed + stats.probe_errors, broken = stats.probe_failed,
+            errors = stats.probe_errors, pending = stats.probe_pending;
             "catalogue: region {}: probed {} video files ({} broken, {} could not run), {} left for later passes",
             short_id(region),
             stats.probed + stats.probe_failed + stats.probe_errors,
@@ -3366,7 +3372,8 @@ impl Engine {
             // the truth and the pass repairs a row this could not write (a
             // read-only view, a busy database).
             if let Err(e) = self.rows_follow_rename(region, from, to, plan.is_dir) {
-                eprintln!("pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+                pv_warn!("pvfs.rename.rows_deferred", path = content(from), new_path = content(to), error = content(&e);
+                    "pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
             }
         }
         Ok(moved)
@@ -5157,7 +5164,7 @@ impl Engine {
                         // Renamed or deleted since the walk. Nothing is
                         // written, and the next pass's walk will not list it.
                         ReadFault::Gone => {
-                            eprintln!(
+                            pv_info!("pvfs.scan.file_gone", path = content(p.display());
                                 "scan: {} went away before it could be read; the next pass decides",
                                 p.display()
                             );
@@ -5876,7 +5883,7 @@ impl Engine {
         match self.is_homed(id) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!(
+                pv_info!("pvfs.scan.hash_skipped", path = content(uri);
                     "scan: not hashing {uri} — its node is not linked into the tree \
                      (a duplicate that lost a collision); the location belongs on the \
                      node that won"
@@ -5884,7 +5891,8 @@ impl Engine {
                 return id.clone();
             }
             Err(e) => {
-                eprintln!("scan: cannot tell whether {uri} is linked: {e}");
+                pv_warn!("pvfs.scan.hash_failed", path = content(uri), error = content(&e);
+                    "scan: cannot tell whether {uri} is linked: {e}");
                 return id.clone();
             }
         }
@@ -5895,7 +5903,8 @@ impl Engine {
         let path = match crate::storage::uri_to_path(uri) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("scan: cannot resolve {uri} to a path for hashing: {e}");
+                pv_warn!("pvfs.scan.hash_failed", path = content(uri), error = content(&e);
+                    "scan: cannot resolve {uri} to a path for hashing: {e}");
                 return id.clone();
             }
         };
@@ -5907,7 +5916,8 @@ impl Engine {
         // honest limit of what a sidecar can promise.
         let (content_hash, chunks) = match crate::sync::sidecar_hashes(&path, size) {
             Some(known) => {
-                eprintln!("scan: hash from sidecar {} ({size} bytes)", path.display());
+                pv_info!("pvfs.scan.hash_from_sidecar", path = content(path.display()), bytes = size;
+                    "scan: hash from sidecar {} ({size} bytes)", path.display());
                 known
             }
             // A sidecar carrying only the whole hash still saves the whole read,
@@ -5917,21 +5927,23 @@ impl Engine {
             // computes them the first time the file is actually served.
             None if crate::sync::sidecar_whole_hash(&path, size).is_some() => {
                 let w = crate::sync::sidecar_whole_hash(&path, size).unwrap();
-                eprintln!(
+                pv_info!("pvfs.scan.hash_from_sidecar", path = content(path.display()), bytes = size;
                     "scan: hash from sidecar (no chunks) {} ({size} bytes)",
                     path.display()
                 );
                 (w, Vec::new())
             }
             None => {
-                eprintln!("scan: hashing {} ({size} bytes)", path.display());
+                pv_info!("pvfs.scan.hashing", path = content(path.display()), bytes = size;
+                    "scan: hashing {} ({size} bytes)", path.display());
                 match crate::sync::hash_with_manifest_until(&path, self.cancel_flag()) {
                     Ok(Some(v)) => v,
                     // Asked to stop mid-file. Not a failure: nothing is recorded,
                     // and the next pass hashes it from the start.
                     Ok(None) => return id.clone(),
                     Err(e) => {
-                        eprintln!("scan: could not hash {}: {e}", path.display());
+                        pv_warn!("pvfs.scan.hash_failed", path = content(path.display()), error = content(&e);
+                            "scan: could not hash {}: {e}", path.display());
                         return id.clone();
                     }
                 }
@@ -5982,7 +5994,7 @@ impl Engine {
                     // embedded said "retried 0x", so the two halves of one
                     // sentence disagreed and the inner one was believed.
                     let e = e.with_retries(attempt);
-                    eprintln!(
+                    pv_warn!("pvfs.scan.hash_failed", path = content(path.display()), error = content(&e), retries = attempt;
                         "scan: hash fill failed for {} after {attempt} retries: {e}",
                         path.display()
                     );
@@ -7221,7 +7233,8 @@ fn hash_reusing_sidecar_until(
     progress: Option<&crate::progress::JobProgress>,
 ) -> Result<Option<(String, Vec<[u8; 32]>)>> {
     if let Some(known) = crate::sync::sidecar_hashes(path, size) {
-        eprintln!("add: hash from sidecar {} ({size} bytes)", path.display());
+        pv_info!("pvfs.scan.hash_from_sidecar", path = content(path.display()), bytes = size;
+            "add: hash from sidecar {} ({size} bytes)", path.display());
         if let Some(p) = progress {
             p.file_done(size);
         }
@@ -7229,7 +7242,8 @@ fn hash_reusing_sidecar_until(
     }
     if let Some(w) = crate::sync::sidecar_whole_hash(path, size) {
         // Whole hash only still saves the whole read, which is the cost.
-        eprintln!("add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
+        pv_info!("pvfs.scan.hash_from_sidecar", path = content(path.display()), bytes = size;
+            "add: hash from sidecar (no chunks) {} ({size} bytes)", path.display());
         if let Some(p) = progress {
             p.file_done(size);
         }

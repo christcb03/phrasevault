@@ -10,6 +10,7 @@ use std::sync::Arc;
 use clap::Parser;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use pvfs_core::mount;
+use pvfs_log::{content, pv_error, pv_info, pv_notice, pv_warn};
 use pvfsd::{serve_until, Daemon};
 
 // D110 — the release number AND the build it came from (see VERSIONING.md),
@@ -106,6 +107,9 @@ fn notify_systemd_ready() {
 }
 
 fn main() -> std::process::ExitCode {
+    // PVOS D222 — the logger first, before anything can log: under systemd
+    // the journal gets fields and levels, anywhere else today's text.
+    pvfs_log::init_daemon("pvfsd");
     // SIGPIPE stays ignored (Rust's startup default) on purpose: pvfsd writes
     // only to client sockets and stderr, and a client vanishing mid-write must
     // surface as EPIPE on that one connection, not kill the daemon. The
@@ -115,7 +119,7 @@ fn main() -> std::process::ExitCode {
     match run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pvfsd: {e}");
+            pv_error!("pvfs.serve.fatal", error = content(&e); "pvfsd: {e}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -132,7 +136,7 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
             Some(j) if j.enabled => {
                 if j.last_ok_ms.is_some() || j.last_error.is_some() {
                     if said {
-                        eprintln!("pvfsd: health: first pass done — taking network writes");
+                        pv_notice!("pvfs.health.first_pass_done"; "pvfsd: health: first pass done — taking network writes");
                     }
                     return;
                 }
@@ -140,7 +144,7 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
             _ => return,
         }
         if started.elapsed() >= limit {
-            eprintln!(
+            pv_warn!("pvfs.health.first_pass_late", wait_s = limit.as_secs();
                 "pvfsd: health: no first pass within {} s — taking network writes anyway (the \
                  fence still checks every write's tip)",
                 limit.as_secs()
@@ -148,7 +152,7 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
             return;
         }
         if !said {
-            eprintln!(
+            pv_notice!("pvfs.health.first_pass_waiting";
                 "pvfsd: health: hearing the fleet before taking network writes (D182); reads are \
                  served meanwhile (D185)"
             );
@@ -166,7 +170,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // workers lowered whichever thread hashes first; the job supervisor
     // lowers itself below. Serving keeps the unit's priority.
     pvfsd::priority::build_hash_pool();
-    eprintln!("{}", pvfsd::priority::policy_line());
+    pv_notice!("pvfs.priority.policy"; "{}", pvfsd::priority::policy_line());
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
     let is_replica = engine.is_replica();
@@ -210,8 +214,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Best-effort: a failed sweep is worth a warning, never a refused start.
     match pvfs_core::sync::sweep_orphan_tmps(&data_dir) {
         Ok(0) => {}
-        Ok(n) => eprintln!("pvfsd: removed {n} orphaned sync tmp file(s)"),
-        Err(e) => eprintln!("pvfsd: sync tmp sweep failed: {e}"),
+        Ok(n) => pv_info!("pvfs.sync.tmp_swept", files = n; "pvfsd: removed {n} orphaned sync tmp file(s)"),
+        Err(e) => pv_warn!("pvfs.sync.tmp_sweep_failed", error = content(&e); "pvfsd: sync tmp sweep failed: {e}"),
     }
 
     let daemon = Arc::new(Daemon::new(engine));
@@ -262,7 +266,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = &cli.listen {
         let tls = pvfsd::nettls::load_or_generate(&data_dir)?;
         let tcp = std::net::TcpListener::bind(addr)?;
-        eprintln!(
+        pv_notice!("pvfs.serve.listening", pin = &tls.pin;
             "pvfsd: listening on {} (transport pin {})",
             tcp.local_addr()?,
             tls.pin
@@ -274,7 +278,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    eprintln!(
+    pv_notice!("pvfs.serve.serving", mount = content(cli.mount.display()), socket = content(socket.display());
         "pvfsd: serving {} on {}",
         cli.mount.display(),
         socket.display()
@@ -315,7 +319,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let _ = t.join();
     }
     let _ = drain.join();
-    eprintln!("pvfsd: shutting down (checkpointing)");
+    pv_notice!("pvfs.serve.shutting_down"; "pvfsd: shutting down (checkpointing)");
     daemon.shutdown_checkpoint()?;
     Ok(())
 }

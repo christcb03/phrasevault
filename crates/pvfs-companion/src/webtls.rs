@@ -90,21 +90,25 @@ pub fn install_trust(cert_path: &Path) {
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                eprintln!("companion: web-agent cert trusted in the login keychain");
+                pvfs_log::pv_notice!(audit success "pvfs.tls.trust_installed", path = pvfs_log::content(cert_path.display());
+                    "companion: web-agent cert trusted in the login keychain");
             }
-            Ok(o) => eprintln!(
+            Ok(o) => pvfs_log::pv_warn!("pvfs.tls.trust_failed",
+                error = pvfs_log::content(String::from_utf8_lossy(&o.stderr).trim()),
+                path = pvfs_log::content(cert_path.display());
                 "companion: keychain trust not installed ({}) — https://127.0.0.1:7421 will \
                  show a warning; to trust manually: security add-trusted-cert -r trustRoot \
                  -k ~/Library/Keychains/login.keychain-db {}",
                 String::from_utf8_lossy(&o.stderr).trim(),
                 cert_path.display()
             ),
-            Err(e) => eprintln!("companion: keychain trust not installed ({e})"),
+            Err(e) => pvfs_log::pv_warn!("pvfs.tls.trust_failed", error = pvfs_log::content(&e);
+                "companion: keychain trust not installed ({e})"),
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        eprintln!(
+        pvfs_log::pv_notice!("pvfs.tls.trust_manual", path = pvfs_log::content(cert_path.display());
             "companion: web-agent TLS cert at {} — add it to your browser/OS trust store \
              to serve the relay over https without warnings",
             cert_path.display()

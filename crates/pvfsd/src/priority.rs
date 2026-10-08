@@ -153,7 +153,7 @@ mod imp {
                         Ok(()) => token |= NICE_RAISED | (((nice + 20) as u64 & 0xff) << 32),
                         Err(e) => {
                             NICE_DENIED.store(true, std::sync::atomic::Ordering::Relaxed);
-                            eprintln!(
+                            pvfs_log::pv_warn!("pvfs.priority.nice_denied", error = pvfs_log::content(&e);
                                 "pvfsd: a job holding the writer keeps its lowered CPU priority ({e}; \
                                  raising it back needs LimitNICE=); its disk class is raised for the hold"
                             );
@@ -253,7 +253,8 @@ pub fn restore_after_hold(token: u64) {
 pub fn enter_background(what: &str) {
     if let Some(step) = background_step() {
         if let Err(e) = lower_this_thread(step) {
-            eprintln!("pvfsd: {what} stays at the daemon's priority: {e}");
+            pvfs_log::pv_warn!("pvfs.priority.lower_failed", thread = what, error = pvfs_log::content(&e);
+                "pvfsd: {what} stays at the daemon's priority: {e}");
         }
     }
 }
@@ -273,7 +274,8 @@ pub fn build_hash_pool() {
         })
         .build_global();
     if let Err(e) = built {
-        eprintln!("pvfsd: hashing pool: {e} (its threads keep the priority of whatever made them)");
+        pvfs_log::pv_warn!("pvfs.priority.lower_failed", thread = "hashing pool", error = pvfs_log::content(&e);
+            "pvfsd: hashing pool: {e} (its threads keep the priority of whatever made them)");
     }
 }
 

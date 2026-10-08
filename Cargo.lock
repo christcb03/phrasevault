@@ -1045,6 +1045,7 @@ dependencies = [
  "pvfs-companion",
  "pvfs-core",
  "pvfs-fuse",
+ "pvfs-log",
  "serde_json",
 ]
 
@@ -1057,6 +1058,7 @@ dependencies = [
  "nix",
  "notify",
  "pvfs-core",
+ "pvfs-log",
  "pvfs-proto",
  "rusqlite",
  "rustls",
@@ -1077,6 +1079,7 @@ dependencies = [
  "nix",
  "pvfs-client",
  "pvfs-core",
+ "pvfs-log",
  "pvfs-proto",
  "pvfsd",
  "rand",
@@ -1103,6 +1106,7 @@ dependencies = [
  "hex",
  "k256",
  "nix",
+ "pvfs-log",
  "rand",
  "rusqlite",
  "tempfile",
@@ -1119,7 +1123,20 @@ dependencies = [
  "libc",
  "pvfs-client",
  "pvfs-core",
+ "pvfs-log",
  "pvfsd",
+ "tempfile",
+]
+
+[[package]]
+name = "pvfs-log"
+version = "1.4.0"
+dependencies = [
+ "blake3",
+ "nix",
+ "rand",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1144,6 +1161,7 @@ dependencies = [
  "nix",
  "pvfs-client",
  "pvfs-core",
+ "pvfs-log",
  "pvfs-proto",
  "rand",
  "rayon-core",

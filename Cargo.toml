@@ -7,6 +7,7 @@ members = [
     "crates/pvfsd",
     "crates/pvfs-companion",
     "crates/pvfs-fuse",
+    "crates/pvfs-log",
 ]
 resolver = "2"
 

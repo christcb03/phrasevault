@@ -5,6 +5,27 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every daemon line is a log record a log server can use (PVOS D222).**
+  pvfsd, the `pvfs mount` view and the companion's `serve` log through a new
+  crate, `pvfs-log` (PVOS uses it too): each line keeps its exact text and
+  gains a severity (RFC 5424), a stable event name (`pvfs.job.failed`; the
+  list is [docs/32-log-events.md](docs/32-log-events.md), checked by a test),
+  a category (`system`/`audit`/`security`), an outcome, a UTC timestamp, an
+  id and named fields, each with a privacy class (`meta`, `actor`, `net`,
+  `content`, `identity`). Under systemd the record goes to the journal with
+  its native protocol: `MESSAGE` is the old line, `PRIORITY` the severity,
+  and `PV_EVENT`, `PV_CATEGORY`, `PV_<FIELD>` … beside it (`journalctl
+  PV_EVENT=pvfs.job.failed` works; a send that fails falls back to `<N>line`
+  on stderr). Anywhere else — the NAS's `pvfsd.log`, a terminal, a test — the
+  output is the old line byte for byte. `PVFS_LOG_FORMAT`
+  (`auto`/`text`/`journal`/`json`/`logfmt`), `PVFS_LOG_LEVEL`,
+  `PVFS_LOG_PRIVACY` (`full`/`identified`/`minimal`: what a level takes out
+  of the fields it also takes out of the sentence) and
+  `PVFS_LOG_PSEUDONYM_KEY_FILE` (keyed BLAKE3 pseudonyms) set it. All 187
+  daemon-side `eprintln!` moved; a test fails on a new one. The job
+  failure/recovery lines are logged by `JobsState::failed`/`recovered`
+  themselves. The CLIs print exactly what they did.
+
 - **pvfs-core compiles on macOS again (fix to PVOS D216).** D216's
   `Engine::floor_for` multiplied a statvfs `blocks()` by its
   `fragment_size()` directly: both are `u64` on Linux, but on macOS

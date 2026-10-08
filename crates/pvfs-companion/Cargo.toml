@@ -24,6 +24,8 @@ os-keychain = ["dep:keyring"]
 [dependencies]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
+# PVOS D222: `serve` logs through the pv_* macros (journal fields under systemd).
+pvfs-log = { path = "../pvfs-log" }
 nix = { workspace = true, features = ["signal"] }
 clap.workspace = true
 thiserror.workspace = true

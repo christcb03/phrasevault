@@ -3,6 +3,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+use pvfs_log::{content, pv_error, pv_notice, pv_warn};
+
 use crate::acl::{self, Principal};
 use crate::error::{map_db, PvfsError, Result};
 use crate::event::Event;
@@ -539,7 +541,7 @@ pub(crate) fn lock_folds_within(
             Ok(l) => return Ok(FoldLock(l)),
             Err((_f, _)) => {
                 if !said {
-                    eprintln!("pvfs: waiting for another pvfs process folding this forest…");
+                    pv_warn!("pvfs.projection.fold_busy"; "pvfs: waiting for another pvfs process folding this forest…");
                     said = true;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -3557,7 +3559,8 @@ pub fn full_rebuild(
     // D71: say WHY. A bare "rebuilding" line cost hours of diagnosis when the
     // lab owner replayed a 59k-event log every ~25s — the message read as the
     // one-time upgrade path while it was actually recurring.
-    eprintln!(
+    // The reason may carry an error's text (a schema that would not apply).
+    pv_notice!("pvfs.projection.rebuilding", reason = content(reason);
         "pvfs: rebuilding the index from the signed log — {reason} \
          (large forests take a few minutes)"
     );
@@ -3834,7 +3837,7 @@ pub fn startup_check(
                         &format!("the migrated cache still does not fit this schema ({e})"),
                     );
                 }
-                eprintln!(
+                pv_notice!("pvfs.projection.migrated", from_version = version, to_version = SCHEMA_VERSION;
                     "pvfs: projection migrated v{version} → v{SCHEMA_VERSION} ({what}) \
                      — no replay needed"
                 );
@@ -3971,17 +3974,18 @@ pub fn startup_check(
                 Ok(()) => break,
                 Err(e @ PvfsError::Busy { .. }) => {
                     if started.elapsed() >= startup_fold_wait() {
-                        eprintln!(
+                        pv_error!("pvfs.projection.fold_gave_up",
+                            duration_ms = started.elapsed().as_millis() as u64, error = content(&e);
                             "pvfs: another pvfs process has held this forest's fold lock for {:?}; \
                              giving up this open rather than replaying a cache that is not torn ({e})",
                             started.elapsed()
                         );
                         return Err(e);
                     }
-                    eprintln!("pvfs: another pvfs process is folding this forest; trying again");
+                    pv_warn!("pvfs.projection.fold_busy"; "pvfs: another pvfs process is folding this forest; trying again");
                 }
                 Err(e) => {
-                    eprintln!(
+                    pv_warn!("pvfs.projection.cache_discarded", error = content(&e);
                         "pvfs: incremental fold failed ({e}); discarding the projection \
                          cache and replaying the full log"
                     );
@@ -4050,7 +4054,7 @@ pub(crate) fn fold_tail_now(
         Ok(n) => Ok(n),
         Err(e @ PvfsError::Busy { .. }) => Err(e),
         Err(e) => {
-            eprintln!(
+            pv_warn!("pvfs.projection.cache_discarded", error = content(&e);
                 "pvfs: incremental fold failed ({e}); discarding the projection cache and \
                  replaying the full log"
             );

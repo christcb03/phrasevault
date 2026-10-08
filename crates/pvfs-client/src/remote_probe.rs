@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use pvfs_core::media::Observed;
 use pvfs_core::probe::{ProbeOutcome, Prober, RangeServer, RangeSource, REMOTE_PROBE_MAX_BYTES};
 use pvfs_core::{Engine, PvfsError, ReplicaSource};
+use pvfs_log::{content, pv_warn};
 
 use crate::ClientError;
 
@@ -269,7 +270,8 @@ pub fn remote_probe_regions(
                     match outcome {
                         ProbeOutcome::Measured(q) => Some(Observed::Measured(q)),
                         ProbeOutcome::Broken(why) => {
-                            eprintln!("pvfsd: probe: ffprobe could not read {rel} ({short}, over the LAN): {why}");
+                            pv_warn!("pvfs.quality.probe_broken", path = content(rel), region = short, error = content(&why);
+                                "pvfsd: probe: ffprobe could not read {rel} ({short}, over the LAN): {why}");
                             Some(Observed::Broken)
                         }
                         ProbeOutcome::Error(why) => {
@@ -278,16 +280,19 @@ pub fn remote_probe_regions(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .insert((region.clone(), rel.clone()), Instant::now());
-                            eprintln!("pvfsd: probe: {rel} ({short}) could not be probed: {why}; nothing recorded");
+                            pv_warn!("pvfs.quality.probe_error", path = content(rel), region = short, error = content(&why);
+                                "pvfsd: probe: {rel} ({short}) could not be probed: {why}; nothing recorded");
                             None
                         }
                         ProbeOutcome::TimedOut => {
-                            eprintln!("pvfsd: probe: {rel} ({short}) still running after {} s; killed", rp.timeout.as_secs());
+                            pv_warn!("pvfs.quality.probe_timeout", path = content(rel), region = short, timeout_s = rp.timeout.as_secs();
+                                "pvfsd: probe: {rel} ({short}) still running after {} s; killed", rp.timeout.as_secs());
                             None
                         }
                         ProbeOutcome::Cancelled => break,
                         ProbeOutcome::Unavailable(why) => {
-                            eprintln!("pvfsd: probe: the prober would not start ({why}); measuring stops for this pass");
+                            pv_warn!("pvfs.quality.prober_failed", error = content(&why);
+                                "pvfsd: probe: the prober would not start ({why}); measuring stops for this pass");
                             break;
                         }
                     }

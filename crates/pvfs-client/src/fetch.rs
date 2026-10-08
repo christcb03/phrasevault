@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use pvfs_core::{identity, Engine, PvfsError, ReplicaSource};
+use pvfs_log::{content, pv_info, pv_warn};
 
 use crate::follow::dial_source;
 use crate::Client;
@@ -74,12 +75,14 @@ fn quarantine_stale(engine: &Engine, id: &str, pin: &str, e: &PvfsError) {
     match engine.quarantine_locations_at_pin(id, pin, &reason) {
         Ok(uris) => {
             for uri in uris {
-                eprintln!("fetch: quarantined stale location {uri} ({id})");
+                pv_warn!("pvfs.sync.quarantined", location = content(&uri), node = id;
+                    "fetch: quarantined stale location {uri} ({id})");
             }
         }
         // Recording the discovery is best-effort; losing it must not fail the
         // pass, which would trade a stuck file for a stuck mover.
-        Err(err) => eprintln!("fetch: could not quarantine {id} at {pin}: {err}"),
+        Err(err) => pv_warn!("pvfs.sync.quarantine_failed", node = id, pin = pin, error = content(&err);
+            "fetch: could not quarantine {id} at {pin}: {err}"),
     }
 }
 
@@ -326,7 +329,8 @@ impl Fetcher {
             Ok(true) => return Ok(()),
             Ok(false) => {} // not swarm-eligible — single-stream below
             Err(e) => {
-                eprintln!("swarm: falling back to single-stream ({e})");
+                pv_warn!("pvfs.sync.swarm_fallback", node = id, error = content(&e);
+                    "swarm: falling back to single-stream ({e})");
                 // D122 item 4 — an attributed mismatch has quarantined its
                 // holder inside the swarm. Ask the catalogue again rather than
                 // stream from the pin that just served the wrong bytes.
@@ -365,11 +369,13 @@ impl Fetcher {
             match client.cat(id, &mut sink) {
                 Ok(_) => match engine.sync_commit(sink) {
                     Ok(_) => {
-                        eprintln!("fetch: {id} committed from {key}");
+                        pv_info!("pvfs.sync.fetched", node = id, source = &key;
+                            "fetch: {id} committed from {key}");
                         return Ok(());
                     }
                     Err(e) => {
-                        eprintln!("fetch: {id} streamed but commit failed from {key}: {e}");
+                        pv_warn!("pvfs.sync.fetch_failed", node = id, source = &key, error = content(&e);
+                            "fetch: {id} streamed but commit failed from {key}: {e}");
                         // An id mismatch quarantines THIS holder (D99); the
                         // loop goes on to the next one, never back to this pin.
                         quarantine_stale(engine, id, &cand.pin, &e);
@@ -380,7 +386,8 @@ impl Fetcher {
                     }
                 },
                 Err(e) => {
-                    eprintln!("fetch: {id} stream failed from {key}: {e}");
+                    pv_warn!("pvfs.sync.fetch_failed", node = id, source = &key, error = content(&e);
+                        "fetch: {id} stream failed from {key}: {e}");
                     // A catalogue-named holder without the bytes is the
                     // catalogue being wrong about it — permanent until it
                     // changes. Anything else is the network.
@@ -573,7 +580,8 @@ impl Fetcher {
         }
         drop(f);
         if resumed > 0 {
-            eprintln!("swarm: resumed {resumed}/{} chunks from a previous attempt", manifest.len());
+            pv_info!("pvfs.sync.swarm_resumed", node = id, chunks = resumed, total = manifest.len();
+                "swarm: resumed {resumed}/{} chunks from a previous attempt", manifest.len());
         }
 
         let queue: Mutex<Vec<usize>> = Mutex::new(
@@ -669,7 +677,7 @@ impl Fetcher {
             } else {
                 "every holder failed"
             };
-            eprintln!(
+            pv_warn!("pvfs.sync.swarm_abandoned", node = id, chunks = leftover, total = manifest.len(), reason = why;
                 "swarm: giving up on {id} — {leftover}/{} chunk(s) unfetched ({why})",
                 manifest.len()
             );
@@ -695,7 +703,7 @@ impl Fetcher {
         }
         let total: u64 = stats.iter().map(|(_, n)| n).sum();
         let desc: Vec<String> = stats.iter().map(|(k, n)| format!("{k}={n}")).collect();
-        eprintln!(
+        pv_info!("pvfs.sync.swarm_done", node = id, chunks = total, holders = stats.len();
             "swarm: {total} chunk(s) from {} holder(s) [{}]",
             stats.len(),
             desc.join(", ")
@@ -1232,7 +1240,7 @@ fn tier_pass_inner(
                 } else if unhashed && !pull_only {
                     match engine.hash_node(&id) {
                         Ok(new_id) => {
-                            eprintln!(
+                            pv_info!("pvfs.sync.attested", path = content(&label), node = &id[..12], new_node = &new_id[..12];
                                 "tier: attested {label} ({} -> {})",
                                 &id[..12],
                                 &new_id[..12]
@@ -1405,7 +1413,8 @@ fn tier_pass_inner(
                                         ));
                                         continue;
                                     }
-                                    eprintln!("tier: {label} replaces the copy in place — {}", verdict.reason());
+                                    pv_info!("pvfs.sync.replaced", path = content(&label), reason = content(verdict.reason());
+                                        "tier: {label} replaces the copy in place — {}", verdict.reason());
                                     if let Err(e) = pvfs_core::sync::move_to_trash(&dest, &cpath) {
                                         report.failed.push((label, e.to_string()));
                                         continue;

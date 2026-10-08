@@ -40,6 +40,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use pvfs_core::{Engine, ReplicaSource};
+use pvfs_log::{content, pv_info, pv_warn};
 
 use crate::ClientError;
 
@@ -804,9 +805,10 @@ fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
                 if let Err(e) = fetch_run(cache, fetch, &sources, &mut run, first, end, demand) {
                     let mut st = fetch.st.lock().unwrap();
                     if !run.gone {
-                        eprintln!("mount: read-through of {} failed: {e}", &fetch.hash[..8]);
+                        pv_warn!("pvfs.mount.read_through_failed", hash = &fetch.hash[..8], error = content(&e);
+                            "mount: read-through of {} failed: {e}", &fetch.hash[..8]);
                     } else if !st.gone_said {
-                        eprintln!(
+                        pv_info!("pvfs.mount.gone", hash = &fetch.hash[..8];
                             "mount: {} is gone — every box asked says it holds no such bytes \
                              (deleted or replaced since this box's catalogue last moved)",
                             &fetch.hash[..8]
@@ -953,7 +955,8 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
     };
     if got == fetch.hash && cache.opts.mode == CacheMode::Stream {
         // Nothing is kept: the verified partial serves until the last close.
-        eprintln!("mount: {} is whole and verified ({} bytes; stream mode keeps nothing)", &fetch.hash[..8], fetch.size);
+        pv_info!("pvfs.mount.verified", hash = &fetch.hash[..8], bytes = fetch.size, kept = false;
+            "mount: {} is whole and verified ({} bytes; stream mode keeps nothing)", &fetch.hash[..8], fetch.size);
         fetch.finish(Ok(fetch.part.clone()));
         return;
     }
@@ -963,7 +966,8 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
             Ok(()) => {
                 touch(&fetch.final_path);
                 cache.completed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("mount: {} is whole, verified and kept ({} bytes)", &fetch.hash[..8], fetch.size);
+                pv_info!("pvfs.mount.verified", hash = &fetch.hash[..8], bytes = fetch.size, kept = true;
+                    "mount: {} is whole, verified and kept ({} bytes)", &fetch.hash[..8], fetch.size);
                 fetch.finish(Ok(fetch.final_path.clone()));
             }
             Err(e) => fetch.finish(Err(format!("hash store: {e}"))),
@@ -979,7 +983,7 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
         &got[..got.len().min(16)],
         fetch.hash
     );
-    eprintln!("mount: {}", run.last);
+    pv_warn!("pvfs.mount.bytes_refused", hash = &fetch.hash[..8]; "mount: {}", run.last);
     for (i, s) in sources.iter().enumerate() {
         if run.served.contains(&s.target) {
             run.bad.insert(i);
@@ -1020,7 +1024,8 @@ fn punch(path: &Path, off: u64, len: u64) -> bool {
     match fallocate(f.as_raw_fd(), flags, off as i64, len as i64) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("mount: cannot drop read pieces of {}: {e}", path.display());
+            pv_warn!("pvfs.mount.punch_failed", path = content(path.display()), error = content(&e);
+                "mount: cannot drop read pieces of {}: {e}", path.display());
             false
         }
     }
@@ -1526,7 +1531,8 @@ impl HashCache {
                     inner.fetched.load(Ordering::Relaxed),
                 );
                 if now != said || r.removed > 0 {
-                    eprintln!(
+                    pv_info!("pvfs.mount.cache", opened = now.0, kept_whole = now.1, fetched_bytes = now.2,
+                        entries = r.kept, bytes = r.kept_bytes, evicted = r.removed, evicted_bytes = r.removed_bytes;
                         "mount: read-through cache — {} file(s) opened through, {} kept whole, {} bytes fetched; holding {} entries, {} bytes; evicted {} ({} bytes)",
                         now.0, now.1, now.2, r.kept, r.kept_bytes, r.removed, r.removed_bytes
                     );

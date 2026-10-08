@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use pvfs_core::{sync, Engine, PvfsError};
+use pvfs_log::{content, pv_info, pv_notice, pv_warn};
 
 /// How soon a failed pass tries again, and the ceiling it backs off to.
 const RETRY_MIN: Duration = Duration::from_secs(5);
@@ -162,7 +163,7 @@ pub fn run_shared(
     let db = pvfs_core::SharedDb::new(writer, "watch")?;
     let local = db.view().local_bindings()?;
     if local.iter().any(|b| !db.view().is_catalogue_region(&b.folder_id).unwrap_or(false)) {
-        eprintln!(
+        pv_info!("pvfs.scan.node_model", job = "watch";
             "pvfsd: watch: this box binds folders of the node model; the watch scans them with an \
              engine of its own (PVOS D199)"
         );
@@ -529,7 +530,7 @@ fn scan_pass(
             Ok(r) => *route = r,
             // PVOS D196 — unreachable, or fenced (`replica_route` says which).
             Err(e) if engine.catalogues_only()? => {
-                eprintln!(
+                pv_warn!("pvfs.scan.owner_unreachable", job = "watch", error = content(&e);
                     "pvfs: watch: no route through the owner ({e}) — cataloguing here; \
                      the head is published locally and committed when a writer answers"
                 );
@@ -597,7 +598,7 @@ fn scan_pass_db(
             Ok(r) => *route = r,
             // PVOS D196 — unreachable, or fenced (`replica_route` says which).
             Err(e) if db.view().catalogues_only()? => {
-                eprintln!(
+                pv_warn!("pvfs.scan.owner_unreachable", job = "watch", error = content(&e);
                     "pvfs: watch: no route through the owner ({e}) — cataloguing here; \
                      the head is published locally and committed when a writer answers"
                 );
@@ -654,9 +655,11 @@ fn commit_heads(pending: &[(String, u64, String)], w: &mut dyn pvfs_core::ScanWr
     for (region, seq, hash) in pending {
         let short = &region[..region.len().min(8)];
         match w.commit_region_head(region, *seq, hash) {
-            Ok(()) => eprintln!("pvfs: committed head {seq} of {short} — published while the owner was away"),
+            Ok(()) => pv_notice!("pvfs.catalogue.head_committed", region = short, seq = *seq;
+                "pvfs: committed head {seq} of {short} — published while the owner was away"),
             Err(PvfsError::BadInput { reason, .. }) if reason.contains("does not advance") => {
-                eprintln!("pvfs: head {seq} of {short} — the owner already holds it or a newer one")
+                pv_info!("pvfs.catalogue.head_held", region = short, seq = *seq;
+                    "pvfs: head {seq} of {short} — the owner already holds it or a newer one")
             }
             Err(e) => return Err(e),
         }
