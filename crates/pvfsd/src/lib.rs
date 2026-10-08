@@ -32,7 +32,7 @@ use pvfs_proto::{
     IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, SignedEventWire, WriteOp,
     DATA_CHUNK, PROTO_VERSION,
 };
-use pvfs_log::{actor, content, pv_error, pv_info, pv_notice, pv_warn};
+use pvfs_log::{actor, content, net, pv_error, pv_info, pv_notice, pv_warn};
 use rand::RngCore;
 
 /// How long a challenge stays valid.
@@ -661,7 +661,7 @@ pub fn serve_until(
                 stream.set_nonblocking(false)?;
                 let d = Arc::clone(&daemon);
                 std::thread::spawn(move || {
-                    let _ = serve_connection(&d, stream, true);
+                    let _ = serve_connection_from(&d, stream, true, Peer::Local);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -689,7 +689,7 @@ pub fn serve_tls_until(
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
                 stream.set_nonblocking(false)?;
                 // PVOS D187 — replies go out whole, never held for an ACK
                 // (see `pvfs_proto::write_msg`).
@@ -697,12 +697,37 @@ pub fn serve_tls_until(
                 let d = Arc::clone(&daemon);
                 let cfg = Arc::clone(&tls);
                 std::thread::spawn(move || {
+                    let peer = Peer::Tcp(addr);
                     let conn = match rustls::ServerConnection::new(cfg) {
                         Ok(c) => c,
-                        Err(_) => return,
+                        Err(e) => {
+                            note_tls_failure(peer, &e.to_string());
+                            return;
+                        }
                     };
-                    let tls_stream = rustls::StreamOwned::new(conn, stream);
-                    let _ = serve_connection(&d, tls_stream, false);
+                    let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                    // PVOS D222b — finish the handshake here, so one that
+                    // fails is told apart from a client that simply left
+                    // (a port check: not logged).
+                    let mut idle = 0;
+                    while tls_stream.conn.is_handshaking() {
+                        match tls_stream.conn.complete_io(&mut tls_stream.sock) {
+                            Ok((0, 0)) => {
+                                idle += 1;
+                                if idle > 2 {
+                                    return;
+                                }
+                            }
+                            Ok(_) => idle = 0,
+                            Err(e) => {
+                                if e.kind() == io::ErrorKind::InvalidData {
+                                    note_tls_failure(peer, &e.to_string());
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    let _ = serve_connection_from(&d, tls_stream, false, peer);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -718,10 +743,182 @@ pub fn serve_tls_until(
 /// a Unix socket and a TLS-wrapped TCP stream serve identically (F1).
 /// `local` = the Unix-socket transport: the only difference it makes is
 /// P10.2's same-box answers (ingest partial paths are filled locally only).
-pub fn serve_connection<S: io::Read + io::Write>(
+pub fn serve_connection<S: io::Read + io::Write>(daemon: &Daemon, stream: S, local: bool) -> io::Result<()> {
+    serve_connection_from(daemon, stream, local, Peer::Local)
+}
+
+/// Where a connection came from (PVOS D222b decision 7): the TCP peer, or
+/// this box's Unix socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    Local,
+    Tcp(std::net::SocketAddr),
+}
+
+impl Peer {
+    /// What a log line says: `local`, or `ip:port`.
+    pub fn label(&self) -> String {
+        match self {
+            Peer::Local => "local".into(),
+            Peer::Tcp(a) => a.to_string(),
+        }
+    }
+}
+
+thread_local! {
+    /// PVOS D222b decision 1 — the last refusal this connection's thread
+    /// answered (`err` sets it for `forbidden` and `integrity`): the request
+    /// loop logs it with who asked, from where and for what. One place, so a
+    /// gate added later is covered without a line of its own.
+    static REFUSED: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn take_refusal() -> Option<(String, String)> {
+    REFUSED.with(|r| r.borrow_mut().take())
+}
+
+/// The key a refusal's rate limit counts under: the peer's IP for a TCP
+/// peer, else the principal (D222b decision 9).
+fn limit_key(peer: Peer, principal: &str) -> String {
+    match peer {
+        Peer::Tcp(a) => a.ip().to_string(),
+        Peer::Local => principal.to_string(),
+    }
+}
+
+/// Log the refusal the last op answered, if it answered one. A key the
+/// forest once admitted and has revoked is `pvfs.access.revoked_key`,
+/// however the refusal was worded.
+fn note_refusal(daemon: &Daemon, principal: &Principal, peer: Peer, op: &str) {
+    let Some((code, reason)) = take_refusal() else { return };
+    let who = principal.display();
+    let from = peer.label();
+    let key = limit_key(peer, &who);
+    let revoked = match principal {
+        Principal::Key(pk) => daemon.reader().is_revoked_key(pk).unwrap_or(false),
+        _ => false,
+    };
+    if code == "forbidden" && !revoked {
+        if let Some(n) = pvfs_log::limit("pvfs.access.denied", &key) {
+            pv_warn!(security failure "pvfs.access.denied", op = op, principal = actor(&who),
+                peer_addr = net(&from), reason = content(&reason), suppressed = n;
+                "pvfsd: {op} refused for {who} from {from}: {reason}");
+        }
+    } else if revoked || (code == "integrity" && reason.contains("author not authorized")) {
+        if let Some(n) = pvfs_log::limit("pvfs.access.revoked_key", &key) {
+            pv_warn!(security failure "pvfs.access.revoked_key", op = op, principal = actor(&who),
+                peer_addr = net(&from), reason = content(&reason), suppressed = n;
+                "pvfsd: {op} from {who} at {from} signed by a key that is not an active device: {reason}");
+        }
+    } else if code == "integrity" && reason.contains("signature invalid") {
+        if let Some(n) = pvfs_log::limit("pvfs.access.bad_signature", &key) {
+            pv_warn!(security failure "pvfs.access.bad_signature", op = op, principal = actor(&who),
+                peer_addr = net(&from), reason = content(&reason), suppressed = n;
+                "pvfsd: {op} from {who} at {from} carried a signature that does not verify: {reason}");
+        }
+    }
+}
+
+/// D222b decision 2 — a refused handshake (`reason` is one of a few fixed
+/// words; `key` the key it claimed, if any).
+fn note_auth_refused(peer: Peer, key: Option<&str>, reason: &'static str) {
+    let from = peer.label();
+    // The client chose it: at most 200 characters of it.
+    let claimed = key.map(|k| format!("key:{}", k.chars().take(200).collect::<String>())).unwrap_or_else(|| "no key".into());
+    if let Some(n) = pvfs_log::limit("pvfs.auth.refused", &limit_key(peer, &claimed)) {
+        pv_warn!(security failure "pvfs.auth.refused", reason = reason, principal = actor(&claimed),
+            peer_addr = net(&from), suppressed = n;
+            "pvfsd: connection from {from} refused at the handshake ({reason}; {claimed})");
+    }
+}
+
+/// D222b decision 2 — a TLS handshake that failed (not one that was left).
+fn note_tls_failure(peer: Peer, error: &str) {
+    let from = peer.label();
+    if let Some(n) = pvfs_log::limit("pvfs.tls.handshake_failed", &limit_key(peer, "")) {
+        pv_warn!(security failure "pvfs.tls.handshake_failed", peer_addr = net(&from),
+            error = content(error), suppressed = n;
+            "pvfsd: TLS handshake from {from} failed: {error}");
+    }
+}
+
+/// D222b decision 4 — the changes of authority a commit just made, once,
+/// on the daemon that committed them. `tip` is the log's (seq, chain hash)
+/// after the commit: the batch is its last `events.len()` entries.
+fn note_authority(forest: &str, events: &[pvfs_core::event::Event], tip: Option<(u64, Vec<u8>)>) {
+    use pvfs_core::event::Event;
+    let n = events.len() as u64;
+    let chain_tip = tip.as_ref().map(|(_, h)| hex::encode(h)).unwrap_or_default();
+    for (i, ev) in events.iter().enumerate() {
+        let seq = tip.as_ref().map(|(t, _)| t.saturating_sub(n - 1 - i as u64)).unwrap_or(0);
+        let author = format!("key:{}", hex::encode(ev.author()));
+        match ev {
+            Event::DeviceAuthorized { device_pubkey, device_index, .. } => {
+                let device = format!("key:{}", hex::encode(device_pubkey));
+                pv_notice!(audit success "pvfs.authority.device_authorized", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), device = actor(&device), device_index = *device_index;
+                    "pvfsd: device {device} authorized (index {device_index}) by {author} — log seq {seq}");
+            }
+            Event::DeviceRevoked { device_pubkey, .. } => {
+                let device = format!("key:{}", hex::encode(device_pubkey));
+                pv_notice!(audit success "pvfs.authority.device_revoked", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), device = actor(&device);
+                    "pvfsd: device {device} revoked by {author} — log seq {seq}");
+            }
+            Event::AclSet { node_id, principal_kind, principal_id, rights, expires_at, .. } => {
+                let grantee = match principal_kind {
+                    1 => format!("key:{}", hex::encode(principal_id)),
+                    3 => format!("tag:{}", String::from_utf8_lossy(principal_id)),
+                    2 => "public".into(),
+                    _ => "any".into(),
+                };
+                pv_notice!(audit success "pvfs.authority.acl_set", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), node = node_id.as_str(), grantee = actor(&grantee),
+                    rights = *rights, expires_at = *expires_at;
+                    "pvfsd: ACL on {node_id} for {grantee} set to rights {rights} by {author} — log seq {seq}");
+            }
+            Event::MemberTagged { member_pubkey, tag, granted, .. } => {
+                let member = format!("key:{}", hex::encode(member_pubkey));
+                let what = if *granted { "granted" } else { "removed" };
+                pv_notice!(audit success "pvfs.authority.member_tagged", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), member = actor(&member), tag = tag.as_str(), granted = *granted;
+                    "pvfsd: tag {tag} {what} for {member} by {author} — log seq {seq}");
+            }
+            Event::RootRotated { new_root_pubkey, .. } => {
+                let new_root = format!("key:{}", hex::encode(new_root_pubkey));
+                pv_notice!(audit success "pvfs.authority.root_rotated", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), new_root = actor(&new_root);
+                    "pvfsd: root key rotated to {new_root} by {author} — log seq {seq}");
+            }
+            Event::RecoveryKeyRegistered { recovery_pubkey, .. } => {
+                let key = format!("key:{}", hex::encode(recovery_pubkey));
+                pv_notice!(audit success "pvfs.authority.recovery_key_registered", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), recovery_key = actor(&key);
+                    "pvfsd: recovery key {key} registered by {author} — log seq {seq}");
+            }
+            Event::RecoveryKeyRevoked { recovery_pubkey, .. } => {
+                let key = format!("key:{}", hex::encode(recovery_pubkey));
+                pv_notice!(audit success "pvfs.authority.recovery_key_revoked", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author), recovery_key = actor(&key);
+                    "pvfsd: recovery key {key} revoked by {author} — log seq {seq}");
+            }
+            Event::CertificatesBound { .. } => {
+                pv_notice!(audit success "pvfs.authority.certificates_bound", forest = forest, seq = seq,
+                    chain_tip = &chain_tip, author = actor(&author);
+                    "pvfsd: certificates bound to this forest by {author} — log seq {seq}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Handshake then request loop for one connection, knowing where it came
+/// from (PVOS D222b): refusals are logged with the peer's address.
+pub fn serve_connection_from<S: io::Read + io::Write>(
     daemon: &Daemon,
     mut stream: S,
     local: bool,
+    peer: Peer,
 ) -> io::Result<()> {
     // D67 C3: this connection's identity for lease purposes, and the guard
     // that releases the lease however this scope ends.
@@ -751,19 +948,25 @@ pub fn serve_connection<S: io::Read + io::Write>(
         }
         Some(ClientMsg::Auth { pubkey, sig }) => {
             if !daemon.consume_nonce(&nonce) {
-                write_msg(&mut stream, &err("forbidden", "challenge already used or expired"))?;
+                let refusal = err("forbidden", "challenge already used or expired");
+                take_refusal();
+                note_auth_refused(peer, Some(pubkey.as_str()), "challenge_reused");
+                write_msg(&mut stream, &refusal)?;
                 return Ok(());
             }
             match resolve_auth(&nonce, &daemon.forest_id, expiry_ms, &pubkey, &sig) {
                 Ok(p) => p,
-                Err(msg) => {
-                    write_msg(&mut stream, &msg)?;
+                Err((reason, code, message)) => {
+                    note_auth_refused(peer, Some(pubkey.as_str()), reason);
+                    write_msg(&mut stream, &err(code, message))?;
+                    take_refusal();
                     return Ok(());
                 }
             }
         }
         Some(_) => {
             daemon.consume_nonce(&nonce);
+            note_auth_refused(peer, None, "protocol");
             write_msg(&mut stream, &err("bad_input", "expected auth or anonymous"))?;
             return Ok(());
         }
@@ -791,7 +994,12 @@ pub fn serve_connection<S: io::Read + io::Write>(
             pvfs_proto::Frame::Unknown { tag } => {
                 // Named, so the caller can fall back on THIS op rather than
                 // guessing which of its requests was too new.
-                daemon.unknown_ops.lock().unwrap().insert(tag.clone());
+                if daemon.unknown_ops.lock().unwrap().insert(tag.clone()) {
+                    // PVOS D222b — once per op name per run. The name came
+                    // from the client, so it is content.
+                    pv_warn!("pvfs.request.unknown_op", op = content(&tag), peer_addr = net(peer.label());
+                        "pvfsd: a client at {} asked for the unknown op {tag:?}", peer.label());
+                }
                 write_msg(
                     &mut stream,
                     &ServerMsg::Error {
@@ -805,24 +1013,24 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 continue;
             }
         };
+        // PVOS D222b — the op's name for the refusal line, and a clean
+        // slate: whatever this op refuses is logged after it.
+        let op = req.op_name();
+        take_refusal();
         // Cat uses the data plane: it writes multiple frames to the stream
         // directly rather than returning a single ServerMsg.
         match req {
             ClientMsg::Cat { node, offset, len } => {
                 do_cat(daemon, &principal, &mut stream, &node, offset, len)?;
-                continue;
             }
             ClientMsg::CatHash { hash, offset, len, trashed } => {
                 do_cat_hash(daemon, &principal, &mut stream, &hash, offset, len, trashed)?;
-                continue;
             }
             ClientMsg::SecureCat { node } => {
                 do_secure_cat(daemon, &principal, &mut stream, &node)?;
-                continue;
             }
             ClientMsg::SecurePut { node } => {
                 do_secure_put(daemon, &principal, &mut stream, &node, conn_id)?;
-                continue;
             }
             ClientMsg::IngestWrite {
                 session,
@@ -830,32 +1038,36 @@ pub fn serve_connection<S: io::Read + io::Write>(
                 offset,
             } => {
                 do_ingest_write(daemon, &principal, &mut stream, &session, &file, offset)?;
-                continue;
             }
             req => {
                 let resp = handle(daemon, &principal, req, local, conn_id);
                 write_msg(&mut stream, &resp)?;
             }
         }
+        note_refusal(daemon, &principal, peer, op);
     }
     Ok(())
 }
 
 /// Verify a client's signature over the challenge → the proven key is the principal.
+/// Why a handshake was refused: (the word the log says, the wire code, the
+/// message the client gets) — D222b.
+type AuthRefusal = (&'static str, &'static str, &'static str);
+
 fn resolve_auth(
     nonce: &[u8],
     forest_id: &str,
     expiry_ms: u64,
     pubkey: &str,
     sig: &str,
-) -> Result<Principal, ServerMsg> {
+) -> Result<Principal, AuthRefusal> {
     if now_ms() > expiry_ms {
-        return Err(err("bad_input", "challenge expired"));
+        return Err(("challenge_expired", "bad_input", "challenge expired"));
     }
-    let pk = hex::decode(pubkey).map_err(|_| err("bad_input", "pubkey not hex"))?;
-    let sigb = hex::decode(sig).map_err(|_| err("bad_input", "sig not hex"))?;
+    let pk = hex::decode(pubkey).map_err(|_| ("malformed", "bad_input", "pubkey not hex"))?;
+    let sigb = hex::decode(sig).map_err(|_| ("malformed", "bad_input", "sig not hex"))?;
     let digest = auth_digest(nonce, forest_id, expiry_ms);
-    crypto::verify_digest(&pk, &digest, &sigb).map_err(|_| err("forbidden", "bad signature"))?;
+    crypto::verify_digest(&pk, &digest, &sigb).map_err(|_| ("bad_signature", "forbidden", "bad signature"))?;
     Ok(Principal::Key(pk))
 }
 
@@ -3103,7 +3315,7 @@ fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEven
     // The same bounded Busy retry as a two-phase commit (see do_commit),
     // with the writer released while it sleeps (D199).
     let mut attempt = 0;
-    let outcome = loop {
+    let (outcome, tip) = loop {
         let mut e = daemon.writer.lock_serving("serve: commit signed");
         match e.commit_member_write(events.clone()) {
             Err(PvfsError::Busy { .. }) if attempt < 4 => {
@@ -3111,11 +3323,15 @@ fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEven
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
             }
-            other => break other,
+            // PVOS D222b — the log's tip while the writer is still held, so
+            // the authority lines name the seqs this commit took.
+            Ok(()) => break (Ok(()), e.log_tip_hash().ok()),
+            other => break (other, None),
         }
     };
     match outcome {
         Ok(()) => {
+            note_authority(&daemon.forest_id, &events, tip);
             nudge_catalogue_on_heads(daemon, &events);
             ServerMsg::Committed { id: String::new() }
         }
@@ -3192,6 +3408,7 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
     };
     match outcome {
         Ok(()) => {
+            note_authority(&daemon.forest_id, &events, e.log_tip_hash().ok());
             // Punch H: a committed write is new content on the owner — wake
             // the mover instead of waiting out its interval.
             if let Some(j) = daemon.jobs.get() {
@@ -3360,6 +3577,9 @@ fn do_stat(daemon: &Daemon, principal: &Principal, node: &str) -> Result<NodeInf
 }
 
 fn err(code: &str, message: &str) -> ServerMsg {
+    if code == "forbidden" || code == "integrity" {
+        REFUSED.with(|r| *r.borrow_mut() = Some((code.to_string(), message.to_string())));
+    }
     ServerMsg::Error {
         code: code.into(),
         message: message.into(),

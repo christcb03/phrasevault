@@ -20,7 +20,7 @@ pvfs-core = { path = "../pvfs-core" }
 pvfs-client = { path = "../pvfs-client" }
 pvfs-proto = { path = "../pvfs-proto" }
 # PVOS D222 — every line through one log record (levels, event names, fields).
-pvfs-log = { path = "../pvfs-log" }
+pvfs-log = { path = "../pvfs-log", features = ["ship"] }
 blake3.workspace = true
 hex.workspace = true
 rand.workspace = true

@@ -1,0 +1,350 @@
+//! D222d — formats, transports against in-test receivers, the spool through
+//! a sender, health, the install path.
+
+use super::*;
+use crate::{content, identity, net, render, Category, Class, Field, Outcome, Privacy, Record, ToField, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, UdpSocket};
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+
+fn rec(event: &str, line: &str, category: Category, fields: Vec<Field>) -> Record {
+    let mut r = Record::now(Severity::Warning, event, line.to_string());
+    r.category = category;
+    r.fields = fields;
+    r.host = "mediabox".into();
+    r.service = "pvfsd".into();
+    r.ts_ms = 1_791_418_934_370;
+    r
+}
+
+fn dest(kind: Kind) -> Destination {
+    Destination {
+        name: "t".into(),
+        enabled: true,
+        kind,
+        url: None,
+        address: None,
+        transport: None,
+        format: None,
+        index: None,
+        sourcetype: None,
+        header: None,
+        privacy: "full".into(),
+        min_severity: "info".into(),
+        categories: vec![],
+        services: vec![],
+        tls: TlsSettings::default(),
+        secret: None,
+        spool_mb: 1,
+    }
+}
+
+fn mk_dest(cfg: Destination, token: Option<&str>, dir: &Path) -> Arc<sender::Dest> {
+    Arc::new(sender::Dest {
+        cfg,
+        token: token.map(str::to_string),
+        key: Some([3u8; 32]),
+        product: "PVFS".into(),
+        version: "1.4-test".into(),
+        spool: Mutex::new(Spool::open(dir, 1 << 20).unwrap()),
+        health: Mutex::new(Health::default()),
+        stop: AtomicBool::new(false),
+        started_ms: crate::time::now_ms(),
+        failing_after_ms: 0,
+    })
+}
+
+// ── formats ──────────────────────────────────────────────────────────────
+
+#[test]
+fn rfc5424_escapes_its_structured_data() {
+    let r = rec(
+        "pvfs.access.denied",
+        "pvfsd: ls refused for public from 10.0.0.9:5555: no \"read\" ] here \\",
+        Category::Security,
+        vec![Field { name: "reason".into(), class: Class::Meta, value: Value::Str("a\"b]c\\d".into()) }],
+    );
+    let v = render(&r, Privacy::Full, None);
+    let m = format::rfc5424(&r, &v, &v.line(), true);
+    // authpriv (10) * 8 + warning (4) = 84
+    assert!(m.starts_with("<84>1 2026-10-08T00:22:14.370Z mediabox pvfsd "), "{m}");
+    assert!(m.contains(" pvfs.access.denied [pvlog@32473 event=\"pvfs.access.denied\" category=\"security\""), "{m}");
+    assert!(m.contains("reason=\"a\\\"b\\]c\\\\d\"]"), "{m}");
+    assert!(m.ends_with("pvfsd: ls refused for public from 10.0.0.9:5555: no \"read\" ] here \\"));
+    // MSGID is at most 32 characters.
+    let long = rec("pvfs.authority.recovery_key_registered", "x", Category::Audit, vec![]);
+    let lv = render(&long, Privacy::Full, None);
+    assert!(format::rfc5424(&long, &lv, "x", false).contains(" pvfs.authority.recovery_key_regi - x"));
+}
+
+#[test]
+fn cef_escapes_header_and_extension() {
+    let mut r = rec(
+        "pvfs.access.denied",
+        "pvfsd: a|b = c\nd",
+        Category::Security,
+        vec![
+            net("10.0.0.9:5555").to_field("peer_addr"),
+            Field { name: "principal".into(), class: Class::Actor, value: Value::Str("key:02ab".into()) },
+            Field { name: "op".into(), class: Class::Meta, value: Value::Str("ls".into()) },
+        ],
+    );
+    r.outcome = Some(Outcome::Failure);
+    let v = render(&r, Privacy::Full, None);
+    let c = format::cef(&r, &v, "PVFS", "1.4|x");
+    assert!(c.starts_with("CEF:0|PhraseVault|PVFS|1.4\\|x|pvfs.access.denied|pvfsd: a\\|b = c d|5|"), "{c}");
+    assert!(c.contains(" src=10.0.0.9 spt=5555 "), "{c}");
+    assert!(c.contains(" suser=key:02ab "), "{c}");
+    assert!(c.contains(" cs1Label=op cs1=ls "), "{c}");
+    assert!(c.contains(" outcome=failure "), "{c}");
+    assert!(c.ends_with(" msg=pvfsd: a|b \\= c\\nd"), "{c}");
+}
+
+#[test]
+fn hec_and_loki_bodies() {
+    let r = rec("pvfs.job.failed", "pvfsd: watch failed", Category::System, vec![]);
+    let v = render(&r, Privacy::Full, None);
+    let h = format::hec_event(&r, &v, "pvfs:json", Some("main"));
+    let j: serde_json::Value = serde_json::from_str(&h).unwrap();
+    assert_eq!(j["time"].as_f64().unwrap(), 1_791_418_934.37);
+    assert_eq!(j["sourcetype"], "pvfs:json");
+    assert_eq!(j["index"], "main");
+    assert_eq!(j["event"]["event"], "pvfs.job.failed");
+    let s = rec("pvfs.auth.refused", "pvfsd: refused", Category::Security, vec![]);
+    let sv = render(&s, Privacy::Full, None);
+    let body = format::loki_body(&[(&r, v), (&s, sv)]);
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let streams = j["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 2, "system and security lines are separate streams");
+    let sec = streams.iter().find(|s| s["stream"]["category"] == "security").unwrap();
+    assert_eq!(sec["stream"]["job"], "pvlog");
+    assert_eq!(sec["values"][0][0], "1791418934370000000");
+    assert_eq!(sec["values"][0][1], "pvfsd: refused");
+    assert_eq!(sec["values"][0][2]["event"], "pvfs.auth.refused");
+}
+
+#[test]
+fn a_minimal_destination_never_sees_a_path_or_a_name() {
+    let r = rec(
+        "pvfs.mount.deleted",
+        "mount: delete of Films/Obsession (2026)/x.mkv by chris@example.com",
+        Category::System,
+        vec![content("Films/Obsession (2026)/x.mkv").to_field("path"), identity("chris@example.com").to_field("email")],
+    );
+    let v = render(&r, Privacy::Minimal, Some(&[3u8; 32]));
+    for out in [
+        format::rfc5424(&r, &v, &v.line(), true),
+        format::cef(&r, &v, "PVFS", "1"),
+        format::hec_event(&r, &v, "pvfs:json", None),
+        format::ndjson(&[(&r, v.clone())]),
+    ] {
+        assert!(!out.contains("Obsession") && !out.contains("chris@"), "{out}");
+    }
+}
+
+// ── transports, against in-test receivers ────────────────────────────────
+
+fn read_frames(mut s: impl Read) -> Vec<String> {
+    let mut all = Vec::new();
+    let _ = s.read_to_end(&mut all);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < all.len() {
+        let sp = all[i..].iter().position(|b| *b == b' ').unwrap();
+        let n: usize = std::str::from_utf8(&all[i..i + sp]).unwrap().parse().unwrap();
+        out.push(String::from_utf8(all[i + sp + 1..i + sp + 1 + n].to_vec()).unwrap());
+        i += sp + 1 + n;
+    }
+    out
+}
+
+#[test]
+fn syslog_over_tcp_and_udp() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let t = std::thread::spawn(move || read_frames(l.accept().unwrap().0));
+    syslog::send(&addr, SyslogTransport::Tcp, &TlsSettings::default(), &["one".into(), "two 2".into()]).unwrap();
+    assert_eq!(t.join().unwrap(), vec!["one".to_string(), "two 2".to_string()]);
+
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let uaddr = u.local_addr().unwrap().to_string();
+    syslog::send(&uaddr, SyslogTransport::Udp, &TlsSettings::default(), &["<14>1 - - - - - - hi".into()]).unwrap();
+    let mut buf = [0u8; 9000];
+    let (n, _) = u.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"<14>1 - - - - - - hi");
+}
+
+fn tls_server() -> (TcpListener, Arc<rustls::ServerConfig>, String) {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    let der = ck.cert.der().to_vec();
+    let pin: String = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&der).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![rustls::pki_types::CertificateDer::from(der)], key)
+        .unwrap();
+    (TcpListener::bind("127.0.0.1:0").unwrap(), Arc::new(cfg), pin)
+}
+
+#[test]
+fn syslog_over_tls_needs_the_right_certificate() {
+    let (l, cfg, pin) = tls_server();
+    let addr = l.local_addr().unwrap().to_string();
+    let t = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let (s, _) = l.accept().unwrap();
+            let conn = rustls::ServerConnection::new(cfg.clone()).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, s);
+            let mut all = Vec::new();
+            let _ = tls.read_to_end(&mut all);
+            out.push(all);
+        }
+        out
+    });
+    let pinned = TlsSettings { ca_file: None, pin_sha256: Some(pin) };
+    syslog::send(&addr, SyslogTransport::Tls, &pinned, &["secure".into()]).unwrap();
+    // The public roots do not vouch for a self-signed certificate.
+    assert!(syslog::send(&addr, SyslogTransport::Tls, &TlsSettings::default(), &["nope".into()]).is_err());
+    let got = t.join().unwrap();
+    assert_eq!(read_frames(&got[0][..]), vec!["secure".to_string()]);
+    assert!(got[1].is_empty(), "nothing reached the server over the unverified connection");
+}
+
+/// A tiny HTTP receiver: answers each request with the next of `answers`
+/// (status, body) and keeps (head, body).
+fn http_server(answers: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let t = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        for (code, body) in answers {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut head = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    len = line[15..].trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let mut b = vec![0u8; len];
+            r.read_exact(&mut b).unwrap();
+            let _ = write!(s, "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            got.push((head, String::from_utf8(b).unwrap()));
+        }
+        got
+    });
+    (url, t)
+}
+
+#[test]
+fn hec_sends_its_token_and_reads_the_answer() {
+    let (url, t) = http_server(vec![(200, "{\"text\":\"Success\",\"code\":0}"), (403, "{\"text\":\"Invalid token\",\"code\":4}")]);
+    let mut cfg = dest(Kind::SplunkHec);
+    cfg.url = Some(url);
+    cfg.index = Some("main".into());
+    let d = tempfile::tempdir().unwrap();
+    let dd = mk_dest(cfg, Some("tok-123"), d.path());
+    let r = rec("pvfs.job.failed", "pvfsd: x", Category::System, vec![]);
+    sender::deliver(&dd, std::slice::from_ref(&r)).unwrap();
+    let e = sender::deliver(&dd, &[r]).unwrap_err();
+    assert!(e.contains("403"), "{e}");
+    let got = t.join().unwrap();
+    assert!(got[0].0.starts_with("POST /services/collector/event HTTP/1.1"), "{}", got[0].0);
+    assert!(got[0].0.contains("Authorization: Splunk tok-123"));
+    let ev: serde_json::Value = serde_json::from_str(&got[0].1).unwrap();
+    assert_eq!(ev["index"], "main");
+    assert_eq!(ev["event"]["event"], "pvfs.job.failed");
+}
+
+#[test]
+fn the_spool_delivers_in_order_after_the_receiver_comes_back_and_says_so() {
+    let cap = crate::testing::GlobalCapture::start();
+    // First answer fails, then two succeed.
+    let (url, t) = http_server(vec![(500, "down"), (200, "ok"), (200, "ok")]);
+    let mut cfg = dest(Kind::HttpsJson);
+    cfg.name = "spooltest".into();
+    cfg.url = Some(url);
+    let d = tempfile::tempdir().unwrap();
+    let dd = mk_dest(cfg, Some("s3cret"), d.path());
+    for i in 0..3 {
+        dd.offer(&rec("pvfs.job.failed", &format!("pvfsd: number {i}"), Category::System, vec![]));
+    }
+    let runner = Arc::clone(&dd);
+    let th = std::thread::spawn(move || sender::run(runner));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while dd.health().sent < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // One more after the first batch went: a second request.
+    dd.offer(&rec("pvfs.job.failed", "pvfsd: number 3", Category::System, vec![]));
+    while dd.health().sent < 4 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    dd.stop.store(true, Ordering::Relaxed);
+    th.join().unwrap();
+    let got = t.join().unwrap();
+    assert_eq!(dd.health().sent, 4);
+    assert!(got[1].0.contains("Authorization: Bearer s3cret"));
+    let lines: Vec<String> = got[1].1.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["msg"].as_str().unwrap().to_string()).collect();
+    assert_eq!(lines, vec!["number 0", "number 1", "number 2"]);
+    assert!(got[2].1.contains("number 3"));
+    // failing_after_ms = 0: the first failure was reported, the success after it too.
+    assert!(cap.events("pvfs.log.destination_failing").iter().any(|r| r.fields.iter().any(|f| f.value == Value::Str("spooltest".into()))));
+    assert!(cap.events("pvfs.log.destination_recovered").iter().any(|r| r.fields.iter().any(|f| f.value == Value::Str("spooltest".into()))));
+}
+
+#[test]
+fn a_destination_never_gets_its_own_failure_and_filters_apply() {
+    let mut cfg = dest(Kind::HttpsJson);
+    cfg.name = "x".into();
+    cfg.categories = vec!["security".into()];
+    cfg.min_severity = "warning".into();
+    let own = rec("pvfs.log.destination_failing", "pvfs-log: x failed", Category::Security, vec![crate::ToField::to_field("x", "destination")]);
+    assert!(!cfg.takes(&own));
+    let sec = rec("pvfs.auth.refused", "pvfsd: refused", Category::Security, vec![]);
+    assert!(cfg.takes(&sec));
+    let sys = rec("pvfs.job.failed", "pvfsd: failed", Category::System, vec![]);
+    assert!(!cfg.takes(&sys));
+    let mut info = sec.clone();
+    info.severity = Severity::Info;
+    assert!(!cfg.takes(&info));
+}
+
+#[test]
+fn config_parses_and_says_what_is_wrong() {
+    let ok = r#"{"v":1,"destinations":[
+        {"name":"logs","type":"loki","url":"http://192.168.1.83:3100","privacy":"full"},
+        {"name":"siem","type":"syslog","address":"siem.corp:6514","format":"cef"},
+        {"name":"splunk","type":"splunk_hec","url":"https://splunk:8088","secret":"splunk.token","tls":{"pin_sha256":"ab"}}]}"#;
+    let c = ShipConfig::parse(ok).unwrap();
+    assert_eq!(c.destinations[1].privacy, "minimal", "minimal by default");
+    assert_eq!(c.destinations[1].syslog_transport(), SyslogTransport::Tls, "tls by default");
+    assert!(c.destinations[0].problems().is_empty());
+    assert!(c.destinations[1].problems().is_empty());
+    assert!(c.destinations[2].problems().iter().any(|p| p.contains("pin_sha256")));
+    assert!(ShipConfig::parse(r#"{"v":2}"#).is_err());
+    assert!(ShipConfig::parse(r#"{"v":1,"destinations":[{"name":"a","type":"loki","url":"http://x"},{"name":"a","type":"loki","url":"http://y"}]}"#).is_err());
+    let back = ShipConfig::parse(&c.to_text()).unwrap();
+    assert_eq!(back, c);
+}
+
+#[test]
+fn whois_finds_the_member() {
+    let key = [9u8; 32];
+    let p = crate::pseudonym(&key, 'a', "key:02cafe");
+    assert_eq!(whois(&key, &p, ["key:0200", "key:02cafe", "chris"]), vec!["key:02cafe"]);
+}

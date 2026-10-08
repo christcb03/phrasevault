@@ -943,6 +943,21 @@ impl Engine {
         Ok(n != 0)
     }
 
+    /// PVOS D222b — true when `pubkey` was authorized here once (member or
+    /// device) and has since been revoked: a refusal of it is "a revoked key
+    /// used", not an ordinary denial.
+    pub fn is_revoked_key(&self, pubkey: &[u8]) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NOT NULL)",
+                params![pubkey],
+                |r| r.get(0),
+            )
+            .map_err(map_db("revoked check"))?;
+        Ok(n != 0)
+    }
+
     /// PVOS D188 — true when `pubkey` is a DEVICE key (not a member key) the
     /// forest has revoked: a retired owner's, after a promotion.
     pub fn is_revoked_device(&self, pubkey: &[u8]) -> Result<bool> {
@@ -1155,6 +1170,20 @@ impl Engine {
         engine.ensure_device_active()?;
         engine.sweep_temp_spool()?; // doc 04 §7 — rebuild empties temp ⇒ spool emptied
         Ok(engine)
+    }
+
+    /// PVOS D222d — every key the forest has authorized (devices and
+    /// members, revoked or not), hex: what `pvfs log whois` hashes to turn a
+    /// pseudonym back into a key.
+    pub fn known_keys(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT device_pubkey FROM device_keys ORDER BY authorized_at")
+            .map_err(map_db("known keys"))?;
+        let rows = stmt
+            .query_map([], |r| Ok(hex::encode(r.get::<_, Vec<u8>>(0)?)))
+            .map_err(map_db("known keys"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(map_db("known keys"))
     }
 
     /// D128 — every phrase-derived device certificate the log carries, in

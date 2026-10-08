@@ -976,6 +976,50 @@ pub enum ClientMsg {
     ClaimWriteLease { roots: Vec<String> },
 }
 
+impl ClientMsg {
+    /// The op's wire name (its serde tag) — what a log line calls it
+    /// (PVOS D222b), without serializing the whole message.
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            ClientMsg::Auth { .. } => "auth",
+            ClientMsg::Anonymous => "anonymous",
+            ClientMsg::Info => "info",
+            ClientMsg::Ls { .. } => "ls",
+            ClientMsg::Stat { .. } => "stat",
+            ClientMsg::Payload { .. } => "payload",
+            ClientMsg::Cat { .. } => "cat",
+            ClientMsg::CatHash { .. } => "cat_hash",
+            ClientMsg::TrashPath { .. } => "trash_path",
+            ClientMsg::RenamePath { .. } => "rename_path",
+            ClientMsg::RemoveDir { .. } => "remove_dir",
+            ClientMsg::SetRegionQuality { .. } => "set_region_quality",
+            ClientMsg::ChunkManifest { .. } => "chunk_manifest",
+            ClientMsg::SecureCat { .. } => "secure_cat",
+            ClientMsg::SecurePut { .. } => "secure_put",
+            ClientMsg::LogInfo { .. } => "log_info",
+            ClientMsg::LogRead { .. } => "log_read",
+            ClientMsg::LogWait { .. } => "log_wait",
+            ClientMsg::RegionManifest { .. } => "region_manifest",
+            ClientMsg::RegionClaims => "region_claims",
+            ClientMsg::ViewLs { .. } => "view_ls",
+            ClientMsg::ViewEntry { .. } => "view_entry",
+            ClientMsg::CatalogueStatus => "catalogue_status",
+            ClientMsg::PrepareWrite { .. } => "prepare_write",
+            ClientMsg::Commit { .. } => "commit",
+            ClientMsg::CommitSigned { .. } => "commit_signed",
+            ClientMsg::ServeStatus => "serve_status",
+            ClientMsg::ReceivePlan => "receive_plan",
+            ClientMsg::IngestBegin { .. } => "ingest_begin",
+            ClientMsg::IngestWrite { .. } => "ingest_write",
+            ClientMsg::IngestVerified { .. } => "ingest_verified",
+            ClientMsg::IngestCommit { .. } => "ingest_commit",
+            ClientMsg::IngestAbort { .. } => "ingest_abort",
+            ClientMsg::IngestList => "ingest_list",
+            ClientMsg::ClaimWriteLease { .. } => "claim_write_lease",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildInfo {
     pub id: String,

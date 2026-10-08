@@ -24,11 +24,16 @@
 
 mod encode;
 mod journal;
+mod limit;
 mod privacy;
 pub mod registry;
+#[cfg(feature = "ship")]
+pub mod ship;
+pub mod testing;
 mod time;
 
 pub use encode::{parse_json, to_json, to_logfmt};
+pub use limit::{limit, Limiter};
 #[doc(hidden)]
 pub use journal::__send_record;
 pub use privacy::{pseudonym, render, View};
@@ -577,11 +582,40 @@ pub fn current_format() -> Format {
 }
 
 pub fn enabled(sev: Severity) -> bool {
-    sev <= logger().cfg.level || CAPTURE.with(|c| c.borrow().is_some())
+    sev <= logger().cfg.level || CAPTURE.with(|c| c.borrow().is_some()) || testing::active()
 }
 
 thread_local! {
     static CAPTURE: RefCell<Option<Vec<Record>>> = const { RefCell::new(None) };
+    /// PVOS D222b — fields every record made on this thread carries (a web
+    /// connection's client address), set where the connection starts.
+    static CONTEXT: RefCell<Vec<Field>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Fields every record made on this thread from now on carries, unless the
+/// record has a field of the same name: `set_thread_context(vec![net(addr).to_field("peer_addr")])`
+/// at a connection's start, so each line it causes says where it came from.
+pub fn set_thread_context(fields: Vec<Field>) {
+    CONTEXT.with(|c| *c.borrow_mut() = fields);
+}
+
+/// Add one field to this thread's context (or replace the one of that
+/// name): the member, once a web connection has signed in.
+pub fn add_thread_context(field: Field) {
+    CONTEXT.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|f| f.name != field.name);
+        c.push(field);
+    });
+}
+
+/// The value of one of this thread's context fields, as text.
+pub fn thread_context_value(name: &str) -> Option<String> {
+    CONTEXT.with(|c| c.borrow().iter().find(|f| f.name == name).map(|f| f.value.to_string()))
+}
+
+pub fn clear_thread_context() {
+    CONTEXT.with(|c| c.borrow_mut().clear());
 }
 
 /// Run `f` and return the records this thread logged in it, instead of
@@ -606,6 +640,13 @@ pub fn __emit(
     r.category = category;
     r.outcome = outcome;
     r.fields = fields;
+    CONTEXT.with(|c| {
+        for f in c.borrow().iter() {
+            if !r.fields.iter().any(|x| x.name == f.name) {
+                r.fields.push(f.clone());
+            }
+        }
+    });
     emit_record(r);
 }
 
@@ -623,6 +664,11 @@ pub fn emit_record(rec: Record) {
     if captured {
         return;
     }
+    testing::offer(&rec);
+    // PVOS D222d — every destination whose filter takes it spools it (each
+    // has its own minimum severity, so before this process's level check).
+    #[cfg(feature = "ship")]
+    ship::offer(&rec);
     let lg = logger();
     if rec.severity > lg.cfg.level {
         return;

@@ -223,14 +223,44 @@ final class AgentController: ObservableObject {
             env["PVFS_COMPANION_PASSPHRASE"] = pass
         }
         proc.environment = env
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        // PVOS D222c — the companion's log (its records, the audit events it
+        // logs since D222b) goes to ~/Library/Logs/PVFS/companion.log, which
+        // Console.app shows, instead of nowhere.
+        let log = Self.companionLogHandle()
+        proc.standardOutput = log ?? FileHandle.nullDevice
+        proc.standardError = log ?? FileHandle.nullDevice
         try proc.run()
         agentProcess = proc
         needsVaultPassword = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.refresh()
         }
+    }
+
+    /// PVOS D222c — `~/Library/Logs/PVFS/companion.log`, opened for append
+    /// (the daemon is a child; its stderr is this file). Over 10 MB at a
+    /// start it becomes `.1`, the old `.1` becomes `.2`, and a fresh file
+    /// begins. `nil` if the file cannot be opened (logging is never a reason
+    /// not to start).
+    static func companionLogHandle() -> FileHandle? {
+        let fm = FileManager.default
+        let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/PVFS", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("companion.log")
+        if let size = (try? fm.attributesOfItem(atPath: file.path))?[.size] as? NSNumber,
+           size.int64Value > 10 * 1024 * 1024 {
+            let one = dir.appendingPathComponent("companion.log.1")
+            let two = dir.appendingPathComponent("companion.log.2")
+            try? fm.removeItem(at: two)
+            try? fm.moveItem(at: one, to: two)
+            try? fm.moveItem(at: file, to: one)
+        }
+        if !fm.fileExists(atPath: file.path) {
+            fm.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        guard let handle = try? FileHandle(forWritingTo: file) else { return nil }
+        handle.seekToEndOfFile()
+        return handle
     }
 
     func stopAgent() {

@@ -5,6 +5,53 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Log destinations: Loki, Splunk HEC, syslog (RFC 5424 as text, JSON or
+  CEF, over TLS, TCP or UDP) and HTTPS JSON, built in (PVOS D222d).** A
+  daemon sends its records to the destinations in
+  `~/.config/pvfs/log-destinations.json` (or `/etc/pvfs/…`, or
+  `$PVFS_LOG_DESTINATIONS`) and re-reads the file within 30 s of a change.
+  - Each destination has a filter (categories, minimum severity,
+    services) and a privacy level, `minimal` by default.
+  - Delivery is at least once, through an on-disk spool (256 MB cap, the
+    oldest dropped and counted) rendered at the destination's privacy level
+    at send time.
+  - TLS is always verified: public roots, a CA file, or a pinned SHA-256.
+    There is no setting to skip it.
+  - A destination failing for 15 min logs `pvfs.log.destination_failing`,
+    and `…_recovered` when it is back.
+  - `pvfs log destinations` lists, adds (asking each question), tests and
+    removes destinations; `pvfs log whois a:…` turns a pseudonym back into
+    a key.
+  - Reference and recipes for Splunk UF, Elastic, Vector, rsyslog and Alloy:
+    [docs/33-shipping-logs.md](docs/33-shipping-logs.md).
+  - New feature `ship` in `pvfs-log`; pvfsd and the CLI turn it on.
+
+- **Every refusal and every change of authority is logged, with who and
+  from where (PVOS D222b).** These are category `security`, outcome
+  `failure`, rate-limited to 10 a minute per peer, with the next one saying
+  how many were dropped:
+  - a request refused (`pvfs.access.denied`);
+  - a revoked key used (`pvfs.access.revoked_key`);
+  - a signature that does not verify;
+  - a refused handshake (`pvfs.auth.refused`: challenge reused or expired,
+    bad signature, malformed, protocol);
+  - a TLS handshake that fails (`pvfs.tls.handshake_failed`; a client that
+    connects and leaves is not logged).
+
+  pvfsd catches them where the answer leaves (`err()`), so every gate is
+  covered. Each line carries the op, the principal, and the client's
+  `peer_addr`, or `local` for the Unix socket.
+
+  Authority changes a daemon commits are logged once, category `audit`
+  (`pvfs.authority.device_authorized`, `device_revoked`, `acl_set`,
+  `member_tagged`, `root_rotated`, `recovery_key_registered`/`_revoked`,
+  `certificates_bound`), with author, subject and log seq.
+
+  The companion logs its web agent's refusals and each `audit.jsonl` entry
+  (`pvfs.agent.audit`). New: `ClientMsg::op_name`, `Engine::is_revoked_key`,
+  `Engine::known_keys`, `pvfs_log::limit`, thread context fields, and
+  `testing::GlobalCapture`.
+
 - **Every daemon line is a log record a log server can use (PVOS D222).**
   pvfsd, the `pvfs mount` view and the companion's `serve` log through a new
   crate, `pvfs-log` (PVOS uses it too): each line keeps its exact text and

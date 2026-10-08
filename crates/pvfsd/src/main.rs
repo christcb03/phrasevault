@@ -174,6 +174,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
     let is_replica = engine.is_replica();
+    // PVOS D222d — log destinations from log-destinations.json (when there
+    // is one), spooled under this forest's data dir; re-read when it changes.
+    pvfs_log::ship::watch_file(data_dir.join("log-spool"), "PVFS", VERSION.to_string());
 
     let socket = match &cli.socket {
         Some(s) => s.clone(),

@@ -329,6 +329,13 @@ enum Cmd {
     /// box that holds the region — run this there.
     #[command(subcommand)]
     Trash(TrashCmd),
+    /// PVOS D222d — where this box's daemons send their logs besides the
+    /// journal (log destinations: Loki, Splunk HEC, syslog, HTTPS JSON), and
+    /// which key a pseudonym in a shipped log stands for. Bare, it asks.
+    Log {
+        #[command(subcommand)]
+        cmd: Option<LogCmd>,
+    },
     /// Mount a tree read-only as a real filesystem (P7.3, doc 20 §3):
     /// directories from the catalog, file reads resolve live — local bytes,
     /// the sync store, else verified read-through. Blocks until unmounted.
@@ -1379,6 +1386,31 @@ enum ServeCmd {
         #[arg(long, default_value_t = 30_000)]
         ceiling_ms: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum LogCmd {
+    /// List, add, test or remove log destinations. Bare, it lists them and
+    /// asks what to do.
+    Destinations {
+        #[command(subcommand)]
+        action: Option<DestCmd>,
+    },
+    /// Which of this forest's keys a pseudonym (`a:…`) in a shipped log
+    /// stands for. Bare, it asks for the pseudonym.
+    Whois { pseudonym: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum DestCmd {
+    /// The destinations and what each one sends.
+    List,
+    /// Add one, asking each question (defaults offered).
+    Add,
+    /// Send one test event to a destination now and say what it answered.
+    Test { name: Option<String> },
+    /// Remove a destination (its spool on each daemon is left to age out).
+    Remove { name: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -6795,6 +6827,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
         }
         Cmd::Trash(TrashCmd::Put { path, region, hash, from }) => trash_put(&ctx?, path, region, hash, from, json),
+        Cmd::Log { cmd } => log_cmd(cmd, ctx, json),
         Cmd::Trash(cmd) => {
             let engine = Engine::open(&ctx?)?;
             let lists = engine.region_trash_lists()?;
@@ -11242,6 +11275,334 @@ fn main() -> ExitCode {
         Err(e) => {
             print_error(&e, json);
             ExitCode::from(exit_code_for(&e))
+        }
+    }
+}
+
+// ---- PVOS D222d: `pvfs log` -------------------------------------------------
+
+fn log_err(e: impl std::fmt::Display) -> PvfsError {
+    PvfsError::BadInput { field: "log".into(), reason: e.to_string() }
+}
+
+fn log_load(path: &std::path::Path) -> Result<pvfs_log::ship::ShipConfig, PvfsError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => pvfs_log::ship::ShipConfig::parse(&t).map_err(log_err),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(pvfs_log::ship::ShipConfig { v: 1, ..Default::default() }),
+        Err(e) => Err(PvfsError::io("read log destinations", e)),
+    }
+}
+
+fn log_save(path: &std::path::Path, cfg: &pvfs_log::ship::ShipConfig) -> Result<(), PvfsError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create the log destinations directory", e))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, cfg.to_text()).map_err(|e| PvfsError::io("write log destinations", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| PvfsError::io("write log destinations", e))
+}
+
+/// A file only its owner reads (a token, the pseudonym key).
+fn write_private(path: &std::path::Path, text: &str) -> Result<(), PvfsError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| PvfsError::io("write a private file", e))?;
+    f.write_all(text.as_bytes()).map_err(|e| PvfsError::io("write a private file", e))
+}
+
+fn ask_yes(what: &str, default_yes: bool) -> Result<bool, PvfsError> {
+    let a = prompt_line(what, Some(if default_yes { "Y/n" } else { "y/N" }))?;
+    Ok(match a.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default_yes,
+    })
+}
+
+fn log_opts(path: &std::path::Path, cfg: &pvfs_log::ship::ShipConfig) -> pvfs_log::ship::InstallOpts {
+    let mut o = pvfs_log::ship::InstallOpts::new(&std::env::temp_dir(), "PVFS", env!("CARGO_PKG_VERSION"));
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let resolve = |f: &str| {
+        let p = std::path::PathBuf::from(f);
+        if p.is_absolute() { p } else { dir.join(p) }
+    };
+    for d in &cfg.destinations {
+        if let Some(f) = &d.secret {
+            if let Ok(t) = std::fs::read_to_string(resolve(f)) {
+                o.secrets.insert(d.name.clone(), t.trim().to_string());
+            }
+        }
+    }
+    if let Some(k) = &cfg.pseudonym_key_file {
+        o.pseudonym_key = pvfs_log::read_key(&resolve(k)).ok();
+    }
+    o
+}
+
+fn log_list(path: &std::path::Path, cfg: &pvfs_log::ship::ShipConfig, json: bool) {
+    if json {
+        println!("{}", cfg.to_text().trim_end());
+        return;
+    }
+    println!("log destinations: {}", path.display());
+    if cfg.destinations.is_empty() {
+        println!("  (none — the daemons log to the journal only)");
+    }
+    for d in &cfg.destinations {
+        let to = d.url.clone().or_else(|| d.address.clone()).unwrap_or_default();
+        let what = match d.kind {
+            pvfs_log::ship::Kind::Syslog => format!(
+                "syslog over {} as {}",
+                d.transport.as_deref().unwrap_or("tls"),
+                d.format.as_deref().unwrap_or("rfc5424")
+            ),
+            k => k.as_str().to_string(),
+        };
+        let cats = if d.categories.is_empty() { "all".to_string() } else { d.categories.join(",") };
+        println!(
+            "  {}{}: {what} → {to}; privacy {}; from {} up; categories {cats}",
+            d.name,
+            if d.enabled { "" } else { " (off)" },
+            d.privacy,
+            d.min_severity
+        );
+    }
+}
+
+fn log_pick(cfg: &pvfs_log::ship::ShipConfig, name: Option<String>, verb: &str) -> Result<String, PvfsError> {
+    if let Some(n) = name {
+        return Ok(n);
+    }
+    let names: Vec<&str> = cfg.destinations.iter().map(|d| d.name.as_str()).collect();
+    if names.is_empty() {
+        return Err(log_err("there are no log destinations"));
+    }
+    prompt_line(&format!("which destination to {verb} ({})", names.join(", ")), names.first().copied().filter(|_| names.len() == 1))
+}
+
+fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Result<String, PvfsError> {
+    use pvfs_log::ship::{Destination, Kind, TlsSettings};
+    let default_name = if cfg.destinations.iter().any(|d| d.name == "logs") { "" } else { "logs" };
+    let name = prompt_line("name for it (letters, digits, - and _)", Some(default_name).filter(|d| !d.is_empty()))?;
+    if cfg.destinations.iter().any(|d| d.name == name) {
+        return Err(log_err(format!("there is already a destination named {name}")));
+    }
+    let kind = loop {
+        let k = prompt_line("type: loki, splunk_hec, syslog or https_json", Some("loki"))?;
+        match Kind::parse(&k) {
+            Some(k) => break k,
+            None => eprintln!("  {k:?} is not one of them"),
+        }
+    };
+    let mut d = Destination {
+        name: name.clone(),
+        enabled: true,
+        kind,
+        url: None,
+        address: None,
+        transport: None,
+        format: None,
+        index: None,
+        sourcetype: None,
+        header: None,
+        privacy: "minimal".into(),
+        min_severity: "info".into(),
+        categories: vec![],
+        services: vec![],
+        tls: TlsSettings::default(),
+        secret: None,
+        spool_mb: 256,
+    };
+    let mut uses_tls = false;
+    let mut token_wanted = false;
+    match kind {
+        Kind::Syslog => {
+            let t = prompt_line("transport: tls, tcp or udp", Some("tls"))?;
+            uses_tls = t == "tls";
+            d.transport = Some(t);
+            d.address = Some(prompt_line("the receiver, host:port", Some(if uses_tls { "siem.example.com:6514" } else { "siem.example.com:514" }))?);
+            d.format = Some(prompt_line("format: rfc5424, json or cef", Some("rfc5424"))?);
+        }
+        Kind::SplunkHec => {
+            d.url = Some(prompt_line("the HEC URL", Some("https://splunk.example.com:8088"))?);
+            let idx = prompt_line("Splunk index (blank = the token's default)", Some(""))?;
+            d.index = Some(idx).filter(|i| !i.is_empty());
+            token_wanted = true;
+        }
+        Kind::Loki => {
+            d.url = Some(prompt_line("Loki's URL", Some("http://192.168.1.83:3100"))?);
+        }
+        Kind::HttpsJson => {
+            d.url = Some(prompt_line("the receiver's URL", None)?);
+        }
+    }
+    if let Some(u) = &d.url {
+        uses_tls = u.trim().starts_with("https://");
+    }
+    let token = if token_wanted {
+        prompt_line("the HEC token", None)?
+    } else if kind != Kind::Syslog {
+        prompt_line("a token to send, if the receiver wants one (blank = none)", Some(""))?
+    } else {
+        String::new()
+    };
+    if uses_tls {
+        let how = prompt_line("verify the receiver's certificate by: roots (public CAs), ca (a CA file) or pin (its SHA-256)", Some("roots"))?;
+        match how.as_str() {
+            "ca" => d.tls.ca_file = Some(prompt_line("the CA file (PEM)", None)?),
+            "pin" => d.tls.pin_sha256 = Some(prompt_line("the certificate's SHA-256 (openssl x509 -fingerprint -sha256)", None)?),
+            _ => {}
+        }
+    }
+    let privacy = prompt_line("privacy: minimal (no names, paths or addresses except on security events), identified or full", Some("minimal"))?;
+    if privacy != "minimal" {
+        let what = if privacy == "full" { "everything, file names and paths included," } else { "names, emails and addresses" };
+        if !ask_yes(&format!("this sends {what} to {name} — sure?"), false)? {
+            return Err(log_err("not added"));
+        }
+    }
+    d.privacy = privacy;
+    d.min_severity = prompt_line("the least severe record to send: error, warning, notice or info", Some("info"))?;
+    let cats = prompt_line("categories: all, or a list of system, audit, security", Some("all"))?;
+    if cats != "all" {
+        d.categories = cats.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+    }
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create the log destinations directory", e))?;
+    if !token.is_empty() {
+        let f = format!("{name}.token");
+        write_private(&dir.join(&f), &format!("{token}\n"))?;
+        d.secret = Some(f);
+    }
+    if cfg.pseudonym_key_file.is_none() {
+        let mut key = [0u8; 32];
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut key))
+            .map_err(|e| PvfsError::io("make a pseudonym key", e))?;
+        write_private(&dir.join("pseudonym.key"), &format!("{}\n", hex::encode(key)))?;
+        cfg.pseudonym_key_file = Some("pseudonym.key".into());
+    }
+    let p = d.problems();
+    if !p.is_empty() {
+        return Err(log_err(p.join("; ")));
+    }
+    cfg.destinations.push(d);
+    log_save(path, cfg)?;
+    println!("added {name} to {} — running daemons pick it up within 30 s", path.display());
+    Ok(name)
+}
+
+fn log_test(path: &std::path::Path, cfg: &pvfs_log::ship::ShipConfig, name: &str) -> Result<(), PvfsError> {
+    let d = cfg.destinations.iter().find(|d| d.name == name).ok_or_else(|| log_err(format!("no destination named {name}")))?;
+    match pvfs_log::ship::test_send(d, &log_opts(path, cfg)) {
+        Ok(()) => {
+            println!("{name}: the test event was accepted");
+            Ok(())
+        }
+        Err(e) => Err(log_err(format!("{name}: {e}"))),
+    }
+}
+
+fn log_cmd(cmd: Option<LogCmd>, ctx: Result<PathBuf, PvfsError>, json: bool) -> Result<(), PvfsError> {
+    let path = pvfs_log::ship::config_path();
+    let cmd = match cmd {
+        Some(c) => c,
+        None => {
+            let a = prompt_line("destinations or whois", Some("destinations"))?;
+            if a == "whois" { LogCmd::Whois { pseudonym: None } } else { LogCmd::Destinations { action: None } }
+        }
+    };
+    match cmd {
+        LogCmd::Whois { pseudonym } => {
+            let p = match pseudonym {
+                Some(p) => p,
+                None => prompt_line("the pseudonym (a:… or h:…)", None)?,
+            };
+            let cfg = log_load(&path)?;
+            let key = log_opts(&path, &cfg).pseudonym_key.ok_or_else(|| log_err("no pseudonym key in the log destinations"))?;
+            let engine = Engine::open(&ctx?)?;
+            let keys: Vec<String> = engine.known_keys()?.into_iter().map(|k| format!("key:{k}")).collect();
+            engine.close()?;
+            let hits = pvfs_log::ship::whois(&key, &p, keys.iter().map(String::as_str));
+            if hits.is_empty() {
+                println!("{p}: none of this forest's keys (a member's name or a path is only known where it was written)");
+            }
+            for h in hits {
+                println!("{p} = {h}");
+            }
+            Ok(())
+        }
+        LogCmd::Destinations { action } => {
+            let mut cfg = log_load(&path)?;
+            match action {
+                Some(DestCmd::List) => {
+                    log_list(&path, &cfg, json);
+                    Ok(())
+                }
+                Some(DestCmd::Add) => {
+                    let name = log_add(&path, &mut cfg)?;
+                    if ask_yes("send a test event now?", true)? {
+                        log_test(&path, &cfg, &name)?;
+                    }
+                    Ok(())
+                }
+                Some(DestCmd::Test { name }) => {
+                    let n = log_pick(&cfg, name, "test")?;
+                    log_test(&path, &cfg, &n)
+                }
+                Some(DestCmd::Remove { name }) => {
+                    let n = log_pick(&cfg, name, "remove")?;
+                    if !cfg.destinations.iter().any(|d| d.name == n) {
+                        return Err(log_err(format!("no destination named {n}")));
+                    }
+                    if !ask_yes(&format!("remove {n}?"), false)? {
+                        return Ok(());
+                    }
+                    cfg.destinations.retain(|d| d.name != n);
+                    log_save(&path, &cfg)?;
+                    println!("removed {n}");
+                    Ok(())
+                }
+                None => {
+                    log_list(&path, &cfg, json);
+                    if !interactive() {
+                        return Ok(());
+                    }
+                    loop {
+                        let a = prompt_line("add, test, remove or done", Some("done"))?;
+                        match a.as_str() {
+                            "add" => {
+                                let name = log_add(&path, &mut cfg)?;
+                                if ask_yes("send a test event now?", true)? {
+                                    if let Err(e) = log_test(&path, &cfg, &name) {
+                                        eprintln!("{e}");
+                                    }
+                                }
+                            }
+                            "test" => {
+                                let n = log_pick(&cfg, None, "test")?;
+                                if let Err(e) = log_test(&path, &cfg, &n) {
+                                    eprintln!("{e}");
+                                }
+                            }
+                            "remove" => {
+                                let n = log_pick(&cfg, None, "remove")?;
+                                cfg.destinations.retain(|d| d.name != n);
+                                log_save(&path, &cfg)?;
+                                println!("removed {n}");
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                }
+            }
         }
     }
 }
