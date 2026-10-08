@@ -5,6 +5,13 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The mount's per-file "whole and verified" line is `debug` in stream
+  mode (PVOS D223).** It was about 9,300 of mediabox's 9,600 mount lines a
+  day. It is now the event `pvfs.mount.stream_verified` (same text), and
+  the cache report counts every verified file: `… N file(s) opened
+  through, N verified, N kept whole, …` (field `verified`). Keep mode's
+  `… whole, verified and kept` line stays `info`.
+
 - **More log formats (PVOS D222e).** These are new destination types and
   formats, each built from the record already rendered at the
   destination's privacy level:
