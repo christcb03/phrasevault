@@ -309,17 +309,28 @@ fn keys_read_raw_or_hex() {
 fn relayed_lines_keep_a_childs_record() {
     let child = rec("iac: run 42 failed", Category::System, vec![f("path", Class::Content, "/srv/x")]);
     let line = to_json(&child, &render(&child, Privacy::Full, None));
-    let r = relayed(&line, "pvosd/app[iac] err", "app:iac", "pvos.app.output");
+    let r = relayed(&line, "pvosd/app[iac] err", "app:iac", "pvos.app.output", vec![]);
     assert_eq!(r.event, "pvfs.job.failed");
     assert_eq!(r.severity, Severity::Warning);
     assert_eq!(r.service, "app:iac");
     assert_eq!(r.fields[0].class, Class::Content);
     assert_eq!(r.line(), "pvosd/app[iac] err: iac: run 42 failed");
 
-    let raw = relayed("thread 'main' panicked at src/main.rs:3:5", "pvosd/app[iac] err", "app:iac", "pvos.app.output");
+    let raw = relayed("thread 'main' panicked at src/main.rs:3:5", "pvosd/app[iac] err", "app:iac", "pvos.app.output", vec![]);
     assert_eq!(raw.event, "pvos.app.output");
     assert_eq!(raw.severity, Severity::Info);
     assert_eq!(raw.line(), "pvosd/app[iac] err: thread 'main' panicked at src/main.rs:3:5");
+
+    // A forest's mount path in `via` comes out at minimal when it is a field.
+    let fr = relayed(
+        "pvfsd: listening on 0.0.0.0:7710",
+        "pvosd/pvfsd[/home/chris/mounts/family] err",
+        "pvfsd",
+        "pvos.forest.output",
+        vec![content("/home/chris/mounts/family").to_field("mount")],
+    );
+    assert_eq!(fr.line(), "pvosd/pvfsd[/home/chris/mounts/family] err: pvfsd: listening on 0.0.0.0:7710");
+    assert_eq!(render(&fr, Privacy::Minimal, None).line(), "pvosd/pvfsd[‹mount›] err: pvfsd: listening on 0.0.0.0:7710");
 }
 
 // ── the registry check ───────────────────────────────────────────────────

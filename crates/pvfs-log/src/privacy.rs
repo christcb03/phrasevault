@@ -98,7 +98,7 @@ pub fn render(rec: &Record, privacy: Privacy, key: Option<&[u8; 32]>) -> View {
     };
     View {
         component: rec.component.as_deref().map(swap),
-        via: rec.via.clone(),
+        via: rec.via.as_deref().map(swap),
         msg: swap(&rec.msg),
         fields,
     }

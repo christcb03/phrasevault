@@ -650,14 +650,17 @@ pub fn emit_record(rec: Record) {
 
 /// A child's stderr line, as pvosd relays it (D222 decision 12): a schema-1
 /// JSON record keeps its severity, event and fields; anything else is
-/// `raw_event` at info. Either way `via` and `service` are the relay's.
-pub fn relayed(line: &str, via: &str, service: &str, raw_event: &str) -> Record {
+/// `raw_event` at info. Either way `via` and `service` are the relay's, and
+/// `extra` fields are added — a value in `via` that is not `meta` (a
+/// forest's mount path) must be one of them, so privacy can take it out.
+pub fn relayed(line: &str, via: &str, service: &str, raw_event: &str, extra: Vec<Field>) -> Record {
     let mut r = match parse_json(line) {
         Some(r) => r,
         None => Record::now(Severity::Info, raw_event, line.to_string()),
     };
     r.via = Some(via.to_string());
     r.service = service.to_string();
+    r.fields.extend(extra);
     r
 }
 
