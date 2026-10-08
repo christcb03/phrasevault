@@ -5,6 +5,18 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **pvfs-core compiles on macOS again (fix to PVOS D216).** D216's
+  `Engine::floor_for` multiplied a statvfs `blocks()` by its
+  `fragment_size()` directly: both are `u64` on Linux, but on macOS
+  `fsblkcnt_t` is 32-bit while `fragment_size()` is `c_ulong`, so the
+  product did not type-check and `apps/macos-companion/build.sh` failed at
+  `cargo build -p pvfs-companion`. Both are now cast to `u64`, as the other
+  statvfs callers (`store_filesystems`, `sync`, `ingest::free_space_at`)
+  already do, with `clippy::unnecessary_cast` allowed on that statement: on
+  Linux the casts are no-ops, and clippy's type-alias exemption that keeps
+  the other callers quiet does not reach a closure parameter. No behaviour
+  change on Linux.
+
 - **A file being read through the view keeps reading after its holder
   trashes it (PVOS D220).** A Plex stream of an episode Sonarr upgrades
   broke the moment the holder moved the old copy to its region's trash; a
