@@ -1124,6 +1124,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pvfs-log"
+version = "1.4.0"
+dependencies = [
+ "blake3",
+ "nix",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pvfs-proto"
 version = "1.4.0"
 dependencies = [

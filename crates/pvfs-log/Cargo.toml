@@ -1,0 +1,17 @@
+[package]
+name = "pvfs-log"
+description = "One log record for PVFS and PVOS: levels, stable event names, classed fields, journal/JSON/logfmt/text (PVOS D222)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# D222 decision 3d: pseudonyms are a keyed BLAKE3 hash.
+blake3.workspace = true
+rand.workspace = true
+nix = { workspace = true, features = ["hostname"] }
+
+[dev-dependencies]
+tempfile.workspace = true
