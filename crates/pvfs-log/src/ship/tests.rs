@@ -348,3 +348,229 @@ fn whois_finds_the_member() {
     let p = crate::pseudonym(&key, 'a', "key:02cafe");
     assert_eq!(whois(&key, &p, ["key:0200", "key:02cafe", "chris"]), vec!["key:02cafe"]);
 }
+
+// ── D222e: LEEF, RFC 3164, GELF, ECS / _bulk, OCSF, OTLP ────────────────
+
+fn refusal() -> Record {
+    let mut r = rec(
+        "pvfs.access.denied",
+        "pvfsd: ls refused for key:02ab from 10.0.0.9:5555: access denied",
+        Category::Security,
+        vec![
+            Field { name: "op".into(), class: Class::Meta, value: Value::Str("ls".into()) },
+            Field { name: "principal".into(), class: Class::Actor, value: Value::Str("key:02ab".into()) },
+            net("10.0.0.9:5555").to_field("peer_addr"),
+            Field { name: "id".into(), class: Class::Meta, value: Value::Str("clash".into()) },
+        ],
+    );
+    r.outcome = Some(Outcome::Failure);
+    r
+}
+
+#[test]
+fn leef_and_rfc3164() {
+    let r = refusal();
+    let v = render(&r, Privacy::Full, None);
+    let l = format::leef(&r, &v, "PVFS", "1.4");
+    assert!(l.starts_with("LEEF:2.0|PhraseVault|PVFS|1.4|pvfs.access.denied|x09|devTime=1791418934370\tsev=5\tcat=security\t"), "{l}");
+    assert!(l.contains("\tsrc=10.0.0.9\tsrcPort=5555\t"), "{l}");
+    assert!(l.contains("\tusrName=key:02ab\t"), "{l}");
+    assert!(l.contains("\tpv_op=ls\t"), "{l}");
+    assert!(!l.contains('\n'));
+    let b = format::rfc3164(&r, &v.line());
+    // authpriv (10) * 8 + warning (4); 2026-10-08 00:22:14 UTC; the day space-padded.
+    assert_eq!(b, format!("<84>Oct  8 00:22:14 mediabox pvfsd[{}]: pvfsd: ls refused for key:02ab from 10.0.0.9:5555: access denied", r.pid));
+}
+
+#[test]
+fn gelf_documents() {
+    let r = refusal();
+    let v = render(&r, Privacy::Full, None);
+    let g: serde_json::Value = serde_json::from_str(&format::gelf(&r, &v)).unwrap();
+    assert_eq!(g["version"], "1.1");
+    assert_eq!(g["host"], "mediabox");
+    assert_eq!(g["level"], 4);
+    assert_eq!(g["timestamp"].as_f64().unwrap(), 1_791_418_934.37);
+    assert_eq!(g["_event"], "pvfs.access.denied");
+    assert_eq!(g["_outcome"], "failure");
+    assert_eq!(g["_op"], "ls");
+    assert_eq!(g["_f_id"], "clash", "GELF reserves _id");
+    assert!(g.get("_id").is_none());
+    // Too big for one datagram: the sentence is cut and the extras go.
+    let mut big = r.clone();
+    big.fields.push(Field { name: "huge".into(), class: Class::Meta, value: Value::Str("x".repeat(20_000)) });
+    let bv = render(&big, Privacy::Full, None);
+    let small = format::gelf_udp(&big, &bv, 8192);
+    assert!(small.len() <= 8192);
+    let g: serde_json::Value = serde_json::from_str(&small).unwrap();
+    assert!(g.get("_huge").is_none());
+}
+
+#[test]
+fn ecs_and_bulk() {
+    let r = refusal();
+    let v = render(&r, Privacy::Full, None);
+    let e: serde_json::Value = serde_json::from_str(&format::ecs(&r, &v)).unwrap();
+    assert_eq!(e["@timestamp"], "2026-10-08T00:22:14.370Z");
+    assert_eq!(e["event"]["action"], "pvfs.access.denied");
+    assert_eq!(e["event"]["kind"], "alert");
+    assert_eq!(e["event"]["category"][0], "iam");
+    assert_eq!(e["event"]["type"][0], "denied");
+    assert_eq!(e["event"]["outcome"], "failure");
+    assert_eq!(e["log"]["level"], "warning");
+    assert_eq!(e["source"]["ip"], "10.0.0.9");
+    assert_eq!(e["source"]["port"], 5555);
+    assert_eq!(e["user"]["id"], "key:02ab");
+    assert_eq!(e["labels"]["op"], "ls");
+    let mut auth = refusal();
+    auth.event = "pvfs.auth.refused".into();
+    let av = render(&auth, Privacy::Full, None);
+    let a: serde_json::Value = serde_json::from_str(&format::ecs(&auth, &av)).unwrap();
+    assert_eq!(a["event"]["category"][0], "authentication");
+    let bulk = format::es_bulk(&[(&r, v)], "pvfs-logs");
+    let lines: Vec<&str> = bulk.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "{\"create\":{\"_index\":\"pvfs-logs\"}}");
+    assert!(serde_json::from_str::<serde_json::Value>(lines[1]).is_ok());
+}
+
+#[test]
+fn ocsf_classes() {
+    let r = refusal();
+    let v = render(&r, Privacy::Full, None);
+    let o: serde_json::Value = serde_json::from_str(&format::ocsf(&r, &v, "PVFS", "1.4")).unwrap();
+    assert_eq!(o["class_uid"], 3002);
+    assert_eq!(o["type_uid"], 300201);
+    assert_eq!(o["status_id"], 2);
+    assert_eq!(o["severity_id"], 3);
+    assert_eq!(o["src_endpoint"]["ip"], "10.0.0.9");
+    assert_eq!(o["actor"]["user"]["uid"], "key:02ab");
+    assert_eq!(o["metadata"]["product"]["vendor_name"], "PhraseVault");
+    assert_eq!(o["unmapped"]["op"], "ls");
+    let mut change = rec("pvfs.authority.acl_set", "pvfsd: ACL set", Category::Audit, vec![]);
+    change.outcome = Some(Outcome::Success);
+    let cv = render(&change, Privacy::Full, None);
+    let c: serde_json::Value = serde_json::from_str(&format::ocsf(&change, &cv, "PVFS", "1.4")).unwrap();
+    assert_eq!(c["class_uid"], 3005);
+    assert_eq!(c["status_id"], 1);
+    let plain = rec("pvfs.job.failed", "pvfsd: x", Category::System, vec![]);
+    let pv = render(&plain, Privacy::Full, None);
+    let p: serde_json::Value = serde_json::from_str(&format::ocsf(&plain, &pv, "PVFS", "1.4")).unwrap();
+    assert_eq!(p["class_uid"], 0);
+    assert_eq!(p["type_uid"], 99);
+}
+
+#[test]
+fn otlp_body() {
+    let r = refusal();
+    let v = render(&r, Privacy::Full, None);
+    let b: serde_json::Value = serde_json::from_str(&format::otlp_body(&[(&r, v)])).unwrap();
+    let lr = &b["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+    assert_eq!(lr["timeUnixNano"], "1791418934370000000");
+    assert_eq!(lr["severityNumber"], 13);
+    assert_eq!(lr["severityText"], "WARN");
+    let attrs = lr["attributes"].as_array().unwrap();
+    assert!(attrs.iter().any(|a| a["key"] == "pvfs.event" && a["value"]["stringValue"] == "pvfs.access.denied"));
+    let res = b["resourceLogs"][0]["resource"]["attributes"].as_array().unwrap();
+    assert!(res.iter().any(|a| a["key"] == "service.name" && a["value"]["stringValue"] == "pvfsd"));
+}
+
+#[test]
+fn the_new_formats_keep_minimal_private() {
+    let r = rec(
+        "pvfs.mount.deleted",
+        "mount: delete of Films/Obsession (2026)/x.mkv by chris@example.com",
+        Category::System,
+        vec![content("Films/Obsession (2026)/x.mkv").to_field("path"), identity("chris@example.com").to_field("email")],
+    );
+    let v = render(&r, Privacy::Minimal, Some(&[3u8; 32]));
+    for out in [
+        format::leef(&r, &v, "PVFS", "1"),
+        format::rfc3164(&r, &v.line()),
+        format::gelf(&r, &v),
+        format::ecs(&r, &v),
+        format::ocsf(&r, &v, "PVFS", "1"),
+        format::otlp_body(&[(&r, v.clone())]),
+    ] {
+        assert!(!out.contains("Obsession") && !out.contains("chris@"), "{out}");
+    }
+}
+
+#[test]
+fn gelf_over_udp_and_tcp_and_es_and_otlp_over_http() {
+    let r = refusal();
+    let d = tempfile::tempdir().unwrap();
+    // GELF over UDP.
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut g = dest(Kind::Gelf);
+    g.address = Some(u.local_addr().unwrap().to_string());
+    let gd = mk_dest(g, None, &d.path().join("g"));
+    sender::deliver(&gd, std::slice::from_ref(&r)).unwrap();
+    let mut buf = [0u8; 9000];
+    let (n, _) = u.recv_from(&mut buf).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+    assert_eq!(doc["_event"], "pvfs.access.denied");
+    // GELF over TCP: NUL-delimited.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut gt = dest(Kind::Gelf);
+    gt.transport = Some("tcp".into());
+    gt.address = Some(l.local_addr().unwrap().to_string());
+    let t = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        l.accept().unwrap().0.read_to_end(&mut all).unwrap();
+        all
+    });
+    let gtd = mk_dest(gt, None, &d.path().join("gt"));
+    sender::deliver(&gtd, &[r.clone(), r.clone()]).unwrap();
+    let all = t.join().unwrap();
+    assert_eq!(all.iter().filter(|b| **b == 0).count(), 2);
+    // Elasticsearch: errors:true is a failure, ApiKey auth, x-ndjson.
+    let (url, t) = http_server(vec![(200, "{\"took\":1,\"errors\":false,\"items\":[]}"), (200, "{\"took\":1,\"errors\":true,\"items\":[]}")]);
+    let mut es = dest(Kind::Elasticsearch);
+    es.url = Some(url);
+    let esd = mk_dest(es, Some("k3y"), &d.path().join("es"));
+    sender::deliver(&esd, std::slice::from_ref(&r)).unwrap();
+    assert!(sender::deliver(&esd, std::slice::from_ref(&r)).is_err());
+    let got = t.join().unwrap();
+    assert!(got[0].0.starts_with("POST /_bulk HTTP/1.1"), "{}", got[0].0);
+    assert!(got[0].0.contains("Content-Type: application/x-ndjson"));
+    assert!(got[0].0.contains("Authorization: ApiKey k3y"));
+    assert!(got[0].1.starts_with("{\"create\":{\"_index\":\"pvfs-logs\"}}\n"));
+    // OTLP: /v1/logs, a parsable body; https_json as ECS.
+    let (url, t) = http_server(vec![(200, "{}"), (200, "ok")]);
+    let mut o = dest(Kind::Otlp);
+    o.url = Some(url.clone());
+    let od = mk_dest(o, None, &d.path().join("o"));
+    sender::deliver(&od, std::slice::from_ref(&r)).unwrap();
+    let mut h = dest(Kind::HttpsJson);
+    h.url = Some(url);
+    h.format = Some("ecs".into());
+    let hd = mk_dest(h, None, &d.path().join("h"));
+    sender::deliver(&hd, std::slice::from_ref(&r)).unwrap();
+    let got = t.join().unwrap();
+    assert!(got[0].0.starts_with("POST /v1/logs HTTP/1.1"));
+    assert!(serde_json::from_str::<serde_json::Value>(&got[0].1).unwrap()["resourceLogs"].is_array());
+    let ecs: serde_json::Value = serde_json::from_str(got[1].1.trim()).unwrap();
+    assert_eq!(ecs["event"]["action"], "pvfs.access.denied");
+}
+
+#[test]
+fn the_new_kinds_validate() {
+    let mut g = dest(Kind::Gelf);
+    assert!(g.problems().iter().any(|p| p.contains("address")));
+    g.address = Some("graylog:12201".into());
+    assert!(g.problems().is_empty());
+    g.transport = Some("http".into());
+    assert!(g.problems().iter().any(|p| p.contains("url")));
+    let mut h = dest(Kind::HttpsJson);
+    h.url = Some("https://x".into());
+    h.format = Some("xml".into());
+    assert!(h.problems().iter().any(|p| p.contains("format")));
+    let mut s = dest(Kind::Syslog);
+    s.address = Some("siem:514".into());
+    s.format = Some("leef".into());
+    assert!(s.problems().is_empty());
+    assert_eq!(Kind::parse("graylog"), Some(Kind::Gelf));
+    assert_eq!(Kind::parse("opensearch"), Some(Kind::Elasticsearch));
+    assert_eq!(Kind::parse("otel"), Some(Kind::Otlp));
+}

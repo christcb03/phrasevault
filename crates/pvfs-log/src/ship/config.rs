@@ -27,6 +27,12 @@ pub enum Kind {
     SplunkHec,
     Loki,
     HttpsJson,
+    /// PVOS D222e — Graylog's GELF over udp, tcp or http.
+    Gelf,
+    /// PVOS D222e — Elasticsearch / OpenSearch `_bulk`, ECS documents.
+    Elasticsearch,
+    /// PVOS D222e — OpenTelemetry logs, OTLP/HTTP JSON.
+    Otlp,
 }
 
 impl Kind {
@@ -36,6 +42,9 @@ impl Kind {
             Kind::SplunkHec => "splunk_hec",
             Kind::Loki => "loki",
             Kind::HttpsJson => "https_json",
+            Kind::Gelf => "gelf",
+            Kind::Elasticsearch => "elasticsearch",
+            Kind::Otlp => "otlp",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -44,6 +53,9 @@ impl Kind {
             "splunk_hec" | "splunk" | "hec" => Kind::SplunkHec,
             "loki" => Kind::Loki,
             "https_json" | "http_json" | "json" | "webhook" => Kind::HttpsJson,
+            "gelf" | "graylog" => Kind::Gelf,
+            "elasticsearch" | "elastic" | "opensearch" => Kind::Elasticsearch,
+            "otlp" | "opentelemetry" | "otel" => Kind::Otlp,
             _ => return None,
         })
     }
@@ -138,12 +150,26 @@ pub enum SyslogTransport {
     Tls,
 }
 
-/// syslog's three payloads (decision 4).
+/// syslog's payloads (D222d decision 4; LEEF and RFC 3164 since D222e).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyslogFormat {
     Rfc5424,
     Json,
     Cef,
+    Leef,
+    /// The older BSD framing (`<PRI>Mmm dd hh:mm:ss HOST TAG[PID]: MSG`).
+    Rfc3164,
+}
+
+/// What an `https_json` destination posts (PVOS D222e decision 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpFormat {
+    /// The schema-1 record (doc 32).
+    Schema1,
+    /// Elastic Common Schema documents.
+    Ecs,
+    /// OCSF events.
+    Ocsf,
 }
 
 impl Destination {
@@ -164,7 +190,24 @@ impl Destination {
         match self.format.as_deref().unwrap_or("rfc5424").trim().to_ascii_lowercase().as_str() {
             "json" => SyslogFormat::Json,
             "cef" => SyslogFormat::Cef,
+            "leef" => SyslogFormat::Leef,
+            "rfc3164" | "bsd" => SyslogFormat::Rfc3164,
             _ => SyslogFormat::Rfc5424,
+        }
+    }
+    pub fn http_format(&self) -> HttpFormat {
+        match self.format.as_deref().unwrap_or("schema1").trim().to_ascii_lowercase().as_str() {
+            "ecs" => HttpFormat::Ecs,
+            "ocsf" => HttpFormat::Ocsf,
+            _ => HttpFormat::Schema1,
+        }
+    }
+    /// GELF's transport: `udp` (default), `tcp` or `http`.
+    pub fn gelf_transport(&self) -> &str {
+        match self.transport.as_deref().map(|t| t.trim().to_ascii_lowercase()) {
+            Some(t) if t == "tcp" => "tcp",
+            Some(t) if t == "http" || t == "https" => "http",
+            _ => "udp",
         }
     }
 
@@ -216,16 +259,36 @@ impl Destination {
                     }
                 }
                 if let Some(f) = &self.format {
-                    if !matches!(f.trim().to_ascii_lowercase().as_str(), "rfc5424" | "json" | "cef") {
-                        p.push(format!("{n}: format {f:?} is not rfc5424, json or cef"));
+                    if !matches!(f.trim().to_ascii_lowercase().as_str(), "rfc5424" | "json" | "cef" | "leef" | "rfc3164" | "bsd") {
+                        p.push(format!("{n}: format {f:?} is not rfc5424, json, cef, leef or rfc3164"));
                     }
                 }
             }
-            Kind::SplunkHec | Kind::Loki | Kind::HttpsJson => match self.url.as_deref().map(super::http::Url::parse) {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => p.push(format!("{n}: url: {e}")),
-                None => p.push(format!("{n}: {} needs a url", self.kind.as_str())),
-            },
+            Kind::Gelf if self.gelf_transport() != "http" => {
+                match self.address.as_deref() {
+                    Some(a) if a.rsplit_once(':').is_some_and(|(h, port)| !h.is_empty() && port.parse::<u16>().is_ok()) => {}
+                    _ => p.push(format!("{n}: gelf over {} needs an address host:port", self.gelf_transport())),
+                }
+                if let Some(t) = &self.transport {
+                    if !matches!(t.trim().to_ascii_lowercase().as_str(), "udp" | "tcp" | "http" | "https") {
+                        p.push(format!("{n}: transport {t:?} is not udp, tcp or http"));
+                    }
+                }
+            }
+            Kind::SplunkHec | Kind::Loki | Kind::HttpsJson | Kind::Gelf | Kind::Elasticsearch | Kind::Otlp => {
+                match self.url.as_deref().map(super::http::Url::parse) {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => p.push(format!("{n}: url: {e}")),
+                    None => p.push(format!("{n}: {} needs a url", self.kind.as_str())),
+                }
+                if self.kind == Kind::HttpsJson {
+                    if let Some(f) = &self.format {
+                        if !matches!(f.trim().to_ascii_lowercase().as_str(), "schema1" | "json" | "ecs" | "ocsf") {
+                            p.push(format!("{n}: format {f:?} is not schema1, ecs or ocsf"));
+                        }
+                    }
+                }
+            }
         }
         if let Some(pin) = &self.tls.pin_sha256 {
             if super::tls::parse_pin(pin).is_none() {

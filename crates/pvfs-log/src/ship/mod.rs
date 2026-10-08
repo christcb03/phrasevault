@@ -9,13 +9,14 @@
 
 mod config;
 pub mod format;
+mod gelf;
 mod http;
 mod sender;
 mod spool;
 mod syslog;
 mod tls;
 
-pub use config::{config_path, Destination, Kind, ShipConfig, SyslogFormat, SyslogTransport, TlsSettings};
+pub use config::{config_path, Destination, HttpFormat, Kind, ShipConfig, SyslogFormat, SyslogTransport, TlsSettings};
 pub use http::Url;
 pub use sender::Health;
 pub use spool::Spool;

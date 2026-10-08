@@ -11394,7 +11394,7 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
         return Err(log_err(format!("there is already a destination named {name}")));
     }
     let kind = loop {
-        let k = prompt_line("type: loki, splunk_hec, syslog or https_json", Some("loki"))?;
+        let k = prompt_line("type: loki, splunk_hec, syslog, https_json, gelf, elasticsearch or otlp", Some("loki"))?;
         match Kind::parse(&k) {
             Some(k) => break k,
             None => eprintln!("  {k:?} is not one of them"),
@@ -11427,7 +11427,24 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
             uses_tls = t == "tls";
             d.transport = Some(t);
             d.address = Some(prompt_line("the receiver, host:port", Some(if uses_tls { "siem.example.com:6514" } else { "siem.example.com:514" }))?);
-            d.format = Some(prompt_line("format: rfc5424, json or cef", Some("rfc5424"))?);
+            d.format = Some(prompt_line("format: rfc5424, cef, leef, json or rfc3164", Some("rfc5424"))?);
+        }
+        Kind::Gelf => {
+            let t = prompt_line("transport: udp, tcp or http", Some("udp"))?;
+            if t == "http" {
+                d.url = Some(prompt_line("Graylog's GELF HTTP URL", Some("http://graylog.example.com:12201/gelf"))?);
+            } else {
+                d.address = Some(prompt_line("the GELF input, host:port", Some("graylog.example.com:12201"))?);
+            }
+            d.transport = Some(t);
+        }
+        Kind::Elasticsearch => {
+            d.url = Some(prompt_line("Elasticsearch / OpenSearch URL", Some("https://elastic.example.com:9200"))?);
+            d.index = Some(prompt_line("index or data stream", Some("pvfs-logs"))?);
+            token_wanted = true;
+        }
+        Kind::Otlp => {
+            d.url = Some(prompt_line("the OTLP/HTTP endpoint (an OpenTelemetry Collector)", Some("http://otel-collector.example.com:4318"))?);
         }
         Kind::SplunkHec => {
             d.url = Some(prompt_line("the HEC URL", Some("https://splunk.example.com:8088"))?);
@@ -11440,14 +11457,17 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
         }
         Kind::HttpsJson => {
             d.url = Some(prompt_line("the receiver's URL", None)?);
+            d.format = Some(prompt_line("format: schema1 (PVFS's own), ecs (Elastic Common Schema) or ocsf", Some("schema1"))?);
         }
     }
     if let Some(u) = &d.url {
         uses_tls = u.trim().starts_with("https://");
     }
-    let token = if token_wanted {
+    let token = if token_wanted && kind == Kind::Elasticsearch {
+        prompt_line("an API key (sent as ApiKey …; or type \"Basic <base64>\")", None)?
+    } else if token_wanted {
         prompt_line("the HEC token", None)?
-    } else if kind != Kind::Syslog {
+    } else if kind != Kind::Syslog && !(kind == Kind::Gelf && d.url.is_none()) {
         prompt_line("a token to send, if the receiver wants one (blank = none)", Some(""))?
     } else {
         String::new()
