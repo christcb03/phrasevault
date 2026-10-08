@@ -943,6 +943,21 @@ impl Engine {
         Ok(n != 0)
     }
 
+    /// PVOS D222b — true when `pubkey` was authorized here once (member or
+    /// device) and has since been revoked: a refusal of it is "a revoked key
+    /// used", not an ordinary denial.
+    pub fn is_revoked_key(&self, pubkey: &[u8]) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_keys WHERE device_pubkey = ?1 AND revoked_at IS NOT NULL)",
+                params![pubkey],
+                |r| r.get(0),
+            )
+            .map_err(map_db("revoked check"))?;
+        Ok(n != 0)
+    }
+
     /// PVOS D188 — true when `pubkey` is a DEVICE key (not a member key) the
     /// forest has revoked: a retired owner's, after a promotion.
     pub fn is_revoked_device(&self, pubkey: &[u8]) -> Result<bool> {

@@ -41,6 +41,32 @@ pub struct AuditEntry<'a> {
     pub context: Option<&'a ApprovalContext>,
 }
 
+/// PVOS D222b decision 6 — every audit entry is also a log record
+/// (`pvfs.agent.audit`, category audit), so it reaches a log server like the
+/// daemons' lines. The file is unchanged: the Mac app's Console reads it.
+/// A decision other than `approved` is the failure outcome.
+fn log_entry(e: &AuditEntry<'_>) {
+    use pvfs_log::{content, net, pv_notice, pv_warn};
+    let action = e.event;
+    let decision = e.decision.unwrap_or("");
+    let request = e.request_type.unwrap_or("");
+    let origin = e.origin.unwrap_or("");
+    let digest = e.digest.unwrap_or("");
+    let summary = e.context.map(|c| c.summary.clone()).unwrap_or_default();
+    let what = if request.is_empty() { action.to_string() } else { format!("{action} {request}") };
+    let from = if origin.is_empty() { String::new() } else { format!(" from {origin}") };
+    let on = if decision.is_empty() { String::new() } else { format!(": {decision}") };
+    if decision.is_empty() || decision == "approved" {
+        pv_notice!(audit success "pvfs.agent.audit", action = action, decision = decision, request_type = request,
+            origin = net(origin), digest = digest, summary = content(&summary);
+            "pvfs-companion: audit: {what}{from}{on}");
+    } else {
+        pv_warn!(audit failure "pvfs.agent.audit", action = action, decision = decision, request_type = request,
+            origin = net(origin), digest = digest, summary = content(&summary);
+            "pvfs-companion: audit: {what}{from}{on}");
+    }
+}
+
 /// An open audit log; appends are serialized and flushed per line.
 pub struct AuditLog {
     path: PathBuf,
@@ -79,6 +105,7 @@ impl AuditLog {
         let Ok(line) = serde_json::to_string(&entry) else {
             return;
         };
+        log_entry(&entry);
         let mut f = self.file.lock().expect("audit log poisoned");
         if writeln!(f, "{line}").and_then(|_| f.flush()).is_err() {
             pvfs_log::pv_error!("pvfs.companion.audit_unwritten", path = pvfs_log::content(self.path.display());

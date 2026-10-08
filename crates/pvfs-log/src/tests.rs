@@ -379,3 +379,62 @@ fn a() {
     assert_eq!(strays.len(), 1);
     assert_eq!(strays[0].1, 8);
 }
+
+// ── D222b: rate limits and the global capture ───────────────────────────
+
+#[test]
+fn the_limit_lets_ten_a_minute_through_and_counts_the_rest() {
+    let mut l = Limiter::new();
+    for i in 0..10 {
+        assert_eq!(l.check(1_000 + i, "pvfs.auth.refused", "10.0.0.9"), Some(0));
+    }
+    for i in 0..20 {
+        assert_eq!(l.check(2_000 + i, "pvfs.auth.refused", "10.0.0.9"), None);
+    }
+    // Another key and another event are not held back.
+    assert_eq!(l.check(3_000, "pvfs.auth.refused", "10.0.0.10"), Some(0));
+    assert_eq!(l.check(3_000, "pvfs.access.denied", "10.0.0.9"), Some(0));
+    // The next minute: the first one says how many were dropped.
+    assert_eq!(l.check(61_001, "pvfs.auth.refused", "10.0.0.9"), Some(20));
+    assert_eq!(l.check(61_002, "pvfs.auth.refused", "10.0.0.9"), Some(0));
+}
+
+#[test]
+fn the_limit_forgets_the_oldest_key_at_its_cap() {
+    let mut l = Limiter::new();
+    for i in 0..(limit::MAX_KEYS as u64 + 50) {
+        l.check(i, "pvfs.auth.refused", &format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255));
+    }
+    assert_eq!(l.keys(), limit::MAX_KEYS);
+}
+
+#[test]
+fn the_global_capture_sees_other_threads() {
+    let cap = testing::GlobalCapture::start();
+    std::thread::spawn(|| {
+        pv_warn!("pvfs.test.global_capture", marker = "d222b-gc-1"; "pvfsd: from another thread");
+    })
+    .join()
+    .unwrap();
+    let mine: Vec<Record> = cap
+        .events("pvfs.test.global_capture")
+        .into_iter()
+        .filter(|r| r.fields.iter().any(|f| f.value == Value::Str("d222b-gc-1".into())))
+        .collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].line(), "pvfsd: from another thread");
+}
+
+#[test]
+fn thread_context_fields_ride_along() {
+    let got = capture(|| {
+        set_thread_context(vec![net("192.0.2.7:5555").to_field("peer_addr")]);
+        pv_warn!(security failure "pvos.signin.refused"; "pvosd: browser sign-in refused: nope");
+        pv_info!("pvos.web.x", peer_addr = net("10.9.9.9:1"); "pvosd/web: own address wins");
+        clear_thread_context();
+        pv_info!("pvos.web.y"; "pvosd/web: none after clearing");
+    });
+    assert_eq!(got[0].fields, vec![net("192.0.2.7:5555").to_field("peer_addr")]);
+    assert_eq!(got[1].fields, vec![net("10.9.9.9:1").to_field("peer_addr")]);
+    assert!(got[2].fields.is_empty());
+}

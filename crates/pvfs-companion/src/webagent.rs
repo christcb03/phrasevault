@@ -135,6 +135,7 @@ impl WebAgent {
         // bootstrap — its gates are loopback binding, the browser-enforced
         // Origin, one explicit human prompt, and the bearer code itself.
         if path != "/relay" && path != "/redeem-invite" && token.as_deref() != Some(self.token.as_str()) {
+            note_refused(origin.as_deref(), &path, "bad_token");
             return respond_json(
                 reader.get_mut(),
                 401,
@@ -168,6 +169,10 @@ impl WebAgent {
         let body = String::from_utf8_lossy(&body);
 
         let (status, reason, out) = self.route(&method, &path, &origin, &body);
+        if status == 403 {
+            let why = json_str_field(&out, "error").unwrap_or_else(|| "forbidden".into());
+            note_refused(Some(origin.as_str()), &path, &why);
+        }
         respond_json(reader.get_mut(), status, reason, Some(&origin), &out)
     }
 
@@ -374,4 +379,16 @@ fn respond<W: Write>(
         body.len()
     )?;
     stream.flush()
+}
+
+/// PVOS D222b decision 6 — a web-agent request refused (a wrong token, an
+/// origin not connected, a connect the person denied). Rate-limited per
+/// origin: a page can ask in a loop.
+fn note_refused(origin: Option<&str>, path: &str, reason: &str) {
+    let o = origin.unwrap_or("no origin");
+    if let Some(n) = pvfs_log::limit("pvfs.agent.refused", o) {
+        pvfs_log::pv_warn!(security failure "pvfs.agent.refused", origin = pvfs_log::net(o),
+            path = pvfs_log::content(path), reason = pvfs_log::content(reason), suppressed = n;
+            "pvfs-companion: web agent refused {path} from {o}: {reason}");
+    }
 }

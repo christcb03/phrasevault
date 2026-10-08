@@ -66,10 +66,24 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 
 | Event | Severity | Category | Meaning |
 |---|---|---|---|
+| `pvfs.access.bad_signature` | warning | security | A signed event carried a signature that does not verify. |
+| `pvfs.access.denied` | warning | security | A request was refused (`forbidden`): who, from where, which op, why. Rate-limited per peer. |
+| `pvfs.access.revoked_key` | warning | security | A key the forest once admitted and has revoked tried to act (or a signed event by an author that is not an active device). |
+| `pvfs.agent.audit` | notice | audit | A companion audit entry (signing decisions, connects, pairings, locks), as also written to `audit.jsonl`; a decision other than `approved` is the failure outcome. |
 | `pvfs.agent.listening` | notice | system | The companion's socket, web agent or tenant socket is serving. |
 | `pvfs.agent.origin_revoked` | notice | audit | A web origin's sign-in grant was revoked. |
 | `pvfs.agent.phrase` | info | system | At start: one phrase the companion serves, with its root key prefix. |
+| `pvfs.agent.refused` | warning | security | The companion's web agent refused a request (a wrong token, an origin not connected, a connect the person denied). |
 | `pvfs.agent.settings` | notice | system | At start: prompt backend, idle lock and audit files. |
+| `pvfs.auth.refused` | warning | security | A connection was refused at the handshake: `challenge_reused`, `challenge_expired`, `bad_signature`, `malformed` or `protocol`. |
+| `pvfs.authority.acl_set` | notice | audit | An ACL entry was set (node, grantee, rights, expiry). |
+| `pvfs.authority.certificates_bound` | notice | audit | Certificates were bound to this forest. |
+| `pvfs.authority.device_authorized` | notice | audit | A device or member key was authorized (author, device, log seq). |
+| `pvfs.authority.device_revoked` | notice | audit | A device or member key was revoked. |
+| `pvfs.authority.member_tagged` | notice | audit | A membership tag was granted to or removed from a key. |
+| `pvfs.authority.recovery_key_registered` | notice | audit | A recovery key was registered. |
+| `pvfs.authority.recovery_key_revoked` | notice | audit | A recovery key was revoked. |
+| `pvfs.authority.root_rotated` | notice | audit | The forest's root key was rotated. |
 | `pvfs.catalogue.claim_refused` | warning | system | A peer's region claim was refused. |
 | `pvfs.catalogue.fetch_failed` | warning | system | A region is still behind after the pass. |
 | `pvfs.catalogue.fetched` | info | system | A catalogue region was fetched at a head. |
@@ -154,6 +168,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.rename.renamed` | info | system | A rename through the view. |
 | `pvfs.rename.rows_deferred` | warning | system | Renamed on disk; its rows wait for the next pass. |
 | `pvfs.replica.fold_deferred` | warning | system | The follow job's fold failed; the next tick retries. |
+| `pvfs.request.unknown_op` | warning | system | A client asked for an op this daemon does not know (once per op name per run). |
 | `pvfs.resolve.folders_removed` | info | system | Emptied staging folders were removed. |
 | `pvfs.resolve.trashed` | info | system | Staging copies the library holds were trashed (confirmed). |
 | `pvfs.resolve.unconfirmed` | info | system | Staging copies kept: not confirmed yet. |
@@ -187,6 +202,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.sync.swarm_resumed` | info | system | A swarm resumed chunks from an earlier attempt. |
 | `pvfs.sync.tmp_sweep_failed` | warning | system | The start-up sync tmp sweep failed. |
 | `pvfs.sync.tmp_swept` | info | system | Orphaned sync tmp files were removed at start. |
+| `pvfs.tls.handshake_failed` | warning | security | A TLS handshake on the network listener failed (a client that connects and leaves is not logged). |
 | `pvfs.tls.trust_failed` | warning | system | Keychain trust was not installed. |
 | `pvfs.tls.trust_installed` | notice | audit | The web agent's certificate was added as a trusted root in the login keychain. |
 | `pvfs.tls.trust_manual` | notice | system | Not macOS: the person is told to trust the certificate by hand. |
