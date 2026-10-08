@@ -3714,8 +3714,10 @@ impl Engine {
         if let Ok(Some(set)) = crate::sync::region_floor_setting(&self.data_dir, region) {
             return set;
         }
+        // Both are u64 on Linux; on macOS `blocks()` is 32-bit.
+        #[allow(clippy::unnecessary_cast)]
         let total = nix::sys::statvfs::statvfs(root)
-            .map(|st| st.blocks() * st.fragment_size())
+            .map(|st| st.blocks() as u64 * st.fragment_size() as u64)
             .unwrap_or(0);
         crate::sync::default_floor_for(total)
     }
