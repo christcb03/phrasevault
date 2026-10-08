@@ -956,10 +956,10 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
             }
             match resolve_auth(&nonce, &daemon.forest_id, expiry_ms, &pubkey, &sig) {
                 Ok(p) => p,
-                Err((reason, msg)) => {
-                    take_refusal();
+                Err((reason, code, message)) => {
                     note_auth_refused(peer, Some(pubkey.as_str()), reason);
-                    write_msg(&mut stream, &msg)?;
+                    write_msg(&mut stream, &err(code, message))?;
+                    take_refusal();
                     return Ok(());
                 }
             }
@@ -1050,21 +1050,24 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
 }
 
 /// Verify a client's signature over the challenge → the proven key is the principal.
-/// The error says why, in one of a few fixed words, for the log (D222b).
+/// Why a handshake was refused: (the word the log says, the wire code, the
+/// message the client gets) — D222b.
+type AuthRefusal = (&'static str, &'static str, &'static str);
+
 fn resolve_auth(
     nonce: &[u8],
     forest_id: &str,
     expiry_ms: u64,
     pubkey: &str,
     sig: &str,
-) -> Result<Principal, (&'static str, ServerMsg)> {
+) -> Result<Principal, AuthRefusal> {
     if now_ms() > expiry_ms {
-        return Err(("challenge_expired", err("bad_input", "challenge expired")));
+        return Err(("challenge_expired", "bad_input", "challenge expired"));
     }
-    let pk = hex::decode(pubkey).map_err(|_| ("malformed", err("bad_input", "pubkey not hex")))?;
-    let sigb = hex::decode(sig).map_err(|_| ("malformed", err("bad_input", "sig not hex")))?;
+    let pk = hex::decode(pubkey).map_err(|_| ("malformed", "bad_input", "pubkey not hex"))?;
+    let sigb = hex::decode(sig).map_err(|_| ("malformed", "bad_input", "sig not hex"))?;
     let digest = auth_digest(nonce, forest_id, expiry_ms);
-    crypto::verify_digest(&pk, &digest, &sigb).map_err(|_| ("bad_signature", err("forbidden", "bad signature")))?;
+    crypto::verify_digest(&pk, &digest, &sigb).map_err(|_| ("bad_signature", "forbidden", "bad signature"))?;
     Ok(Principal::Key(pk))
 }
 
