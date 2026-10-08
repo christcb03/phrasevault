@@ -11440,7 +11440,7 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
         }
         Kind::Elasticsearch => {
             d.url = Some(prompt_line("Elasticsearch / OpenSearch URL", Some("https://elastic.example.com:9200"))?);
-            d.index = Some(prompt_line("index or data stream", Some("pvfs-logs"))?);
+            d.index = Some(prompt_line("index or data stream", Some(pvfs_log::ship::DEFAULT_ES_INDEX))?);
             token_wanted = true;
         }
         Kind::Otlp => {

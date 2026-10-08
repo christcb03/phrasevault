@@ -5,6 +5,14 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Elasticsearch's default index is `logs-pvfs-default` (was `pvfs-logs`),
+  and pvosd's web refusals are ECS `web` (PVOS D222e, found live).** Against
+  a real Elasticsearch 9.5.2, `pvfs-logs` was a plain index; a name in
+  Elastic's `logs-<dataset>-<namespace>` scheme becomes a data stream with
+  ECS mappings. A destination that names its index is unchanged. Doc 33 no
+  longer says `event.id` drops duplicates: a resent batch stores the ones
+  already taken twice, with the same `event.id`.
+
 - **The mount's per-file "whole and verified" line is `debug` in stream
   mode (PVOS D223).** It was about 9,300 of mediabox's 9,600 mount lines a
   day. It is now the event `pvfs.mount.stream_verified` (same text), and

@@ -384,6 +384,8 @@ fn ecs_kind(rec: &Record) -> (&'static str, &'static str) {
         "iam"
     } else if e.contains(".tls.") {
         "network"
+    } else if e.contains(".web.") {
+        "web"
     } else if e.contains(".boot.") || e.contains(".serve.") || e.contains(".app.") {
         "process"
     } else {

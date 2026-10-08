@@ -73,7 +73,7 @@ Tokens are kept in the PVOS keychain.
 | `address` | `host:port` (syslog; GELF over udp/tcp) | — |
 | `transport` | syslog: `tls` (RFC 5425), `tcp` (RFC 6587 octet counting), `udp`; GELF: `udp`, `tcp` (NUL-delimited), `http` | syslog `tls`, GELF `udp` |
 | `format` | syslog: `rfc5424` (the line, fields as structured data), `json` (the record), `cef`, `leef`, `rfc3164`; https_json: `schema1`, `ecs`, `ocsf` | `rfc5424`, `schema1` |
-| `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `pvfs-logs` |
+| `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `logs-pvfs-default` |
 | `header` | the header the token goes in. For `Authorization` the token is sent as `Bearer <token>` (Elasticsearch: `ApiKey <token>`) unless it names its own scheme (`Basic …`) | `Authorization` |
 | `secret` | a file holding the token (relative to this file) | none |
 | `tls.ca_file` | trust only this CA bundle (PEM) | the public roots |
@@ -149,8 +149,16 @@ self-signed certificate is trusted by its pin.
   with its sentence cut and without its extra fields.
 - **Elasticsearch / OpenSearch**: `POST <url>/_bulk`, a `create` into the
   index (or data stream) and an ECS document per record. A reply with
-  `"errors":true` counts as a failure, so the batch is resent; `event.id`
-  lets the index drop duplicates.
+  `"errors":true` counts as a failure, so the whole batch is resent: the
+  documents Elasticsearch had already taken are then stored twice, with
+  the same `event.id` (collapse on it to see each once).
+  - The default index, `logs-pvfs-default`, follows Elastic's
+    `logs-<dataset>-<namespace>` naming, so Elasticsearch's built-in `logs`
+    template makes it a **data stream** with ECS mappings, and Kibana's
+    `logs-*` view finds it. Any other name not matched by a template is a
+    plain index (OpenSearch has no such template: a plain index there).
+  - Checked live on 2026-10-08 against Elasticsearch 9.5.2 (security on,
+    its own HTTPS certificate, an API key; D222e).
 - **OpenTelemetry**: `POST <url>/v1/logs`, OTLP/HTTP JSON.
   - Resource attributes: `service.name`, `host.name`, `process.pid`.
   - Record attributes: `pvfs.event`, `pvfs.category`, `pvfs.outcome`,
@@ -181,6 +189,7 @@ ECS `event.category` and `event.type`, by the event's name:
 - `iam` for authority, grants, members, invites, shares, keychain, access,
   control and desktop;
 - `network` for `*.tls.*`;
+- `web` for `*.web.*` (pvosd's web plane: a refused cross-origin websocket);
 - `process` for the daemon lifecycle;
 - `host` otherwise.
 
