@@ -11279,149 +11279,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // PVOS D198 — ask a person only when one can see the question: never
-    // under --json, never with stdin or stderr off a terminal (Ansible's pty
-    // gives stdin a terminal while the play redirects stderr).
-    #[test]
-    fn asks_only_when_someone_can_answer() {
-        assert!(interactive_when(false, true, true));
-        assert!(!interactive_when(true, true, true), "--json never asks");
-        assert!(!interactive_when(false, false, true), "a pipe or /dev/null on stdin");
-        assert!(!interactive_when(false, true, false), "stderr redirected: nobody sees the question");
-    }
-
-    // PVOS D206 — a bare `serve enable|disable` takes a job's name or its
-    // number in the list it printed, and nothing else.
-    #[test]
-    fn a_job_is_picked_by_name_or_number() {
-        let names = pvfs_core::serve::JOB_NAMES;
-        assert_eq!(pick_job("receive").unwrap(), "receive");
-        assert_eq!(pick_job(" 1 ").unwrap(), names[0]);
-        assert_eq!(pick_job(&names.len().to_string()).unwrap(), names[names.len() - 1]);
-        for bad in ["", "0", "12", "defrag", "Receive", "-1"] {
-            assert!(pick_job(bad).is_err(), "{bad:?} must be refused");
-        }
-    }
-
-    // PVOS D198 — `forest promote <dir>` routes the companion by <dir>, not by
-    // the directory it runs in; other commands keep the context forest.
-    #[test]
-    fn promote_routes_the_companion_by_its_target() {
-        let cli = Cli::parse_from(["pvfs", "forest", "promote", "/srv/pvfs/lab5-plex", "--via-companion", "--yes"]);
-        assert_eq!(companion_target(&cli.cmd), Some(mount::state_dir(std::path::Path::new("/srv/pvfs/lab5-plex"))));
-        let cli = Cli::parse_from(["pvfs", "fleet", "notify"]);
-        assert_eq!(companion_target(&cli.cmd), None);
-    }
-
-    fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    }
-
-    // doc 13 Q-E1: `--expires` accepts a duration (relative to now) or an
-    // absolute `@<unix-ms>`; zero and garbage are refused with `bad_input`.
-    #[test]
-    fn parse_expires_durations_and_absolute() {
-        let before = now_ms();
-        let t = parse_expires("45s").unwrap();
-        assert!(t >= before + 45_000 && t <= now_ms() + 45_000);
-        let t = parse_expires("2w").unwrap();
-        assert!(t >= before + 14 * 86_400_000);
-        assert_eq!(parse_expires("@1753000000000").unwrap(), 1_753_000_000_000);
-
-        for bad in ["@0", "@x", "5", "5y", "", "s", "99999999999999999999w"] {
-            assert!(
-                matches!(parse_expires(bad), Err(PvfsError::BadInput { .. })),
-                "{bad:?} must be refused"
-            );
-        }
-    }
-
-    // D167: a trash bucket's day number, as a date.
-    #[test]
-    fn a_trash_day_reads_as_a_date() {
-        assert_eq!(day_to_date(0), "1970-01-01");
-        assert_eq!(day_to_date(19_782), "2024-02-29");
-        assert_eq!(day_to_date(20_710), "2026-09-14");
-        assert_eq!(day_to_date(20_819), "2027-01-01");
-        // kept 7 days: a bucket goes once it is 7 days old (`purge_trash`)
-        assert_eq!(trash_days_left(20_710, 7, 20_713), 4);
-        assert_eq!(trash_days_left(20_710, 7, 20_717), 0);
-        assert_eq!(trash_days_left(20_710, 0, 20_710), 0);
-    }
-
-    // D181 guardrail 1: a running mount survives a build only if nothing it
-    // relies on moves under it.
-    #[test]
-    fn a_running_mount_survives_a_build_only_when_nothing_it_relies_on_moves() {
-        use pvfs_core::projection::ProjectionPlan;
-        let same = MountStatus {
-            alive: true,
-            mount_compat: pvfs_core::MOUNT_COMPAT,
-            proto: pvfs_client::PROTO_VERSION,
-            schema: pvfs_core::projection::SCHEMA_VERSION,
-            ..Default::default()
-        };
-        let current = ProjectionPlan::Current { version: pvfs_core::projection::SCHEMA_VERSION };
-        let in_place = ProjectionPlan::InPlace { from: 18, steps: vec!["x"] };
-        assert!(mount_survives(&same, &current).is_empty());
-        assert!(
-            mount_survives(&same, &in_place).is_empty(),
-            "an additive migration runs under a mount that already reads its schema"
-        );
-        // PVOS D188: a mount on the old schema does NOT survive an in-place
-        // migration — its fresh opens would refuse the moved catalogue.
-        let old_schema = MountStatus { schema: pvfs_core::projection::SCHEMA_VERSION - 1, ..same.clone() };
-        let why = mount_survives(&old_schema, &in_place);
-        assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("schema") && why[0].contains("other boxes"), "{why:?}");
-        let rebuild = ProjectionPlan::Rebuild { from: 1, why: "no in-place step from v1".into() };
-        assert!(mount_survives(&same, &rebuild)[0].contains("rebuilt"));
-        assert!(mount_survives(&same, &ProjectionPlan::Newer { found: 99 })[0].contains("newer"));
-        let old_compat = MountStatus { mount_compat: pvfs_core::MOUNT_COMPAT + 1, ..same.clone() };
-        assert!(mount_survives(&old_compat, &current)[0].contains("compatibility"));
-        if pvfs_client::PROTO_COMPATIBLE_WITH > 0 {
-            let old_proto = MountStatus { proto: pvfs_client::PROTO_COMPATIBLE_WITH - 1, ..same.clone() };
-            assert!(mount_survives(&old_proto, &current)[0].contains("wire protocol"));
-        }
-        let stale = MountStatus { stale: Some("the catalogue is v20".into()), ..same };
-        assert_eq!(mount_survives(&stale, &current), vec!["the catalogue is v20".to_string()]);
-    }
-
-    // D165: `pvfs mount --view --cache-max 500G --cache-age 1d`.
-    #[test]
-    fn parse_cache_size_and_age() {
-        assert_eq!(parse_size("500G").unwrap(), 500_000_000_000);
-        assert_eq!(parse_size("500GB").unwrap(), 500_000_000_000);
-        assert_eq!(parse_size("1.5t").unwrap(), 1_500_000_000_000);
-        assert_eq!(parse_size("250000").unwrap(), 250_000);
-        assert_eq!(parse_age("1d").unwrap(), std::time::Duration::from_secs(86_400));
-        assert_eq!(parse_age("90m").unwrap(), std::time::Duration::from_secs(5_400));
-        for bad in ["", "G", "-5G", "0", "five", "1x"] {
-            assert!(matches!(parse_size(bad), Err(PvfsError::BadInput { .. })), "size {bad:?}");
-        }
-        for bad in ["", "d", "0d", "1", "1y", "99999999999999999999w"] {
-            assert!(matches!(parse_age(bad), Err(PvfsError::BadInput { .. })), "age {bad:?}");
-        }
-    }
-
-    #[test]
-    fn expiry_suffix_marks_never_expired_and_coarse_remaining() {
-        assert_eq!(expiry_suffix(0), "");
-        assert_eq!(expiry_suffix(1), " [expired]");
-        let s = expiry_suffix(now_ms() + 2 * 86_400_000 + 60_000);
-        assert!(s.contains("expires in ~2d"), "{s}");
-        let s = expiry_suffix(now_ms() + 30 * 60_000 + 1_000);
-        assert!(s.contains("expires in ~30m"), "{s}");
-    }
-}
-
 // ---- PVOS D222d: `pvfs log` -------------------------------------------------
 
 fn log_err(e: impl std::fmt::Display) -> PvfsError {
@@ -11747,5 +11604,148 @@ fn log_cmd(cmd: Option<LogCmd>, ctx: Result<PathBuf, PvfsError>, json: bool) -> 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PVOS D198 — ask a person only when one can see the question: never
+    // under --json, never with stdin or stderr off a terminal (Ansible's pty
+    // gives stdin a terminal while the play redirects stderr).
+    #[test]
+    fn asks_only_when_someone_can_answer() {
+        assert!(interactive_when(false, true, true));
+        assert!(!interactive_when(true, true, true), "--json never asks");
+        assert!(!interactive_when(false, false, true), "a pipe or /dev/null on stdin");
+        assert!(!interactive_when(false, true, false), "stderr redirected: nobody sees the question");
+    }
+
+    // PVOS D206 — a bare `serve enable|disable` takes a job's name or its
+    // number in the list it printed, and nothing else.
+    #[test]
+    fn a_job_is_picked_by_name_or_number() {
+        let names = pvfs_core::serve::JOB_NAMES;
+        assert_eq!(pick_job("receive").unwrap(), "receive");
+        assert_eq!(pick_job(" 1 ").unwrap(), names[0]);
+        assert_eq!(pick_job(&names.len().to_string()).unwrap(), names[names.len() - 1]);
+        for bad in ["", "0", "12", "defrag", "Receive", "-1"] {
+            assert!(pick_job(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    // PVOS D198 — `forest promote <dir>` routes the companion by <dir>, not by
+    // the directory it runs in; other commands keep the context forest.
+    #[test]
+    fn promote_routes_the_companion_by_its_target() {
+        let cli = Cli::parse_from(["pvfs", "forest", "promote", "/srv/pvfs/lab5-plex", "--via-companion", "--yes"]);
+        assert_eq!(companion_target(&cli.cmd), Some(mount::state_dir(std::path::Path::new("/srv/pvfs/lab5-plex"))));
+        let cli = Cli::parse_from(["pvfs", "fleet", "notify"]);
+        assert_eq!(companion_target(&cli.cmd), None);
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    // doc 13 Q-E1: `--expires` accepts a duration (relative to now) or an
+    // absolute `@<unix-ms>`; zero and garbage are refused with `bad_input`.
+    #[test]
+    fn parse_expires_durations_and_absolute() {
+        let before = now_ms();
+        let t = parse_expires("45s").unwrap();
+        assert!(t >= before + 45_000 && t <= now_ms() + 45_000);
+        let t = parse_expires("2w").unwrap();
+        assert!(t >= before + 14 * 86_400_000);
+        assert_eq!(parse_expires("@1753000000000").unwrap(), 1_753_000_000_000);
+
+        for bad in ["@0", "@x", "5", "5y", "", "s", "99999999999999999999w"] {
+            assert!(
+                matches!(parse_expires(bad), Err(PvfsError::BadInput { .. })),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    // D167: a trash bucket's day number, as a date.
+    #[test]
+    fn a_trash_day_reads_as_a_date() {
+        assert_eq!(day_to_date(0), "1970-01-01");
+        assert_eq!(day_to_date(19_782), "2024-02-29");
+        assert_eq!(day_to_date(20_710), "2026-09-14");
+        assert_eq!(day_to_date(20_819), "2027-01-01");
+        // kept 7 days: a bucket goes once it is 7 days old (`purge_trash`)
+        assert_eq!(trash_days_left(20_710, 7, 20_713), 4);
+        assert_eq!(trash_days_left(20_710, 7, 20_717), 0);
+        assert_eq!(trash_days_left(20_710, 0, 20_710), 0);
+    }
+
+    // D181 guardrail 1: a running mount survives a build only if nothing it
+    // relies on moves under it.
+    #[test]
+    fn a_running_mount_survives_a_build_only_when_nothing_it_relies_on_moves() {
+        use pvfs_core::projection::ProjectionPlan;
+        let same = MountStatus {
+            alive: true,
+            mount_compat: pvfs_core::MOUNT_COMPAT,
+            proto: pvfs_client::PROTO_VERSION,
+            schema: pvfs_core::projection::SCHEMA_VERSION,
+            ..Default::default()
+        };
+        let current = ProjectionPlan::Current { version: pvfs_core::projection::SCHEMA_VERSION };
+        let in_place = ProjectionPlan::InPlace { from: 18, steps: vec!["x"] };
+        assert!(mount_survives(&same, &current).is_empty());
+        assert!(
+            mount_survives(&same, &in_place).is_empty(),
+            "an additive migration runs under a mount that already reads its schema"
+        );
+        // PVOS D188: a mount on the old schema does NOT survive an in-place
+        // migration — its fresh opens would refuse the moved catalogue.
+        let old_schema = MountStatus { schema: pvfs_core::projection::SCHEMA_VERSION - 1, ..same.clone() };
+        let why = mount_survives(&old_schema, &in_place);
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("schema") && why[0].contains("other boxes"), "{why:?}");
+        let rebuild = ProjectionPlan::Rebuild { from: 1, why: "no in-place step from v1".into() };
+        assert!(mount_survives(&same, &rebuild)[0].contains("rebuilt"));
+        assert!(mount_survives(&same, &ProjectionPlan::Newer { found: 99 })[0].contains("newer"));
+        let old_compat = MountStatus { mount_compat: pvfs_core::MOUNT_COMPAT + 1, ..same.clone() };
+        assert!(mount_survives(&old_compat, &current)[0].contains("compatibility"));
+        if pvfs_client::PROTO_COMPATIBLE_WITH > 0 {
+            let old_proto = MountStatus { proto: pvfs_client::PROTO_COMPATIBLE_WITH - 1, ..same.clone() };
+            assert!(mount_survives(&old_proto, &current)[0].contains("wire protocol"));
+        }
+        let stale = MountStatus { stale: Some("the catalogue is v20".into()), ..same };
+        assert_eq!(mount_survives(&stale, &current), vec!["the catalogue is v20".to_string()]);
+    }
+
+    // D165: `pvfs mount --view --cache-max 500G --cache-age 1d`.
+    #[test]
+    fn parse_cache_size_and_age() {
+        assert_eq!(parse_size("500G").unwrap(), 500_000_000_000);
+        assert_eq!(parse_size("500GB").unwrap(), 500_000_000_000);
+        assert_eq!(parse_size("1.5t").unwrap(), 1_500_000_000_000);
+        assert_eq!(parse_size("250000").unwrap(), 250_000);
+        assert_eq!(parse_age("1d").unwrap(), std::time::Duration::from_secs(86_400));
+        assert_eq!(parse_age("90m").unwrap(), std::time::Duration::from_secs(5_400));
+        for bad in ["", "G", "-5G", "0", "five", "1x"] {
+            assert!(matches!(parse_size(bad), Err(PvfsError::BadInput { .. })), "size {bad:?}");
+        }
+        for bad in ["", "d", "0d", "1", "1y", "99999999999999999999w"] {
+            assert!(matches!(parse_age(bad), Err(PvfsError::BadInput { .. })), "age {bad:?}");
+        }
+    }
+
+    #[test]
+    fn expiry_suffix_marks_never_expired_and_coarse_remaining() {
+        assert_eq!(expiry_suffix(0), "");
+        assert_eq!(expiry_suffix(1), " [expired]");
+        let s = expiry_suffix(now_ms() + 2 * 86_400_000 + 60_000);
+        assert!(s.contains("expires in ~2d"), "{s}");
+        let s = expiry_suffix(now_ms() + 30 * 60_000 + 1_000);
+        assert!(s.contains("expires in ~30m"), "{s}");
     }
 }
