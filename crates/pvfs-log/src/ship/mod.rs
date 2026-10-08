@@ -12,6 +12,7 @@ pub mod format;
 mod gelf;
 mod http;
 mod sender;
+pub use sender::DEFAULT_ES_INDEX;
 mod spool;
 mod syslog;
 mod tls;

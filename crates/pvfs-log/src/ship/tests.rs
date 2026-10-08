@@ -427,6 +427,13 @@ fn ecs_and_bulk() {
     let av = render(&auth, Privacy::Full, None);
     let a: serde_json::Value = serde_json::from_str(&format::ecs(&auth, &av)).unwrap();
     assert_eq!(a["event"]["category"][0], "authentication");
+    // Found live (D222e): a refused cross-origin websocket is `web`, not `host`.
+    let mut web = refusal();
+    web.event = "pvos.web.origin_refused".into();
+    let wv = render(&web, Privacy::Full, None);
+    let w: serde_json::Value = serde_json::from_str(&format::ecs(&web, &wv)).unwrap();
+    assert_eq!(w["event"]["category"][0], "web");
+    assert_eq!(w["event"]["type"][0], "denied");
     let bulk = format::es_bulk(&[(&r, v)], "pvfs-logs");
     let lines: Vec<&str> = bulk.lines().collect();
     assert_eq!(lines.len(), 2);
@@ -535,7 +542,7 @@ fn gelf_over_udp_and_tcp_and_es_and_otlp_over_http() {
     assert!(got[0].0.starts_with("POST /_bulk HTTP/1.1"), "{}", got[0].0);
     assert!(got[0].0.contains("Content-Type: application/x-ndjson"));
     assert!(got[0].0.contains("Authorization: ApiKey k3y"));
-    assert!(got[0].1.starts_with("{\"create\":{\"_index\":\"pvfs-logs\"}}\n"));
+    assert!(got[0].1.starts_with("{\"create\":{\"_index\":\"logs-pvfs-default\"}}\n"), "the default index");
     // OTLP: /v1/logs, a parsable body; https_json as ECS.
     let (url, t) = http_server(vec![(200, "{}"), (200, "ok")]);
     let mut o = dest(Kind::Otlp);

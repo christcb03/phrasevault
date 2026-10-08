@@ -12,6 +12,11 @@ use super::format;
 use super::spool::Spool;
 use crate::{parse_json, render, to_json, Record, View};
 
+/// Elasticsearch's index when a destination names none: Elastic's
+/// `logs-<dataset>-<namespace>` scheme, so the built-in `logs` template
+/// makes it a data stream with ECS mappings (found live, D222e).
+pub const DEFAULT_ES_INDEX: &str = "logs-pvfs-default";
+
 pub const BATCH_LINES: usize = 500;
 pub const BATCH_BYTES: usize = 1 << 20;
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -158,7 +163,7 @@ pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
         },
         Kind::Elasticsearch => {
             let url = super::http::Url::parse(d.cfg.url.as_deref().unwrap_or_default())?;
-            let index = d.cfg.index.as_deref().unwrap_or("pvfs-logs");
+            let index = d.cfg.index.as_deref().unwrap_or(DEFAULT_ES_INDEX);
             let (code, text) = super::http::post_typed(
                 &url,
                 &url.path_or("/_bulk"),
