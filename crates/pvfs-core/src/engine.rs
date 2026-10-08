@@ -1172,6 +1172,20 @@ impl Engine {
         Ok(engine)
     }
 
+    /// PVOS D222d — every key the forest has authorized (devices and
+    /// members, revoked or not), hex: what `pvfs log whois` hashes to turn a
+    /// pseudonym back into a key.
+    pub fn known_keys(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT device_pubkey FROM device_keys ORDER BY authorized_at")
+            .map_err(map_db("known keys"))?;
+        let rows = stmt
+            .query_map([], |r| Ok(hex::encode(r.get::<_, Vec<u8>>(0)?)))
+            .map_err(map_db("known keys"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(map_db("known keys"))
+    }
+
     /// D128 — every phrase-derived device certificate the log carries, in
     /// index order. Member keys (`fleet enroll`, index -1) are not devices
     /// and are left out.

@@ -15,7 +15,7 @@ pvfs-client = { path = "../pvfs-client" }
 pvfs-companion = { path = "../pvfs-companion", default-features = false }
 # PVOS D222: only the long-running `pvfs mount` sets up the logger
 # (`init_daemon("pvfs-mount")`); every other command prints plain text.
-pvfs-log = { path = "../pvfs-log" }
+pvfs-log = { path = "../pvfs-log", features = ["ship"] }
 # `signal` to give SIGPIPE its default disposition in main — a pipeline filter
 # dies quietly when its reader exits (`pvfs ls | head`); feature unification
 # adds it on top of the workspace's user/fs features.

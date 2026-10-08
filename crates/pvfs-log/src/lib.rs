@@ -27,6 +27,8 @@ mod journal;
 mod limit;
 mod privacy;
 pub mod registry;
+#[cfg(feature = "ship")]
+pub mod ship;
 pub mod testing;
 mod time;
 
@@ -663,6 +665,10 @@ pub fn emit_record(rec: Record) {
         return;
     }
     testing::offer(&rec);
+    // PVOS D222d — every destination whose filter takes it spools it (each
+    // has its own minimum severity, so before this process's level check).
+    #[cfg(feature = "ship")]
+    ship::offer(&rec);
     let lg = logger();
     if rec.severity > lg.cfg.level {
         return;

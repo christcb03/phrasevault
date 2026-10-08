@@ -12,6 +12,17 @@ serde_json.workspace = true
 blake3.workspace = true
 rand.workspace = true
 nix = { workspace = true, features = ["hostname"] }
+# PVOS D222d — the `ship` feature: log destinations (syslog/TLS, Splunk HEC,
+# Loki, HTTPS JSON) with an on-disk spool. Only the daemons turn it on; the
+# CLIs never carry the TLS client.
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { version = "1", optional = true }
+sha2 = { workspace = true, optional = true }
+
+[features]
+ship = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:sha2"]
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen.workspace = true
