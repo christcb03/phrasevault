@@ -74,7 +74,8 @@ pub fn write(
         .and_then(|_| std::fs::write(&tmp, v.to_string()))
         .and_then(|_| std::fs::rename(&tmp, &file));
     if let Err(e) = wrote {
-        eprintln!("mount: cannot write its status file {}: {e}", file.display());
+        pvfs_log::pv_warn!("pvfs.mount.status_unwritten", path = pvfs_log::content(file.display()), error = pvfs_log::content(&e);
+            "mount: cannot write its status file {}: {e}", file.display());
     }
 }
 

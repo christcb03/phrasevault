@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pvfs_core::{identity, Db, Engine, OwnDb, PvfsError, ReplicaSource};
+use pvfs_log::{content, pv_warn};
 
 use crate::ClientError;
 
@@ -109,7 +110,8 @@ pub fn fetch_pass_db_with<D: Db>(
                     report.committed = n;
                     crate::advertise::catch_up_db(db, &mut client);
                 }
-                Err(e) => eprintln!("pvfs: catalogue: pending heads not committed yet: {e}"),
+                Err(e) => pv_warn!("pvfs.catalogue.heads_pending", job = "catalogue", error = content(&e);
+                    "pvfs: catalogue: pending heads not committed yet: {e}"),
             }
         }
     }
@@ -260,7 +262,8 @@ fn collect_claims<D: Db>(
                     claimed_by.entry(c.region.clone()).or_insert_with(|| addr.clone());
                 }
                 pvfs_core::ClaimOutcome::Refused(why) => {
-                    eprintln!("pvfs: catalogue: a claim from {addr} for {} refused: {why}", short_region(&c.region));
+                    pv_warn!("pvfs.catalogue.claim_refused", peer_addr = addr, region = short_region(&c.region), reason = content(&why);
+                        "pvfs: catalogue: a claim from {addr} for {} refused: {why}", short_region(&c.region));
                     report.claims_refused.push((addr.clone(), format!("{}: {why}", short_region(&c.region))));
                 }
             }

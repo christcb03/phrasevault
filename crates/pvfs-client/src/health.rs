@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use pvfs_core::{Engine, PvfsError, ReplicaSource};
+use pvfs_log::{content, pv_warn};
 
 use crate::follow::dial_source;
 
@@ -372,7 +373,8 @@ fn judge_tip(data_dir: &Path, addr: &str, trusted: bool, health: &mut PeerHealth
                 .into(),
             )
         }
-        Err(e) => eprintln!("pvfs: health: could not judge {addr}'s log tip: {e}"),
+        Err(e) => pv_warn!("pvfs.health.tip_unjudged", peer_addr = addr, error = content(&e);
+            "pvfs: health: could not judge {addr}'s log tip: {e}"),
     }
 }
 

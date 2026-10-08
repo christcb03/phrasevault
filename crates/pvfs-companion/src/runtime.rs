@@ -36,12 +36,33 @@ pub fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes())
 }
 
+/// PVOS D222 — one thing a look found worth saying: the line for the log,
+/// and its parts for the log's fields (the path, and the error when the
+/// look failed — both content).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Said {
+    pub line: String,
+    pub path: String,
+    pub error: Option<String>,
+}
+
+impl Said {
+    fn new(path: &Path, error: Option<String>, line: String) -> Said {
+        Said { line, path: path.display().to_string(), error }
+    }
+}
+
 /// One look at each file: one that still holds what this companion wrote is
 /// touched (access and modification times set to now), one that has gone is
 /// written again, and one holding anything else — another instance took over
 /// — is left alone and dropped from `files`. Returns a line for each thing
 /// worth saying (a file written again, or given up), for the log.
 pub fn keep_once(files: &mut Vec<RuntimeFile>) -> Vec<String> {
+    look(files).into_iter().map(|s| s.line).collect()
+}
+
+/// [`keep_once`], each thing said in parts (PVOS D222).
+pub fn look(files: &mut Vec<RuntimeFile>) -> Vec<Said> {
     let mut said = Vec::new();
     files.retain(|f| match std::fs::read_to_string(&f.path) {
         Ok(now) if now == f.contents => {
@@ -51,29 +72,46 @@ pub fn keep_once(files: &mut Vec<RuntimeFile>) -> Vec<String> {
                 .open(&f.path)
                 .and_then(|h| h.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t)));
             if let Err(e) = touched {
-                said.push(format!("companion: could not touch {} ({e}) — the next look tries again", f.path.display()));
+                said.push(Said::new(
+                    &f.path,
+                    Some(e.to_string()),
+                    format!("companion: could not touch {} ({e}) — the next look tries again", f.path.display()),
+                ));
             }
             true
         }
         Ok(_) => {
-            said.push(format!(
-                "companion: {} now belongs to another instance — no longer kept by this one",
-                f.path.display()
+            said.push(Said::new(
+                &f.path,
+                None,
+                format!("companion: {} now belongs to another instance — no longer kept by this one", f.path.display()),
             ));
             false
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             match write_owner_only(&f.path, &f.contents) {
-                Ok(()) => said.push(format!("companion: {} was gone — written again", f.path.display())),
-                Err(e) => said.push(format!(
-                    "companion: {} was gone and could not be written again ({e}) — the next look tries again",
-                    f.path.display()
+                Ok(()) => said.push(Said::new(
+                    &f.path,
+                    None,
+                    format!("companion: {} was gone — written again", f.path.display()),
+                )),
+                Err(e) => said.push(Said::new(
+                    &f.path,
+                    Some(e.to_string()),
+                    format!(
+                        "companion: {} was gone and could not be written again ({e}) — the next look tries again",
+                        f.path.display()
+                    ),
                 )),
             }
             true
         }
         Err(e) => {
-            said.push(format!("companion: could not read {} ({e}) — the next look tries again", f.path.display()));
+            said.push(Said::new(
+                &f.path,
+                Some(e.to_string()),
+                format!("companion: could not read {} ({e}) — the next look tries again", f.path.display()),
+            ));
             true
         }
     });
@@ -92,8 +130,13 @@ pub fn keep(mut files: Vec<RuntimeFile>, every: Duration) {
     std::thread::spawn(move || {
         while !files.is_empty() {
             std::thread::sleep(every);
-            for line in keep_once(&mut files) {
-                eprintln!("{line}");
+            for s in look(&mut files) {
+                match &s.error {
+                    Some(e) => pvfs_log::pv_warn!("pvfs.companion.runtime_file_failed",
+                        path = pvfs_log::content(&s.path), error = pvfs_log::content(e); "{}", s.line),
+                    None => pvfs_log::pv_notice!("pvfs.companion.runtime_file", path = pvfs_log::content(&s.path);
+                        "{}", s.line),
+                }
             }
         }
     });

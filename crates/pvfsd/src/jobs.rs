@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pvfs_client::follow::{self, FollowEvent};
 use pvfs_client::watch::{self, WatchEvent};
 use pvfs_core::{serve, PvfsError, Writer};
+use pvfs_log::{content, pv_info, pv_notice, pv_warn};
 use pvfs_proto::ServeJobWire;
 
 /// How often the supervisor wakes to notice shutdown/reload and reconcile.
@@ -131,10 +132,12 @@ impl Writers {
             match Writer::into_engine(w) {
                 Ok(engine) => {
                     if let Err(e) = engine.close() {
-                        eprintln!("pvfsd: the runner's engine did not close cleanly: {e}");
+                        pv_warn!("pvfs.engine.close_failed", error = content(&e);
+                            "pvfsd: the runner's engine did not close cleanly: {e}");
                     }
                 }
-                Err(_) => eprintln!("pvfsd: the runner's engine is still shared at stop; left open"),
+                Err(_) => pv_warn!("pvfs.engine.close_failed";
+                    "pvfsd: the runner's engine is still shared at stop; left open"),
             }
         }
     }
@@ -267,6 +270,16 @@ enum Fault {
 }
 
 impl Fault {
+    /// PVOS D222 — the job a fault's lines are about (the `job` field).
+    fn job(self) -> &'static str {
+        match self {
+            Fault::WatchPass => "watch",
+            Fault::FollowSession => "follow",
+            Fault::Trash => "trash",
+            Fault::Exit(job) | Fault::Pass(job) => job,
+        }
+    }
+
     fn failed_line(self, err: &str) -> String {
         match self {
             Fault::WatchPass => format!("pvfsd: watch pass failed: {err}; retrying"),
@@ -572,25 +585,37 @@ impl JobsState {
     /// fault (a watch pass in backoff, a follower in its, a thread the
     /// supervisor restarts every 60 s, a periodic pass every interval) does
     /// not repeat itself.
+    ///
+    /// PVOS D222 — the line is logged here, where the job and the error are
+    /// at hand (`pvfs.job.failed`), and returned for tests to read.
     fn failed(&self, fault: Fault, err: &str) -> Option<String> {
-        let mut runs = self.failing.lock().unwrap();
-        let r = runs
-            .entry(fault)
-            .or_insert_with(|| FailingRun { logged: None, failed: 0, since_ms: now_ms() });
-        r.failed += 1;
-        if r.logged.as_deref() == Some(err) {
-            return None;
+        {
+            let mut runs = self.failing.lock().unwrap();
+            let r = runs
+                .entry(fault)
+                .or_insert_with(|| FailingRun { logged: None, failed: 0, since_ms: now_ms() });
+            r.failed += 1;
+            if r.logged.as_deref() == Some(err) {
+                return None;
+            }
+            r.logged = Some(err.to_string());
         }
-        r.logged = Some(err.to_string());
-        Some(fault.failed_line(err))
+        let line = fault.failed_line(err);
+        pv_warn!("pvfs.job.failed", job = fault.job(), error = content(err); "{line}");
+        Some(line)
     }
 
     /// D157, D159 — the evidence that ends `fault`'s run, if one is open: the
     /// line that says so. Which evidence counts is the caller's (see
     /// `Fault`); a stopped pass (D154) or a bare connect is none.
+    ///
+    /// PVOS D222 — logged here (`pvfs.job.recovered`), and returned.
     fn recovered(&self, fault: Fault) -> Option<String> {
         let r = self.failing.lock().unwrap().remove(&fault)?;
-        Some(fault.recovered_line(r.failed, &failing_span(now_ms().saturating_sub(r.since_ms))))
+        let span_ms = now_ms().saturating_sub(r.since_ms);
+        let line = fault.recovered_line(r.failed, &failing_span(span_ms));
+        pv_notice!("pvfs.job.recovered", job = fault.job(), failures = r.failed, duration_ms = span_ms; "{line}");
+        Some(line)
     }
 
     /// A fatal failure: the thread exited; the supervisor retries later.
@@ -665,24 +690,20 @@ impl JobsState {
     /// as `mark_pass` always did, and now the journal too — the first
     /// failure of a run and any change of text (D157's rule), not every
     /// pass. D162's "database or disk is full" reached the phone and never
-    /// `pvfsd.log`, and the NAS has no other log. Returns the line it printed.
+    /// `pvfsd.log`, and the NAS has no other log. Returns the line it printed
+    /// (`failed` logs it, D222).
     fn pass_failed(&self, name: &'static str, err: String) -> Option<String> {
         let line = self.failed(Fault::Pass(name), &err);
-        if let Some(l) = &line {
-            eprintln!("{l}");
-        }
         self.mark_pass(name, Some(err));
         line
     }
 
     /// PVOS D196 — a periodic job's pass completed (per-file `issue`s, if
     /// any, stay in the row as before): ends the job's run of failed passes,
-    /// saying so once. Returns the line it printed.
+    /// saying so once. Returns the line it printed (`recovered` logs it,
+    /// D222).
     fn pass_done(&self, name: &'static str, issue: Option<String>) -> Option<String> {
         let line = self.recovered(Fault::Pass(name));
-        if let Some(l) = &line {
-            eprintln!("{l}");
-        }
         self.mark_pass(name, issue);
         line
     }
@@ -715,10 +736,9 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) 
                 st.set_state("follow", "running");
                 let data_dir = st.data_dir().clone();
                 let cb = Arc::clone(&st);
+                // PVOS D222 — the event's lines are logged where they are made.
                 let on_event = |ev: FollowEvent<'_>| {
-                    for line in follow_event(&cb, ev) {
-                        eprintln!("{line}");
-                    }
+                    follow_event(&cb, ev);
                 };
                 // PVOS D199 — through the daemon's one writer. A runner with
                 // no daemon that cannot open an engine yet (a replica not yet
@@ -727,9 +747,7 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) 
                     Ok(writer) => follow::run_shared(writer, FOLLOW_POLL_MS, &flag, on_event),
                     Err(_) => follow::run(&data_dir, FOLLOW_POLL_MS, &flag, on_event),
                 };
-                if let Some(line) = job_exited(&st, "follow", r) {
-                    eprintln!("{line}");
-                }
+                job_exited(&st, "follow", r);
             })
         }
         "watch" => {
@@ -750,15 +768,11 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) 
                         &flag,
                         cb.progress("watch"),
                         |ev| {
-                            for line in watch_event(&cb, ev) {
-                                eprintln!("{line}");
-                            }
+                            watch_event(&cb, ev);
                         },
                     )
                 });
-                if let Some(line) = job_exited(&st, "watch", r) {
-                    eprintln!("{line}");
-                }
+                job_exited(&st, "watch", r);
             })
         }
         other => unreachable!("no continuous body for job {other}"),
@@ -767,12 +781,13 @@ fn spawn_continuous(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) 
 }
 
 /// D159 — a continuous job's thread has ended: the journal line that earns,
-/// if any. Stopped on request (`Ok`), the row goes back to what the config
-/// says, and nothing is said. An error (a follower that is not a replica, a
-/// watch that cannot take `serve.lock` or register its watches) sets the row
-/// to `error`, the supervisor's cue to restart it after `FATAL_RETRY`, and
-/// is said once per run and text, as a failed pass is (D157). That restart
-/// failing the same way every 60 s used to reach only the row.
+/// if any (logged by `failed`, PVOS D222). Stopped on request (`Ok`), the
+/// row goes back to what the config says, and nothing is said. An error (a
+/// follower that is not a replica, a watch that cannot take `serve.lock` or
+/// register its watches) sets the row to `error`, the supervisor's cue to
+/// restart it after `FATAL_RETRY`, and is said once per run and text, as a
+/// failed pass is (D157). That restart failing the same way every 60 s used
+/// to reach only the row.
 fn job_exited(st: &JobsState, job: &'static str, r: Result<(), PvfsError>) -> Option<String> {
     match r {
         Ok(()) => {
@@ -789,7 +804,8 @@ fn job_exited(st: &JobsState, job: &'static str, r: Result<(), PvfsError>) -> Op
 
 /// D159 — the follow job's reading of one follower event, out of the
 /// thread's closure as `watch_event` is (D156), so a test can drive it. It
-/// updates the job's row and returns the journal lines the event earns.
+/// updates the job's row and returns the journal lines the event earns
+/// (PVOS D222: each logged where it is made, with its event and fields).
 fn follow_event(cb: &JobsState, ev: FollowEvent<'_>) -> Vec<String> {
     // Any event means `follow::run` is through its setup: `ReplicaSource::
     // load`, its only error exit, comes before the first one. So an open run
@@ -827,8 +843,9 @@ fn follow_event(cb: &JobsState, ev: FollowEvent<'_>) -> Vec<String> {
 
 /// The watch job's reading of one watcher event — out of the thread's
 /// closure so a test can drive it (D156). It updates the job's row and
-/// returns the journal lines the event earns, which the thread prints; D157
-/// returns them rather than printing them so a test can read them too.
+/// returns the journal lines the event earns; D157 returns them so a test
+/// can read them too. PVOS D222: each is logged where it is made, with its
+/// event and fields, so the thread prints nothing itself.
 fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
     let mut log = Vec::new();
     match ev {
@@ -845,17 +862,22 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
             // many did that unlink?" could only be answered by diffing the
             // forest before and after.
             if a + c + rm + un > 0 {
-                log.push(format!(
+                let line = format!(
                     "pvfsd: watch ingested {folder}: \
                      +{a} changed {c} removed {rm} unlinked {un}"
-                ));
+                );
+                pv_info!("pvfs.scan.ingested", job = "watch", folder = folder, added = a, changed = c,
+                    removed = rm, unlinked = un; "{line}");
+                log.push(line);
             }
             // D149 — the one thing a pass moves on disk.
             if orphans > 0 {
-                log.push(format!(
+                let line = format!(
                     "pvfsd: watch moved {orphans} orphaned manifest(s) \
                      to the trash in {folder}"
-                ));
+                );
+                pv_info!("pvfs.trash.orphans_moved", job = "watch", folder = folder, manifests = orphans; "{line}");
+                log.push(line);
             }
             if a + c + rm > 0 {
                 // local ingest = new content: views, placed subtrees, the
@@ -870,15 +892,19 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
         // pass, and it used to be stamped here for a pass that kept nothing.
         WatchEvent::Stopped(ref folder, a, c, orphans) => {
             cb.mark_pass_abandoned("watch");
-            log.push(format!(
+            let line = format!(
                 "pvfsd: watch stopped mid-pass in {folder}: \
                  kept +{a} changed {c}; the next pass carries on"
-            ));
+            );
+            pv_info!("pvfs.scan.stopped", job = "watch", folder = folder, added = a, changed = c; "{line}");
+            log.push(line);
             if orphans > 0 {
-                log.push(format!(
+                let line = format!(
                     "pvfsd: watch moved {orphans} orphaned manifest(s) \
                      to the trash in {folder}"
-                ));
+                );
+                pv_info!("pvfs.trash.orphans_moved", job = "watch", folder = folder, manifests = orphans; "{line}");
+                log.push(line);
             }
             if a + c > 0 {
                 cb.nudge_content();
@@ -913,12 +939,16 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
         // phone. The pass's verdict came first, so this note outlasts it.
         WatchEvent::NeedsAttention(n, named) => {
             for (what, why) in &named {
-                log.push(format!("pvfsd: watch skipped {what}: {why}"));
+                let line = format!("pvfsd: watch skipped {what}: {why}");
+                pv_warn!("pvfs.scan.skipped", job = "watch", path = content(what), error = content(why); "{line}");
+                log.push(line);
             }
-            log.push(format!(
+            let line = format!(
                 "pvfsd: watch: {n} file(s) need attention \
                  (skipped this pass; every pass tries them again)"
-            ));
+            );
+            pv_warn!("pvfs.scan.needs_attention", job = "watch", files = n; "{line}");
+            log.push(line);
             cb.mark_attention("watch", attention_note(n, &named));
         }
     }
@@ -1140,7 +1170,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
             match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
                 Ok(mut rec) => {
                     for (pin, r) in rec.down() {
-                        eprintln!(
+                        pv_warn!("pvfs.health.peer_down", peer = &pin[..8], peer_addr = &r.addr,
+                            since_ms = r.unreachable_since_ms.unwrap_or(0),
+                            error = content(r.last.error.as_deref().unwrap_or("no detail"));
                             "pvfsd: health: {} ({}) not answering since {} — {}",
                             &pin[..8],
                             r.addr,
@@ -1156,22 +1188,31 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                     match pvfs_client::supervise::act_on_down(st.data_dir(), &mut rec, now) {
                         Ok(done) => {
                             for (pin, a) in &done {
-                                eprintln!("pvfsd: supervise: sent start to {} → rc {} {:?}", &pin[..8], a.rc, a.output);
+                                pv_notice!("pvfs.supervise.start_sent", peer = &pin[..8], rc = a.rc,
+                                    output = content(format!("{:?}", a.output));
+                                    "pvfsd: supervise: sent start to {} → rc {} {:?}", &pin[..8], a.rc, a.output);
                             }
                             if !done.is_empty() {
                                 if let Err(e) = rec.save(st.data_dir()) {
-                                    eprintln!("pvfsd: supervise: record not saved: {e}");
+                                    pv_warn!("pvfs.supervise.save_failed", error = content(&e);
+                                        "pvfsd: supervise: record not saved: {e}");
                                 }
                             }
                             // D142 — tell a person, on transitions only; a
                             // failure to notify never fails the pass.
                             match pvfs_client::notify::emit(st.data_dir(), prev.as_ref(), &rec, now) {
                                 Ok(sent) => {
+                                    // PVOS D222 — `<event> [peer] → sent`, or
+                                    // `→ NOT sent: <error>`.
                                     for l in &sent {
-                                        eprintln!("pvfsd: notify: {l}");
+                                        match l.split_once(" → NOT sent: ") {
+                                            Some((_, e)) => pv_warn!("pvfs.notify.failed", error = content(e);
+                                                "pvfsd: notify: {l}"),
+                                            None => pv_info!("pvfs.notify.sent"; "pvfsd: notify: {l}"),
+                                        }
                                     }
                                 }
-                                Err(e) => eprintln!("pvfsd: notify: {e}"),
+                                Err(e) => pv_warn!("pvfs.notify.failed", error = content(&e); "pvfsd: notify: {e}"),
                             }
                             st.pass_done("health", None);
                         }
@@ -1201,10 +1242,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                     // PVOS D183 — a head taken from the region's own box
                     // (refusals and commits say so where they happen).
                     for (region, seq, from) in &rep.claims_taken {
-                        eprintln!("pvfsd: catalogue {} head {seq} taken from {from} — provisional until the owner commits it", &region[..8]);
+                        pv_notice!("pvfs.catalogue.head_taken", region = &region[..8], seq = seq, peer_addr = from;
+                            "pvfsd: catalogue {} head {seq} taken from {from} — provisional until the owner commits it", &region[..8]);
                     }
                     for (region, seq, n) in &rep.fetched {
-                        eprintln!(
+                        pv_info!("pvfs.catalogue.fetched", region = &region[..8], seq = seq, rows = n.rows,
+                            added = n.added, changed = n.changed, removed = n.removed;
                             "pvfsd: catalogue {} at head {seq}: {} rows (+{} changed {} removed {})",
                             &region[..8],
                             n.rows,
@@ -1214,7 +1257,8 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                         );
                     }
                     for (region, why) in &rep.failed {
-                        eprintln!("pvfsd: catalogue {}: {why}", &region[..8]);
+                        pv_warn!("pvfs.catalogue.fetch_failed", region = &region[..8], error = content(why);
+                            "pvfsd: catalogue {}: {why}", &region[..8]);
                     }
                     st.pass_done("catalogue", None);
                     // PVOS D206 — a refused claim on the row, for the fleet.
@@ -1260,25 +1304,29 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                 Ok(t) => {
                     let n: u64 = t.iter().map(|x| x.purge.removed).sum();
                     if n > 0 {
-                        eprintln!("pvfsd: receive purged {n} trash buckets past retention");
+                        pv_info!("pvfs.trash.purged", job = "receive", buckets = n;
+                            "pvfsd: receive purged {n} trash buckets past retention");
                     }
                     st.record_trash(&t);
                 }
-                Err(e) => eprintln!("pvfsd: receive: trash purge: {e}"),
+                Err(e) => pv_warn!("pvfs.trash.purge_failed", job = "receive", error = content(&e);
+                    "pvfsd: receive: trash purge: {e}"),
             }
             match r {
                 Ok(rep) => {
                     if !rep.folders.is_empty() {
-                        eprintln!("pvfsd: receive made {} folders only staging had (D145)", rep.folders.len());
+                        pv_info!("pvfs.receive.folders_made", folders = rep.folders.len();
+                            "pvfsd: receive made {} folders only staging had (D145)", rep.folders.len());
                     }
                     for (p, h, _) in &rep.received {
-                        eprintln!("pvfsd: received {p} ({}) into the library (doc 26 §7.3)", &h[..8]);
+                        pv_info!("pvfs.receive.received", path = content(p), hash = &h[..8];
+                            "pvfsd: received {p} ({}) into the library (doc 26 §7.3)", &h[..8]);
                     }
                     for p in &rep.skipped_no_space {
-                        eprintln!("pvfsd: receive: no space for {p}");
+                        pv_warn!("pvfs.receive.no_space", path = content(p); "pvfsd: receive: no space for {p}");
                     }
                     for (p, why) in &rep.failed {
-                        eprintln!("pvfsd: receive: {p}: {why}");
+                        pv_warn!("pvfs.receive.failed", path = content(p), error = content(why); "pvfsd: receive: {p}: {why}");
                     }
                     st.pass_done("receive", None);
                 }
@@ -1311,20 +1359,24 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
             match r {
                 Ok((rep, purged)) => {
                     if !rep.trashed.is_empty() {
-                        eprintln!("pvfsd: resolve trashed {} staging copies the library holds (confirmed)", rep.trashed.len());
+                        pv_info!("pvfs.resolve.trashed", files = rep.trashed.len();
+                            "pvfsd: resolve trashed {} staging copies the library holds (confirmed)", rep.trashed.len());
                     }
                     if !rep.unconfirmed.is_empty() {
-                        eprintln!(
+                        pv_info!("pvfs.resolve.unconfirmed", files = rep.unconfirmed.len(),
+                            paths = content(rep.unconfirmed.join(", "));
                             "pvfsd: resolve kept {} staging copies the library could not confirm yet: {}",
                             rep.unconfirmed.len(),
                             rep.unconfirmed.join(", ")
                         );
                     }
                     if !rep.folders_removed.is_empty() {
-                        eprintln!("pvfsd: resolve removed {} emptied folders the library holds", rep.folders_removed.len());
+                        pv_info!("pvfs.resolve.folders_removed", folders = rep.folders_removed.len();
+                            "pvfsd: resolve removed {} emptied folders the library holds", rep.folders_removed.len());
                     }
                     if purged > 0 {
-                        eprintln!("pvfsd: resolve purged {purged} trash buckets past retention");
+                        pv_info!("pvfs.trash.purged", job = "resolve", buckets = purged;
+                            "pvfsd: resolve purged {purged} trash buckets past retention");
                     }
                     st.pass_done("resolve", None);
                 }
@@ -1672,7 +1724,8 @@ fn trash_every() -> Duration {
 
 /// D176 — one run of the runner's trash step: purge each catalogue region
 /// this box holds (`roots`, from the daemon's read pool) by its retention,
-/// record what each keeps for `serve status`, and return the journal lines.
+/// record what each keeps for `serve status`, and return the journal lines
+/// (PVOS D222: logged where they are made, as `watch_event`'s are).
 ///
 /// The purge used to live only in `receive` and `resolve`, so a box running
 /// neither — mediabox, whose disks are 98 % full — never purged its trash
@@ -1710,10 +1763,12 @@ fn trash_step(
     let removed: u64 = found.iter().map(|t| t.purge.removed).sum();
     if removed > 0 {
         let freed: u64 = found.iter().map(|t| t.purge.freed_bytes).sum();
-        log.push(format!(
+        let line = format!(
             "pvfsd: trash purged {removed} bucket(s) past retention ({} freed)",
             size_text(freed)
-        ));
+        );
+        pv_info!("pvfs.trash.purged", job = "trash", buckets = removed, bytes = freed; "{line}");
+        log.push(line);
     }
     if stopped {
         return log;
@@ -1811,7 +1866,7 @@ pub fn run(
         if Instant::now() >= report_at {
             report_at = Instant::now() + WRITER_REPORT_EVERY;
             if let Some(w) = writers.current() {
-                eprintln!("{}", writer_report(&w, &mut counted));
+                pv_info!("pvfs.writer.hourly"; "{}", writer_report(&w, &mut counted));
             }
         }
         if Instant::now() >= heads_at {
@@ -1835,9 +1890,8 @@ pub fn run(
                 let handle = job_thread("trash", move || {
                     // the read view is handed back before any disk work
                     let roots = d.trash_roots();
-                    for line in trash_step(&st, roots, &flag) {
-                        eprintln!("{line}");
-                    }
+                    // PVOS D222 — the step logs its own lines.
+                    trash_step(&st, roots, &flag);
                 });
                 trashing = Some(Managed { stop, handle });
             }
@@ -1852,14 +1906,14 @@ pub fn run(
                 let listed = match pvfs_core::sync::probe_remote_regions(state.data_dir()) {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("pvfsd: probe: {e}");
+                        pv_warn!("pvfs.quality.remote_failed", error = content(&e); "pvfsd: probe: {e}");
                         Vec::new()
                     }
                 };
                 if !listed.is_empty() && remote.is_none() {
                     match pvfs_core::probe::Prober::detect() {
                         Some(p) => {
-                            eprintln!(
+                            pv_notice!("pvfs.quality.prober_found", regions = listed.len(), path = content(p.program.display());
                                 "pvfsd: probe: measuring {} region(s) for their holders with {}",
                                 listed.len(),
                                 p.program.display()
@@ -1868,7 +1922,7 @@ pub fn run(
                         }
                         None if !said_no_prober => {
                             said_no_prober = true;
-                            eprintln!(
+                            pv_warn!("pvfs.quality.remote_no_prober", regions = listed.len();
                                 "pvfsd: probe: probe-remote names {} region(s), but this box has no ffprobe (PATH, or PVFS_FFPROBE): nothing is measured",
                                 listed.len()
                             );
@@ -1886,11 +1940,25 @@ pub fn run(
                         });
                         match r {
                             Ok(reports) => {
-                                for line in pvfs_client::remote_probe::report_lines(&reports) {
-                                    eprintln!("{line}");
+                                // PVOS D222 — region by region, so each line has its
+                                // region; a skip's reason or a refusal ends its line,
+                                // and is content (it can name a file).
+                                for r in &reports {
+                                    let region = r.region.get(..8).unwrap_or(&r.region);
+                                    let ends = |line: &str, d: &str| !d.is_empty() && line.ends_with(d);
+                                    for line in pvfs_client::remote_probe::report_lines(std::slice::from_ref(r)) {
+                                        if let Some(d) = r.refused.iter().find(|d| ends(line.as_str(), d.as_str())) {
+                                            pv_warn!("pvfs.quality.remote_refused", region = region, detail = content(d); "{line}");
+                                        } else if let Some(d) = r.skipped.as_deref().filter(|d| ends(line.as_str(), d)) {
+                                            pv_info!("pvfs.quality.remote_skipped", region = region, detail = content(d); "{line}");
+                                        } else {
+                                            pv_info!("pvfs.quality.report", region = region; "{line}");
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => eprintln!("pvfsd: probe: pass failed: {e}"),
+                            Err(e) => pv_warn!("pvfs.quality.remote_failed", error = content(&e);
+                                "pvfsd: probe: pass failed: {e}"),
                         }
                     });
                     probing = Some(Managed { stop, handle });
@@ -1906,7 +1974,7 @@ pub fn run(
         }
         if reload.swap(false, Ordering::SeqCst) {
             if let Err(e) = state.reload() {
-                eprintln!("pvfsd: serve.jobs reload failed (config kept): {e}");
+                pv_warn!("pvfs.job.reload_failed", error = content(&e); "pvfsd: serve.jobs reload failed (config kept): {e}");
             }
         }
 

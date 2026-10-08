@@ -777,7 +777,7 @@ impl Engine {
             // projection that STILL answers inactive is a real revocation —
             // that refusal stands.
             if matches!(e, PvfsError::Integrity { .. }) {
-                eprintln!(
+                pvfs_log::pv_warn!("pvfs.projection.cache_discarded", error = pvfs_log::content(&e);
                     "pvfs: device check failed on the cached projection ({e}); \
                      discarding the cache and replaying the full log"
                 );

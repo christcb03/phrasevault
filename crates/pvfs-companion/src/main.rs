@@ -20,6 +20,7 @@ use pvfs_companion::{
     serve_tenant, tenant_request, Agent, ApprovalPolicy, Sessions, TenantAgent,
     TenantRequest, TenantResponse, UnlockedSigner, Vault, VaultStore,
 };
+use pvfs_log::{actor, content, net, pv_error, pv_info, pv_notice, pv_warn};
 
 /// D124 item 2 — the same build stamp the CLI and daemon carry (`build.rs`:
 /// `PVFS_BUILD` from the pipeline, else `git describe`), so the companion
@@ -222,7 +223,7 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pvfs-companion: {e}");
+            pv_error!("pvfs.companion.failed", error = content(&e); "pvfs-companion: {e}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -243,7 +244,7 @@ fn interactive() -> bool {
 fn read_phrase() -> Result<String, String> {
     let mut phrase = String::new();
     if interactive() {
-        eprintln!("Paste your recovery phrase (shown when the forest was created):");
+        pv_info!("pvfs.companion.prompt"; "Paste your recovery phrase (shown when the forest was created):");
         std::io::stdin()
             .read_line(&mut phrase)
             .map_err(|e| e.to_string())?;
@@ -267,14 +268,14 @@ fn prompt_new_passphrase() -> Result<String, String> {
         let a = rpassword::prompt_password("Choose a vault passphrase: ")
             .map_err(|e| e.to_string())?;
         if a.is_empty() {
-            eprintln!("The passphrase cannot be empty — try again.");
+            pv_info!("pvfs.companion.prompt"; "The passphrase cannot be empty — try again.");
             continue;
         }
         let b = rpassword::prompt_password("Confirm it: ").map_err(|e| e.to_string())?;
         if a == b {
             return Ok(a);
         }
-        eprintln!("Those don't match — try again.");
+        pv_info!("pvfs.companion.prompt"; "Those don't match — try again.");
     }
     Err("giving up after 3 attempts".into())
 }
@@ -412,7 +413,7 @@ fn run() -> Result<(), String> {
             // never touch a real keychain.
             if keychain {
                 keychain_create(&vault, phrase.as_bytes())?;
-                eprintln!(
+                pv_notice!(audit success "pvfs.vault.sealed", path = content(vault.display()), sealing = "keychain";
                     "pvfs-companion: sealed vault at {} (data key in the OS keychain)",
                     vault.display()
                 );
@@ -421,14 +422,15 @@ fn run() -> Result<(), String> {
             if !passphrase_only && interactive() {
                 match keychain_create(&vault, phrase.as_bytes()) {
                     Ok(()) => {
-                        eprintln!(
+                        pv_notice!(audit success "pvfs.vault.sealed", path = content(vault.display()), sealing = "keychain";
                             "pvfs-companion: sealed vault at {} (data key in the OS keychain)",
                             vault.display()
                         );
                         return Ok(());
                     }
                     Err(e) => {
-                        eprintln!("OS keychain unavailable ({e}); using a passphrase instead.");
+                        pv_warn!("pvfs.vault.keychain_unavailable", error = content(&e);
+                            "OS keychain unavailable ({e}); using a passphrase instead.");
                     }
                 }
             }
@@ -439,7 +441,8 @@ fn run() -> Result<(), String> {
             };
             Vault::create(&vault, phrase.as_bytes(), pass.as_bytes())
                 .map_err(|e| e.to_string())?;
-            eprintln!("pvfs-companion: sealed vault at {}", vault.display());
+            pv_notice!(audit success "pvfs.vault.sealed", path = content(vault.display()), sealing = "passphrase";
+                "pvfs-companion: sealed vault at {}", vault.display());
             Ok(())
         }
         // `restart` is `serve` made explicit: serve already takes over any
@@ -451,7 +454,7 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("no companion at {} ({e})", socket.display()))?;
             match resp {
                 pvfs_companion::AgentResponse::Ok => {
-                    eprintln!("pvfs-companion: locked (the seed is out of memory)");
+                    pv_notice!("pvfs.vault.locked"; "pvfs-companion: locked (the seed is out of memory)");
                     Ok(())
                 }
                 pvfs_companion::AgentResponse::Error { code, message } => {
@@ -471,7 +474,8 @@ fn run() -> Result<(), String> {
             store
                 .create(&user, phrase.as_bytes(), pass.as_bytes())
                 .map_err(|e| e.to_string())?;
-            eprintln!("pvfs-companion: provisioned tenant {user}");
+            pv_notice!(audit success "pvfs.vault.sealed", tenant = actor(&user), sealing = "passphrase";
+                "pvfs-companion: provisioned tenant {user}");
             Ok(())
         }
         Cmd::ServeTenant {
@@ -494,7 +498,8 @@ fn run() -> Result<(), String> {
             let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
-            eprintln!("pvfs-companion: serving tenant custody on {}", socket.display());
+            pv_notice!("pvfs.agent.listening", socket = content(socket.display());
+                "pvfs-companion: serving tenant custody on {}", socket.display());
             serve_tenant(listener, agent).map_err(|e| e.to_string())?;
             Ok(())
         }
@@ -531,6 +536,10 @@ fn run() -> Result<(), String> {
 }
 
 fn run_serve(args: ServeArgs) -> Result<(), String> {
+    // PVOS D222 — the long-running agent logs records (journal fields under
+    // systemd, today's text anywhere else); every other subcommand keeps
+    // plain text, as the logger is never set up for it.
+    pvfs_log::init_daemon("pvfs-companion");
     // Serving now: re-ignore SIGPIPE (main gave it the default disposition for
     // the filter commands). A browser or CLI client that disconnects mid-write
     // must surface as EPIPE on that connection, not kill the signing agent.
@@ -588,7 +597,8 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
                 audits.push(v.with_extension("audit.jsonl"));
                 slots.push(slot);
             }
-            Err(e) if i > 0 => eprintln!("pvfs-companion: phrase {name} left out — {e}"),
+            Err(e) if i > 0 => pv_warn!("pvfs.vault.left_out", phrase = content(&name), error = content(&e);
+                "pvfs-companion: phrase {name} left out — {e}"),
             Err(e) => return Err(e),
         }
     }
@@ -603,10 +613,10 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     // and record ourselves as the one companion.
     let takeover = pvfs_companion::take_over(&socket);
     if let Some(pid) = takeover.killed {
-        eprintln!("pvfs-companion: took over from a running instance (pid {pid})");
+        pv_notice!("pvfs.companion.took_over", pid = pid; "pvfs-companion: took over from a running instance (pid {pid})");
     }
     if takeover.orphaned {
-        eprintln!(
+        pv_warn!("pvfs.companion.orphaned", socket = content(socket.display());
             "pvfs-companion: WARNING: an older companion answers on {} but left no \
              pidfile — it cannot be killed and is now orphaned (quit it manually)",
             socket.display()
@@ -670,11 +680,13 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
                 if t.fresh {
                     pvfs_companion::webtls::install_trust(&t.cert_path);
                 }
-                eprintln!("companion: web agent serves https (dual-mode) on port {web_port}");
+                pv_notice!("pvfs.agent.listening", port = web_port, tls = true;
+                    "companion: web agent serves https (dual-mode) on port {web_port}");
                 Some(t.config)
             }
             Err(e) => {
-                eprintln!("companion: web-agent TLS unavailable ({e}) — serving plain http");
+                pv_warn!("pvfs.tls.unavailable", error = content(&e);
+                    "companion: web-agent TLS unavailable ({e}) — serving plain http");
                 None
             }
         };
@@ -682,16 +694,17 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         std::thread::spawn(move || w.serve(http, tls));
     }
 
-    eprintln!("pvfs-companion: serving on {}", socket.display());
+    pv_notice!("pvfs.agent.listening", socket = content(socket.display()); "pvfs-companion: serving on {}", socket.display());
     for k in router.keys() {
-        eprintln!(
+        pv_info!("pvfs.agent.phrase", phrase = content(&k.vault), is_default = k.default, root = actor(&k.root[..k.root.len().min(12)]);
             "pvfs-companion: phrase {}{}: root {}",
             k.vault,
             if k.default { " (default)" } else { "" },
             &k.root[..k.root.len().min(12)]
         );
     }
-    eprintln!(
+    pv_notice!("pvfs.agent.settings", prompts = prompt_label, idle_lock_s = idle_lock_secs,
+        audit = content(audits.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", "));
         "pvfs-companion: approval prompts: {prompt_label}; idle lock: {}; audit: {}",
         match idle_lock_secs {
             0 => "off".to_string(),
@@ -699,7 +712,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         },
         audits.iter().map(|a| a.display().to_string()).collect::<Vec<_>>().join(", ")
     );
-    eprintln!(
+    pv_notice!("pvfs.agent.listening", addr = &addr, port_file = content(port_file.display());
         "pvfs-companion: identity agent on http(s)://{addr} (dual-mode; port file {})",
         port_file.display()
     );
@@ -840,7 +853,7 @@ fn run_origins(cmd: Option<OriginsCmd>, vault: Option<PathBuf>) -> Result<(), St
         }
         Some(OriginsCmd::Revoke { origin }) => {
             if reg.revoke(&origin)? {
-                eprintln!("pvfs-companion: revoked {origin}");
+                pv_notice!(audit success "pvfs.agent.origin_revoked", origin = net(&origin); "pvfs-companion: revoked {origin}");
                 Ok(())
             } else {
                 Err(format!("{origin} was not connected"))
@@ -875,7 +888,7 @@ fn run_pairings(cmd: Option<PairingsCmd>, vault: Option<PathBuf>) -> Result<(), 
         }
         Some(PairingsCmd::Revoke { name }) => {
             if reg.revoke(&name).map_err(|e| e.to_string())? {
-                eprintln!("pvfs-companion: revoked pairing {name}");
+                pv_notice!(audit success "pvfs.pairing.revoked", pairing = &name; "pvfs-companion: revoked pairing {name}");
                 Ok(())
             } else {
                 Err(format!("no pairing named {name}"))
@@ -887,12 +900,14 @@ fn run_pairings(cmd: Option<PairingsCmd>, vault: Option<PathBuf>) -> Result<(), 
             };
             reg.trust_origin(&p.server_pubkey_hex, &url)
                 .map_err(|e| e.to_string())?;
-            eprintln!("pvfs-companion: trusting {url} for {name}");
+            pv_notice!(audit success "pvfs.pairing.trusted", pairing = &name, url = content(&url);
+                "pvfs-companion: trusting {url} for {name}");
             Ok(())
         }
         Some(PairingsCmd::Untrust { name, url }) => {
             if reg.untrust_origin(&name, &url).map_err(|e| e.to_string())? {
-                eprintln!("pvfs-companion: forgot {url} for {name}");
+                pv_notice!(audit success "pvfs.pairing.untrusted", pairing = &name, url = content(&url);
+                    "pvfs-companion: forgot {url} for {name}");
                 Ok(())
             } else {
                 Err(format!("{url} was not trusted for {name}"))
@@ -1010,7 +1025,8 @@ fn run_keys_link(
     .map_err(|e| format!("no companion at {} ({e})", socket.display()))?;
     match resp {
         pvfs_companion::AgentResponse::Ok => {
-            eprintln!("pvfs-companion: linked {} ({}) to key {}…", forest.label, forest.id, &hex::encode(&key)[..12]);
+            pv_notice!("pvfs.vault.forest_linked", forest = &forest.id, label = content(&forest.label), key = actor(&hex::encode(&key)[..12]);
+                "pvfs-companion: linked {} ({}) to key {}…", forest.label, forest.id, &hex::encode(&key)[..12]);
             Ok(())
         }
         pvfs_companion::AgentResponse::Error { code, message } => Err(format!("{code}: {message}")),

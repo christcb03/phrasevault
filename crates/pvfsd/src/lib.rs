@@ -32,6 +32,7 @@ use pvfs_proto::{
     IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, SignedEventWire, WriteOp,
     DATA_CHUNK, PROTO_VERSION,
 };
+use pvfs_log::{actor, content, pv_error, pv_info, pv_notice, pv_warn};
 use rand::RngCore;
 
 /// How long a challenge stays valid.
@@ -176,7 +177,7 @@ impl Drop for LeaseGuard<'_> {
         };
         if held.as_ref().is_some_and(|l| l.conn == self.conn) {
             *held = None;
-            eprintln!("pvfsd: write lease released (connection {} ended)", self.conn);
+            pv_notice!("pvfs.lease.released", conn = self.conn; "pvfsd: write lease released (connection {} ended)", self.conn);
         }
     }
 }
@@ -191,7 +192,8 @@ impl Daemon {
         let sessions = match ingest::load_sessions(&data_dir) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("pvfsd: ingest.sessions unreadable ({e}) — fix or remove the file");
+                pv_error!("pvfs.ingest.sessions_unreadable", error = content(&e);
+                    "pvfsd: ingest.sessions unreadable ({e}) — fix or remove the file");
                 std::process::exit(2);
             }
         };
@@ -216,10 +218,11 @@ impl Daemon {
         // wait on a lock a checkpoint holds, and a lowered checkpoint starved
         // by load held one for seconds (measured: a served commit 0.9 s).
         if let Err(e) = Writer::offload_checkpoints(&writer, CHECKPOINT_EVERY, || {}) {
-            eprintln!("pvfsd: checkpoints stay on the writer's commits: {e}");
+            pv_warn!("pvfs.writer.checkpoint_offload_failed", error = content(&e);
+                "pvfsd: checkpoints stay on the writer's commits: {e}");
         }
         if let Err(e) = writer.lock_serving("index sync: normal").set_index_sync_normal() {
-            eprintln!("pvfsd: index.db keeps an fsync per commit: {e}");
+            pv_warn!("pvfs.writer.index_sync_failed", error = content(&e); "pvfsd: index.db keeps an fsync per commit: {e}");
         }
         Daemon {
             writer,
@@ -430,7 +433,7 @@ impl Daemon {
                 ),
             )),
             Ok(((TipVerdict::Diverged, own), _)) => {
-                eprintln!(
+                pv_warn!("pvfs.fence.diverged", peer = actor(&who), peer_seq = t.seq, own_seq = own;
                     "pvfsd: a write from {who} not accepted: its log differs from this owner's at \
                      seq {} (this owner holds {own})",
                     t.seq
@@ -1181,7 +1184,9 @@ fn do_trash_path(daemon: &Daemon, principal: &Principal, region: &str, rel_path:
     }
     match e.trash_region_path(&region.to_string(), rel_path, hash) {
         Ok(pvfs_core::TrashedHere::Trashed(to)) => {
-            eprintln!("pvfsd: trashed {rel_path} of {} for {} — it is at {}", &region[..8], principal.display(), to.display());
+            pv_info!("pvfs.trash.trashed", path = content(rel_path), region = &region[..8],
+                principal = actor(principal.display()), trash_path = content(to.display());
+                "pvfsd: trashed {rel_path} of {} for {} — it is at {}", &region[..8], principal.display(), to.display());
             ServerMsg::Trashed { moved: true }
         }
         Ok(pvfs_core::TrashedHere::Gone) => ServerMsg::Trashed { moved: false },
@@ -1240,7 +1245,8 @@ fn do_rename_path(
                 if matches!(moved, Ok(pvfs_core::RenamedHere::Moved)) {
                     let e = daemon.writer.lock_serving("serve: rename rows");
                     if let Err(e) = e.rows_follow_rename(&region_id, from, to, plan.is_dir()) {
-                        eprintln!("pvfsd: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+                        pv_warn!("pvfs.rename.rows_deferred", path = content(from), new_path = content(to), error = content(&e);
+                            "pvfsd: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
                     }
                 }
                 moved
@@ -1250,7 +1256,9 @@ fn do_rename_path(
     };
     match renamed {
         Ok(pvfs_core::RenamedHere::Moved) => {
-            eprintln!("pvfsd: renamed {from} → {to} in {} for {}", &region[..8], principal.display());
+            pv_info!("pvfs.rename.renamed", path = content(from), new_path = content(to), region = &region[..8],
+                principal = actor(principal.display());
+                "pvfsd: renamed {from} → {to} in {} for {}", &region[..8], principal.display());
             ServerMsg::Renamed { moved: true }
         }
         Ok(pvfs_core::RenamedHere::AlreadyDone | pvfs_core::RenamedHere::Gone) => ServerMsg::Renamed { moved: false },
@@ -1314,7 +1322,9 @@ fn do_set_region_quality(
                     (pvfs_core::media::Observed::Measured(q), _) => format!("measured {}x{}", q.width, q.height),
                     _ => "recorded".to_string(),
                 };
-                eprintln!("pvfsd: quality of {rel_path} in {} for {}: {what}", &region[..8], principal.display());
+                pv_info!("pvfs.quality.recorded", path = content(rel_path), region = &region[..8],
+                    principal = actor(principal.display()), quality = &what;
+                    "pvfsd: quality of {rel_path} in {} for {}: {what}", &region[..8], principal.display());
             }
             ServerMsg::RegionQualitySet { written: n > 0, quality: now }
         }
@@ -1346,7 +1356,9 @@ fn do_remove_dir(daemon: &Daemon, principal: &Principal, region: &str, rel_path:
     };
     match removed {
         Ok(pvfs_core::DirRemovedHere::Removed) => {
-            eprintln!("pvfsd: removed folder {rel_path} of {} for {}", &region[..8], principal.display());
+            pv_info!("pvfs.rmdir.removed", path = content(rel_path), region = &region[..8],
+                principal = actor(principal.display());
+                "pvfsd: removed folder {rel_path} of {} for {}", &region[..8], principal.display());
             ServerMsg::DirRemoved { removed: true }
         }
         Ok(pvfs_core::DirRemovedHere::Gone) => ServerMsg::DirRemoved { removed: false },
@@ -1714,7 +1726,8 @@ fn say_served_from_trash(hash: &str, region: &str, principal: &Principal) {
         return;
     }
     said.insert(hash.to_string(), std::time::Instant::now());
-    eprintln!(
+    pv_info!("pvfs.trash.served", hash = &hash[..hash.len().min(8)], region = &region[..region.len().min(8)],
+        principal = actor(principal.display());
         "pvfsd: {} served from {}'s trash to {} — its live copy went while it was being read",
         &hash[..hash.len().min(8)],
         &region[..region.len().min(8)],
@@ -2469,7 +2482,8 @@ fn do_ingest_commit(daemon: &Daemon, principal: &Principal, session: &str, file:
                                 }
                                 let sessions = st.sessions.clone();
                                 if let Err(e2) = ingest::save_sessions(&daemon.data_dir, &sessions) {
-                                    eprintln!("pvfsd: ingest.sessions save failed ({e2})");
+                                    pv_error!("pvfs.ingest.save_failed", error = content(&e2);
+                                        "pvfsd: ingest.sessions save failed ({e2})");
                                 }
                             }
                             ingest_retry_publish(daemon, session, file, &new, &part)
@@ -2529,7 +2543,7 @@ fn ingest_retry_publish(
     st.sessions
         .retain(|s| !(s.id == session && s.files.iter().all(|f| f.committed.is_some())));
     if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
-        eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+        pv_error!("pvfs.ingest.save_failed", error = content(&pve); "pvfsd: ingest.sessions save failed ({pve})");
     }
     ServerMsg::Committed { id: new.to_string() }
 }
@@ -2740,7 +2754,7 @@ fn do_claim_write_lease(
             "another live connection holds this forest's write lease",
         ),
         _ => {
-            eprintln!(
+            pv_notice!("pvfs.lease.taken", conn = conn, roots = roots.len();
                 "pvfsd: write lease held by connection {conn} over {} root(s)",
                 roots.len()
             );
@@ -3226,7 +3240,8 @@ fn finish_ingest_followup(
             st.sessions.push(*rec);
             if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
                 // The catalog commit landed; the session works until restart.
-                eprintln!("pvfsd: ingest.sessions save failed ({pve}) — session is live but not persisted");
+                pv_error!("pvfs.ingest.save_failed", error = content(&pve);
+                    "pvfsd: ingest.sessions save failed ({pve}) — session is live but not persisted");
             }
             ServerMsg::Committed { id: result_id }
         }
@@ -3259,7 +3274,7 @@ fn finish_ingest_followup(
                     st.sessions
                         .retain(|s| !(s.id == session && s.files.iter().all(|f| f.committed.is_some())));
                     if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
-                        eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+                        pv_error!("pvfs.ingest.save_failed", error = content(&pve); "pvfsd: ingest.sessions save failed ({pve})");
                     }
                     ServerMsg::Committed { id: result_id }
                 }
@@ -3267,7 +3282,8 @@ fn finish_ingest_followup(
                     // The log commit landed; the partial is still in place.
                     // The retry path re-verifies through swarm_commit.
                     if let Err(e2) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
-                        eprintln!("pvfsd: ingest.sessions save failed ({e2})");
+                        pv_error!("pvfs.ingest.save_failed", error = content(&e2);
+                            "pvfsd: ingest.sessions save failed ({e2})");
                     }
                     err(
                         "io",
@@ -3291,7 +3307,7 @@ fn finish_ingest_followup(
                     }
                 }
                 if let Err(pve) = ingest::save_sessions(&daemon.data_dir, &st.sessions) {
-                    eprintln!("pvfsd: ingest.sessions save failed ({pve})");
+                    pv_error!("pvfs.ingest.save_failed", error = content(&pve); "pvfsd: ingest.sessions save failed ({pve})");
                 }
             }
             ServerMsg::Committed { id: result_id }

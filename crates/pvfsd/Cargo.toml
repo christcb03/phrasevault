@@ -19,6 +19,8 @@ pvfs-core = { path = "../pvfs-core" }
 # follower loop — the daemon is a *client* of the replica's source.
 pvfs-client = { path = "../pvfs-client" }
 pvfs-proto = { path = "../pvfs-proto" }
+# PVOS D222 — every line through one log record (levels, event names, fields).
+pvfs-log = { path = "../pvfs-log" }
 blake3.workspace = true
 hex.workspace = true
 rand.workspace = true

@@ -6729,6 +6729,11 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 (data_dir, id, dir)
             };
             std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create mountpoint", e))?;
+            // PVOS D222 — the mount serves until unmounted (pvfs-mount.service
+            // runs `--view`): its lines from here on are records (journal
+            // fields under systemd, today's text anywhere else). Only this
+            // command sets the logger up; every other one prints plain text.
+            pvfs_log::init_daemon("pvfs-mount");
             eprintln!(
                 "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),

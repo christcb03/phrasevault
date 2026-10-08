@@ -36,7 +36,6 @@ pub use time::{format_ts, parse_ts};
 
 use std::cell::RefCell;
 use std::fmt;
-use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -490,7 +489,7 @@ impl Config {
             }
         }
         for b in bad {
-            let _ = writeln!(std::io::stderr().lock(), "{service}: log setting ignored: {b}");
+            eprintln!("{service}: log setting ignored: {b}");
         }
         c
     }
@@ -643,9 +642,9 @@ pub fn emit_record(rec: Record) {
         Format::Logfmt => to_logfmt(&rec, &view),
         Format::Text | Format::Auto => view.line(),
     };
-    let mut e = std::io::stderr().lock();
-    let _ = e.write_all(out.as_bytes());
-    let _ = e.write_all(b"\n");
+    // `eprintln!` itself, as every line used to be: the test harness
+    // captures it per test, where a write to `stderr()` would bypass that.
+    eprintln!("{out}");
 }
 
 /// A child's stderr line, as pvosd relays it (D222 decision 12): a schema-1

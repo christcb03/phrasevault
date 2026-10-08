@@ -92,7 +92,8 @@ impl Slot {
     fn note(&self, forest: &ForestRef, role: &str, action: &str) {
         if let Some(l) = &self.ledger {
             if let Err(e) = l.record(forest, &hex::encode(self.key_of(role)), role, action) {
-                eprintln!("pvfs-companion: ledger for {}: {e}", self.vault);
+                pvfs_log::pv_warn!("pvfs.companion.ledger_unwritten", phrase = pvfs_log::content(&self.vault), error = pvfs_log::content(&e);
+                    "pvfs-companion: ledger for {}: {e}", self.vault);
             }
         }
     }

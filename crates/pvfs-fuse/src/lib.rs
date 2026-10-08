@@ -25,6 +25,7 @@ use pvfs_client::fetch::{Fetcher, SwarmProgress};
 use overlay::{GoneDir, Move, Overlay};
 use pvfs_client::hash_cache::{CacheOpts, HashCache, HashFetch, Opened, RenameCopy};
 use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, ReplicaSource, TYPE_FILE};
+use pvfs_log::{content, pv_error, pv_info, pv_warn};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -160,7 +161,7 @@ fn bury_gone(tombs: &Tombstones, rel: &str, hash: &str, held: &HashMap<String, u
                     ttl: GONE_TTL,
                 },
             );
-            eprintln!(
+            pv_info!("pvfs.mount.gone", path = content(rel), hash = &hash[..hash.len().min(8)];
                 "mount: {rel} is gone ({}) — hidden until this box's catalogue catches up",
                 &hash[..hash.len().min(8)]
             );
@@ -679,7 +680,8 @@ impl PvfsFs {
         for (region, hash) in copies {
             match self.engine.trash_region_path(&region, &rel, &hash) {
                 Ok(pvfs_core::TrashedHere::Trashed(to)) => {
-                    eprintln!("mount: delete of {rel} — this box's copy is in the trash at {}", to.display());
+                    pv_info!("pvfs.mount.deleted", path = content(&rel), trash_path = content(to.display());
+                        "mount: delete of {rel} — this box's copy is in the trash at {}", to.display());
                     dead.insert(hash);
                 }
                 Ok(pvfs_core::TrashedHere::Gone) => {
@@ -687,7 +689,8 @@ impl PvfsFs {
                 }
                 Ok(pvfs_core::TrashedHere::NotHere) => elsewhere.push((region, hash)),
                 Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
-                    eprintln!("mount: delete of {rel} refused — this box's copy is not the file the view showed");
+                    pv_warn!("pvfs.mount.delete_refused", path = content(&rel);
+                        "mount: delete of {rel} refused — this box's copy is not the file the view showed");
                     return reply.error(libc::EIO);
                 }
             }
@@ -717,13 +720,15 @@ impl PvfsFs {
             let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
             match pvfs_client::hash_cache::trash_elsewhere(&sources, &rel, &elsewhere) {
                 Ok(()) => {
-                    eprintln!("mount: delete of {rel} — {} copy(ies) moved to their boxes' trash", elsewhere.len());
+                    pv_info!("pvfs.mount.deleted", path = content(&rel), copies = elsewhere.len();
+                        "mount: delete of {rel} — {} copy(ies) moved to their boxes' trash", elsewhere.len());
                     dead.extend(elsewhere.into_iter().map(|(_, h)| h));
                     bury(rel, dead);
                     reply.ok();
                 }
                 Err(e) => {
-                    eprintln!("mount: delete of {rel} failed: {e}");
+                    pv_error!("pvfs.mount.delete_failed", path = content(&rel), error = content(&e);
+                        "mount: delete of {rel} failed: {e}");
                     reply.error(libc::EIO);
                 }
             }
@@ -762,7 +767,8 @@ impl PvfsFs {
             return reply.error(libc::EINVAL); // into itself
         }
         if pvfs_core::sync::is_own_name(newname, is_dir) || pvfs_core::sync::is_litter_name(newname) {
-            eprintln!("mount: rename of {from} refused — `{newname}` is a name the catalogue passes over");
+            pv_warn!("pvfs.mount.rename_refused", path = content(&from), name = content(newname);
+                "mount: rename of {from} refused — `{newname}` is a name the catalogue passes over");
             return reply.error(libc::EPERM);
         }
         // What is at `to`.
@@ -836,7 +842,8 @@ impl PvfsFs {
                 }
                 Ok(pvfs_core::TrashedHere::NotHere) => replaced_elsewhere.push((region, hash)),
                 Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
-                    eprintln!("mount: rename onto {to} refused — this box's copy there is not the file the view showed");
+                    pv_warn!("pvfs.mount.rename_refused", new_path = content(&to);
+                        "mount: rename onto {to} refused — this box's copy there is not the file the view showed");
                     return reply.error(libc::EIO);
                 }
             }
@@ -855,7 +862,8 @@ impl PvfsFs {
                 Ok(pvfs_core::RenamedHere::Gone) => {}
                 Ok(pvfs_core::RenamedHere::NotHere) => elsewhere.push(c),
                 other => {
-                    eprintln!("mount: rename of {from} refused here: {other:?}");
+                    pv_warn!("pvfs.mount.rename_refused", path = content(&from), error = content(format!("{other:?}"));
+                        "mount: rename of {from} refused here: {other:?}");
                     for d in &done_here {
                         let _ = self.engine.rename_region_path(&d.0, &to, &from, &expect(d));
                     }
@@ -915,22 +923,26 @@ impl PvfsFs {
                 }
             };
             if let Err(e) = pvfs_client::hash_cache::trash_elsewhere(&sources, &to, &replaced_elsewhere) {
-                eprintln!("mount: rename of {from} failed — what is at {to} could not be trashed: {e}");
+                pv_error!("pvfs.mount.rename_failed", path = content(&from), new_path = content(&to), error = content(&e);
+                    "mount: rename of {from} failed — what is at {to} could not be trashed: {e}");
                 put_back_here(&done_here);
                 return reply.error(libc::EIO);
             }
             dead.extend(replaced_elsewhere.into_iter().map(|(_, h)| h));
             match pvfs_client::hash_cache::rename_elsewhere(&sources, &from, &to, &elsewhere) {
                 Ok(()) => {
-                    eprintln!("mount: rename of {from} → {to} — {} copy(ies) renamed on their boxes", elsewhere.len());
+                    pv_info!("pvfs.mount.renamed", path = content(&from), new_path = content(&to), copies = elsewhere.len();
+                        "mount: rename of {from} → {to} — {} copy(ies) renamed on their boxes", elsewhere.len());
                     remember(dead);
                     reply.ok();
                 }
                 Err((why, done)) => {
-                    eprintln!("mount: rename of {from} failed: {why}");
+                    pv_error!("pvfs.mount.rename_failed", path = content(&from), error = content(&why);
+                        "mount: rename of {from} failed: {why}");
                     if done > 0 {
                         if let Err((e, _)) = pvfs_client::hash_cache::rename_elsewhere(&sources, &to, &from, &elsewhere[..done]) {
-                            eprintln!("mount: and {done} copy(ies) already renamed could not be put back: {e}");
+                            pv_error!("pvfs.mount.rename_unrolled", copies = done, error = content(&e);
+                                "mount: and {done} copy(ies) already renamed could not be put back: {e}");
                         }
                     }
                     put_back_here(&done_here);
@@ -1003,7 +1015,8 @@ impl PvfsFs {
                 Ok(pvfs_core::DirRemovedHere::NotHere) => elsewhere.push(region),
                 Ok(pvfs_core::DirRemovedHere::NotEmpty) => return reply.error(libc::ENOTEMPTY),
                 Err(e) => {
-                    eprintln!("mount: rmdir of {rel} failed here: {e}");
+                    pv_error!("pvfs.mount.rmdir_failed", path = content(&rel), error = content(&e);
+                        "mount: rmdir of {rel} failed here: {e}");
                     return reply.error(libc::EIO);
                 }
             }
@@ -1029,16 +1042,19 @@ impl PvfsFs {
             let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
             match pvfs_client::hash_cache::rmdir_elsewhere(&sources, &rel, &elsewhere) {
                 Ok(()) => {
-                    eprintln!("mount: rmdir of {rel} — removed on the box(es) that held it");
+                    pv_info!("pvfs.mount.dir_removed", path = content(&rel);
+                        "mount: rmdir of {rel} — removed on the box(es) that held it");
                     forget(rel);
                     reply.ok();
                 }
                 Err(e) if e.contains(": not_empty: ") => {
-                    eprintln!("mount: rmdir of {rel} refused: {e}");
+                    pv_warn!("pvfs.mount.rmdir_refused", path = content(&rel), error = content(&e);
+                        "mount: rmdir of {rel} refused: {e}");
                     reply.error(libc::ENOTEMPTY);
                 }
                 Err(e) => {
-                    eprintln!("mount: rmdir of {rel} failed: {e}");
+                    pv_error!("pvfs.mount.rmdir_failed", path = content(&rel), error = content(&e);
+                        "mount: rmdir of {rel} failed: {e}");
                     reply.error(libc::EIO);
                 }
             }
@@ -1399,7 +1415,8 @@ impl Filesystem for PvfsFs {
             let progress = match self.active.get(&node) {
                 Some(p) => Arc::clone(p),
                 None => {
-                    eprintln!("mount: streaming {node} while its fetch verifies (doc 22 §2)");
+                    pv_info!("pvfs.mount.streaming", node = &node;
+                        "mount: streaming {node} while its fetch verifies (doc 22 §2)");
                     let p: Arc<SwarmProgress> = Arc::new(SwarmProgress::default());
                     let bg = Arc::clone(&p);
                     let dir = self.data_dir.clone();
@@ -1438,7 +1455,8 @@ impl Filesystem for PvfsFs {
             .unwrap_or(false);
         if local.is_none() && !held_elsewhere {
             if let Some((declared, client)) = self.ingest_proxy(&node) {
-                eprintln!("mount: ingest-stream {node} — reads proxy ranged Cat (doc 23 §11)");
+                pv_info!("pvfs.mount.ingest_stream", node = &node;
+                    "mount: ingest-stream {node} — reads proxy ranged Cat (doc 23 §11)");
                 let fh = self.next_fh;
                 self.next_fh += 1;
                 self.proxy.insert(
@@ -1776,7 +1794,7 @@ impl Filesystem for PvfsFs {
             return match res {
                 Ok(()) => reply.ok(),
                 Err(e) => {
-                    eprintln!("pvfs mount: rename failed: {e}");
+                    pv_error!("pvfs.mount.rename_failed", error = content(&e); "pvfs mount: rename failed: {e}");
                     reply.error(libc::EIO)
                 }
             };
@@ -1805,7 +1823,7 @@ impl Filesystem for PvfsFs {
                 return match res {
                     Ok(()) => reply.ok(),
                     Err(e) => {
-                        eprintln!("pvfs mount: relabel failed: {e}");
+                        pv_error!("pvfs.mount.rename_failed", error = content(&e); "pvfs mount: relabel failed: {e}");
                         reply.error(libc::EIO)
                     }
                 };
@@ -2125,7 +2143,7 @@ impl PvfsFs {
             }
         })();
         res.map_err(|e| {
-            eprintln!("pvfs mount: rename failed: {e}");
+            pv_error!("pvfs.mount.rename_failed", error = content(&e); "pvfs mount: rename failed: {e}");
             libc::EIO
         })
     }
@@ -2223,7 +2241,7 @@ impl PvfsFs {
         // Say WHY. A mount that answers EIO with no explanation is exactly
         // what turned a one-line bug into a lab round.
         res.map_err(|e| {
-            eprintln!("pvfs mount: folder rename failed: {e}");
+            pv_error!("pvfs.mount.rename_failed", error = content(&e); "pvfs mount: folder rename failed: {e}");
             libc::EIO
         })
     }
@@ -2549,7 +2567,8 @@ impl MountGuard {
         }
         let gone = !is_mounted(&self.at);
         if !gone {
-            eprintln!("pvfs-fuse: {} is still mounted after fusermount -uz", self.at.display());
+            pv_error!("pvfs.mount.unmount_failed", path = content(self.at.display());
+                "pvfs-fuse: {} is still mounted after fusermount -uz", self.at.display());
         }
         gone
     }

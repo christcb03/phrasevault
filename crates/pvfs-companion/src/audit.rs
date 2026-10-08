@@ -81,7 +81,7 @@ impl AuditLog {
         };
         let mut f = self.file.lock().expect("audit log poisoned");
         if writeln!(f, "{line}").and_then(|_| f.flush()).is_err() {
-            eprintln!(
+            pvfs_log::pv_error!("pvfs.companion.audit_unwritten", path = pvfs_log::content(self.path.display());
                 "pvfs-companion: WARNING: could not append to the audit log at {}",
                 self.path.display()
             );
