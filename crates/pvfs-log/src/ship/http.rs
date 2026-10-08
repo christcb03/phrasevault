@@ -100,8 +100,21 @@ pub fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
 /// POST `body` to `path` on `url`'s host; the status code and the response
 /// body (as text, still chunk-framed if the server chunked it).
 pub fn post(url: &Url, path: &str, tls: &TlsSettings, headers: &[(String, String)], body: &[u8]) -> Result<(u16, String), String> {
+    post_typed(url, path, "application/json", tls, headers, body)
+}
+
+/// As [`post`], with the body's content type (`application/x-ndjson` for
+/// Elasticsearch's `_bulk`).
+pub fn post_typed(
+    url: &Url,
+    path: &str,
+    content_type: &str,
+    tls: &TlsSettings,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(u16, String), String> {
     let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: pvfs-log/1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: pvfs-log/1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         url.authority(),
         body.len()
     );

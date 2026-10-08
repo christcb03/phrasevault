@@ -71,6 +71,14 @@ pub fn parse_ts(t: &str) -> Option<u64> {
     Some(secs as u64 * 1000 + frac_ms as u64)
 }
 
+/// (year, month, day, hour, minute, second) in UTC — RFC 3164's stamp.
+pub(crate) fn utc_parts(ms: u64) -> (i64, u32, u32, u64, u64, u64) {
+    let secs = ms / 1000;
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let s = secs % 86_400;
+    (y, m, d, s / 3600, (s % 3600) / 60, s % 60)
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::config::{Destination, Kind, SyslogFormat};
+use super::config::{Destination, HttpFormat, Kind, SyslogFormat};
 use super::format;
 use super::spool::Spool;
 use crate::{parse_json, render, to_json, Record, View};
@@ -78,6 +78,8 @@ pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
                     SyslogFormat::Rfc5424 => format::rfc5424(r, v, &v.line(), true),
                     SyslogFormat::Json => format::rfc5424(r, v, &to_json(r, v), false),
                     SyslogFormat::Cef => format::rfc5424(r, v, &format::cef(r, v, &d.product, &d.version), false),
+                    SyslogFormat::Leef => format::rfc5424(r, v, &format::leef(r, v, &d.product, &d.version), false),
+                    SyslogFormat::Rfc3164 => format::rfc3164(r, &v.line()),
                 })
                 .collect();
             super::syslog::send(
@@ -126,19 +128,64 @@ pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
         }
         Kind::HttpsJson => {
             let url = super::http::Url::parse(d.cfg.url.as_deref().unwrap_or_default())?;
-            let mut headers = Vec::new();
-            if let Some(t) = &d.token {
-                match d.cfg.header.as_deref().unwrap_or("Authorization") {
-                    h if h.eq_ignore_ascii_case("authorization") => headers.push((h.to_string(), format!("Bearer {t}"))),
-                    h => headers.push((h.to_string(), t.clone())),
-                }
-            }
-            let (code, text) =
-                super::http::post(&url, &url.path_or("/"), &d.cfg.tls, &headers, format::ndjson(&items).as_bytes())?;
+            let headers = auth_headers(d, "Bearer");
+            let body = match d.cfg.http_format() {
+                HttpFormat::Schema1 => format::ndjson(&items),
+                HttpFormat::Ecs => items.iter().map(|(r, v)| format::ecs(r, v) + "\n").collect(),
+                HttpFormat::Ocsf => items.iter().map(|(r, v)| format::ocsf(r, v, &d.product, &d.version) + "\n").collect(),
+            };
+            let (code, text) = super::http::post(&url, &url.path_or("/"), &d.cfg.tls, &headers, body.as_bytes())?;
             if (200..300).contains(&code) {
                 Ok(())
             } else {
                 Err(format!("the receiver answered {code}: {}", text.chars().take(200).collect::<String>()))
+            }
+        }
+        Kind::Gelf => match d.cfg.gelf_transport() {
+            "http" => {
+                let url = super::http::Url::parse(d.cfg.url.as_deref().unwrap_or_default())?;
+                let docs: Vec<String> = items.iter().map(|(r, v)| format::gelf(r, v)).collect();
+                super::gelf::send_http(&url, &d.cfg.tls, &auth_headers(d, "Bearer"), &docs)
+            }
+            "tcp" => {
+                let docs: Vec<String> = items.iter().map(|(r, v)| format::gelf(r, v)).collect();
+                super::gelf::send_tcp(d.cfg.address.as_deref().unwrap_or_default(), &docs)
+            }
+            _ => {
+                let docs: Vec<String> = items.iter().map(|(r, v)| format::gelf_udp(r, v, super::gelf::UDP_MAX)).collect();
+                super::gelf::send_udp(d.cfg.address.as_deref().unwrap_or_default(), &docs)
+            }
+        },
+        Kind::Elasticsearch => {
+            let url = super::http::Url::parse(d.cfg.url.as_deref().unwrap_or_default())?;
+            let index = d.cfg.index.as_deref().unwrap_or("pvfs-logs");
+            let (code, text) = super::http::post_typed(
+                &url,
+                &url.path_or("/_bulk"),
+                "application/x-ndjson",
+                &d.cfg.tls,
+                &auth_headers(d, "ApiKey"),
+                format::es_bulk(&items, index).as_bytes(),
+            )?;
+            if (200..300).contains(&code) && !text.contains("\"errors\":true") {
+                Ok(())
+            } else {
+                Err(format!("Elasticsearch answered {code}: {}", text.chars().take(300).collect::<String>()))
+            }
+        }
+        Kind::Otlp => {
+            let url = super::http::Url::parse(d.cfg.url.as_deref().unwrap_or_default())?;
+            let (code, text) = super::http::post(
+                &url,
+                &url.path_or("/v1/logs"),
+                &d.cfg.tls,
+                &auth_headers(d, "Bearer"),
+                format::otlp_body(&items).as_bytes(),
+            )?;
+            if (200..300).contains(&code) {
+                Ok(())
+            } else {
+                Err(format!("the OTLP receiver answered {code}: {}", text.chars().take(200).collect::<String>()))
             }
         }
     }
@@ -200,4 +247,18 @@ fn sleep_unless_stopped(d: &Dest, total: Duration) {
         std::thread::sleep(step);
         slept += step;
     }
+}
+
+/// The token as its header (PVOS D222e): `header` (default `Authorization`);
+/// for `Authorization`, `<scheme> <token>` unless the token already names
+/// its scheme (`Basic …`, `ApiKey …`, `Bearer …`).
+fn auth_headers(d: &Dest, scheme: &str) -> Vec<(String, String)> {
+    let Some(t) = &d.token else { return Vec::new() };
+    let name = d.cfg.header.clone().unwrap_or_else(|| "Authorization".into());
+    let value = if name.eq_ignore_ascii_case("authorization") && !t.contains(' ') {
+        format!("{scheme} {t}")
+    } else {
+        t.clone()
+    };
+    vec![(name, value)]
 }

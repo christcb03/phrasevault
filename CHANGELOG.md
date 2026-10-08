@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **More log formats (PVOS D222e).** These are new destination types and
+  formats, each built from the record already rendered at the
+  destination's privacy level:
+  - syslog `leef` (IBM QRadar) and `rfc3164`;
+  - `gelf` (Graylog, over UDP, TCP or HTTP);
+  - `elasticsearch` (`_bulk` of ECS documents; `errors:true` is a failure);
+  - `otlp` (OpenTelemetry logs over HTTP JSON);
+  - `https_json` with `format` `ecs` or `ocsf`.
+
+  The token header defaults per type (`Bearer`, `ApiKey`) unless the token
+  names its scheme. The prompts in `pvfs log destinations add` ask about
+  them, and the ECS/OCSF mapping is in doc 33.
+
 - **Log destinations: Loki, Splunk HEC, syslog (RFC 5424 as text, JSON or
   CEF, over TLS, TCP or UDP) and HTTPS JSON, built in (PVOS D222d).** A
   daemon sends its records to the destinations in

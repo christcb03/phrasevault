@@ -5,10 +5,17 @@ a severity, a stable event name, a category, an outcome, a UTC time, and
 named fields, each with a privacy class. There are two ways to get those
 records off a box, and both can run at once:
 
-- **Built in** (PVOS D222d): the daemons send to the destinations you
-  configure — Loki, Splunk HEC, syslog (RFC 5424, as text, JSON or CEF, over
-  TLS, TCP or UDP), or any HTTPS endpoint that takes JSON. Nothing else to
-  install, and each destination has its own privacy level.
+- **Built in** (PVOS D222d, D222e): the daemons send to the destinations
+  you configure. Nothing else to install, and each destination has its own
+  privacy level:
+  - Loki;
+  - Splunk HEC;
+  - syslog (RFC 5424 as text, JSON, CEF or LEEF, or RFC 3164, over TLS,
+    TCP or UDP);
+  - Graylog (GELF over UDP, TCP or HTTP);
+  - Elasticsearch / OpenSearch (`_bulk`, ECS);
+  - OpenTelemetry (OTLP/HTTP);
+  - any HTTPS endpoint that takes JSON (PVFS's own records, ECS or OCSF).
 - **Bring your own collector**: the records are in the journal with their
   fields, so a collector you already run (Splunk Universal Forwarder, Elastic
   Agent, Vector, rsyslog, Grafana Alloy) can read them.
@@ -61,13 +68,13 @@ Tokens are kept in the PVOS keychain.
 | Key | Means | Default |
 |---|---|---|
 | `name` | letters, digits, `-`, `_` | — |
-| `type` | `loki`, `splunk_hec`, `syslog`, `https_json` | — |
+| `type` | `loki`, `splunk_hec`, `syslog`, `https_json`, `gelf`, `elasticsearch`, `otlp` | — |
 | `url` | `http(s)://host[:port][/path]` (Loki, HEC, HTTPS JSON); the path defaults to `/loki/api/v1/push`, `/services/collector/event`, `/` | — |
-| `address` | `host:port` (syslog) | — |
-| `transport` | syslog: `tls` (RFC 5425), `tcp` (RFC 6587 octet counting), `udp` | `tls` |
-| `format` | syslog: `rfc5424` (the line, fields as structured data), `json` (the record), `cef` | `rfc5424` |
-| `index`, `sourcetype` | HEC | token's index, `pvfs:json` |
-| `header` | HTTPS JSON: the header the token goes in (`Authorization` → `Bearer <token>`) | `Authorization` |
+| `address` | `host:port` (syslog; GELF over udp/tcp) | — |
+| `transport` | syslog: `tls` (RFC 5425), `tcp` (RFC 6587 octet counting), `udp`; GELF: `udp`, `tcp` (NUL-delimited), `http` | syslog `tls`, GELF `udp` |
+| `format` | syslog: `rfc5424` (the line, fields as structured data), `json` (the record), `cef`, `leef`, `rfc3164`; https_json: `schema1`, `ecs`, `ocsf` | `rfc5424`, `schema1` |
+| `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `pvfs-logs` |
+| `header` | the header the token goes in. For `Authorization` the token is sent as `Bearer <token>` (Elasticsearch: `ApiKey <token>`) unless it names its own scheme (`Basic …`) | `Authorization` |
 | `secret` | a file holding the token (relative to this file) | none |
 | `tls.ca_file` | trust only this CA bundle (PEM) | the public roots |
 | `tls.pin_sha256` | trust only this certificate (`openssl x509 -fingerprint -sha256`) | — |
@@ -128,7 +135,66 @@ self-signed certificate is trusted by its pin.
     - other fields go in `cs1`–`cs6` with their labels.
   - 32473 is IANA's documentation enterprise number until PhraseVault has
     its own.
-- **HTTPS JSON**: newline-delimited schema-1 records, POSTed in batches.
+- **HTTPS JSON**: newline-delimited records, POSTed in batches, as
+  schema 1 (default), ECS or OCSF (`format`).
+- **syslog LEEF** (IBM QRadar): `LEEF:2.0|PhraseVault|PVFS|<version>|<event>|x09|`
+  then tab-separated `devTime` (epoch ms), `sev` (1–10), `cat`,
+  `src`/`srcPort`, `usrName`, `outcome`, `pv_<field>` and `msg`.
+- **syslog RFC 3164**: `<PRI>Mmm dd hh:mm:ss HOST TAG[PID]: <line>`. The time
+  is UTC, because the format cannot name a zone; prefer RFC 5424.
+- **Graylog (GELF 1.1)**: `short_message` is the line, `level` the syslog
+  severity; `_event`, `_category`, `_outcome`, `_service`, `_record_id`, and
+  each field as `_<name>` (a field named `id` as `_f_id`: GELF reserves
+  `_id`). Over UDP a record that would not fit one 8 KiB datagram is sent
+  with its sentence cut and without its extra fields.
+- **Elasticsearch / OpenSearch**: `POST <url>/_bulk`, a `create` into the
+  index (or data stream) and an ECS document per record. A reply with
+  `"errors":true` counts as a failure, so the batch is resent; `event.id`
+  lets the index drop duplicates.
+- **OpenTelemetry**: `POST <url>/v1/logs`, OTLP/HTTP JSON.
+  - Resource attributes: `service.name`, `host.name`, `process.pid`.
+  - Record attributes: `pvfs.event`, `pvfs.category`, `pvfs.outcome`,
+    `pvfs.id` and the fields.
+  - `severityNumber`: debug 5, info 9, notice 10, warning 13, error 17,
+    critical 21.
+  - Point it at an OpenTelemetry Collector, and from there Datadog, New
+    Relic, Honeycomb, Grafana Cloud or Splunk Observability.
+
+### ECS and OCSF, as mapped
+
+| Record | ECS | OCSF |
+|---|---|---|
+| `ts` | `@timestamp` | `time` (ms) |
+| the line | `message` | `message` |
+| `event` | `event.action` | `metadata.log_name`, `unmapped.pvfs_event` |
+| `id` | `event.id` | `metadata.uid` |
+| `severity` | `log.level`, `log.syslog.severity.{code,name}`, `event.severity` | `severity_id` (1 info … 6 fatal) |
+| `outcome` | `event.outcome` | `status_id` (1 success, 2 failure) |
+| `category` | `event.kind` (`alert` for security) | the class, below |
+| `peer_addr` | `source.ip`, `source.port` | `src_endpoint.ip`, `.port` |
+| `principal` / `member` | `user.id` | `actor.user.uid` |
+| `host`, `service`, `pid` | `host.name`, `service.name`, `process.pid` | `device.hostname`, `unmapped.pvfs_service` |
+| other fields | `labels.<name>` | `unmapped.<name>` |
+
+ECS `event.category` and `event.type`, by the event's name:
+- `authentication` for `*.auth.*`, `*.signin.*` and `*.session.*`;
+- `iam` for authority, grants, members, invites, shares, keychain, access,
+  control and desktop;
+- `network` for `*.tls.*`;
+- `process` for the daemon lifecycle;
+- `host` otherwise.
+
+The type is `denied` for a refused security event, `change` for an audit
+event, `error` for an error, and `info` otherwise.
+
+OCSF classes:
+- **3002** Authentication (activity 1) for security and audit events about
+  auth, sign-in, access, control or TLS;
+- **3005** User Access Management (activity 1) for other audit events;
+- **0** Base Event (activity 99) otherwise.
+
+`metadata.version` is 1.1.0. These mappings are a best effort; a SIEM that
+needs another can take schema 1 and map it.
 
 ### Privacy
 
