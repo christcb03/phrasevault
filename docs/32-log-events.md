@@ -59,6 +59,34 @@ organisations. Without a key, `actor` and `content` values are taken out
 instead. The box's own journal is `full`; destinations off the box default
 to `minimal` (PVOS D222d).
 
+## Audit and security events (PVOS D222b)
+
+Two categories are for a SIEM:
+
+- **`security`** — something was refused. These are logged where the
+  answer leaves the daemon, so every gate is covered:
+  - a request (`pvfs.access.denied`);
+  - a revoked key (`pvfs.access.revoked_key`);
+  - a signature (`pvfs.access.bad_signature`);
+  - a handshake (`pvfs.auth.refused`, with `reason`);
+  - a TLS handshake (`pvfs.tls.handshake_failed`; a client that connects
+    and leaves without a byte is not logged);
+  - the companion's web agent (`pvfs.agent.refused`).
+
+  Each carries the op, the `principal` and the client's `peer_addr` (`local`
+  for the Unix socket). They are rate-limited per peer: ten a minute, then
+  the next one that goes out says how many were dropped (`suppressed`).
+- **`audit`** — a change of authority, logged once by the daemon that
+  commits it, with author, subject and log `seq`:
+  `pvfs.authority.device_authorized`, `device_revoked`, `acl_set`,
+  `member_tagged`, `root_rotated`, `recovery_key_registered`/`_revoked`,
+  `certificates_bound`. The companion's signing decisions (`audit.jsonl`)
+  are `pvfs.agent.audit`.
+
+The signed log is still the record of authority; these lines are how a
+SIEM hears of it. Our log server keeps both categories 90 days and alerts on
+a burst of refusals and on a revoked key used (HomeLab `docs/LOGGING.md`).
+
 ## Event names
 
 `pvfs.<area>.<what>`. Renaming or removing one is a breaking change for
