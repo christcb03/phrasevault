@@ -95,7 +95,9 @@ fn refusals_and_authority_changes_are_logged_with_who_and_where() {
     // ---- 2. a refused handshake: a signature that does not verify
     let bad = Client::connect_tcp_signed(&addr, &tls.pin, &member_pub, |_d| vec![0u8; 64]);
     assert!(bad.is_err(), "a bad signature must not authenticate");
-    let refused = wait_for(&cap, "pvfs.auth.refused", 1, |r| s(field(r, "reason")) == "bad_signature");
+    let refused = wait_for(&cap, "pvfs.auth.refused", 1, |r| {
+        s(field(r, "reason")) == "bad_signature" && s(field(r, "principal")) == format!("key:{member_hex}")
+    });
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(s(field(&refused[0], "principal")), format!("key:{member_hex}"));
     assert!(s(field(&refused[0], "peer_addr")).starts_with("127.0.0.1:"));
@@ -149,35 +151,24 @@ fn refusals_and_authority_changes_are_logged_with_who_and_where() {
     });
     assert_eq!(used.len(), 1, "a revoked key's write: {used:?}");
     assert_eq!(used[0].category, Category::Security);
-}
 
-#[test]
-fn a_flood_of_bad_handshakes_is_rate_limited() {
-    let cap = GlobalCapture::start();
-    let dir = tempfile::tempdir().unwrap();
-    let (engine, _mn) = Engine::init(dir.path()).unwrap();
-    let tls = nettls::load_or_generate(dir.path()).unwrap();
-    // A second loopback address, so the other test's refusals (127.0.0.1)
-    // never share this one's limit.
-    let listener = TcpListener::bind("127.0.0.2:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let daemon = Arc::new(Daemon::new(engine));
-    {
-        let d = Arc::clone(&daemon);
-        let cfg = Arc::clone(&tls.config);
-        std::thread::spawn(move || {
-            static NEVER: AtomicBool = AtomicBool::new(false);
-            let _ = serve_tls_until(listener, cfg, d, &NEVER);
-        });
-    }
+    // ---- 6. a flood of bad handshakes from one address is rate-limited:
+    // ten records a minute for 127.0.0.1 — step 2's one and nine of these
+    // thirty (loopback clients all come from 127.0.0.1, whatever address
+    // the server listens on, so this runs here, after step 2, not in a
+    // test of its own beside it).
     let key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
     let pubk = crypto::pubkey_bytes(&key);
     for _ in 0..30 {
         let _ = Client::connect_tcp_signed(&addr, &tls.pin, &pubk, |_d| vec![1u8; 64]);
     }
-    let mine = |r: &Record| s(field(r, "principal")) == format!("key:{}", hex::encode(&pubk));
-    let _ = wait_for(&cap, "pvfs.auth.refused", 10, mine);
     std::thread::sleep(Duration::from_millis(500));
-    let got: Vec<Record> = cap.events("pvfs.auth.refused").into_iter().filter(mine).collect();
-    assert_eq!(got.len(), 10, "ten a minute from one address, the rest counted: {}", got.len());
+    let all: Vec<Record> = cap
+        .events("pvfs.auth.refused")
+        .into_iter()
+        .filter(|r| s(field(r, "peer_addr")).starts_with("127.0.0.1:"))
+        .collect();
+    assert_eq!(all.len(), 10, "ten a minute from one address, the rest counted: {}", all.len());
+    let flood = all.iter().filter(|r| s(field(r, "principal")) == format!("key:{}", hex::encode(&pubk))).count();
+    assert_eq!(flood, 9);
 }
