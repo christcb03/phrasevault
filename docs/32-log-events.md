@@ -144,7 +144,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.lease.released` | notice | system | The write lease was released. |
 | `pvfs.lease.taken` | notice | system | A connection holds the write lease. |
 | `pvfs.mount.bytes_refused` | warning | system | A holder served bytes with the wrong hash. |
-| `pvfs.mount.cache` | info | system | The read-through cache's periodic report. |
+| `pvfs.mount.cache` | info | system | The read-through cache's report: files opened, verified and kept, bytes fetched, evictions; when anything moved, at most every 5 min. |
 | `pvfs.mount.delete_failed` | error | system | A delete through the view failed (EIO). |
 | `pvfs.mount.delete_refused` | warning | system | A delete was refused: this box's copy is not the file shown. |
 | `pvfs.mount.deleted` | info | system | A delete through the view succeeded. |
@@ -160,9 +160,10 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.mount.rmdir_failed` | error | system | An rmdir through the view failed. |
 | `pvfs.mount.rmdir_refused` | warning | system | An rmdir was refused (not empty on a holder). |
 | `pvfs.mount.status_unwritten` | warning | system | The mount's status file could not be written. |
+| `pvfs.mount.stream_verified` | debug | system | A file read through in stream mode is whole and verified (one per file; the cache report counts them). |
 | `pvfs.mount.streaming` | info | system | A file streams while its fetch verifies. |
 | `pvfs.mount.unmount_failed` | error | system | Still mounted after `fusermount -uz`. |
-| `pvfs.mount.verified` | info | system | A read-through file is whole and verified. |
+| `pvfs.mount.verified` | info | system | A read-through file is whole, verified and kept (keep mode). |
 | `pvfs.notify.failed` | warning | system | A fleet notification was not sent, or emit failed. |
 | `pvfs.notify.sent` | info | system | A fleet notification was sent. |
 | `pvfs.pairing.revoked` | notice | audit | A paired server was removed. |

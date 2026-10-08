@@ -40,7 +40,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use pvfs_core::{Engine, ReplicaSource};
-use pvfs_log::{content, pv_info, pv_warn};
+use pvfs_log::{content, pv_debug, pv_info, pv_warn};
 
 use crate::ClientError;
 
@@ -955,7 +955,10 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
     };
     if got == fetch.hash && cache.opts.mode == CacheMode::Stream {
         // Nothing is kept: the verified partial serves until the last close.
-        pv_info!("pvfs.mount.verified", hash = &fetch.hash[..8], bytes = fetch.size, kept = false;
+        // One per file a scan or a stream finishes (~9,300 a day on mediabox),
+        // so `debug`; the janitor's report counts them (PVOS D223).
+        cache.verified.fetch_add(1, Ordering::Relaxed);
+        pv_debug!("pvfs.mount.stream_verified", hash = &fetch.hash[..8], bytes = fetch.size;
             "mount: {} is whole and verified ({} bytes; stream mode keeps nothing)", &fetch.hash[..8], fetch.size);
         fetch.finish(Ok(fetch.part.clone()));
         return;
@@ -966,6 +969,7 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
             Ok(()) => {
                 touch(&fetch.final_path);
                 cache.completed.fetch_add(1, Ordering::Relaxed);
+                cache.verified.fetch_add(1, Ordering::Relaxed);
                 pv_info!("pvfs.mount.verified", hash = &fetch.hash[..8], bytes = fetch.size, kept = true;
                     "mount: {} is whole, verified and kept ({} bytes)", &fetch.hash[..8], fetch.size);
                 fetch.finish(Ok(fetch.final_path.clone()));
@@ -1248,6 +1252,9 @@ struct CacheInner {
     pool: Mutex<HashMap<String, Vec<crate::Client>>>,
     probes: AtomicU64,
     completed: AtomicU64,
+    /// Files read through to the end and verified, kept or not (PVOS D223:
+    /// the report counts what stream mode's per-file line, now `debug`, says).
+    verified: AtomicU64,
     fetched: AtomicU64,
     /// The box that served last. A scan walks a library directory by
     /// directory, so the next file is most likely on the same box: asking it
@@ -1401,6 +1408,7 @@ impl HashCache {
             pool: Mutex::new(HashMap::new()),
             probes: AtomicU64::new(0),
             completed: AtomicU64::new(0),
+            verified: AtomicU64::new(0),
             fetched: AtomicU64::new(0),
             hint: AtomicUsize::new(0),
         });
@@ -1514,7 +1522,7 @@ impl HashCache {
     pub fn start_janitor(&self) {
         let weak = Arc::downgrade(&self.inner);
         std::thread::spawn(move || {
-            let mut said = (0u64, 0u64, 0u64);
+            let mut said = (0u64, 0u64, 0u64, 0u64);
             let mut slept = Duration::ZERO;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -1527,14 +1535,15 @@ impl HashCache {
                 let r = inner.evict();
                 let now = (
                     inner.probes.load(Ordering::Relaxed),
+                    inner.verified.load(Ordering::Relaxed),
                     inner.completed.load(Ordering::Relaxed),
                     inner.fetched.load(Ordering::Relaxed),
                 );
                 if now != said || r.removed > 0 {
-                    pv_info!("pvfs.mount.cache", opened = now.0, kept_whole = now.1, fetched_bytes = now.2,
+                    pv_info!("pvfs.mount.cache", opened = now.0, verified = now.1, kept_whole = now.2, fetched_bytes = now.3,
                         entries = r.kept, bytes = r.kept_bytes, evicted = r.removed, evicted_bytes = r.removed_bytes;
-                        "mount: read-through cache — {} file(s) opened through, {} kept whole, {} bytes fetched; holding {} entries, {} bytes; evicted {} ({} bytes)",
-                        now.0, now.1, now.2, r.kept, r.kept_bytes, r.removed, r.removed_bytes
+                        "mount: read-through cache — {} file(s) opened through, {} verified, {} kept whole, {} bytes fetched; holding {} entries, {} bytes; evicted {} ({} bytes)",
+                        now.0, now.1, now.2, now.3, r.kept, r.kept_bytes, r.removed, r.removed_bytes
                     );
                     said = now;
                 }

@@ -16,6 +16,8 @@ use pvfs_client::hash_cache::{CacheMode, CacheOpts, HashCache, HashFetch, Opened
 use pvfs_core::acl::{self, Principal};
 use pvfs_core::{crypto, identity, sync, BindSpec, Engine, HashPolicy, NodeSpec, ReplicaSource, TYPE_FOLDER};
 use pvfsd::{serve, Daemon};
+use pvfs_log::testing::GlobalCapture;
+use pvfs_log::{Record, Severity, Value};
 
 const PIECE: u64 = 64 * 1024;
 /// 40 whole pieces and a 1000-byte last one: the tail a probe reads is
@@ -26,6 +28,8 @@ struct Holder {
     src: ReplicaSource,
     big: (String, Vec<u8>),
     two: (String, Vec<u8>),
+    /// Read only by the D223 report test, so its count is its own.
+    three: (String, Vec<u8>),
     bad: String,
     _keep: Vec<tempfile::TempDir>,
 }
@@ -48,8 +52,10 @@ fn holder() -> &'static Holder {
         std::fs::create_dir_all(files.path().join("Shows")).unwrap();
         let big = bytes(BIG, 1);
         let two = bytes(9 * PIECE as usize + 17, 2);
+        let three = bytes(3 * PIECE as usize + 5, 3);
         std::fs::write(files.path().join("Shows/big.mkv"), &big).unwrap();
         std::fs::write(files.path().join("Shows/two.mkv"), &two).unwrap();
+        std::fs::write(files.path().join("Shows/three.mkv"), &three).unwrap();
         std::fs::write(files.path().join("Shows/bad.mkv"), b"beta").unwrap();
 
         let (mut owner, mn) = Engine::init(dir.path()).unwrap();
@@ -106,6 +112,7 @@ fn holder() -> &'static Holder {
             },
             big: (h_big, big),
             two: (blake3::hash(&two).to_hex().to_string(), two),
+            three: (blake3::hash(&three).to_hex().to_string(), three),
             bad: blake3::hash(b"beta").to_hex().to_string(),
             _keep: vec![cfg, dir, files, sockdir],
         }
@@ -265,8 +272,16 @@ fn a_small_file_is_verified_whole_and_not_kept() {
     let (dir, cache) = reader(small());
     let f = stream(&cache, hash, data.len());
     // ten pieces, under `complete_after`: verified before its last is served
+    let logs = GlobalCapture::start();
     assert_eq!(read(&f, 0, data.len()), *data);
     assert!(sync::hash_store_lookup(dir.path(), hash).unwrap().is_none(), "verified, not kept");
+    // PVOS D223 — one `debug` record for the file, no `info` one.
+    let mine = |r: &Record| r.fields.iter().any(|x| x.name == "hash" && x.value == Value::Str(hash[..8].to_string()));
+    let said: Vec<Record> = logs.events("pvfs.mount.stream_verified").into_iter().filter(|r| mine(r)).collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].severity, Severity::Debug);
+    assert!(said[0].msg.contains("is whole and verified"), "{}", said[0].msg);
+    assert!(logs.events("pvfs.mount.verified").iter().all(|r| !mine(r)), "stream mode logs no info line per file");
     assert!(partial(dir.path(), hash).exists(), "served from the partial while open");
     f.handle_closed();
     until("gone at close", Duration::from_secs(5), || !partial(dir.path(), hash).exists());
@@ -277,6 +292,27 @@ fn a_small_file_is_verified_whole_and_not_kept() {
     let why = bad.read_range(0, 4, Duration::from_secs(20)).expect_err("wrong bytes must not be served");
     assert!(why.contains(&h.src.target) && why.contains("hash"), "{why}");
     bad.handle_closed();
+}
+
+/// PVOS D223 — the janitor's report counts the files verified in stream
+/// mode, which no longer get an `info` line each.
+#[test]
+fn the_cache_report_counts_what_stream_mode_verified() {
+    let logs = GlobalCapture::start();
+    let (hash, data) = &holder().three;
+    let (dir, cache) = reader(CacheOpts { janitor_every: Duration::from_secs(1), ..small() });
+    cache.start_janitor();
+    let f = stream(&cache, hash, data.len());
+    assert_eq!(read(&f, 0, data.len()), *data);
+    f.handle_closed();
+    let mine = |r: &Record| r.fields.iter().any(|x| x.name == "verified" && x.value == Value::UInt(1));
+    until("a report that counts the file", Duration::from_secs(10), || {
+        logs.events("pvfs.mount.cache").iter().any(mine)
+    });
+    let report = logs.events("pvfs.mount.cache").into_iter().find(|r| mine(r)).unwrap();
+    assert_eq!(report.severity, Severity::Info);
+    assert!(report.msg.contains(", 1 verified, 0 kept whole,"), "{}", report.msg);
+    drop(dir);
 }
 
 #[test]
