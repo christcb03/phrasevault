@@ -5,6 +5,13 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A Loki destination takes `labels` (PVOS D224).** Extra stream labels
+  on every push, such as `{"env": "prod"}`, so records sent by a box with
+  no Alloy (the NAS) match the same alert rules as the journal streams.
+  Names may not be `job`, `host`, `service`, `level` or `category`; only
+  `loki` destinations take them. `pvfs log destinations add` asks for
+  them. An older daemon ignores the key.
+
 - **Elasticsearch's default index is `logs-pvfs-default` (was `pvfs-logs`),
   and pvosd's web refusals are ECS `web` (PVOS D222e, found live).** Against
   a real Elasticsearch 9.5.2, `pvfs-logs` was a plain index; a name in

@@ -123,7 +123,7 @@ pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
                 &url.path_or("/loki/api/v1/push"),
                 &d.cfg.tls,
                 &headers,
-                format::loki_body(&items).as_bytes(),
+                format::loki_body(&items, &d.cfg.labels).as_bytes(),
             )?;
             if (200..300).contains(&code) {
                 Ok(())

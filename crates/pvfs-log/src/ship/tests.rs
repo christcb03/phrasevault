@@ -36,6 +36,7 @@ fn dest(kind: Kind) -> Destination {
         services: vec![],
         tls: TlsSettings::default(),
         secret: None,
+        labels: Default::default(),
         spool_mb: 1,
     }
 }
@@ -113,7 +114,7 @@ fn hec_and_loki_bodies() {
     assert_eq!(j["event"]["event"], "pvfs.job.failed");
     let s = rec("pvfs.auth.refused", "pvfsd: refused", Category::Security, vec![]);
     let sv = render(&s, Privacy::Full, None);
-    let body = format::loki_body(&[(&r, v), (&s, sv)]);
+    let body = format::loki_body(&[(&r, v.clone()), (&s, sv.clone())], &Default::default());
     let j: serde_json::Value = serde_json::from_str(&body).unwrap();
     let streams = j["streams"].as_array().unwrap();
     assert_eq!(streams.len(), 2, "system and security lines are separate streams");
@@ -122,6 +123,65 @@ fn hec_and_loki_bodies() {
     assert_eq!(sec["values"][0][0], "1791418934370000000");
     assert_eq!(sec["values"][0][1], "pvfsd: refused");
     assert_eq!(sec["values"][0][2]["event"], "pvfs.auth.refused");
+    // PVOS D224 — a destination's own labels go on every stream.
+    let extra: std::collections::BTreeMap<String, String> = [("env".to_string(), "prod".to_string())].into();
+    let j: serde_json::Value = serde_json::from_str(&format::loki_body(&[(&r, v), (&s, sv)], &extra)).unwrap();
+    let streams = j["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 2);
+    for st in streams {
+        assert_eq!(st["stream"]["env"], "prod", "{st}");
+        assert_eq!(st["stream"]["job"], "pvlog");
+        assert!(st["stream"]["host"].is_string() && st["stream"]["level"].is_string());
+    }
+}
+
+/// PVOS D224 — labels: Loki only, label names, never one PVFS sets.
+#[test]
+fn a_loki_destinations_labels_are_checked() {
+    let mut d = dest(Kind::Loki);
+    d.url = Some("http://loki.example:3100".into());
+    d.labels = [("env".to_string(), "prod".to_string()), ("site".to_string(), "home".to_string())].into();
+    assert!(d.problems().is_empty(), "{:?}", d.problems());
+    for (k, v, why) in [
+        ("job", "x", "set by PVFS"),
+        ("category", "x", "set by PVFS"),
+        ("__name", "x", "not a label name"),
+        ("9lives", "x", "not a label name"),
+        ("bad-name", "x", "not a label name"),
+        ("env", "", "1 to 128"),
+    ] {
+        let mut b = d.clone();
+        b.labels = [(k.to_string(), v.to_string())].into();
+        assert!(b.problems().iter().any(|p| p.contains(why)), "{k}={v}: {:?}", b.problems());
+    }
+    let mut hec = dest(Kind::SplunkHec);
+    hec.url = Some("https://splunk.example:8088".into());
+    hec.labels = [("env".to_string(), "prod".to_string())].into();
+    assert!(hec.problems().iter().any(|p| p.contains("loki destination only")), "{:?}", hec.problems());
+    // A file written with labels reads back with them; one without has none.
+    let j = serde_json::to_string(&d).unwrap();
+    assert!(j.contains("\"labels\":{\"env\":\"prod\",\"site\":\"home\"}"), "{j}");
+    let back: Destination = serde_json::from_str(&j).unwrap();
+    assert_eq!(back.labels, d.labels);
+    assert!(!serde_json::to_string(&dest(Kind::Loki)).unwrap().contains("labels"));
+}
+
+/// PVOS D224 — the sender pushes the labels to Loki.
+#[test]
+fn the_loki_sender_pushes_the_destinations_labels() {
+    let d = tempfile::tempdir().unwrap();
+    let r = rec("pvfs.tls.handshake_failed", "pvfsd: TLS handshake failed", Category::Security, vec![]);
+    let (url, t) = http_server(vec![(204, "")]);
+    let mut l = dest(Kind::Loki);
+    l.url = Some(url);
+    l.labels = [("env".to_string(), "prod".to_string())].into();
+    let ld = mk_dest(l, None, &d.path().join("l"));
+    sender::deliver(&ld, std::slice::from_ref(&r)).unwrap();
+    let got = t.join().unwrap();
+    assert!(got[0].0.starts_with("POST /loki/api/v1/push HTTP/1.1"), "{}", got[0].0);
+    let j: serde_json::Value = serde_json::from_str(&got[0].1).unwrap();
+    assert_eq!(j["streams"][0]["stream"]["env"], "prod");
+    assert_eq!(j["streams"][0]["stream"]["category"], "security");
 }
 
 #[test]

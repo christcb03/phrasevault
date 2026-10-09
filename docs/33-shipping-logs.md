@@ -76,6 +76,7 @@ Tokens are kept in the PVOS keychain.
 | `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `logs-pvfs-default` |
 | `header` | the header the token goes in. For `Authorization` the token is sent as `Bearer <token>` (Elasticsearch: `ApiKey <token>`) unless it names its own scheme (`Basic …`) | `Authorization` |
 | `secret` | a file holding the token (relative to this file) | none |
+| `labels` | Loki only: extra stream labels on every push, `{"env": "prod"}`. Names are label names, not `job`, `host`, `service`, `level` or `category`; values 1–128 characters. Fixed values only: each distinct set is a Loki stream | none |
 | `tls.ca_file` | trust only this CA bundle (PEM) | the public roots |
 | `tls.pin_sha256` | trust only this certificate (`openssl x509 -fingerprint -sha256`) | — |
 | `privacy` | `minimal`, `identified`, `full` | `minimal` |
@@ -117,8 +118,11 @@ self-signed certificate is trusted by its pin.
 ### What each receiver gets
 
 - **Loki**: a push with labels `job="pvlog"`, `host`, `service`, `level`,
-  and `category` on audit/security lines. The line is the text a person
-  reads. `event`, `outcome` and `id` are structured metadata.
+  `category` on audit/security lines, and the destination's own `labels`
+  (PVOS D224: the fleet gives the NAS `env="prod"`, the label our alert
+  rules select, which Alloy gives the journal streams). The line is the
+  text a person reads. `event`, `outcome` and `id` are structured
+  metadata.
 - **Splunk HEC**: one event per record, with `time`, `host`, `source` (the
   service) and `sourcetype`. The `event` is the record as JSON (schema 1,
   [doc 32](32-log-events.md)). Search with

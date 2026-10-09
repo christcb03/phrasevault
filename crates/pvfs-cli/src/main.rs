@@ -11417,6 +11417,7 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
         services: vec![],
         tls: TlsSettings::default(),
         secret: None,
+        labels: Default::default(),
         spool_mb: 256,
     };
     let mut uses_tls = false;
@@ -11454,6 +11455,12 @@ fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Resu
         }
         Kind::Loki => {
             d.url = Some(prompt_line("Loki's URL", Some("http://192.168.1.83:3100"))?);
+            // PVOS D224 — fixed stream labels, e.g. env=prod for the alerts.
+            let extra = prompt_line("extra stream labels, name=value, comma-separated (fixed values such as env=prod; blank = none)", Some(""))?;
+            for pair in extra.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (k, v) = pair.split_once('=').ok_or_else(|| log_err(format!("label {pair:?}: write it as name=value")))?;
+                d.labels.insert(k.trim().to_string(), v.trim().to_string());
+            }
         }
         Kind::HttpsJson => {
             d.url = Some(prompt_line("the receiver's URL", None)?);
