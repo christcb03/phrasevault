@@ -1,4 +1,4 @@
-//! PVOS D225 — a panic is a `pvfs.panic` record. Its own test binary: the
+//! PVOS D225 — a panic is a `pvfs.thread.panicked` record. Its own test binary: the
 //! hook is process-wide.
 
 use pvfs_log::testing::GlobalCapture;
@@ -18,7 +18,7 @@ fn a_panic_becomes_a_critical_record_and_the_hook_does_not_recurse() {
         .spawn(|| panic!("could not open /srv/media/Films/Secret (2026)/x.mkv"))
         .unwrap();
     assert!(t.join().is_err(), "the thread panicked");
-    let got = logs.events("pvfs.panic");
+    let got = logs.events("pvfs.thread.panicked");
     assert_eq!(got.len(), 1, "{got:?}");
     let r = &got[0];
     assert_eq!(r.severity, Severity::Critical);
@@ -36,7 +36,7 @@ fn a_panic_becomes_a_critical_record_and_the_hook_does_not_recurse() {
     // A second panic is a second record (the guard was reset).
     let t = std::thread::Builder::new().name("worker-8".into()).spawn(|| panic!("again")).unwrap();
     assert!(t.join().is_err());
-    let got = logs.events("pvfs.panic");
+    let got = logs.events("pvfs.thread.panicked");
     assert_eq!(got.len(), 2, "{got:?}");
     assert_eq!(field(&got[1], "thread"), Some(&Value::Str("worker-8".into())));
 }

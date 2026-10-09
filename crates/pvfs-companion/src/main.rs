@@ -539,9 +539,8 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     // PVOS D222 — the long-running agent logs records (journal fields under
     // systemd, today's text anywhere else); every other subcommand keeps
     // plain text, as the logger is never set up for it.
-    pvfs_log::init_daemon("pvfs-companion");
-    // PVOS D225 — the build that writes this log, first.
-    pv_notice!("pvfs.companion.started", build = VERSION, pid = std::process::id(); "pvfs-companion: build {VERSION} starting (pid {})", std::process::id());
+    // PVOS D225 — the build that writes this log is its first record.
+    pvfs_log::init_daemon_with_build("pvfs-companion", VERSION);
     // Serving now: re-ignore SIGPIPE (main gave it the default disposition for
     // the filter commands). A browser or CLI client that disconnects mid-write
     // must surface as EPIPE on that connection, not kill the signing agent.

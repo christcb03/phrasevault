@@ -578,7 +578,17 @@ pub fn init_daemon(service: &str) -> bool {
     set
 }
 
-/// PVOS D225 — a panic is a record: `pvfs.panic` at critical (the thread,
+/// [`init_daemon`], then the build that writes this log as its first record
+/// (PVOS D225): `pvfs.process.started` with `build` and `pid`, so a log read
+/// after an upgrade or a crash says which build wrote it.
+pub fn init_daemon_with_build(service: &str, build: &str) -> bool {
+    let set = init_daemon(service);
+    let pid = std::process::id();
+    crate::pv_notice!("pvfs.process.started", build = build, pid = pid; "{service}: build {build} starting (pid {pid})");
+    set
+}
+
+/// PVOS D225 — a panic is a record: `pvfs.thread.panicked` at critical (the thread,
 /// where, and the message), to the journal or file and to every destination,
 /// then Rust's own report as before (with its backtrace under
 /// `RUST_BACKTRACE`). Without it a panic was one unlevelled stderr line no
@@ -603,7 +613,7 @@ pub fn install_panic_hook() {
                     .unwrap_or_else(|| "(no message)".into());
                 let line = format!("{}: PANIC in thread '{thread}' at {at}: {message}", logger().cfg.service);
                 let fields = vec![thread.to_field("thread"), at.to_field("at"), content(&message).to_field("message")];
-                __emit(Severity::Critical, Category::System, Some(Outcome::Failure), "pvfs.panic", line, fields);
+                __emit(Severity::Critical, Category::System, Some(Outcome::Failure), "pvfs.thread.panicked", line, fields);
                 IN_HOOK.with(|f| f.set(false));
             }
             previous(info);

@@ -87,6 +87,22 @@ The signed log is still the record of authority; these lines are how a
 SIEM hears of it. Our log server keeps both categories 90 days and alerts on
 a burst of refusals and on a revoked key used (HomeLab `docs/LOGGING.md`).
 
+## From the logging library itself (PVOS D225)
+
+Every daemon logs these through `pvfs-log`, so they are not in the table
+below (it lists the names each crate logs; doc 33 lists the shipping ones):
+
+- **`pvfs.process.started`** (notice, system): the first record of pvfsd,
+  the mount and the companion (`init_daemon_with_build`), with `build` and
+  `pid`, e.g. `pvfsd: build 1.4.0 (v1.4-592-g…) starting (pid 4131)`. A log
+  read after an upgrade or a crash says which build wrote it. pvosd has its
+  own, `pvos.boot.started`.
+- **`pvfs.thread.panicked`** (critical, system, outcome failure): a thread
+  panicked. Fields: `thread`, `at` (file:line) and `message` (content: it
+  can hold a path). It goes to the journal or file and to the
+  destinations, and Rust's own report follows it as before. It is
+  installed by `init_daemon`, so every daemon has it, pvosd too.
+
 ## Event names
 
 `pvfs.<area>.<what>`. Renaming or removing one is a breaking change for
@@ -126,9 +142,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.companion.prompt` | info | system | An interactive prompt or retry hint at the terminal. |
 | `pvfs.companion.runtime_file` | notice | system | A runtime file was rewritten, or left to another instance. |
 | `pvfs.companion.runtime_file_failed` | warning | system | A runtime file could not be read, touched or rewritten; retried later. |
-| `pvfs.companion.started` | notice | system | The agent starts serving; its build and pid (D225). |
 | `pvfs.companion.took_over` | notice | system | A running instance was stopped and replaced. |
-| `pvfs.daemon.started` | notice | system | pvfsd starts; its build and pid, before anything else (D225). |
 | `pvfs.engine.close_failed` | warning | system | The runner's own engine did not close cleanly. |
 | `pvfs.fence.diverged` | warning | system | A routed write was refused: its log diverges from this owner's. |
 | `pvfs.fence.fenced` | error | system | This owner is FENCED: a peer holds a longer log. |
@@ -161,7 +175,6 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.mount.renamed` | info | system | A rename was done on the boxes that hold the copies. |
 | `pvfs.mount.rmdir_failed` | error | system | An rmdir through the view failed. |
 | `pvfs.mount.rmdir_refused` | warning | system | An rmdir was refused (not empty on a holder). |
-| `pvfs.mount.started` | notice | system | The mount starts; its build and pid (D225). |
 | `pvfs.mount.status_unwritten` | warning | system | The mount's status file could not be written. |
 | `pvfs.mount.stream_verified` | debug | system | A file read through in stream mode is whole and verified (one per file; the cache report counts them). |
 | `pvfs.mount.streaming` | info | system | A file streams while its fetch verifies. |
@@ -172,7 +185,6 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.pairing.revoked` | notice | audit | A paired server was removed. |
 | `pvfs.pairing.trusted` | notice | audit | A URL was pre-trusted for a pairing. |
 | `pvfs.pairing.untrusted` | notice | audit | A trusted URL was forgotten. |
-| `pvfs.panic` | critical | system | A thread panicked: the thread, where, and the message (D225; every daemon, through `init_daemon`). |
 | `pvfs.priority.lower_failed` | warning | system | A thread or the hashing pool stays at the daemon's priority. |
 | `pvfs.priority.nice_denied` | warning | system | A job holding the writer keeps its lowered CPU priority (needs LimitNICE=). |
 | `pvfs.priority.policy` | notice | system | The background-priority policy at start. |
