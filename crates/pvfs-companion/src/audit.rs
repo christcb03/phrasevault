@@ -177,6 +177,30 @@ mod tests {
         assert!(lines[2].contains("\"decision\":\"denied\""));
     }
 
+    /// PVOS D228 (D222b Deviation 6) — each entry is also a record:
+    /// `pvfs.agent.audit`, category audit; approved is success, anything
+    /// else failure; the origin is a network field (gone at `minimal` unless
+    /// security/audit keeps it), the summary content.
+    #[test]
+    fn each_entry_is_an_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(&dir.path().join("audit.jsonl")).unwrap();
+        let recs = pvfs_log::capture(|| {
+            log.sign("identity_tag", "https://app.example", "approved", &"aa".repeat(32));
+            log.sign("root_device_cert", "local", "denied", &"bb".repeat(32));
+        });
+        let audits: Vec<_> = recs.iter().filter(|r| r.event == "pvfs.agent.audit").collect();
+        assert_eq!(audits.len(), 2, "{recs:?}");
+        assert_eq!(audits[0].category, pvfs_log::Category::Audit);
+        assert_eq!(audits[0].outcome, Some(pvfs_log::Outcome::Success));
+        assert_eq!(audits[1].outcome, Some(pvfs_log::Outcome::Failure));
+        assert_eq!(audits[1].severity, pvfs_log::Severity::Warning);
+        let field = |r: &pvfs_log::Record, n: &str| r.fields.iter().find(|f| f.name == n).map(|f| (f.class, f.value.to_string()));
+        assert_eq!(field(audits[0], "origin"), Some((pvfs_log::Class::Net, "https://app.example".into())));
+        assert_eq!(field(audits[1], "decision"), Some((pvfs_log::Class::Meta, "denied".into())));
+        assert!(audits[0].msg.contains("audit: sign identity_tag from https://app.example: approved"), "{}", audits[0].msg);
+    }
+
     #[cfg(unix)]
     #[test]
     fn audit_file_is_private() {
