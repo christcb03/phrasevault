@@ -84,9 +84,22 @@ chmod +x "$MACOS_DIR/PVFS Companion"
 # PkgInfo
 echo -n 'APPL????' > "$OUT/Contents/PkgInfo"
 
+# Signing. Ad-hoc signing names each build by its own hash, so to the
+# Keychain every build is a new app: it asks again, per phrase, with the
+# login password. Signed with one certificate kept in the login keychain, a
+# build is "com.phrasevault.pvfs-companion signed by that certificate", and
+# an Always Allow given once carries over to every later build. Make the
+# certificate once in Keychain Access (README, "Signing").
+SIGN_ID="${PVFS_SIGN_IDENTITY:-PVFS Companion Signing}"
 if command -v codesign >/dev/null; then
-  echo "==> Ad-hoc codesign"
-  codesign --force --deep --sign - "$OUT" 2>/dev/null || true
+  if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_ID\"" \
+     && codesign --force --sign "$SIGN_ID" --identifier com.phrasevault.pvfs-companion "$MACOS_DIR/pvfs-companion" \
+     && codesign --force --sign "$SIGN_ID" "$OUT"; then
+    echo "==> Signed with \"$SIGN_ID\" (Keychain approvals carry over to the next build)"
+  else
+    echo "==> Ad-hoc codesign (no \"$SIGN_ID\" certificate: the Keychain asks again after each build; README, \"Signing\")"
+    codesign --force --deep --sign - "$OUT" 2>/dev/null || true
+  fi
 fi
 
 echo ""

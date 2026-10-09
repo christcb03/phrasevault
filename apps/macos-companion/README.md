@@ -112,3 +112,25 @@ apps/macos-companion/
   package-dmg.sh    → dist/PVFS-Companion-*.dmg
   Info.plist
 ```
+
+## Signing (so the Keychain stops asking after every build)
+
+macOS lets a program read a Keychain item when the program matches what was
+allowed, and an ad-hoc signed build matches only itself. So after each
+`updateCompanion.sh`, the Keychain asks again for every phrase, with the
+login password. Signed with a certificate of your own, every build is the
+same program to the Keychain.
+
+Once, in **Keychain Access**:
+
+1. Menu **Keychain Access → Certificate Assistant → Create a Certificate…**
+2. Name **`PVFS Companion Signing`**, Identity Type **Self Signed Root**,
+   Certificate Type **Code Signing**. Click Create, then Done.
+
+`build.sh` finds it by that name and signs with it (`PVFS_SIGN_IDENTITY`
+names another). The first install signed this way asks one last time per
+phrase: choose **Always Allow**. Later builds do not ask. If `build.sh` still
+says "Ad-hoc", open the certificate in Keychain Access, then **Trust → Code
+Signing: Always Trust**. The certificate lives in the login keychain. If it
+is deleted, builds go back to ad-hoc and the prompts return until it is
+made again.
