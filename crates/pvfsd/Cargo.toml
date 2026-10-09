@@ -41,6 +41,7 @@ rayon-core = "1.13"
 
 [dev-dependencies]
 pvfs-client = { path = "../pvfs-client" }
+serde_json.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 hex.workspace = true

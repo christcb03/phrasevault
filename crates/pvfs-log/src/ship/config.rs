@@ -130,6 +130,12 @@ pub struct Destination {
     /// values only (an environment, a site), never per-record ones.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Elasticsearch only (PVOS D228): send each record's id as the
+    /// document's `_id`, so a resent batch does not store what was taken
+    /// (a 409 for it counts as delivered). Off by default: Elastic advises
+    /// leaving `_id` unset on LogsDB data streams (the `logs-*-*` default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doc_ids: bool,
     /// The spool's cap in MiB (default 256).
     #[serde(default = "spool_default")]
     pub spool_mb: u64,
@@ -258,6 +264,9 @@ impl Destination {
         }
         if !self.labels.is_empty() && self.kind != Kind::Loki {
             p.push(format!("{n}: labels are for a loki destination only"));
+        }
+        if self.doc_ids && self.kind != Kind::Elasticsearch {
+            p.push(format!("{n}: doc_ids is for an elasticsearch destination only"));
         }
         for (k, v) in &self.labels {
             let name_ok = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')

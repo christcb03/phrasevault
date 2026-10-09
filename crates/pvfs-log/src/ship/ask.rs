@@ -58,6 +58,7 @@ pub fn ask_destination(taken: &[String], ask: &mut Ask<'_>, confirm: &mut Confir
         tls: TlsSettings::default(),
         secret: None,
         labels: Default::default(),
+        doc_ids: false,
         spool_mb: 256,
     };
     let mut uses_tls = false;
@@ -82,6 +83,12 @@ pub fn ask_destination(taken: &[String], ask: &mut Ask<'_>, confirm: &mut Confir
         Kind::Elasticsearch => {
             d.url = Some(ask("Elasticsearch / OpenSearch URL", Some("https://elastic.example.com:9200"))?);
             d.index = Some(ask("index or data stream", Some(DEFAULT_ES_INDEX))?);
+            // PVOS D228 — idempotent resends, where the target takes ids.
+            let ids = ask(
+                "send each record's id as the document id, so a resend is not stored twice? (yes only for a plain index or a stream that takes ids — not the logs-*-* default)",
+                Some("no"),
+            )?;
+            d.doc_ids = matches!(ids.trim().to_ascii_lowercase().as_str(), "y" | "yes");
             token_wanted = true;
         }
         Kind::Otlp => {

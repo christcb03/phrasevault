@@ -70,6 +70,18 @@ impl Dest {
     }
 }
 
+/// PVOS D228 — a `_bulk` reply whose failed items (status 300 and up) are
+/// all 409, version conflicts: documents with those ids already exist.
+fn bulk_failures_are_duplicates(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+    let Some(items) = v.get("items").and_then(|i| i.as_array()) else { return false };
+    let statuses: Vec<u64> = items
+        .iter()
+        .filter_map(|item| item.as_object().and_then(|o| o.values().next()).and_then(|op| op.get("status")).and_then(|s| s.as_u64()))
+        .collect();
+    statuses.len() == items.len() && statuses.iter().filter(|s| **s >= 300).all(|s| *s == 409) && statuses.iter().any(|s| *s == 409)
+}
+
 /// Send these records now, as this destination wants them.
 pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
     let privacy = d.cfg.privacy();
@@ -170,9 +182,13 @@ pub fn deliver(d: &Dest, recs: &[Record]) -> Result<(), String> {
                 "application/x-ndjson",
                 &d.cfg.tls,
                 &auth_headers(d, "ApiKey"),
-                format::es_bulk(&items, index).as_bytes(),
+                format::es_bulk(&items, index, d.cfg.doc_ids).as_bytes(),
             )?;
             if (200..300).contains(&code) && !text.contains("\"errors\":true") {
+                Ok(())
+            } else if (200..300).contains(&code) && d.cfg.doc_ids && bulk_failures_are_duplicates(&text) {
+                // PVOS D228 — every failed item is a 409: those records were
+                // already taken (a resend after a lost reply), so delivered.
                 Ok(())
             } else {
                 Err(format!("Elasticsearch answered {code}: {}", text.chars().take(300).collect::<String>()))

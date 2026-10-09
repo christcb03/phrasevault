@@ -452,10 +452,15 @@ pub fn ecs(rec: &Record, view: &View) -> String {
 }
 
 /// Elasticsearch `_bulk`: an action line and an ECS document per record.
-pub fn es_bulk(items: &[(&Record, View)], index: &str) -> String {
+pub fn es_bulk(items: &[(&Record, View)], index: &str, doc_ids: bool) -> String {
     let mut s = String::new();
     for (rec, view) in items {
-        s.push_str(&format!("{{\"create\":{{\"_index\":{}}}}}\n", js(index)));
+        if doc_ids {
+            // PVOS D228 — the record's id as `_id`: a resend is a 409, not a copy.
+            s.push_str(&format!("{{\"create\":{{\"_index\":{},\"_id\":{}}}}}\n", js(index), js(&rec.id)));
+        } else {
+            s.push_str(&format!("{{\"create\":{{\"_index\":{}}}}}\n", js(index)));
+        }
         s.push_str(&ecs(rec, view));
         s.push('\n');
     }
