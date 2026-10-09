@@ -134,6 +134,16 @@ fn hec_and_loki_bodies() {
         assert_eq!(st["stream"]["job"], "pvlog");
         assert!(st["stream"]["host"].is_string() && st["stream"]["level"].is_string());
     }
+    // PVOS D229 — a failure's kind is structured metadata, kept at `minimal`
+    // (where its error text is not); a record without one has none.
+    let mut k = rec("pvfs.job.failed", "pvfsd: watch failed: refused", Category::System, vec![]);
+    k.fields.push(crate::content("connection refused").to_field("error"));
+    k.fields.push("network:refused".to_field("error_kind"));
+    let kv = render(&k, Privacy::Minimal, None);
+    let j: serde_json::Value = serde_json::from_str(&format::loki_body(&[(&k, kv), (&r, render(&r, Privacy::Full, None))], &Default::default())).unwrap();
+    let vals: Vec<&serde_json::Value> = j["streams"].as_array().unwrap().iter().flat_map(|s| s["values"].as_array().unwrap()).collect();
+    assert_eq!(vals[0][2]["error_kind"], "network:refused", "{j}");
+    assert!(vals[1][2].get("error_kind").is_none(), "{j}");
 }
 
 /// PVOS D224 — labels: Loki only, label names, never one PVFS sets.
