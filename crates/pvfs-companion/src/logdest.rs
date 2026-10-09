@@ -37,7 +37,8 @@ pub struct DestinationView {
 pub fn load(path: &Path) -> Result<ShipConfig, String> {
     match std::fs::read_to_string(path) {
         Ok(t) => ShipConfig::parse(&t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ShipConfig::default()),
+        // A new file is version 1 (the derived default is 0, which no reader takes).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ShipConfig { v: 1, ..Default::default() }),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }

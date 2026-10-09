@@ -31,6 +31,8 @@ SWIFT_FILES=(
   "$APP_SRC/Sources/SetupView.swift"
   "$APP_SRC/Sources/ConsoleView.swift"
   "$APP_SRC/Sources/KeysView.swift"
+  "$APP_SRC/Sources/Unlock.swift"
+  "$APP_SRC/Sources/LoggingView.swift"
   "$APP_SRC/Sources/AppRoot.swift"
 )
 
@@ -40,6 +42,7 @@ compile_swift() {
     -target "arm64-apple-macosx${MIN_VER}" \
     -parse-as-library \
     -framework ServiceManagement \
+    -framework LocalAuthentication \
     -framework AppKit \
     -framework SwiftUI \
     "${SWIFT_FILES[@]}" \

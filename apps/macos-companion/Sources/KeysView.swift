@@ -77,18 +77,26 @@ struct RootSignature: Decodable, Identifiable {
 /// root signatures it has made (devices admitted or revoked, promotions).
 struct KeysSections: View {
     @ObservedObject var agent: AgentController
+    /// PVOS D226 — what each key is used for shows only once unlocked.
+    @ObservedObject var unlocker: Unlocker
 
     var body: some View {
         Group {
             Section {
-                Text("Every recovery phrase this companion holds, its public keys, and what each key is used for. Forests are recorded when a tool (pvfs, promote.sh) uses a phrase for one; `pvfs-companion keys link` records an older one. Public keys only — no phrase ever leaves its vault.")
+                Text("Every recovery phrase this companion holds and its public keys. Public keys only — no phrase ever leaves its vault.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Text(agentLine).font(.caption)
                     Spacer()
+                    if !unlocker.unlocked {
+                        Button("Show history 🔒") { unlocker.unlock("show what your keys are used for") }
+                    }
                     Button("Refresh") { agent.refreshKeys() }
+                }
+                if let e = unlocker.lastError {
+                    Text(e).font(.caption).foregroundStyle(.red)
                 }
                 if let err = agent.keysError {
                     Text(err).font(.caption).foregroundStyle(.red)
@@ -98,7 +106,7 @@ struct KeysSections: View {
             }
             if let report = agent.keysReport {
                 ForEach(report.phrases) { p in
-                    PhraseSection(phrase: p)
+                    PhraseSection(phrase: p, showHistory: unlocker.unlocked)
                 }
             }
         }
@@ -116,34 +124,38 @@ struct KeysSections: View {
 
 private struct PhraseSection: View {
     let phrase: PhraseReport
+    /// Forests, servers, sign-ins, approvals, root signatures (D226: behind Touch ID).
+    let showHistory: Bool
 
     var body: some View {
         Section {
             LabeledContent("State", value: stateLine)
-            LabeledContent("Vault") {
-                Text(phrase.path).font(.caption2.monospaced()).textSelection(.enabled)
-            }
             if let k = phrase.keys {
                 KeyBlock(title: "Root key", hex: k.root,
                          note: "Signs a forest's device certificates, promotions and root rotations.",
+                         showHistory: showHistory,
                          forests: phrase.forests.filter { $0.role == "root" },
                          extra: AnyView(RootGrants(signatures: phrase.rootSignatures)))
                 KeyBlock(title: "Identity key", hex: k.identity,
                          note: "Signs you in and approves app actions.",
+                         showHistory: showHistory,
                          forests: phrase.forests.filter { $0.role == "identity" },
                          extra: AnyView(IdentityUses(pairings: phrase.pairings, origins: phrase.origins, approvals: phrase.approvals)))
                 KeyBlock(title: "Encryption key", hex: k.encryption,
                          note: "Opens the keys of secure nodes sealed to this phrase.",
+                         showHistory: showHistory,
                          forests: phrase.forests.filter { $0.role == "encryption" },
                          extra: AnyView(EmptyView()))
             } else {
                 Text(phrase.served ? "Keys unavailable." : "Not served by the running companion — its keys show when it is.")
                     .font(.caption).foregroundStyle(.secondary)
-                if !phrase.forests.isEmpty {
-                    ForEach(phrase.forests) { f in ForestRow(use: f, showRole: true) }
+                if showHistory {
+                    if !phrase.forests.isEmpty {
+                        ForEach(phrase.forests) { f in ForestRow(use: f, showRole: true) }
+                    }
+                    IdentityUses(pairings: phrase.pairings, origins: phrase.origins, approvals: phrase.approvals)
+                    RootGrants(signatures: phrase.rootSignatures)
                 }
-                IdentityUses(pairings: phrase.pairings, origins: phrase.origins, approvals: phrase.approvals)
-                RootGrants(signatures: phrase.rootSignatures)
             }
         } header: {
             Text("Phrase “\(phrase.vault)”\(phrase.isDefault ? " (default)" : "")")
@@ -168,6 +180,7 @@ private struct KeyBlock: View {
     let title: String
     let hex: String
     let note: String
+    let showHistory: Bool
     let forests: [ForestUse]
     let extra: AnyView
 
@@ -186,12 +199,14 @@ private struct KeyBlock: View {
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
             Text(note).font(.caption).foregroundStyle(.secondary)
-            if forests.isEmpty {
-                Text("No forest recorded for this key.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(forests) { f in ForestRow(use: f, showRole: false) }
+            if showHistory {
+                if forests.isEmpty {
+                    Text("No forest recorded for this key.").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(forests) { f in ForestRow(use: f, showRole: false) }
+                }
+                extra
             }
-            extra
         }
         .padding(.vertical, 4)
     }

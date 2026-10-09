@@ -43,6 +43,28 @@ final class AgentController: ObservableObject {
     /// PVOS D189 — Settings → Phrases & keys.
     @Published var keysReport: KeysReport?
     @Published var keysError: String?
+    /// PVOS D226 — Settings → Logging.
+    @Published var logDestinations: [LogDestinationRow] = []
+    @Published var logError: String?
+    @Published var logTestResults: [String: String] = [:]
+    /// Details → Build.
+    @Published var companionVersion: String = ""
+    /// PVOS D226 — Settings → Security and Logging, passed to `serve` when it
+    /// starts; a change while it runs asks for a restart.
+    @Published var idleLockMinutes: Int = UserDefaults.standard.object(forKey: "idleLockMinutes") as? Int ?? 15 {
+        didSet { UserDefaults.standard.set(idleLockMinutes, forKey: "idleLockMinutes"); markRestartNeeded() }
+    }
+    @Published var rateLimit: Int = UserDefaults.standard.object(forKey: "rateLimit") as? Int ?? 60 {
+        didSet { UserDefaults.standard.set(rateLimit, forKey: "rateLimit"); markRestartNeeded() }
+    }
+    @Published var logLevel: String = UserDefaults.standard.string(forKey: "logLevel") ?? "info" {
+        didSet { UserDefaults.standard.set(logLevel, forKey: "logLevel"); markRestartNeeded() }
+    }
+    @Published var restartNeeded = false
+
+    private func markRestartNeeded() {
+        if agentRunning { restartNeeded = true }
+    }
 
     private var agentProcess: Process?
     private var statusTimer: Timer?
@@ -217,11 +239,15 @@ final class AgentController: ObservableObject {
             args += ["--vault", extra.path]
         }
         args += ["--prompt", "desktop"]
+        // PVOS D226 — Settings → Security.
+        args += ["--idle-lock-secs", String(idleLockMinutes * 60), "--rate-limit", String(rateLimit)]
         proc.arguments = args
         var env = ProcessInfo.processInfo.environment
         if let pass, !pass.isEmpty {
             env["PVFS_COMPANION_PASSPHRASE"] = pass
         }
+        // PVOS D226 — Settings → Logging → Level.
+        env["PVFS_LOG_LEVEL"] = logLevel
         proc.environment = env
         // PVOS D222c — the companion's log (its records, the audit events it
         // logs since D222b) goes to ~/Library/Logs/PVFS/companion.log, which
@@ -232,6 +258,7 @@ final class AgentController: ObservableObject {
         try proc.run()
         agentProcess = proc
         needsVaultPassword = false
+        restartNeeded = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.refresh()
         }
@@ -455,13 +482,13 @@ final class AgentController: ObservableObject {
         return r.stdout
     }
 
-    private struct CmdResult {
+    struct CmdResult {
         var exitCode: Int32
         var stdout: String
         var stderr: String
     }
 
-    private func runCompanionCapturing(
+    func runCompanionCapturing(
         args: [String],
         env: [String: String],
         stdin: String?
