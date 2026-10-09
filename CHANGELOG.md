@@ -5,6 +5,13 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Daemons say their build when they start, and a panic is a record
+  (PVOS D225).** pvfsd, the mount and the companion log
+  `pvfs.daemon.started` / `pvfs.mount.started` / `pvfs.companion.started`
+  (`build`, `pid`) first. Every daemon (`init_daemon`, pvosd too) records a
+  panic as `pvfs.panic` at critical, with the thread, where, and the
+  message, to the journal and the destinations, before Rust's own report.
+
 - **A Loki destination takes `labels` (PVOS D224).** Extra stream labels
   on every push, such as `{"env": "prod"}`, so records sent by a box with
   no Alloy (the NAS) match the same alert rules as the journal streams.
