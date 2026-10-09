@@ -11336,8 +11336,12 @@ fn log_opts(path: &std::path::Path, cfg: &pvfs_log::ship::ShipConfig) -> pvfs_lo
     };
     for d in &cfg.destinations {
         if let Some(f) = &d.secret {
-            if let Ok(t) = std::fs::read_to_string(resolve(f)) {
-                o.secrets.insert(d.name.clone(), t.trim().to_string());
+            match pvfs_log::ship::read_secret(path, f) {
+                Ok(t) => {
+                    o.secrets.insert(d.name.clone(), t);
+                }
+                // PVOS D226 — a Keychain token belongs to the companion.
+                Err(e) => eprintln!("{}: {e}", d.name),
             }
         }
     }
@@ -11389,119 +11393,17 @@ fn log_pick(cfg: &pvfs_log::ship::ShipConfig, name: Option<String>, verb: &str) 
 }
 
 fn log_add(path: &std::path::Path, cfg: &mut pvfs_log::ship::ShipConfig) -> Result<String, PvfsError> {
-    use pvfs_log::ship::{Destination, Kind, TlsSettings};
-    let default_name = if cfg.destinations.iter().any(|d| d.name == "logs") { "" } else { "logs" };
-    let name = prompt_line("name for it (letters, digits, - and _)", Some(default_name).filter(|d| !d.is_empty()))?;
-    if cfg.destinations.iter().any(|d| d.name == name) {
-        return Err(log_err(format!("there is already a destination named {name}")));
-    }
-    let kind = loop {
-        let k = prompt_line("type: loki, splunk_hec, syslog, https_json, gelf, elasticsearch or otlp", Some("loki"))?;
-        match Kind::parse(&k) {
-            Some(k) => break k,
-            None => eprintln!("  {k:?} is not one of them"),
-        }
-    };
-    let mut d = Destination {
-        name: name.clone(),
-        enabled: true,
-        kind,
-        url: None,
-        address: None,
-        transport: None,
-        format: None,
-        index: None,
-        sourcetype: None,
-        header: None,
-        privacy: "minimal".into(),
-        min_severity: "info".into(),
-        categories: vec![],
-        services: vec![],
-        tls: TlsSettings::default(),
-        secret: None,
-        labels: Default::default(),
-        spool_mb: 256,
-    };
-    let mut uses_tls = false;
-    let mut token_wanted = false;
-    match kind {
-        Kind::Syslog => {
-            let t = prompt_line("transport: tls, tcp or udp", Some("tls"))?;
-            uses_tls = t == "tls";
-            d.transport = Some(t);
-            d.address = Some(prompt_line("the receiver, host:port", Some(if uses_tls { "siem.example.com:6514" } else { "siem.example.com:514" }))?);
-            d.format = Some(prompt_line("format: rfc5424, cef, leef, json or rfc3164", Some("rfc5424"))?);
-        }
-        Kind::Gelf => {
-            let t = prompt_line("transport: udp, tcp or http", Some("udp"))?;
-            if t == "http" {
-                d.url = Some(prompt_line("Graylog's GELF HTTP URL", Some("http://graylog.example.com:12201/gelf"))?);
-            } else {
-                d.address = Some(prompt_line("the GELF input, host:port", Some("graylog.example.com:12201"))?);
-            }
-            d.transport = Some(t);
-        }
-        Kind::Elasticsearch => {
-            d.url = Some(prompt_line("Elasticsearch / OpenSearch URL", Some("https://elastic.example.com:9200"))?);
-            d.index = Some(prompt_line("index or data stream", Some(pvfs_log::ship::DEFAULT_ES_INDEX))?);
-            token_wanted = true;
-        }
-        Kind::Otlp => {
-            d.url = Some(prompt_line("the OTLP/HTTP endpoint (an OpenTelemetry Collector)", Some("http://otel-collector.example.com:4318"))?);
-        }
-        Kind::SplunkHec => {
-            d.url = Some(prompt_line("the HEC URL", Some("https://splunk.example.com:8088"))?);
-            let idx = prompt_line("Splunk index (blank = the token's default)", Some(""))?;
-            d.index = Some(idx).filter(|i| !i.is_empty());
-            token_wanted = true;
-        }
-        Kind::Loki => {
-            d.url = Some(prompt_line("Loki's URL", Some("http://192.168.1.83:3100"))?);
-            // PVOS D224 — fixed stream labels, e.g. env=prod for the alerts.
-            let extra = prompt_line("extra stream labels, name=value, comma-separated (fixed values such as env=prod; blank = none)", Some(""))?;
-            for pair in extra.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                let (k, v) = pair.split_once('=').ok_or_else(|| log_err(format!("label {pair:?}: write it as name=value")))?;
-                d.labels.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-        Kind::HttpsJson => {
-            d.url = Some(prompt_line("the receiver's URL", None)?);
-            d.format = Some(prompt_line("format: schema1 (PVFS's own), ecs (Elastic Common Schema) or ocsf", Some("schema1"))?);
-        }
-    }
-    if let Some(u) = &d.url {
-        uses_tls = u.trim().starts_with("https://");
-    }
-    let token = if token_wanted && kind == Kind::Elasticsearch {
-        prompt_line("an API key (sent as ApiKey …; or type \"Basic <base64>\")", None)?
-    } else if token_wanted {
-        prompt_line("the HEC token", None)?
-    } else if kind != Kind::Syslog && !(kind == Kind::Gelf && d.url.is_none()) {
-        prompt_line("a token to send, if the receiver wants one (blank = none)", Some(""))?
-    } else {
-        String::new()
-    };
-    if uses_tls {
-        let how = prompt_line("verify the receiver's certificate by: roots (public CAs), ca (a CA file) or pin (its SHA-256)", Some("roots"))?;
-        match how.as_str() {
-            "ca" => d.tls.ca_file = Some(prompt_line("the CA file (PEM)", None)?),
-            "pin" => d.tls.pin_sha256 = Some(prompt_line("the certificate's SHA-256 (openssl x509 -fingerprint -sha256)", None)?),
-            _ => {}
-        }
-    }
-    let privacy = prompt_line("privacy: minimal (no names, paths or addresses except on security events), identified or full", Some("minimal"))?;
-    if privacy != "minimal" {
-        let what = if privacy == "full" { "everything, file names and paths included," } else { "names, emails and addresses" };
-        if !ask_yes(&format!("this sends {what} to {name} — sure?"), false)? {
-            return Err(log_err("not added"));
-        }
-    }
-    d.privacy = privacy;
-    d.min_severity = prompt_line("the least severe record to send: error, warning, notice or info", Some("info"))?;
-    let cats = prompt_line("categories: all, or a list of system, audit, security", Some("all"))?;
-    if cats != "all" {
-        d.categories = cats.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
-    }
+    // PVOS D226 — the questions live in pvfs-log, shared with the companion.
+    let taken: Vec<String> = cfg.destinations.iter().map(|d| d.name.clone()).collect();
+    let asked = pvfs_log::ship::ask_destination(
+        &taken,
+        &mut |q, d| prompt_line(q, d).map_err(|e| e.to_string()),
+        &mut |q| ask_yes(q, false).map_err(|e| e.to_string()),
+    )
+    .map_err(log_err)?;
+    let mut d = asked.destination;
+    let token = asked.token;
+    let name = d.name.clone();
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     std::fs::create_dir_all(&dir).map_err(|e| PvfsError::io("create the log destinations directory", e))?;
     if !token.is_empty() {

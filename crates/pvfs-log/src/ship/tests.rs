@@ -641,3 +641,43 @@ fn the_new_kinds_validate() {
     assert_eq!(Kind::parse("opensearch"), Some(Kind::Elasticsearch));
     assert_eq!(Kind::parse("otel"), Some(Kind::Otlp));
 }
+
+/// PVOS D226 — the shared questions, answered by a script.
+fn scripted<'a>(answers: &'a [&'a str]) -> impl FnMut(&str, Option<&str>) -> Result<String, String> + 'a {
+    let mut i = 0;
+    move |_q, default| {
+        let a = answers.get(i).copied().ok_or("ran out of answers")?;
+        i += 1;
+        Ok(if a.is_empty() { default.unwrap_or("").to_string() } else { a.to_string() })
+    }
+}
+
+#[test]
+fn ask_destination_builds_what_the_cli_built() {
+    // Loki, all defaults but a label; minimal privacy needs no confirm.
+    let mut ask = scripted(&["", "", "", "env=prod", "", "", "", ""]);
+    let a = ask_destination(&[], &mut ask, &mut |_| Ok(false)).unwrap();
+    let d = &a.destination;
+    assert_eq!((d.name.as_str(), d.kind, d.url.as_deref()), ("logs", Kind::Loki, Some("http://192.168.1.83:3100")));
+    assert_eq!(d.labels.get("env").map(String::as_str), Some("prod"));
+    assert_eq!((d.privacy.as_str(), d.min_severity.as_str()), ("minimal", "info"));
+    assert!(d.categories.is_empty() && a.token.is_empty());
+    assert!(d.problems().is_empty(), "{:?}", d.problems());
+    // Elasticsearch over https with a pin, security only; "logs" is taken so a name is asked.
+    let mut ask = scripted(&["es", "elasticsearch", "https://es.example:9200", "", "k3y ", "pin", "AB:CD", "", "warning", "security"]);
+    let a = ask_destination(&["logs".to_string()], &mut ask, &mut |_| Ok(false)).unwrap();
+    let d = &a.destination;
+    assert_eq!((d.kind, d.index.as_deref()), (Kind::Elasticsearch, Some("logs-pvfs-default")));
+    assert_eq!(d.tls.pin_sha256.as_deref(), Some("AB:CD"));
+    assert_eq!(a.token, "k3y", "trimmed");
+    assert_eq!(d.categories, vec!["security".to_string()]);
+    assert_eq!(d.min_severity, "warning");
+    // A wrong type is asked again; `full` privacy needs a yes, and a no stops it.
+    let mut ask = scripted(&["s", "carrier-pigeon", "syslog", "udp", "siem:514", "cef", "full"]);
+    let e = ask_destination(&[], &mut ask, &mut |q| { assert!(q.contains("everything")); Ok(false) }).err().unwrap();
+    assert_eq!(e, "not added");
+    // A taken name is refused at once.
+    let mut ask = scripted(&["logs"]);
+    assert!(ask_destination(&["logs".to_string()], &mut ask, &mut |_| Ok(true)).err().unwrap().contains("already"));
+}
+

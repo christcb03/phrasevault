@@ -25,7 +25,8 @@ os-keychain = ["dep:keyring"]
 pvfs-core = { path = "../pvfs-core" }
 pvfs-proto = { path = "../pvfs-proto" }
 # PVOS D222: `serve` logs through the pv_* macros (journal fields under systemd).
-pvfs-log = { path = "../pvfs-log" }
+# PVOS D226: and ships them to this Mac's log destinations.
+pvfs-log = { path = "../pvfs-log", features = ["ship"] }
 nix = { workspace = true, features = ["signal"] }
 clap.workspace = true
 thiserror.workspace = true

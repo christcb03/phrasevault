@@ -1,9 +1,12 @@
 import AppKit
 import SwiftUI
 
-/// Main console: Status · Origins · Audit · Settings
+/// Main console (PVOS D226): Status · Keys · Sign-ins · Audit · Details ·
+/// Settings. Information has tabs of its own; Settings holds only what can
+/// be set. Keys' history, the audit log and Revoke ask for Touch ID.
 struct ConsoleView: View {
     @ObservedObject var agent: AgentController
+    @StateObject private var unlocker = Unlocker()
     @State private var tab = 0
     @State private var showPasswordSheet = false
     @State private var vaultPassword = ""
@@ -13,9 +16,11 @@ struct ConsoleView: View {
             header
             Picker("", selection: $tab) {
                 Text("Status").tag(0)
-                Text("Origins").tag(1)
-                Text("Audit").tag(2)
-                Text("Settings").tag(3)
+                Text("Keys").tag(1)
+                Text("Sign-ins").tag(2)
+                Text("Audit").tag(3)
+                Text("Details").tag(4)
+                Text("Settings").tag(5)
             }
             .pickerStyle(.segmented)
             .padding()
@@ -23,18 +28,25 @@ struct ConsoleView: View {
             Group {
                 switch tab {
                 case 0: statusTab
-                case 1: originsTab
-                case 2: auditTab
+                case 1: keysTab
+                case 2: signInsTab
+                case 3: auditTab
+                case 4: detailsTab
                 default: settingsTab
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 560, minHeight: 420)
+        .frame(minWidth: 600, minHeight: 460)
         .sheet(isPresented: $showPasswordSheet) {
             passwordSheet
         }
         .onAppear { agent.refresh() }
+        // One unlock lasts while the window is open and the agent unlocked.
+        .onDisappear { unlocker.lock() }
+        .onChange(of: agent.agentRunning) { running in
+            if !running { unlocker.lock() }
+        }
     }
 
     private var header: some View {
@@ -50,7 +62,10 @@ struct ConsoleView: View {
             }
             Spacer()
             if agent.agentRunning {
-                Button("Lock") { agent.lockAgent() }
+                Button("Lock") {
+                    agent.lockAgent()
+                    unlocker.lock()
+                }
                 Button("Stop") { agent.stopAgent() }
             } else if !agent.needsSetup {
                 Button("Start") { startAgent() }
@@ -61,73 +76,76 @@ struct ConsoleView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
+    // MARK: Status — how it is now.
+
     private var statusTab: some View {
         Form {
             Section("Agent") {
                 LabeledContent("State", value: agent.agentRunning ? "Running" : "Stopped")
+                LabeledContent("Phrases served", value: phrasesServed)
                 LabeledContent("Sealing", value: sealingLabel)
-                if !agent.identityFull.isEmpty {
-                    LabeledContent("Identity") {
-                        Text(agent.identityFull)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                }
-                if !agent.socketPath.isEmpty {
-                    LabeledContent("Socket", value: agent.socketPath)
-                }
-                if !agent.webAgentURL.isEmpty {
-                    LabeledContent("Sign-in URL") {
-                        Text(agent.webAgentURL)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                }
-                LabeledContent("Vault") {
-                    Text(agent.vaultPath.path)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
+            }
+            if agent.restartNeeded && agent.agentRunning {
+                restartSection
+            }
+            if let err = agent.lastError, !err.isEmpty {
+                Section("Last error") {
+                    Text(err).foregroundStyle(.red).font(.caption).textSelection(.enabled)
                 }
             }
             Section("Approvals") {
-                Text("High-authority signing (admit/revoke, etc.) shows a **system dialog** from the agent process (`--prompt desktop`). Approve or deny there — that is the security boundary.")
+                Text("High-authority signing (admitting or revoking a device, promotions) always shows a **system dialog** from the agent. Approve or deny there — that is the security boundary.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let err = agent.lastError, !err.isEmpty {
-                Section("Last error") {
-                    Text(err).foregroundStyle(.red).font(.caption)
-                }
-            }
-            if !agent.statusDetail.isEmpty {
-                Section("Raw status") {
-                    Text(agent.statusDetail)
-                        .font(.system(.caption2, design: .monospaced))
-                        .textSelection(.enabled)
+        }
+        .formStyle(.grouped)
+        .onAppear { agent.refreshKeys() }
+    }
+
+    private var phrasesServed: String {
+        guard let r = agent.keysReport else { return "—" }
+        let served = r.phrases.filter(\.served).count
+        return "\(served) of \(r.phrases.count)"
+    }
+
+    // MARK: Keys — public keys; their history behind Touch ID.
+
+    private var keysTab: some View {
+        Form {
+            KeysSections(agent: agent, unlocker: unlocker)
+            Section {
+                Button("Set up another phrase…") {
+                    NotificationCenter.default.post(name: .openSetup, object: nil)
                 }
             }
         }
         .formStyle(.grouped)
-        .padding(.bottom)
+        .onAppear { agent.refreshKeys() }
     }
 
-    private var originsTab: some View {
+    // MARK: Sign-ins — the web origins it signs in to.
+
+    private var signInsTab: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Connected web origins (Sign in with PVFS)")
+                Text("Connected web sign-ins (Sign in with PVFS)")
                     .font(.headline)
                 Spacer()
                 Button("Refresh") { agent.refreshOrigins() }
             }
             .padding()
+            if let e = unlocker.lastError {
+                Text(e).font(.caption).foregroundStyle(.red).padding(.horizontal)
+            }
             if agent.origins.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "globe")
                         .font(.largeTitle)
                         .foregroundStyle(.secondary)
-                    Text("No connected origins").font(.headline)
-                    Text("When a local web app asks to sign in, you approve its origin once.")
+                    Text("No connected sign-ins").font(.headline)
+                    Text("When a web app asks to sign in, you approve its origin once.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -143,8 +161,10 @@ struct ConsoleView: View {
                                 Text(g.expiry).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("Revoke", role: .destructive) {
-                                agent.revokeOrigin(g.origin)
+                            Button(unlocker.unlocked ? "Revoke" : "Revoke 🔒", role: .destructive) {
+                                unlocker.unlock("revoke the sign-in for \(g.origin)") {
+                                    agent.revokeOrigin(g.origin)
+                                }
                             }
                         }
                     }
@@ -153,118 +173,192 @@ struct ConsoleView: View {
         }
     }
 
+    // MARK: Audit — behind Touch ID.
+
+    @ViewBuilder
     private var auditTab: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Signature audit log")
-                    .font(.headline)
-                Spacer()
-                Button("Refresh") { agent.refreshAudit() }
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([agent.auditPath])
+        if !unlocker.unlocked {
+            LockedPlaceholder(what: "The audit log", unlocker: unlocker)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Signature audit log")
+                        .font(.headline)
+                    Spacer()
+                    Button("Refresh") { agent.refreshAudit() }
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([agent.auditPath])
+                    }
                 }
-            }
-            .padding()
-            Text(agent.auditPath.path)
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal)
-            if agent.auditEntries.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "list.bullet.rectangle")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("No audit entries yet").font(.headline)
-                    Text("Approvals, denials, lock, and unlock events appear here.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding()
-            } else {
-                List(agent.auditEntries) { e in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(e.summary).font(.body)
-                        Text(e.line)
-                            .font(.system(.caption2, design: .monospaced))
+                if agent.auditEntries.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "list.bullet.rectangle")
+                            .font(.largeTitle)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
+                        Text("No audit entries yet").font(.headline)
+                        Text("Approvals, denials, lock, and unlock events appear here.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding()
+                } else {
+                    List(agent.auditEntries) { e in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(e.summary).font(.body)
+                            Text(e.line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
         }
     }
 
+    // MARK: Details — where things are, for troubleshooting.
+
+    private var detailsTab: some View {
+        Form {
+            Section("This companion") {
+                LabeledContent("Build", value: agent.companionVersion.isEmpty ? "—" : agent.companionVersion)
+                if !agent.identityFull.isEmpty {
+                    LabeledContent("Identity") {
+                        Text(agent.identityFull).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }
+                }
+                if !agent.socketPath.isEmpty {
+                    LabeledContent("Socket") {
+                        Text(agent.socketPath).font(.caption.monospaced()).textSelection(.enabled)
+                    }
+                }
+                if !agent.webAgentURL.isEmpty {
+                    LabeledContent("Sign-in URL") {
+                        Text(agent.webAgentURL).font(.caption.monospaced()).textSelection(.enabled)
+                    }
+                }
+            }
+            Section("Files") {
+                LabeledContent("Log file") {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text(agent.logFileURL.path).font(.caption2.monospaced()).textSelection(.enabled)
+                        HStack {
+                            Button("Reveal") { NSWorkspace.shared.activateFileViewerSelecting([agent.logFileURL]) }
+                            Button("Open in Console") {
+                                let console = URL(fileURLWithPath: "/System/Applications/Utilities/Console.app")
+                                NSWorkspace.shared.open([agent.logFileURL], withApplicationAt: console, configuration: NSWorkspace.OpenConfiguration())
+                            }
+                        }
+                    }
+                }
+                LabeledContent("Vault") {
+                    Text(agent.vaultPath.path).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+                ForEach(agent.extraVaultPaths, id: \.self) { v in
+                    LabeledContent("Vault") {
+                        Text(v.path).font(.caption2.monospaced()).textSelection(.enabled)
+                    }
+                }
+                LabeledContent("Audit log") {
+                    Text(agent.auditPath.path).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("App bundle") {
+                    Text(Bundle.main.bundlePath).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Companion binary") {
+                    Text(agent.companionBinary.path).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+            }
+            if !agent.statusDetail.isEmpty {
+                Section {
+                    DisclosureGroup("Raw status") {
+                        Text(agent.statusDetail)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { agent.refreshCompanionVersion() }
+    }
+
+    // MARK: Settings — only what can be set.
+
     private var settingsTab: some View {
         Form {
-            KeysSections(agent: agent)
             Section("Startup") {
                 Toggle("Open at login", isOn: Binding(
                     get: { agent.openAtLogin },
                     set: { agent.setOpenAtLogin($0) }
                 ))
-                Text(LoginItem.statusDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 if let note = agent.loginItemNote {
                     Text(note)
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Text("macOS may ask you to allow this under System Settings → General → Login Items.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
-            Section("SSH with companion (desktop SSO)") {
+            Section {
+                Picker("Lock after idle", selection: $agent.idleLockMinutes) {
+                    Text("Never").tag(0)
+                    Text("5 minutes").tag(5)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                }
+                Picker("Signatures per minute", selection: $agent.rateLimit) {
+                    Text("No limit").tag(0)
+                    Text("30").tag(30)
+                    Text("60").tag(60)
+                    Text("120").tag(120)
+                }
+            } header: {
+                Text("Security")
+            } footer: {
+                Text("Applies when the agent restarts.").font(.caption).foregroundStyle(.secondary)
+            }
+            LoggingSection(agent: agent)
+            Section("SSH with companion") {
                 TextField("Default host (user@host)", text: Binding(
                     get: { CompanionSSH.defaultHost },
                     set: { CompanionSSH.defaultHost = $0 }
                 ))
-                TextField("Remote socket (empty = auto unique)", text: Binding(
+                TextField("Remote socket (empty = a new one each session)", text: Binding(
                     get: { CompanionSSH.remoteSocketPath },
                     set: { CompanionSSH.remoteSocketPath = $0 }
                 ))
                 .font(.system(.body, design: .monospaced))
-                Text("Leave remote socket empty so each session gets a unique path (avoids “forwarding failed” if a previous window is still open). Menu bar → SSH opens Terminal with the companion reverse-forwarded.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if agent.agentRunning {
-                    Button("Open SSH session…") {
-                        let sock = agent.socketPath
-                        if !sock.isEmpty, FileManager.default.fileExists(atPath: sock) {
-                            CompanionSSH.openSessionInteractive(localSocket: sock)
-                        } else {
-                            CompanionSSH.openSessionInteractive(localSocket: sock)
-                        }
-                    }
-                } else {
-                    Text("Start the agent to enable SSH with companion.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
-            Section("Paths") {
-                LabeledContent("App bundle") {
-                    Text(Bundle.main.bundlePath)
-                        .font(.caption2.monospaced())
-                        .textSelection(.enabled)
-                }
-                LabeledContent("Companion binary") {
-                    Text(agent.companionBinary.path)
-                        .font(.caption2.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-            Section("Setup") {
-                Button("Open setup wizard…") {
-                    // Handled by parent openWindow — use notification
-                    NotificationCenter.default.post(name: .openSetup, object: nil)
-                }
+            if agent.restartNeeded && agent.agentRunning {
+                restartSection
             }
         }
         .formStyle(.grouped)
-        .onAppear { agent.refreshKeys() }
+    }
+
+    private var restartSection: some View {
+        Section {
+            HStack {
+                Text("Settings changed — the agent uses them once it restarts.")
+                    .font(.callout)
+                Spacer()
+                Button("Restart agent") { restartAgent() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    private func restartAgent() {
+        do {
+            try agent.restartAgent()
+        } catch AgentError.needsPassword {
+            showPasswordSheet = true
+        } catch {
+            agent.lastError = error.localizedDescription
+        }
     }
 
     private var passwordSheet: some View {

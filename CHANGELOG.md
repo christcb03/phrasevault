@@ -5,6 +5,19 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The Mac companion: settings that are settings, a Logging section, and
+  Touch ID for history (PVOS D226).**
+  - Six tabs: Status, Keys, Sign-ins, Audit, Details, Settings. Settings
+    holds only what can be set: Startup, Security (lock after idle,
+    signatures per minute), Logging and SSH.
+  - Key history, the audit log and Revoke ask for Touch ID (or the Mac's
+    password).
+  - The agent ships its records to this Mac's log destinations. Tokens are
+    kept in the Keychain (`keychain:<name>`).
+  - `pvfs-companion log list|add|test|remove` (prompts when run bare).
+  - `pvfs log destinations add` and the companion ask the same questions
+    (`pvfs_log::ship::ask_destination`).
+
 - **Daemons say their build when they start, and a panic is a record
   (PVOS D225).** pvfsd, the mount and the companion log
   `pvfs.daemon.started` / `pvfs.mount.started` / `pvfs.companion.started`

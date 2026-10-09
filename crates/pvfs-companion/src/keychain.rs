@@ -93,6 +93,11 @@ impl OsKeychain {
         }
     }
 
+    /// PVOS D226 — another namespace (the log tokens: `pvfs-companion-log`).
+    pub fn for_service(service: &str) -> OsKeychain {
+        OsKeychain { service: service.into() }
+    }
+
     fn entry(&self, key_id: &str) -> Result<keyring::Entry, VaultError> {
         keyring::Entry::new(&self.service, key_id)
             .map_err(|e| VaultError::Keychain(e.to_string()))
