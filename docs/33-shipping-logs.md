@@ -76,6 +76,7 @@ Tokens are kept in the PVOS keychain.
 | `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `logs-pvfs-default` |
 | `header` | the header the token goes in. For `Authorization` the token is sent as `Bearer <token>` (Elasticsearch: `ApiKey <token>`) unless it names its own scheme (`Basic …`) | `Authorization` |
 | `secret` | a file holding the token (relative to this file), or `keychain:<name>`: the Mac companion's Keychain item (`pvfs-companion-log` / `<name>`), which only the companion reads (PVOS D226) | none |
+| `doc_ids` | Elasticsearch only (PVOS D228): `true` sends each record's id as `_id`, so a resent batch is not stored twice (a 409 for it counts as delivered). Off by default: Elastic advises leaving `_id` unset on LogsDB data streams (`logs-*-*`); use it with a plain index or a stream that takes ids | `false` |
 | `labels` | Loki only: extra stream labels on every push, `{"env": "prod"}`. Names are label names, not `job`, `host`, `service`, `level` or `category`; values 1–128 characters. Fixed values only: each distinct set is a Loki stream | none |
 | `tls.ca_file` | trust only this CA bundle (PEM) | the public roots |
 | `tls.pin_sha256` | trust only this certificate (`openssl x509 -fingerprint -sha256`) | — |
@@ -102,6 +103,12 @@ self-signed certificate is trusted by its pin.
   disk (as the journal does). Each batch is rendered at the destination's
   privacy level when it is sent, so a stricter level set later also applies
   to what was already queued.
+- **Where to see it** (PVOS D228): `pvfs serve status` lists each
+  destination: sent, queued, dropped, the last delivery, the last error,
+  and FAILING. The owner reads every box's on its health pass and sends a
+  fleet event (`log_destination_failing`, `log_destination_recovered`), so a
+  box whose only destination is down — the NAS, shipping to the log server —
+  still reaches a person.
 - **Health.** A destination failing for 15 minutes logs
   `pvfs.log.destination_failing` (not to itself), and
   `pvfs.log.destination_recovered` when it is back. PVOS also shows the

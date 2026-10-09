@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Troubleshooting with the logs (PVOS D228).**
+  - pvfsd logs `pvfs.daemon.config` at start: the forest, owner or replica,
+    the enabled jobs, the regions by kind, and the listener.
+  - `pvfs serve status` shows each log destination's health, and the owner
+    turns a box's failing or recovered destination into a fleet event
+    (`log_destination_failing` / `log_destination_recovered`); the wire
+    field is optional both ways.
+  - Elasticsearch destinations can send record ids as `_id` (`doc_ids`,
+    opt-in), so a resend is not stored twice.
+  - New tests for the companion's audit and refusal records.
+
 - **The Mac companion: settings that are settings, a Logging section, and
   Touch ID for history (PVOS D226).**
   - Six tabs: Status, Keys, Sign-ins, Audit, Details, Settings. Settings
