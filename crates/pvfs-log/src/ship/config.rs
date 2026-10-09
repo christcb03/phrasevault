@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Category, Privacy, Severity};
 
+/// The stream labels a Loki push always carries; a destination's own
+/// `labels` may not name them (PVOS D224).
+pub const LOKI_SET_LABELS: &[&str] = &["job", "host", "service", "level", "category"];
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShipConfig {
     #[serde(default = "one")]
@@ -121,6 +125,11 @@ pub struct Destination {
     /// keychain and hands them over itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// Loki only (PVOS D224): extra stream labels on every push, such as
+    /// `{"env": "prod"}`. Each distinct set is a Loki stream, so fixed
+    /// values only (an environment, a site), never per-record ones.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
     /// The spool's cap in MiB (default 256).
     #[serde(default = "spool_default")]
     pub spool_mb: u64,
@@ -245,6 +254,22 @@ impl Destination {
         for c in &self.categories {
             if Category::parse(c).is_none() {
                 p.push(format!("{n}: category {c:?} is not system, audit or security"));
+            }
+        }
+        if !self.labels.is_empty() && self.kind != Kind::Loki {
+            p.push(format!("{n}: labels are for a loki destination only"));
+        }
+        for (k, v) in &self.labels {
+            let name_ok = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !k.starts_with("__");
+            if !name_ok {
+                p.push(format!("{n}: label {k:?} is not a label name (letters, digits and _, not starting with a digit or __)"));
+            } else if LOKI_SET_LABELS.contains(&k.as_str()) {
+                p.push(format!("{n}: label {k:?} is set by PVFS itself"));
+            }
+            if v.is_empty() || v.chars().count() > 128 {
+                p.push(format!("{n}: label {k}'s value must be 1 to 128 characters"));
             }
         }
         match self.kind {

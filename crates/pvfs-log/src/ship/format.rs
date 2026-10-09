@@ -190,9 +190,10 @@ pub fn hec_event(rec: &Record, view: &View, sourcetype: &str, index: Option<&str
 }
 
 /// A Loki push body: one stream per label set (`job="pvlog"`, `host`,
-/// `service`, `level`, and `category` on audit/security records), each line
-/// the rendered text with `event`, `outcome` and `id` as structured metadata.
-pub fn loki_body(items: &[(&Record, View)]) -> String {
+/// `service`, `level`, and `category` on audit/security records, then the
+/// destination's own `extra` labels — PVOS D224), each line the rendered
+/// text with `event`, `outcome` and `id` as structured metadata.
+pub fn loki_body(items: &[(&Record, View)], extra: &std::collections::BTreeMap<String, String>) -> String {
     use std::collections::BTreeMap;
     let js = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let mut streams: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -205,6 +206,9 @@ pub fn loki_body(items: &[(&Record, View)]) -> String {
         );
         if rec.category != Category::System {
             labels.push_str(&format!(",\"category\":\"{}\"", rec.category.as_str()));
+        }
+        for (k, v) in extra {
+            labels.push_str(&format!(",{}:{}", js(k), js(v)));
         }
         labels.push('}');
         let mut meta = format!("{{\"event\":{},\"id\":{}", js(&rec.event), js(&rec.id));
