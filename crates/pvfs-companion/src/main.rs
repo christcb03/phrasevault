@@ -1034,14 +1034,15 @@ fn log_store() -> Result<Box<dyn pvfs_companion::keychain::SecretStore>, String>
     }
 }
 
-/// A question at the terminal; blank takes the default.
-fn ask_line(q: &str, default: Option<&str>) -> Result<String, String> {
+/// A question at the terminal; blank takes the default (as `ask_line`, below,
+/// for questions that have one).
+fn ask_default(q: &str, default: Option<&str>) -> Result<String, String> {
     if !interactive() {
         return Err(format!("{q}: no terminal to ask at (the app passes --json)"));
     }
     match default {
-        Some(d) if !d.is_empty() => pv_info!("pvfs.companion.prompt"; "{q} [{d}]:"),
-        _ => pv_info!("pvfs.companion.prompt"; "{q}:"),
+        Some(d) if !d.is_empty() => eprint!("{q} [{d}]: "),
+        _ => eprint!("{q}: "),
     }
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
@@ -1050,7 +1051,7 @@ fn ask_line(q: &str, default: Option<&str>) -> Result<String, String> {
 }
 
 fn ask_yes(q: &str) -> Result<bool, String> {
-    Ok(matches!(ask_line(&format!("{q} (y/N)"), Some("n"))?.to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(ask_default(&format!("{q} (y/N)"), Some("n"))?.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
@@ -1058,7 +1059,7 @@ fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
     let path = pvfs_log::ship::config_path();
     let cmd = match cmd {
         Some(c) => c,
-        None => match ask_line("list, add, test or remove", Some("list"))?.as_str() {
+        None => match ask_default("list, add, test or remove", Some("list"))?.as_str() {
             "add" => LogCmd::Add,
             "test" => LogCmd::Test { name: None },
             "remove" => LogCmd::Remove { name: None, yes: false },
@@ -1073,7 +1074,7 @@ fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
                 if names.is_empty() {
                     return Err("no log destinations yet".into());
                 }
-                ask_line(&format!("which one ({})", names.join(", ")), names.first().map(String::as_str).filter(|_| names.len() == 1))
+                ask_default(&format!("which one ({})", names.join(", ")), names.first().map(String::as_str).filter(|_| names.len() == 1))
             }
         }
     };
@@ -1108,7 +1109,7 @@ fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
                 (req.destination, req.token)
             } else {
                 let taken: Vec<String> = logdest::list(&path)?.into_iter().map(|d| d.name).collect();
-                let a = pvfs_log::ship::ask_destination(&taken, &mut |q, d| ask_line(q, d), &mut |q| ask_yes(q))?;
+                let a = pvfs_log::ship::ask_destination(&taken, &mut |q, d| ask_default(q, d), &mut |q| ask_yes(q))?;
                 (a.destination, a.token)
             };
             let name = dest.name.clone();
