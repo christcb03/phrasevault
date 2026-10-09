@@ -280,6 +280,54 @@ server, Splunk or a SIEM is [doc 33](33-shipping-logs.md) (PVOS D222d); our
 own log server reads the journal fields with Alloy (HomeLab
 `docs/LOGGING.md`).
 
+### 1.6 Everything at once: `pvfs diagnose` (PVOS D230)
+
+One troubleshooting bundle, to read or to hand to whoever helps:
+
+```bash
+pvfs diagnose                       # asks: the other boxes too? how far back? where to save it?
+pvfs diagnose --this-box --since 30m --out -   # scripts: this box, to the terminal
+```
+
+For this box and (unless `--this-box`) every box it knows, which are the
+owner's `fleet-health.json` peers or the forest's endpoint records, it
+gives:
+
+- build and proto;
+- role, forest, jobs, regions and listener;
+- up since when;
+- the clock against this box's (flagged past 2 s);
+- the log level and privacy;
+- each log destination's health;
+- stores and free space;
+- jobs and their last errors;
+- mounts;
+- the log tip, fence and backup;
+- every warning and error since the time asked, counted by event and
+  `error_kind`, then listed (the newest 300 per box).
+
+This box adds its kernel, uptime and load, and whether NTP has synced it.
+A box that does not answer is a section saying why.
+
+**Where the failures come from.** Each daemon keeps every record at
+warning or above, as JSON, in `<data dir>/log-problems.jsonl`; its mounts
+write there too. The file is 1 MB, then becomes `.1`. A box answers
+`Diagnose` (proto 18, member-gated as `serve status` is) from that file.
+So the NAS, whose `pvfsd.log` is plain text, can say its last hour's
+failures as well as a systemd box can.
+
+**Not in it:**
+- no phrase, key or token;
+- URLs keep only their scheme, host and path. A URL's user, password and
+  query can hold a token, so they are cut, which also covers a URL inside
+  an error's text.
+
+On the Mac, the companion's Details → **Copy diagnostics** (Touch ID first)
+puts the same kind of block on the clipboard: `pvfs-companion diagnose`.
+It includes the app's settings, the vault and agent, the log destinations,
+and the agent's failures from
+`~/Library/Logs/PVFS/companion-problems.jsonl`.
+
 ## 2. Worked example: the Home Assistant build
 
 Three feeds, one pattern: **the thing being watched pushes JSON to a
