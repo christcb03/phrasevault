@@ -578,14 +578,14 @@ pub fn init_daemon(service: &str) -> bool {
     set
 }
 
-/// [`init_daemon`], then the build that writes this log as its first record
-/// (PVOS D225): `pvfs.process.started` with `build` and `pid`, so a log read
-/// after an upgrade or a crash says which build wrote it.
-pub fn init_daemon_with_build(service: &str, build: &str) -> bool {
-    let set = init_daemon(service);
+/// PVOS D225 — the build that writes this log, as the daemon's first record
+/// once its arguments are parsed (`--version` and `--help` log nothing):
+/// `pvfs.process.started` with `build` and `pid`, so a log read after an
+/// upgrade or a crash says which build wrote it.
+pub fn process_started(build: &str) {
+    let service = logger().cfg.service.clone();
     let pid = std::process::id();
     crate::pv_notice!("pvfs.process.started", build = build, pid = pid; "{service}: build {build} starting (pid {pid})");
-    set
 }
 
 /// PVOS D225 — a panic is a record: `pvfs.thread.panicked` at critical (the thread,

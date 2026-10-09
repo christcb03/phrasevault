@@ -109,14 +109,15 @@ fn notify_systemd_ready() {
 fn main() -> std::process::ExitCode {
     // PVOS D222 — the logger first, before anything can log: under systemd
     // the journal gets fields and levels, anywhere else today's text.
-    // PVOS D225 — the build that writes this log is its first record.
-    pvfs_log::init_daemon_with_build("pvfsd", VERSION);
+    pvfs_log::init_daemon("pvfsd");
     // SIGPIPE stays ignored (Rust's startup default) on purpose: pvfsd writes
     // only to client sockets and stderr, and a client vanishing mid-write must
     // surface as EPIPE on that one connection, not kill the daemon. The
     // pipeline-filter binaries make the opposite call — see pvfs-cli's and
     // pvfs-companion's main().
     let cli = Cli::parse();
+    // PVOS D225 — the build that writes this log is its first record.
+    pvfs_log::process_started(VERSION);
     match run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

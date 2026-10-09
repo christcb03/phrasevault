@@ -93,8 +93,8 @@ Every daemon logs these through `pvfs-log`, so they are not in the table
 below (it lists the names each crate logs; doc 33 lists the shipping ones):
 
 - **`pvfs.process.started`** (notice, system): the first record of pvfsd,
-  the mount and the companion (`init_daemon_with_build`), with `build` and
-  `pid`, e.g. `pvfsd: build 1.4.0 (v1.4-592-g…) starting (pid 4131)`. A log
+  the mount and the companion (`process_started`, after their arguments
+  are parsed: `--version` logs nothing), with `build` and `pid`, e.g. `pvfsd: build 1.4.0 (v1.4-592-g…) starting (pid 4131)`. A log
   read after an upgrade or a crash says which build wrote it. pvosd has its
   own, `pvos.boot.started`.
 - **`pvfs.thread.panicked`** (critical, system, outcome failure): a thread
