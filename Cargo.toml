@@ -49,3 +49,13 @@ serde_json = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"
+
+# PVOS D227 — line tables, not full debug info: a panic or a backtrace still
+# names file:line, and the test binaries (sccache cannot cache them; they
+# link on every run) shrink a lot. A debugger that steps needs a local
+# `debug = true`. Dependencies carry none. The test profile inherits this.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
