@@ -87,6 +87,22 @@ The signed log is still the record of authority; these lines are how a
 SIEM hears of it. Our log server keeps both categories 90 days and alerts on
 a burst of refusals and on a revoked key used (HomeLab `docs/LOGGING.md`).
 
+## From the logging library itself (PVOS D225)
+
+Every daemon logs these through `pvfs-log`, so they are not in the table
+below (it lists the names each crate logs; doc 33 lists the shipping ones):
+
+- **`pvfs.process.started`** (notice, system): the first record of pvfsd,
+  the mount and the companion (`process_started`, after their arguments
+  are parsed: `--version` logs nothing), with `build` and `pid`, e.g. `pvfsd: build 1.4.0 (v1.4-592-g…) starting (pid 4131)`. A log
+  read after an upgrade or a crash says which build wrote it. pvosd has its
+  own, `pvos.boot.started`.
+- **`pvfs.thread.panicked`** (critical, system, outcome failure): a thread
+  panicked. Fields: `thread`, `at` (file:line) and `message` (content: it
+  can hold a path). It goes to the journal or file and to the
+  destinations, and Rust's own report follows it as before. It is
+  installed by `init_daemon`, so every daemon has it, pvosd too.
+
 ## Event names
 
 `pvfs.<area>.<what>`. Renaming or removing one is a breaking change for

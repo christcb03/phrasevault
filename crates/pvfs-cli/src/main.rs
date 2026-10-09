@@ -6766,6 +6766,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // fields under systemd, today's text anywhere else). Only this
             // command sets the logger up; every other one prints plain text.
             pvfs_log::init_daemon("pvfs-mount");
+            // PVOS D225 — the build that writes this log is its first record.
+            pvfs_log::process_started(VERSION);
             eprintln!(
                 "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),

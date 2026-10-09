@@ -573,7 +573,52 @@ pub fn init(cfg: Config) -> bool {
 
 /// A daemon's start: [`Config::from_env`] for `service`, then [`init`].
 pub fn init_daemon(service: &str) -> bool {
-    init(Config::from_env(service))
+    let set = init(Config::from_env(service));
+    install_panic_hook();
+    set
+}
+
+/// PVOS D225 — the build that writes this log, as the daemon's first record
+/// once its arguments are parsed (`--version` and `--help` log nothing):
+/// `pvfs.process.started` with `build` and `pid`, so a log read after an
+/// upgrade or a crash says which build wrote it.
+pub fn process_started(build: &str) {
+    let service = logger().cfg.service.clone();
+    let pid = std::process::id();
+    crate::pv_notice!("pvfs.process.started", build = build, pid = pid; "{service}: build {build} starting (pid {pid})");
+}
+
+/// PVOS D225 — a panic is a record: `pvfs.thread.panicked` at critical (the thread,
+/// where, and the message), to the journal or file and to every destination,
+/// then Rust's own report as before (with its backtrace under
+/// `RUST_BACKTRACE`). Without it a panic was one unlevelled stderr line no
+/// query or alert could find. Installed once per process, by
+/// [`init_daemon`]; a panic while recording one does not recurse.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            thread_local! {
+                static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            if !IN_HOOK.with(|f| f.replace(true)) {
+                let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+                let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+                let message = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(no message)".into());
+                let line = format!("{}: PANIC in thread '{thread}' at {at}: {message}", logger().cfg.service);
+                let fields = vec![thread.to_field("thread"), at.to_field("at"), content(&message).to_field("message")];
+                __emit(Severity::Critical, Category::System, Some(Outcome::Failure), "pvfs.thread.panicked", line, fields);
+                IN_HOOK.with(|f| f.set(false));
+            }
+            previous(info);
+        }));
+    });
 }
 
 /// The format this process resolved to (`Auto` becomes journal or text).
