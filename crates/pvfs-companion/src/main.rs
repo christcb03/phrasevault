@@ -1109,7 +1109,7 @@ fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
                 (req.destination, req.token)
             } else {
                 let taken: Vec<String> = logdest::list(&path)?.into_iter().map(|d| d.name).collect();
-                let a = pvfs_log::ship::ask_destination(&taken, &mut |q, d| ask_default(q, d), &mut |q| ask_yes(q))?;
+                let a = pvfs_log::ship::ask_destination(&taken, &mut ask_default, &mut ask_yes)?;
                 (a.destination, a.token)
             };
             let name = dest.name.clone();

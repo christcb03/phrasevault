@@ -13,7 +13,7 @@ mod gelf;
 mod http;
 mod sender;
 mod ask;
-pub use ask::{ask_destination, Asked};
+pub use ask::{ask_destination, Ask, Asked, Confirm};
 pub use sender::DEFAULT_ES_INDEX;
 mod spool;
 mod syslog;

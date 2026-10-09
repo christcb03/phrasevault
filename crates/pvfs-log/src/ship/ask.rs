@@ -13,17 +13,18 @@ pub struct Asked {
     pub token: String,
 }
 
+/// A question and its default; the answer (the default when left blank).
+pub type Ask<'a> = dyn FnMut(&str, Option<&str>) -> Result<String, String> + 'a;
+/// A yes-or-no question.
+pub type Confirm<'a> = dyn FnMut(&str) -> Result<bool, String> + 'a;
+
 /// `ask(question, default)` returns the answer (the default when it is
 /// left blank); `confirm(question)` a yes or no. `taken` are the names in
 /// use.
-pub fn ask_destination(
-    taken: &[String],
-    ask: &mut dyn FnMut(&str, Option<&str>) -> Result<String, String>,
-    confirm: &mut dyn FnMut(&str) -> Result<bool, String>,
-) -> Result<Asked, String> {
+pub fn ask_destination(taken: &[String], ask: &mut Ask<'_>, confirm: &mut Confirm<'_>) -> Result<Asked, String> {
     let default_name = if taken.iter().any(|n| n == "logs") { None } else { Some("logs") };
     let name = ask("name for it (letters, digits, - and _)", default_name)?;
-    if taken.iter().any(|n| *n == name) {
+    if taken.contains(&name) {
         return Err(format!("there is already a destination named {name}"));
     }
     let mut q = "type: loki, splunk_hec, syslog, https_json, gelf, elasticsearch or otlp".to_string();
