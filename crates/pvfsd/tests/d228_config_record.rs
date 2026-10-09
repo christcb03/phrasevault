@@ -48,7 +48,9 @@ fn the_daemon_logs_its_config_at_start() {
     assert_eq!(f["jobs"], "none");
     assert_eq!(f["regions"], "none");
     assert_eq!(f["listen"], "127.0.0.1:0");
+    // The record splits the sentence's "pvfsd: " prefix into `component`.
+    assert_eq!(v["component"], "pvfsd");
     let msg = v["msg"].as_str().unwrap();
-    assert!(msg.starts_with(&format!("pvfsd: forest {} as owner", &forest[..8])), "{msg}");
+    assert!(msg.starts_with(&format!("forest {} as owner — jobs none; regions none", &forest[..8])), "{msg}");
     assert!(msg.contains("listening on 127.0.0.1:0"), "{msg}");
 }
