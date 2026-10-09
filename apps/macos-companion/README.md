@@ -9,8 +9,11 @@ Native menu-bar app for the **Rust** `pvfs-companion` agent (not the old Node ag
 | **Setup wizard** | Create or import a 24-word recovery phrase |
 | **Keychain first** | Seals with macOS Keychain; vault password only if Keychain fails |
 | **Menu bar** | Custom shield icon; start/stop/lock; open at login toggle |
-| **Console window** | Status, connected **origins** (revoke), **audit** log, settings |
-| **Phrases & keys** | Settings → Phrases & keys (PVOS D189): every recovery phrase the companion holds, its public keys, and what each is used for — forests, paired servers, sign-ins and approvals, root signatures. What `pvfs-companion keys --json` reports; public keys only |
+| **Console window** | Six tabs (PVOS D226): **Status** (running, phrases served, last error), **Keys**, **Sign-ins** (revoke), **Audit**, **Details** (build, identity, socket, files, the log, raw status) and **Settings** — only things you can set: Startup, Security, Logging, SSH |
+| **Keys** | Every recovery phrase the companion holds and its public keys (PVOS D189). What each is used for — forests, paired servers, sign-ins and approvals, root signatures — shows after **Touch ID** (or the Mac's password): **Show history 🔒**. What `pvfs-companion keys --json` reports; public keys only |
+| **Touch ID** | Key history, the audit log and Revoke ask once per window (PVOS D226); closing the window or locking the agent locks them again |
+| **Logging** | Settings → Logging (PVOS D226): the level, and where the agent's records go — Loki, Splunk HEC, syslog, Elasticsearch, OTLP, GELF, HTTPS JSON — with Test and Remove. The same `~/.config/pvfs/log-destinations.json` the `pvfs` CLI uses; tokens in the Keychain (`pvfs-companion-log`). The log itself: `~/Library/Logs/PVFS/companion.log` (Details → Open in Console) |
+| **Security settings** | Lock after idle and signatures per minute (Settings → Security), passed to the agent when it starts |
 | **Several phrases** | Every other keychain-sealed `*.vault` beside `companion.vault` in `~/.config/pvfs/` is served by the same agent (the app passes each as a `--vault`); a request picks its phrase by the key it names. Password-sealed extra vaults are left out |
 | **Approvals** | High-authority prompts via macOS system dialogs (`--prompt desktop`) |
 | **Open at login** | `SMAppService` (may need System Settings approval) |
@@ -102,7 +105,8 @@ fighting over `/tmp/pvfs-companion-<user>.sock`.
 
 ```
 apps/macos-companion/
-  Sources/          SwiftUI app
+  Sources/          SwiftUI app (ConsoleView: the tabs; KeysView; LoggingView:
+                    Settings → Logging; Unlock: Touch ID)
   Resources/        Menu bar PNG + AppIcon.icns
   build.sh          → dist/PVFS Companion.app
   package-dmg.sh    → dist/PVFS-Companion-*.dmg

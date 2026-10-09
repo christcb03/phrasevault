@@ -75,7 +75,7 @@ Tokens are kept in the PVOS keychain.
 | `format` | syslog: `rfc5424` (the line, fields as structured data), `json` (the record), `cef`, `leef`, `rfc3164`; https_json: `schema1`, `ecs`, `ocsf` | `rfc5424`, `schema1` |
 | `index`, `sourcetype` | HEC (index, sourcetype); Elasticsearch (index or data stream) | token's index, `pvfs:json`; `logs-pvfs-default` |
 | `header` | the header the token goes in. For `Authorization` the token is sent as `Bearer <token>` (Elasticsearch: `ApiKey <token>`) unless it names its own scheme (`Basic …`) | `Authorization` |
-| `secret` | a file holding the token (relative to this file) | none |
+| `secret` | a file holding the token (relative to this file), or `keychain:<name>`: the Mac companion's Keychain item (`pvfs-companion-log` / `<name>`), which only the companion reads (PVOS D226) | none |
 | `labels` | Loki only: extra stream labels on every push, `{"env": "prod"}`. Names are label names, not `job`, `host`, `service`, `level` or `category`; values 1–128 characters. Fixed values only: each distinct set is a Loki stream | none |
 | `tls.ca_file` | trust only this CA bundle (PEM) | the public roots |
 | `tls.pin_sha256` | trust only this certificate (`openssl x509 -fingerprint -sha256`) | — |
@@ -114,6 +114,16 @@ self-signed certificate is trusted by its pin.
 | `pvfs.log.destinations_loaded` | notice | system | The destinations file was read (how many). |
 | `pvfs.log.destination_problem` | warning | system | A destination in the file was left out, or the file could not be read (the running ones are kept). |
 | `pvfs.log.test` | notice | system | A test event (`pvfs log destinations test`). |
+
+### On a Mac (PVOS D226)
+
+The companion app's **Settings → Logging** lists, adds, tests and removes
+this Mac's destinations (`pvfs-companion log`, which also asks its
+questions bare). They live in the same `~/.config/pvfs/log-destinations.json`
+the `pvfs` CLI uses. A token entered there goes to the Keychain (`secret:
+"keychain:<name>"`), not a file. The agent (`pvfs-companion serve`) ships
+its own records: approvals and refusals (`pvfs.agent.audit`), its start and
+any panic. The `pvfs` CLI reports a Keychain token as one it cannot read.
 
 ### What each receiver gets
 
