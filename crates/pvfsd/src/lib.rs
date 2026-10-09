@@ -789,6 +789,24 @@ fn limit_key(peer: Peer, principal: &str) -> String {
 /// Log the refusal the last op answered, if it answered one. A key the
 /// forest once admitted and has revoked is `pvfs.access.revoked_key`,
 /// however the refusal was worded.
+/// PVOS D228 — this daemon's log destinations, as `serve status` reports
+/// them (and the owner's health pass carries them into fleet events).
+fn log_destination_health() -> Vec<pvfs_proto::LogDestHealthWire> {
+    pvfs_log::ship::health_by_kind()
+        .into_iter()
+        .map(|(name, kind, h)| pvfs_proto::LogDestHealthWire {
+            name,
+            kind: kind.to_string(),
+            sent: h.sent,
+            queued_bytes: h.pending_bytes,
+            dropped: h.dropped,
+            last_ok_ms: h.last_ok_ms,
+            last_error: h.last_error,
+            failing: h.failing_reported,
+        })
+        .collect()
+}
+
 fn note_refusal(daemon: &Daemon, principal: &Principal, peer: Peer, op: &str) {
     let Some((code, reason)) = take_refusal() else { return };
     let who = principal.display();
@@ -1100,6 +1118,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity().map(Box::new),
                         trash: Box::new(j.trash_snapshot()),
+                        log_destinations: Box::new(log_destination_health()),
                         stores: Box::new(daemon.store_filesystems()),
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),
@@ -1115,6 +1134,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         stale: daemon.stale_catalogue_count(),
                         capacity: daemon.store_capacity().map(Box::new),
                         trash: Box::default(),
+                        log_destinations: Box::new(log_destination_health()),
                         stores: Box::new(daemon.store_filesystems()),
                         log: daemon.log_tip_wire().map(Box::new),
                         fenced: daemon.fence_wire().map(Box::new),

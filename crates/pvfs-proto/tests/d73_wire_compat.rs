@@ -113,6 +113,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             freed_bytes: 0,
             measured_ms: 1,
         }]),
+        log_destinations: Box::default(),
         stores: Box::default(),
         mounts: Box::default(),
         log: None,
@@ -143,6 +144,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
         stale: 0,
         capacity: None,
         trash: Box::default(),
+        log_destinations: Box::default(),
         stores: Box::new(vec![
             pvfs_proto::StoreWire { path: "/srv/pvfs/x/.pvfs/sync".into(), regions: vec![], free_bytes: 3, total_bytes: 4 },
             pvfs_proto::StoreWire { path: "/mnt/local".into(), regions: vec!["c020473f".into()], free_bytes: 5, total_bytes: 6 },
@@ -175,6 +177,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
         stale: 0,
         capacity: None,
         trash: Box::default(),
+        log_destinations: Box::default(),
         stores: Box::default(),
         mounts: Box::new(vec![pvfs_proto::MountWire {
             mountpoint: "/mnt/pvfs/Media".into(),
@@ -211,6 +214,7 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
         stale: 0,
         capacity: None,
         trash: Box::default(),
+        log_destinations: Box::default(),
         stores: Box::default(),
         mounts: Box::default(),
         log: Some(Box::new(pvfs_proto::LogTipWire { seq: 3472, hash: "ab".repeat(32) })),
@@ -249,6 +253,7 @@ fn an_older_serve_jobs_reply_without_build_decodes() {
         stale: 0,
         capacity: None,
         trash: Box::default(),
+        log_destinations: Box::default(),
         stores: Box::default(),
         mounts: Box::default(),
         log: None,
@@ -323,3 +328,47 @@ fn a_job_row_with_and_without_progress() {
     let json = serde_json::to_string(&with).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServeJobWire>(&json).unwrap(), with);
 }
+
+/// PVOS D228 — `serve status` carries each log destination's health; an
+/// older daemon's reply (none) still parses, and a box with none sends no
+/// field.
+#[test]
+fn serve_status_log_destinations_are_optional_both_ways() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[]}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { log_destinations, .. } => assert!(log_destinations.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    let mut new = pvfs_proto::ServerMsg::ServeJobs {
+        runner: "on".into(),
+        jobs: Box::default(),
+        conflicts: 0,
+        stale: 0,
+        capacity: None,
+        trash: Box::default(),
+        log_destinations: Box::default(),
+        stores: Box::default(),
+        mounts: Box::default(),
+        log: None,
+        fenced: None,
+        backup: None,
+        build: None,
+    };
+    assert!(!serde_json::to_string(&new).unwrap().contains("log_destinations"));
+    if let pvfs_proto::ServerMsg::ServeJobs { log_destinations, .. } = &mut new {
+        log_destinations.push(pvfs_proto::LogDestHealthWire {
+            name: "loki".into(),
+            kind: "loki".into(),
+            sent: 12,
+            queued_bytes: 4096,
+            dropped: 0,
+            last_ok_ms: 1_791_000_000_000,
+            last_error: Some("connection refused".into()),
+            failing: true,
+        });
+    }
+    let s = serde_json::to_string(&new).unwrap();
+    assert!(s.contains(r#""log_destinations":[{"name":"loki","type":"loki""#), "{s}");
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
+}
+

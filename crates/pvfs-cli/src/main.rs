@@ -10607,6 +10607,8 @@ fn serve_status_print(
     // PVOS D188 — the owner's own row on the Home Assistant page reads these
     // from here (a peer's come through the health record, in the same shape).
     let (mounts, backup) = (st.mounts, st.backup);
+    // PVOS D228 — each log destination's health.
+    let log_destinations = st.log_destinations;
     // PVOS D200 — the build the daemon runs (not this CLI's: after a roll
     // that has not restarted it, the two differ). None from an older daemon.
     let build = st.build;
@@ -10631,7 +10633,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{},\"log_destinations\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -10644,6 +10646,7 @@ fn serve_status_print(
             serde_json::to_string(&mounts).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&backup).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&build).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&log_destinations).unwrap_or_else(|_| "[]".into()),
         );
     } else {
         // PVOS D182 — first, because nothing else matters while it holds.
@@ -10677,6 +10680,25 @@ fn serve_status_print(
                 };
                 println!("store {}: {} free of {}  ({on})", s.path, fmt_bytes(s.free_bytes), fmt_bytes(s.total_bytes));
             }
+        }
+        // PVOS D228 — where this box's records go, and whether they get there.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        for d in &log_destinations {
+            let last = if d.last_ok_ms == 0 {
+                "nothing delivered yet".to_string()
+            } else {
+                format!("last delivered {} min ago", now.saturating_sub(d.last_ok_ms) / 60_000)
+            };
+            let err = d.last_error.as_deref().map(|e| format!("; last error: {e}")).unwrap_or_default();
+            println!(
+                "log destination {} ({}): {}sent {}, queued {}, dropped {}; {last}{err}  (D228)",
+                d.name,
+                d.kind,
+                if d.failing { "FAILING — " } else { "" },
+                d.sent,
+                fmt_bytes(d.queued_bytes),
+                d.dropped
+            );
         }
         for t in &trash {
             println!(

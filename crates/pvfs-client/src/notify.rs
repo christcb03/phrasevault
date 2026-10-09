@@ -103,7 +103,8 @@ pub struct Seen {
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
 /// `supervise`, `job_error`, `job_error_cleared`, `heartbeat`, `test`, and
 /// since PVOS D182 `owner_fenced`, `owner_unfenced`, `peer_diverged`,
-/// `peer_diverged_cleared`.
+/// `peer_diverged_cleared`, and since PVOS D228 `log_destination_failing`,
+/// `log_destination_recovered`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub event: String,
@@ -287,6 +288,25 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
         }
         if was_diverged && r.last.log_verdict.as_deref() == Some("consistent") {
             out.push(base("peer_diverged_cleared", pin, r));
+        }
+        // PVOS D228 — a peer's log destination that has stopped delivering
+        // (its shipper already waited 15 minutes before calling it failing),
+        // said once, and once more when it delivers again. Only answering
+        // peers count: one that did not answer says nothing either way.
+        if r.last.ok() {
+            let before = |name: &str| p.and_then(|p| p.last.log_destinations.iter().find(|d| d.name == name));
+            for d in &r.last.log_destinations {
+                let was_failing = before(&d.name).is_some_and(|b| b.failing);
+                if d.failing && !was_failing {
+                    let mut e = base("log_destination_failing", pin, r);
+                    e.detail = Some(format!("{} ({}): {}", d.name, d.kind, d.last_error.as_deref().unwrap_or("no delivery")));
+                    out.push(e);
+                } else if !d.failing && was_failing {
+                    let mut e = base("log_destination_recovered", pin, r);
+                    e.detail = Some(format!("{} ({})", d.name, d.kind));
+                    out.push(e);
+                }
+            }
         }
     }
     // PVOS D182 — this box's own fence, said once when it appears (on the
@@ -490,6 +510,7 @@ pub fn severity(ev: &Event) -> &'static str {
         // PVOS D182 — an owner that has stopped writing is the forest stopped.
         "owner_fenced" => "critical",
         "peer_diverged" => "warning",
+        "log_destination_failing" => "warning",
         "heartbeat" if ev.detail.as_deref().is_some_and(|d| d.starts_with("FENCED")) => "warning",
         "heartbeat" if ev.down > 0 => "warning",
         _ => "info",
@@ -550,6 +571,15 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
             ev.detail.as_deref().map(|d| format!(" at {d}")).unwrap_or_default()
         ),
         "peer_diverged_cleared" => format!("{who}'s copy of the forest's log agrees with the owner's again."),
+        "log_destination_failing" => format!(
+            "On {who}, the log destination {} has delivered nothing for 15 minutes. Its records wait in the \
+             spool (up to its cap). pvfs serve status there shows it; pvfs log destinations test <name> checks it.",
+            ev.detail.as_deref().unwrap_or("?")
+        ),
+        "log_destination_recovered" => format!(
+            "On {who}, the log destination {} delivers again; what it queued is being sent.",
+            ev.detail.as_deref().unwrap_or("?")
+        ),
         "heartbeat" if ev.detail.as_deref().is_some_and(|d| d.starts_with("FENCED")) => format!(
             "Daily check-in: {me} is still fenced and writes nothing — {}. Run pvfs forest fence on it.",
             ev.detail.as_deref().unwrap_or("").trim_start_matches("FENCED: ")
