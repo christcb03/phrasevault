@@ -665,11 +665,12 @@ fn ask_destination_builds_what_the_cli_built() {
     assert!(d.categories.is_empty() && a.token.is_empty());
     assert!(d.problems().is_empty(), "{:?}", d.problems());
     // Elasticsearch over https with a pin, security only; "logs" is taken so a name is asked.
-    let mut ask = scripted(&["es", "elasticsearch", "https://es.example:9200", "", "k3y ", "pin", "AB:CD", "", "warning", "security"]);
+    let mut ask = scripted(&["es", "elasticsearch", "https://es.example:9200", "", "yes", "k3y ", "pin", "AB:CD", "", "warning", "security"]);
     let a = ask_destination(&["logs".to_string()], &mut ask, &mut |_| Ok(false)).unwrap();
     let d = &a.destination;
     assert_eq!((d.kind, d.index.as_deref()), (Kind::Elasticsearch, Some("logs-pvfs-default")));
     assert_eq!(d.tls.pin_sha256.as_deref(), Some("AB:CD"));
+    assert!(d.doc_ids, "PVOS D228: asked, and answered yes");
     assert_eq!(a.token, "k3y", "trimmed");
     assert_eq!(d.categories, vec!["security".to_string()]);
     assert_eq!(d.min_severity, "warning");
