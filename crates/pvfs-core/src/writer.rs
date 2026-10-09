@@ -382,7 +382,7 @@ impl Writer {
         if waited >= log_threshold() {
             // The last holder is the one it waited out (the last of several,
             // when several went before it).
-            pv_warn!("pvfs.writer.waited", step = &*what, duration_ms = waited.as_millis() as u64;
+            pv_warn!("pvfs.writer.waited", step = &*what, duration_ms = waited.as_millis() as u64, error_kind = "slow:waited";
                 "pvfsd: {what} waited {} for the writer (last held by {})",
                 secs(waited),
                 self.last_holder.lock().unwrap_or_else(|p| p.into_inner()).as_deref().unwrap_or("nobody")
@@ -408,7 +408,7 @@ impl Writer {
         }
         drop(s);
         if held >= log_threshold() {
-            pv_warn!("pvfs.writer.held", step = what, duration_ms = held.as_millis() as u64;
+            pv_warn!("pvfs.writer.held", step = what, duration_ms = held.as_millis() as u64, error_kind = "slow:held";
                 "pvfsd: the writer was held {} by {what}", secs(held));
         }
     }

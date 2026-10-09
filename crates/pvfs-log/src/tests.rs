@@ -434,7 +434,8 @@ fn thread_context_fields_ride_along() {
         clear_thread_context();
         pv_info!("pvos.web.y"; "pvosd/web: none after clearing");
     });
-    assert_eq!(got[0].fields, vec![net("192.0.2.7:5555").to_field("peer_addr")]);
+    // PVOS D229: a warning also says what kind of failure it is.
+    assert_eq!(got[0].fields, vec![net("192.0.2.7:5555").to_field("peer_addr"), "other".to_field("error_kind")]);
     assert_eq!(got[1].fields, vec![net("10.9.9.9:1").to_field("peer_addr")]);
     assert!(got[2].fields.is_empty());
 }

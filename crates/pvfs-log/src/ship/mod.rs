@@ -289,12 +289,12 @@ pub fn watch_file(state_dir: PathBuf, product: &'static str, version: String) {
                     "pvfs-log: {n} log destination(s) from {}", path.display());
             }
             for p in problems {
-                crate::pv_warn!("pvfs.log.destination_problem", problem = crate::content(&p);
+                crate::pv_warn!("pvfs.log.destination_problem", problem = crate::content(&p), error_kind = "config:destination";
                     "pvfs-log: log destination left out: {p}");
             }
         }
         Err(e) => {
-            crate::pv_warn!("pvfs.log.destination_problem", problem = crate::content(&e);
+            crate::pv_warn!("pvfs.log.destination_problem", problem = crate::content(&e), error_kind = "config:destination";
                 "pvfs-log: log destinations not loaded (the ones running are kept): {e}");
         }
     };

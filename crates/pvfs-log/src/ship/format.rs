@@ -192,7 +192,8 @@ pub fn hec_event(rec: &Record, view: &View, sourcetype: &str, index: Option<&str
 /// A Loki push body: one stream per label set (`job="pvlog"`, `host`,
 /// `service`, `level`, and `category` on audit/security records, then the
 /// destination's own `extra` labels — PVOS D224), each line the rendered
-/// text with `event`, `outcome` and `id` as structured metadata.
+/// text with `event`, `outcome`, `id` and (on a failure, PVOS D229)
+/// `error_kind` as structured metadata.
 pub fn loki_body(items: &[(&Record, View)], extra: &std::collections::BTreeMap<String, String>) -> String {
     use std::collections::BTreeMap;
     let js = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
@@ -214,6 +215,9 @@ pub fn loki_body(items: &[(&Record, View)], extra: &std::collections::BTreeMap<S
         let mut meta = format!("{{\"event\":{},\"id\":{}", js(&rec.event), js(&rec.id));
         if let Some(o) = rec.outcome {
             meta.push_str(&format!(",\"outcome\":\"{}\"", o.as_str()));
+        }
+        if let Some(k) = view.fields.iter().find(|f| f.name == crate::kind::FIELD) {
+            meta.push_str(&format!(",\"error_kind\":{}", js(&k.value.to_string())));
         }
         meta.push('}');
         let value = format!("[\"{}000000\",{},{}]", rec.ts_ms, js(&view.line()), meta);

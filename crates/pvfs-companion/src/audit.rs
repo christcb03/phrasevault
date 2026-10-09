@@ -62,7 +62,7 @@ fn log_entry(e: &AuditEntry<'_>) {
             "pvfs-companion: audit: {what}{from}{on}");
     } else {
         pv_warn!(audit failure "pvfs.agent.audit", action = action, decision = decision, request_type = request,
-            origin = net(origin), digest = digest, summary = content(&summary);
+            origin = net(origin), digest = digest, summary = content(&summary), error_kind = "auth:denied";
             "pvfs-companion: audit: {what}{from}{on}");
     }
 }
@@ -108,7 +108,7 @@ impl AuditLog {
         log_entry(&entry);
         let mut f = self.file.lock().expect("audit log poisoned");
         if writeln!(f, "{line}").and_then(|_| f.flush()).is_err() {
-            pvfs_log::pv_error!("pvfs.companion.audit_unwritten", path = pvfs_log::content(self.path.display());
+            pvfs_log::pv_error!("pvfs.companion.audit_unwritten", path = pvfs_log::content(self.path.display()), error_kind = "disk:io";
                 "pvfs-companion: WARNING: could not append to the audit log at {}",
                 self.path.display()
             );

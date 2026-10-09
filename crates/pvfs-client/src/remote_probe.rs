@@ -285,7 +285,7 @@ pub fn remote_probe_regions(
                             None
                         }
                         ProbeOutcome::TimedOut => {
-                            pv_warn!("pvfs.quality.probe_timeout", path = content(rel), region = short, timeout_s = rp.timeout.as_secs();
+                            pv_warn!("pvfs.quality.probe_timeout", path = content(rel), region = short, timeout_s = rp.timeout.as_secs(), error_kind = "external:timeout";
                                 "pvfsd: probe: {rel} ({short}) still running after {} s; killed", rp.timeout.as_secs());
                             None
                         }

@@ -656,7 +656,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         pv_notice!("pvfs.companion.took_over", pid = pid; "pvfs-companion: took over from a running instance (pid {pid})");
     }
     if takeover.orphaned {
-        pv_warn!("pvfs.companion.orphaned", socket = content(socket.display());
+        pv_warn!("pvfs.companion.orphaned", socket = content(socket.display()), error_kind = "config:orphaned";
             "pvfs-companion: WARNING: an older companion answers on {} but left no \
              pidfile — it cannot be killed and is now orphaned (quit it manually)",
             socket.display()

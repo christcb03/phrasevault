@@ -24,6 +24,8 @@
 
 mod encode;
 mod journal;
+pub mod kind;
+pub mod level;
 mod limit;
 mod privacy;
 pub mod registry;
@@ -41,7 +43,7 @@ pub use time::{format_ts, parse_ts};
 
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// RFC 5424's eight severities; journald's PRIORITY is the number.
@@ -574,8 +576,19 @@ pub fn init(cfg: Config) -> bool {
 /// A daemon's start: [`Config::from_env`] for `service`, then [`init`].
 pub fn init_daemon(service: &str) -> bool {
     let set = init(Config::from_env(service));
+    DAEMON.store(true, Ordering::Relaxed);
     install_panic_hook();
     set
+}
+
+static DAEMON: AtomicBool = AtomicBool::new(false);
+
+/// PVOS D229 — whether this process set its logger up as a daemon
+/// ([`init_daemon`]): pvfsd, a mount, pvosd, the companion's agent. A CLI
+/// run is not one, so records only a daemon should make (a slow peer: the
+/// person running a CLI is already watching the wait) check this.
+pub fn is_daemon() -> bool {
+    DAEMON.load(Ordering::Relaxed)
 }
 
 /// PVOS D225 — the build that writes this log, as the daemon's first record
@@ -627,7 +640,19 @@ pub fn current_format() -> Format {
 }
 
 pub fn enabled(sev: Severity) -> bool {
-    sev <= logger().cfg.level || CAPTURE.with(|c| c.borrow().is_some()) || testing::active()
+    sev <= current_level() || CAPTURE.with(|c| c.borrow().is_some()) || testing::active()
+}
+
+/// The level this process started with (`PVFS_LOG_LEVEL`, else info).
+pub fn configured_level() -> Severity {
+    logger().cfg.level
+}
+
+/// PVOS D229 — the level in force: a live override ([`level`]) while its
+/// time lasts, else [`configured_level`]. Without an override this reads no
+/// clock, so a filtered-out debug call stays one atomic load.
+pub fn current_level() -> Severity {
+    level::active().unwrap_or_else(configured_level)
 }
 
 thread_local! {
@@ -692,6 +717,11 @@ pub fn __emit(
             }
         }
     });
+    // PVOS D229 — every failure says what kind it is (`kind`).
+    if severity <= Severity::Warning && !r.fields.iter().any(|f| f.name == kind::FIELD) {
+        let k = kind::classify(event, &r.fields);
+        r.fields.push(Field { name: kind::FIELD.to_string(), class: Class::Meta, value: Value::Str(k) });
+    }
     emit_record(r);
 }
 
@@ -715,7 +745,7 @@ pub fn emit_record(rec: Record) {
     #[cfg(feature = "ship")]
     ship::offer(&rec);
     let lg = logger();
-    if rec.severity > lg.cfg.level {
+    if rec.severity > current_level() {
         return;
     }
     let view = render(&rec, lg.cfg.privacy, lg.cfg.pseudonym_key.as_ref());

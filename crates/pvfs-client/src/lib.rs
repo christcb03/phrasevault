@@ -43,7 +43,7 @@ pub fn idle_timeout() -> std::time::Duration {
 }
 
 pub use pvfs_proto::{
-    ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, NodeInfo, PassProgressWire, ServeJobWire,
+    ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, LogLevelWire, NodeInfo, PassProgressWire, ServeJobWire,
     PROTO_COMPATIBLE_WITH, PROTO_VERSION,
 };
 
@@ -67,6 +67,35 @@ pub mod watch;
 enum Stream {
     Unix(UnixStream),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    /// Who answers, as a log line names it (PVOS D229): `the local daemon`,
+    /// or the peer's `ip:port`.
+    fn peer_label(&self) -> String {
+        match self {
+            Stream::Unix(_) => "the local daemon".into(),
+            Stream::Tls(s) => s.sock.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "a peer".into()),
+        }
+    }
+}
+
+/// PVOS D229 — how long a request may take before it is logged as slow
+/// (`pvfs.request.slow` in pvfsd, `pvfs.client.request_slow` in a daemon's
+/// client): `PVFS_SLOW_REQUEST_MS`, default 5000. Read once per process.
+pub fn slow_request_threshold() -> std::time::Duration {
+    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let ms = std::env::var("PVFS_SLOW_REQUEST_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(5000);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// PVOS D229 — whether a wait on a peer is logged: only in a daemon process
+/// (pvfsd, a mount — a person running the CLI is watching the wait already),
+/// never for `log_wait` (a long poll by design), and only past the threshold.
+pub fn client_wait_is_slow(daemon: bool, op: &str, took: std::time::Duration, threshold: std::time::Duration) -> bool {
+    daemon && op != "log_wait" && took >= threshold
 }
 
 impl io::Read for Stream {
@@ -121,6 +150,8 @@ pub struct ServeStatusReply {
     /// PVOS D228 — each log destination's health (empty from an older daemon,
     /// and where none is set).
     pub log_destinations: Vec<pvfs_proto::LogDestHealthWire>,
+    /// PVOS D229 — the box's log level (`None` from an older daemon).
+    pub log_level: Option<pvfs_proto::LogLevelWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -180,6 +211,9 @@ struct Challenge {
 
 /// PVOS D183 — the first proto that answers `RegionClaims`.
 pub const REGION_CLAIMS_PROTO: u32 = 12;
+
+/// PVOS D229 — the first proto that answers `SetLogLevel`.
+pub const LOG_LEVEL_PROTO: u32 = 17;
 
 /// PVOS D187 — the first proto that answers `ViewLs`, `ViewEntry` and
 /// `CatalogueStatus` (the merged view and `region ls` over the socket).
@@ -316,6 +350,22 @@ impl Client {
     }
 
     fn request(&mut self, req: ClientMsg) -> Result<ServerMsg> {
+        let op = req.op_name();
+        let started = std::time::Instant::now();
+        let r = self.request_untimed(req);
+        let took = started.elapsed();
+        if client_wait_is_slow(pvfs_log::is_daemon(), op, took, slow_request_threshold()) {
+            if let Some(suppressed) = pvfs_log::limit("pvfs.client.request_slow", op) {
+                let peer = self.stream.peer_label();
+                pvfs_log::pv_warn!("pvfs.client.request_slow", op = op, peer_addr = &peer,
+                    duration_ms = took.as_millis() as u64, suppressed = suppressed, error_kind = "slow:request";
+                    "pvfs: {op} to {peer} took {:.1} s", took.as_secs_f64());
+            }
+        }
+        r
+    }
+
+    fn request_untimed(&mut self, req: ClientMsg) -> Result<ServerMsg> {
         write_msg(&mut self.stream, &req)?;
         match read_msg::<_, ServerMsg>(&mut self.stream)? {
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
@@ -365,6 +415,7 @@ impl Client {
                 backup,
                 build,
                 log_destinations,
+                log_level,
             } => Ok(ServeStatusReply {
                 runner: *runner,
                 jobs: *jobs,
@@ -379,8 +430,28 @@ impl Client {
                 backup: backup.map(|b| *b),
                 build: build.map(|b| *b).filter(|b| !b.is_empty()),
                 log_destinations: *log_destinations,
+                log_level: log_level.map(|b| *b),
             }),
             other => Err(unexpected("ServeJobs", &other)),
+        }
+    }
+
+    /// PVOS D229 — use `level` on the box for `minutes` (`"default"`: back to
+    /// its configured level now). A daemon before proto 17 cannot; this says
+    /// so instead of sending an op it would refuse.
+    pub fn set_log_level(&mut self, level: &str, minutes: u32) -> Result<pvfs_proto::LogLevelWire> {
+        if self.daemon_proto < LOG_LEVEL_PROTO {
+            return Err(ClientError::Server {
+                code: "unknown_op".into(),
+                message: format!(
+                    "this box's daemon speaks proto {} and cannot change its log level live (proto {LOG_LEVEL_PROTO}, PVOS D229): roll it first",
+                    self.daemon_proto
+                ),
+            });
+        }
+        match self.request(ClientMsg::SetLogLevel { level: level.into(), minutes })? {
+            ServerMsg::LogLevel(l) => Ok(*l),
+            other => Err(unexpected("LogLevel", &other)),
         }
     }
 

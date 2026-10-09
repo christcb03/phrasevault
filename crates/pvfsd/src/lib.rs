@@ -433,7 +433,7 @@ impl Daemon {
                 ),
             )),
             Ok(((TipVerdict::Diverged, own), _)) => {
-                pv_warn!("pvfs.fence.diverged", peer = actor(&who), peer_seq = t.seq, own_seq = own;
+                pv_warn!("pvfs.fence.diverged", peer = actor(&who), peer_seq = t.seq, own_seq = own, error_kind = "data:diverged";
                     "pvfsd: a write from {who} not accepted: its log differs from this owner's at \
                      seq {} (this owner holds {own})",
                     t.seq
@@ -807,6 +807,89 @@ fn log_destination_health() -> Vec<pvfs_proto::LogDestHealthWire> {
         .collect()
 }
 
+/// PVOS D229 — the log level for `serve status` and `SetLogLevel`'s answer:
+/// the configured one, the one in force, and until when a live one lasts.
+fn log_level_wire(data_dir: &std::path::Path) -> pvfs_proto::LogLevelWire {
+    let configured = pvfs_log::configured_level().as_str().to_string();
+    match pvfs_log::level::override_until() {
+        Some((sev, until_ms)) => pvfs_proto::LogLevelWire {
+            configured,
+            current: sev.as_str().to_string(),
+            until_ms,
+            by: pvfs_log::level::read(data_dir).ok().flatten().map(|f| f.by).unwrap_or_default(),
+        },
+        None => pvfs_proto::LogLevelWire { current: configured.clone(), configured, ..Default::default() },
+    }
+}
+
+/// PVOS D229 — `SetLogLevel`: an active member over this box's own socket,
+/// or a key with admin on the forest root from anywhere. The level goes in
+/// `<data dir>/log-level.json`, which every process of this data dir (this
+/// daemon, each mount) applies within a few seconds — this one at once.
+fn set_log_level(daemon: &Daemon, principal: &Principal, local: bool, level: &str, minutes: u32) -> ServerMsg {
+    let Principal::Key(pk) = principal else {
+        return err("forbidden", "changing the log level needs a signed key");
+    };
+    let allowed = {
+        let e = daemon.reader();
+        if local {
+            e.is_active_member(pk).unwrap_or(false)
+        } else {
+            matches!(e.effective_rights(principal, &e.identity.root_node_id), Ok(r) if r & acl::ACL_A != 0)
+        }
+    };
+    if !allowed {
+        return err(
+            "forbidden",
+            if local {
+                "changing the log level is member-gated (enroll this box)"
+            } else {
+                "changing a box's log level over the network needs admin rights on the forest root"
+            },
+        );
+    }
+    let l = level.trim();
+    let sev = if l.is_empty() || l.eq_ignore_ascii_case("default") {
+        None
+    } else {
+        match pvfs_log::level::parse_settable(l) {
+            Some(s) => Some(s),
+            None => {
+                return err(
+                    "bad_input",
+                    &format!("level {l:?}: one of {}, or default", pvfs_log::level::SETTABLE.join(", ")),
+                )
+            }
+        }
+    };
+    let minutes = if minutes == 0 { pvfs_log::level::DEFAULT_MINUTES } else { minutes };
+    if sev.is_some() && minutes > pvfs_log::level::MAX_MINUTES {
+        return err("bad_input", &format!("{minutes} minutes: a live level lasts at most a day ({})", pvfs_log::level::MAX_MINUTES));
+    }
+    let by = format!("key:{}", hex::encode(pk));
+    if let Err(e) = pvfs_log::level::write(&daemon.data_dir, sev, minutes, &by, now_ms()) {
+        return err("io", &format!("could not write the live log level: {e}"));
+    }
+    pvfs_log::level::apply_now(&daemon.data_dir);
+    ServerMsg::LogLevel(Box::new(log_level_wire(&daemon.data_dir)))
+}
+
+/// PVOS D229 — a request this daemon took longer than the threshold
+/// (`PVFS_SLOW_REQUEST_MS`, 5 s) to answer: the op, who asked, how long.
+/// `log_wait` is a long poll by design, and the data-plane streams are not
+/// timed (their time is the file's size). At most ten a minute per op.
+fn note_slow_request(op: &'static str, peer: Peer, took: Duration) {
+    if op == "log_wait" || took < pvfs_client::slow_request_threshold() {
+        return;
+    }
+    if let Some(suppressed) = pvfs_log::limit("pvfs.request.slow", op) {
+        let from = peer.label();
+        pv_warn!("pvfs.request.slow", op = op, peer_addr = net(&from), duration_ms = took.as_millis() as u64,
+            suppressed = suppressed, error_kind = "slow:request";
+            "pvfsd: {op} from {from} took {}", pvfs_core::writer::secs(took));
+    }
+}
+
 fn note_refusal(daemon: &Daemon, principal: &Principal, peer: Peer, op: &str) {
     let Some((code, reason)) = take_refusal() else { return };
     let who = principal.display();
@@ -1015,7 +1098,7 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
                 if daemon.unknown_ops.lock().unwrap().insert(tag.clone()) {
                     // PVOS D222b — once per op name per run. The name came
                     // from the client, so it is content.
-                    pv_warn!("pvfs.request.unknown_op", op = content(&tag), peer_addr = net(peer.label());
+                    pv_warn!("pvfs.request.unknown_op", op = content(&tag), peer_addr = net(peer.label()), error_kind = "protocol:unknown_op";
                         "pvfsd: a client at {} asked for the unknown op {tag:?}", peer.label());
                 }
                 write_msg(
@@ -1058,7 +1141,9 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
                 do_ingest_write(daemon, &principal, &mut stream, &session, &file, offset)?;
             }
             req => {
+                let started = std::time::Instant::now();
                 let resp = handle(daemon, &principal, req, local, conn_id);
+                note_slow_request(op, peer, started.elapsed());
                 write_msg(&mut stream, &resp)?;
             }
         }
@@ -1125,6 +1210,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         backup: daemon.backup_wire().map(Box::new),
                         // PVOS D200 — the build this daemon runs.
                         build: Some(Box::new(env!("PVFS_BUILD").to_string())),
+                        log_level: Some(Box::new(log_level_wire(&daemon.data_dir))),
                     },
                     None => ServerMsg::ServeJobs {
                         runner: Box::new("off".into()),
@@ -1140,10 +1226,12 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         fenced: daemon.fence_wire().map(Box::new),
                         backup: daemon.backup_wire().map(Box::new),
                         build: Some(Box::new(env!("PVFS_BUILD").to_string())),
+                        log_level: Some(Box::new(log_level_wire(&daemon.data_dir))),
                     },
                 }
             }
         }
+        ClientMsg::SetLogLevel { level, minutes } => set_log_level(daemon, principal, local, &level, minutes),
         // PVOS D183: gated as `ServeStatus` is. Each claim is signed now, by
         // this box's client identity — the key its region grants name, the
         // same key that signs its routed commits.
