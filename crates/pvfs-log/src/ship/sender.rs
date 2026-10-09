@@ -79,7 +79,7 @@ fn bulk_failures_are_duplicates(text: &str) -> bool {
         .iter()
         .filter_map(|item| item.as_object().and_then(|o| o.values().next()).and_then(|op| op.get("status")).and_then(|s| s.as_u64()))
         .collect();
-    statuses.len() == items.len() && statuses.iter().filter(|s| **s >= 300).all(|s| *s == 409) && statuses.iter().any(|s| *s == 409)
+    statuses.len() == items.len() && statuses.iter().filter(|s| **s >= 300).all(|s| *s == 409) && statuses.contains(&409)
 }
 
 /// Send these records now, as this destination wants them.
