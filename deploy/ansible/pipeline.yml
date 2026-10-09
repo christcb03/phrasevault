@@ -74,6 +74,10 @@
       SCCACHE_DIR: "{{ ansible_facts.env.HOME }}/.cache/sccache"
       SCCACHE_CACHE_SIZE: 20G
       CARGO_INCREMENTAL: "0"
+      # PVOS D227 — link with mold: the ~220 test binaries are not cacheable
+      # (crate-type) and link on every run. Linux gnu builds only; the musl
+      # and NAS scripts and the Mac are untouched.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     # D132 — the suite's temp files live on tmpfs: every event append and
     # projection commit fsyncs, the build VMs' virtual disks take 65-80 ms per
     # fsync, and that made each test cost seconds regardless of profile
@@ -97,7 +101,8 @@
         # fuse3: fusermount3 for the P7.3 streaming mount (doc 20 §3)
         # ffmpeg: ffprobe for D211's real-probe test, and ffmpeg to make the
         # media it probes (PVOS D221: that test ran ignored without them)
-        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev, fuse3, ffmpeg]
+        # mold: the linker the test binaries link with (PVOS D227)
+        name: [build-essential, pkg-config, curl, git, rsync, python3, libdbus-1-dev, fuse3, ffmpeg, mold]
         state: present
         update_cache: true
       tags: [prepare]
@@ -155,6 +160,16 @@
         dest: "{{ ansible_facts.env.HOME }}/.cargo/bin/sccache"
         state: link
       when: sccache_probe.rc == 3
+      tags: [build]
+
+    # PVOS D227 — mold, which cargo_env links with. Tagged `build` like the
+    # sccache tasks (not prepare+build, which `--skip-tags prepare` skips),
+    # with no cache refresh: it is in the cached index.
+    - name: Install mold (the linker cargo_env names)
+      become: true
+      ansible.builtin.apt:
+        name: mold
+        state: present
       tags: [build]
 
     - name: Toolchain from rust-toolchain.toml (idempotent)
