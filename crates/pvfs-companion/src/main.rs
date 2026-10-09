@@ -132,6 +132,16 @@ enum Cmd {
     /// it signs in to, and the approvals and root signatures it has given.
     /// Public data only. `link` records a forest made before the companion
     /// kept a ledger.
+    /// PVOS D226 — where this Mac's records go (the app's Settings → Logging
+    /// uses it): the same destinations file as the `pvfs` CLI, with tokens in
+    /// the Keychain. Run it bare: it asks what to do.
+    Log {
+        #[command(subcommand)]
+        cmd: Option<LogCmd>,
+        /// Machine-readable output, and `add` reads {"destination", "token"} on stdin (the app)
+        #[arg(long, global = true)]
+        json: bool,
+    },
     Keys {
         #[command(subcommand)]
         cmd: Option<KeysCmd>,
@@ -191,6 +201,23 @@ struct ServeArgs {
     /// 0 = ephemeral, previous behavior).
     #[arg(long, default_value_t = 7421)]
     web_port: u16,
+}
+
+#[derive(Subcommand)]
+enum LogCmd {
+    /// The destinations, never their tokens.
+    List,
+    /// Add one: asks its questions (or reads JSON on stdin with --json).
+    Add,
+    /// Send a test event to one now.
+    Test { name: Option<String> },
+    /// Remove one, and its token from the Keychain.
+    Remove {
+        name: Option<String>,
+        /// Do not ask first
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -467,6 +494,7 @@ fn run() -> Result<(), String> {
         Cmd::Origins { cmd, vault } => run_origins(cmd, vault),
         Cmd::Pairings { cmd, vault } => run_pairings(cmd, vault),
         Cmd::Keys { cmd, json, socket } => run_keys(cmd, json, socket),
+        Cmd::Log { cmd, json } => run_log(cmd, json),
         Cmd::TenantInit { store, user } => {
             let pass = passphrase()?;
             let phrase = read_phrase()?;
@@ -542,6 +570,16 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     pvfs_log::init_daemon("pvfs-companion");
     // PVOS D225 — the build that writes this log is its first record.
     pvfs_log::process_started(VERSION);
+    // PVOS D226 — ship to this Mac's log destinations (the app's Settings →
+    // Logging), re-read within 30 s of a change; tokens from the Keychain.
+    #[cfg(feature = "os-keychain")]
+    pvfs_log::ship::set_secret_resolver(|item| {
+        use pvfs_companion::keychain::SecretStore;
+        let kc = pvfs_companion::OsKeychain::for_service(pvfs_companion::logdest::LOG_KEYCHAIN_SERVICE);
+        kc.get(item).map(|v| String::from_utf8_lossy(&v).to_string()).map_err(|e| e.to_string())
+    });
+    let spool = pvfs_log::ship::config_path().parent().map(|p| p.join("log-spool")).unwrap_or_else(|| PathBuf::from("log-spool"));
+    pvfs_log::ship::watch_file(spool, "PVFS", VERSION.to_string());
     // Serving now: re-ignore SIGPIPE (main gave it the default disposition for
     // the filter commands). A browser or CLI client that disconnects mid-write
     // must surface as EPIPE on that connection, not kill the signing agent.
@@ -982,6 +1020,134 @@ struct ApprovalRow {
 struct RootSignature {
     summary: String,
     at_ms: u64,
+}
+
+/// PVOS D226 — the Keychain the log tokens live in.
+fn log_store() -> Result<Box<dyn pvfs_companion::keychain::SecretStore>, String> {
+    #[cfg(feature = "os-keychain")]
+    {
+        Ok(Box::new(pvfs_companion::OsKeychain::for_service(pvfs_companion::logdest::LOG_KEYCHAIN_SERVICE)))
+    }
+    #[cfg(not(feature = "os-keychain"))]
+    {
+        Err("this build has no Keychain (os-keychain): use `pvfs log destinations add`, which keeps tokens in files".into())
+    }
+}
+
+/// A question at the terminal; blank takes the default.
+fn ask_line(q: &str, default: Option<&str>) -> Result<String, String> {
+    if !interactive() {
+        return Err(format!("{q}: no terminal to ask at (the app passes --json)"));
+    }
+    match default {
+        Some(d) if !d.is_empty() => pv_info!("pvfs.companion.prompt"; "{q} [{d}]:"),
+        _ => pv_info!("pvfs.companion.prompt"; "{q}:"),
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+    let line = line.trim().to_string();
+    Ok(if line.is_empty() { default.unwrap_or("").to_string() } else { line })
+}
+
+fn ask_yes(q: &str) -> Result<bool, String> {
+    Ok(matches!(ask_line(&format!("{q} (y/N)"), Some("n"))?.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn run_log(cmd: Option<LogCmd>, json: bool) -> Result<(), String> {
+    use pvfs_companion::logdest;
+    let path = pvfs_log::ship::config_path();
+    let cmd = match cmd {
+        Some(c) => c,
+        None => match ask_line("list, add, test or remove", Some("list"))?.as_str() {
+            "add" => LogCmd::Add,
+            "test" => LogCmd::Test { name: None },
+            "remove" => LogCmd::Remove { name: None, yes: false },
+            _ => LogCmd::List,
+        },
+    };
+    let pick = |name: Option<String>| -> Result<String, String> {
+        match name {
+            Some(n) => Ok(n),
+            None => {
+                let names: Vec<String> = logdest::list(&path)?.into_iter().map(|d| d.name).collect();
+                if names.is_empty() {
+                    return Err("no log destinations yet".into());
+                }
+                ask_line(&format!("which one ({})", names.join(", ")), names.first().map(String::as_str).filter(|_| names.len() == 1))
+            }
+        }
+    };
+    match cmd {
+        LogCmd::List => {
+            let v = logdest::list(&path)?;
+            if json {
+                println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
+            } else if v.is_empty() {
+                println!("no log destinations — this Mac's records stay in ~/Library/Logs/PVFS/companion.log");
+            } else {
+                for d in v {
+                    println!("{}: {} → {}; privacy {}; from {} up; {}; token {}{}", d.name, d.kind, d.target, d.privacy, d.min_severity,
+                        if d.categories.is_empty() { "all categories".to_string() } else { d.categories.join(", ") }, d.token,
+                        if d.problems.is_empty() { String::new() } else { format!(" — {}", d.problems.join("; ")) });
+                }
+            }
+            Ok(())
+        }
+        LogCmd::Add => {
+            let store = log_store()?;
+            let (dest, token) = if json {
+                #[derive(serde::Deserialize)]
+                struct AddReq {
+                    destination: pvfs_log::ship::Destination,
+                    #[serde(default)]
+                    token: String,
+                }
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text).map_err(|e| e.to_string())?;
+                let req: AddReq = serde_json::from_str(&text).map_err(|e| format!("the request: {e}"))?;
+                (req.destination, req.token)
+            } else {
+                let taken: Vec<String> = logdest::list(&path)?.into_iter().map(|d| d.name).collect();
+                let a = pvfs_log::ship::ask_destination(&taken, &mut |q, d| ask_line(q, d), &mut |q| ask_yes(q))?;
+                (a.destination, a.token)
+            };
+            let name = dest.name.clone();
+            logdest::add(&path, store.as_ref(), dest, &token)?;
+            if json {
+                println!("{}", serde_json::json!({ "added": name }));
+            } else {
+                println!("added {name} — the companion sends to it within 30 s; `pvfs-companion log test {name}` checks it now");
+            }
+            Ok(())
+        }
+        LogCmd::Test { name } => {
+            let name = pick(name)?;
+            let store = log_store()?;
+            let r = logdest::test(&path, store.as_ref(), &name, VERSION);
+            if json {
+                println!("{}", match &r {
+                    Ok(()) => serde_json::json!({ "ok": true }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                });
+                return Ok(());
+            }
+            r.map(|()| println!("{name}: the test event was accepted")).map_err(|e| format!("{name}: {e}"))
+        }
+        LogCmd::Remove { name, yes } => {
+            let name = pick(name)?;
+            if !yes && !ask_yes(&format!("remove {name}"))? {
+                return Err("not removed".into());
+            }
+            let store = log_store()?;
+            logdest::remove(&path, store.as_ref(), &name)?;
+            if json {
+                println!("{}", serde_json::json!({ "removed": name }));
+            } else {
+                println!("removed {name}");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_keys(cmd: Option<KeysCmd>, json: bool, socket: Option<PathBuf>) -> Result<(), String> {
