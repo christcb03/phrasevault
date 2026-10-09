@@ -52,5 +52,8 @@ fn the_daemon_logs_its_config_at_start() {
     assert_eq!(v["component"], "pvfsd");
     let msg = v["msg"].as_str().unwrap();
     assert!(msg.starts_with(&format!("forest {} as owner — jobs none; regions none", &forest[..8])), "{msg}");
-    assert!(msg.contains("listening on 127.0.0.1:0"), "{msg}");
+    assert!(msg.ends_with("network: 127.0.0.1:0"), "{msg}");
+    // Not the listener's own phrase: the smoke tests and the fleet plays find
+    // the real listener (port and pin) by "listening on".
+    assert!(!msg.contains("listening on"), "{msg}");
 }

@@ -260,10 +260,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let job_list = if enabled.is_empty() { "none".to_string() } else { enabled.join(",") };
         let role = if is_replica { "replica" } else { "owner" };
         let listen = cli.listen.clone().unwrap_or_else(|| "none".into());
+        // Not "listening on": scripts and plays find the listener's own line
+        // (with its port and pin) by that phrase.
         pv_notice!("pvfs.daemon.config", forest = &forest_id, role = role, jobs = &job_list, regions = &regions, listen = &listen;
-            "pvfsd: forest {} as {role} — jobs {job_list}; regions {regions}; {}",
-            forest_id.get(..8).unwrap_or(&forest_id),
-            if listen == "none" { "no network listener".to_string() } else { format!("listening on {listen}") }
+            "pvfsd: forest {} as {role} — jobs {job_list}; regions {regions}; network: {listen}",
+            forest_id.get(..8).unwrap_or(&forest_id)
         );
     }
     // PVOS D191 — the supervisor runs below serving, and so does every pass.
