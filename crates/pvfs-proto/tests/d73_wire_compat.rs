@@ -120,6 +120,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         fenced: None,
         backup: None,
         build: None,
+        log_level: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -154,6 +155,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
         fenced: None,
         backup: None,
         build: None,
+        log_level: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -190,6 +192,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
         fenced: None,
         backup: None,
         build: None,
+        log_level: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -227,6 +230,7 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
         })),
         backup: Some(Box::new(pvfs_proto::BackupWire { at_ms: 7, ok: true, seq: Some(3472), error: None })),
         build: None,
+        log_level: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
@@ -260,6 +264,7 @@ fn an_older_serve_jobs_reply_without_build_decodes() {
         fenced: None,
         backup: None,
         build: Some(Box::new("v1.4-495-gc17ae29".into())),
+        log_level: None,
     };
     let s = serde_json::to_string(&new).unwrap();
     assert!(s.contains(r#""build":"v1.4-495-gc17ae29""#), "{s}");
@@ -353,6 +358,7 @@ fn serve_status_log_destinations_are_optional_both_ways() {
         fenced: None,
         backup: None,
         build: None,
+        log_level: None,
     };
     assert!(!serde_json::to_string(&new).unwrap().contains("log_destinations"));
     if let pvfs_proto::ServerMsg::ServeJobs { log_destinations, .. } = &mut new {
@@ -372,3 +378,34 @@ fn serve_status_log_destinations_are_optional_both_ways() {
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&s).unwrap(), new);
 }
 
+
+/// PVOS D229 — `serve status` from an older daemon has no log level; a new
+/// one round-trips, and `SetLogLevel` (proto 17) round-trips with and
+/// without its minutes.
+#[test]
+fn serve_status_log_level_is_optional_and_set_log_level_round_trips() {
+    let old = r#"{"t":"serve_jobs","runner":"on","jobs":[]}"#;
+    match serde_json::from_str::<pvfs_proto::ServerMsg>(old).unwrap() {
+        pvfs_proto::ServerMsg::ServeJobs { log_level, .. } => assert!(log_level.is_none()),
+        other => panic!("{other:?}"),
+    }
+    let lvl = pvfs_proto::LogLevelWire {
+        configured: "info".into(),
+        current: "debug".into(),
+        until_ms: 1_791_000_000_000,
+        by: "key:4f1c".into(),
+    };
+    let reply = pvfs_proto::ServerMsg::LogLevel(Box::new(lvl.clone()));
+    let back: pvfs_proto::ServerMsg = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+    assert_eq!(back, reply);
+    let quiet = pvfs_proto::LogLevelWire { configured: "info".into(), current: "info".into(), ..Default::default() };
+    let j = serde_json::to_string(&pvfs_proto::ServerMsg::LogLevel(Box::new(quiet))).unwrap();
+    assert!(!j.contains("until_ms") && !j.contains("\"by\""), "{j}");
+
+    let set = pvfs_proto::ClientMsg::SetLogLevel { level: "debug".into(), minutes: 30 };
+    assert_eq!(set.op_name(), "set_log_level");
+    let j = serde_json::to_string(&set).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::ClientMsg>(&j).unwrap(), set);
+    let bare: pvfs_proto::ClientMsg = serde_json::from_str(r#"{"t":"set_log_level","level":"default"}"#).unwrap();
+    assert_eq!(bare, pvfs_proto::ClientMsg::SetLogLevel { level: "default".into(), minutes: 0 });
+}

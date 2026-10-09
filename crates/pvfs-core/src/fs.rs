@@ -1029,7 +1029,7 @@ fn probe_region_quality<D: crate::writer::Db>(
                 );
             }
             crate::probe::ProbeOutcome::TimedOut => {
-                pv_warn!("pvfs.quality.probe_timeout", region = short_id(region), path = content(path.display());
+                pv_warn!("pvfs.quality.probe_timeout", region = short_id(region), path = content(path.display()), error_kind = "external:timeout";
                     "catalogue: probe of {} still running after {} s; killed, tried again next pass",
                     path.display(),
                     p.timeout.as_secs()

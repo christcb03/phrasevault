@@ -36,7 +36,26 @@ missing here, or listed here but no longer logged, fails the pipeline.
 - `text`, `journal`, `json` (one schema-1 object per line), `logfmt`.
 
 `PVFS_LOG_LEVEL` (`error`/`warning`/`notice`/`info`/`debug`, default `info`)
-drops records below it. `PVFS_LOG_PRIVACY` (`full`/`identified`/`minimal`,
+drops records below it.
+
+**Changing the level while a box runs (PVOS D229).** `pvfs serve log-level`
+(bare at a terminal: it shows the level and asks which, and for how long)
+sets a level for 1 minute to a day, 60 by default. Every process of the box
+applies it within 5 s: pvfsd and each mount, which share the data dir's
+`log-level.json`. It goes back to `PVFS_LOG_LEVEL` on its own when its time
+runs out; `pvfs serve log-level default` goes back now. A restart inside the
+window keeps it, so "debug for 30 minutes, then restart" shows the start in
+debug. Each change is a `pvfs.log.level_changed` record from each process,
+with who set it. A member may change it on the box itself (its own socket);
+over the network only a key with admin on the forest root may (`SetLogLevel`,
+proto 17). `pvfs serve status` prints the level in force.
+
+**Slow requests (PVOS D229).** pvfsd logs `pvfs.request.slow` when it took
+longer than `PVFS_SLOW_REQUEST_MS` (default 5000) to answer a request, with
+the op, who asked and how long. A daemon (pvfsd, a mount) logs
+`pvfs.client.request_slow` when a peer took that long to answer it. The long
+poll (`log_wait`) and the data streams are not timed, and each op logs at
+most ten a minute. `PVFS_LOG_PRIVACY` (`full`/`identified`/`minimal`,
 default `full` on the box itself) and `PVFS_LOG_PSEUDONYM_KEY_FILE` (32 bytes,
 raw or hex) are below.
 
@@ -103,6 +122,43 @@ below (it lists the names each crate logs; doc 33 lists the shipping ones):
   destinations, and Rust's own report follows it as before. It is
   installed by `init_daemon`, so every daemon has it, pvosd too.
 
+- **`pvfs.log.level_changed`** (notice, audit): the live log level of
+  this process changed (PVOS D229, `pvfs serve log-level`). Fields:
+  `level`, `previous`, `until_ms`, `by` (actor: the key that set it) and
+  `reason` (`set`, `expired`, `cleared`). Each process of the box (pvfsd,
+  each mount) logs its own, within 5 s of the change.
+- **`pvfs.log.level_file_unreadable`** (warning, system): the data dir's
+  `log-level.json` cannot be read or names no level; it is ignored (once per
+  problem).
+
+## What kind of failure: `error_kind` (PVOS D229)
+
+Every record at warning or above carries `error_kind`, `<class>:<detail>`.
+It is `meta`: a fixed word, never a path or a name, so it is kept at every
+privacy level, even where the error's own text is not. Search by class:
+`error_kind=~"network.*"`.
+
+| Class | Means | Details used |
+|---|---|---|
+| `network` | a peer could not be reached or answered badly on the wire | `refused`, `timeout`, `dropped`, `unreachable`, `tls`, `io` |
+| `disk` | this box's storage | `no_space`, `read_only`, `io`, `permission`, `not_found`, `database`, `busy`, `not_connected` |
+| `auth` | a key, signature or grant said no | `forbidden`, `revoked`, `signature`, `denied`, `not_trusted` |
+| `protocol` | a peer sent what this box cannot use | `unknown_op`, `unexpected`, `malformed` |
+| `data` | the forest's content or log disagrees with itself | `integrity`, `corruption`, `encoding`, `diverged`, `fenced`, `not_found`, `not_held`, `changed`, `refused`, `reserved_name`, `needs_attention` |
+| `slow` | it worked, too slowly | `busy`, `held`, `waited`, `request`, `first_pass` |
+| `config` | a setting or the box's setup | `invalid`, `destination`, `address_in_use`, `limits`, `orphaned`, `level_file` |
+| `internal` | a bug in PVFS | `panic`, `still_shared` |
+| `external` | a helper program | `tool`, `timeout`, `unmount`, `no_prober` |
+| `other` | nothing above matched | — |
+
+Where it comes from, first match wins: the call site's own `error_kind`;
+the event name (`….panicked` → `internal:panic`, `…_slow` → `slow:held`,
+`pvfs.tls.…` → `network:tls`); the `error` or `reason` field's text
+(`pvfs-log` `kind.rs` lists the phrases); else `other`. pvosd's records go
+through the same library, so they carry it too. In PVFS a test holds every
+warning and error call to it: it carries an `error`/`reason` field or
+states its kind.
+
 ## Event names
 
 `pvfs.<area>.<what>`. Renaming or removing one is a breaking change for
@@ -135,6 +191,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.catalogue.head_held` | info | system | The owner already holds that head or a newer one. |
 | `pvfs.catalogue.head_taken` | notice | system | A provisional head was taken from a region's box. |
 | `pvfs.catalogue.heads_pending` | warning | system | Pending heads could not be committed yet. |
+| `pvfs.client.request_slow` | warning | system | A daemon process (pvfsd, a mount) waited past `PVFS_SLOW_REQUEST_MS` (5 s) for a peer's answer: `op`, `peer_addr`, `duration_ms` (PVOS D229). At most ten a minute per op. |
 | `pvfs.companion.audit_unwritten` | error | system | An audit.jsonl entry could not be appended. |
 | `pvfs.companion.failed` | error | system | A companion command ended with an error. |
 | `pvfs.companion.ledger_unwritten` | warning | system | A key-ledger entry could not be written. |
@@ -214,6 +271,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.rename.renamed` | info | system | A rename through the view. |
 | `pvfs.rename.rows_deferred` | warning | system | Renamed on disk; its rows wait for the next pass. |
 | `pvfs.replica.fold_deferred` | warning | system | The follow job's fold failed; the next tick retries. |
+| `pvfs.request.slow` | warning | system | pvfsd took past `PVFS_SLOW_REQUEST_MS` (5 s) to answer a request: `op`, `peer_addr`, `duration_ms` (PVOS D229). Not timed: `log_wait` (a long poll) and the data-plane streams. At most ten a minute per op. |
 | `pvfs.request.unknown_op` | warning | system | A client asked for an op this daemon does not know (once per op name per run). |
 | `pvfs.resolve.folders_removed` | info | system | Emptied staging folders were removed. |
 | `pvfs.resolve.trashed` | info | system | Staging copies the library holds were trashed (confirmed). |

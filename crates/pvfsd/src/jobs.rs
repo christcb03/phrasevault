@@ -136,7 +136,7 @@ impl Writers {
                             "pvfsd: the runner's engine did not close cleanly: {e}");
                     }
                 }
-                Err(_) => pv_warn!("pvfs.engine.close_failed";
+                Err(_) => pv_warn!("pvfs.engine.close_failed", error_kind = "internal:still_shared";
                     "pvfsd: the runner's engine is still shared at stop; left open"),
             }
         }
@@ -947,7 +947,7 @@ fn watch_event(cb: &JobsState, ev: WatchEvent) -> Vec<String> {
                 "pvfsd: watch: {n} file(s) need attention \
                  (skipped this pass; every pass tries them again)"
             );
-            pv_warn!("pvfs.scan.needs_attention", job = "watch", files = n; "{line}");
+            pv_warn!("pvfs.scan.needs_attention", job = "watch", files = n, error_kind = "data:needs_attention"; "{line}");
             log.push(line);
             cb.mark_attention("watch", attention_note(n, &named));
         }
@@ -1323,7 +1323,7 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                             "pvfsd: received {p} ({}) into the library (doc 26 §7.3)", &h[..8]);
                     }
                     for p in &rep.skipped_no_space {
-                        pv_warn!("pvfs.receive.no_space", path = content(p); "pvfsd: receive: no space for {p}");
+                        pv_warn!("pvfs.receive.no_space", path = content(p), error_kind = "disk:no_space"; "pvfsd: receive: no space for {p}");
                     }
                     for (p, why) in &rep.failed {
                         pv_warn!("pvfs.receive.failed", path = content(p), error = content(why); "pvfsd: receive: {p}: {why}");
@@ -1922,7 +1922,7 @@ pub fn run(
                         }
                         None if !said_no_prober => {
                             said_no_prober = true;
-                            pv_warn!("pvfs.quality.remote_no_prober", regions = listed.len();
+                            pv_warn!("pvfs.quality.remote_no_prober", regions = listed.len(), error_kind = "external:no_prober";
                                 "pvfsd: probe: probe-remote names {} region(s), but this box has no ffprobe (PATH, or PVFS_FFPROBE): nothing is measured",
                                 listed.len()
                             );
@@ -1948,7 +1948,7 @@ pub fn run(
                                     let ends = |line: &str, d: &str| !d.is_empty() && line.ends_with(d);
                                     for line in pvfs_client::remote_probe::report_lines(std::slice::from_ref(r)) {
                                         if let Some(d) = r.refused.iter().find(|d| ends(line.as_str(), d.as_str())) {
-                                            pv_warn!("pvfs.quality.remote_refused", region = region, detail = content(d); "{line}");
+                                            pv_warn!("pvfs.quality.remote_refused", region = region, detail = content(d), error_kind = "data:refused"; "{line}");
                                         } else if let Some(d) = r.skipped.as_deref().filter(|d| ends(line.as_str(), d)) {
                                             pv_info!("pvfs.quality.remote_skipped", region = region, detail = content(d); "{line}");
                                         } else {

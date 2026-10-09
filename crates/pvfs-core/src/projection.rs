@@ -541,7 +541,7 @@ pub(crate) fn lock_folds_within(
             Ok(l) => return Ok(FoldLock(l)),
             Err((_f, _)) => {
                 if !said {
-                    pv_warn!("pvfs.projection.fold_busy"; "pvfs: waiting for another pvfs process folding this forest…");
+                    pv_warn!("pvfs.projection.fold_busy", error_kind = "slow:busy"; "pvfs: waiting for another pvfs process folding this forest…");
                     said = true;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -3982,7 +3982,7 @@ pub fn startup_check(
                         );
                         return Err(e);
                     }
-                    pv_warn!("pvfs.projection.fold_busy"; "pvfs: another pvfs process is folding this forest; trying again");
+                    pv_warn!("pvfs.projection.fold_busy", error_kind = "slow:busy"; "pvfs: another pvfs process is folding this forest; trying again");
                 }
                 Err(e) => {
                     pv_warn!("pvfs.projection.cache_discarded", error = content(&e);

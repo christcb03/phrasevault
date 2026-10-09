@@ -57,7 +57,10 @@ use serde::{Deserialize, Serialize};
 ///          box's copy of a video file (mediabox for the NAS, over the LAN)
 ///          hands the holder what ffprobe saw; the holder checks the copy
 ///          and writes its own row. Additive; compatible-with stays.
-pub const PROTO_VERSION: u32 = 16;
+///   16 → 17: PVOS D229 `SetLogLevel` — the box's log level for a while
+///          (`pvfs serve log-level`), without a restart. Additive;
+///          compatible-with stays.
+pub const PROTO_VERSION: u32 = 17;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -241,7 +244,14 @@ pub enum ServerMsg {
         /// bump. Boxed like the rest (the variant must stay small).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build: Option<Box<String>>,
+        /// PVOS D229: the log level in force, and until when a live one
+        /// lasts. Absent on older daemons, so defaulted rather than a proto
+        /// bump.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log_level: Option<Box<LogLevelWire>>,
     },
+    /// PVOS D229: the log level after a `SetLogLevel`.
+    LogLevel(Box<LogLevelWire>),
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
     /// sends the usual `Commit`; the session activates when that commit
@@ -488,6 +498,19 @@ pub struct LogDestHealthWire {
     pub last_error: Option<String>,
     /// It has not delivered for the failing time (15 minutes).
     pub failing: bool,
+}
+
+/// PVOS D229 — a box's log level: what it started with, what is in force,
+/// and until when a live level lasts (`until_ms` 0: none).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogLevelWire {
+    pub configured: String,
+    pub current: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub until_ms: u64,
+    /// Who set the live level (`key:<hex>`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
 }
 
 /// D181 — one running view mount, as its status file describes it.
@@ -926,6 +949,16 @@ pub enum ClientMsg {
     /// Live job-runner state (P5, doc 18 §2). Answered like `Info` — operational
     /// metadata, no catalog content.
     ServeStatus,
+    /// PVOS D229 (proto 17): use `level` (`error` … `debug`) for `minutes`
+    /// (1 … a day), on every process of this box's data dir; `""` or
+    /// `"default"` goes back to the configured level now. An active member
+    /// over the box's own Unix socket, or a key with admin on the forest root
+    /// over the network. Answered `ServerMsg::LogLevel`.
+    SetLogLevel {
+        level: String,
+        #[serde(default)]
+        minutes: u32,
+    },
     /// PVOS D174: this box's receive plan, as the running daemon sees it —
     /// answered from the daemon's read pool: no second engine opens the
     /// forest, nothing folds, the writer is not waited on. Member-gated like
@@ -1035,6 +1068,7 @@ impl ClientMsg {
             ClientMsg::Commit { .. } => "commit",
             ClientMsg::CommitSigned { .. } => "commit_signed",
             ClientMsg::ServeStatus => "serve_status",
+            ClientMsg::SetLogLevel { .. } => "set_log_level",
             ClientMsg::ReceivePlan => "receive_plan",
             ClientMsg::IngestBegin { .. } => "ingest_begin",
             ClientMsg::IngestWrite { .. } => "ingest_write",

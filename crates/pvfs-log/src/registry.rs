@@ -78,6 +78,12 @@ pub struct Use {
     pub line: usize,
     pub event: String,
     pub category: Category,
+    /// The macro's level (`pv_warn!` → warning).
+    pub severity: Severity,
+    /// The call's field names, in order (`job`, `error`, …).
+    pub fields: Vec<String>,
+    /// PVOS D229 — the `error_kind` the call states, when it is a literal.
+    pub error_kind: Option<String>,
 }
 
 const MACROS: &[&str] = &["pv_error!", "pv_warn!", "pv_notice!", "pv_info!", "pv_debug!"];
@@ -144,11 +150,122 @@ pub fn uses(sources: &[(PathBuf, String)]) -> Vec<Use> {
                 let Some(lit) = r.strip_prefix('"') else { continue };
                 let Some(end) = lit.find('"') else { continue };
                 let category = words.first().and_then(|w| Category::parse(w)).unwrap_or(Category::System);
-                out.push(Use { file: file.clone(), line: line_of(src, at), event: lit[..end].to_string(), category });
+                let severity = match *mac {
+                    "pv_error!" => Severity::Error,
+                    "pv_warn!" => Severity::Warning,
+                    "pv_notice!" => Severity::Notice,
+                    "pv_info!" => Severity::Info,
+                    _ => Severity::Debug,
+                };
+                let (fields, error_kind) = call_fields(&lit[end + 1..]);
+                out.push(Use {
+                    file: file.clone(),
+                    line: line_of(src, at),
+                    event: lit[..end].to_string(),
+                    category,
+                    severity,
+                    fields,
+                    error_kind,
+                });
             }
         }
     }
     out
+}
+
+/// The `name = value` fields after a call's event literal, up to the `;`
+/// that starts its sentence: their names, and the `error_kind` value when it
+/// is a string literal.
+fn call_fields(after_event: &str) -> (Vec<String>, Option<String>) {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let mut chars = after_event.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                cur.push(c);
+                while let Some(d) = chars.next() {
+                    cur.push(d);
+                    if d == '\\' {
+                        if let Some(e) = chars.next() {
+                            cur.push(e);
+                        }
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ';' if depth == 0 => break,
+            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    let mut names = Vec::new();
+    let mut kind = None;
+    for p in parts {
+        let Some((name, value)) = p.split_once('=') else { continue };
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        if name == crate::kind::FIELD {
+            let v = value.trim();
+            if let Some(lit) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+                kind = Some(lit.to_string());
+            }
+        }
+        names.push(name.to_string());
+    }
+    (names, kind)
+}
+
+/// PVOS D229 — every call at warning or above says what kind of failure
+/// it is: it carries the failure's text (`error` or `reason`, which the
+/// logger classifies) or states an `error_kind` from the vocabulary.
+pub fn check_error_kinds(uses: &[Use]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for u in uses.iter().filter(|u| u.severity <= Severity::Warning) {
+        if let Some(k) = &u.error_kind {
+            if !crate::kind::valid(k) {
+                problems.push(format!(
+                    "{}:{}: {}: error_kind {k:?} is not <class>[:<detail>] with a class from {}",
+                    u.file.display(),
+                    u.line,
+                    u.event,
+                    crate::kind::CLASSES.join("|")
+                ));
+            }
+            continue;
+        }
+        let has = |n: &str| u.fields.iter().any(|f| f == n);
+        if !(has("error") || has("reason") || has(crate::kind::FIELD) || crate::kind::from_event(&u.event).is_some()) {
+            problems.push(format!(
+                "{}:{}: {} is a {} with no `error`/`reason` field and no `error_kind` (D229)",
+                u.file.display(),
+                u.line,
+                u.event,
+                u.severity.as_str()
+            ));
+        }
+    }
+    problems
+}
+
+/// [`check_error_kinds`] over a repo's crates.
+pub fn check_repo_error_kinds(root: &Path, crate_dirs: &[&str]) -> Vec<String> {
+    let dirs: Vec<PathBuf> = crate_dirs.iter().map(|c| root.join(c).join("src")).collect();
+    check_error_kinds(&uses(&sources(&dirs)))
 }
 
 /// `eprintln!` outside comments, unless the line says `pv-log: allow`.

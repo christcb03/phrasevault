@@ -689,7 +689,7 @@ impl PvfsFs {
                 }
                 Ok(pvfs_core::TrashedHere::NotHere) => elsewhere.push((region, hash)),
                 Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
-                    pv_warn!("pvfs.mount.delete_refused", path = content(&rel);
+                    pv_warn!("pvfs.mount.delete_refused", path = content(&rel), error_kind = "data:changed";
                         "mount: delete of {rel} refused — this box's copy is not the file the view showed");
                     return reply.error(libc::EIO);
                 }
@@ -767,7 +767,7 @@ impl PvfsFs {
             return reply.error(libc::EINVAL); // into itself
         }
         if pvfs_core::sync::is_own_name(newname, is_dir) || pvfs_core::sync::is_litter_name(newname) {
-            pv_warn!("pvfs.mount.rename_refused", path = content(&from), name = content(newname);
+            pv_warn!("pvfs.mount.rename_refused", path = content(&from), name = content(newname), error_kind = "data:reserved_name";
                 "mount: rename of {from} refused — `{newname}` is a name the catalogue passes over");
             return reply.error(libc::EPERM);
         }
@@ -842,7 +842,7 @@ impl PvfsFs {
                 }
                 Ok(pvfs_core::TrashedHere::NotHere) => replaced_elsewhere.push((region, hash)),
                 Ok(pvfs_core::TrashedHere::Changed) | Err(_) => {
-                    pv_warn!("pvfs.mount.rename_refused", new_path = content(&to);
+                    pv_warn!("pvfs.mount.rename_refused", new_path = content(&to), error_kind = "data:changed";
                         "mount: rename onto {to} refused — this box's copy there is not the file the view showed");
                     return reply.error(libc::EIO);
                 }
@@ -2567,7 +2567,7 @@ impl MountGuard {
         }
         let gone = !is_mounted(&self.at);
         if !gone {
-            pv_error!("pvfs.mount.unmount_failed", path = content(self.at.display());
+            pv_error!("pvfs.mount.unmount_failed", path = content(self.at.display()), error_kind = "external:unmount";
                 "pvfs-fuse: {} is still mounted after fusermount -uz", self.at.display());
         }
         gone

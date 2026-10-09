@@ -987,7 +987,7 @@ fn verify(cache: &CacheInner, fetch: &Arc<HashFetch>, sources: &[ReplicaSource],
         &got[..got.len().min(16)],
         fetch.hash
     );
-    pv_warn!("pvfs.mount.bytes_refused", hash = &fetch.hash[..8]; "mount: {}", run.last);
+    pv_warn!("pvfs.mount.bytes_refused", hash = &fetch.hash[..8], error_kind = "data:integrity"; "mount: {}", run.last);
     for (i, s) in sources.iter().enumerate() {
         if run.served.contains(&s.target) {
             run.bad.insert(i);

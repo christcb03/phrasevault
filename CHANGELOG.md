@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **What kind of failure, slow requests, and a log level you change live
+  (PVOS D229).**
+  - Every record at warning or above carries `error_kind`
+    (`network:refused`, `disk:no_space`, `auth:forbidden`, `slow:busy`, …):
+    a fixed vocabulary, kept at every privacy level, so a log server can
+    group failures even where the error's text is not shipped. It comes from
+    the call site, the event name or the error's text (`pvfs_log::kind`);
+    pvosd's records get it too. A test holds every PVFS warning and error
+    call to it.
+  - `pvfs.request.slow` (pvfsd took past `PVFS_SLOW_REQUEST_MS`, 5 s, to
+    answer) and `pvfs.client.request_slow` (a daemon waited that long on a
+    peer): the op, the peer, how long. Rate-limited per op.
+  - `pvfs serve log-level`: a level for a while (1 minute to a day), applied
+    by pvfsd and its mounts within 5 s, back on its own; `serve status`
+    shows it. Proto 17 (`SetLogLevel`, additive).
+
 - **Troubleshooting with the logs (PVOS D228).**
   - pvfsd logs `pvfs.daemon.config` at start: the forest, owner or replica,
     the enabled jobs, the regions by kind, and the listener.
@@ -31,9 +47,9 @@ file tracks Layer 0, the file-system engine.
 
 - **Daemons say their build when they start, and a panic is a record
   (PVOS D225).** pvfsd, the mount and the companion log
-  `pvfs.daemon.started` / `pvfs.mount.started` / `pvfs.companion.started`
-  (`build`, `pid`) first. Every daemon (`init_daemon`, pvosd too) records a
-  panic as `pvfs.panic` at critical, with the thread, where, and the
+  `pvfs.process.started` (`build`, `pid`) first. Every daemon
+  (`init_daemon`, pvosd too) records a panic as `pvfs.thread.panicked` at
+  critical, with the thread, where, and the
   message, to the journal and the destinations, before Rust's own report.
 
 - **A Loki destination takes `labels` (PVOS D224).** Extra stream labels

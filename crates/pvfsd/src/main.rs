@@ -146,7 +146,7 @@ fn wait_for_first_health_pass(jobs: &pvfsd::jobs::JobsState, limit: std::time::D
             _ => return,
         }
         if started.elapsed() >= limit {
-            pv_warn!("pvfs.health.first_pass_late", wait_s = limit.as_secs();
+            pv_warn!("pvfs.health.first_pass_late", wait_s = limit.as_secs(), error_kind = "slow:first_pass";
                 "pvfsd: health: no first pass within {} s — taking network writes anyway (the \
                  fence still checks every write's tip)",
                 limit.as_secs()
@@ -193,6 +193,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // PVOS D222d — log destinations from log-destinations.json (when there
     // is one), spooled under this forest's data dir; re-read when it changes.
     pvfs_log::ship::watch_file(data_dir.join("log-spool"), "PVFS", VERSION.to_string());
+    // PVOS D229 — the live log level (`pvfs serve log-level`): applied now,
+    // so a restart inside its window starts at that level, then every 5 s.
+    pvfs_log::level::watch(data_dir.clone());
 
     let socket = match &cli.socket {
         Some(s) => s.clone(),

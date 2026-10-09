@@ -1370,6 +1370,18 @@ enum ServeCmd {
     Exports,
     /// Ask the running daemon for live job-runner state
     Status,
+    /// Change this box's log level for a while, without a restart: pvfsd
+    /// and its mounts apply it within 5 s, and it always goes back on its
+    /// own (at most a day). Bare, at a terminal, it shows the level and asks
+    /// (PVOS D229)
+    LogLevel {
+        /// `error`, `warning`, `notice`, `info`, `debug` — or `default`, back
+        /// to the configured level now
+        level: Option<String>,
+        /// How long, in minutes (1 to 1440; the daemon's default is 60)
+        #[arg(long = "for", value_name = "MINUTES")]
+        minutes: Option<u32>,
+    },
     /// Ask the running daemon for this box's receive plan — what its mover
     /// has left to pull. Live state: never opens the forest (with no daemon
     /// running, `pvfs view receive --dry-run` computes it here instead)
@@ -6403,6 +6415,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     })?;
                     serve_status_print(&data_dir, &sock, json)
                 }
+                ServeCmd::LogLevel { level, minutes } => {
+                    let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
+                        field: "serve".into(),
+                        reason: "no running daemon for this forest (the live log level is the running daemon's; \
+                                 without one, set PVFS_LOG_LEVEL in its unit)"
+                            .into(),
+                    })?;
+                    serve_log_level(&data_dir, &sock, level.as_deref(), minutes, json)
+                }
                 // PVOS D174 — the owner's status collector asks this every
                 // minute. It must never fall back to opening the forest: a
                 // daemon that is not answering is usually one that is
@@ -6768,6 +6789,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             pvfs_log::init_daemon("pvfs-mount");
             // PVOS D225 — the build that writes this log is its first record.
             pvfs_log::process_started(VERSION);
+            // PVOS D229 — the daemon's live log level reaches the mount too
+            // (they share the data dir's log-level.json).
+            pvfs_log::level::watch(data_dir.clone());
             eprintln!(
                 "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),
@@ -10519,6 +10543,79 @@ fn daemon_member_client(state_dir: &std::path::Path, sock: &std::path::Path) -> 
     Client::connect_signed(sock, &pubkey, |d| crypto::sign_digest(&key, d).unwrap_or_default()).map_err(remote_err)
 }
 
+/// PVOS D229 — a log level as a person reads it: `debug for 42 more minutes,
+/// then info (configured)`, or `info (configured)`.
+fn describe_log_level(l: &pvfs_client::LogLevelWire, now_ms: u64) -> String {
+    if l.until_ms > now_ms {
+        let mins = (l.until_ms - now_ms).div_ceil(60_000);
+        format!(
+            "{} for {mins} more minute{}, then {} (configured)",
+            l.current,
+            if mins == 1 { "" } else { "s" },
+            l.configured
+        )
+    } else {
+        format!("{} (configured)", l.current)
+    }
+}
+
+/// PVOS D229 — `pvfs serve log-level`. Bare at a terminal: show the level,
+/// ask which and for how long. Bare anywhere else: show it, change nothing
+/// (a script that wants a change names the level).
+fn serve_log_level(
+    state_dir: &std::path::Path,
+    sock: &std::path::Path,
+    level: Option<&str>,
+    minutes: Option<u32>,
+    json: bool,
+) -> Result<(), PvfsError> {
+    let mut client = daemon_member_client(state_dir, sock)?;
+    let now = now_ms();
+    let level = match level {
+        Some(l) => l.to_string(),
+        None => {
+            let cur = client.serve_status_full().map_err(remote_err)?.log_level.ok_or_else(|| PvfsError::BadInput {
+                field: "serve".into(),
+                reason: "this box's daemon does not report a log level (it predates PVOS D229): roll it first".into(),
+            })?;
+            if !interactive() {
+                if json {
+                    println!("{}", serde_json::to_string(&cur).unwrap_or_default());
+                } else {
+                    println!("log level: {}", describe_log_level(&cur, now));
+                }
+                return Ok(());
+            }
+            eprintln!("log level now: {}", describe_log_level(&cur, now));
+            let offer = if cur.until_ms > now { "default" } else { "debug" };
+            prompt_line(&format!("Level ({}, or default)", pvfs_log::level::SETTABLE.join(", ")), Some(offer))?
+        }
+    };
+    let back = level.trim().eq_ignore_ascii_case("default");
+    let minutes = match minutes {
+        Some(m) => m,
+        None if back || !interactive() => 0,
+        None => {
+            let a = prompt_line(
+                &format!("For how many minutes (1 to {})", pvfs_log::level::MAX_MINUTES),
+                Some(&pvfs_log::level::DEFAULT_MINUTES.to_string()),
+            )?;
+            a.trim().parse::<u32>().map_err(|_| PvfsError::BadInput {
+                field: "minutes".into(),
+                reason: format!("{a:?} is not a number of minutes"),
+            })?
+        }
+    };
+    let r = client.set_log_level(level.trim(), minutes).map_err(remote_err)?;
+    if json {
+        println!("{}", serde_json::to_string(&r).unwrap_or_default());
+    } else {
+        println!("log level: {}", describe_log_level(&r, now_ms()));
+        println!("  pvfsd has it now; each mount of this box within 5 s");
+    }
+    Ok(())
+}
+
 /// PVOS D174 — `serve receive-plan`'s output: the dry run's shape (so what
 /// read `view receive --dry-run --json` reads this unchanged), each file with
 /// its size and whether it replaces a library copy. A plan never fails or
@@ -10609,6 +10706,8 @@ fn serve_status_print(
     let (mounts, backup) = (st.mounts, st.backup);
     // PVOS D228 — each log destination's health.
     let log_destinations = st.log_destinations;
+    // PVOS D229 — the log level in force (None from an older daemon).
+    let log_level = st.log_level;
     // PVOS D200 — the build the daemon runs (not this CLI's: after a roll
     // that has not restarted it, the two differ). None from an older daemon.
     let build = st.build;
@@ -10633,7 +10732,7 @@ fn serve_status_print(
             })
             .collect();
         println!(
-            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{},\"log_destinations\":{}}}",
+            "{{\"runner\":\"{}\",\"jobs\":[{}],\"conflicts\":{conflicts},\"stale\":{stale},\"capacity\":{},\"trash\":{},\"stores\":{},\"log\":{},\"fenced\":{},\"mounts\":{},\"backup\":{},\"build\":{},\"log_destinations\":{},\"log_level\":{}}}",
             json_escape(&runner),
             rows.join(","),
             capacity
@@ -10647,6 +10746,7 @@ fn serve_status_print(
             serde_json::to_string(&backup).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&build).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&log_destinations).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&log_level).unwrap_or_else(|_| "null".into()),
         );
     } else {
         // PVOS D182 — first, because nothing else matters while it holds.
@@ -10656,6 +10756,9 @@ fn serve_status_print(
         println!("runner: {runner}");
         if let Some(b) = &build {
             println!("build: {b}  (the running daemon's; D200)");
+        }
+        if let Some(l) = &log_level {
+            println!("log level: {}  (pvfs serve log-level; D229)", describe_log_level(l, now_ms()));
         }
         if let Some(t) = &log {
             println!("log: seq {}  (this box's copy of the forest log; D182)", t.seq);

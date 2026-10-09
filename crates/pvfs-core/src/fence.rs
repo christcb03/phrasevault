@@ -185,7 +185,7 @@ pub(crate) fn fence_if_ahead(
         return Ok(());
     }
     if !trusted {
-        pv_warn!(security "pvfs.fence.not_believed", peer = actor(peer), peer_seq = peer_seq, own_seq = own_seq;
+        pv_warn!(security "pvfs.fence.not_believed", peer = actor(peer), peer_seq = peer_seq, own_seq = own_seq, error_kind = "auth:not_trusted";
             "pvfs: {peer} claims the log reaches seq {peer_seq} (this owner holds {own_seq}) but \
              holds no admin on the forest root — not believed, not fenced"
         );
@@ -203,7 +203,7 @@ pub(crate) fn fence_if_ahead(
     if set(data_dir, &fence)? {
         // The reason is this file's own sentence around the peer, so the
         // peer is the part privacy takes out (D222 3c).
-        pv_error!("pvfs.fence.fenced", peer = actor(&fence.peer), peer_seq = fence.peer_seq, own_seq = fence.own_seq;
+        pv_error!("pvfs.fence.fenced", peer = actor(&fence.peer), peer_seq = fence.peer_seq, own_seq = fence.own_seq, error_kind = "data:fenced";
             "pvfs: FENCED — {}", fence.reason);
     }
     Ok(())

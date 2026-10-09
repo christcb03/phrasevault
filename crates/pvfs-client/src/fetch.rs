@@ -75,7 +75,7 @@ fn quarantine_stale(engine: &Engine, id: &str, pin: &str, e: &PvfsError) {
     match engine.quarantine_locations_at_pin(id, pin, &reason) {
         Ok(uris) => {
             for uri in uris {
-                pv_warn!("pvfs.sync.quarantined", location = content(&uri), node = id;
+                pv_warn!("pvfs.sync.quarantined", location = content(&uri), node = id, error_kind = "data:integrity";
                     "fetch: quarantined stale location {uri} ({id})");
             }
         }
