@@ -12,6 +12,8 @@ pub mod format;
 mod gelf;
 mod http;
 mod sender;
+mod ask;
+pub use ask::{ask_destination, Asked};
 pub use sender::DEFAULT_ES_INDEX;
 mod spool;
 mod syslog;
@@ -218,11 +220,11 @@ pub fn install_from_file(path: &Path, state_dir: &Path, product: &str, version: 
     let mut problems = Vec::new();
     for d in &cfg.destinations {
         if let Some(f) = &d.secret {
-            match std::fs::read_to_string(resolve(path, f)) {
+            match read_secret(path, f) {
                 Ok(t) => {
-                    opts.secrets.insert(d.name.clone(), t.trim().to_string());
+                    opts.secrets.insert(d.name.clone(), t);
                 }
-                Err(e) => problems.push(format!("{}: secret {f}: {e}", d.name)),
+                Err(e) => problems.push(format!("{}: {e}", d.name)),
             }
         }
     }
@@ -234,6 +236,28 @@ pub fn install_from_file(path: &Path, state_dir: &Path, product: &str, version: 
     }
     problems.extend(install(&cfg, &opts));
     Ok(problems)
+}
+
+type SecretResolver = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+static SECRET_RESOLVER: std::sync::OnceLock<SecretResolver> = std::sync::OnceLock::new();
+
+/// PVOS D226 — how this process reads a `keychain:<name>` secret (the Mac
+/// companion: its Keychain). Set once; a process with none reports such a
+/// destination as a problem.
+pub fn set_secret_resolver(f: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) {
+    let _ = SECRET_RESOLVER.set(Box::new(f));
+}
+
+/// A destination's token: `keychain:<name>` through the resolver, else a
+/// file (relative to the destinations file), trimmed.
+pub fn read_secret(file: &Path, secret: &str) -> Result<String, String> {
+    if let Some(name) = secret.strip_prefix("keychain:") {
+        return match SECRET_RESOLVER.get() {
+            Some(r) => r(name).map(|t| t.trim().to_string()).map_err(|e| format!("secret {secret}: {e}")),
+            None => Err(format!("secret {secret} is in the Mac companion's Keychain; only the companion reads it")),
+        };
+    }
+    std::fs::read_to_string(resolve(file, secret)).map(|t| t.trim().to_string()).map_err(|e| format!("secret {secret}: {e}"))
 }
 
 /// A relative path in the file is relative to the file's own directory.
