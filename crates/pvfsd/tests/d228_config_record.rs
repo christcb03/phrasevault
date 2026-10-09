@@ -11,7 +11,8 @@ use pvfs_core::Engine;
 fn the_daemon_logs_its_config_at_start() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let (e, _) = Engine::init(dir.path()).unwrap();
+    // A mount: the forest lives in `<dir>/.pvfs`, as `pvfs forest init --mount` makes it.
+    let (e, _) = Engine::init(&pvfs_core::mount::state_dir(dir.path())).unwrap();
     let forest = e.identity.forest_id.clone();
     e.close().unwrap();
     let sock = home.path().join("d.sock");
@@ -28,17 +29,18 @@ fn the_daemon_logs_its_config_at_start() {
         .unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut found = None;
+    let (mut found, mut seen) = (None, Vec::new());
     while Instant::now() < deadline {
         let Some(Ok(line)) = lines.next() else { break };
         if line.contains("\"pvfs.daemon.config\"") {
             found = Some(line);
             break;
         }
+        seen.push(line);
     }
     let _ = child.kill();
     let _ = child.wait();
-    let line = found.expect("a pvfs.daemon.config record at start");
+    let line = found.unwrap_or_else(|| panic!("no pvfs.daemon.config record; the daemon said:\n{}", seen.join("\n")));
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     let f = &v["fields"];
     assert_eq!(f["forest"], forest.as_str(), "{line}");
