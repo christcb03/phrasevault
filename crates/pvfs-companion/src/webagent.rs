@@ -392,3 +392,35 @@ fn note_refused(origin: Option<&str>, path: &str, reason: &str) {
             "pvfs-companion: web agent refused {path} from {o}: {reason}");
     }
 }
+
+#[cfg(test)]
+mod d228_tests {
+    use super::note_refused;
+
+    /// PVOS D228 (D222b Deviation 6) — a refused web-agent request is a
+    /// security record with the origin (network class: kept on security
+    /// records at `minimal`), the path and the reason; rate-limited per
+    /// origin, so a page asking in a loop writes 10 lines a minute.
+    #[test]
+    fn a_refusal_is_a_security_record_rate_limited_per_origin() {
+        let origin = "https://d228-refusal-test.example";
+        let recs = pvfs_log::capture(|| {
+            for _ in 0..15 {
+                note_refused(Some(origin), "/sign", "origin not connected");
+            }
+        });
+        let refused: Vec<_> = recs.iter().filter(|r| r.event == "pvfs.agent.refused").collect();
+        assert_eq!(refused.len(), 10, "rate-limited to 10 a minute per origin");
+        let r = refused[0];
+        assert_eq!(r.category, pvfs_log::Category::Security);
+        assert_eq!(r.outcome, Some(pvfs_log::Outcome::Failure));
+        let field = |n: &str| r.fields.iter().find(|f| f.name == n).map(|f| (f.class, f.value.to_string()));
+        assert_eq!(field("origin"), Some((pvfs_log::Class::Net, origin.into())));
+        assert_eq!(field("path").map(|f| f.0), Some(pvfs_log::Class::Content));
+        assert!(r.msg.contains("refused /sign from https://d228-refusal-test.example: origin not connected"), "{}", r.msg);
+        // At `minimal` a security record keeps the origin (it says where from).
+        let v = pvfs_log::render(r, pvfs_log::Privacy::Minimal, Some(&[1u8; 32]));
+        assert!(v.line().contains(origin), "{}", v.line());
+    }
+}
+

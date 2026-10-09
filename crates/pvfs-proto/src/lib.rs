@@ -169,7 +169,9 @@ pub enum ServerMsg {
     /// `runner` is `"on"` when a runner thread is attached, `"off"` when this
     /// daemon predates jobs or was started without one.
     ServeJobs {
-        runner: String,
+        /// Boxed (PVOS D228) with the rest: adding `log_destinations` took the
+        /// variant past clippy's 128 bytes. The JSON is the same string.
+        runner: Box<String>,
         /// Boxed (PVOS D182, with `capacity`): the variant must stay under
         /// clippy's 128 bytes, since `ServerMsg` is the error half of many
         /// results. The JSON is the same.
@@ -204,6 +206,10 @@ pub enum ServerMsg {
         /// small: `ServerMsg` is an `Err` type, and a fat one is a lint.
         #[serde(default)]
         trash: Box<Vec<TrashWire>>,
+        /// PVOS D228: each log destination's health. Absent on older daemons
+        /// and where none is set, so defaulted rather than a proto bump.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        log_destinations: Box<Vec<LogDestHealthWire>>,
         /// PVOS D178: every filesystem this box stores on — `capacity` is the
         /// data dir's alone. Absent on older daemons, so defaulted rather
         /// than a proto bump. Boxed: the variant must stay small, since
@@ -461,6 +467,27 @@ pub struct FileProgressWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     pub advanced_ms: u64,
+}
+
+/// PVOS D228 — one log destination's health, as the daemon's shipper keeps
+/// it (`serve status`, and the owner's fleet events when one fails).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogDestHealthWire {
+    pub name: String,
+    /// `loki`, `splunk_hec`, `syslog`, …
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub sent: u64,
+    /// Bytes waiting in the spool.
+    pub queued_bytes: u64,
+    /// Records dropped when the spool hit its cap.
+    pub dropped: u64,
+    /// Unix ms of the last delivery (0: none yet).
+    pub last_ok_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// It has not delivered for the failing time (15 minutes).
+    pub failing: bool,
 }
 
 /// D181 — one running view mount, as its status file describes it.

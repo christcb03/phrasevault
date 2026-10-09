@@ -82,6 +82,11 @@ pub struct PeerHealth {
     /// an older daemon, and when the probe got no answer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    /// PVOS D228: that box's log destinations and their health — how a
+    /// destination that fails on a box with no other way to say so (the NAS,
+    /// whose only destination is the log server) still reaches a person.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_destinations: Vec<pvfs_proto::LogDestHealthWire>,
     pub error: Option<String>,
 }
 
@@ -256,6 +261,7 @@ pub fn probe_peer(src: &ReplicaSource, want_forest: &str) -> PeerHealth {
             h.trash = s.trash;
             h.stores = s.stores;
             h.mounts = s.mounts;
+            h.log_destinations = s.log_destinations;
             h.log = s.log;
             h.fenced = s.fenced;
             h.backup = s.backup;

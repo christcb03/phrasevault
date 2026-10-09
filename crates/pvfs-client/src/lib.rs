@@ -118,6 +118,9 @@ pub struct ServeStatusReply {
     /// PVOS D200 — the build the box's daemon runs (`None` from an older
     /// daemon, which does not say).
     pub build: Option<String>,
+    /// PVOS D228 — each log destination's health (empty from an older daemon,
+    /// and where none is set).
+    pub log_destinations: Vec<pvfs_proto::LogDestHealthWire>,
 }
 
 /// PVOS D174 — what `ReceivePlan` carries.
@@ -361,8 +364,9 @@ impl Client {
                 fenced,
                 backup,
                 build,
+                log_destinations,
             } => Ok(ServeStatusReply {
-                runner,
+                runner: *runner,
                 jobs: *jobs,
                 conflicts,
                 stale,
@@ -374,6 +378,7 @@ impl Client {
                 fenced: fenced.map(|b| *b),
                 backup: backup.map(|b| *b),
                 build: build.map(|b| *b).filter(|b| !b.is_empty()),
+                log_destinations: *log_destinations,
             }),
             other => Err(unexpected("ServeJobs", &other)),
         }
@@ -427,7 +432,7 @@ impl Client {
 
     pub fn serve_status(&mut self) -> Result<(String, Vec<ServeJobWire>)> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((runner, *jobs)),
+            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((*runner, *jobs)),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

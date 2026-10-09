@@ -105,3 +105,52 @@ fn a_fenced_owners_check_in_says_so() {
     let said = notify::summary(&labels(), &hb);
     assert!(said.starts_with("Daily check-in: the owner is still fenced"), "{said}");
 }
+
+fn with_dest(failing: bool) -> PeerHealth {
+    let mut p = peer(Some("consistent"), 3472);
+    p.log_destinations = vec![pvfs_proto::LogDestHealthWire {
+        name: "loki".into(),
+        kind: "loki".into(),
+        sent: 10,
+        queued_bytes: if failing { 8192 } else { 0 },
+        dropped: 0,
+        last_ok_ms: 1,
+        last_error: failing.then(|| "192.168.1.83:3100: Connection refused".into()),
+        failing,
+    }];
+    p
+}
+
+/// PVOS D228 — a peer's log destination that stops delivering is said once
+/// (the shipper already waited its 15 minutes), not again while it stays
+/// down, and once more when it delivers again. A peer that did not answer
+/// says nothing either way.
+#[test]
+fn a_failing_log_destination_is_said_once_and_its_recovery_once() {
+    let t = 1_790_000_000_000;
+    let addr = "192.168.1.142:7434";
+    let mut prev = FleetHealth { self_addr: Some("192.168.1.120:7431".into()), ..Default::default() };
+    prev.observe(&pin(), addr, None, t, with_dest(false));
+    let mut next = prev.clone();
+    next.observe(&pin(), addr, None, t + 120_000, with_dest(true));
+    let ev = notify::transitions(Some(&prev), &next, t + 120_000);
+    assert_eq!(kinds(&ev), ["log_destination_failing"]);
+    assert_eq!(notify::severity(&ev[0]), "warning");
+    let said = notify::summary(&labels(), &ev[0]);
+    assert!(said.starts_with("On mediabox, the log destination loki (loki): 192.168.1.83:3100: Connection refused"), "{said}");
+    // Still failing: nothing new.
+    let mut again = next.clone();
+    again.observe(&pin(), addr, None, t + 240_000, with_dest(true));
+    assert!(notify::transitions(Some(&next), &again, t + 240_000).is_empty());
+    // Not answering: nothing either way.
+    let mut silent = again.clone();
+    silent.observe(&pin(), addr, None, t + 360_000, PeerHealth { error: Some("refused".into()), ..Default::default() });
+    assert!(!kinds(&notify::transitions(Some(&again), &silent, t + 360_000)).iter().any(|k| k.starts_with("log_destination")));
+    // Delivering again.
+    let mut back = again.clone();
+    back.observe(&pin(), addr, None, t + 480_000, with_dest(false));
+    let ev = notify::transitions(Some(&again), &back, t + 480_000);
+    assert_eq!(kinds(&ev), ["log_destination_recovered"]);
+    assert_eq!(notify::severity(&ev[0]), "info");
+}
+

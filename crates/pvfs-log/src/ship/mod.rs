@@ -139,6 +139,13 @@ pub fn health() -> Vec<(String, Health)> {
     a.iter().map(|d| (d.cfg.name.clone(), d.health())).collect()
 }
 
+/// PVOS D228 — each destination's name, type and health, for `pvfs serve
+/// status` and the owner's fleet events.
+pub fn health_by_kind() -> Vec<(String, &'static str, Health)> {
+    let a = ACTIVE.read().unwrap_or_else(|p| p.into_inner());
+    a.iter().map(|d| (d.cfg.name.clone(), d.cfg.kind.as_str(), d.health())).collect()
+}
+
 /// One line for a census or a status report: `name: sent N, queued B bytes,
 /// dropped D[, failing since …: error]`.
 pub fn health_line() -> String {

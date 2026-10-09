@@ -1174,6 +1174,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "tempfile",
 ]
 

@@ -37,6 +37,7 @@ fn dest(kind: Kind) -> Destination {
         tls: TlsSettings::default(),
         secret: None,
         labels: Default::default(),
+        doc_ids: false,
         spool_mb: 1,
     }
 }
@@ -494,7 +495,7 @@ fn ecs_and_bulk() {
     let w: serde_json::Value = serde_json::from_str(&format::ecs(&web, &wv)).unwrap();
     assert_eq!(w["event"]["category"][0], "web");
     assert_eq!(w["event"]["type"][0], "denied");
-    let bulk = format::es_bulk(&[(&r, v)], "pvfs-logs");
+    let bulk = format::es_bulk(&[(&r, v)], "pvfs-logs", false);
     let lines: Vec<&str> = bulk.lines().collect();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0], "{\"create\":{\"_index\":\"pvfs-logs\"}}");
@@ -664,11 +665,12 @@ fn ask_destination_builds_what_the_cli_built() {
     assert!(d.categories.is_empty() && a.token.is_empty());
     assert!(d.problems().is_empty(), "{:?}", d.problems());
     // Elasticsearch over https with a pin, security only; "logs" is taken so a name is asked.
-    let mut ask = scripted(&["es", "elasticsearch", "https://es.example:9200", "", "k3y ", "pin", "AB:CD", "", "warning", "security"]);
+    let mut ask = scripted(&["es", "elasticsearch", "https://es.example:9200", "", "yes", "k3y ", "pin", "AB:CD", "", "warning", "security"]);
     let a = ask_destination(&["logs".to_string()], &mut ask, &mut |_| Ok(false)).unwrap();
     let d = &a.destination;
     assert_eq!((d.kind, d.index.as_deref()), (Kind::Elasticsearch, Some("logs-pvfs-default")));
     assert_eq!(d.tls.pin_sha256.as_deref(), Some("AB:CD"));
+    assert!(d.doc_ids, "PVOS D228: asked, and answered yes");
     assert_eq!(a.token, "k3y", "trimmed");
     assert_eq!(d.categories, vec!["security".to_string()]);
     assert_eq!(d.min_severity, "warning");
@@ -679,5 +681,40 @@ fn ask_destination_builds_what_the_cli_built() {
     // A taken name is refused at once.
     let mut ask = scripted(&["logs"]);
     assert!(ask_destination(&["logs".to_string()], &mut ask, &mut |_| Ok(true)).err().unwrap().contains("already"));
+}
+
+/// PVOS D228 — `doc_ids`: the record's id is the document's `_id`, and a
+/// reply whose failed items are all 409 (already there) is a delivery; any
+/// other item error fails the batch. Without it, no `_id`.
+#[test]
+fn elasticsearch_doc_ids_make_a_resend_a_delivery() {
+    let d = tempfile::tempdir().unwrap();
+    let r = rec("pvfs.auth.refused", "pvfsd: refused", Category::Security, vec![]);
+    let v = render(&r, Privacy::Full, None);
+    let with = format::es_bulk(&[(&r, v.clone())], "logs-pvfs-default", true);
+    assert!(with.lines().next().unwrap().contains(&format!("\"_id\":\"{}\"", r.id)), "{with}");
+    assert!(!format::es_bulk(&[(&r, v)], "logs-pvfs-default", false).contains("_id"));
+    let dup = r#"{"took":1,"errors":true,"items":[{"create":{"status":409,"error":{"type":"version_conflict_engine_exception"}}},{"create":{"status":201}}]}"#;
+    let bad = r#"{"took":1,"errors":true,"items":[{"create":{"status":409}},{"create":{"status":400,"error":{"type":"mapper_parsing_exception"}}}]}"#;
+    let (url, t) = http_server(vec![(200, dup), (200, bad), (200, dup)]);
+    let mut es = dest(Kind::Elasticsearch);
+    es.url = Some(url);
+    es.doc_ids = true;
+    let ed = mk_dest(es.clone(), Some("k3y"), &d.path().join("es"));
+    sender::deliver(&ed, std::slice::from_ref(&r)).expect("409s are already-delivered records");
+    assert!(sender::deliver(&ed, std::slice::from_ref(&r)).unwrap_err().contains("400"), "a 400 item fails the batch");
+    // Without doc_ids, the same 409 reply is a failure (it cannot be ours).
+    let mut plain = es;
+    plain.doc_ids = false;
+    let pd = mk_dest(plain, Some("k3y"), &d.path().join("es2"));
+    assert!(sender::deliver(&pd, std::slice::from_ref(&r)).is_err());
+    let got = t.join().unwrap();
+    assert!(got[0].1.contains("\"_id\""), "{}", got[0].1);
+    assert!(!got[2].1.contains("\"_id\""), "{}", got[2].1);
+    // doc_ids on another type is a config problem.
+    let mut l = dest(Kind::Loki);
+    l.url = Some("http://loki:3100".into());
+    l.doc_ids = true;
+    assert!(l.problems().iter().any(|p| p.contains("doc_ids")), "{:?}", l.problems());
 }
 
