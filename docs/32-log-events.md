@@ -143,6 +143,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.companion.runtime_file` | notice | system | A runtime file was rewritten, or left to another instance. |
 | `pvfs.companion.runtime_file_failed` | warning | system | A runtime file could not be read, touched or rewritten; retried later. |
 | `pvfs.companion.took_over` | notice | system | A running instance was stopped and replaced. |
+| `pvfs.daemon.config` | notice | system | At start: the forest, the role (owner/replica), the enabled jobs, the regions by kind, the listen address (D228). |
 | `pvfs.engine.close_failed` | warning | system | The runner's own engine did not close cleanly. |
 | `pvfs.fence.diverged` | warning | system | A routed write was refused: its log diverges from this owner's. |
 | `pvfs.fence.fenced` | error | system | This owner is FENCED: a peer holds a longer log. |

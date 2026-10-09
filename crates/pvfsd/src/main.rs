@@ -176,6 +176,20 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = mount::open_mount(&cli.mount)?;
     let data_dir = engine.data_dir().to_path_buf();
     let is_replica = engine.is_replica();
+    // PVOS D228 — what this daemon is, for its config record below: the
+    // forest, and its regions counted by kind.
+    let forest_id = engine.identity.forest_id.clone();
+    let regions = match engine.regions() {
+        Ok(rs) if rs.is_empty() => "none".to_string(),
+        Ok(rs) => {
+            let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for (_, _, kind) in rs {
+                *by_kind.entry(kind).or_default() += 1;
+            }
+            by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", ")
+        }
+        Err(e) => format!("unreadable ({e})"),
+    };
     // PVOS D222d — log destinations from log-destinations.json (when there
     // is one), spooled under this forest's data dir; re-read when it changes.
     pvfs_log::ship::watch_file(data_dir.join("log-spool"), "PVFS", VERSION.to_string());
@@ -239,6 +253,19 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // A corrupt config refuses startup — loud beats silently jobless.
     let jobs = Arc::new(pvfsd::jobs::JobsState::load(data_dir.clone())?);
     daemon.attach_jobs(Arc::clone(&jobs));
+    // PVOS D228 — the box's role, jobs, regions and listener in one record,
+    // the first things anyone checks when a box misbehaves.
+    {
+        let enabled: Vec<String> = jobs.snapshot().into_iter().filter(|j| j.enabled).map(|j| j.name).collect();
+        let job_list = if enabled.is_empty() { "none".to_string() } else { enabled.join(",") };
+        let role = if is_replica { "replica" } else { "owner" };
+        let listen = cli.listen.clone().unwrap_or_else(|| "none".into());
+        pv_notice!("pvfs.daemon.config", forest = &forest_id, role = role, jobs = &job_list, regions = &regions, listen = &listen;
+            "pvfsd: forest {} as {role} — jobs {job_list}; regions {regions}; {}",
+            forest_id.get(..8).unwrap_or(&forest_id),
+            if listen == "none" { "no network listener".to_string() } else { format!("listening on {listen}") }
+        );
+    }
     // PVOS D191 — the supervisor runs below serving, and so does every pass.
     let jobs_thread =
         pvfsd::jobs::spawn_supervisor(Arc::clone(&jobs), &SHUTDOWN, &RELOAD, Some(Arc::clone(&daemon)))?;
