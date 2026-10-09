@@ -473,6 +473,29 @@ final class AgentController: ObservableObject {
         lastError = nil
     }
 
+    /// PVOS D230 — Details → Copy diagnostics: the app's own settings, then
+    /// `pvfs-companion diagnose` (build, vault, agent, log destinations, the
+    /// last hour's warnings and errors — never a phrase, key or token), on
+    /// the clipboard. Returns a one-line result. Quick (local files and one
+    /// request to the agent), so it runs in place, as `refreshKeys` does.
+    func copyDiagnostics() -> String {
+        let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let header = """
+        app           PVFS Companion \(app) (\(Bundle.main.bundlePath))
+        settings      open at login \(openAtLogin ? "on" : "off"); idle lock \(idleLockMinutes) min; \(rateLimit) signatures/min; log level \(logLevel)\(restartNeeded ? " (restart pending)" : "")
+
+        """
+        let r = runCompanionCapturing(args: ["diagnose", "--vault", vaultPath.path], env: [:], stdin: nil)
+        let text = header + (r.exitCode == 0 ? r.stdout : "pvfs-companion diagnose failed: \(r.stderr.isEmpty ? r.stdout : r.stderr)\n")
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        let lines = text.split(separator: "\n").count
+        return r.exitCode == 0
+            ? "Copied (\(lines) lines) — paste it into a message or an issue."
+            : "Copied, but the companion's part failed (see the text)."
+    }
+
     private func runCompanion(args: [String], env: [String: String]) -> String? {
         let r = runCompanionCapturing(args: args, env: env, stdin: nil)
         if r.exitCode != 0 {

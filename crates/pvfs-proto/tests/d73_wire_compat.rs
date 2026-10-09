@@ -409,3 +409,40 @@ fn serve_status_log_level_is_optional_and_set_log_level_round_trips() {
     let bare: pvfs_proto::ClientMsg = serde_json::from_str(r#"{"t":"set_log_level","level":"default"}"#).unwrap();
     assert_eq!(bare, pvfs_proto::ClientMsg::SetLogLevel { level: "default".into(), minutes: 0 });
 }
+
+/// PVOS D230 — `Diagnose` (proto 18) and its answer round-trip; the answer
+/// from a box without a problems file says why, and an empty list is fine.
+#[test]
+fn diagnose_round_trips() {
+    let ask = pvfs_proto::ClientMsg::Diagnose { since_ms: 1_791_000_000_000 };
+    assert_eq!(ask.op_name(), "diagnose");
+    assert_eq!(serde_json::from_str::<pvfs_proto::ClientMsg>(&serde_json::to_string(&ask).unwrap()).unwrap(), ask);
+    let bare: pvfs_proto::ClientMsg = serde_json::from_str(r#"{"t":"diagnose"}"#).unwrap();
+    assert_eq!(bare, pvfs_proto::ClientMsg::Diagnose { since_ms: 0 });
+    let d = pvfs_proto::DiagnoseWire {
+        now_ms: 1_791_000_000_500,
+        started_ms: 1_790_990_000_000,
+        host: "qnap".into(),
+        build: "v1.4-620".into(),
+        forest: "ae60b1db".into(),
+        role: "replica".into(),
+        jobs: "follow".into(),
+        regions: "1 catalogue".into(),
+        listen: "0.0.0.0:7434".into(),
+        privacy: "full".into(),
+        problems: vec![pvfs_proto::ProblemWire {
+            ts_ms: 1_791_000_000_000,
+            severity: "warning".into(),
+            event: "pvfs.writer.held".into(),
+            error_kind: "slow:held".into(),
+            service: "pvfsd".into(),
+            line: "pvfsd: the writer was held 2.4 s by scan".into(),
+        }],
+        problems_left_out: 4,
+        problems_note: String::new(),
+    };
+    let reply = pvfs_proto::ServerMsg::Diagnose(Box::new(d));
+    let j = serde_json::to_string(&reply).unwrap();
+    assert!(!j.contains("problems_note"), "{j}");
+    assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&j).unwrap(), reply);
+}

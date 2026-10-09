@@ -27,6 +27,8 @@ mod journal;
 pub mod kind;
 pub mod level;
 mod limit;
+pub mod problems;
+mod redact;
 mod privacy;
 pub mod registry;
 #[cfg(feature = "ship")]
@@ -39,6 +41,7 @@ pub use limit::{limit, Limiter};
 #[doc(hidden)]
 pub use journal::__send_record;
 pub use privacy::{pseudonym, render, View};
+pub use redact::redact_urls;
 pub use time::{format_ts, parse_ts};
 
 use std::cell::RefCell;
@@ -639,6 +642,16 @@ pub fn current_format() -> Format {
     logger().format
 }
 
+/// PVOS D230 — this process's host name, as its records carry it.
+pub fn host() -> String {
+    logger().host.clone()
+}
+
+/// PVOS D230 — the privacy this process's own log is written at.
+pub fn local_privacy() -> Privacy {
+    logger().cfg.privacy
+}
+
 pub fn enabled(sev: Severity) -> bool {
     sev <= current_level() || CAPTURE.with(|c| c.borrow().is_some()) || testing::active()
 }
@@ -740,6 +753,8 @@ pub fn emit_record(rec: Record) {
         return;
     }
     testing::offer(&rec);
+    // PVOS D230 — failures, structured, in the process's problems file.
+    problems::offer(&rec);
     // PVOS D222d — every destination whose filter takes it spools it (each
     // has its own minimum severity, so before this process's level check).
     #[cfg(feature = "ship")]

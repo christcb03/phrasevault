@@ -7,6 +7,8 @@ import SwiftUI
 struct ConsoleView: View {
     @ObservedObject var agent: AgentController
     @StateObject private var unlocker = Unlocker()
+    /// PVOS D230 — what Copy diagnostics last said.
+    @State private var diagnosticsNote: String?
     @State private var tab = 0
     @State private var showPasswordSheet = false
     @State private var vaultPassword = ""
@@ -271,6 +273,22 @@ struct ConsoleView: View {
                 LabeledContent("Companion binary") {
                     Text(agent.companionBinary.path).font(.caption2.monospaced()).textSelection(.enabled)
                 }
+            }
+            // PVOS D230 — one block of text for whoever is helping: asks for
+            // Touch ID first (it holds refused sign-ins and their origins).
+            Section("Troubleshooting") {
+                HStack {
+                    Button("Copy diagnostics") {
+                        unlocker.unlock("copy this companion's diagnostics (they include refused sign-ins)") {
+                            diagnosticsNote = agent.copyDiagnostics()
+                        }
+                    }
+                    if let n = diagnosticsNote {
+                        Text(n).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text("Build, vault and agent, log destinations, and the last hour's warnings and errors. No phrase, key or token.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             if !agent.statusDetail.isEmpty {
                 Section {

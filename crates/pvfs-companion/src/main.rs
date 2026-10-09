@@ -86,6 +86,21 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// This Mac's companion in one block of text for troubleshooting: build,
+    /// vault, agent, log destinations, and the warnings and errors since a
+    /// time. No phrase, key or token is in it (PVOS D230; the app's Details →
+    /// Copy diagnostics)
+    Diagnose {
+        /// How far back: `30m`, `1h`, `2d` (a bare number is minutes; default 1h)
+        #[arg(long, value_name = "AGO")]
+        since: Option<String>,
+        /// Vault file (default: ~/.config/pvfs/companion.vault, or $PVFS_COMPANION_VAULT)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Socket path (default: $XDG_RUNTIME_DIR/pvfs-companion.sock, or $PVFS_COMPANION_SOCKET)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Server / multi-tenant custody (doc 14 §13): seal a phrase (stdin) into the
     /// per-user store under `--user`. Passphrase = that user's from the env.
     TenantInit {
@@ -491,6 +506,7 @@ fn run() -> Result<(), String> {
             }
         }
         Cmd::Status { vault, socket } => run_status(vault, socket),
+        Cmd::Diagnose { since, vault, socket } => run_diagnose(since, vault, socket),
         Cmd::Origins { cmd, vault } => run_origins(cmd, vault),
         Cmd::Pairings { cmd, vault } => run_pairings(cmd, vault),
         Cmd::Keys { cmd, json, socket } => run_keys(cmd, json, socket),
@@ -568,6 +584,8 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     // systemd, today's text anywhere else); every other subcommand keeps
     // plain text, as the logger is never set up for it.
     pvfs_log::init_daemon("pvfs-companion");
+    // PVOS D230 — the agent's failures, structured, for `diagnose`.
+    pvfs_log::problems::open(pvfs_companion::diagnose::problems_path());
     // PVOS D225 — the build that writes this log is its first record.
     pvfs_log::process_started(VERSION);
     // PVOS D226 — ship to this Mac's log destinations (the app's Settings →
@@ -871,6 +889,100 @@ fn run_status(vault: Option<PathBuf>, socket: Option<PathBuf>) -> Result<(), Str
     let n = reg.list().len();
     println!("origins: {n} connected for sign-in");
     Ok(())
+}
+
+/// PVOS D230 — `pvfs-companion diagnose`: what `status` says, the log
+/// destinations (never a token), and the agent's problems file since a time.
+fn run_diagnose(since: Option<String>, vault: Option<PathBuf>, socket: Option<PathBuf>) -> Result<(), String> {
+    let back_ms = match since.as_deref() {
+        None => 3_600_000,
+        Some(s) => parse_ago(s).ok_or_else(|| format!("{s:?}: say how far back as 30m, 1h or 2d (a bare number is minutes)"))?,
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let since_ms = now.saturating_sub(back_ms);
+    let vault_path = match vault {
+        Some(p) => p,
+        None => default_vault()?,
+    };
+    let socket = socket.unwrap_or_else(pvfs_companion::default_socket_path);
+    let mut lines: Vec<(String, String)> = Vec::new();
+    if !vault_path.exists() {
+        lines.push(("vault".into(), format!("none at {}", vault_path.display())));
+    } else {
+        match Vault::open(&vault_path) {
+            Ok(v) => match v.sealing() {
+                pvfs_companion::Sealing::Passphrase => lines.push(("vault".into(), format!("{} (passphrase-sealed)", vault_path.display()))),
+                pvfs_companion::Sealing::Keychain => {
+                    lines.push(("vault".into(), format!("{} (keychain-sealed)", vault_path.display())));
+                    lines.push((
+                        "key".into(),
+                        match keychain_probe(&v) {
+                            Ok(()) => "present in the OS keychain".into(),
+                            Err(e) => format!("NOT retrievable ({e})"),
+                        },
+                    ));
+                }
+            },
+            Err(e) => lines.push(("vault".into(), format!("{} (unreadable: {e})", vault_path.display()))),
+        }
+    }
+    match pvfs_companion::request(&socket, &pvfs_companion::AgentRequest::GetPubkey { role: "identity".into() }) {
+        Ok(pvfs_companion::AgentResponse::Pubkey { pubkey }) => {
+            lines.push(("agent".into(), format!("running on {} (identity {}…)", socket.display(), pubkey.get(..16).unwrap_or(&pubkey))));
+            if let Ok(s) = std::fs::read_to_string(socket.with_extension("http")) {
+                let addr = s.split("\"addr\":\"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("?");
+                lines.push(("web".into(), format!("identity agent on {addr}")));
+            }
+        }
+        Ok(_) => lines.push(("agent".into(), format!("running on {} (unexpected reply)", socket.display()))),
+        Err(e) => lines.push(("agent".into(), format!("NOT running ({e})"))),
+    }
+    let reg = pvfs_companion::OriginRegistry::at(&vault_path.with_extension("origins.json"));
+    lines.push(("origins".into(), format!("{} connected for sign-in", reg.list().len())));
+    let (destinations, destinations_error) = match pvfs_companion::logdest::list(&pvfs_log::ship::config_path()) {
+        Ok(d) => (d, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let (problems, problems_left_out) = pvfs_log::problems::read_since(&pvfs_companion::diagnose::problems_path(), since_ms, 300);
+    let system = std::process::Command::new("uname")
+        .arg("-srm")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let facts = pvfs_companion::diagnose::Facts {
+        now_ms: now,
+        since_ms,
+        build: format!("pvfs-companion {VERSION}"),
+        host: pvfs_log::host(),
+        system,
+        lines,
+        destinations,
+        destinations_error,
+        problems,
+        problems_left_out,
+    };
+    print!("{}", pvfs_companion::diagnose::render(&facts));
+    Ok(())
+}
+
+/// `30m`, `1h`, `2d`, `45s`; a bare number is minutes. In ms.
+fn parse_ago(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&s[..i], s[i..].trim()),
+        None => (s, "m"),
+    };
+    let n: u64 = num.parse().ok()?;
+    let mul = match unit {
+        "s" => 1_000,
+        "m" | "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    (n > 0).then_some(n * mul)
 }
 
 fn run_origins(cmd: Option<OriginsCmd>, vault: Option<PathBuf>) -> Result<(), String> {

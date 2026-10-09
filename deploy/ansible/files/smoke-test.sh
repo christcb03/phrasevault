@@ -527,6 +527,21 @@ $PVFS remote --socket "$SOCK" --anon ls "$DROOT" | qgrep albums \
   && ok "remote ls root (anon via public grant)" || fail "remote ls root (anon via public grant)"
 $PVFS --json remote --socket "$SOCK" info | qgrep '"principal":"key:' \
   && ok "remote info (signed client identity)" || fail "remote info (signed client identity)"
+# PVOS D229 — the live log level, through the real daemon: set for a while,
+# shown by serve status, and back. PVOS D230 — the diagnostics bundle.
+$PVFS --data-dir "$DMOUNT/.pvfs" serve log-level debug --for 2 | qgrep 'log level: debug for 2 more minutes' \
+  && ok "serve log-level sets a level for a while (D229)" || fail "serve log-level debug"
+$PVFS --data-dir "$DMOUNT/.pvfs" serve status | qgrep '^log level: debug for' \
+  && ok "serve status shows the live level (D229)" || fail "serve status: no live level"
+$PVFS --data-dir "$DMOUNT/.pvfs" serve log-level default | qgrep 'log level: info (configured)' \
+  && ok "serve log-level default goes back at once (D229)" || fail "serve log-level default"
+DIAG="$($PVFS --data-dir "$DMOUNT/.pvfs" diagnose --this-box --out - 2>&1)"
+if echo "$DIAG" | qgrep '(this box) ==' && echo "$DIAG" | qgrep "^role: *owner of forest ${DFID:0:8}" \
+  && echo "$DIAG" | qgrep '^problems:' && echo "$DIAG" | qgrep '^log level: *info (configured)'; then
+  ok "pvfs diagnose --this-box: role, level and problems (D230)"
+else
+  fail "pvfs diagnose: $(echo "$DIAG" | head -8 | tr '\n' '|')"
+fi
 
 # member write: create a folder through the daemon, signed by the client identity
 NEWID="$(jget "$($PVFS --json remote --socket "$SOCK" mkdir "$DROOT" uploaded)" created)"
