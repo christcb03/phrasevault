@@ -10,6 +10,7 @@
 
 mod agent;
 pub mod approve;
+pub mod diagnose;
 mod audit;
 mod client;
 pub mod keychain;

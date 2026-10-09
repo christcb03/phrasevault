@@ -43,7 +43,7 @@ pub fn idle_timeout() -> std::time::Duration {
 }
 
 pub use pvfs_proto::{
-    ChildInfo, IngestFileWire, IngestSessionWire, LogEventWire, LogLevelWire, NodeInfo, PassProgressWire, ServeJobWire,
+    ChildInfo, DiagnoseWire, IngestFileWire, IngestSessionWire, LogEventWire, LogLevelWire, NodeInfo, PassProgressWire, ProblemWire, ServeJobWire,
     PROTO_COMPATIBLE_WITH, PROTO_VERSION,
 };
 
@@ -214,6 +214,9 @@ pub const REGION_CLAIMS_PROTO: u32 = 12;
 
 /// PVOS D229 — the first proto that answers `SetLogLevel`.
 pub const LOG_LEVEL_PROTO: u32 = 17;
+
+/// PVOS D230 — the first proto that answers `Diagnose`.
+pub const DIAGNOSE_PROTO: u32 = 18;
 
 /// PVOS D187 — the first proto that answers `ViewLs`, `ViewEntry` and
 /// `CatalogueStatus` (the merged view and `region ls` over the socket).
@@ -452,6 +455,25 @@ impl Client {
         match self.request(ClientMsg::SetLogLevel { level: level.into(), minutes })? {
             ServerMsg::LogLevel(l) => Ok(*l),
             other => Err(unexpected("LogLevel", &other)),
+        }
+    }
+
+    /// PVOS D230 — what the box says about itself for `pvfs diagnose`: its
+    /// config, clock, log level and failures since `since_ms`. A daemon
+    /// before proto 18 cannot; this says so instead of sending the op.
+    pub fn diagnose(&mut self, since_ms: u64) -> Result<pvfs_proto::DiagnoseWire> {
+        if self.daemon_proto < DIAGNOSE_PROTO {
+            return Err(ClientError::Server {
+                code: "unknown_op".into(),
+                message: format!(
+                    "this box's daemon speaks proto {} and cannot say its recent failures (proto {DIAGNOSE_PROTO}, PVOS D230): roll it first",
+                    self.daemon_proto
+                ),
+            });
+        }
+        match self.request(ClientMsg::Diagnose { since_ms })? {
+            ServerMsg::Diagnose(d) => Ok(*d),
+            other => Err(unexpected("Diagnose", &other)),
         }
     }
 

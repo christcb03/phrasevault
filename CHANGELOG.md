@@ -5,6 +5,21 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Diagnostics in one bundle (PVOS D230).**
+  - `pvfs diagnose` asks when run bare; `--this-box`, `--since`, `--out`
+    and `--json` are for scripts. It covers every box this one knows:
+    - build, role and config;
+    - the clock against this box's;
+    - the log level;
+    - destination health, stores, jobs, mounts, fence and backup;
+    - the warnings and errors since a time.
+  - Each daemon keeps its failures in `log-problems.jsonl` (1 MB, one old
+    copy), and answers `Diagnose` from it (proto 18, member-gated).
+  - The Mac companion has `pvfs-companion diagnose` and Details → Copy
+    diagnostics (Touch ID).
+  - No phrase, key or token is in either; URLs lose their user, password
+    and query (`pvfs_log::redact_urls`).
+
 - **What kind of failure, slow requests, and a log level you change live
   (PVOS D229).**
   - Every record at warning or above carries `error_kind`

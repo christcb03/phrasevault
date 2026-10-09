@@ -126,6 +126,10 @@ pub struct Daemon {
     /// The P5 job runner's state, when the binary attached one (doc 18 §2).
     /// Absent in embedded/test daemons — `ServeStatus` then reports `"off"`.
     jobs: std::sync::OnceLock<Arc<jobs::JobsState>>,
+    /// PVOS D230 — when this daemon started, and its listener (`main` sets
+    /// it; `none` when it serves only its socket), for `Diagnose`.
+    started_ms: u64,
+    listen: std::sync::OnceLock<String>,
     /// P10.0: the forest's data dir, for ingest partial/sidecar paths
     /// without taking an engine lock.
     data_dir: PathBuf,
@@ -233,6 +237,8 @@ impl Daemon {
             prepared: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
             jobs: std::sync::OnceLock::new(),
+            started_ms: now_ms(),
+            listen: std::sync::OnceLock::new(),
             data_dir,
             ingest: Mutex::new(IngestState {
                 sessions,
@@ -308,6 +314,67 @@ impl Daemon {
                 started_ms: m.started_ms,
             })
             .collect()
+    }
+
+    /// PVOS D230 — the listener this daemon serves the network on, for
+    /// `Diagnose` (set once, by `main`).
+    pub fn set_listen(&self, listen: String) {
+        let _ = self.listen.set(listen);
+    }
+
+    /// PVOS D230 — what this box says about itself to `pvfs diagnose`: its
+    /// role, jobs, regions and listener (as its start record, but now), its
+    /// clock, and its failures since `since_ms` from the problems file this
+    /// process and its mounts write.
+    pub fn diagnose(&self, since_ms: u64) -> pvfs_proto::DiagnoseWire {
+        let (role, regions) = {
+            let e = self.reader();
+            (if e.is_replica() { "replica" } else { "owner" }, regions_by_kind(&e))
+        };
+        let jobs = self
+            .jobs
+            .get()
+            .map(|j| j.snapshot().into_iter().filter(|j| j.enabled).map(|j| j.name).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.join(","))
+            .unwrap_or_else(|| "none".into());
+        let mut w = pvfs_proto::DiagnoseWire {
+            now_ms: now_ms(),
+            started_ms: self.started_ms,
+            host: pvfs_log::host(),
+            build: env!("PVFS_BUILD").to_string(),
+            forest: self.forest_id.clone(),
+            role: role.into(),
+            jobs,
+            regions,
+            listen: self.listen.get().cloned().unwrap_or_else(|| "none".into()),
+            privacy: pvfs_log::local_privacy().as_str().into(),
+            ..Default::default()
+        };
+        match pvfs_log::problems::path() {
+            Some(p) => {
+                let (recs, left_out) = pvfs_log::problems::read_since(&p, since_ms, DIAGNOSE_MAX_PROBLEMS);
+                w.problems_left_out = left_out;
+                w.problems = recs
+                    .iter()
+                    .map(|r| pvfs_proto::ProblemWire {
+                        ts_ms: r.ts_ms,
+                        severity: r.severity.as_str().into(),
+                        event: r.event.clone(),
+                        error_kind: r
+                            .fields
+                            .iter()
+                            .find(|f| f.name == pvfs_log::kind::FIELD)
+                            .map(|f| f.value.to_string())
+                            .unwrap_or_default(),
+                        service: r.service.clone(),
+                        line: r.line(),
+                    })
+                    .collect();
+            }
+            None => w.problems_note = "this daemon keeps no problems file (it runs embedded)".into(),
+        }
+        w
     }
 
     /// Attach the job runner's state so `ServeStatus` answers live (set once,
@@ -807,6 +874,25 @@ fn log_destination_health() -> Vec<pvfs_proto::LogDestHealthWire> {
         .collect()
 }
 
+/// PVOS D230 — the most failures one `Diagnose` answer carries (the newest).
+pub const DIAGNOSE_MAX_PROBLEMS: usize = 300;
+
+/// PVOS D228/D230 — a box's regions counted by kind: `3 catalogue`, or
+/// `none`.
+pub fn regions_by_kind(engine: &Engine) -> String {
+    match engine.regions() {
+        Ok(rs) if rs.is_empty() => "none".to_string(),
+        Ok(rs) => {
+            let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for (_, _, kind) in rs {
+                *by_kind.entry(kind).or_default() += 1;
+            }
+            by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", ")
+        }
+        Err(e) => format!("unreadable ({e})"),
+    }
+}
+
 /// PVOS D229 — the log level for `serve status` and `SetLogLevel`'s answer:
 /// the configured one, the one in force, and until when a live one lasts.
 fn log_level_wire(data_dir: &std::path::Path) -> pvfs_proto::LogLevelWire {
@@ -1232,6 +1318,18 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             }
         }
         ClientMsg::SetLogLevel { level, minutes } => set_log_level(daemon, principal, local, &level, minutes),
+        // PVOS D230: gated as `ServeStatus` is.
+        ClientMsg::Diagnose { since_ms } => {
+            let member = match principal {
+                Principal::Key(pk) => daemon.reader().is_active_member(pk).unwrap_or(false),
+                _ => false,
+            };
+            if member {
+                ServerMsg::Diagnose(Box::new(daemon.diagnose(since_ms)))
+            } else {
+                err("forbidden", "diagnose is member-gated (enroll this box)")
+            }
+        }
         // PVOS D183: gated as `ServeStatus` is. Each claim is signed now, by
         // this box's client identity — the key its region grants name, the
         // same key that signs its routed commits.

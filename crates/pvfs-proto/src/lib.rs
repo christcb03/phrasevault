@@ -60,7 +60,10 @@ use serde::{Deserialize, Serialize};
 ///   16 → 17: PVOS D229 `SetLogLevel` — the box's log level for a while
 ///          (`pvfs serve log-level`), without a restart. Additive;
 ///          compatible-with stays.
-pub const PROTO_VERSION: u32 = 17;
+///   17 → 18: PVOS D230 `Diagnose` — a box's config, clock, level and its
+///          recent failures, for `pvfs diagnose`. Additive; compatible-with
+///          stays.
+pub const PROTO_VERSION: u32 = 18;
 
 /// The oldest proto this binary can still talk to (D73).
 ///
@@ -252,6 +255,8 @@ pub enum ServerMsg {
     },
     /// PVOS D229: the log level after a `SetLogLevel`.
     LogLevel(Box<LogLevelWire>),
+    /// PVOS D230: the answer to `Diagnose`.
+    Diagnose(Box<DiagnoseWire>),
     /// P10.0 (doc 23 §3): phase 1 of `IngestBegin` — the session layout plus
     /// the standard prepared-write fields. The client signs the preimages and
     /// sends the usual `Commit`; the session activates when that commit
@@ -498,6 +503,51 @@ pub struct LogDestHealthWire {
     pub last_error: Option<String>,
     /// It has not delivered for the failing time (15 minutes).
     pub failing: bool,
+}
+
+/// PVOS D230 — what a box says about itself for `pvfs diagnose`: what it
+/// is, its clock, and its failures since a time (from its problems file).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnoseWire {
+    /// The box's clock when it answered (Unix ms): the caller compares it
+    /// with its own.
+    pub now_ms: u64,
+    /// When this daemon started (Unix ms).
+    pub started_ms: u64,
+    pub host: String,
+    pub build: String,
+    pub forest: String,
+    /// `owner` or `replica`.
+    pub role: String,
+    /// The enabled jobs, comma-separated, or `none`.
+    pub jobs: String,
+    /// The regions by kind (`3 catalogue`), or `none`.
+    pub regions: String,
+    /// The listener (`0.0.0.0:7434`), or `none`.
+    pub listen: String,
+    /// The local log privacy (`full`, `identified`, `minimal`).
+    pub privacy: String,
+    #[serde(default)]
+    pub problems: Vec<ProblemWire>,
+    /// Failures in the window older than the ones sent (at most 300 are).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub problems_left_out: u64,
+    /// Why there are none to say: no problems file on this box.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub problems_note: String,
+}
+
+/// PVOS D230 — one failure record, as the box's problems file has it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProblemWire {
+    pub ts_ms: u64,
+    pub severity: String,
+    pub event: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_kind: String,
+    /// `pvfsd`, `pvfs-mount`, …
+    pub service: String,
+    pub line: String,
 }
 
 /// PVOS D229 — a box's log level: what it started with, what is in force,
@@ -959,6 +1009,13 @@ pub enum ClientMsg {
         #[serde(default)]
         minutes: u32,
     },
+    /// PVOS D230 (proto 18): the box's config, clock, log level and its
+    /// failures since `since_ms` (Unix ms; at most the newest 300).
+    /// Member-gated, as `ServeStatus`. Answered `ServerMsg::Diagnose`.
+    Diagnose {
+        #[serde(default)]
+        since_ms: u64,
+    },
     /// PVOS D174: this box's receive plan, as the running daemon sees it —
     /// answered from the daemon's read pool: no second engine opens the
     /// forest, nothing folds, the writer is not waited on. Member-gated like
@@ -1069,6 +1126,7 @@ impl ClientMsg {
             ClientMsg::CommitSigned { .. } => "commit_signed",
             ClientMsg::ServeStatus => "serve_status",
             ClientMsg::SetLogLevel { .. } => "set_log_level",
+            ClientMsg::Diagnose { .. } => "diagnose",
             ClientMsg::ReceivePlan => "receive_plan",
             ClientMsg::IngestBegin { .. } => "ingest_begin",
             ClientMsg::IngestWrite { .. } => "ingest_write",

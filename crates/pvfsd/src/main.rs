@@ -179,23 +179,16 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // PVOS D228 — what this daemon is, for its config record below: the
     // forest, and its regions counted by kind.
     let forest_id = engine.identity.forest_id.clone();
-    let regions = match engine.regions() {
-        Ok(rs) if rs.is_empty() => "none".to_string(),
-        Ok(rs) => {
-            let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-            for (_, _, kind) in rs {
-                *by_kind.entry(kind).or_default() += 1;
-            }
-            by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", ")
-        }
-        Err(e) => format!("unreadable ({e})"),
-    };
+    let regions = pvfsd::regions_by_kind(&engine);
     // PVOS D222d — log destinations from log-destinations.json (when there
     // is one), spooled under this forest's data dir; re-read when it changes.
     pvfs_log::ship::watch_file(data_dir.join("log-spool"), "PVFS", VERSION.to_string());
     // PVOS D229 — the live log level (`pvfs serve log-level`): applied now,
     // so a restart inside its window starts at that level, then every 5 s.
     pvfs_log::level::watch(data_dir.clone());
+    // PVOS D230 — this daemon's failures, structured, for `pvfs diagnose`
+    // (its mounts write the same file).
+    pvfs_log::problems::open(data_dir.join(pvfs_log::problems::FILE_NAME));
 
     let socket = match &cli.socket {
         Some(s) => s.clone(),
@@ -263,6 +256,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let job_list = if enabled.is_empty() { "none".to_string() } else { enabled.join(",") };
         let role = if is_replica { "replica" } else { "owner" };
         let listen = cli.listen.clone().unwrap_or_else(|| "none".into());
+        daemon.set_listen(listen.clone());
         // Not "listening on": scripts and plays find the listener's own line
         // (with its port and pin) by that phrase.
         pv_notice!("pvfs.daemon.config", forest = &forest_id, role = role, jobs = &job_list, regions = &regions, listen = &listen;

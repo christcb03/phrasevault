@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod diagnose;
+
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use pvfs_client::fetch::{sync_pull, Fetcher};
@@ -634,6 +636,24 @@ enum Cmd {
     Serve {
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
+    },
+    /// One troubleshooting bundle: this box and every box it knows — each
+    /// one's build, config, clock, log level, jobs, stores, log
+    /// destinations, and its warnings and errors since a time. Bare, at a
+    /// terminal, it asks which boxes, how far back and where to save it
+    /// (PVOS D230)
+    Diagnose {
+        /// Only this box, not its peers
+        #[arg(long)]
+        this_box: bool,
+        /// How far back: `30m`, `1h`, `2d` (a bare number is minutes;
+        /// default 1h)
+        #[arg(long, value_name = "AGO")]
+        since: Option<String>,
+        /// Where to write it; `-` for this terminal (bare, at a terminal, it
+        /// offers ./pvfs-diagnose-<host>-<time>.txt; elsewhere the terminal)
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
     },
     /// External-ingest sessions (P10, doc 23): catalog a download now,
     /// stream bytes in as they verify, commit through the usual gates.
@@ -6237,6 +6257,22 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::Diagnose { this_box, since, out } => {
+            let data_dir = ctx?;
+            if !data_dir.join("log.db").exists() {
+                return Err(PvfsError::NotFound {
+                    kind: "forest",
+                    id: data_dir.to_string_lossy().into_owned(),
+                });
+            }
+            let sock = try_daemon_socket(&data_dir).ok_or_else(|| PvfsError::BadInput {
+                field: "diagnose".into(),
+                reason: "no running daemon for this forest: `pvfs diagnose` asks the running daemons \
+                         (`pvfs serve status` says why one is not running)"
+                    .into(),
+            })?;
+            run_diagnose(&data_dir, &sock, this_box, since.as_deref(), out.as_deref(), json)
+        }
         Cmd::Serve { cmd: Some(cmd), .. } => {
             // enable/disable/ls edit the local `serve.jobs` (deployment state,
             // doc 18 §2); status asks the running daemon over its socket.
@@ -6792,6 +6828,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             // PVOS D229 — the daemon's live log level reaches the mount too
             // (they share the data dir's log-level.json).
             pvfs_log::level::watch(data_dir.clone());
+            // PVOS D230 — the mount's failures go in the daemon's problems file.
+            pvfs_log::problems::open(data_dir.join(pvfs_log::problems::FILE_NAME));
             eprintln!(
                 "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),
@@ -10541,6 +10579,129 @@ fn daemon_member_client(state_dir: &std::path::Path, sock: &std::path::Path) -> 
     };
     let pubkey = crypto::pubkey_bytes(&key);
     Client::connect_signed(sock, &pubkey, |d| crypto::sign_digest(&key, d).unwrap_or_default()).map_err(remote_err)
+}
+
+/// PVOS D230 — the other boxes of this forest, as `(pin, address)`: the
+/// owner's health record when there is one (it lists exactly the boxes the
+/// fleet announces), else the forest's endpoint records through a read view
+/// (never a second engine under the running daemon). This box is left out.
+fn diagnose_peers(data_dir: &std::path::Path) -> Vec<(String, String)> {
+    let own = pvfs_core::storage::host_pin(data_dir);
+    let mut peers: Vec<(String, String)> = match pvfs_client::health::FleetHealth::load(data_dir) {
+        Ok(Some(h)) if !h.peers.is_empty() => h.peers.into_iter().map(|(pin, r)| (pin, r.addr)).collect(),
+        _ => match Engine::open_read_view(data_dir) {
+            Ok(view) => {
+                let all = pvfs_client::fetch::catalog_endpoints(&view);
+                let _ = view.close();
+                all.into_iter().collect()
+            }
+            Err(_) => Vec::new(),
+        },
+    };
+    peers.retain(|(pin, _)| own.as_deref() != Some(pin.as_str()));
+    peers.sort_by(|a, b| a.1.cmp(&b.1));
+    peers
+}
+
+/// PVOS D230 — `pvfs diagnose`.
+fn run_diagnose(
+    data_dir: &std::path::Path,
+    sock: &std::path::Path,
+    this_box: bool,
+    since: Option<&str>,
+    out: Option<&str>,
+    json: bool,
+) -> Result<(), PvfsError> {
+    let ask = interactive();
+    let peers = if this_box { Vec::new() } else { diagnose_peers(data_dir) };
+    let include_peers = !peers.is_empty()
+        && (!ask || {
+            let addrs: Vec<&str> = peers.iter().map(|(_, a)| a.as_str()).collect();
+            ask_yes(&format!("Include the other {} box(es) ({})?", peers.len(), addrs.join(", ")), true)?
+        });
+    let bad_since = |a: &str| PvfsError::BadInput {
+        field: "since".into(),
+        reason: format!("{a:?}: say how far back as 30m, 1h or 2d (a bare number is minutes)"),
+    };
+    let back_ms = match since {
+        Some(s) => diagnose::parse_since(s).ok_or_else(|| bad_since(s))?,
+        None if ask => {
+            let a = prompt_line("Since how long ago (e.g. 30m, 1h, 1d)", Some("1h"))?;
+            diagnose::parse_since(&a).ok_or_else(|| bad_since(&a))?
+        }
+        None => 3_600_000,
+    };
+    let now = now_ms();
+    let since_ms = now.saturating_sub(back_ms);
+    let mut bundle = diagnose::Bundle {
+        collected_ms: now,
+        by_host: pvfs_log::host(),
+        cli_build: VERSION.to_string(),
+        since_ms,
+        boxes: Vec::new(),
+        system: diagnose::system_facts(),
+    };
+    match daemon_member_client(data_dir, sock) {
+        Ok(mut c) => bundle.boxes.push(diagnose::collect_box(&mut c, "local socket", true, since_ms)),
+        Err(e) => bundle.boxes.push(diagnose::BoxReport {
+            name: pvfs_log::host(),
+            addr: "local socket".into(),
+            this_box: true,
+            error: Some(e.to_string()),
+            ..Default::default()
+        }),
+    }
+    if include_peers {
+        for (pin, addr) in peers {
+            if ask {
+                eprintln!("asking {addr}…");
+            }
+            let src = pvfs_core::replica::ReplicaSource { transport: "tcp".into(), target: addr.clone(), pin, region: String::new() };
+            bundle.boxes.push(match pvfs_client::follow::dial_source(&src) {
+                Ok(mut c) => diagnose::collect_box(&mut c, &addr, false, since_ms),
+                Err(e) => diagnose::BoxReport { name: addr.clone(), addr, error: Some(e.to_string()), ..Default::default() },
+            });
+        }
+    }
+    let text = if json { diagnose::render_json(&bundle) } else { diagnose::render_text(&bundle) };
+    let stamp: String = pvfs_log::format_ts(now).chars().filter(|c| c.is_ascii_digit()).take(12).collect();
+    let default_out = format!("pvfs-diagnose-{}-{}-{}.txt", bundle.by_host, &stamp[..8.min(stamp.len())], stamp.get(8..).unwrap_or(""));
+    let out = match out {
+        Some(o) => o.to_string(),
+        None if ask => prompt_line("Save it to (- for this terminal)", Some(&default_out))?,
+        None => "-".into(),
+    };
+    if out == "-" {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    write_private(std::path::Path::new(&out), &text)?;
+    let problems: u64 = bundle
+        .boxes
+        .iter()
+        .filter_map(|b| b.diag.as_ref())
+        .map(|d| d.problems.len() as u64 + d.problems_left_out)
+        .sum();
+    let silent = bundle.boxes.iter().filter(|b| b.error.is_some()).count();
+    println!(
+        "diagnostics for {} box(es) written to {out} ({} warnings and errors since {}{})",
+        bundle.boxes.len(),
+        problems,
+        diagnose_ago(back_ms),
+        if silent > 0 { format!("; {silent} box(es) did not answer") } else { String::new() }
+    );
+    Ok(())
+}
+
+fn diagnose_ago(ms: u64) -> String {
+    match ms {
+        m if m % 86_400_000 == 0 => format!("{} day(s) ago", m / 86_400_000),
+        m if m % 3_600_000 == 0 => format!("{} hour(s) ago", m / 3_600_000),
+        m => format!("{} minute(s) ago", m / 60_000),
+    }
 }
 
 /// PVOS D229 — a log level as a person reads it: `debug for 42 more minutes,
