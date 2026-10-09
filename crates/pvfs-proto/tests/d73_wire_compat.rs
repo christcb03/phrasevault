@@ -99,7 +99,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
         other => panic!("{other:?}"),
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,
@@ -138,7 +138,7 @@ fn an_older_serve_jobs_reply_without_stores_decodes() {
         other => panic!("{other:?}"),
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,
@@ -171,7 +171,7 @@ fn an_older_serve_jobs_reply_without_mounts_decodes() {
         other => panic!("{other:?}"),
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,
@@ -208,7 +208,7 @@ fn an_older_serve_jobs_reply_without_log_or_fence_decodes() {
         other => panic!("{other:?}"),
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,
@@ -247,7 +247,7 @@ fn an_older_serve_jobs_reply_without_build_decodes() {
         other => panic!("{other:?}"),
     }
     let new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,
@@ -340,7 +340,7 @@ fn serve_status_log_destinations_are_optional_both_ways() {
         other => panic!("{other:?}"),
     }
     let mut new = pvfs_proto::ServerMsg::ServeJobs {
-        runner: "on".into(),
+        runner: Box::new("on".into()),
         jobs: Box::default(),
         conflicts: 0,
         stale: 0,

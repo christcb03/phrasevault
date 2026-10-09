@@ -169,7 +169,9 @@ pub enum ServerMsg {
     /// `runner` is `"on"` when a runner thread is attached, `"off"` when this
     /// daemon predates jobs or was started without one.
     ServeJobs {
-        runner: String,
+        /// Boxed (PVOS D228) with the rest: adding `log_destinations` took the
+        /// variant past clippy's 128 bytes. The JSON is the same string.
+        runner: Box<String>,
         /// Boxed (PVOS D182, with `capacity`): the variant must stay under
         /// clippy's 128 bytes, since `ServerMsg` is the error half of many
         /// results. The JSON is the same.

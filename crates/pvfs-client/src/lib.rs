@@ -366,7 +366,7 @@ impl Client {
                 build,
                 log_destinations,
             } => Ok(ServeStatusReply {
-                runner,
+                runner: *runner,
                 jobs: *jobs,
                 conflicts,
                 stale,
@@ -432,7 +432,7 @@ impl Client {
 
     pub fn serve_status(&mut self) -> Result<(String, Vec<ServeJobWire>)> {
         match self.request(ClientMsg::ServeStatus)? {
-            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((runner, *jobs)),
+            ServerMsg::ServeJobs { runner, jobs, .. } => Ok((*runner, *jobs)),
             other => Err(unexpected("ServeJobs", &other)),
         }
     }

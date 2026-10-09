@@ -1111,7 +1111,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             } else {
                 match daemon.jobs.get() {
                     Some(j) => ServerMsg::ServeJobs {
-                        runner: "on".into(),
+                        runner: Box::new("on".into()),
                         jobs: Box::new(j.snapshot()),
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
@@ -1127,7 +1127,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
                         build: Some(Box::new(env!("PVFS_BUILD").to_string())),
                     },
                     None => ServerMsg::ServeJobs {
-                        runner: "off".into(),
+                        runner: Box::new("off".into()),
                         jobs: Box::default(),
                         mounts: Box::new(daemon.running_mounts()),
                         conflicts: daemon.view_conflict_count(),
