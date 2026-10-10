@@ -61,8 +61,7 @@ pub fn is_mount(path: &Path) -> bool {
 /// no recovery) — used by inventory listings.
 pub fn peek_identity(mount: &Path) -> Result<ForestIdentity> {
     let log = state_dir(mount).join("log.db");
-    let conn = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(map_db("open log read-only"))?;
+    let conn = open_peek(&log).map_err(map_db("open log read-only"))?;
     let row: Option<(String, Vec<u8>)> = conn
         .query_row(
             "SELECT kind, body FROM events WHERE seq = 1",
@@ -101,8 +100,7 @@ pub fn peek_identity(mount: &Path) -> Result<ForestIdentity> {
 /// engine open, no recovery, safe beside a running daemon. What a replica
 /// sends with its routed writes, and what `pvfs forest tip` prints.
 pub fn peek_tip(data_dir: &Path) -> Result<(u64, Vec<u8>)> {
-    let conn = Connection::open_with_flags(data_dir.join("log.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(map_db("open log read-only"))?;
+    let conn = open_peek(&data_dir.join("log.db")).map_err(map_db("open log read-only"))?;
     crate::log_store::tip_in(&conn, "main")
 }
 
@@ -111,17 +109,51 @@ pub fn peek_tip(data_dir: &Path) -> Result<(u64, Vec<u8>)> {
 /// companion must hold to promote (D182): genesis's alone is wrong once the
 /// root has been rotated.
 pub fn peek_current_root(data_dir: &Path, identity: &ForestIdentity) -> Result<Vec<u8>> {
-    let conn = Connection::open_with_flags(data_dir.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(map_db("open projection read-only"))?;
+    let conn = open_peek(&data_dir.join("index.db")).map_err(map_db("open projection read-only"))?;
     crate::projection::current_root(&conn, identity)
 }
 
 /// PVOS D192 — whether the forest binds its certificates (`genesis`, or the
 /// seq of its `CertificatesBound`), read-only beside a running daemon.
 pub fn peek_certs_bound(data_dir: &Path) -> Result<Option<String>> {
-    let conn = Connection::open_with_flags(data_dir.join("index.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(map_db("open projection read-only"))?;
+    let conn = open_peek(&data_dir.join("index.db")).map_err(map_db("open projection read-only"))?;
     crate::projection::certs_bound(&conn)
+}
+
+/// PVOS D232 — a read-only connection for a peek. As the forest's user, the
+/// usual one. As any other user (root, under a `sudo` command D231 still
+/// allows), `immutable`: SQLite then creates no `-shm` or `-wal` and takes
+/// no lock on a forest that is not this process's. A read-only connection
+/// to a WAL database otherwise creates those files when they are not there
+/// (a daemon stopped and cleanly closed). Under root SQLite gives them to
+/// the database file's owner (checked: D232 deviation 1), so this is
+/// defense: for a non-root other user, and for locks. Immutable reads the
+/// database file alone, so a write still in the WAL is not seen: the peeks
+/// a root command makes read the genesis row and identity, long
+/// checkpointed.
+pub fn open_peek(db: &Path) -> rusqlite::Result<Connection> {
+    let other_user = db.parent().is_some_and(|dir| check_forest_user(dir).is_err());
+    if !other_user {
+        return Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY);
+    }
+    Connection::open_with_flags(
+        format!("file:{}?immutable=1", uri_path(db)),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+/// `path` for a `file:` URI: `%`, `?` and `#` escaped (SQLite's URI rules).
+fn uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '?' => out.push_str("%3f"),
+            '#' => out.push_str("%23"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---- mount-level engine lifecycle ---------------------------------------------
@@ -225,36 +257,68 @@ pub fn mount_owner_credentials() -> Result<(u32, u32)> {
 /// an arbitrary target (the classic `chown -R` escalation). Entries already owned
 /// by the target uid/gid are skipped, making this a cheap no-op in the common
 /// case where state is already operator-owned (and avoiding needless `EPERM`).
+///
+/// PVOS D232 — by descriptors. The walk used to `symlink_metadata` a path
+/// and then `chown(2)` the same path, which follows a link: the tree's user,
+/// swapping an entry for a link to `/etc/shadow` between the two calls,
+/// would be given that file by the root running `forest fix-permissions`.
+/// Now every folder is opened `O_NOFOLLOW` (from `/`, then relative to its
+/// parent), and each entry is changed with `fchownat(…, AT_SYMLINK_NOFOLLOW)`
+/// relative to its folder: a link is never followed, whatever is swapped.
 #[cfg(unix)]
 pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    use nix::unistd::{chown, Gid, Uid};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::fd::AsRawFd;
+    let root = crate::sync::open_dir_nofollow(path).map_err(|e| PvfsError::io("open for chown", e))?;
+    chown_dir(root.as_raw_fd(), uid, gid)
+}
 
-    let u = Uid::from_raw(uid);
-    let g = Gid::from_raw(gid);
-    fn recurse(p: &Path, u: Uid, g: Gid, uid: u32, gid: u32) -> Result<()> {
-        let md = std::fs::symlink_metadata(p).map_err(|e| PvfsError::io("stat", e))?;
-        if md.file_type().is_symlink() {
-            return Ok(()); // skip symlinks entirely — never follow them
-        }
-        if md.uid() != uid || md.gid() != gid {
-            chown(p, Some(u), Some(g))
-                .map_err(|e| PvfsError::io("chown", std::io::Error::from(e)))?;
-        }
-        if md.is_dir() {
-            for entry in std::fs::read_dir(p).map_err(|e| PvfsError::io("read dir", e))? {
-                recurse(
-                    &entry.map_err(|e| PvfsError::io("read dir", e))?.path(),
-                    u,
-                    g,
-                    uid,
-                    gid,
-                )?;
+/// Change the folder open at `fd`, then everything in it (see `chown_tree`).
+#[cfg(unix)]
+fn chown_dir(fd: std::os::fd::RawFd, uid: u32, gid: u32) -> Result<()> {
+    use nix::fcntl::{AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode};
+    use nix::unistd::{fchown, fchownat, Gid, Uid};
+    let (u, g) = (Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
+    let io = |what: &str, e: nix::errno::Errno| PvfsError::io(what, std::io::Error::from(e));
+    let st = fstat(fd).map_err(|e| io("stat", e))?;
+    if st.st_uid != uid || st.st_gid != gid {
+        fchown(fd, u, g).map_err(|e| io("chown", e))?;
+    }
+    // a second descriptor for the listing: Dir takes and closes its own
+    let list = nix::fcntl::openat(Some(fd), ".", OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
+        .map_err(|e| io("read dir", e))?;
+    let mut dir = nix::dir::Dir::from_fd(list).map_err(|e| io("read dir", e))?;
+    let names: Vec<std::ffi::CString> = dir
+        .iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !matches!(e.file_name().to_bytes(), b"." | b".."))
+        .map(|e| e.file_name().to_owned())
+        .collect();
+    for name in names {
+        let Ok(st) = fstatat(Some(fd), name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) else { continue };
+        match st.st_mode & nix::libc::S_IFMT {
+            nix::libc::S_IFLNK => continue, // a link: never followed, never changed
+            nix::libc::S_IFDIR => {
+                let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+                match nix::fcntl::openat(Some(fd), name.as_c_str(), flags, Mode::empty()) {
+                    Ok(sub) => {
+                        // Safety: just opened, owned here only.
+                        let sub = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(sub) };
+                        chown_dir(std::os::fd::AsRawFd::as_raw_fd(&sub), uid, gid)?;
+                    }
+                    // swapped for a link (or a file) since the stat: left alone
+                    Err(nix::errno::Errno::ELOOP) | Err(nix::errno::Errno::ENOTDIR) => {}
+                    Err(e) => return Err(io("open dir", e)),
+                }
+            }
+            _ => {
+                if st.st_uid != uid || st.st_gid != gid {
+                    fchownat(Some(fd), name.as_c_str(), u, g, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|e| io("chown", e))?;
+                }
             }
         }
-        Ok(())
     }
-    recurse(path, u, g, uid, gid)
+    Ok(())
 }
 
 #[cfg(not(unix))]

@@ -663,6 +663,11 @@ pub struct TrashWire {
     /// purge that runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_error: Option<String>,
+    /// PVOS D232 — the region's root on that box (its trash is
+    /// `<root>/.pvfs-trash`): where `pvfs trash unstick` gives a failing
+    /// region's trash folder back. Absent from a daemon before D232.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 /// PVOS D231 — one trash bucket a purge could not wholly remove: the first

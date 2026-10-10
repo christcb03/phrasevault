@@ -372,6 +372,7 @@ impl JobsState {
                 // PVOS D231 — what this pass could not remove, by bucket
                 stuck: r.purge.stuck.iter().map(stuck_wire).collect(),
                 purge_error: None,
+                root: Some(r.root.display().to_string()),
             };
             match t.iter_mut().find(|x| x.region == w.region) {
                 Some(x) => *x = w,
@@ -383,17 +384,35 @@ impl JobsState {
     /// PVOS D231 — a region whose purge failed as a whole: said in `serve
     /// status` (and so to the owner's notifier) beside its last figures, as
     /// the trash step's journal line alone reached nobody (2026-10-09).
-    fn record_trash_error(&self, region: &str, retention_days: u64, error: &str) {
+    fn record_trash_error(&self, region: &str, root: &std::path::Path, retention_days: u64, error: &str) {
         let mut t = self.trash.lock().unwrap();
+        let root = Some(root.display().to_string());
         match t.iter_mut().find(|x| x.region == region) {
-            Some(x) => x.purge_error = Some(error.to_string()),
+            Some(x) => {
+                x.purge_error = Some(error.to_string());
+                x.root = root;
+            }
             None => t.push(pvfs_proto::TrashWire {
                 region: region.to_string(),
                 retention_days,
                 purge_error: Some(error.to_string()),
+                root,
                 ..Default::default()
             }),
         }
+    }
+
+    /// PVOS D232 — what a `receive`/`resolve` purge did (`purge_region_trash`
+    /// goes region by region now): record the purged, record and say the
+    /// failed. Returns the buckets removed.
+    fn record_purges(&self, job: &'static str, p: &pvfs_core::sync::RegionPurges) -> u64 {
+        self.record_trash(&p.done);
+        for f in &p.failed {
+            self.record_trash_error(&f.region, &f.root, f.retention_days, &f.error);
+            pv_warn!("pvfs.trash.purge_failed", job = job, region = &f.region[..f.region.len().min(8)], error = content(&f.error);
+                "pvfsd: {job}: trash purge of {}: {}", &f.region[..f.region.len().min(8)], f.error);
+        }
+        p.done.iter().map(|x| x.purge.removed).sum()
     }
 
     /// D148 — the trash as the last purge passes left it (`serve status`).
@@ -1323,13 +1342,12 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                 view.purge_region_trash()
             };
             match purged {
-                Ok(t) => {
-                    let n: u64 = t.iter().map(|x| x.purge.removed).sum();
+                Ok(p) => {
+                    let n = st.record_purges("receive", &p);
                     if n > 0 {
                         pv_info!("pvfs.trash.purged", job = "receive", buckets = n;
                             "pvfsd: receive purged {n} trash buckets past retention");
                     }
-                    st.record_trash(&t);
                 }
                 Err(e) => pv_warn!("pvfs.trash.purge_failed", job = "receive", error = content(&e);
                     "pvfsd: receive: trash purge: {e}"),
@@ -1374,8 +1392,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
                     let _one = st.one_purge();
                     view.purge_region_trash()?
                 };
-                let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
-                st.record_trash(&trash);
+                // PVOS D232 — a region whose trash cannot be read is recorded
+                // and said; it no longer fails the pass
+                let purged = st.record_purges("resolve", &trash);
                 Ok((r, purged))
             })();
             match r {
@@ -1785,7 +1804,7 @@ fn trash_step(
                 found.push(t)
             }
             Err(e) => {
-                st.record_trash_error(&region, days, &e.to_string());
+                st.record_trash_error(&region, &root, days, &e.to_string());
                 failed.push(format!("{short}: {e}"))
             }
         }
@@ -2422,6 +2441,37 @@ mod tests {
         let log = trash_step(&st, Err(PvfsError::BadInput { field: "x".into(), reason: "y".into() }), &never);
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0].starts_with("pvfsd: trash purge failed: listing this box's regions: "), "{log:?}");
+    }
+
+    /// PVOS D232 — a `receive`/`resolve` purge records what it purged and,
+    /// for a region whose trash could not be read, why (with its root, for
+    /// `pvfs trash unstick`), instead of failing the pass.
+    #[test]
+    fn a_job_purge_records_the_failed_region_with_its_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = JobsState::load(tmp.path().join("forest")).unwrap();
+        let p = pvfs_core::sync::RegionPurges {
+            done: vec![pvfs_core::sync::RegionTrash {
+                region: "a".repeat(64),
+                root: "/mnt/local/Media".into(),
+                retention_days: 7,
+                purge: Default::default(),
+                kept: Default::default(),
+            }],
+            failed: vec![pvfs_core::sync::RegionPurgeFailed {
+                region: "b".repeat(64),
+                root: "/mnt/local2".into(),
+                retention_days: 7,
+                error: "I/O error during read trash: Permission denied (os error 13)".into(),
+            }],
+        };
+        assert_eq!(st.record_purges("resolve", &p), 0);
+        let t = st.trash_snapshot();
+        let a = t.iter().find(|x| x.region.starts_with('a')).unwrap();
+        assert_eq!((a.root.as_deref(), a.purge_error.as_deref()), (Some("/mnt/local/Media"), None));
+        let b = t.iter().find(|x| x.region.starts_with('b')).unwrap();
+        assert_eq!(b.root.as_deref(), Some("/mnt/local2"));
+        assert!(b.purge_error.as_deref().is_some_and(|e| e.contains("Permission denied")), "{b:?}");
     }
 
     /// PVOS D196 — a periodic job's failed pass reaches the journal on D157's

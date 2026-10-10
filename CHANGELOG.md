@@ -5,6 +5,32 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **`pvfs trash unstick`, and root-run commands that leave nothing behind
+  (PVOS D232).**
+  - `sudo pvfs trash unstick` clears what the purge reports stuck.
+    - Bare, it asks the box's daemon what is stuck, shows each bucket and
+      asks before removing it. Or name the buckets.
+    - It refuses anything that is not a PVFS trash bucket of this forest,
+      and follows no link anywhere on the path.
+    - A region whose trash folder cannot be read is offered back to the
+      forest's user.
+    - The daemon itself never gets sudo. The `trash_stuck` event and
+      `serve status` name the command.
+  - The commands still allowed under sudo take no lock and make no file in
+    another user's `.pvfs`:
+    - the peeks open SQLite `immutable` as another user;
+    - no companion-key peek runs for another user.
+
+    This is defense: under root, SQLite already gives a `-shm`/`-wal` it
+    makes to the database's owner.
+  - `forest fix-permissions` changes owners by descriptor. Before this it
+    could follow a link swapped in during the walk, and give a root-owned
+    file to the tree's user.
+  - `purge_region_trash` goes region by region. `receive` and `resolve`
+    record a region whose trash cannot be read, and `resolve` no longer
+    fails on one.
+  - `replica add` and the legacy `init` refuse root.
+
 - **A stuck trash bucket is named and skipped; `sudo pvfs` is refused
   (PVOS D231).**
   - A trash bucket the purge cannot wholly remove no longer ends the purge:

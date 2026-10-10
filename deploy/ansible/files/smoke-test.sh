@@ -1294,6 +1294,52 @@ assert "I/O error" not in s, s' \
   done
   ROOTS="$(sudo -n find "$DATA" -user root 2>/dev/null | head -5)"
   [ -z "$ROOTS" ] && ok "D231: and nothing in the forest or its regions is root's" || fail "D231: root-owned: $ROOTS"
+
+  # PVOS D232 — a person clears what the purge could not: `sudo pvfs trash
+  # unstick` removes a root-made bucket (the daemon never gets sudo), and
+  # refuses what is not a PVFS trash bucket of this forest.
+  sudo -n mkdir -p "$CATLIB2/.pvfs-trash/$OLD/TV/Show"
+  sudo -n sh -c "printf root > '$CATLIB2/.pvfs-trash/$OLD/TV/Show/ep.mkv'"
+  U="$(asroot --json trash unstick --yes "$CATLIB2/.pvfs-trash/$OLD" 2>&1)" || true
+  printf '%s' "$U" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert len(r["removed"])==1 and r["left"]==[], r' \
+    && [ ! -e "$CATLIB2/.pvfs-trash/$OLD" ] \
+    && ok "D232: sudo pvfs trash unstick removes a root-made bucket" || fail "D232: unstick: $U"
+  rc=0; out="$(asroot trash unstick --yes "$DATA" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | qgrep "not a trash bucket" \
+    && ok "D232: unstick refuses a path that is not a trash bucket" || fail "D232: unstick non-bucket (rc $rc): $out"
+  mkdir -p "$DATA/d232-real/.pvfs-trash/$OLD" && ln -s "$DATA/d232-real" "$DATA/d232-link"
+  rc=0; out="$(asroot trash unstick --yes "$DATA/d232-link/.pvfs-trash/$OLD" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | qgrep "without following a link" && [ -d "$DATA/d232-real/.pvfs-trash/$OLD" ] \
+    && ok "D232: unstick refuses a path with a link on the way" || fail "D232: unstick through a link (rc $rc): $out"
+  rc=0; out="$(asroot trash unstick 2>&1 </dev/null)" || rc=$?
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | qgrep "no daemon answers for this forest" \
+    && ok "D232: bare unstick with no daemon says so and how to name the buckets" || fail "D232: bare unstick (rc $rc): $out"
+  U="$(asroot --data-dir "$DMOUNT/.pvfs" --json trash unstick </dev/null 2>&1)" || true
+  printf '%s' "$U" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["removed"]==[], r' \
+    && ok "D232: bare sudo unstick asks the running daemon what is stuck (nothing, here)" || fail "D232: bare unstick, daemon: $U"
+  # outside any forest (no context), so it is replica add's own rule that answers
+  rc=0; out="$(cd / && sudo -n env PVFS_REGISTRY_DIR="$PVFS_REGISTRY_DIR" XDG_CONFIG_HOME="$ROOTCFG" "$(command -v "$PVFS")" replica add "$DATA/d232-replica" --socket "$DATA/none.sock" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | qgrep "make a replica as root" && [ ! -e "$DATA/d232-replica" ] \
+    && ok "D232: sudo pvfs replica add is refused" || fail "D232: replica add as root (rc $rc): $out"
+
+  # PVOS D232 — the commands still allowed under sudo leave nothing of
+  # root's in `.pvfs`, even when SQLite's -shm/-wal are not there to reuse
+  # (a forest closed cleanly): its peeks open the database `immutable`.
+  M232="$DATA/d232-forest"
+  mkdir -p "$M232" && $PVFS forest init --mount "$M232" --no-import >/dev/null 2>&1
+  if [ -e "$M232/.pvfs/log.db" ] && [ ! -e "$M232/.pvfs/log.db-shm" ]; then
+    ok "D232: premise: a cleanly closed forest has no -shm for root to reuse"
+  else
+    fail "D232: premise: $(ls "$M232/.pvfs" | tr '\n' ' ')"
+  fi
+  ROOTREG="$(sudo -n mktemp -d)"
+  sudo -n env PVFS_REGISTRY_DIR="$ROOTREG" PVFS_DATA_DIR="$M232/.pvfs" XDG_CONFIG_HOME="$ROOTCFG" "$(command -v "$PVFS")" forest register "$M232" --alias d232 >/dev/null 2>&1 \
+    && sudo -n env PVFS_REGISTRY_DIR="$ROOTREG" PVFS_DATA_DIR="$M232/.pvfs" XDG_CONFIG_HOME="$ROOTCFG" "$(command -v "$PVFS")" forest fix-permissions --mount "$M232" >/dev/null 2>&1 \
+    && sudo -n env PVFS_REGISTRY_DIR="$ROOTREG" PVFS_DATA_DIR="$M232/.pvfs" XDG_CONFIG_HOME="$ROOTCFG" "$(command -v "$PVFS")" forest unregister d232 >/dev/null 2>&1 \
+    && ok "D232: sudo pvfs forest register, fix-permissions, unregister ran" || fail "D232: the root-allowed commands failed"
+  ROOTS="$(sudo -n find "$M232" -user root 2>/dev/null | head -5)"
+  [ -z "$ROOTS" ] && ok "D232: and left nothing of root's in the forest (no -shm, no -wal)" || fail "D232: root-owned after the sudo commands: $ROOTS"
+  sudo -n rm -rf "$ROOTREG"
   sudo -n rm -rf "$ROOTCFG"
 else
   fail "D231: needs passwordless sudo here to make root-owned trash (the pipeline's host has it)"

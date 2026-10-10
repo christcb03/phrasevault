@@ -521,7 +521,8 @@ though its bytes are on disk (user manual §7.13, known problems).
 
 **What it looks like.** Before PVOS D231: `pvfsd: trash purge failed:
 c020473f: I/O error during purge trash bucket: Permission denied (os error
-13)` in the holder's journal, and Grafana paged "Disk errors on mediabox"
+13)` in the journal of mediabox's daemon (the owner, which holds its
+regions), and Grafana paged "Disk errors on mediabox"
 (2026-10-09 8:01 PM; the rule no longer matches it, HomeLab `69391a6`).
 Since D231: a `trash_stuck` fleet event and a page problem, and in `pvfs
 serve status`:
@@ -537,8 +538,22 @@ the forest's user, which may not remove what is in another user's folder.
 Before D231 the purge stopped at that bucket, so every newer bucket waited
 behind it. Since D231 it removes what it can, names the rest, and goes on.
 
-**Fix.** Give the bucket back to the daemon's user. The next purge, within
-five minutes, takes it:
+**Fix (since PVOS D232).** On that box, run:
+
+```
+sudo pvfs trash unstick
+```
+
+It asks the box's daemon what is stuck and shows each bucket (what is left,
+whose folder). It asks before removing each one. It refuses anything that is
+not a PVFS trash bucket of this forest, and follows no link on the way. A
+region whose trash folder itself cannot be read is offered back to the
+forest's user. With the daemon stopped, name the buckets: `sudo pvfs trash
+unstick <root>/.pvfs-trash/<day> …`.
+
+The daemon never gets sudo: it listens on the network, so any grant to it
+would be a root path for whoever took it over. Before D232, the fix was to
+give the bucket back and let the next purge take it:
 
 ```
 sudo chown -R chris:chris /mnt/local/Media/.pvfs-trash /mnt/local2/.pvfs-trash
@@ -565,8 +580,13 @@ remove it later (§18). pvfsd itself refuses to start as root against
 another user's forest, for the same reason.
 
 **Fix.** Run it as that user: `sudo -u chris pvfs …`, or log in as chris.
-Only the system registry's commands (`forest register`, `forest
-unregister`, `forest fix-permissions`) and `forest init` are meant for
-`sudo`. If the forest's `.pvfs` is wrongly root's (a `sudo` init), give it
+Only these are meant for `sudo`, and none of them leaves a file of root's
+in `.pvfs` (PVOS D232):
+- the system registry's commands (`forest register`, `forest unregister`,
+  `forest fix-permissions`);
+- `forest init`;
+- `trash unstick` (§18).
+
+`replica add` and the legacy `init` refuse root. If the forest's `.pvfs` is wrongly root's (a `sudo` init), give it
 back with `sudo pvfs forest fix-permissions --mount <mount>`.
 
