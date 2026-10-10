@@ -657,6 +657,12 @@ pub struct TrashWire {
     /// and from a daemon before D231: an older peer reads the record as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stuck: Vec<StuckBucketWire>,
+    /// PVOS D231 — the latest purge of this region failed as a whole (its
+    /// trash could not be read): why. The figures above are the last ones
+    /// measured (`measured_ms`; 0 when none has been). Cleared by the next
+    /// purge that runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_error: Option<String>,
 }
 
 /// PVOS D231 — one trash bucket a purge could not wholly remove: the first

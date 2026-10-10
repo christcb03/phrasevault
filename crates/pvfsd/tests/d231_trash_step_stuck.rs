@@ -7,6 +7,9 @@
 //! was no longer reported (its record froze), with only `I/O error during
 //! purge trash bucket: Permission denied` in the journal to say why.
 //!
+//! Then a region whose whole trash cannot be read: its purge's failure is
+//! in `serve status` too, so the owner's notifier sees it.
+//!
 //! A read-only folder stands in for root's (this needs a non-root test
 //! user, as the pipeline's is). Its own test binary: it sets process-wide
 //! environment (the step's interval, the config dir).
@@ -147,6 +150,22 @@ fn the_trash_step_reports_a_stuck_bucket_and_still_purges_the_rest() {
     let t = s.trash.iter().find(|t| t.region == r).unwrap();
     assert!(!stuck.exists());
     assert_eq!((t.buckets, t.oldest_day), (1, Some(d)), "{t:?}");
+
+    // 3. A region whose trash cannot be read at all: its purge fails as a
+    //    whole. Said in `serve status` beside the last figures (the journal
+    //    line alone reached nobody), and gone at the next purge that runs.
+    let trash_dir = local.join(".pvfs-trash");
+    set_mode(&trash_dir, 0o000);
+    let s = status_until(&mut member, 5, "the purge's failure reported", |s| {
+        s.trash.iter().any(|t| t.region == r && t.purge_error.is_some())
+    });
+    set_mode(&trash_dir, 0o755);
+    let t = s.trash.iter().find(|t| t.region == r).unwrap();
+    assert!(t.purge_error.as_deref().is_some_and(|e| e.contains("Permission denied")), "{t:?}");
+    assert_eq!((t.buckets, t.oldest_day), (1, Some(d)), "the last figures are kept: {t:?}");
+    status_until(&mut member, 5, "the failure cleared", |s| {
+        s.trash.iter().any(|t| t.region == r && t.purge_error.is_none())
+    });
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = runner.join();

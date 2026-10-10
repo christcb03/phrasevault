@@ -347,9 +347,11 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
     out
 }
 
-/// PVOS D231 — a trash bucket a box's purge could not wholly remove, said
-/// once when first seen (`trash_stuck`) and once when that region's latest
-/// purge no longer lists it (`trash_stuck_cleared`). Remembered in `state`,
+/// PVOS D231 — a trash bucket a box's purge could not wholly remove, or a
+/// region whose purge failed as a whole (`purge_error`), said once when first
+/// seen (`trash_stuck`) and once when that region's latest purge no longer
+/// lists it (`trash_stuck_cleared`). The trash step's failure was a journal
+/// line only (never a job's `last_error`), so `job_errors` never saw it. Remembered in `state`,
 /// not compared with the last record: a daemon that has just started reports
 /// no trash until its first purge, and a peer that missed a probe reports
 /// nothing, and neither is a clear — nor, when the bucket shows again, news.
@@ -380,6 +382,15 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
     let mut out = Vec::new();
     for TrashSource { who, peer, addr, trash } in &boxes {
         for t in trash.iter() {
+            // the region's purge failed as a whole (its trash unreadable)
+            if let Some(err) = &t.purge_error {
+                let key = format!("{who}/{}/error", t.region);
+                if let std::collections::btree_map::Entry::Vacant(slot) = state.reported_stuck.entry(key) {
+                    let detail = format!("region {}: cannot purge its trash: {err}", short(&t.region));
+                    out.push(event("trash_stuck", peer.clone(), addr.clone(), detail.clone()));
+                    slot.insert(detail);
+                }
+            }
             for b in &t.stuck {
                 let key = format!("{who}/{}/{}", t.region, b.day);
                 if let std::collections::btree_map::Entry::Vacant(slot) = state.reported_stuck.entry(key) {
@@ -395,16 +406,24 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
             .keys()
             .filter(|k| k.starts_with(&mine))
             .filter(|k| {
-                let Some((region, day)) = k[mine.len()..].rsplit_once('/') else { return false };
-                let day: Option<u64> = day.parse().ok();
-                // its region measured, and the bucket no longer stuck there
-                trash.iter().find(|t| t.region == region).is_some_and(|t| !t.stuck.iter().any(|b| Some(b.day) == day))
+                let Some((region, what)) = k[mine.len()..].rsplit_once('/') else { return false };
+                let Some(t) = trash.iter().find(|t| t.region == region) else { return false };
+                if what == "error" {
+                    return t.purge_error.is_none(); // a purge ran since
+                }
+                // its region purged again, and the bucket no longer stuck there
+                let day: Option<u64> = what.parse().ok();
+                t.purge_error.is_none() && !t.stuck.iter().any(|b| Some(b.day) == day)
             })
             .cloned()
             .collect();
         for key in gone {
             let was = state.reported_stuck.remove(&key).unwrap_or_default();
-            let what = was.split_once(": cannot remove").map_or(was.as_str(), |(w, _)| w).to_string();
+            let what = was
+                .split_once(": cannot remove")
+                .or_else(|| was.split_once(": cannot purge"))
+                .map_or(was.as_str(), |(w, _)| w)
+                .to_string();
             out.push(event("trash_stuck_cleared", peer.clone(), addr.clone(), what));
         }
     }
@@ -670,10 +689,19 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
              spool (up to its cap). pvfs serve status there shows it; pvfs log destinations test <name> checks it.",
             ev.detail.as_deref().unwrap_or("?")
         ),
+        "trash_stuck" if ev.detail.as_deref().is_some_and(|d| d.contains(": cannot purge its trash")) => format!(
+            "On {who}, the trash purge failed: {}. Nothing in that region's trash is purged until it is fixed; \
+             its other regions still are.",
+            ev.detail.as_deref().unwrap_or("?")
+        ),
         "trash_stuck" => format!(
             "On {who}, the trash purge could not remove a bucket: {}. The rest of the trash is still purged. \
              The usual cause is a folder made by `sudo pvfs`: give it back to the daemon's user (chown -R).",
             ev.detail.as_deref().unwrap_or("?")
+        ),
+        "trash_stuck_cleared" if ev.detail.as_deref().is_some_and(|d| !d.starts_with("bucket ")) => format!(
+            "On {who}, the trash purge runs again in {}.",
+            ev.detail.as_deref().unwrap_or("that region")
         ),
         "trash_stuck_cleared" => format!(
             "On {who}, the trash purge has removed {}, which it could not before.",

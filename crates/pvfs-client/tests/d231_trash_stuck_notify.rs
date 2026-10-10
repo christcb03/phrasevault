@@ -149,3 +149,36 @@ fn the_memory_round_trips_and_an_older_state_reads() {
     let old: State = serde_json::from_str(r#"{"last_heartbeat_ms":5}"#).unwrap();
     assert!(old.reported_stuck.is_empty());
 }
+
+/// A region whose purge failed as a whole (its trash unreadable) is said
+/// too, once, and cleared when a purge runs there again.
+#[test]
+fn a_region_whose_purge_fails_as_a_whole_is_said_and_cleared() {
+    let t = 1_791_000_000_000;
+    let mut st = State::default();
+    let mut failing = trash(&[]);
+    failing[0].purge_error = Some("I/O error during read trash: Permission denied (os error 13)".into());
+    let ev = notify::trash_stuck(&mut st, &record(t, answering(failing.clone())), t);
+    assert_eq!(kinds(&ev), ["trash_stuck"]);
+    let d = ev[0].detail.as_deref().unwrap();
+    assert_eq!(d, "region c020473f: cannot purge its trash: I/O error during read trash: Permission denied (os error 13)");
+    let said = notify::summary(&labels(), &ev[0]);
+    assert!(said.starts_with("On mediabox's holder, the trash purge failed: region c020473f"), "{said}");
+    assert!(notify::trash_stuck(&mut st, &record(t + 1, answering(failing)), t + 1).is_empty(), "said once");
+    let ev = notify::trash_stuck(&mut st, &record(t + 2, answering(trash(&[]))), t + 2);
+    assert_eq!(kinds(&ev), ["trash_stuck_cleared"]);
+    assert_eq!(notify::summary(&labels(), &ev[0]), "On mediabox's holder, the trash purge runs again in region c020473f.");
+}
+
+/// While a region's purge fails, its stuck buckets are unknown, not cleared.
+#[test]
+fn a_failing_region_does_not_clear_its_stuck_buckets() {
+    let t = 1_791_000_000_000;
+    let mut st = State::default();
+    notify::trash_stuck(&mut st, &record(t, answering(trash(&[20729]))), t);
+    let mut failing = trash(&[]);
+    failing[0].purge_error = Some("unreadable".into());
+    let ev = notify::trash_stuck(&mut st, &record(t + 1, answering(failing)), t + 1);
+    assert_eq!(kinds(&ev), ["trash_stuck"], "only the region's failure is news: {ev:?}");
+    assert!(st.reported_stuck.keys().any(|k| k.ends_with("/20729")), "{st:?}");
+}

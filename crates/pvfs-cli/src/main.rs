@@ -7931,6 +7931,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         for b in &t.stuck {
                             notes.push(format!("TRASH STUCK {} {}", &t.region[..t.region.len().min(8)], stuck_text(b)));
                         }
+                        if let Some(e) = &t.purge_error {
+                            notes.push(format!("TRASH PURGE FAILED {}: {e}", &t.region[..t.region.len().min(8)]));
+                        }
                     }
                     if notes.is_empty() {
                         notes.push("jobs clean".into());
@@ -11024,6 +11027,9 @@ fn serve_status_print(
             );
             for b in &t.stuck {
                 println!("  STUCK: {}  (D231)", stuck_text(b));
+            }
+            if let Some(e) = &t.purge_error {
+                println!("  PURGE FAILED: {e} (the figures above are the last measured)  (D231)");
             }
         }
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);

@@ -371,11 +371,28 @@ impl JobsState {
                 measured_ms: now,
                 // PVOS D231 — what this pass could not remove, by bucket
                 stuck: r.purge.stuck.iter().map(stuck_wire).collect(),
+                purge_error: None,
             };
             match t.iter_mut().find(|x| x.region == w.region) {
                 Some(x) => *x = w,
                 None => t.push(w),
             }
+        }
+    }
+
+    /// PVOS D231 — a region whose purge failed as a whole: said in `serve
+    /// status` (and so to the owner's notifier) beside its last figures, as
+    /// the trash step's journal line alone reached nobody (2026-10-09).
+    fn record_trash_error(&self, region: &str, retention_days: u64, error: &str) {
+        let mut t = self.trash.lock().unwrap();
+        match t.iter_mut().find(|x| x.region == region) {
+            Some(x) => x.purge_error = Some(error.to_string()),
+            None => t.push(pvfs_proto::TrashWire {
+                region: region.to_string(),
+                retention_days,
+                purge_error: Some(error.to_string()),
+                ..Default::default()
+            }),
         }
     }
 
@@ -1759,7 +1776,7 @@ fn trash_step(
             break;
         }
         let short = region.get(..8).unwrap_or(&region).to_string();
-        match pvfs_core::sync::purge_region(region, &root, days) {
+        match pvfs_core::sync::purge_region(region.clone(), &root, days) {
             Ok(t) => {
                 // PVOS D231 — a bucket that would not all go is a failure of
                 // this step, named (bucket, path, whose folder), while the
@@ -1767,7 +1784,10 @@ fn trash_step(
                 failed.extend(t.purge.stuck.iter().map(|b| format!("{short}: {}", b.describe())));
                 found.push(t)
             }
-            Err(e) => failed.push(format!("{short}: {e}")),
+            Err(e) => {
+                st.record_trash_error(&region, days, &e.to_string());
+                failed.push(format!("{short}: {e}"))
+            }
         }
     }
     st.record_trash(&found);

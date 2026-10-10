@@ -113,6 +113,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             freed_bytes: 0,
             measured_ms: 1,
             stuck: Vec::new(),
+            purge_error: None,
         }]),
         log_destinations: Box::default(),
         stores: Box::default(),
@@ -473,4 +474,8 @@ fn trash_stuck_buckets_are_additive() {
     };
     let text = serde_json::to_string(&stuck).unwrap();
     assert_eq!(serde_json::from_str::<pvfs_proto::TrashWire>(&text).unwrap(), stuck);
+    // a region whose purge failed as a whole
+    let failed = pvfs_proto::TrashWire { purge_error: Some("I/O error during read trash: Permission denied".into()), ..stuck };
+    let text = serde_json::to_string(&failed).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::TrashWire>(&text).unwrap(), failed);
 }
