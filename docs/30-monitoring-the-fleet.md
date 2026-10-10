@@ -225,8 +225,8 @@ Formats: `ha` (JSON for a Home Assistant webhook), `slack`, `discord`,
 | `owner_unfenced` | the fence was lifted (a clear, sent as ✅) | info |
 | `peer_diverged` | a peer's copy of the log differs from the owner's at its tip: it followed a writer that is not the owner, or was restored wrongly; the owner takes no writes from it until it is re-seeded. Once | warning |
 | `peer_diverged_cleared` | that peer agrees again (re-seeded) — a clear, sent as ✅ | info |
-| `trash_stuck` | PVOS D231: a box's trash purge could not wholly remove a bucket past retention: the bucket, the first path that would not go, the error, and whose folder it is when not the daemon's user (the usual cause: a folder made by `sudo pvfs`). The rest of that trash is still purged. Once per bucket, remembered across restarts and missed probes (`notify-state.json`); the owner's own trash too | warning |
-| `trash_stuck_cleared` | that bucket's region was purged again and the bucket is gone — a clear, sent as ✅ | info |
+| `trash_stuck` | PVOS D231: a box's trash purge could not wholly remove a bucket past retention: the bucket, the first path that would not go, the error, and whose folder it is when not the daemon's user (the usual cause: a folder made by `sudo pvfs`). The rest of that trash is still purged. Also a region whose purge failed as a whole (its trash unreadable: `serve status` `purge_error`). Not a `job_error`: the trash step is no job, and its failure used to be a journal line only. At first sighting (the trash step plus the next poll), once per bucket or region, remembered across restarts and missed probes (`notify-state.json`); the owner's own trash too | warning |
+| `trash_stuck_cleared` | that bucket's region was purged again and the bucket is gone, or the failing region's purge runs again — a clear, sent as ✅ | info |
 
 Payload (format `ha`/`json`):
 
