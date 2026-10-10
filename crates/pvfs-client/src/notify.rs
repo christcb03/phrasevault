@@ -369,16 +369,16 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
         until_ms: None,
         forest: None,
     };
-    // (key prefix, peer, addr, its trash) for every box that answered
-    let mut boxes: Vec<(String, Option<String>, Option<String>, &[pvfs_proto::TrashWire])> = next
+    // every box that answered, and this one
+    let mut boxes: Vec<TrashSource> = next
         .peers
         .iter()
         .filter(|(_, r)| r.last.ok())
-        .map(|(pin, r)| (short(pin), Some(short(pin)), Some(r.addr.clone()), r.last.trash.as_slice()))
+        .map(|(pin, r)| TrashSource { who: short(pin), peer: Some(short(pin)), addr: Some(r.addr.clone()), trash: &r.last.trash })
         .collect();
-    boxes.push(("self".into(), None, next.self_addr.clone(), next.self_trash.as_slice()));
+    boxes.push(TrashSource { who: "self".into(), peer: None, addr: next.self_addr.clone(), trash: &next.self_trash });
     let mut out = Vec::new();
-    for (who, peer, addr, trash) in &boxes {
+    for TrashSource { who, peer, addr, trash } in &boxes {
         for t in trash.iter() {
             for b in &t.stuck {
                 let key = format!("{who}/{}/{}", t.region, b.day);
@@ -395,9 +395,8 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
             .keys()
             .filter(|k| k.starts_with(&mine))
             .filter(|k| {
-                let mut it = k[mine.len()..].rsplitn(2, '/');
-                let day: Option<u64> = it.next().and_then(|d| d.parse().ok());
-                let region = it.next().unwrap_or("");
+                let Some((region, day)) = k[mine.len()..].rsplit_once('/') else { return false };
+                let day: Option<u64> = day.parse().ok();
                 // its region measured, and the bucket no longer stuck there
                 trash.iter().find(|t| t.region == region).is_some_and(|t| !t.stuck.iter().any(|b| Some(b.day) == day))
             })
@@ -413,6 +412,15 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
     let polled: BTreeSet<String> = next.peers.keys().map(|p| short(p)).chain(["self".to_string()]).collect();
     state.reported_stuck.retain(|k, _| k.split_once('/').is_some_and(|(w, _)| polled.contains(w)));
     out
+}
+
+/// One box's trash as [`trash_stuck`] reads it: its key in the memory
+/// (`pin8`, or `self`), how an event names it, and its regions.
+struct TrashSource<'a> {
+    who: String,
+    peer: Option<String>,
+    addr: Option<String>,
+    trash: &'a [pvfs_proto::TrashWire],
 }
 
 /// `bucket 20729 (/mnt/…/.pvfs-trash/20729) in region c020473f: cannot remove
