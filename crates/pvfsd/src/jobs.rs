@@ -2361,7 +2361,7 @@ mod tests {
     /// D176 — the trash step purges and records every region it is given; a
     /// region that fails is said once per run and does not cost the others
     /// their purge or their record; its recovery is said; a stopped step
-    /// gives no verdict.
+    /// gives no verdict. PVOS D231 — the failed region's record says why.
     #[test]
     fn the_trash_step_purges_every_region_and_says_a_failure_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2390,9 +2390,15 @@ mod tests {
         assert!(!a.join(format!(".pvfs-trash/{}", today - 10)).exists(), "past retention: gone");
         assert!(a.join(format!(".pvfs-trash/{today}")).exists(), "today's bucket is kept");
         let t = st.trash_snapshot();
-        assert_eq!(t.len(), 1, "the failed region has no record: {t:?}");
-        assert_eq!((t[0].region.as_str(), t[0].bytes, t[0].buckets), (ra.as_str(), 2_000, 1));
-        assert_eq!((t[0].oldest_day, t[0].retention_days, t[0].freed_bytes), (Some(today), 7, 3_000));
+        assert_eq!(t.len(), 2, "{t:?}");
+        let ta = t.iter().find(|x| x.region == ra).unwrap();
+        assert_eq!((ta.bytes, ta.buckets, ta.purge_error.as_deref()), (2_000, 1, None));
+        assert_eq!((ta.oldest_day, ta.retention_days, ta.freed_bytes), (Some(today), 7, 3_000));
+        // PVOS D231 — the failed region is listed with why, and no
+        // measurement (it has never had one): what reaches the notifier
+        let tb = t.iter().find(|x| x.region == rb).unwrap();
+        assert!(tb.purge_error.as_deref().is_some_and(|e| e.contains("read trash")), "{tb:?}");
+        assert_eq!((tb.measured_ms, tb.bytes, tb.retention_days), (0, 0, 7), "{tb:?}");
 
         assert!(trash_step(&st, roots(), &never).is_empty(), "the same failure is not said again");
 
@@ -2407,6 +2413,7 @@ mod tests {
         assert_eq!(t.len(), 2, "{t:?}");
         let tb = t.iter().find(|x| x.region == rb).unwrap();
         assert_eq!((tb.bytes, tb.buckets, tb.oldest_day, tb.freed_bytes), (0, 0, None, 0), "an empty trash is reported too");
+        assert!(tb.purge_error.is_none() && tb.measured_ms > 0, "recovered: measured, the failure gone: {tb:?}");
 
         // A step told to stop purges nothing more and gives no verdict.
         std::fs::write(b.join(".pvfs-trash"), b"broken again").unwrap();
