@@ -382,10 +382,10 @@ pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Ev
         for t in trash.iter() {
             for b in &t.stuck {
                 let key = format!("{who}/{}/{}", t.region, b.day);
-                if !state.reported_stuck.contains_key(&key) {
+                if let std::collections::btree_map::Entry::Vacant(slot) = state.reported_stuck.entry(key) {
                     let detail = stuck_detail(&t.region, b);
                     out.push(event("trash_stuck", peer.clone(), addr.clone(), detail.clone()));
-                    state.reported_stuck.insert(key, detail);
+                    slot.insert(detail);
                 }
             }
         }
