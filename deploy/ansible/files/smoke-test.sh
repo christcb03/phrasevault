@@ -1254,6 +1254,50 @@ $PVFS --json region retention "$CAT2" 0 | qgrep '"retention_days":0' && ok "regi
 $PVFS --json view resolve | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["purged"]>=1, r' \
   && ok "resolve purged the trash past retention" || fail "purge"
 [ -z "$(ls -A "$CATLIB2/.pvfs-trash" 2>/dev/null)" ] && ok "the staging disk is free again" || fail "trash not empty"
+
+# PVOS D231 — 2026-10-09 on mediabox, with real root ownership: a bucket that
+# `sudo pvfs trash put` made (root's) cannot be purged by the forest's user.
+# It is named — the bucket, the first path that will not go, whose folder —
+# and the other bucket past retention still goes. Then `sudo pvfs` itself is
+# refused, and leaves nothing of root's behind.
+if sudo -n true 2>/dev/null; then
+  OLD=$(( $(date +%s) / 86400 - 30 ))
+  sudo -n mkdir -p "$CATLIB2/.pvfs-trash/$OLD/TV/Show"
+  sudo -n sh -c "printf root > '$CATLIB2/.pvfs-trash/$OLD/TV/Show/ep.mkv'"
+  mkdir -p "$CATLIB2/.pvfs-trash/$((OLD + 1))/TV" && printf mine > "$CATLIB2/.pvfs-trash/$((OLD + 1))/TV/ep2.mkv"
+  R231="$($PVFS --json view resolve 2>"$DATA/d231.err")" || R231="$R231 $(cat "$DATA/d231.err")"
+  printf '%s' "$R231" | OLD="$OLD" python3 -c '
+import json, os, sys
+r = json.load(sys.stdin); old = os.environ["OLD"]
+assert r["purged"] >= 1, r
+assert len(r["stuck"]) == 1, r
+s = r["stuck"][0]
+assert f"trash bucket {old} not removed: cannot remove " in s, s
+assert f"/{old}/TV/Show/ep.mkv: Permission denied" in s, s
+assert "its folder belongs to root (uid 0)" in s, s
+assert "I/O error" not in s, s' \
+    && ok "D231: a root-made trash bucket is named (path, owner) and the next bucket is still purged" \
+    || fail "D231: stuck bucket: $R231"
+  [ ! -e "$CATLIB2/.pvfs-trash/$((OLD + 1))" ] && [ -e "$CATLIB2/.pvfs-trash/$OLD/TV/Show/ep.mkv" ] \
+    && ok "D231: on disk too: the user's bucket gone, root's kept" || fail "D231: trash after the purge: $(ls -la "$CATLIB2/.pvfs-trash")"
+  sudo -n rm -rf "$CATLIB2/.pvfs-trash/$OLD"
+
+  ROOTCFG="$(mktemp -d "${TMPDIR:-/tmp}/pvfs-smoke-root.XXXXXX")"
+  asroot() {
+    sudo -n env PVFS_DATA_DIR="$PVFS_DATA_DIR" PVFS_REGISTRY_DIR="$PVFS_REGISTRY_DIR" PVFS_SOCKET_DIR="$PVFS_SOCKET_DIR" \
+      XDG_CONFIG_HOME="$ROOTCFG" XDG_RUNTIME_DIR="$ROOTCFG" "$(command -v "$PVFS")" "$@"
+  }
+  for c in "trash put sub/b.mkv --region $CAT12" "view resolve" "serve enable watch" "ls" "region ls"; do
+    rc=0; out="$(asroot $c 2>&1)" || rc=$?
+    [ "$rc" -ne 0 ] && printf '%s' "$out" | qgrep "its files belong to $(id -un) (uid $(id -u))" && printf '%s' "$out" | qgrep "sudo -u $(id -un) pvfs" \
+      && ok "D231: sudo pvfs $c is refused, and says to run it as $(id -un)" || fail "D231: sudo pvfs $c (rc $rc): $out"
+  done
+  ROOTS="$(sudo -n find "$DATA" -user root 2>/dev/null | head -5)"
+  [ -z "$ROOTS" ] && ok "D231: and nothing in the forest or its regions is root's" || fail "D231: root-owned: $ROOTS"
+  sudo -n rm -rf "$ROOTCFG"
+else
+  fail "D231: needs passwordless sudo here to make root-owned trash (the pipeline's host has it)"
+fi
 $PVFS --json region receive "$CAT" off | qgrep '"receives":false' && ok "region receive off" || fail "region receive off"
 $PVFS --json region drain "$CAT2" off >/dev/null
 

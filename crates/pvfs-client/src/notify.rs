@@ -91,6 +91,10 @@ pub struct State {
     /// forgotten if the error comes back first (one episode, not two).
     #[serde(default)]
     pub job_errors_gone: BTreeMap<String, u64>,
+    /// PVOS D231 — stuck trash buckets already said, `<pin8 or self>/<region>/<day>`
+    /// → the detail sent, so each is said once and its clear once.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reported_stuck: BTreeMap<String, String>,
 }
 
 /// A job's error and when this text of it was first seen.
@@ -103,8 +107,9 @@ pub struct Seen {
 /// One thing worth saying. `event` is one of `peer_down`, `peer_up`,
 /// `supervise`, `job_error`, `job_error_cleared`, `heartbeat`, `test`, and
 /// since PVOS D182 `owner_fenced`, `owner_unfenced`, `peer_diverged`,
-/// `peer_diverged_cleared`, and since PVOS D228 `log_destination_failing`,
-/// `log_destination_recovered`.
+/// `peer_diverged_cleared`, since PVOS D228 `log_destination_failing`,
+/// `log_destination_recovered`, and since PVOS D231 `trash_stuck`,
+/// `trash_stuck_cleared`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub event: String,
@@ -342,6 +347,112 @@ pub fn transitions(prev: Option<&FleetHealth>, next: &FleetHealth, now_ms: u64) 
     out
 }
 
+/// PVOS D231 — a trash bucket a box's purge could not wholly remove, or a
+/// region whose purge failed as a whole (`purge_error`), said once when first
+/// seen (`trash_stuck`) and once when that region's latest purge no longer
+/// lists it (`trash_stuck_cleared`). The trash step's failure was a journal
+/// line only (never a job's `last_error`), so `job_errors` never saw it. Remembered in `state`,
+/// not compared with the last record: a daemon that has just started reports
+/// no trash until its first purge, and a peer that missed a probe reports
+/// nothing, and neither is a clear — nor, when the bucket shows again, news.
+/// The owner's own trash (`self_trash`; it never polls itself) is held to
+/// the same rule. A peer no longer polled at all is forgotten silently.
+pub fn trash_stuck(state: &mut State, next: &FleetHealth, now_ms: u64) -> Vec<Event> {
+    let (up, down) = counts(next);
+    let event = |name: &str, peer: Option<String>, addr: Option<String>, detail: String| Event {
+        event: name.into(),
+        at_ms: now_ms,
+        peer,
+        addr,
+        since_ms: None,
+        detail: Some(detail),
+        up,
+        down,
+        until_ms: None,
+        forest: None,
+    };
+    // every box that answered, and this one
+    let mut boxes: Vec<TrashSource> = next
+        .peers
+        .iter()
+        .filter(|(_, r)| r.last.ok())
+        .map(|(pin, r)| TrashSource { who: short(pin), peer: Some(short(pin)), addr: Some(r.addr.clone()), trash: &r.last.trash })
+        .collect();
+    boxes.push(TrashSource { who: "self".into(), peer: None, addr: next.self_addr.clone(), trash: &next.self_trash });
+    let mut out = Vec::new();
+    for TrashSource { who, peer, addr, trash } in &boxes {
+        for t in trash.iter() {
+            // the region's purge failed as a whole (its trash unreadable)
+            if let Some(err) = &t.purge_error {
+                let key = format!("{who}/{}/error", t.region);
+                if let std::collections::btree_map::Entry::Vacant(slot) = state.reported_stuck.entry(key) {
+                    let detail = format!("region {}: cannot purge its trash: {err}", short(&t.region));
+                    out.push(event("trash_stuck", peer.clone(), addr.clone(), detail.clone()));
+                    slot.insert(detail);
+                }
+            }
+            for b in &t.stuck {
+                let key = format!("{who}/{}/{}", t.region, b.day);
+                if let std::collections::btree_map::Entry::Vacant(slot) = state.reported_stuck.entry(key) {
+                    let detail = stuck_detail(&t.region, b);
+                    out.push(event("trash_stuck", peer.clone(), addr.clone(), detail.clone()));
+                    slot.insert(detail);
+                }
+            }
+        }
+        let mine = format!("{who}/");
+        let gone: Vec<String> = state
+            .reported_stuck
+            .keys()
+            .filter(|k| k.starts_with(&mine))
+            .filter(|k| {
+                let Some((region, what)) = k[mine.len()..].rsplit_once('/') else { return false };
+                let Some(t) = trash.iter().find(|t| t.region == region) else { return false };
+                if what == "error" {
+                    return t.purge_error.is_none(); // a purge ran since
+                }
+                // its region purged again, and the bucket no longer stuck there
+                let day: Option<u64> = what.parse().ok();
+                t.purge_error.is_none() && !t.stuck.iter().any(|b| Some(b.day) == day)
+            })
+            .cloned()
+            .collect();
+        for key in gone {
+            let was = state.reported_stuck.remove(&key).unwrap_or_default();
+            let what = was
+                .split_once(": cannot remove")
+                .or_else(|| was.split_once(": cannot purge"))
+                .map_or(was.as_str(), |(w, _)| w)
+                .to_string();
+            out.push(event("trash_stuck_cleared", peer.clone(), addr.clone(), what));
+        }
+    }
+    // a peer no longer polled (retired, retracted): forget it, say nothing
+    let polled: BTreeSet<String> = next.peers.keys().map(|p| short(p)).chain(["self".to_string()]).collect();
+    state.reported_stuck.retain(|k, _| k.split_once('/').is_some_and(|(w, _)| polled.contains(w)));
+    out
+}
+
+/// One box's trash as [`trash_stuck`] reads it: its key in the memory
+/// (`pin8`, or `self`), how an event names it, and its regions.
+struct TrashSource<'a> {
+    who: String,
+    peer: Option<String>,
+    addr: Option<String>,
+    trash: &'a [pvfs_proto::TrashWire],
+}
+
+/// `bucket 20729 (/mnt/…/.pvfs-trash/20729) in region c020473f: cannot remove
+/// …: Permission denied (os error 13); its folder belongs to root (uid 0),
+/// the daemon runs as chris (uid 1000)`.
+fn stuck_detail(region: &str, b: &pvfs_proto::StuckBucketWire) -> String {
+    let whose = match (&b.folder_owner, &b.daemon_user) {
+        (Some(f), Some(d)) if f != d => format!("; its folder belongs to {f}, the daemon runs as {d}"),
+        _ => String::new(),
+    };
+    format!("bucket {} ({}) in region {}: cannot remove {}: {}{whose}", b.day, b.bucket, short(region), b.path, b.error)
+}
+
 /// A job's error is reported once it has been there, with the same text,
 /// for `JOB_ERROR_AFTER_MS` — timed from when it was first seen, not by
 /// counting records: every daemon start polls at once, so a burst of
@@ -511,6 +622,8 @@ pub fn severity(ev: &Event) -> &'static str {
         "owner_fenced" => "critical",
         "peer_diverged" => "warning",
         "log_destination_failing" => "warning",
+        // PVOS D231 — needs a hand (an ownership fix), wakes nobody
+        "trash_stuck" => "warning",
         "heartbeat" if ev.detail.as_deref().is_some_and(|d| d.starts_with("FENCED")) => "warning",
         "heartbeat" if ev.down > 0 => "warning",
         _ => "info",
@@ -575,6 +688,24 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
             "On {who}, the log destination {} has delivered nothing for 15 minutes. Its records wait in the \
              spool (up to its cap). pvfs serve status there shows it; pvfs log destinations test <name> checks it.",
             ev.detail.as_deref().unwrap_or("?")
+        ),
+        "trash_stuck" if ev.detail.as_deref().is_some_and(|d| d.contains(": cannot purge its trash")) => format!(
+            "On {who}, the trash purge failed: {}. Nothing in that region's trash is purged until it is fixed; \
+             its other regions still are.",
+            ev.detail.as_deref().unwrap_or("?")
+        ),
+        "trash_stuck" => format!(
+            "On {who}, the trash purge could not remove a bucket: {}. The rest of the trash is still purged. \
+             The usual cause is a folder made by `sudo pvfs`: give it back to the daemon's user (chown -R).",
+            ev.detail.as_deref().unwrap_or("?")
+        ),
+        "trash_stuck_cleared" if ev.detail.as_deref().is_some_and(|d| !d.starts_with("bucket ")) => format!(
+            "On {who}, the trash purge runs again in {}.",
+            ev.detail.as_deref().unwrap_or("that region")
+        ),
+        "trash_stuck_cleared" => format!(
+            "On {who}, the trash purge has removed {}, which it could not before.",
+            ev.detail.as_deref().unwrap_or("the stuck bucket")
         ),
         "log_destination_recovered" => format!(
             "On {who}, the log destination {} delivers again; what it queued is being sent.",
@@ -687,6 +818,7 @@ pub fn emit(data_dir: &Path, prev: Option<&FleetHealth>, next: &FleetHealth, now
     let mut state = load_state(data_dir);
     let mut events = transitions(prev, next, now_ms);
     events.extend(job_errors(&mut state, next, now_ms));
+    events.extend(trash_stuck(&mut state, next, now_ms));
     // PVOS D182 — a fenced owner's view of the fleet is not the fleet's (after
     // a promotion it is a zombie, and the new owner reports the fleet): it
     // says its own fence, its clear and the check-in, nothing else.

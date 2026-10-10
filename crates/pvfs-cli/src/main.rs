@@ -3127,9 +3127,45 @@ fn interactive_when(json: bool, stdin_tty: bool, stderr_tty: bool) -> bool {
     !json && stdin_tty && stderr_tty
 }
 
+/// PVOS D231 — the commands that may run as a user other than the forest's:
+/// the system registry's (root's by design: `/etc/pvfs`), and creating a
+/// forest (it becomes the caller's, or the sudo caller's), and the two that
+/// only read or write this user's own config. Every other command is refused
+/// when the forest it would use belongs to another user — a `sudo pvfs trash
+/// put` left root's trash buckets that mediabox's daemon could not purge
+/// (2026-10-09). Default-deny: a new command is refused until listed here.
+fn may_run_as_another_user(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Forest(
+            ForestCmd::Register { .. } | ForestCmd::Unregister { .. } | ForestCmd::FixPermissions { .. } | ForestCmd::Init { .. }
+        ) | Cmd::Init
+            | Cmd::Whoami
+            | Cmd::Instance(_)
+    )
+}
+
+/// PVOS D231 — `state` when this process runs as its forest's owner, else
+/// the refusal (`mount::check_forest_user`). For the commands that find
+/// their forest themselves (a target argument, a mount path) rather than
+/// through the context.
+fn owned(state: PathBuf) -> Result<PathBuf, PvfsError> {
+    mount::check_forest_user(&state)?;
+    Ok(state)
+}
+
 fn run(cli: Cli) -> Result<(), PvfsError> {
     let legacy = legacy_state_dir(&cli);
     let ctx = context_state_dir(&cli);
+    // PVOS D231 — before anything reads or writes the forest's files (even
+    // the companion key's peek below opens its index): a command that writes
+    // `.pvfs` without opening the engine (`serve enable`, `fleet notify`,
+    // `forest backup` …) would otherwise get past the engine's own check.
+    if let Ok(state) = &ctx {
+        if !may_run_as_another_user(&cli.cmd) {
+            mount::check_forest_user(state)?;
+        }
+    }
     let target = companion_target(&cli.cmd);
     set_companion_key(target.as_deref().or(ctx.as_ref().ok().map(|p| p.as_path())));
     JSON_MODE.store(cli.json, std::sync::atomic::Ordering::Relaxed);
@@ -6695,7 +6731,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 Ok(())
             }
             ReplicaCmd::Sync { mount } => {
-                let data_dir = mount.join(".pvfs");
+                let data_dir = owned(mount.join(".pvfs"))?; // PVOS D231
                 let dial = pvfs_core::ReplicaSource::load(&data_dir)?;
                 let mut client = replica_client(&dial)?;
                 let mut store = pvfs_core::ReplicaStore::open(&data_dir)?;
@@ -6723,7 +6759,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 pin,
                 socket,
             } => {
-                let data_dir = mount.join(".pvfs");
+                let data_dir = owned(mount.join(".pvfs"))?; // PVOS D231
                 let old = pvfs_core::ReplicaSource::load(&data_dir)?;
                 let mut dial = resolve_replica_dial(instance, connect, pin, socket)?;
                 dial.region = old.region.clone();
@@ -6758,7 +6794,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             ReplicaCmd::Follow { mount } => {
                 // The loop itself is shared with pvfsd's `follow` job (P5.1,
                 // doc 18 §5) — this command is the ad-hoc, foreground driver.
-                let data_dir = mount.join(".pvfs");
+                let data_dir = owned(mount.join(".pvfs"))?; // PVOS D231
                 let dial = pvfs_core::ReplicaSource::load(&data_dir)?;
                 eprintln!(
                     "following {} from {} (long-poll; ctrl-c to stop)",
@@ -6971,7 +7007,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
             let rep = engine.resolve_conflicts(dry_run, &std::sync::atomic::AtomicBool::new(false), &mut confirm)?;
             // D133 — then free what retention allows (never on a dry run).
-            let purged: u64 = if dry_run { 0 } else { engine.purge_region_trash()?.iter().map(|t| t.purge.removed).sum() };
+            let trash = if dry_run { Vec::new() } else { engine.purge_region_trash()? };
+            let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
+            // PVOS D231 — a bucket the purge could not wholly remove, named
+            let stuck: Vec<String> = trash.iter().flat_map(|t| t.purge.stuck.iter().map(|b| b.describe())).collect();
             if json {
                 println!(
                     "{}",
@@ -6983,11 +7022,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "folders_removed": rep.folders_removed,
                         "reported": rep.reported,
                         "purged": purged,
+                        "stuck": stuck,
                     })
                 );
             } else {
                 if purged > 0 {
                     println!("purged\t{purged} trash bucket(s) past retention");
+                }
+                for b in &stuck {
+                    eprintln!("warning: {b}");
                 }
                 let verb = if dry_run { "would trash" } else { "trashed" };
                 for (p, r) in &rep.trashed {
@@ -7882,6 +7925,15 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             fmt_bytes(t.bytes),
                             t.oldest_day.map(|d| format!(" (oldest {} d, kept {} d)", today.saturating_sub(d), t.retention_days)).unwrap_or_default()
                         ));
+                    }
+                    // PVOS D231 — a bucket its purge could not wholly remove
+                    for t in &r.last.trash {
+                        for b in &t.stuck {
+                            notes.push(format!("TRASH STUCK {} {}", &t.region[..t.region.len().min(8)], stuck_text(b)));
+                        }
+                        if let Some(e) = &t.purge_error {
+                            notes.push(format!("TRASH PURGE FAILED {}: {e}", &t.region[..t.region.len().min(8)]));
+                        }
                     }
                     if notes.is_empty() {
                         notes.push("jobs clean".into());
@@ -9915,7 +9967,7 @@ fn forest_cmd(
             companion_socket,
             yes,
         } => {
-            let data_dir = mount.join(".pvfs");
+            let data_dir = owned(mount.join(".pvfs"))?; // PVOS D231
             let src = match pvfs_core::ReplicaSource::load(&data_dir) {
                 Ok(s) => s,
                 Err(PvfsError::Io { source, .. })
@@ -10157,7 +10209,7 @@ fn forest_cmd(
             let (mount_path, state) = match target {
                 Some(t) => {
                     let r = mount::resolve_target(&Registry::system(), &t)?;
-                    (Some(r.mount.clone()), mount::state_dir(&r.mount))
+                    (Some(r.mount.clone()), owned(mount::state_dir(&r.mount))?)
                 }
                 None => (None, ctx?),
             };
@@ -10187,7 +10239,7 @@ fn forest_cmd(
         }
         ForestCmd::BindCerts { target, yes } => {
             let state = match target {
-                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                Some(t) => owned(mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount))?,
                 None => ctx?,
             };
             let engine = open_for_reading(&state)?;
@@ -10267,7 +10319,7 @@ fn forest_cmd(
         }
         ForestCmd::Tip { target } => {
             let state = match target {
-                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                Some(t) => owned(mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount))?,
                 None => ctx?,
             };
             let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
@@ -10317,7 +10369,7 @@ fn forest_cmd(
         }
         ForestCmd::Backup { target, to, keep } => {
             let state = match target {
-                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                Some(t) => owned(mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount))?,
                 None => ctx?,
             };
             let mount_dir = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
@@ -10401,7 +10453,7 @@ fn forest_cmd(
         }
         ForestCmd::Fence { target, clear } => {
             let state = match target {
-                Some(t) => mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount),
+                Some(t) => owned(mount::state_dir(&mount::resolve_target(&Registry::system(), &t)?.mount))?,
                 None => ctx?,
             };
             let Some(f) = pvfs_core::fence::load(&state) else {
@@ -10556,7 +10608,7 @@ fn forest_state_dir(
     match forest {
         Some(t) => {
             let r = mount::resolve_target(&Registry::system(), &t)?;
-            Ok(mount::state_dir(&r.mount))
+            owned(mount::state_dir(&r.mount))
         }
         None => ctx,
     }
@@ -10973,6 +11025,12 @@ fn serve_status_print(
                 t.oldest_day.map(|d| format!(", oldest {} days old", today.saturating_sub(d))).unwrap_or_default(),
                 t.retention_days
             );
+            for b in &t.stuck {
+                println!("  STUCK: {}  (D231)", stuck_text(b));
+            }
+            if let Some(e) = &t.purge_error {
+                println!("  PURGE FAILED: {e} (the figures above are the last measured)  (D231)");
+            }
         }
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         for j in &jobs {
@@ -11426,6 +11484,22 @@ fn trash_put(
 
 /// Days until a bucket is purged: `purge_trash` takes it once it is
 /// `retention_days` old.
+/// PVOS D231 — a stuck trash bucket from a daemon's status, in one line.
+fn stuck_text(b: &pvfs_client::StuckBucketWire) -> String {
+    let whose = match (&b.folder_owner, &b.daemon_user) {
+        (Some(f), Some(d)) if f != d => format!("; its folder belongs to {f}, the daemon runs as {d}"),
+        _ => String::new(),
+    };
+    format!(
+        "bucket {} not removed: cannot remove {}: {}{whose} ({} entries, {} left)",
+        b.day,
+        b.path,
+        b.error,
+        b.left_entries,
+        fmt_bytes(b.left_bytes)
+    )
+}
+
 fn trash_days_left(day: u64, retention_days: u64, today: u64) -> u64 {
     (day + retention_days).saturating_sub(today)
 }

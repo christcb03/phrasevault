@@ -24,6 +24,8 @@ whenever a fix is found, not only when it recurs.**
 | Subtitles and `.nfo` files on a different disk from their media | [§15](#15-subtitles-and-nfo-files-on-a-different-disk-from-their-media) |
 | `resolve` reports `copy to trash: No such file or directory` | [§16](#16-resolve-fails-copy-to-trash-no-such-file-or-directory) |
 | `rm` of a file just created through the view: `Input/output error` | [§17](#17-rm-of-a-file-just-created-through-the-view-inputoutput-error) |
+| "Disk errors" page: `trash purge failed: … Permission denied`; a `STUCK` trash bucket | [§18](#18-a-trash-bucket-the-purge-cannot-remove-permission-denied) |
+| `forbidden: use the forest at … as root` | [§19](#19-pvfs-refuses-forbidden-use-the-forest--as-root) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -514,3 +516,57 @@ answers `Input/output error` too, so a tool that writes a temporary file
 and renames it into place fails and leaves the temporary file behind; and
 after 10 minutes uncatalogued the file drops out of the mount's listing,
 though its bytes are on disk (user manual §7.13, known problems).
+
+## 18. A trash bucket the purge cannot remove: "Permission denied"
+
+**What it looks like.** Before PVOS D231: `pvfsd: trash purge failed:
+c020473f: I/O error during purge trash bucket: Permission denied (os error
+13)` in the holder's journal, and Grafana paged "Disk errors on mediabox"
+(2026-10-09 8:01 PM; the rule no longer matches it, HomeLab `69391a6`).
+Since D231: a `trash_stuck` fleet event and a page problem, and in `pvfs
+serve status`:
+
+```
+trash c020473f: 64.0 GB in 2 day bucket(s), oldest 9 days old; kept 7 days  (D148)
+  STUCK: bucket 20729 not removed: cannot remove /mnt/local/Media/.pvfs-trash/20729/TV/…: Permission denied (os error 13); its folder belongs to root (uid 0), the daemon runs as chris (uid 1000) (…)  (D231)
+```
+
+**Why.** A bucket's folders were made by another user, usually root through
+`sudo pvfs trash put` (8,827 of them on 2026-10-03/04). The daemon runs as
+the forest's user, which may not remove what is in another user's folder.
+Before D231 the purge stopped at that bucket, so every newer bucket waited
+behind it. Since D231 it removes what it can, names the rest, and goes on.
+
+**Fix.** Give the bucket back to the daemon's user. The next purge, within
+five minutes, takes it:
+
+```
+sudo chown -R chris:chris /mnt/local/Media/.pvfs-trash /mnt/local2/.pvfs-trash
+sudo find /mnt/local/Media/.pvfs-trash /mnt/local2/.pvfs-trash ! -user chris   # nothing left
+```
+
+Since D231 `sudo pvfs` is refused (§19), so this should not recur from
+PVFS. A folder another program made as root (Bazarr's `.srt` files, for
+one) is outside the trash and does not block it.
+
+## 19. pvfs refuses: "forbidden: use the forest … as root"
+
+**What it looks like.**
+
+```
+forbidden: use the forest at /opt/pvfs/media/.pvfs as root (uid 0) — its files belong to chris (uid 1000), the user its daemon runs as. …
+```
+
+**Why.** Since PVOS D231, pvfs uses a forest's files only as the user that
+owns them (its `.pvfs` directory's owner, the user its daemon runs as).
+Anything it made as root (trash folders, index files, SQLite's `-wal` and
+`-shm`, state files) would be root's, and the daemon could not change or
+remove it later (§18). pvfsd itself refuses to start as root against
+another user's forest, for the same reason.
+
+**Fix.** Run it as that user: `sudo -u chris pvfs …`, or log in as chris.
+Only the system registry's commands (`forest register`, `forest
+unregister`, `forest fix-permissions`) and `forest init` are meant for
+`sudo`. If the forest's `.pvfs` is wrongly root's (a `sudo` init), give it
+back with `sudo pvfs forest fix-permissions --mount <mount>`.
+

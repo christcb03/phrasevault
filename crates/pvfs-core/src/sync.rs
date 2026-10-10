@@ -856,6 +856,71 @@ pub fn tail_chunk(path: &Path, size: u64) -> std::io::Result<(u64, u64, [u8; 32]
 pub struct TrashPurge {
     pub removed: u64,
     pub freed_bytes: u64,
+    /// PVOS D231 — buckets the purge wanted gone that it could not wholly
+    /// remove. Whatever in them it could remove went; every other bucket was
+    /// still tried. One such bucket used to end the pass with an error, which
+    /// kept every newer bucket and the space rule's purge too (2026-10-09:
+    /// two root-owned buckets on mediabox, from a `sudo pvfs trash put`).
+    pub stuck: Vec<StuckBucket>,
+}
+
+/// PVOS D231 — a trash bucket that could not all be removed, and why: the
+/// first thing in it that would not go, the error, and whose folder held it
+/// (the folder's owner decides who may remove what is in it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckBucket {
+    /// The bucket's day (its name).
+    pub day: u64,
+    pub bucket: PathBuf,
+    /// The first entry, in name order, that this process could not remove.
+    pub first: PathBuf,
+    /// Its error, as the system says it (`Permission denied (os error 13)`).
+    pub error: String,
+    /// The owner of the folder holding `first`, when it could be read.
+    pub folder_uid: Option<u32>,
+    /// Entries still there, and their bytes.
+    pub left_entries: u64,
+    pub left_bytes: u64,
+}
+
+impl StuckBucket {
+    /// The owner of `first`'s folder as a person reads it: `root (uid 0)`.
+    pub fn folder_owner(&self) -> Option<String> {
+        self.folder_uid.map(user_text)
+    }
+
+    /// One line for a log or a status page: the bucket, the path, the error,
+    /// and, when the folder is another user's, whose — the usual cause.
+    pub fn describe(&self) -> String {
+        let mine = nix::unistd::geteuid().as_raw();
+        let whose = match self.folder_uid {
+            Some(uid) if uid != mine => {
+                format!("; its folder belongs to {}, and this process runs as {}", user_text(uid), process_user())
+            }
+            _ => String::new(),
+        };
+        format!(
+            "trash bucket {} not removed: cannot remove {}: {}{whose} ({} entries, {} bytes left)",
+            self.day,
+            self.first.display(),
+            self.error,
+            self.left_entries,
+            self.left_bytes
+        )
+    }
+}
+
+/// Who this process runs as: `chris (uid 1000)`.
+pub fn process_user() -> String {
+    user_text(nix::unistd::geteuid().as_raw())
+}
+
+/// `chris (uid 1000)`, or `uid 1000` when the name cannot be read.
+pub fn user_text(uid: u32) -> String {
+    match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(u)) => format!("{} (uid {uid})", u.name),
+        _ => format!("uid {uid}"),
+    }
 }
 
 /// Purge trash buckets older than `keep_days`, and — when `min_free_bytes` is
@@ -864,6 +929,10 @@ pub struct TrashPurge {
 /// Age alone is not enough here: `Data` is 88% full with 9.4 T free, so a
 /// fortnight of deleted 40 GB episodes could matter. Oldest first, and the
 /// caller reports what went.
+///
+/// PVOS D231 — a bucket that will not all go is reported in `stuck` and the
+/// purge goes on to the next: an `Err` now means the trash could not be read
+/// at all.
 pub fn purge_trash(root: &Path, keep_days: u64, min_free_bytes: u64) -> Result<TrashPurge> {
     let mut report = TrashPurge::default();
     let base = trash_root(root);
@@ -888,15 +957,168 @@ pub fn purge_trash(root: &Path, keep_days: u64, min_free_bytes: u64) -> Result<T
             continue;
         }
         let freed = dir_bytes(&path);
-        match std::fs::remove_dir_all(&path) {
+        match remove_bucket(&path) {
             Ok(()) => {
                 report.removed += 1;
                 report.freed_bytes += freed;
             }
-            Err(e) => return Err(PvfsError::io("purge trash bucket", e)),
+            Err(left) => {
+                let left_bytes = dir_bytes(&path);
+                report.freed_bytes += freed.saturating_sub(left_bytes);
+                report.stuck.push(StuckBucket {
+                    day,
+                    bucket: path,
+                    first: left.first,
+                    error: left.error,
+                    folder_uid: left.folder_uid,
+                    left_entries: left.entries,
+                    left_bytes,
+                });
+            }
         }
     }
     Ok(report)
+}
+
+/// What [`remove_bucket`] could not remove.
+#[derive(Debug)]
+struct Leftover {
+    first: PathBuf,
+    error: String,
+    folder_uid: Option<u32>,
+    entries: u64,
+}
+
+/// PVOS D231 — remove `bucket` and everything in it this process may remove.
+///
+/// `remove_dir_all` first: the usual case, unchanged. It stops at its first
+/// error, so when it fails a second walk ([`sweep`]) removes what it still
+/// can and names the first entry, in name order, that will not go — the same
+/// one every pass, so a log that says it once per run stays quiet. That walk
+/// never follows a link: each folder is opened `O_NOFOLLOW` relative to its
+/// parent's descriptor and entries are unlinked relative to it (as std's own
+/// walk does), so a folder swapped for a link mid-walk is removed as the
+/// link, never walked into.
+fn remove_bucket(bucket: &Path) -> std::result::Result<(), Leftover> {
+    match std::fs::remove_dir_all(bucket) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+    let mut left = Sweep::default();
+    sweep(bucket, &mut left);
+    match std::fs::remove_dir(bucket) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            left.entries += 1;
+            if left.first.is_none() {
+                let folder_uid = bucket.parent().and_then(|p| std::fs::symlink_metadata(p).ok()).map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid()
+                });
+                left.first = Some((bucket.to_path_buf(), e.to_string(), folder_uid));
+            }
+        }
+    }
+    let (first, error, folder_uid) = left.first.unwrap_or_else(|| (bucket.to_path_buf(), "not removed".into(), None));
+    Err(Leftover { first, error, folder_uid, entries: left.entries })
+}
+
+#[derive(Debug, Default)]
+struct Sweep {
+    /// The first entry that would not go: its path, error and folder's owner.
+    first: Option<(PathBuf, String, Option<u32>)>,
+    entries: u64,
+}
+
+impl Sweep {
+    fn note(&mut self, path: PathBuf, err: nix::errno::Errno, folder_uid: Option<u32>) {
+        self.entries += 1;
+        if self.first.is_none() {
+            self.first = Some((path, std::io::Error::from_raw_os_error(err as i32).to_string(), folder_uid));
+        }
+    }
+}
+
+const SWEEP_DIR: nix::fcntl::OFlag = nix::fcntl::OFlag::O_RDONLY
+    .union(nix::fcntl::OFlag::O_DIRECTORY)
+    .union(nix::fcntl::OFlag::O_NOFOLLOW)
+    .union(nix::fcntl::OFlag::O_CLOEXEC);
+
+/// Remove everything under the folder at `dir` that can be removed; leave
+/// the folder itself (its caller removes it). See [`remove_bucket`].
+fn sweep(dir: &Path, left: &mut Sweep) {
+    match nix::dir::Dir::open(dir, SWEEP_DIR, nix::sys::stat::Mode::empty()) {
+        Ok(mut d) => sweep_in(&mut d, dir, left),
+        Err(e) => {
+            let folder_uid = dir.parent().and_then(|p| std::fs::symlink_metadata(p).ok()).map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid()
+            });
+            left.note(dir.to_path_buf(), e, folder_uid);
+        }
+    }
+}
+
+fn sweep_in(d: &mut nix::dir::Dir, path: &Path, left: &mut Sweep) {
+    use nix::dir::Type;
+    use nix::errno::Errno;
+    use nix::fcntl::AtFlags;
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fd = d.as_raw_fd();
+    let owner = nix::sys::stat::fstat(fd).ok().map(|s| s.st_uid);
+    let mut names: Vec<(std::ffi::CString, Option<Type>)> = d
+        .iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !matches!(e.file_name().to_bytes(), b"." | b".."))
+        .map(|e| (e.file_name().to_owned(), e.file_type()))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, ty) in names {
+        let child = path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let is_dir = match ty {
+            Some(t) => t == Type::Directory,
+            None => nix::sys::stat::fstatat(Some(fd), name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map(|s| s.st_mode & nix::libc::S_IFMT == nix::libc::S_IFDIR)
+                .unwrap_or(false),
+        };
+        if is_dir {
+            match nix::dir::Dir::openat(Some(fd), name.as_c_str(), SWEEP_DIR, nix::sys::stat::Mode::empty()) {
+                Ok(mut sub) => sweep_in(&mut sub, &child, left),
+                // swapped for a link (or a file) since it was listed: it goes
+                // as what it is now
+                Err(Errno::ELOOP) | Err(Errno::ENOTDIR) => {
+                    match unlinkat(Some(fd), name.as_c_str(), UnlinkatFlags::NoRemoveDir) {
+                        Ok(()) | Err(Errno::ENOENT) => {}
+                        Err(e) => left.note(child, e, owner),
+                    }
+                    continue;
+                }
+                Err(Errno::ENOENT) => continue,
+                // cannot look inside: the folder stays, and this is why
+                Err(e) => {
+                    left.note(child, e, owner);
+                    continue;
+                }
+            }
+            match unlinkat(Some(fd), name.as_c_str(), UnlinkatFlags::RemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                // not empty because something in it would not go: that
+                // entry is already the one named
+                Err(Errno::ENOTEMPTY) | Err(Errno::EEXIST) if left.first.is_some() => left.entries += 1,
+                Err(e) => left.note(child, e, owner),
+            }
+        } else {
+            match unlinkat(Some(fd), name.as_c_str(), UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(e) => left.note(child, e, owner),
+            }
+        }
+    }
 }
 
 /// D148 — what a root's trash holds: bytes, bucket count, the oldest bucket's

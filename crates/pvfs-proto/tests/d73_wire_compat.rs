@@ -112,6 +112,8 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             retention_days: 7,
             freed_bytes: 0,
             measured_ms: 1,
+            stuck: Vec::new(),
+            purge_error: None,
         }]),
         log_destinations: Box::default(),
         stores: Box::default(),
@@ -445,4 +447,35 @@ fn diagnose_round_trips() {
     let j = serde_json::to_string(&reply).unwrap();
     assert!(!j.contains("problems_note"), "{j}");
     assert_eq!(serde_json::from_str::<pvfs_proto::ServerMsg>(&j).unwrap(), reply);
+}
+
+/// PVOS D231 — a trash record with no stuck buckets is the bytes it always
+/// was (an older owner reads it unchanged), one from an older daemon decodes
+/// with none, and stuck buckets round-trip.
+#[test]
+fn trash_stuck_buckets_are_additive() {
+    let plain = pvfs_proto::TrashWire { region: "fe38175f".into(), bytes: 5, buckets: 1, ..Default::default() };
+    let text = serde_json::to_string(&plain).unwrap();
+    assert!(!text.contains("stuck"), "{text}");
+    let old = r#"{"region":"fe38175f","bytes":5,"buckets":1,"oldest_day":20691,"retention_days":7,"freed_bytes":0,"measured_ms":1}"#;
+    assert!(serde_json::from_str::<pvfs_proto::TrashWire>(old).unwrap().stuck.is_empty());
+    let stuck = pvfs_proto::TrashWire {
+        stuck: vec![pvfs_proto::StuckBucketWire {
+            day: 20729,
+            bucket: "/mnt/local/Media/.pvfs-trash/20729".into(),
+            path: "/mnt/local/Media/.pvfs-trash/20729/TV".into(),
+            error: "Permission denied (os error 13)".into(),
+            folder_owner: Some("root (uid 0)".into()),
+            daemon_user: Some("chris (uid 1000)".into()),
+            left_entries: 3,
+            left_bytes: 64,
+        }],
+        ..plain
+    };
+    let text = serde_json::to_string(&stuck).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::TrashWire>(&text).unwrap(), stuck);
+    // a region whose purge failed as a whole
+    let failed = pvfs_proto::TrashWire { purge_error: Some("I/O error during read trash: Permission denied".into()), ..stuck };
+    let text = serde_json::to_string(&failed).unwrap();
+    assert_eq!(serde_json::from_str::<pvfs_proto::TrashWire>(&text).unwrap(), failed);
 }

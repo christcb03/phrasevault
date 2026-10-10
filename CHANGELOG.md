@@ -5,6 +5,24 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A stuck trash bucket is named and skipped; `sudo pvfs` is refused
+  (PVOS D231).**
+  - A trash bucket the purge cannot wholly remove no longer ends the purge:
+    what can go goes, every other bucket is still purged (for retention and
+    for space), and the bucket is reported. The report has the first path
+    that would not go, the error, and whose folder held it (`serve status`
+    `STUCK`, `fleet health`, `view resolve`). The walk after a failure
+    never follows a link.
+  - The owner says it: `trash_stuck` (warning) and `trash_stuck_cleared`
+    fleet events, once per bucket, the owner's own trash included.
+    `TrashWire.stuck` is additive; no proto bump.
+  - pvfs refuses to use a forest's files as a user other than their owner
+    (`forbidden: use the forest at … as root …`). That covers every engine
+    open (pvfsd too), and the CLI before anything else. Only the registry's
+    commands and `forest init` may run under `sudo`. Before this, `sudo
+    pvfs trash put` left root's buckets that the daemon could not purge
+    (2026-10-09).
+
 - **Diagnostics in one bundle (PVOS D230).**
   - `pvfs diagnose` asks when run bare; `--this-box`, `--since`, `--out`
     and `--json` are for scripts. It covers every box this one knows:

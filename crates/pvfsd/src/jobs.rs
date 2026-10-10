@@ -369,11 +369,30 @@ impl JobsState {
                 retention_days: r.retention_days,
                 freed_bytes: r.purge.freed_bytes,
                 measured_ms: now,
+                // PVOS D231 — what this pass could not remove, by bucket
+                stuck: r.purge.stuck.iter().map(stuck_wire).collect(),
+                purge_error: None,
             };
             match t.iter_mut().find(|x| x.region == w.region) {
                 Some(x) => *x = w,
                 None => t.push(w),
             }
+        }
+    }
+
+    /// PVOS D231 — a region whose purge failed as a whole: said in `serve
+    /// status` (and so to the owner's notifier) beside its last figures, as
+    /// the trash step's journal line alone reached nobody (2026-10-09).
+    fn record_trash_error(&self, region: &str, retention_days: u64, error: &str) {
+        let mut t = self.trash.lock().unwrap();
+        match t.iter_mut().find(|x| x.region == region) {
+            Some(x) => x.purge_error = Some(error.to_string()),
+            None => t.push(pvfs_proto::TrashWire {
+                region: region.to_string(),
+                retention_days,
+                purge_error: Some(error.to_string()),
+                ..Default::default()
+            }),
         }
     }
 
@@ -1169,6 +1188,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
             let prev = pvfs_client::health::FleetHealth::load(st.data_dir()).ok().flatten();
             match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
                 Ok(mut rec) => {
+                    // PVOS D231 — this box's own trash, for its stuck buckets
+                    // (the owner never polls itself)
+                    rec.self_trash = st.trash_snapshot();
                     for (pin, r) in rec.down() {
                         pv_warn!("pvfs.health.peer_down", peer = &pin[..8], peer_addr = &r.addr,
                             since_ms = r.unreachable_since_ms.unwrap_or(0),
@@ -1754,9 +1776,18 @@ fn trash_step(
             break;
         }
         let short = region.get(..8).unwrap_or(&region).to_string();
-        match pvfs_core::sync::purge_region(region, &root, days) {
-            Ok(t) => found.push(t),
-            Err(e) => failed.push(format!("{short}: {e}")),
+        match pvfs_core::sync::purge_region(region.clone(), &root, days) {
+            Ok(t) => {
+                // PVOS D231 — a bucket that would not all go is a failure of
+                // this step, named (bucket, path, whose folder), while the
+                // rest of the region's trash was still purged.
+                failed.extend(t.purge.stuck.iter().map(|b| format!("{short}: {}", b.describe())));
+                found.push(t)
+            }
+            Err(e) => {
+                st.record_trash_error(&region, days, &e.to_string());
+                failed.push(format!("{short}: {e}"))
+            }
         }
     }
     st.record_trash(&found);
@@ -1779,6 +1810,20 @@ fn trash_step(
         log.extend(st.failed(Fault::Trash, &failed.join("; ")));
     }
     log
+}
+
+/// PVOS D231 — a stuck bucket as `serve status` carries it.
+fn stuck_wire(b: &pvfs_core::sync::StuckBucket) -> pvfs_proto::StuckBucketWire {
+    pvfs_proto::StuckBucketWire {
+        day: b.day,
+        bucket: b.bucket.display().to_string(),
+        path: b.first.display().to_string(),
+        error: b.error.clone(),
+        folder_owner: b.folder_owner(),
+        daemon_user: Some(pvfs_core::sync::process_user()),
+        left_entries: b.left_entries,
+        left_bytes: b.left_bytes,
+    }
 }
 
 /// A byte count as a person reads it in the journal.
@@ -2316,7 +2361,7 @@ mod tests {
     /// D176 — the trash step purges and records every region it is given; a
     /// region that fails is said once per run and does not cost the others
     /// their purge or their record; its recovery is said; a stopped step
-    /// gives no verdict.
+    /// gives no verdict. PVOS D231 — the failed region's record says why.
     #[test]
     fn the_trash_step_purges_every_region_and_says_a_failure_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2345,9 +2390,15 @@ mod tests {
         assert!(!a.join(format!(".pvfs-trash/{}", today - 10)).exists(), "past retention: gone");
         assert!(a.join(format!(".pvfs-trash/{today}")).exists(), "today's bucket is kept");
         let t = st.trash_snapshot();
-        assert_eq!(t.len(), 1, "the failed region has no record: {t:?}");
-        assert_eq!((t[0].region.as_str(), t[0].bytes, t[0].buckets), (ra.as_str(), 2_000, 1));
-        assert_eq!((t[0].oldest_day, t[0].retention_days, t[0].freed_bytes), (Some(today), 7, 3_000));
+        assert_eq!(t.len(), 2, "{t:?}");
+        let ta = t.iter().find(|x| x.region == ra).unwrap();
+        assert_eq!((ta.bytes, ta.buckets, ta.purge_error.as_deref()), (2_000, 1, None));
+        assert_eq!((ta.oldest_day, ta.retention_days, ta.freed_bytes), (Some(today), 7, 3_000));
+        // PVOS D231 — the failed region is listed with why, and no
+        // measurement (it has never had one): what reaches the notifier
+        let tb = t.iter().find(|x| x.region == rb).unwrap();
+        assert!(tb.purge_error.as_deref().is_some_and(|e| e.contains("read trash")), "{tb:?}");
+        assert_eq!((tb.measured_ms, tb.bytes, tb.retention_days), (0, 0, 7), "{tb:?}");
 
         assert!(trash_step(&st, roots(), &never).is_empty(), "the same failure is not said again");
 
@@ -2362,6 +2413,7 @@ mod tests {
         assert_eq!(t.len(), 2, "{t:?}");
         let tb = t.iter().find(|x| x.region == rb).unwrap();
         assert_eq!((tb.bytes, tb.buckets, tb.oldest_day, tb.freed_bytes), (0, 0, None, 0), "an empty trash is reported too");
+        assert!(tb.purge_error.is_none() && tb.measured_ms > 0, "recovered: measured, the failure gone: {tb:?}");
 
         // A step told to stop purges nothing more and gives no verdict.
         std::fs::write(b.join(".pvfs-trash"), b"broken again").unwrap();

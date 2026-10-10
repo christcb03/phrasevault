@@ -652,6 +652,40 @@ pub struct TrashWire {
     pub retention_days: u64,
     pub freed_bytes: u64,
     pub measured_ms: u64,
+    /// PVOS D231 — buckets that pass wanted gone and could not wholly remove
+    /// (the rest of the trash was still purged). Absent when there are none,
+    /// and from a daemon before D231: an older peer reads the record as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stuck: Vec<StuckBucketWire>,
+    /// PVOS D231 — the latest purge of this region failed as a whole (its
+    /// trash could not be read): why. The figures above are the last ones
+    /// measured (`measured_ms`; 0 when none has been). Cleared by the next
+    /// purge that runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_error: Option<String>,
+}
+
+/// PVOS D231 — one trash bucket a purge could not wholly remove: the first
+/// entry that would not go, its error, and whose folder held it — the usual
+/// cause is a folder made by another user (`sudo pvfs …`), which the daemon
+/// may not empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StuckBucketWire {
+    /// The bucket's day (days since the epoch; its folder's name).
+    pub day: u64,
+    /// The bucket's folder on that box.
+    pub bucket: String,
+    /// The first entry, in name order, that could not be removed.
+    pub path: String,
+    pub error: String,
+    /// Who owns the folder holding `path`: `root (uid 0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_owner: Option<String>,
+    /// Who the daemon runs as: `chris (uid 1000)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_user: Option<String>,
+    pub left_entries: u64,
+    pub left_bytes: u64,
 }
 
 /// One shipped log row, verbatim (F2 log shipping, doc 17 §5): the replica
