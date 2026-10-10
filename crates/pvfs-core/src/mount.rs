@@ -123,12 +123,14 @@ pub fn peek_certs_bound(data_dir: &Path) -> Result<Option<String>> {
 /// PVOS D232 — a read-only connection for a peek. As the forest's user, the
 /// usual one. As any other user (root, under a `sudo` command D231 still
 /// allows), `immutable`: SQLite then creates no `-shm` or `-wal` and takes
-/// no lock. A read-only connection to a WAL database otherwise CREATES those
-/// files when they are not there (a daemon stopped and cleanly closed) and
-/// it can write the folder, which root can — root's files, which the
-/// forest's daemon then cannot open. Immutable reads the database file
-/// alone, so a write still in the WAL is not seen: the peeks a root command
-/// makes read the genesis row and identity, long checkpointed.
+/// no lock on a forest that is not this process's. A read-only connection
+/// to a WAL database otherwise creates those files when they are not there
+/// (a daemon stopped and cleanly closed). Under root SQLite gives them to
+/// the database file's owner (checked: D232 deviation 1), so this is
+/// defense: for a non-root other user, and for locks. Immutable reads the
+/// database file alone, so a write still in the WAL is not seen: the peeks
+/// a root command makes read the genesis row and identity, long
+/// checkpointed.
 pub fn open_peek(db: &Path) -> rusqlite::Result<Connection> {
     let other_user = db.parent().is_some_and(|dir| check_forest_user(dir).is_err());
     if !other_user {

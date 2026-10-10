@@ -16,11 +16,13 @@ file tracks Layer 0, the file-system engine.
       forest's user.
     - The daemon itself never gets sudo. The `trash_stuck` event and
       `serve status` name the command.
-  - The commands still allowed under sudo leave nothing of root's in
-    `.pvfs`:
-    - the peeks open SQLite `immutable` as another user, so no `-shm` or
-      `-wal` is made;
+  - The commands still allowed under sudo take no lock and make no file in
+    another user's `.pvfs`:
+    - the peeks open SQLite `immutable` as another user;
     - no companion-key peek runs for another user.
+
+    This is defense: under root, SQLite already gives a `-shm`/`-wal` it
+    makes to the database's owner.
   - `forest fix-permissions` changes owners by descriptor. Before this it
     could follow a link swapped in during the walk, and give a root-owned
     file to the tree's user.
