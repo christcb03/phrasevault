@@ -302,6 +302,19 @@ pub fn check_forest_user_for(data_dir: &Path, owner: u32, running: u32) -> Resul
     }
     let owner_text = crate::sync::user_text(owner);
     let owner_name = owner_name(owner).unwrap_or_else(|| format!("#{owner}"));
+    if owner == 0 {
+        // the other way round: root's forest, a user running pvfs. Usually a
+        // `sudo` init by mistake, which fix-permissions undoes.
+        let mount = data_dir.parent().unwrap_or(data_dir);
+        return Err(PvfsError::Forbidden {
+            action: format!("use the forest at {} as {}", data_dir.display(), crate::sync::user_text(running)),
+            reason: format!(
+                "its files belong to root (uid 0). If that is a mistake (a `sudo` init), give them back with \
+                 `sudo pvfs forest fix-permissions --mount {}`; otherwise run pvfs as root",
+                mount.display()
+            ),
+        });
+    }
     Err(PvfsError::Forbidden {
         action: format!("use the forest at {} as {}", data_dir.display(), crate::sync::user_text(running)),
         reason: format!(

@@ -211,6 +211,10 @@ fn another_users_forest_is_refused_with_whom_to_run_it_as() {
     assert!(text.contains("sudo -u "), "{text}");
     let e = check_forest_user_for(dir, 1000, 1001).unwrap_err().to_string();
     assert!(e.contains("would be uid 1001's"), "not only root: {e}");
+    // root's forest and a user: usually a `sudo` init — fix-permissions
+    let e = check_forest_user_for(dir, 0, 1000).unwrap_err().to_string();
+    assert!(e.contains("belong to root (uid 0)"), "{e}");
+    assert!(e.contains("sudo pvfs forest fix-permissions --mount /opt/pvfs/media"), "{e}");
 }
 
 /// A data dir that is not there yet is nobody's: creating a forest decides
