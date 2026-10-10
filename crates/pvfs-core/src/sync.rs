@@ -1252,28 +1252,54 @@ pub fn unstick_bucket(path: &Path, forest_uid: u32) -> Result<Unstick> {
 /// PVOS D232 — give a region's `.pvfs-trash` folder itself back to the
 /// forest's user (`uid`, `gid`), and let its owner read, write and enter it:
 /// what a whole-region purge failure needs (D231's `purge_error`). This one
-/// folder only, never recursively, through a descriptor (no link followed).
+/// folder only, never recursively, through its parent's descriptor (no link
+/// followed, on the way or at the folder).
 /// Returns whether anything changed.
 pub fn give_back_trash_dir(path: &Path, uid: u32, gid: u32) -> Result<bool> {
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::{fstatat, Mode};
     use std::os::fd::AsRawFd;
-    if path.file_name().is_none_or(|n| n != TRASH_DIR) {
-        return Err(PvfsError::Forbidden {
-            action: format!("give back {}", path.display()),
-            reason: format!("it is not a `{TRASH_DIR}` folder"),
-        });
+    let refuse = |why: &str| PvfsError::Forbidden { action: format!("give back {}", path.display()), reason: why.into() };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("it is not a `.pvfs-trash` folder"));
+    };
+    if name != TRASH_DIR {
+        return Err(refuse("it is not a `.pvfs-trash` folder"));
     }
-    let fd = open_dir_nofollow(path).map_err(|e| PvfsError::io("open trash", e))?;
-    let st = nix::sys::stat::fstat(fd.as_raw_fd()).map_err(|e| PvfsError::io("stat trash", e.into()))?;
+    // the folder is changed through its parent's descriptor: a mode-000
+    // folder cannot be opened by its own (non-root) user, and nothing on the
+    // way, nor the folder itself, may be a link
+    let dir = open_dir_nofollow(parent).map_err(|e| PvfsError::io("open trash's parent", e))?;
+    let io = |what: &str, e: nix::errno::Errno| PvfsError::io(what, std::io::Error::from(e));
+    let st = fstatat(Some(dir.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|e| io("stat trash", e))?;
+    if st.st_mode & nix::libc::S_IFMT != nix::libc::S_IFDIR {
+        return Err(refuse("it is not a folder (a link, or a file)"));
+    }
     let mut changed = false;
     if st.st_uid != uid || st.st_gid != gid {
-        nix::unistd::fchown(fd.as_raw_fd(), Some(nix::unistd::Uid::from_raw(uid)), Some(nix::unistd::Gid::from_raw(gid)))
-            .map_err(|e| PvfsError::io("give back trash", e.into()))?;
+        let (u, g) = (Some(nix::unistd::Uid::from_raw(uid)), Some(nix::unistd::Gid::from_raw(gid)));
+        nix::unistd::fchownat(Some(dir.as_raw_fd()), name, u, g, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map_err(|e| io("give back trash", e))?;
         changed = true;
     }
-    let mode = nix::sys::stat::Mode::from_bits_truncate(st.st_mode);
-    let want = mode | nix::sys::stat::Mode::S_IRWXU;
+    let mode = Mode::from_bits_truncate(st.st_mode);
+    let want = mode | Mode::S_IRWXU;
     if want != mode {
-        nix::sys::stat::fchmod(fd.as_raw_fd(), want).map_err(|e| PvfsError::io("open trash to its owner", e.into()))?;
+        match nix::fcntl::openat(Some(dir.as_raw_fd()), name, SWEEP_DIR, Mode::empty()) {
+            Ok(raw) => {
+                // Safety: just opened, owned here only.
+                let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+                nix::sys::stat::fchmod(fd.as_raw_fd(), want).map_err(|e| io("open trash to its owner", e))?;
+            }
+            // its own user, locked out of its own folder: by name. Only root
+            // must never change a mode by a name that could be swapped for a
+            // link, and root is never refused this open.
+            Err(nix::errno::Errno::EACCES) if !nix::unistd::geteuid().is_root() => {
+                nix::sys::stat::fchmodat(Some(dir.as_raw_fd()), name, want, nix::sys::stat::FchmodatFlags::FollowSymlink)
+                    .map_err(|e| io("open trash to its owner", e))?;
+            }
+            Err(e) => return Err(io("open trash", e)),
+        }
         changed = true;
     }
     Ok(changed)
