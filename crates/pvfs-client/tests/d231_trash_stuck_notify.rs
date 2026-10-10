@@ -74,7 +74,7 @@ fn a_stuck_bucket_is_said_once_with_its_path_and_owner_then_cleared_once() {
     let said = notify::summary(&labels(), &ev[0]);
     assert!(said.starts_with("On mediabox's holder, the trash purge could not remove a bucket"), "{said}");
     assert!(said.contains("The rest of the trash is still purged"), "{said}");
-    assert!(said.contains("chown -R"), "it says what to do: {said}");
+    assert!(said.contains("sudo pvfs trash unstick on mediabox's holder"), "it says what to do (PVOS D232): {said}");
 
     // the next steps: still stuck — said already
     assert!(notify::trash_stuck(&mut st, &record(t + 120_000, answering(trash(&[20729]))), t + 120_000).is_empty());

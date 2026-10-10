@@ -1121,6 +1121,164 @@ fn sweep_in(d: &mut nix::dir::Dir, path: &Path, left: &mut Sweep) {
     }
 }
 
+// ---- PVOS D232: `pvfs trash unstick` — a person clears a stuck bucket ------
+//
+// The daemon gets no sudo (D232 decision 1): it listens on the network, and
+// any grant to it is a root path for whoever takes it over. A person runs
+// `sudo pvfs trash unstick`, which removes what the purge reported stuck,
+// after asking. Root acts here inside a tree another user can write, so
+// nothing on the way may follow a link: every component of the path is
+// opened `O_NOFOLLOW` from `/`, and the removal is the D231 sweep, relative
+// to descriptors.
+
+/// Open the folder at `path` without following a link at ANY component:
+/// each one is opened `O_NOFOLLOW | O_DIRECTORY` relative to the one before,
+/// from `/`. `path` must be absolute, without `.` or `..`.
+pub fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::path::Component;
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not an absolute path"));
+    }
+    let raw = nix::fcntl::open("/", SWEEP_DIR, nix::sys::stat::Mode::empty()).map_err(std::io::Error::from)?;
+    // Safety: `raw` was just opened and is owned by nothing else.
+    let mut fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    for c in comps {
+        let Component::Normal(name) = c else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "`.` or `..` in the path"));
+        };
+        use std::os::fd::AsRawFd;
+        let next = nix::fcntl::openat(Some(fd.as_raw_fd()), name, SWEEP_DIR, nix::sys::stat::Mode::empty())
+            .map_err(std::io::Error::from)?;
+        // Safety: as above.
+        fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(next) };
+    }
+    Ok(fd)
+}
+
+/// `(the .pvfs-trash folder, the day)` when `path` names a trash bucket:
+/// absolute, `…/.pvfs-trash/<digits>`, no `.` or `..`. `None` otherwise.
+pub fn trash_bucket_path(path: &Path) -> Option<(PathBuf, u64)> {
+    use std::path::Component;
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let day = name.parse().ok()?;
+    let trash = path.parent()?;
+    (trash.file_name()? == TRASH_DIR).then(|| (trash.to_path_buf(), day))
+}
+
+/// What `unstick_bucket` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unstick {
+    /// The bucket is gone; its bytes, as measured before.
+    Removed { freed_bytes: u64 },
+    /// It was already gone.
+    NotThere,
+    /// Some of it would not go even now (this process lacks the right too).
+    Left(StuckBucket),
+}
+
+/// PVOS D232 — remove the trash bucket at `path`, for a person who has
+/// decided to (`pvfs trash unstick`). Refused unless `path` is a trash
+/// bucket (`trash_bucket_path`), its `.pvfs-trash` folder belongs to
+/// `forest_uid` (the forest's user: a PVFS trash, not a root folder named to
+/// look like one), and the bucket is a real folder, not a link. Never
+/// follows a link (`open_dir_nofollow`, then the sweep).
+pub fn unstick_bucket(path: &Path, forest_uid: u32) -> Result<Unstick> {
+    use std::os::fd::AsRawFd;
+    let refuse = |why: String| PvfsError::Forbidden { action: format!("remove {}", path.display()), reason: why };
+    let Some((trash, day)) = trash_bucket_path(path) else {
+        return Err(refuse("it is not a trash bucket (`<region root>/.pvfs-trash/<day>`, an absolute path)".into()));
+    };
+    let trash_fd = match open_dir_nofollow(&trash) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Unstick::NotThere),
+        Err(e) => return Err(refuse(format!("{} cannot be opened without following a link: {e}", trash.display()))),
+    };
+    let owner = nix::sys::stat::fstat(trash_fd.as_raw_fd()).map_err(|e| PvfsError::io("stat trash", e.into()))?.st_uid;
+    if owner != forest_uid {
+        return Err(refuse(format!(
+            "{} belongs to {}, not to the forest's user {} — not a PVFS trash this forest's daemon made",
+            trash.display(),
+            user_text(owner),
+            user_text(forest_uid)
+        )));
+    }
+    let name = day.to_string();
+    let bucket_raw = match nix::fcntl::openat(Some(trash_fd.as_raw_fd()), name.as_str(), SWEEP_DIR, nix::sys::stat::Mode::empty()) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(Unstick::NotThere),
+        Err(nix::errno::Errno::ELOOP) | Err(nix::errno::Errno::ENOTDIR) => {
+            return Err(refuse("it is not a folder (a link, or a file)".into()))
+        }
+        Err(e) => return Err(PvfsError::io("open trash bucket", e.into())),
+    };
+    let freed = dir_bytes(path);
+    let mut left = Sweep::default();
+    match nix::dir::Dir::from_fd(bucket_raw) {
+        Ok(mut d) => sweep_in(&mut d, path, &mut left),
+        Err(e) => left.note(path.to_path_buf(), e, Some(owner)),
+    }
+    let gone = nix::unistd::unlinkat(Some(trash_fd.as_raw_fd()), name.as_str(), nix::unistd::UnlinkatFlags::RemoveDir);
+    match gone {
+        Ok(()) | Err(nix::errno::Errno::ENOENT) => Ok(Unstick::Removed { freed_bytes: freed }),
+        Err(e) => {
+            if left.first.is_none() {
+                left.note(path.to_path_buf(), e, Some(owner));
+            } else {
+                left.entries += 1;
+            }
+            let (first, error, folder_uid) = left.first.unwrap_or_else(|| (path.to_path_buf(), "not removed".into(), None));
+            let left_bytes = dir_bytes(path);
+            Ok(Unstick::Left(StuckBucket {
+                day,
+                bucket: path.to_path_buf(),
+                first,
+                error,
+                folder_uid,
+                left_entries: left.entries,
+                left_bytes,
+            }))
+        }
+    }
+}
+
+/// PVOS D232 — give a region's `.pvfs-trash` folder itself back to the
+/// forest's user (`uid`, `gid`), and let its owner read, write and enter it:
+/// what a whole-region purge failure needs (D231's `purge_error`). This one
+/// folder only, never recursively, through a descriptor (no link followed).
+/// Returns whether anything changed.
+pub fn give_back_trash_dir(path: &Path, uid: u32, gid: u32) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    if path.file_name().is_none_or(|n| n != TRASH_DIR) {
+        return Err(PvfsError::Forbidden {
+            action: format!("give back {}", path.display()),
+            reason: format!("it is not a `{TRASH_DIR}` folder"),
+        });
+    }
+    let fd = open_dir_nofollow(path).map_err(|e| PvfsError::io("open trash", e))?;
+    let st = nix::sys::stat::fstat(fd.as_raw_fd()).map_err(|e| PvfsError::io("stat trash", e.into()))?;
+    let mut changed = false;
+    if st.st_uid != uid || st.st_gid != gid {
+        nix::unistd::fchown(fd.as_raw_fd(), Some(nix::unistd::Uid::from_raw(uid)), Some(nix::unistd::Gid::from_raw(gid)))
+            .map_err(|e| PvfsError::io("give back trash", e.into()))?;
+        changed = true;
+    }
+    let mode = nix::sys::stat::Mode::from_bits_truncate(st.st_mode);
+    let want = mode | nix::sys::stat::Mode::S_IRWXU;
+    if want != mode {
+        nix::sys::stat::fchmod(fd.as_raw_fd(), want).map_err(|e| PvfsError::io("open trash to its owner", e.into()))?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 /// D148 — what a root's trash holds: bytes, bucket count, the oldest bucket's
 /// day. Walks the trash (a few hundred files at most), so it belongs in a job's
 /// pass, never in a status probe (D136).
@@ -1151,9 +1309,30 @@ pub fn trash_stats(root: &Path) -> TrashStats {
 #[derive(Debug)]
 pub struct RegionTrash {
     pub region: String,
+    /// PVOS D232 — the region's root on this box (its trash is `.pvfs-trash`
+    /// in it).
+    pub root: PathBuf,
     pub retention_days: u64,
     pub purge: TrashPurge,
     pub kept: TrashStats,
+}
+
+/// PVOS D232 — `Engine::purge_region_trash`'s answer: every region purged,
+/// and every region whose trash could not be read, and why. One such region
+/// used to end the purge of all of them (and `resolve`'s pass).
+#[derive(Debug, Default)]
+pub struct RegionPurges {
+    pub done: Vec<RegionTrash>,
+    pub failed: Vec<RegionPurgeFailed>,
+}
+
+/// One region whose purge failed as a whole.
+#[derive(Debug, Clone)]
+pub struct RegionPurgeFailed {
+    pub region: String,
+    pub root: PathBuf,
+    pub retention_days: u64,
+    pub error: String,
 }
 
 /// D148, D176 — purge one region's trash at `root` by its retention, then
@@ -1161,7 +1340,7 @@ pub struct RegionTrash {
 pub fn purge_region(region: String, root: &Path, retention_days: u64) -> Result<RegionTrash> {
     let purge = purge_trash(root, retention_days, 0)?;
     let kept = trash_stats(root);
-    Ok(RegionTrash { region, retention_days, purge, kept })
+    Ok(RegionTrash { region, root: root.to_path_buf(), retention_days, purge, kept })
 }
 
 /// D167 — one file in a root's trash.

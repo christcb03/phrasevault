@@ -691,12 +691,14 @@ pub fn summary(n: &Notify, ev: &Event) -> String {
         ),
         "trash_stuck" if ev.detail.as_deref().is_some_and(|d| d.contains(": cannot purge its trash")) => format!(
             "On {who}, the trash purge failed: {}. Nothing in that region's trash is purged until it is fixed; \
-             its other regions still are.",
+             its other regions still are. To fix it: sudo pvfs trash unstick on {who} (it shows what it \
+             changes and asks).",
             ev.detail.as_deref().unwrap_or("?")
         ),
         "trash_stuck" => format!(
             "On {who}, the trash purge could not remove a bucket: {}. The rest of the trash is still purged. \
-             The usual cause is a folder made by `sudo pvfs`: give it back to the daemon's user (chown -R).",
+             The usual cause is a folder made by `sudo pvfs`. To clear it: sudo pvfs trash unstick on {who} \
+             (it shows the bucket and asks before removing it).",
             ev.detail.as_deref().unwrap_or("?")
         ),
         "trash_stuck_cleared" if ev.detail.as_deref().is_some_and(|d| !d.starts_with("bucket ")) => format!(

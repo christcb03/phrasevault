@@ -114,6 +114,7 @@ fn an_older_serve_jobs_reply_without_trash_decodes() {
             measured_ms: 1,
             stuck: Vec::new(),
             purge_error: None,
+            root: None,
         }]),
         log_destinations: Box::default(),
         stores: Box::default(),

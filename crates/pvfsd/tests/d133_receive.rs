@@ -136,13 +136,13 @@ fn a_box_receives_its_own_staging_files_replaces_a_loser_and_drains_them() {
 
     // D148 — the library's own trash (the Up copy the upgrade replaced) is
     // purged too, by the library's retention, and the stats say what is kept.
-    let before = e.purge_region_trash().unwrap();
+    let before = e.purge_region_trash().unwrap().done;
     let lib_t = before.iter().find(|t| t.region == rl).expect("the library region reports its trash");
     assert_eq!(lib_t.purge.removed, 0, "7-day default keeps today's library bucket: {before:?}");
     assert_eq!(lib_t.kept.buckets, 1, "{before:?}");
     assert!(lib_t.kept.bytes > 0 && lib_t.kept.oldest_day.is_some(), "{before:?}");
     sync::set_region_retention(e.data_dir(), &rl, 0).unwrap();
-    let after = e.purge_region_trash().unwrap();
+    let after = e.purge_region_trash().unwrap().done;
     let lib_t = after.iter().find(|t| t.region == rl).unwrap();
     assert_eq!(lib_t.purge.removed, 1, "{after:?}");
     assert_eq!(lib_t.kept, sync::TrashStats::default(), "{after:?}");

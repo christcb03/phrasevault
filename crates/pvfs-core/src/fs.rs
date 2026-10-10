@@ -3938,11 +3938,24 @@ impl Engine {
     /// and say what each keeps. D133 purged only draining regions, so the
     /// library copies `receive` replaces piled up on the holder with nothing
     /// to remove them (D127: "retention on non-draining regions — later").
-    pub fn purge_region_trash(&self) -> Result<Vec<crate::sync::RegionTrash>> {
-        self.trash_roots()?
-            .into_iter()
-            .map(|(region, root, days)| crate::sync::purge_region(region, &root, days))
-            .collect()
+    ///
+    /// PVOS D232 — region by region: one whose trash cannot be read is in
+    /// `failed`, and the others are still purged. `Err` means the regions
+    /// could not be listed at all.
+    pub fn purge_region_trash(&self) -> Result<crate::sync::RegionPurges> {
+        let mut out = crate::sync::RegionPurges::default();
+        for (region, root, days) in self.trash_roots()? {
+            match crate::sync::purge_region(region.clone(), &root, days) {
+                Ok(t) => out.done.push(t),
+                Err(e) => out.failed.push(crate::sync::RegionPurgeFailed {
+                    region,
+                    root,
+                    retention_days: days,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(out)
     }
 
     /// PVOS D220 — this box's TRASHED copy of `hash`, in any catalogue region

@@ -1488,6 +1488,21 @@ enum TrashCmd {
         #[arg(long)]
         from: Option<String>,
     },
+    /// PVOS D232: clear what this box's trash purge reports it cannot
+    /// (`serve status`'s STUCK, a `trash_stuck` alert): usually buckets
+    /// another user made (root, through `sudo`), which the daemon may not
+    /// empty. Run it with sudo. Bare, it asks this box's daemon what is
+    /// stuck, shows each bucket (what is left, whose folder) and asks before
+    /// removing it; a region whose trash folder cannot be read is offered
+    /// back to the forest's user. The daemon itself never gets sudo.
+    Unstick {
+        /// Buckets (`<region root>/.pvfs-trash/<day>`) or `.pvfs-trash`
+        /// folders, instead of asking the daemon (it may be stopped)
+        paths: Vec<PathBuf>,
+        /// Clear without asking (for scripts; a terminal asks)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3142,7 +3157,31 @@ fn may_run_as_another_user(cmd: &Cmd) -> bool {
         ) | Cmd::Init
             | Cmd::Whoami
             | Cmd::Instance(_)
+            // PVOS D232 — a person clearing what the purge could not, with sudo
+            | Cmd::Trash(TrashCmd::Unstick { .. })
     )
+}
+
+/// PVOS D232 — a forest or replica made as root is root's, and a daemon run
+/// as any other user cannot use it (the D231 rule then refuses that daemon).
+/// `forest init` makes its forest the sudo caller's (`mount_owner_credentials`);
+/// `replica add` and the legacy `init` refuse root.
+fn refuse_root(what: &str) -> Result<(), PvfsError> {
+    refuse_root_for(what, nix::unistd::geteuid().is_root(), std::env::var("SUDO_USER").ok())
+}
+
+fn refuse_root_for(what: &str, root: bool, sudo_user: Option<String>) -> Result<(), PvfsError> {
+    if !root {
+        return Ok(());
+    }
+    let how = match sudo_user.filter(|u| !u.is_empty() && u != "root") {
+        Some(u) => format!("as that user: sudo -u {u} pvfs …"),
+        None => "as the user its daemon will run as".into(),
+    };
+    Err(PvfsError::Forbidden {
+        action: format!("{what} as root"),
+        reason: format!("what it made would be root's, and a daemon run as any other user could not use it. Run it {how}"),
+    })
 }
 
 /// PVOS D231 — `state` when this process runs as its forest's owner, else
@@ -3167,11 +3206,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
         }
     }
     let target = companion_target(&cli.cmd);
-    set_companion_key(target.as_deref().or(ctx.as_ref().ok().map(|p| p.as_path())));
+    // PVOS D232 — a command another user may run (D231's list) reads nothing
+    // of the forest's for a companion it never uses: the peek is a SQLite
+    // open, which could leave that user's `-shm`/`-wal` in `.pvfs`.
+    let mine = ctx.as_ref().ok().filter(|state| mount::check_forest_user(state).is_ok());
+    set_companion_key(target.as_deref().or(mine.map(|p| p.as_path())));
     JSON_MODE.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     let json = cli.json;
     match cli.cmd {
         Cmd::Init => {
+            refuse_root("make a forest with the legacy `init`")?; // PVOS D232
             let (engine, mnemonic) = Engine::init(&legacy)?;
             if json {
                 println!(
@@ -6656,6 +6700,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 socket,
                 region,
             } => {
+                refuse_root("make a replica")?; // PVOS D232
                 let data_dir = dest.join(".pvfs");
                 if region.as_deref().is_some_and(|r| r.len() != 64 || !r.chars().all(|c| c.is_ascii_hexdigit())) {
                     return Err(PvfsError::BadInput {
@@ -6927,6 +6972,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
         }
         Cmd::Trash(TrashCmd::Put { path, region, hash, from }) => trash_put(&ctx?, path, region, hash, from, json),
+        Cmd::Trash(TrashCmd::Unstick { paths, yes }) => trash_unstick(ctx, paths, yes, json),
         Cmd::Log { cmd } => log_cmd(cmd, ctx, json),
         Cmd::Trash(cmd) => {
             let engine = Engine::open(&ctx?)?;
@@ -6996,7 +7042,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     Ok(())
                 }
-                TrashCmd::Put { .. } => unreachable!("handled above"),
+                TrashCmd::Put { .. } | TrashCmd::Unstick { .. } => unreachable!("handled above"),
             }
         }
         Cmd::View(ViewCmd::Resolve { dry_run }) => {
@@ -7007,10 +7053,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let mut confirm = |c: &pvfs_core::DrainCheck| pvfs_client::drain::confirm_held(&sources, c);
             let rep = engine.resolve_conflicts(dry_run, &std::sync::atomic::AtomicBool::new(false), &mut confirm)?;
             // D133 — then free what retention allows (never on a dry run).
-            let trash = if dry_run { Vec::new() } else { engine.purge_region_trash()? };
-            let purged: u64 = trash.iter().map(|t| t.purge.removed).sum();
+            let trash = if dry_run { Default::default() } else { engine.purge_region_trash()? };
+            let purged: u64 = trash.done.iter().map(|t| t.purge.removed).sum();
             // PVOS D231 — a bucket the purge could not wholly remove, named
-            let stuck: Vec<String> = trash.iter().flat_map(|t| t.purge.stuck.iter().map(|b| b.describe())).collect();
+            let stuck: Vec<String> = trash.done.iter().flat_map(|t| t.purge.stuck.iter().map(|b| b.describe())).collect();
+            // PVOS D232 — a region whose trash could not be read at all
+            let purge_failed: Vec<String> = trash
+                .failed
+                .iter()
+                .map(|f| format!("region {}: trash purge failed: {}", &f.region[..f.region.len().min(8)], f.error))
+                .collect();
             if json {
                 println!(
                     "{}",
@@ -7023,13 +7075,14 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                         "reported": rep.reported,
                         "purged": purged,
                         "stuck": stuck,
+                        "purge_failed": purge_failed,
                     })
                 );
             } else {
                 if purged > 0 {
                     println!("purged\t{purged} trash bucket(s) past retention");
                 }
-                for b in &stuck {
+                for b in stuck.iter().chain(&purge_failed) {
                     eprintln!("warning: {b}");
                 }
                 let verb = if dry_run { "would trash" } else { "trashed" };
@@ -11026,10 +11079,10 @@ fn serve_status_print(
                 t.retention_days
             );
             for b in &t.stuck {
-                println!("  STUCK: {}  (D231)", stuck_text(b));
+                println!("  STUCK: {}  (D231; clear it: sudo pvfs trash unstick)", stuck_text(b));
             }
             if let Some(e) = &t.purge_error {
-                println!("  PURGE FAILED: {e} (the figures above are the last measured)  (D231)");
+                println!("  PURGE FAILED: {e} (the figures above are the last measured)  (D231; sudo pvfs trash unstick)");
             }
         }
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
@@ -11330,6 +11383,127 @@ fn trash_filter(
 /// PVOS D168 — `pvfs trash put`: one region's copy of a path (or each line of
 /// a `--from` list) to its region's trash — here when this box catalogues the
 /// region from its own disk, else on the box that answers for it.
+/// PVOS D232 — `pvfs trash unstick` (see `TrashCmd::Unstick`).
+fn trash_unstick(ctx: Result<PathBuf, PvfsError>, paths: Vec<PathBuf>, yes: bool, json: bool) -> Result<(), PvfsError> {
+    use pvfs_core::sync::{give_back_trash_dir, unstick_bucket, user_text, Unstick};
+    use std::os::unix::fs::MetadataExt;
+    let state = ctx.map_err(|e| PvfsError::BadInput {
+        field: "forest".into(),
+        reason: format!("which forest's trash? Run it inside the forest's mount, or with --forest <alias> ({e})"),
+    })?;
+    let md = std::fs::metadata(&state).map_err(|e| PvfsError::io("stat the forest", e))?;
+    let (uid, gid) = (md.uid(), md.gid());
+    // What to clear: (bucket, what the daemon said about it) and trash folders.
+    let mut buckets: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut folders: Vec<(PathBuf, Option<String>)> = Vec::new();
+    if paths.is_empty() {
+        let Some(sock) = try_daemon_socket(&state) else {
+            return Err(PvfsError::BadInput {
+                field: "unstick".into(),
+                reason: "no daemon answers for this forest on this box, so nothing says what is stuck: name the \
+                         buckets (`<region root>/.pvfs-trash/<day>`, as the alert or `pvfs serve status` said)"
+                    .into(),
+            });
+        };
+        let status = daemon_member_client(&state, &sock)?.serve_status_full().map_err(remote_err)?;
+        for t in &status.trash {
+            for b in &t.stuck {
+                buckets.push((PathBuf::from(&b.bucket), Some(stuck_text(b))));
+            }
+            if let (Some(e), Some(root)) = (&t.purge_error, &t.root) {
+                let dir = PathBuf::from(root).join(".pvfs-trash");
+                folders.push((dir, Some(format!("region {}: its trash purge fails: {e}", &t.region[..t.region.len().min(8)]))));
+            }
+        }
+    } else {
+        for p in paths {
+            if p.file_name().is_some_and(|n| n == ".pvfs-trash") {
+                folders.push((p, None));
+            } else {
+                buckets.push((p, None));
+            }
+        }
+    }
+    if buckets.is_empty() && folders.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"stuck": [], "removed": [], "left": [], "given_back": []}));
+        } else {
+            println!("nothing is stuck in this box's trash (as its daemon reports it)");
+        }
+        return Ok(());
+    }
+    if !yes && !interactive() {
+        return Err(PvfsError::BadInput {
+            field: "unstick".into(),
+            reason: "this removes trash for good: run it at a terminal to be asked, or pass --yes".into(),
+        });
+    }
+    let forest_user = user_text(uid);
+    let (mut removed, mut left, mut given, mut skipped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (dir, why) in folders {
+        if let Some(w) = &why {
+            eprintln!("{w}");
+        }
+        if !yes && !ask_yes(&format!("Give {} back to {forest_user} (this folder only)?", dir.display()), true)? {
+            skipped.push(dir.display().to_string());
+            continue;
+        }
+        if give_back_trash_dir(&dir, uid, gid)? {
+            given.push(dir.display().to_string());
+            if !json {
+                println!("given back\t{}\t(its buckets show as stuck if they are another user's too: run this again after the next purge)", dir.display());
+            }
+        } else if !json {
+            println!("unchanged\t{}\t(already {forest_user}'s and open to it)", dir.display());
+        }
+    }
+    for (bucket, why) in buckets {
+        if !json {
+            match &why {
+                Some(w) => eprintln!("{w}"),
+                None => eprintln!("bucket {}", bucket.display()),
+            }
+        }
+        if !yes && !ask_yes(&format!("Remove {} for good?", bucket.display()), true)? {
+            skipped.push(bucket.display().to_string());
+            continue;
+        }
+        match unstick_bucket(&bucket, uid)? {
+            Unstick::Removed { freed_bytes } => {
+                if !json {
+                    println!("removed\t{}\t({} freed)", bucket.display(), fmt_bytes(freed_bytes));
+                }
+                removed.push(serde_json::json!({"bucket": bucket.display().to_string(), "freed_bytes": freed_bytes}));
+            }
+            Unstick::NotThere => {
+                if !json {
+                    println!("gone\t{}\t(already removed)", bucket.display());
+                }
+            }
+            Unstick::Left(b) => {
+                if !json {
+                    println!("left\t{}\t({})", bucket.display(), b.describe());
+                }
+                left.push(b.describe());
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"removed": removed, "left": left, "given_back": given, "skipped": skipped})
+        );
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(PvfsError::BadInput {
+            field: "unstick".into(),
+            reason: format!("{} bucket(s) still hold what this user may not remove: run it with sudo", left.len()),
+        })
+    }
+}
+
 fn trash_put(
     data_dir: &Path,
     path: Option<String>,
@@ -11901,6 +12075,18 @@ fn log_cmd(cmd: Option<LogCmd>, ctx: Result<PathBuf, PvfsError>, json: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PVOS D232 — `replica add` and the legacy `init` refuse root, and say
+    /// whom to run them as.
+    #[test]
+    fn making_a_forest_or_replica_as_root_is_refused() {
+        assert!(refuse_root_for("make a replica", false, None).is_ok());
+        let e = refuse_root_for("make a replica", true, Some("chris".into())).unwrap_err().to_string();
+        assert!(e.contains("make a replica as root"), "{e}");
+        assert!(e.contains("sudo -u chris pvfs"), "{e}");
+        let e = refuse_root_for("make a replica", true, Some("root".into())).unwrap_err().to_string();
+        assert!(e.contains("as the user its daemon will run as"), "a root shell, not sudo: {e}");
+    }
 
     // PVOS D198 — ask a person only when one can see the question: never
     // under --json, never with stdin or stderr off a terminal (Ansible's pty
