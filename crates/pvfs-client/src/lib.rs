@@ -44,6 +44,7 @@ pub fn idle_timeout() -> std::time::Duration {
 
 pub use pvfs_proto::{
     ChildInfo, DiagnoseWire, IngestFileWire, IngestSessionWire, LogEventWire, LogLevelWire, NodeInfo, PassProgressWire, ProblemWire, ServeJobWire,
+    StuckBucketWire,
     PROTO_COMPATIBLE_WITH, PROTO_VERSION,
 };
 

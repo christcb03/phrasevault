@@ -369,6 +369,8 @@ impl JobsState {
                 retention_days: r.retention_days,
                 freed_bytes: r.purge.freed_bytes,
                 measured_ms: now,
+                // PVOS D231 — what this pass could not remove, by bucket
+                stuck: r.purge.stuck.iter().map(stuck_wire).collect(),
             };
             match t.iter_mut().find(|x| x.region == w.region) {
                 Some(x) => *x = w,
@@ -1169,6 +1171,9 @@ fn spawn_pass(name: &str, state: &Arc<JobsState>, writers: &Arc<Writers>) -> Man
             let prev = pvfs_client::health::FleetHealth::load(st.data_dir()).ok().flatten();
             match pvfs_client::health::poll_fleet(st.data_dir(), &cancel) {
                 Ok(mut rec) => {
+                    // PVOS D231 — this box's own trash, for its stuck buckets
+                    // (the owner never polls itself)
+                    rec.self_trash = st.trash_snapshot();
                     for (pin, r) in rec.down() {
                         pv_warn!("pvfs.health.peer_down", peer = &pin[..8], peer_addr = &r.addr,
                             since_ms = r.unreachable_since_ms.unwrap_or(0),
@@ -1755,7 +1760,13 @@ fn trash_step(
         }
         let short = region.get(..8).unwrap_or(&region).to_string();
         match pvfs_core::sync::purge_region(region, &root, days) {
-            Ok(t) => found.push(t),
+            Ok(t) => {
+                // PVOS D231 — a bucket that would not all go is a failure of
+                // this step, named (bucket, path, whose folder), while the
+                // rest of the region's trash was still purged.
+                failed.extend(t.purge.stuck.iter().map(|b| format!("{short}: {}", b.describe())));
+                found.push(t)
+            }
             Err(e) => failed.push(format!("{short}: {e}")),
         }
     }
@@ -1779,6 +1790,20 @@ fn trash_step(
         log.extend(st.failed(Fault::Trash, &failed.join("; ")));
     }
     log
+}
+
+/// PVOS D231 — a stuck bucket as `serve status` carries it.
+fn stuck_wire(b: &pvfs_core::sync::StuckBucket) -> pvfs_proto::StuckBucketWire {
+    pvfs_proto::StuckBucketWire {
+        day: b.day,
+        bucket: b.bucket.display().to_string(),
+        path: b.first.display().to_string(),
+        error: b.error.clone(),
+        folder_owner: b.folder_owner(),
+        daemon_user: Some(pvfs_core::sync::process_user()),
+        left_entries: b.left_entries,
+        left_bytes: b.left_bytes,
+    }
 }
 
 /// A byte count as a person reads it in the journal.

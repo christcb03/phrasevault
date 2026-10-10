@@ -135,6 +135,7 @@ pub struct ReplicaStore {
 impl ReplicaStore {
     /// Open (creating on first use) the log store under `data_dir`.
     pub fn open(data_dir: &Path) -> Result<ReplicaStore> {
+        crate::mount::check_forest_user(data_dir)?; // PVOS D231
         std::fs::create_dir_all(data_dir).map_err(|e| PvfsError::io("create replica dir", e))?;
         #[cfg(unix)]
         {

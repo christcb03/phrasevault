@@ -151,6 +151,11 @@ pub struct FleetHealth {
     /// page reads each follower's lag against it.
     #[serde(default)]
     pub self_log_seq: Option<u64>,
+    /// PVOS D231: this box's own trash as its last purge left it — the owner
+    /// never polls itself, so its stuck buckets are said from here. Set by
+    /// pvfsd's health job (it holds the purge's record); absent elsewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_trash: Vec<pvfs_proto::TrashWire>,
 }
 
 impl FleetHealth {

@@ -742,6 +742,8 @@ impl Engine {
     /// Open an existing data dir using the cached device key (spec §9.3 runs
     /// on every open).
     pub fn open(data_dir: &Path) -> Result<Engine> {
+        // PVOS D231 — never as another user than the forest's (`sudo pvfs`)
+        crate::mount::check_forest_user(data_dir)?;
         // A marked replica dir routes to the read-only open (F2, doc 17 §5) —
         // callers need not know which kind of forest a data dir holds.
         if crate::replica::marker_path(data_dir).exists() {
@@ -876,6 +878,8 @@ impl Engine {
     /// peers fetch — took the writer lock. A replica's view carries the same
     /// ephemeral key and `replica` flag as `open_replica`.
     pub fn open_read_view(data_dir: &Path) -> Result<Engine> {
+        // PVOS D231 — a view writes too (its scratch dir; SQLite's -shm)
+        crate::mount::check_forest_user(data_dir)?;
         let replica = crate::replica::marker_path(data_dir).exists();
         let device = if replica { DeviceKeyCache::ephemeral()? } else { DeviceKeyCache::load(data_dir)? };
         let conn = open_connection_read_only(data_dir)?;
@@ -906,6 +910,7 @@ impl Engine {
     /// replicated forest by construction — so an ephemeral key satisfies the
     /// engine plumbing and every log write is refused.
     pub fn open_replica(data_dir: &Path) -> Result<Engine> {
+        crate::mount::check_forest_user(data_dir)?; // PVOS D231
         let device = DeviceKeyCache::ephemeral()?;
         crate::writer::COUNTERS.engine_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let others = probe_other_writers(data_dir);

@@ -19,7 +19,7 @@ thiserror.workspace = true
 hex.workspace = true
 rand.workspace = true
 uuid.workspace = true
-nix = { workspace = true, features = ["user", "fs"] }
+nix = { workspace = true, features = ["user", "fs", "dir"] }
 
 [dev-dependencies]
 tempfile.workspace = true

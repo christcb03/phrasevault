@@ -262,6 +262,67 @@ pub fn chown_tree(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
     Ok(())
 }
 
+/// PVOS D231 — refuse to use a forest's files as a user other than the one
+/// that owns them (its `.pvfs` data dir's owner: the user its daemon runs as).
+///
+/// Whatever this process made there would be its own: run as root (`sudo
+/// pvfs …`), trash folders, index files, SQLite's `-wal`/`-shm`, job and
+/// state files come out root's, and the daemon cannot change or remove them
+/// later. On 2026-10-09 two root-made trash buckets stopped mediabox's purge
+/// and paged as disk errors. Making the new entries the owner's instead (a
+/// chown after each) was not chosen: root's writes skip the permission
+/// checks the daemon itself is held to, SQLite and the standard library
+/// create files PVFS never sees, and any path that missed its chown would
+/// bring the fault back. Default-deny: nothing is opened, nothing written.
+///
+/// A data dir that does not exist yet passes (creating a forest is
+/// `init_forest`'s business, which makes it the caller's, or the sudo
+/// caller's). The system registry's commands (`forest register`, …) never
+/// open a forest, so they still run as root.
+#[cfg(unix)]
+pub fn check_forest_user(data_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = std::fs::metadata(data_dir) else {
+        return Ok(()); // not there yet: nothing of anyone's to spoil
+    };
+    let running = nix::unistd::geteuid().as_raw();
+    check_forest_user_for(data_dir, md.uid(), running)
+}
+
+#[cfg(not(unix))]
+pub fn check_forest_user(_data_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// [`check_forest_user`]'s rule, for a data dir owned by `owner` and a
+/// process running as `running`.
+pub fn check_forest_user_for(data_dir: &Path, owner: u32, running: u32) -> Result<()> {
+    if owner == running {
+        return Ok(());
+    }
+    let owner_text = crate::sync::user_text(owner);
+    let owner_name = owner_name(owner).unwrap_or_else(|| format!("#{owner}"));
+    Err(PvfsError::Forbidden {
+        action: format!("use the forest at {} as {}", data_dir.display(), crate::sync::user_text(running)),
+        reason: format!(
+            "its files belong to {owner_text}, the user its daemon runs as. Anything pvfs made there now \
+             would be {}, and that daemon could not change or remove it later. Run it as that user: \
+             sudo -u {owner_name} pvfs …",
+            if running == 0 { "root's".to_string() } else { format!("uid {running}'s") }
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn owner_name(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok().flatten().map(|u| u.name)
+}
+
+#[cfg(not(unix))]
+fn owner_name(_uid: u32) -> Option<String> {
+    None
+}
+
 /// Repair ownership so the operator owns the **engine state** (`<mount>/.pvfs/`),
 /// plus the mount **directory entry** itself if some other account (e.g. a
 /// mistaken `sudo init`) created it.
