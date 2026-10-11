@@ -5,6 +5,26 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The trash keeps every version (PVOS D234).**
+  - A deletion went to `.pvfs-trash/<day>/<path>` by `rename(2)`, so a
+    second deletion of a path on one day replaced the first in the trash.
+    On mediabox, a file renamed over and then removed left only the second.
+  - Now the day's next bucket takes a path the day's buckets already hold
+    (`<day>.1`, `<day>.2`, …). Every move into the trash is no-replace
+    (`renameat2(RENAME_NOREPLACE)` by syscall, so musl builds have it too; a
+    checked rename where a filesystem lacks the flag; a `create_new` copy
+    across filesystems, which keeps the mtime).
+  - A file's sidecars go into its own bucket.
+  - The purge, `trash_stats`, `trash ls`, the read-through-the-trash index
+    (D220) and `trash unstick` (D232) read `<day>.<n>`. Retention removes a
+    day's buckets together.
+  - `pvfs trash ls` shows the bucket (`--json`: `bucket`, `version`).
+  - `pvfs trash restore` takes the newest version unless `--from` names a
+    day or a bucket (`20737.1`). Bare at a terminal, a file trashed more
+    than once asks which.
+  - An older build ignores `<day>.<n>` buckets: neither listed nor purged
+    until a D234 build is back.
+
 - **The writable view, made safe (PVOS D233; D218 §2.1).**
   - **An edit writes the file at the path opened.** D217 asked for any
     local file with the served hash, so with two byte-identical files (every

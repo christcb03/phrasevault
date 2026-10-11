@@ -1461,10 +1461,13 @@ enum TrashCmd {
     Restore {
         /// As `pvfs trash ls` shows it, relative to the region's root
         path: Option<String>,
-        /// The day (as `ls` shows it, the number) to restore from when the
-        /// same path was trashed on more than one; default: the newest
+        /// The day or bucket to restore from, as `ls` shows it: `20737`
+        /// (the newest version that day) or `20737.1` (exactly that one —
+        /// PVOS D234: the same path trashed again that day). Default: the
+        /// newest; bare at a terminal, a file with more than one version
+        /// asks which
         #[arg(long)]
-        from: Option<u64>,
+        from: Option<String>,
         /// Which region (an id prefix) when more than one on this box has
         /// the path in its trash; asked at a terminal, required in a script
         #[arg(long)]
@@ -7005,6 +7008,13 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     Ok(())
                 }
                 TrashCmd::Restore { path, from, region } => {
+                    let mut from = match from.as_deref() {
+                        None => None,
+                        Some(f) => Some(pvfs_core::sync::TrashPick::parse(f).ok_or_else(|| PvfsError::BadInput {
+                            field: "from".into(),
+                            reason: format!("{f:?} — a day or a bucket as `pvfs trash ls` shows it (20737, 20737.1)"),
+                        })?),
+                    };
                     let path = match path {
                         Some(p) => p,
                         None => {
@@ -7012,6 +7022,33 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                             prompt_line("Path to restore (as listed; a folder restores everything under it)", None)?
                         }
                     };
+                    // PVOS D234 — one file trashed more than once: at a
+                    // terminal, say so and ask which (the newest offered).
+                    if from.is_none() && interactive() {
+                        let want = path.trim_matches('/');
+                        let mut versions: Vec<(String, u64, u32, u64)> = trash_filter(&lists, Some(want), None, region.as_deref())
+                            .iter()
+                            .flat_map(|l| {
+                                l.entries
+                                    .iter()
+                                    .filter(|e| e.rel_path == want)
+                                    .map(|e| (e.bucket.clone(), e.day, e.version, e.size_bytes))
+                            })
+                            .collect();
+                        versions.sort_by_key(|v| std::cmp::Reverse((v.1, v.2)));
+                        versions.dedup_by(|a, b| a.0 == b.0);
+                        if versions.len() > 1 {
+                            eprintln!("{want} is in the trash {} times:", versions.len());
+                            for (bucket, day, _, size) in &versions {
+                                eprintln!("  {bucket}\t{}\t{}", day_to_date(*day), fmt_bytes(*size));
+                            }
+                            let pick = prompt_line("which (a bucket as listed)", Some(&versions[0].0))?;
+                            from = Some(pvfs_core::sync::TrashPick::parse(&pick).ok_or_else(|| PvfsError::BadInput {
+                                field: "from".into(),
+                                reason: format!("{pick:?} is not a bucket as listed"),
+                            })?);
+                        }
+                    }
                     let mut has = trash_filter(&lists, Some(&path), from, region.as_deref());
                     has.retain(|l| !l.entries.is_empty());
                     if has.is_empty() {
@@ -7027,7 +7064,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     // DIFFERENT file is left alone and named (`--region`
                     // restores exactly one). Nothing here is a question.
                     let roots: Vec<&std::path::Path> = has.iter().map(|l| l.root.as_path()).collect();
-                    let done = pvfs_core::sync::restore_identical(&roots, &path, from)?;
+                    let done = pvfs_core::sync::restore_identical_pick(&roots, &path, from)?;
                     for (list, done) in has.iter().zip(&done.per_root) {
                         for p in &done.restored {
                             println!("restored\t{}", list.root.join(p).display());
@@ -11470,7 +11507,7 @@ fn parse_range(s: &str) -> Result<ByteRange, PvfsError> {
 fn trash_filter(
     lists: &[pvfs_core::RegionTrashList],
     path: Option<&str>,
-    day: Option<u64>,
+    pick: Option<pvfs_core::sync::TrashPick>,
     region: Option<&str>,
 ) -> Vec<pvfs_core::RegionTrashList> {
     let path = path.map(|p| p.trim_matches('/').to_string()).filter(|p| !p.is_empty());
@@ -11480,8 +11517,10 @@ fn trash_filter(
         .map(|l| {
             let mut l = l.clone();
             l.entries.retain(|e| {
-                day.is_none_or(|d| d == e.day)
-                    && path.as_ref().is_none_or(|p| e.rel_path == *p || e.rel_path.starts_with(&format!("{p}/")))
+                pick.is_none_or(|p| match p {
+                    pvfs_core::sync::TrashPick::Day(d) => d == e.day,
+                    pvfs_core::sync::TrashPick::Bucket(d, n) => d == e.day && n == e.version,
+                }) && path.as_ref().is_none_or(|p| e.rel_path == *p || e.rel_path.starts_with(&format!("{p}/")))
             });
             l
         })
@@ -11805,7 +11844,8 @@ fn print_trash(lists: &[pvfs_core::RegionTrashList], today: u64) {
             println!(
                 "  {} ({})\t{}\t{}\t{}",
                 day_to_date(e.day),
-                e.day,
+                // PVOS D234 — the bucket when it is not the day's first
+                e.bucket,
                 if left == 0 { "purged at the next pass".to_string() } else { format!("purged in {left} d") },
                 fmt_bytes(e.size_bytes),
                 e.rel_path
@@ -11831,6 +11871,8 @@ fn trash_json(lists: &[pvfs_core::RegionTrashList], today: u64) -> serde_json::V
                     "drains": l.drains,
                     "entries": l.entries.iter().map(|e| serde_json::json!({
                         "day": e.day,
+                        "bucket": e.bucket,
+                        "version": e.version,
                         "date": day_to_date(e.day),
                         "days_left": trash_days_left(e.day, l.retention_days, today),
                         "size_bytes": e.size_bytes,

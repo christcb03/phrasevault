@@ -780,38 +780,154 @@ pub fn trash_root(root: &Path) -> PathBuf {
     root.join(TRASH_DIR)
 }
 
+/// PVOS D234 — a trash bucket's name: `<day>` (the day's first bucket,
+/// version 0) or `<day>.<n>` (n ≥ 1: the n-th time that day a path already
+/// in the day's buckets was trashed again). `None` for any other name.
+pub fn trash_bucket(name: &str) -> Option<(u64, u32)> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match name.split_once('.') {
+        None if digits(name) => Some((name.parse().ok()?, 0)),
+        Some((d, n)) if digits(d) && digits(n) => {
+            let n: u32 = n.parse().ok()?;
+            (n > 0).then_some((d.parse().ok()?, n))
+        }
+        _ => None,
+    }
+}
+
+/// PVOS D234 — the name of bucket `n` of `day` ([`trash_bucket`]'s inverse).
+pub fn trash_bucket_name(day: u64, n: u32) -> String {
+    if n == 0 {
+        day.to_string()
+    } else {
+        format!("{day}.{n}")
+    }
+}
+
 /// Move `file` (which must be under `root`) into the trash, preserving its
 /// relative path so a restore is obvious. Returns where it went.
+///
+/// PVOS D234 — never over anything: the day's first bucket whose path is
+/// free takes it (`<day>`, then `<day>.1`, …). Before, a second deletion of a
+/// path on one day replaced the first in the trash — a deletion that was
+/// supposed to be restorable was gone (seen on mediabox, 2026-10-11).
 pub fn move_to_trash(root: &Path, file: &Path) -> Result<PathBuf> {
+    trash_into_free_bucket(root, file, &[])
+}
+
+/// PVOS D234 — `file` (and the `sidecars` beside it that exist) into the
+/// first bucket of today where the file's path AND every sidecar's path are
+/// free, the sidecars into that same bucket. The moves never replace: a
+/// path taken between the look and the move sends it to the next bucket.
+fn trash_into_free_bucket(root: &Path, file: &Path, sidecars: &[PathBuf]) -> Result<PathBuf> {
     let rel = file.strip_prefix(root).map_err(|_| {
         bad(
             "trash",
             &format!("{} is not under {}", file.display(), root.display()),
         )
     })?;
-    let dest = trash_root(root)
-        .join(epoch_day(crate::engine::now_ms()).to_string())
-        .join(rel);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create trash dir", e))?;
-    }
-    // Same filesystem ⇒ instant. If it is not (a store on another mount), fall
-    // back to copy+remove rather than silently leaving the file in place.
-    //
-    // Only for that case: the fallback used to catch EVERY rename error, so a
-    // file that had gone (the arrs delete and replace under us) came back as
-    // `copy to trash: No such file or directory` — which reads as though
-    // writing to the trash broke, when the trash was fine and the source was
-    // the thing missing. That cost an evening's diagnosis on 2026-10-03.
-    match std::fs::rename(file, &dest) {
-        Ok(()) => Ok(dest),
-        Err(e) if is_cross_device(&e) => {
-            std::fs::copy(file, &dest).map_err(|e| PvfsError::io("copy to trash", e))?;
-            std::fs::remove_file(file).map_err(|e| PvfsError::io("remove after trash copy", e))?;
-            Ok(dest)
+    let sides: Vec<(&PathBuf, &Path)> = sidecars
+        .iter()
+        .filter(|s| s.symlink_metadata().is_ok())
+        .filter_map(|s| s.strip_prefix(root).ok().map(|r| (s, r)))
+        .collect();
+    let day = epoch_day(crate::engine::now_ms());
+    let taken = |p: &Path| p.symlink_metadata().is_ok();
+    for n in 0..=MAX_BUCKETS_A_DAY {
+        let bucket = trash_root(root).join(trash_bucket_name(day, n));
+        let dest = bucket.join(rel);
+        if taken(&dest) || sides.iter().any(|(_, r)| taken(&bucket.join(r))) {
+            continue;
         }
-        Err(e) => Err(PvfsError::io("move to trash", e)),
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create trash dir", e))?;
+        }
+        // Same filesystem ⇒ instant. If it is not (a store on another mount),
+        // copy + remove rather than silently leaving the file in place —
+        // only for that case: the fallback used to catch EVERY rename error,
+        // so a file that had gone (the arrs delete and replace under us) came
+        // back as `copy to trash: No such file or directory`, which reads as
+        // though writing to the trash broke (2026-10-03).
+        match move_noreplace(file, &dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(PvfsError::io("move to trash", e)),
+        }
+        // Derived data, best-effort — beside its own file, in its bucket.
+        for (side, r) in sides.iter() {
+            let to = bucket.join(r);
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = move_noreplace(side, &to);
+        }
+        return Ok(dest);
     }
+    Err(bad(
+        "trash",
+        &format!("{} has been trashed more than {MAX_BUCKETS_A_DAY} times today", rel.display()),
+    ))
+}
+
+/// How many buckets one day may have: a bound on the search, not a limit
+/// anything reaches.
+const MAX_BUCKETS_A_DAY: u32 = 100_000;
+
+/// PVOS D234 — rename `src` to `dst` only if `dst` does not exist: an
+/// `AlreadyExists` error otherwise, and nothing moved. `renameat2` with
+/// `RENAME_NOREPLACE` on Linux; a checked `rename` where the filesystem has
+/// no such flag; across filesystems a copy that opens `dst` `create_new`
+/// (a file only — a folder never left its filesystem here either).
+fn move_noreplace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // The raw syscall: nix wraps `renameat2` for glibc only, and the fleet's
+    // mediabox and NAS builds are musl.
+    #[cfg(target_os = "linux")]
+    {
+        use nix::errno::Errno;
+        use nix::libc;
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        let (s, d) = (c(src)?, c(dst)?);
+        // Safety: two NUL-terminated paths that outlive the call.
+        let r = unsafe {
+            libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, s.as_ptr(), libc::AT_FDCWD, d.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        match Errno::last() {
+            Errno::EEXIST => return Err(std::io::ErrorKind::AlreadyExists.into()),
+            Errno::EXDEV => return copy_noreplace(src, dst),
+            // the filesystem (or kernel) has no RENAME_NOREPLACE: below
+            Errno::EINVAL | Errno::ENOSYS => {}
+            e => return Err(e.into()),
+        }
+    }
+    if dst.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device(&e) => copy_noreplace(src, dst),
+        Err(e) => Err(e),
+    }
+}
+
+/// The cross-filesystem leg of [`move_noreplace`]: copy into a new file
+/// (never an existing one), keep the mode and mtime (a sidecar names the
+/// mtime it describes — D150, D220), then remove the source.
+fn copy_noreplace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let md = from.metadata()?;
+    let mut to = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let copied = std::io::copy(&mut from, &mut to)
+        .and_then(|_| to.set_permissions(md.permissions()))
+        .and_then(|_| md.modified().and_then(|t| to.set_modified(t)));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(dst);
+        return Err(e);
+    }
+    std::fs::remove_file(src)
 }
 
 /// `EXDEV` — the one rename failure a copy+remove can answer. `ErrorKind`
@@ -824,14 +940,14 @@ fn is_cross_device(e: &std::io::Error) -> bool {
 /// leaves nothing of the file behind (doc 29 §10.5: one orphan `.manifest`
 /// per moved file on feederbox). The sidecar is best-effort — derived data;
 /// the file in the trash is the part that matters.
+///
+/// PVOS D234 — the sidecars go into the file's own bucket: they used to be
+/// trashed by a second call that worked the bucket out again, so a second
+/// version's sidecar replaced the first's.
 pub fn move_to_trash_with_sidecar(root: &Path, file: &Path) -> Result<PathBuf> {
-    let dest = move_to_trash(root, file)?;
-    for side in [manifest_sidecar_path(file), legacy_manifest_sidecar_path(file)] {
-        if side.is_file() {
-            let _ = move_to_trash(root, &side);
-        }
-    }
-    Ok(dest)
+    let sides = [manifest_sidecar_path(file), legacy_manifest_sidecar_path(file)];
+    let sides: Vec<PathBuf> = sides.into_iter().filter(|s| s.is_file()).collect();
+    trash_into_free_bucket(root, file, &sides)
 }
 
 /// D145 — the last `SWARM_CHUNK`-aligned range of a file and its blake3, as
@@ -939,18 +1055,16 @@ pub fn purge_trash(root: &Path, keep_days: u64, min_free_bytes: u64) -> Result<T
     if !base.exists() {
         return Ok(report);
     }
-    let mut buckets: Vec<(u64, PathBuf)> = std::fs::read_dir(&base)
+    // PVOS D234 — every bucket of a day (`<day>`, `<day>.1`, …), oldest first.
+    let mut buckets: Vec<((u64, u32), PathBuf)> = std::fs::read_dir(&base)
         .map_err(|e| PvfsError::io("read trash", e))?
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let day: u64 = e.file_name().to_str()?.parse().ok()?;
-            Some((day, e.path()))
-        })
+        .filter_map(|e| Some((trash_bucket(e.file_name().to_str()?)?, e.path())))
         .collect();
-    buckets.sort_by_key(|(day, _)| *day);
+    buckets.sort_by_key(|(key, _)| *key);
 
     let today = epoch_day(crate::engine::now_ms());
-    for (day, path) in buckets {
+    for ((day, _), path) in buckets {
         let too_old = today.saturating_sub(day) >= keep_days;
         let need_space = min_free_bytes > 0 && free_bytes(root) < min_free_bytes;
         if !too_old && !need_space {
@@ -1158,17 +1272,14 @@ pub fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
 }
 
 /// `(the .pvfs-trash folder, the day)` when `path` names a trash bucket:
-/// absolute, `…/.pvfs-trash/<digits>`, no `.` or `..`. `None` otherwise.
+/// absolute, `…/.pvfs-trash/<day>` or (PVOS D234) `…/.pvfs-trash/<day>.<n>`,
+/// no `.` or `..`. `None` otherwise.
 pub fn trash_bucket_path(path: &Path) -> Option<(PathBuf, u64)> {
     use std::path::Component;
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
         return None;
     }
-    let name = path.file_name()?.to_str()?;
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let day = name.parse().ok()?;
+    let (day, _) = trash_bucket(path.file_name()?.to_str()?)?;
     let trash = path.parent()?;
     (trash.file_name()? == TRASH_DIR).then(|| (trash.to_path_buf(), day))
 }
@@ -1321,7 +1432,7 @@ pub fn trash_stats(root: &Path) -> TrashStats {
         return s;
     };
     for e in rd.flatten() {
-        let Some(day) = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else {
+        let Some((day, _)) = e.file_name().to_str().and_then(trash_bucket) else {
             continue;
         };
         s.buckets += 1;
@@ -1374,6 +1485,11 @@ pub fn purge_region(region: String, root: &Path, retention_days: u64) -> Result<
 pub struct TrashEntry {
     /// The bucket it is in: the day it was trashed, in days since the epoch.
     pub day: u64,
+    /// PVOS D234 — which of that day's buckets: 0 for `<day>`, n for
+    /// `<day>.<n>` (the same path trashed again that day).
+    pub version: u32,
+    /// The bucket's name (`20737`, `20737.1`).
+    pub bucket: String,
     /// Where it was, relative to the root (forward slashes).
     pub rel_path: String,
     pub size_bytes: u64,
@@ -1387,9 +1503,10 @@ pub fn list_trash(root: &Path) -> Vec<TrashEntry> {
         return out;
     };
     for b in buckets.flatten() {
-        let Some(day) = b.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else {
+        let Some((day, version)) = b.file_name().to_str().and_then(trash_bucket) else {
             continue;
         };
+        let bucket = trash_bucket_name(day, version);
         let base = b.path();
         let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
@@ -1407,13 +1524,15 @@ pub fn list_trash(root: &Path) -> Vec<TrashEntry> {
                 let Ok(rel) = path.strip_prefix(&base) else { continue };
                 out.push(TrashEntry {
                     day,
+                    version,
+                    bucket: bucket.clone(),
                     rel_path: rel.to_string_lossy().replace('\\', "/"),
                     size_bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
                 });
             }
         }
     }
-    out.sort_by(|a, b| b.day.cmp(&a.day).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    out.sort_by(|a, b| (b.day, b.version).cmp(&(a.day, a.version)).then_with(|| a.rel_path.cmp(&b.rel_path)));
     out
 }
 
@@ -1440,7 +1559,7 @@ fn index_trash(root: &Path) -> std::collections::HashMap<String, (PathBuf, u64)>
         return by_hash;
     };
     for b in buckets.flatten() {
-        if b.file_name().to_str().and_then(|n| n.parse::<u64>().ok()).is_none() {
+        if b.file_name().to_str().and_then(trash_bucket).is_none() {
             continue;
         }
         let mut stack = vec![b.path()];
@@ -1515,30 +1634,68 @@ pub struct TrashRestore {
 /// it. **Never over something that is there** — that path is reported and its
 /// file stays in the trash. An error when the trash holds nothing at `rel`.
 pub fn restore_from_trash(root: &Path, rel: &str, day: Option<u64>) -> Result<TrashRestore> {
+    restore_from_trash_pick(root, rel, day.map(TrashPick::Day))
+}
+
+/// PVOS D234 — which trashed version a restore takes: the newest of a day,
+/// or exactly one bucket. With none, the newest of all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrashPick {
+    /// `--from 20737`: the newest version that day.
+    Day(u64),
+    /// `--from 20737.1`: exactly that bucket.
+    Bucket(u64, u32),
+}
+
+impl TrashPick {
+    /// `20737` or `20737.1`, as `pvfs trash ls` shows a bucket.
+    pub fn parse(s: &str) -> Option<TrashPick> {
+        let (day, n) = trash_bucket(s.trim())?;
+        Some(if s.contains('.') { TrashPick::Bucket(day, n) } else { TrashPick::Day(day) })
+    }
+
+    fn admits(&self, e: &TrashEntry) -> bool {
+        match *self {
+            TrashPick::Day(d) => e.day == d,
+            TrashPick::Bucket(d, n) => e.day == d && e.version == n,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match *self {
+            TrashPick::Day(d) => format!("day {d}"),
+            TrashPick::Bucket(d, n) => format!("bucket {}", trash_bucket_name(d, n)),
+        }
+    }
+}
+
+/// [`restore_from_trash`] with PVOS D234's pick: each file from the newest
+/// bucket (by day, then version) that holds it and that `pick` admits.
+pub fn restore_from_trash_pick(root: &Path, rel: &str, pick: Option<TrashPick>) -> Result<TrashRestore> {
     let rel = rel.trim_matches('/');
     if rel.is_empty() || rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
         return Err(bad("trash", "name a path as `pvfs trash ls` shows it, relative to the region's root"));
     }
     let inside = format!("{rel}/");
-    let mut newest: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut newest: std::collections::BTreeMap<String, (u64, u32)> = std::collections::BTreeMap::new();
     for e in list_trash(root) {
-        if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && day.is_none_or(|d| d == e.day) {
-            let d = newest.entry(e.rel_path).or_insert(e.day);
-            *d = (*d).max(e.day);
+        if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && pick.is_none_or(|p| p.admits(&e)) {
+            let d = newest.entry(e.rel_path).or_insert((e.day, e.version));
+            *d = (*d).max((e.day, e.version));
         }
     }
     if newest.is_empty() {
         return Err(bad(
             "trash",
-            &match day {
-                Some(d) => format!("nothing in the trash at {rel} from day {d}"),
+            &match pick {
+                Some(p) => format!("nothing in the trash at {rel} from {}", p.describe()),
                 None => format!("nothing in the trash at {rel}"),
             },
         ));
     }
     let mut out = TrashRestore::default();
-    for (path, d) in newest {
-        let from = trash_root(root).join(d.to_string()).join(&path);
+    for (path, (d, n)) in newest {
+        let from = trash_root(root).join(trash_bucket_name(d, n)).join(&path);
         let to = root.join(&path);
         if to.symlink_metadata().is_ok() {
             out.in_the_way.push(path);
@@ -1606,40 +1763,47 @@ fn trashed_hash(file: &Path) -> Option<String> {
 /// reported — restoring everything unasked resurrected exactly that (D169).
 /// A path only one root has is restored without reading anything.
 pub fn restore_identical(roots: &[&Path], rel: &str, day: Option<u64>) -> Result<RestoreIdentical> {
+    restore_identical_pick(roots, rel, day.map(TrashPick::Day))
+}
+
+/// [`restore_identical`] with PVOS D234's pick; "newest" is by day, then
+/// version (each root numbers its own buckets, so a copy that is not the
+/// newest comes back only when its hash is the newest's, as before).
+pub fn restore_identical_pick(roots: &[&Path], rel: &str, pick: Option<TrashPick>) -> Result<RestoreIdentical> {
     let rel = rel.trim_matches('/');
     if rel.is_empty() || rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
         return Err(bad("trash", "name a path as `pvfs trash ls` shows it, relative to the region's root"));
     }
     let inside = format!("{rel}/");
-    // path → (root index → the newest day that root has it from)
-    let mut found: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, u64>> =
+    // path → (root index → the newest (day, version) that root has it from)
+    let mut found: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, (u64, u32)>> =
         std::collections::BTreeMap::new();
     for (i, root) in roots.iter().enumerate() {
         for e in list_trash(root) {
-            if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && day.is_none_or(|d| d == e.day) {
-                let d = found.entry(e.rel_path).or_default().entry(i).or_insert(e.day);
-                *d = (*d).max(e.day);
+            if (e.rel_path == rel || e.rel_path.starts_with(&inside)) && pick.is_none_or(|p| p.admits(&e)) {
+                let d = found.entry(e.rel_path).or_default().entry(i).or_insert((e.day, e.version));
+                *d = (*d).max((e.day, e.version));
             }
         }
     }
     if found.is_empty() {
         return Err(bad(
             "trash",
-            &match day {
-                Some(d) => format!("nothing in the trash at {rel} from day {d}"),
+            &match pick {
+                Some(p) => format!("nothing in the trash at {rel} from {}", p.describe()),
                 None => format!("nothing in the trash at {rel}"),
             },
         ));
     }
     let mut out = RestoreIdentical { per_root: vec![TrashRestore::default(); roots.len()], different: Vec::new() };
     for (path, holders) in found {
-        let chosen: Vec<(usize, u64)> = if holders.len() == 1 {
+        let chosen: Vec<(usize, (u64, u32))> = if holders.len() == 1 {
             holders.into_iter().collect()
         } else {
-            let newest = holders.values().copied().max().unwrap_or(0);
-            let hashed: Vec<(usize, u64, Option<String>)> = holders
+            let newest = holders.values().copied().max().unwrap_or((0, 0));
+            let hashed: Vec<(usize, (u64, u32), Option<String>)> = holders
                 .iter()
-                .map(|(&i, &d)| (i, d, trashed_hash(&trash_root(roots[i]).join(d.to_string()).join(&path))))
+                .map(|(&i, &(d, n))| (i, (d, n), trashed_hash(&trash_root(roots[i]).join(trash_bucket_name(d, n)).join(&path))))
                 .collect();
             let wanted: std::collections::HashSet<&String> =
                 hashed.iter().filter(|(_, d, _)| *d == newest).filter_map(|(_, _, h)| h.as_ref()).collect();
@@ -1649,8 +1813,8 @@ pub fn restore_identical(roots: &[&Path], rel: &str, day: Option<u64>) -> Result
             out.different.extend(no.into_iter().map(|(i, _, _)| (*i, path.clone())));
             yes.into_iter().map(|(i, d, _)| (*i, *d)).collect()
         };
-        for (i, d) in chosen {
-            let done = restore_from_trash(roots[i], &path, Some(d))?;
+        for (i, (d, n)) in chosen {
+            let done = restore_from_trash_pick(roots[i], &path, Some(TrashPick::Bucket(d, n)))?;
             out.per_root[i].restored.extend(done.restored);
             out.per_root[i].in_the_way.extend(done.in_the_way);
         }

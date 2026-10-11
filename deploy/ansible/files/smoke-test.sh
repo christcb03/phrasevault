@@ -1199,6 +1199,29 @@ if [ -f "$CATLIB/sub/b.mkv" ]; then
     || fail "D168: --from: $($PVFS trash put --from "$DATA/d168.list" 2>&1 | tail -2)"
   $PVFS trash restore sub/b.mkv --region "$CAT12" | qgrep '^restored' && [ -f "$CATLIB/sub/b.mkv" ] \
     && ok "D168: and pvfs trash restore --region puts it back" || fail "D168: restore after trash put"
+  # PVOS D234 — the same path trashed twice in a day: two versions in two
+  # buckets (`<day>`, `<day>.1`), neither replacing the other.
+  # (`trash put` refuses a path the catalogue does not list: the restored
+  # file is catalogued again before each put)
+  cp "$CATLIB/sub/b.mkv" "$DATA/d234-b.keep"
+  $PVFS scan "$CAT" >/dev/null 2>&1 || true
+  $PVFS trash put sub/b.mkv --region "$CAT12" >/dev/null 2>"$DATA/d234.err" || true
+  cp "$DATA/d234-b.keep" "$CATLIB/sub/b.mkv"
+  $PVFS scan "$CAT" >/dev/null 2>&1 || true
+  $PVFS trash put sub/b.mkv --region "$CAT12" >/dev/null 2>>"$DATA/d234.err" || true
+  B1="$($PVFS --json trash ls sub/b.mkv | python3 -c '
+import json, sys
+# catlib2 has its own copy of this path in its trash (the resolve section)
+es = [e for l in json.load(sys.stdin) if l["region"] == sys.argv[1] for e in l["entries"] if e["path"] == "sub/b.mkv"]
+bs = sorted((e["version"], e["bucket"]) for e in es)
+assert len(bs) == 2 and bs[0][0] == 0 and bs[1] == (1, bs[0][1] + ".1"), bs
+print(bs[1][1])' "$CAT" 2>/dev/null || true)"
+  [ -n "$B1" ] && ok "D234: the path trashed twice today is two versions ($B1 and the day's first)" \
+    || fail "D234: trash versions: $(cat "$DATA/d234.err") $($PVFS --json trash ls sub/b.mkv 2>&1 | tail -3)"
+  { $PVFS trash restore sub/b.mkv --region "$CAT12" --from "${B1:-none}" 2>&1 || true; } | qgrep '^restored' && [ -f "$CATLIB/sub/b.mkv" ] \
+    && ok "D234: pvfs trash restore --from $B1 restores exactly that version" || fail "D234: restore --from $B1"
+  { $PVFS trash restore sub/b.mkv --region "$CAT12" 2>&1 || true; } | qgrep '^kept in the trash' \
+    && ok "D234: and the other version stays in the trash, never over the file" || fail "D234: restore over a file"
 else
   ok "D168: sub/b.mkv not in the catalogue library here — trash put checks skipped"
 fi
