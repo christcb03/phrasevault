@@ -157,8 +157,14 @@ fn a_writable_mount_edits_what_this_box_holds_and_creates_beside_the_folder() {
     assert!(!scratch.exists(), "gone from the mount");
     assert!(
         !lib.join("TV/Show/Season 01/Show - s01e01.scratch.srt").exists(),
-        "and gone from the disk"
+        "and gone from its folder"
     );
+    // PVOS D233 — into the region's trash, not unlinked (D217 removed it).
+    let trashed = std::fs::read_dir(lib.join(".pvfs-trash"))
+        .expect("the region has a trash")
+        .flatten()
+        .any(|day| day.path().join("TV/Show/Season 01/Show - s01e01.scratch.srt").exists());
+    assert!(trashed, "a just-created file deleted again is in the region's trash");
 
     // ---- edit: a file this box holds takes a write in place
     let ep = season.join("Show - s01e01.mkv");

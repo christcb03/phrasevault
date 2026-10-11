@@ -1251,6 +1251,15 @@ assert r["folders_removed"]==["also/deeper"] and r["unconfirmed"]==[], r
 [ ! -d "$CATLIB2/also/deeper" ] && [ -d "$CATLIB2/also" ] && [ -d "$CATLIB/also/deeper" ] \
   && ok "the emptied staging folder the library holds is gone; the top level stays (D145)" || fail "staging folders after resolve"
 $PVFS --json region retention "$CAT2" 0 | qgrep '"retention_days":0' && ok "region retention 0" || fail "region retention"
+# PVOS D233 — `region floor`: set, shown, back to the default, and bare (no
+# terminal) it lists without asking.
+$PVFS --json region floor "$CAT" 2G | qgrep '"floor_bytes":2000000000' && ok "region floor 2G" || fail "region floor set"
+$PVFS --json region floor "$CAT" </dev/null | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["floor_bytes"]==2000000000 and r["set"], r' \
+  && ok "region floor with no size shows it" || fail "region floor show"
+$PVFS --json region floor "$CAT" default | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["set"] is False and r["cleared"] is True and r["floor_bytes"]!=2000000000, r' \
+  && ok "region floor default clears it" || fail "region floor default"
+$PVFS --json region floor </dev/null | python3 -c 'import json,sys; r=json.load(sys.stdin); assert len(r["floors"])>=2 and all("free_bytes" in f for f in r["floors"]), r' \
+  && ok "bare region floor lists this box's regions and asks nothing" || fail "bare region floor"
 $PVFS --json view resolve | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["purged"]>=1, r' \
   && ok "resolve purged the trash past retention" || fail "purge"
 [ -z "$(ls -A "$CATLIB2/.pvfs-trash" 2>/dev/null)" ] && ok "the staging disk is free again" || fail "trash not empty"

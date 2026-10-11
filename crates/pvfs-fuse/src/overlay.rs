@@ -43,11 +43,40 @@ pub struct MadeDir {
     pub regions: HashSet<String>,
 }
 
-/// D217 — a file created through this mount: when, and where its bytes are.
+/// D217 — a file created through this mount: where its bytes are.
+/// PVOS D233 — and the region and root it was made in (a delete sends it to
+/// that region's trash, a rename moves it on that disk), and how many handles
+/// have it open (never forgotten while one does). No clock: it is remembered
+/// until the catalogue has caught up with it ([`caught_up`]).
 #[derive(Clone, Debug)]
 pub struct MadeFile {
-    pub at: Instant,
     pub path: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+    pub region: String,
+    pub open: usize,
+}
+
+/// PVOS D233 — a catalogued file edited through this mount: the catalogue
+/// still describes the bytes before the edit until the holder's watch has
+/// hashed it again, so until then the view answers from the file itself —
+/// its size and mtime from the disk, its reads from the path — and a rename
+/// or a delete goes to the file without checking it against the old row.
+#[derive(Clone, Debug)]
+pub struct EditedFile {
+    pub path: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+    pub region: String,
+    pub open: usize,
+}
+
+/// PVOS D233 — a file this mount wrote (made or edited), as the handlers
+/// need it: where it is, and whether the catalogue has any copy of it yet.
+#[derive(Clone, Debug)]
+pub struct Written {
+    pub path: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+    pub region: String,
+    pub made: bool,
 }
 
 /// A folder removed through this mount: when, and the seqs held then.
@@ -69,6 +98,9 @@ pub struct Overlay {
     /// has, the view answers from here, so a tool that writes a subtitle and
     /// reads it straight back finds it.
     pub made_files: HashMap<String, MadeFile>,
+    /// PVOS D233 — catalogued files edited through this mount that the
+    /// catalogue has not hashed again yet.
+    pub edited_files: HashMap<String, EditedFile>,
     pub gone_dirs: HashMap<String, GoneDir>,
     /// Renames the inode table has not followed yet — a remote rename
     /// finishes on its own thread, and the table is the session thread's.
@@ -121,6 +153,7 @@ impl Overlay {
             && self.made_dirs.is_empty()
             && self.gone_dirs.is_empty()
             && self.made_files.is_empty()
+            && self.edited_files.is_empty()
     }
 
     /// The catalogue paths whose rows may show at view path `rel`: itself,
@@ -220,10 +253,107 @@ impl Overlay {
         self.made_files.get(rel).map(|m| m.path.clone())
     }
 
-    /// D217 — remember a file just created at `rel`, with its bytes at `path`.
-    pub fn remember_file(&mut self, rel: &str, path: std::path::PathBuf) {
-        self.made_files.insert(rel.to_string(), MadeFile { at: Instant::now(), path });
+    /// D217 — remember a file just created at `rel`, with its bytes at `path`
+    /// under `root` of `region`, open by the handle `create` returns.
+    pub fn remember_file(&mut self, rel: &str, path: std::path::PathBuf, root: std::path::PathBuf, region: &str) {
+        self.made_files.insert(
+            rel.to_string(),
+            MadeFile { path, root, region: region.to_string(), open: 1 },
+        );
         self.dirty = true;
+    }
+
+    /// PVOS D233 — a file this mount made or edited, and not yet forgotten.
+    pub fn written(&self, rel: &str) -> Option<Written> {
+        if let Some(m) = self.made_files.get(rel) {
+            return Some(Written { path: m.path.clone(), root: m.root.clone(), region: m.region.clone(), made: true });
+        }
+        self.edited_files
+            .get(rel)
+            .map(|e| Written { path: e.path.clone(), root: e.root.clone(), region: e.region.clone(), made: false })
+    }
+
+    /// PVOS D233 — the catalogued file at `rel` is being edited at `path`
+    /// (`opening`: by a handle that `closed` will let go of).
+    pub fn remember_edit(&mut self, rel: &str, path: std::path::PathBuf, root: std::path::PathBuf, region: &str, opening: bool) {
+        if let Some(m) = self.made_files.get_mut(rel) {
+            m.open += usize::from(opening);
+            return;
+        }
+        let e = self
+            .edited_files
+            .entry(rel.to_string())
+            .or_insert(EditedFile { path, root, region: region.to_string(), open: 0 });
+        e.open += usize::from(opening);
+        self.dirty = true;
+    }
+
+    /// PVOS D233 — a write handle on `rel` closed.
+    pub fn closed(&mut self, rel: &str) {
+        if let Some(m) = self.made_files.get_mut(rel) {
+            m.open = m.open.saturating_sub(1);
+        } else if let Some(e) = self.edited_files.get_mut(rel) {
+            e.open = e.open.saturating_sub(1);
+        }
+    }
+
+    /// PVOS D233 — forget a written file at `rel` (deleted, or renamed away).
+    pub fn forget_written(&mut self, rel: &str) {
+        self.made_files.remove(rel);
+        self.edited_files.remove(rel);
+        self.dirty = true;
+    }
+
+    /// PVOS D233 — a written file renamed from `from` to `to` on its disk:
+    /// the memory follows it, whatever it was. A file renamed through the
+    /// mount keeps answering from its disk until the catalogue lists it at
+    /// the new path, hashed.
+    pub fn rename_written(&mut self, from: &str, to: &str) {
+        if let Some(mut m) = self.made_files.remove(from) {
+            m.path = m.root.join(to);
+            self.edited_files.remove(to);
+            self.made_files.insert(to.to_string(), m);
+        } else if let Some(mut e) = self.edited_files.remove(from) {
+            e.path = e.root.join(to);
+            self.made_files.remove(to);
+            self.edited_files.insert(to.to_string(), e);
+        }
+        self.dirty = true;
+    }
+
+    /// PVOS D233 — a folder renamed from `from` to `to`: every written file
+    /// under it moves with it, on its own disk.
+    pub fn rename_written_under(&mut self, from: &str, to: &str) {
+        rekey(&mut self.made_files, from, to);
+        rekey(&mut self.edited_files, from, to);
+        for (rel, m) in self.made_files.iter_mut() {
+            if within(rel, to) {
+                m.path = m.root.join(rel);
+            }
+        }
+        for (rel, e) in self.edited_files.iter_mut() {
+            if within(rel, to) {
+                e.path = e.root.join(rel);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// PVOS D233 — the regions holding a file written through this mount
+    /// under folder `dir`: a rename of the folder has to reach them too,
+    /// even where the catalogue does not list the folder yet.
+    pub fn written_regions_under(&self, dir: &str) -> HashSet<String> {
+        self.made_files
+            .iter()
+            .filter(|(rel, _)| *rel != dir && within(rel, dir))
+            .map(|(_, m)| m.region.clone())
+            .chain(
+                self.edited_files
+                    .iter()
+                    .filter(|(rel, _)| *rel != dir && within(rel, dir))
+                    .map(|(_, e)| e.region.clone()),
+            )
+            .collect()
     }
 
     /// D217 — the files this mount made directly inside `dir`.
@@ -342,11 +472,18 @@ impl Overlay {
             }
         }
         self.moves = kept;
-        // D217 — a created file is remembered only until the catalogue lists
-        // it, or for the same grace as the rest of the overlay.
-        self.made_files.retain(|rel, m| {
-            m.at.elapsed() < PENDING_TTL && engine.view_entry(rel).ok().flatten().is_none()
-        });
+        // PVOS D233 — a written file is remembered until the catalogue has
+        // caught up with it, with no clock: D217 forgot a created file at
+        // ten minutes, or at the first row the watch wrote for it (unhashed,
+        // which the view does not show), and a large or slow copy vanished
+        // from the mount while its bytes sat on the disk (D218 §2.1 item 3).
+        // Never while a handle has it open; at once when the file is gone.
+        let before = self.made_files.len() + self.edited_files.len();
+        self.made_files.retain(|rel, m| m.open > 0 || (m.path.exists() && !caught_up(engine, rel, &m.region, &m.path)));
+        self.edited_files.retain(|rel, e| e.open > 0 || (e.path.exists() && !caught_up(engine, rel, &e.region, &e.path)));
+        if before != self.made_files.len() + self.edited_files.len() {
+            self.dirty = true;
+        }
         let before = self.made_dirs.len() + self.gone_dirs.len();
         // A made folder the catalogue now lists is simply a folder.
         self.made_dirs.retain(|d, m| m.at.elapsed() <= PENDING_TTL && !listed(d));
@@ -369,6 +506,32 @@ impl Overlay {
             self.dirty = true;
         }
     }
+}
+
+/// PVOS D233 — the catalogue has caught up with a file written through the
+/// mount: `region` lists it at `rel`, hashed, at the size and mtime (ms) the
+/// file has on disk now. A row the watch wrote before hashing it (no hash), a
+/// row from before the last write (another size or mtime), or no row at all
+/// is not caught up.
+pub fn caught_up(engine: &Engine, rel: &str, region: &str, path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mtime_ms = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    engine.view_entry(rel).ok().flatten().is_some_and(|e| {
+        e.sources.iter().any(|c| {
+            c.region == region
+                && c.kind == "file"
+                && c.content_hash.is_some()
+                && c.size_bytes == md.len()
+                && c.mtime_ms == mtime_ms
+        })
+    })
 }
 
 /// The entry for a folder only this mount knows.

@@ -219,10 +219,12 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.lease.taken` | notice | system | A connection holds the write lease. |
 | `pvfs.mount.bytes_refused` | warning | system | A holder served bytes with the wrong hash. |
 | `pvfs.mount.cache` | info | system | The read-through cache's report: files opened, verified and kept, bytes fetched, evictions; when anything moved, at most every 5 min. |
+| `pvfs.mount.create_refused` | warning | system | A create through a writable view was refused (ENOSPC): every disk it could go on is under its free-space floor (PVOS D233). |
 | `pvfs.mount.delete_failed` | error | system | A delete through the view failed (EIO). |
 | `pvfs.mount.delete_refused` | warning | system | A delete was refused: this box's copy is not the file shown. |
 | `pvfs.mount.deleted` | info | system | A delete through the view succeeded. |
 | `pvfs.mount.dir_removed` | info | system | An rmdir was done on the boxes that held the folder. |
+| `pvfs.mount.edit_refused` | info | system | An edit through a writable view was refused (EROFS), with the reason: the bytes are on another box, the path has more than one copy, or its region is draining (PVOS D233). |
 | `pvfs.mount.gone` | info | system | A file's bytes are gone everywhere; hidden for now. |
 | `pvfs.mount.ingest_stream` | info | system | Reads proxy an in-flight ingest. |
 | `pvfs.mount.punch_failed` | warning | system | Read pieces could not be given back to the disk. |

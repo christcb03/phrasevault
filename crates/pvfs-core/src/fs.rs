@@ -1117,6 +1117,28 @@ pub struct ViewCopy {
     pub stale: bool,
 }
 
+/// PVOS D233 — one row of [`Engine::region_floors`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionFloor {
+    pub region: NodeId,
+    pub root: std::path::PathBuf,
+    /// What `pvfs region floor` set, if anything.
+    pub set: Option<u64>,
+    /// The floor in force: `set`, else the default for the region's disk.
+    pub floor: u64,
+    pub free: u64,
+}
+
+/// PVOS D233 — [`Engine::writable_space`]: what the disks a writable view
+/// creates on can still take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WritableSpace {
+    pub free_bytes: u64,
+    /// Free bytes above each filesystem's floor: what new files may use.
+    pub above_floor_bytes: u64,
+    pub free_files: u64,
+}
+
 /// D130 — bytes this box holds for a content hash: the file, its size (as
 /// the row says and the disk agrees), and the region whose binding it is
 /// under (the read gate is that region's root).
@@ -1154,6 +1176,12 @@ pub const LOCAL_PATH_FOR_HASH_SQL: &str = "SELECT e.region_id, e.rel_path, e.siz
                    FROM region_entries e JOIN regions r ON r.node_id = e.region_id
                   WHERE r.kind = 'catalogue' AND e.kind = 'file' AND e.content_hash = ?1
                   ORDER BY e.region_id, e.rel_path";
+#[doc(hidden)]
+pub const LOCAL_COPY_AT_SQL: &str = "SELECT e.region_id
+                   FROM region_entries e JOIN regions r ON r.node_id = e.region_id
+                  WHERE r.kind = 'catalogue' AND e.kind = 'file' AND e.rel_path = ?1
+                    AND e.content_hash = ?2
+                  ORDER BY e.region_id";
 
 /// D169 — what [`Engine::trash_region_path`] did with this box's copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3262,6 +3290,47 @@ impl Engine {
         Ok(None)
     }
 
+    /// PVOS D233 — THIS box's own file at `rel_path`, in a catalogue region it
+    /// catalogues from its own disk, whose row there has content hash `hash`:
+    /// the copy the view showed, at the path that was opened.
+    ///
+    /// Not a lookup by hash. A byte-identical file at another path (a twin;
+    /// every empty file is one) is a different file, and writing to it is
+    /// writing to the wrong file — the writable view did exactly that until
+    /// D233 (D218 §2.1 item 1). `size` is the file's size on disk NOW: a
+    /// reader compares it with the row's before serving it as that hash
+    /// (D112), and an editor need not — an edit is of the file at the path,
+    /// whatever it holds since the last pass.
+    pub fn local_copy_at(&self, rel_path: &str, hash: &str) -> Result<Option<LocalBytes>> {
+        let rel = rel_path.trim_matches('/');
+        if Self::check_region_rel(rel).is_err() {
+            return Ok(None);
+        }
+        let regions: Vec<String> = self
+            .conn
+            .prepare(LOCAL_COPY_AT_SQL)
+            .map_err(map_db("local copy at"))?
+            .query_map(params![rel, hash], |r| r.get::<_, String>(0))
+            .map_err(map_db("local copy at"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db("local copy at"))?;
+        for region in regions {
+            let Some(roots) = self.own_region_roots(&region)? else {
+                continue;
+            };
+            for root in roots {
+                let p = root.join(rel);
+                // Not through a link: the region's own file, or nothing.
+                if let Ok(m) = std::fs::symlink_metadata(&p) {
+                    if m.is_file() {
+                        return Ok(Some(LocalBytes { path: p, size: m.len(), region }));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// D169 — a delete that came through the view: move THIS box's copy of
     /// `rel_path` in catalogue region `region` into that region's trash, its
     /// sidecar with it — the soft delete every automated deletion is (D145),
@@ -3379,6 +3448,76 @@ impl Engine {
         Ok(moved)
     }
 
+    /// PVOS D233 — a rename through the view of a file WRITTEN through it
+    /// (made there, or edited there since the catalogue last hashed it), on
+    /// this box's own disk, in `root` of catalogue region `region`.
+    ///
+    /// [`Self::rename_region_path`] minus two things. Its check of the bytes
+    /// against the row: the row, if there is one, describes the bytes before
+    /// the write. And the sidecar it writes when the file has none: that pins
+    /// the row's hash to the file's size and mtime NOW (D150), so a file
+    /// edited and then renamed before the watch hashed it again would have
+    /// been catalogued with the old bytes' hash. A sidecar already there moves
+    /// along: it names the size and mtime it was written for, and the watch
+    /// sees that it no longer describes the file. The rows follow, as there.
+    pub fn rename_written_path(&self, region: &NodeId, root: &std::path::Path, from: &str, to: &str) -> Result<RenamedHere> {
+        Self::check_region_rel(from)?;
+        Self::check_region_rel(to)?;
+        Self::check_rename_target(to, false)?;
+        // `root` is where the mount wrote the file (`writable_roots`, or this
+        // region's own root for an edit); the region must still be one this
+        // box catalogues from its own disk.
+        if self.own_region_roots(region)?.is_none() {
+            return Ok(RenamedHere::NotHere);
+        }
+        if from == to {
+            return Ok(RenamedHere::AlreadyDone);
+        }
+        let (src, dst) = (root.join(from), root.join(to));
+        match std::fs::symlink_metadata(&src) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(RenamedHere::Changed),
+            Err(_) => return Ok(RenamedHere::Gone),
+        }
+        if std::fs::symlink_metadata(&dst).is_ok() {
+            return Ok(RenamedHere::InTheWay);
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create rename dir", e))?;
+        }
+        let sides = [
+            (crate::sync::manifest_sidecar_path(&src), crate::sync::manifest_sidecar_path(&dst)),
+            (crate::sync::legacy_manifest_sidecar_path(&src), crate::sync::legacy_manifest_sidecar_path(&dst)),
+        ];
+        std::fs::rename(&src, &dst).map_err(|e| PvfsError::io("rename in region", e))?;
+        for (a, b) in sides {
+            if a.is_file() && std::fs::symlink_metadata(&b).is_err() {
+                let _ = std::fs::rename(&a, &b);
+            }
+        }
+        if let Err(e) = self.rows_follow_rename(region, from, to, false) {
+            pv_warn!("pvfs.rename.rows_deferred", path = content(from), new_path = content(to), error = content(&e);
+                "pvfs: renamed {from} → {to} on disk; its rows wait for the next pass ({e})");
+        }
+        Ok(RenamedHere::Moved)
+    }
+
+    /// Nothing may be renamed to a name the catalogue does not see: the file
+    /// would leave the view and the library with it.
+    fn check_rename_target(to: &str, is_dir: bool) -> Result<()> {
+        let parts: Vec<&str> = to.split('/').collect();
+        for (i, c) in parts.iter().enumerate() {
+            let dir = is_dir || i + 1 < parts.len();
+            if crate::sync::is_own_name(c, dir) || crate::sync::is_litter_name(c) {
+                return Err(PvfsError::BadInput {
+                    field: "to".into(),
+                    reason: format!("`{c}` is a name PVFS keeps for itself or passes over; nothing is renamed to it"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// PVOS D199 — a rename's checks and reads, and nothing on disk: the
     /// daemon asks these of a read view, renames with no engine held
     /// ([`rename_in_region`]), then writes the rows as one step of its
@@ -3393,18 +3532,7 @@ impl Engine {
                 reason: "a folder cannot be moved into itself".into(),
             });
         }
-        // Nothing may be renamed to a name the catalogue does not see: the
-        // file would leave the view and the library with it.
-        let parts: Vec<&str> = to.split('/').collect();
-        for (i, c) in parts.iter().enumerate() {
-            let dir = is_dir || i + 1 < parts.len();
-            if crate::sync::is_own_name(c, dir) || crate::sync::is_litter_name(c) {
-                return Err(PvfsError::BadInput {
-                    field: "to".into(),
-                    reason: format!("`{c}` is a name PVFS keeps for itself or passes over; nothing is renamed to it"),
-                });
-            }
-        }
+        Self::check_rename_target(to, is_dir)?;
         let Some(roots) = self.own_region_roots(region)? else {
             return Ok(RenameStart::Done(RenamedHere::NotHere));
         };
@@ -3693,11 +3821,17 @@ impl Engine {
     /// The folder test is the disk's own answer — does that directory exist
     /// under this region's root — because that is the thing a person means by
     /// "the show is on that mount", and it needs no catalogue read per file.
+    ///
+    /// PVOS D233 — `None` when NO destination has room above its floor. The
+    /// floor used to be passed over in two cases (a file at the root, and no
+    /// folder holder with room), so a full disk took the file anyway; the
+    /// caller now refuses instead (`ENOSPC` for a create, a skip for
+    /// `receive`).
     pub fn placement_for(
         &self,
         rel_path: &str,
         dests: &[(NodeId, std::path::PathBuf)],
-    ) -> (NodeId, std::path::PathBuf) {
+    ) -> Option<(NodeId, std::path::PathBuf)> {
         let floors: Vec<u64> = dests
             .iter()
             .map(|(r, root)| self.floor_for(r, root))
@@ -3722,6 +3856,35 @@ impl Engine {
         crate::sync::default_floor_for(total)
     }
 
+    /// PVOS D233 — every catalogue region this box holds from its own disk,
+    /// with its floor (set, or the default for its disk) and its free space,
+    /// for `pvfs region floor`. Measured without touching the disk: a root
+    /// that is not there (an unmounted volume) reads as 0 free, never made.
+    pub fn region_floors(&self) -> Result<Vec<RegionFloor>> {
+        let mut out = Vec::new();
+        for b in self.local_bindings()? {
+            if !self.is_catalogue_region(&b.folder_id)? {
+                continue;
+            }
+            let Ok(root) = uri_to_path(&b.source_uri) else {
+                continue;
+            };
+            #[allow(clippy::unnecessary_cast)]
+            let free = nix::sys::statvfs::statvfs(&root)
+                .map(|st| st.blocks_available() as u64 * st.fragment_size() as u64)
+                .unwrap_or(0);
+            out.push(RegionFloor {
+                set: crate::sync::region_floor_setting(&self.data_dir, &b.folder_id)?,
+                floor: self.floor_for(&b.folder_id, &root),
+                region: b.folder_id,
+                root,
+                free,
+            });
+        }
+        out.sort_by(|a, b| a.root.cmp(&b.root));
+        Ok(out)
+    }
+
     /// [`Self::placement_for`] with one floor for every region — the shape the
     /// tests use, so a build host's own free space cannot decide the answer.
     pub fn placement_for_with_floor(
@@ -3729,7 +3892,7 @@ impl Engine {
         rel_path: &str,
         dests: &[(NodeId, std::path::PathBuf)],
         floor: u64,
-    ) -> (NodeId, std::path::PathBuf) {
+    ) -> Option<(NodeId, std::path::PathBuf)> {
         let floors = vec![floor; dests.len()];
         self.placement_for_with_floors(rel_path, dests, &floors)
     }
@@ -3740,21 +3903,25 @@ impl Engine {
         rel_path: &str,
         dests: &[(NodeId, std::path::PathBuf)],
         floors: &[u64],
-    ) -> (NodeId, std::path::PathBuf) {
-        let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        if parent.is_empty() {
-            return dests[0].clone();
-        }
+    ) -> Option<(NodeId, std::path::PathBuf)> {
         let has_room = |i: usize, root: &std::path::Path| {
             crate::ingest::free_space_at(root).unwrap_or(0) >= floors.get(i).copied().unwrap_or(0)
         };
+        // With no folder to join, or no holder of it with room: the emptiest
+        // destination that is above its floor (`dests` is most-free first) —
+        // and none at all when every one is under it.
+        let emptiest = || dests.iter().enumerate().find(|(i, (_, root))| has_room(*i, root)).map(|(_, d)| d.clone());
+        let parent = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if parent.is_empty() {
+            return emptiest();
+        }
         let holds_folder: Vec<(usize, &(NodeId, std::path::PathBuf))> = dests
             .iter()
             .enumerate()
             .filter(|(i, (_, root))| root.join(parent).is_dir() && has_room(*i, root))
             .collect();
         if holds_folder.is_empty() {
-            return dests[0].clone();
+            return emptiest();
         }
         // D216 — a folder can be split across disks (a season with one episode
         // on each). Then the folder alone does not say which disk, and picking
@@ -3773,12 +3940,12 @@ impl Engine {
                     n != name && n.starts_with(stem)
                 });
                 if sibling {
-                    return ((*region).clone(), root.clone());
+                    return Some(((*region).clone(), root.clone()));
                 }
             }
         }
         let (_, (region, root)) = holds_folder[0];
-        (region.clone(), root.clone())
+        Some((region.clone(), root.clone()))
     }
 
     /// D217 — the disks this box may create new files on: every catalogue
@@ -3810,6 +3977,40 @@ impl Engine {
         }
         out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         Ok(out.into_iter().map(|(r, p, _)| (r, p)).collect())
+    }
+
+    /// PVOS D233 — what a writable view can still take, for its `statfs`:
+    /// over the distinct filesystems under [`Self::writable_roots`], the free
+    /// bytes, the bytes free above the floor (the smallest floor of the
+    /// regions on that filesystem: down to it, one of them still takes new
+    /// files), and the free inodes.
+    pub fn writable_space(&self) -> Result<WritableSpace> {
+        let mut seen: std::collections::HashMap<u64, (u64, u64, u64)> = std::collections::HashMap::new();
+        for (region, root) in self.writable_roots()? {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(dev) = std::fs::metadata(&root).map(|m| m.dev()) else {
+                continue;
+            };
+            let floor = self.floor_for(&region, &root);
+            if let Some(e) = seen.get_mut(&dev) {
+                e.1 = e.1.min(floor);
+                continue;
+            }
+            let Ok(st) = nix::sys::statvfs::statvfs(&root) else {
+                continue;
+            };
+            // Both are u64 on Linux; on macOS some are 32-bit.
+            #[allow(clippy::unnecessary_cast)]
+            let free = st.blocks_available() as u64 * st.fragment_size() as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let files = st.files_available() as u64;
+            seen.insert(dev, (free, floor, files));
+        }
+        Ok(seen.values().fold(WritableSpace::default(), |acc, (free, floor, files)| WritableSpace {
+            free_bytes: acc.free_bytes + free,
+            above_floor_bytes: acc.above_floor_bytes + free.saturating_sub(*floor),
+            free_files: acc.free_files + files,
+        }))
     }
 
     /// D133 — a relative path this box will write under a root: no `..`, no
@@ -3899,7 +4100,17 @@ impl Engine {
             } else {
                 // D216 — join the folder this file belongs to, if a receiving
                 // region already has it and has room; else the emptiest.
-                self.placement_for(&entry.rel_path, &dests)
+                // PVOS D233 — and nowhere when every one is under its floor.
+                match self.placement_for(&entry.rel_path, &dests) {
+                    Some(d) => d,
+                    None => {
+                        skips.push(ReceiveSkip {
+                            rel_path: entry.rel_path.clone(),
+                            why: "every receiving region is under its free-space floor".into(),
+                        });
+                        continue;
+                    }
+                }
             };
             items.push(ReceiveItem {
                 rel_path: entry.rel_path.clone(),

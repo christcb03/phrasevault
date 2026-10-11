@@ -338,9 +338,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<LogCmd>,
     },
-    /// Mount a tree read-only as a real filesystem (P7.3, doc 20 §3):
-    /// directories from the catalog, file reads resolve live — local bytes,
-    /// the sync store, else verified read-through. Blocks until unmounted.
+    /// Mount a tree as a real filesystem (P7.3, doc 20 §3): directories from
+    /// the catalog, file reads resolve live — local bytes, the sync store,
+    /// else verified read-through. Bytes are read-only unless `--view
+    /// --writable`. Blocks until unmounted.
     #[cfg(target_os = "linux")]
     Mount {
         /// The node to mount (id / path / URI) — or, with --view, the
@@ -360,10 +361,13 @@ enum Cmd {
         view: bool,
         /// D217, with --view: allow EDITS of files this box already holds,
         /// and new files, through the mount. A new file lands in the region
-        /// that already holds its folder (D216). Off by default: a file held
+        /// that already holds its folder (D216), never on a disk under its
+        /// free-space floor (`pvfs region floor`). Off by default: a file held
         /// on another box is still refused rather than copied here, and
         /// turning this on changes what the arrs and Plex may do to the
-        /// library through this path.
+        /// library through this path. PVOS D233: an edit writes the file at
+        /// the path opened, and only when the view's one copy of it is here;
+        /// only the mounting user (and root) may write.
         #[arg(long)]
         writable: bool,
         /// D165, with --view: the most the read-through cache may hold —
@@ -1597,10 +1601,13 @@ enum RegionCmd {
     /// D216: how much free space this box keeps in reserve on a region's disk.
     /// While the disk has less than this, the region stops attracting new
     /// files even when it already holds the folder they belong in — so a disk
-    /// that backups or anything else needs room on keeps it. Local to this
-    /// box, like retention. `500G`, `1T`, or bytes. Prompts when omitted.
+    /// that backups or anything else needs room on keeps it; with every disk
+    /// under its floor, nothing new is placed (PVOS D233). Local to this box,
+    /// like retention. `500G`, `1T`, bytes, or `default` (5 % of the disk,
+    /// at most 500 GB). Bare: lists this box's regions and their floors and,
+    /// at a terminal, asks which to change; with a region and no size, asks.
     Floor {
-        target: String,
+        target: Option<String>,
         size: Option<String>,
     },
     /// D129: fetch the catalogue snapshots this box is behind on — every
@@ -6914,7 +6921,12 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             eprintln!(
                 "mounting {id} at {} ({}; `pvfs umount {}` to stop)",
                 dir.display(),
-                if view { "read-only, one entry per path across every catalogue region" } else { "data read-only; delete/rename write through" },
+                match (view, writable) {
+                    // PVOS D233 — it used to say "read-only" whatever it was
+                    (true, true) => "writable — edits of files only this box holds, new files placed by folder; one entry per path across every catalogue region",
+                    (true, false) => "read-only bytes, one entry per path across every catalogue region; delete/rename write through",
+                    (false, _) => "data read-only; delete/rename write through",
+                },
                 dir.display()
             );
             eprintln!(
@@ -7468,26 +7480,122 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     engine.close()
                 }
                 RegionCmd::Floor { target, size } => {
-                    let (engine, id) = engine_and_node(ctx, &target)?;
+                    let dir = ctx?;
+                    // PVOS D233 — prompts over flags: bare, this box's regions
+                    // and their floors, then (at a terminal) which to change.
+                    let target = match target {
+                        Some(t) => t,
+                        None => {
+                            let engine = open_for_reading(&dir)?;
+                            let rows = engine.region_floors()?;
+                            let label = |id: &str| engine.get_node(&id.to_string()).ok().flatten().map(|n| n.label).unwrap_or_default();
+                            if json {
+                                let out = serde_json::json!({
+                                    "floors": rows.iter().map(|r| serde_json::json!({
+                                        "region": r.region, "label": label(&r.region), "root": r.root,
+                                        "floor_bytes": r.floor, "set": r.set.is_some(), "free_bytes": r.free,
+                                    })).collect::<Vec<_>>(),
+                                });
+                                println!("{out}");
+                            } else if rows.is_empty() {
+                                println!("this box holds no catalogue region from its own disk");
+                            } else {
+                                for (i, r) in rows.iter().enumerate() {
+                                    println!(
+                                        "  {}. {}  {}  {}\n     floor {}{}, free {}{}",
+                                        i + 1,
+                                        &r.region[..8.min(r.region.len())],
+                                        label(&r.region),
+                                        r.root.display(),
+                                        fmt_bytes(r.floor),
+                                        if r.set.is_some() { "" } else { " (the default for its disk)" },
+                                        fmt_bytes(r.free),
+                                        if r.free < r.floor { " — UNDER its floor: it takes no new files" } else { "" },
+                                    );
+                                }
+                            }
+                            if !interactive() || rows.is_empty() {
+                                return engine.close();
+                            }
+                            let pick = prompt_line("region to change (its number, or blank for none)", Some(""))?;
+                            if pick.trim().is_empty() {
+                                return engine.close();
+                            }
+                            let n: usize = pick.trim().parse().map_err(|_| PvfsError::BadInput {
+                                field: "region".into(),
+                                reason: format!("{pick:?} — a number from the list"),
+                            })?;
+                            let Some(r) = rows.get(n.wrapping_sub(1)) else {
+                                return Err(PvfsError::BadInput {
+                                    field: "region".into(),
+                                    reason: format!("{n} is not in the list"),
+                                });
+                            };
+                            let id = r.region.clone();
+                            engine.close()?;
+                            id
+                        }
+                    };
+                    let (engine, id) = engine_and_node(Ok(dir.clone()), &target)?;
                     if !engine.is_catalogue_region(&id)? {
                         return Err(PvfsError::BadInput {
                             field: "region".into(),
                             reason: format!("{id} is not a catalogue region"),
                         });
                     }
+                    let now = engine.region_floors()?.into_iter().find(|r| r.region == id);
                     let text = match size {
                         Some(s) => s,
-                        None => prompt_line(
-                            "free space to keep on this region's disk (e.g. 500G, 1T)",
-                            Some("500G"),
-                        )?,
+                        None if !interactive() => {
+                            // Off a terminal a size-less call only shows.
+                            match (&now, json) {
+                                (Some(r), true) => println!(
+                                    "{}",
+                                    serde_json::json!({"region": id, "floor_bytes": r.floor, "set": r.set.is_some(), "free_bytes": r.free})
+                                ),
+                                (Some(r), false) => println!(
+                                    "{id} keeps {}{} free before it takes new files (free now: {})",
+                                    fmt_bytes(r.floor),
+                                    if r.set.is_some() { "" } else { ", the default for its disk," },
+                                    fmt_bytes(r.free)
+                                ),
+                                (None, _) => println!("{id} is not held on this box's own disk; a floor set here would apply if it were"),
+                            }
+                            return engine.close();
+                        }
+                        None => {
+                            if let Some(r) = &now {
+                                eprintln!(
+                                    "{id} keeps {}{} free (free now: {})",
+                                    fmt_bytes(r.floor),
+                                    if r.set.is_some() { "" } else { ", the default for its disk," },
+                                    fmt_bytes(r.free)
+                                );
+                            }
+                            let current = now.as_ref().and_then(|r| r.set).map(|b| b.to_string()).unwrap_or_else(|| "default".into());
+                            prompt_line("free space to keep on this region's disk (e.g. 500G, 1T, or `default`)", Some(&current))?
+                        }
                     };
+                    if text.trim().eq_ignore_ascii_case("default") {
+                        let was = pvfs_core::sync::clear_region_floor(engine.data_dir(), &id)?;
+                        let floor = engine.region_floors()?.into_iter().find(|r| r.region == id).map(|r| r.floor);
+                        if json {
+                            println!("{}", serde_json::json!({"region": id, "floor_bytes": floor, "set": false, "cleared": was}));
+                        } else {
+                            println!(
+                                "{id} keeps the default floor for its disk{}{}",
+                                floor.map(|f| format!(", {}", fmt_bytes(f))).unwrap_or_default(),
+                                if was { " (the floor set before is cleared)" } else { " (none was set)" }
+                            );
+                        }
+                        return engine.close();
+                    }
                     let bytes = parse_size(text.trim())?;
                     pvfs_core::sync::set_region_floor(engine.data_dir(), &id, bytes)?;
                     if json {
-                        println!("{{\"region\":\"{id}\",\"floor_bytes\":{bytes}}}");
+                        println!("{{\"region\":\"{id}\",\"floor_bytes\":{bytes},\"set\":true}}");
                     } else {
-                        println!("{id} keeps {bytes} bytes free before it takes new files");
+                        println!("{id} keeps {} free before it takes new files", fmt_bytes(bytes));
                     }
                     engine.close()
                 }

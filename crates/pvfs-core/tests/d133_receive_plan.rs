@@ -134,6 +134,17 @@ fn the_plan_follows_the_table() {
     let conflicts = e.view_conflicts().unwrap();
     assert_eq!(conflicts.len(), 2);
     assert!(conflicts.iter().all(|c| matches!(c.state, ViewState::ConflictHashes(_))));
+
+    // PVOS D233 — a receiving region under its floor takes nothing new: the
+    // staging-only file is skipped, and says why. (A replacement still goes
+    // to the region that holds the copy it replaces.)
+    sync::set_region_floor(e.data_dir(), &rl, u64::MAX).unwrap();
+    let (items, skips) = e.receive_plan(&Rules::default()).unwrap();
+    assert!(!items.iter().any(|i| i.rel_path == "Movies/New (2024)/new.mkv"), "{items:?}");
+    assert!(
+        skips.iter().any(|s| s.rel_path == "Movies/New (2024)/new.mkv" && s.why.contains("free-space floor")),
+        "{skips:?}"
+    );
     e.close().unwrap();
 }
 

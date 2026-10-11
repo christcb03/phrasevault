@@ -8,7 +8,7 @@ This manual covers everyday use of the `pvfs` command-line tool and sharing fore
 > attachment kinds, and the swarm data plane) **and what main has added since, unreleased**, up to
 > the build the media fleet runs (`v1.4-549`, rolled 2026-10-04): ingest sessions (§7.12) and the
 > **region model** — each box catalogues its own disk, the merged view and its mount (writable
-> since that roll, with known problems: §7.13), the mover, the trash, copies of the log and moving
+> since that roll; its known problems fixed by PVOS D233: §7.13), the mover, the trash, copies of the log and moving
 > the owner (§7.13). Future work is under
 > [Roadmap](#11-roadmap).
 
@@ -788,7 +788,7 @@ ones as a whole before they are kept.
 - `--allow-other` lets other users read it (root, mergerfs, containers); it
   needs `user_allow_other` in `/etc/fuse.conf`.
 - `--writable` (PVOS D217; off by default) also lets files be created and
-  edited through the mount — below, with its known problems.
+  edited through the mount — below.
 
 What the view accepts, because a media manager importing an upgrade needs it:
 **delete** a file (the box that holds each copy at that path moves it to its
@@ -807,59 +807,44 @@ pvfs --forest media mount --view /mnt/pvfs/Media --allow-other --cache-mode stre
 
 Off by default, because it changes what Plex and the arrs may do to the
 library through this path (PVOS D217; on the fleet since `v1.4-549`,
-2026-10-04). With it:
+2026-10-04; made safe by PVOS D233). With it:
 
-- **Edit a file this box already holds.** It can be opened for writing,
-  written and truncated in place: the bytes go to the real file in its region
-  on this box, and the `watch` job hashes it again afterwards — until then the
-  catalogue still lists the old hash.
-- **A file held only on another box is still refused** (`EROFS`). Nothing is
-  copied here to be edited.
+- **Edit a file this box holds — the file at the path you opened.** It can
+  be opened for writing, written and truncated in place: the bytes go to that
+  file in its region on this box, and the `watch` job hashes it again
+  afterwards. Until then the catalogue still lists the old hash, but the
+  mount answers from the file itself: its size and time from the disk, its
+  reads from the file, so what you wrote reads back at once.
+- **Refused (`EROFS`, "Read-only file system"), with the reason in the
+  mount's log (`pvfs.mount.edit_refused`):**
+  - a file held only on another box — nothing is copied here to be edited;
+  - a path the view has more than one copy of (on two disks or two boxes):
+    an edit of one would set the copies against each other;
+  - a file in a draining (staging) region.
 - **Create a file.** It is made on this box, in one of the catalogue regions
   this box holds that does not drain — the one that already holds the file's
   folder (the placement rule, below) — and it is listed and readable through
-  this mount at once. Other boxes see it once this box's watch has hashed it
-  and published. A box with no such region (an ingest box whose only region
-  drains) still refuses creates.
-- **Delete a file created this way before it is catalogued** and it is
-  removed outright: there is no catalogued copy yet to send to a trash.
-
-The mount's start-up line still says `read-only` with `--writable`, and `df`
-on the mount still reports no free space.
-
-**Known problems (2026-10-04, PVOS D218 §2.1).** All six are open in
-`v1.4-549`, the build the fleet runs. Read them before turning `--writable`
-on, and before editing anything through a mount that has it:
-
-1. **An edit can change the wrong file.** An edit or a truncate is applied to
-   the first file on this box *with the same content* — not to the file that
-   was opened. If the file has a byte-identical twin on this box (the same
-   subtitle or episode filed twice; every empty file is a twin of every other
-   empty file), the twin is changed and the file you opened is not. Until
-   this is fixed, do not edit through the mount a file that may have an
-   identical copy on the same box.
-2. **The free-space floor is not always kept.** A new file at the view's
-   root, or in a folder that no region with room holds — created through the
-   mount, or pulled by `receive` — goes to the region with the most free
-   space, and that region's floor (below) is not checked.
-3. **A created file can drop out of the listing.** If the `watch` job has not
-   catalogued a new file within 10 minutes of its creation — a large or slow
-   copy — the mount stops showing it (`No such file or directory`) until it
-   is catalogued. Its bytes are still on the disk, in the region's folder.
-4. **Deleting a new file is a hard delete.** Until a created file is
-   catalogued, `rm` through the mount removes it for good: no trash, nothing
-   to restore — for as long as that takes, up to the 10 minutes above.
-5. **Truncating or renaming a new file fails.** Until a created file is
-   catalogued, both answer `Input/output error` (`EIO`). A tool that writes a
-   temporary file and renames it into place fails, and leaves the temporary
-   file behind.
-6. **The mount checks no per-user permissions.** With `--allow-other`, any
-   local user can create, overwrite, truncate, delete and rename library
-   files through the mount, with the rights of the user who mounted it.
+  this mount at once, and stays so until this box's watch has catalogued and
+  hashed it, however long that takes. Other boxes see it once the watch has
+  hashed it and published. A box with no such region (an ingest box whose
+  only region drains) still refuses creates. **With every disk it could go
+  on under its floor, a create is refused** with `ENOSPC` ("No space left
+  on device"), and the mount logs `pvfs.mount.create_refused`.
+- **Rename, truncate and delete work on a file just written** — created or
+  edited and not yet hashed again. A delete moves it to its region's trash
+  (restorable, like every other deletion). A tool that writes a temporary
+  file and renames it over the real one works: the file it replaces goes to
+  the trash.
+- **Only the user who mounted it (and root) may write.** The kernel checks
+  each caller against what the mount reports — owner the mounting user,
+  files `0644`, folders `0755` — so any other user can read, and nothing
+  more. mergerfs runs as root and passes the caller's own user through.
+- `df` on the mount reports the free space of the disks a create may use,
+  net of their floors.
 
 Mounting without `--writable` (PVOS's fleet play: `pvfs_mount_writable`)
-removes problems 1 and 3–5, and 2 for creates. It does not remove 6 for
-deletes and renames, which the view accepts either way.
+refuses creates and edits; deletes and renames still go through, by the
+mounting user only.
 
 Restarting the daemon does not end a stream open through the mount;
 restarting the mount does. So a mount may stay on an older build across an
@@ -917,18 +902,19 @@ The **floor** is the free space a region's disk keeps in reserve: per region,
 local to this box.
 
 ```bash
+pvfs region floor                  # this box's regions, each floor and its free space; at a terminal, asks which to change
+pvfs region floor <region>         # shows that region's floor and asks for the new one
 pvfs region floor <region> 1T      # 500G, 1T, or bytes
-pvfs region floor <region>         # bare: asks
+pvfs region floor <region> default # back to the default for its disk
 ```
 
 With nothing set, the floor is 5 % of the disk, capped at 500 GB. A set floor
 is the line `floor <region> <bytes>` in this box's `.pvfs/placement` file.
-Two things to know. The bare prompt offers `[500G]`, so pressing Enter
-**writes an explicit 500 GB floor**, not the default: a region whose disk has
-less than 500 GB free then stops attracting files by their folder — on a disk
-smaller than that, for good. And no command shows a floor or returns a region
-to the default. The floor is not checked in every case: known problem 2,
-above.
+The floor is a floor (PVOS D233): a region under it takes nothing new, and
+with every region under its floor nothing is placed at all — a create through
+a writable view is refused with `ENOSPC`, and `receive` leaves the file on
+staging and says why (`every receiving region is under its free-space
+floor`).
 
 #### The trash
 
@@ -1048,8 +1034,7 @@ are as recorded on 2026-09-30:
 All three run `v1.4-549-gea84559`, rolled 2026-10-04 at about 1:00 PM
 (`v1.4-495` before that, from 2026-09-27). mediabox's library mount is
 writable — `pvfs --forest /opt/pvfs/media mount --allow-other --view
-/mnt/pvfs/Media --cache-mode stream --writable` — so the known problems
-above apply to it; feederbox's view mount has neither `--writable` nor a
+/mnt/pvfs/Media --cache-mode stream --writable`; feederbox's view mount has neither `--writable` nor a
 `--cache-mode`. `mediabox-local`, on `/mnt/local`, keeps a 1 TB floor (set
 with `pvfs region floor`; from the roll session's summary, not read back).
 
@@ -1247,10 +1232,10 @@ second copy of the index while it runs.
 | `pvfs region quality [region]` | What is known of each catalogue region's video quality: measured, unmeasured, unreadable (ffprobe said "invalid data" twice, 30+ min apart — it loses to a measured copy) and suspect (once), and whether this box has ffprobe. The daemon's watch measures (PVOS D208, D211). |
 | `pvfs region probe-remote [region] [on\|off]` | The regions THIS box measures with ffprobe for the box that holds them, reading the bytes from it over the LAN (a holder further than 10 ms is skipped); the holder writes its own rows. For a holder with no ffprobe (the NAS). Bare: lists them and asks (PVOS D211). |
 | `pvfs region drain <region> on\|off` · `receive <region> on\|off` · `retention <region> <days>` | Staging (fleet-wide) · this box's receiving library region · how long its trash is kept (§7.13). |
-| `pvfs region floor <region> [size]` | The free space this box keeps in reserve on a region's disk (`500G`, `1T`, bytes): under it, the region stops attracting new files (PVOS D216; §7.13). Default 5 % of the disk, capped at 500 GB. Bare, it asks, and Enter writes an explicit 500 GB. |
+| `pvfs region floor [region] [size\|default]` | The free space this box keeps in reserve on a region's disk (`500G`, `1T`, bytes): under it, the region takes no new files, and with every region under it nothing is placed (PVOS D216, D233; §7.13). Default 5 % of the disk, capped at 500 GB; `default` returns to it. Bare, it lists this box's regions, floors and free space and asks which to change; with a region and no size it shows the floor and asks. |
 | `pvfs view ls [dir]` · `pvfs view conflicts` | The merged view, one level at a time · every path where two regions disagree (§7.13). |
 | `pvfs view receive [--dry-run]` · `pvfs view resolve [--dry-run]` | Run the mover's two halves now (§7.13). |
-| `pvfs mount --view <dir> [--cache-mode keep\|stream] [--cache-max <size>] [--cache-age <age>] [--allow-other] [--writable]` | The merged view as a filesystem; bytes from this box or read through by hash. `--cache-max` (500G) and `--cache-age` (1d) bound what `keep` keeps. `--writable` (PVOS D217; off by default) allows edits of files this box holds, and new files — read its known problems first (§7.13). |
+| `pvfs mount --view <dir> [--cache-mode keep\|stream] [--cache-max <size>] [--cache-age <age>] [--allow-other] [--writable]` | The merged view as a filesystem; bytes from this box or read through by hash. `--cache-max` (500G) and `--cache-age` (1d) bound what `keep` keeps. `--writable` (PVOS D217, D233; off by default) allows edits of files only this box holds, and new files placed by folder (§7.13). Only the mounting user and root may write. |
 | `pvfs trash ls\|restore [path]` · `pvfs trash put <path> --region <id>` | What was moved aside on this box, and putting it back · one region's copy to its trash (§7.13). |
 | `pvfs forest tip` · `pvfs forest fence [--clear]` | This box's copy of the log (seq, hash, owner or replica, fenced?) · an owner's fence (§7.13). |
 | `pvfs forest backup [--to <dir>] [--keep <days>]` · `pvfs forest restore <copy> <dir>` | A dated copy of the log, verified by a full replay · a replica directory from one (§7.13). |

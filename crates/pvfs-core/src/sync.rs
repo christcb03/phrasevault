@@ -2084,6 +2084,19 @@ pub fn set_region_floor(data_dir: &Path, id: &NodeId, bytes: u64) -> Result<()> 
     save_placement(data_dir, &p)
 }
 
+/// PVOS D233 — forget a floor set with [`set_region_floor`]: the region goes
+/// back to [`default_floor_for`] its disk. `true` when one was set.
+pub fn clear_region_floor(data_dir: &Path, id: &str) -> Result<bool> {
+    let mut p = load_placement_full(data_dir)?;
+    let before = p.floor.len();
+    p.floor.retain(|(r, _)| r != id);
+    if p.floor.len() == before {
+        return Ok(false);
+    }
+    save_placement(data_dir, &p)?;
+    Ok(true)
+}
+
 /// D216 — the free space this region was TOLD to keep, if any. `None` means
 /// nothing was configured and [`default_floor_for`] decides from the disk.
 pub fn region_floor_setting(data_dir: &Path, id: &str) -> Result<Option<u64>> {
