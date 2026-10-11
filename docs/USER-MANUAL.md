@@ -932,7 +932,18 @@ pvfs trash ls                                   # every region on this box: day,
 pvfs trash ls "TV/Andor (2022)"                 # a file or a folder
 pvfs trash restore "TV/Andor (2022)/Season 01"  # back where it was; never over a file that is there
 pvfs trash restore "Movies/…" --from 20720      # an older day (the number ls shows)
+pvfs trash restore "Movies/…" --from 20720.1    # exactly that version (PVOS D234)
 ```
+
+**Every version is kept** (PVOS D234). A path trashed again on a day that
+already holds it goes to that day's next bucket — `20720.1`, `20720.2`, … —
+so a second deletion never replaces the first. `trash ls` shows the bucket
+next to the date when it is not the day's first. `restore` takes the newest
+version unless `--from` names a day (that day's newest) or a bucket (that
+one). Bare at a terminal, a file with several versions lists them and asks.
+A day's buckets are purged together, by retention. An older build does not
+see `<day>.<n>` buckets (it neither lists nor purges them) until this one is
+back.
 
 `pvfs trash put <path> --region <id>` moves **one** region's copy to its
 trash, from any box (it asks the box that holds the region), and only while
