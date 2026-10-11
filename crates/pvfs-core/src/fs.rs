@@ -2538,8 +2538,24 @@ impl Engine {
             };
             let opt = |s: &str| (s != "-").then(|| s.to_string());
             let mtime_ms = num(f[3], "mtime")?;
+            // PVOS D235 — a row is checked before anything uses it: its hash
+            // names files (`receive`'s `<hash>.partial`, the read-through
+            // cache) and its path names places on this box's disk. One bad
+            // row refuses the manifest: it is attested by the region's
+            // owner, so a bad row is a bad publisher, not a typo.
+            let rel_path = unesc(f[1]);
+            let row = |why: &str| bad("manifest", &format!("row {}: {why}", i + 1));
+            if f[0] != "file" && f[0] != "dir" {
+                return Err(row(&format!("kind {:?} is neither file nor dir", f[0])));
+            }
+            if f[4] != "-" && !Self::is_content_hash(f[4]) {
+                return Err(row("the content hash is not 64 lowercase hex characters"));
+            }
+            if rel_path.starts_with('/') || rel_path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+                return Err(row("the path is not relative, or has an empty, `.` or `..` part"));
+            }
             rows.push(RegionEntry {
-                rel_path: unesc(f[1]),
+                rel_path,
                 kind: f[0].to_string(),
                 size_bytes: num(f[2], "size")?,
                 mtime_ms,
@@ -3785,6 +3801,11 @@ impl Engine {
         for b in self.local_bindings()? {
             if declared.contains(&b.folder_id) && self.is_catalogue_region(&b.folder_id)? {
                 let root = uri_to_path(&b.source_uri)?;
+                // PVOS D235 — a root that cannot show its marker is a volume
+                // that may not be mounted: nothing new goes there.
+                if !crate::sync::root_marker_present(&root) {
+                    continue;
+                }
                 let measure = || crate::ingest::free_space_at(&root).unwrap_or(0);
                 let free = match std::fs::metadata(&root) {
                     Ok(m) => {
@@ -3965,6 +3986,12 @@ impl Engine {
                 continue;
             }
             let root = uri_to_path(&b.source_uri)?;
+            // PVOS D235 — as `receiving_roots`: a create through the view never
+            // lands in the empty mountpoint of a volume that is not there (the
+            // next watch would adopt it and its sweep drop every row).
+            if !crate::sync::root_marker_present(&root) {
+                continue;
+            }
             let measure = || crate::ingest::free_space_at(&root).unwrap_or(0);
             let free = match std::fs::metadata(&root) {
                 Ok(m) => {
@@ -4011,6 +4038,12 @@ impl Engine {
             above_floor_bytes: acc.above_floor_bytes + free.saturating_sub(*floor),
             free_files: acc.free_files + files,
         }))
+    }
+
+    /// PVOS D235 — a content hash as PVFS writes one: blake3, 64 lowercase
+    /// hex characters. Anything else is never a file name here.
+    pub fn is_content_hash(h: &str) -> bool {
+        h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 
     /// D133 — a relative path this box will write under a root: no `..`, no

@@ -1113,9 +1113,11 @@ can't read).
 
 - Your **recovery phrase** (shown once at `forest init`) regenerates your keys. Store it safely.
 - Move a forest to a new machine: copy the whole mount (including `.pvfs/`), then
-  `pvfs recover --mnemonic "<phrase>"` to re-derive this machine's device key.
+  `pvfs recover` (it asks for the phrase with no echo, or reads it from stdin;
+  PVOS D235) to re-derive this machine's device key.
 - Revoke a lost/compromised key: `pvfs device revoke --pubkey <hex>` (signed by your admin device;
-  add `--mnemonic "<phrase>"` to root-sign). Its already-signed history stays valid.
+  `--via-companion` root-signs with no phrase typed; `--mnemonic` still works but warns — the
+  phrase lands in your shell history). Its already-signed history stays valid.
 
 Your **recovery phrase** is needed only for recovery — admitting/revoking members is signed by your
 everyday admin device, not the phrase (doc 09 §2.2).

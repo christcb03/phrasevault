@@ -110,3 +110,43 @@ fn lease_refuses_other_connections_and_dies_with_its_holder() {
     }
     assert!(freed, "the lease must die with its holder");
 }
+
+/// PVOS D235 — the lease blocks every other writer under its roots, so a key
+/// that may not write each of them is refused it. Any authenticated key
+/// could take it before (D218 §2.2): a member with read rights only, or a
+/// key the forest has never enrolled.
+#[test]
+fn a_key_that_may_not_write_the_roots_cannot_take_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let key = || identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let (writer, reader, stranger) = (key(), key(), key());
+    for (k, rights) in [(&writer, acl::ACL_R | acl::ACL_W), (&reader, acl::ACL_R)] {
+        let pk = crypto::pubkey_bytes(k);
+        engine.authorize_member(&owner_mn, &pk).unwrap();
+        engine.set_acl(&root, &Principal::Key(pk), rights).unwrap();
+    }
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let connect = |k: &identity::SigningKey| {
+        let pk = crypto::pubkey_bytes(k);
+        Client::connect_signed(&sock, &pk, |d| crypto::sign_digest(k, d).unwrap()).unwrap()
+    };
+
+    let mut r = connect(&reader);
+    assert!(r.claim_write_lease(std::slice::from_ref(&root)).is_err(), "a member that may only read is refused");
+    let mut s = connect(&stranger);
+    assert!(s.claim_write_lease(std::slice::from_ref(&root)).is_err(), "a key the forest never enrolled is refused");
+    let mut w = connect(&writer);
+    w.claim_write_lease(std::slice::from_ref(&root)).expect("a key that may write every root takes it");
+}

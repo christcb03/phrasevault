@@ -55,10 +55,15 @@ enum Cmd {
     Forest(ForestCmd),
     /// Low-level: initialize a forest at the raw state dir (prefer `pvfs forest init`)
     Init,
-    /// Recover onto this machine from a recovery phrase
+    /// Recover onto this machine from a recovery phrase: re-derive this
+    /// machine's device key for the forest whose data dir is here (copied
+    /// back, restored with `pvfs forest restore`, or still in place). The
+    /// phrase is asked with no echo at a terminal, or read from stdin.
     Recover {
+        /// PVOS D235: optional, and best left off — on the command line the
+        /// phrase lands in the shell history and the process list
         #[arg(long)]
-        mnemonic: String,
+        mnemonic: Option<String>,
         #[arg(long, default_value_t = 0)]
         device_index: u64,
     },
@@ -456,8 +461,9 @@ enum Cmd {
     Bindings,
     /// Show this binary's version numbers — and, in a forest, the version the
     /// on-disk projection is at. What an upgrade needs to decide whether it can
-    /// roll box by box (D71): a `proto` change is fleet-wide and needs the
-    /// version handshake, while a `schema` change is a per-box cache rebuild.
+    /// roll box by box (D71): a `schema` change is a per-box cache rebuild,
+    /// and a `proto` bump rolls box by box too when it is additive — every
+    /// one since protocol 4 has been (the version handshake, D63, D174).
     Versions,
     /// Node + per-location availability (target: URI / path / node id)
     Stat { target: String },
@@ -1107,12 +1113,15 @@ enum LocCmd {
 
 #[derive(Subcommand)]
 enum DeviceCmd {
-    /// Authorize a new device key (requires the recovery phrase)
+    /// Authorize a new device key (requires the recovery phrase: asked with
+    /// no echo at a terminal, or read from stdin)
     Authorize {
+        /// PVOS D235: optional, and best left off (shell history, process list)
         #[arg(long)]
-        mnemonic: String,
+        mnemonic: Option<String>,
+        /// The device index; asked at a terminal when omitted
         #[arg(long)]
-        index: u64,
+        index: Option<u64>,
     },
     /// Authorize an external member's device key by public key (doc 09 §2.2).
     /// Signed by your admin device (no phrase); pass --mnemonic to root-sign, or
@@ -1373,8 +1382,8 @@ fn serve_job_parser() -> clap::builder::PossibleValuesParser {
 
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// Enable a job in `serve.jobs`; the daemon picks it up on SIGHUP or
-    /// restart
+    /// Enable a job in `serve.jobs`; the running daemon notices the change
+    /// by itself within seconds (it watches the file)
     Enable {
         /// The job (`--help` says what each one does); bare, at a terminal,
         /// it lists the jobs and asks
@@ -3252,7 +3261,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             mnemonic,
             device_index,
         } => {
-            let m = identity::parse_mnemonic(&mnemonic)?;
+            let m = identity::parse_mnemonic(&phrase_from(mnemonic, "recovery phrase")?)?;
             let engine = Engine::recover(&legacy, &m, device_index)?;
             if json {
                 println!(
@@ -4887,9 +4896,16 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             let state_dir = ctx?;
             match dev {
                 DeviceCmd::Authorize { mnemonic, index } => {
+                    let index = match index {
+                        Some(i) => i,
+                        None => prompt_line("device index to authorize (a number; 0 is the first device)", None)?
+                            .trim()
+                            .parse()
+                            .map_err(|_| PvfsError::BadInput { field: "index".into(), reason: "a device index is a number".into() })?,
+                    };
+                    let m = identity::parse_mnemonic(&phrase_from(mnemonic, "recovery phrase")?)?;
                     // Root-signed — must go direct (phrase needed, can't proxy).
                     let mut engine = Engine::open(&state_dir)?;
-                    let m = identity::parse_mnemonic(&mnemonic)?;
                     let pk = engine.authorize_device(&m, index)?;
                     engine.close()?;
                     if json {
@@ -4945,7 +4961,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     let mut engine = Engine::open(&state_dir)?;
                     match mnemonic {
-                        Some(mn) => engine.authorize_member(&identity::parse_mnemonic(&mn)?, &pk)?,
+                        Some(mn) => engine.authorize_member(&identity::parse_mnemonic(&phrase_from(Some(mn), "")?)?, &pk)?,
                         None => engine.authorize_member_by_device(&pk)?,
                     }
                     engine.close()?;
@@ -5014,7 +5030,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     }
                     let mut engine = Engine::open(&state_dir)?;
                     match mnemonic {
-                        Some(mn) => engine.revoke_device(&identity::parse_mnemonic(&mn)?, &pk)?,
+                        Some(mn) => engine.revoke_device(&identity::parse_mnemonic(&phrase_from(Some(mn), "")?)?, &pk)?,
                         None => engine.revoke_by_device(&pk)?,
                     }
                     engine.close()?;
@@ -6036,8 +6052,8 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                 println!("{{\"pubkey\":\"{pubkey}\"}}");
             } else {
                 println!("client identity : key:{pubkey}");
-                println!("authorize it on a forest with:");
-                println!("  pvfs device authorize-member --mnemonic <owner-phrase> --pubkey {pubkey}");
+                println!("authorize it on a forest, from a device of that forest's admin (no phrase needed):");
+                println!("  pvfs device authorize-member --pubkey {pubkey}");
             }
             Ok(())
         }
@@ -6394,7 +6410,7 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     if json {
                         println!("{{\"job\":\"{job}\",\"{verb}\":true,\"changed\":{changed}}}");
                     } else if changed {
-                        println!("{job} {verb} — the daemon picks it up on SIGHUP or restart");
+                        println!("{job} {verb} — the running daemon notices it by itself within seconds");
                     } else {
                         println!("{job} already {verb}");
                     }
@@ -7257,7 +7273,9 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     let (mut engine, id) = engine_and_node(ctx, &target)?;
                     // Prompts over flags — at a terminal. A script that passes
                     // nothing gets what it always got: a log region, no grant.
-                    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    // PVOS D235 — D198's rule: stdin AND stderr a terminal
+                    // (Ansible's pty fooled a stdin-only test).
+                    let interactive = interactive();
                     let catalogue = catalogue
                         || (interactive
                             && prompt_line(
@@ -8615,9 +8633,10 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
                     None,
                 )?,
             };
-            let pk = hex::decode(&pubkey).map_err(|_| PvfsError::BadInput {
+            // PVOS D235 — as `pvfs whoami` prints it (`key:<hex>`) or bare hex.
+            let pk = hex::decode(pubkey.trim().trim_start_matches("key:")).map_err(|_| PvfsError::BadInput {
                 field: "pubkey".into(),
-                reason: "must be hex (pvfs whoami prints it)".into(),
+                reason: "must be hex, or key:<hex> as `pvfs whoami` prints it".into(),
             })?;
             let rights = match rights {
                 Some(r) => r,
@@ -9996,7 +10015,7 @@ fn forest_cmd(
                     Err(e) => {
                         eprintln!(
                             "note: could not self-enroll this box's client identity ({e}) — \
-                             run `pvfs fleet enroll $(pvfs whoami)` when convenient"
+                             run `pvfs whoami` here, then `pvfs fleet enroll <that key>` on the owner"
                         );
                         return None;
                     }
@@ -10676,7 +10695,7 @@ fn forest_cmd(
                 println!("This box writes nothing while fenced. Lift the fence only when this box");
                 println!("really is the forest's writer:");
                 println!("  * another box was promoted: do not lift it — make this box a replica of");
-                println!("    the new owner (PVFS doc 28 §5) and retire this directory;");
+                println!("    the new owner (PVFS doc 28 §6) and retire this directory;");
                 println!("  * this box was restored behind its followers: promote the most advanced");
                 println!("    follower instead (promote.yml).");
                 if !interactive() {
@@ -11353,6 +11372,36 @@ fn pick_job(answer: &str) -> Result<String, PvfsError> {
             reason: format!("{a:?} is not a job — one of: {}", names.join(", ")),
         }),
     }
+}
+
+/// PVOS D235 — a recovery phrase, never needed on the command line: the flag
+/// when a script passes one (with a warning), else asked with no echo at a
+/// terminal, else one line from stdin (`printf '%s\n' "$PHRASE" | pvfs
+/// recover`).
+fn phrase_from(flag: Option<String>, what: &str) -> Result<String, PvfsError> {
+    use std::io::IsTerminal;
+    if let Some(p) = flag {
+        eprintln!(
+            "warning: the recovery phrase was given on the command line — it is in your shell history now, \
+             and was in the process list while this ran. Leave --mnemonic off to be asked (or pipe it in on stdin)."
+        );
+        return Ok(p);
+    }
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        return rpassword::prompt_password(format!("{what} (not shown): ")).map_err(|e| PvfsError::io("read the phrase", e));
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| PvfsError::io("read the phrase from stdin", e))?;
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        return Err(PvfsError::BadInput {
+            field: "mnemonic".into(),
+            reason: "no recovery phrase: run it at a terminal to be asked, or pipe the phrase in on stdin".into(),
+        });
+    }
+    Ok(line)
 }
 
 fn prompt_line(what: &str, default: Option<&str>) -> Result<String, PvfsError> {

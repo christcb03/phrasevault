@@ -15,6 +15,12 @@ echo "==> Assembling app bundle at: $OUT"
 rm -rf "$OUT"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 cp "$APP_SRC/Info.plist" "$OUT/Contents/Info.plist"
+# PVOS D235 — the app says the version it was built from: the workspace's,
+# and the commit count as the build number (the checked-in plist said 1.1.0).
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
+BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$OUT/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$OUT/Contents/Info.plist"
 cp "$ROOT/target/release/pvfs-companion" "$MACOS_DIR/pvfs-companion"
 chmod +x "$MACOS_DIR/pvfs-companion"
 

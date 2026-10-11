@@ -1,6 +1,6 @@
 [Unit]
 Description=PVFS per-user daemon for forest %i
-Documentation=https://github.com/openclaw/phrasevault
+Documentation=https://github.com/christcb03/phrasevault
 After=network.target
 # Rate-limit restart storms. These keys belong in [Unit] — in [Service] systemd
 # ignores them with an "Unknown key name" warning (seen in the pipeline journal).

@@ -5,6 +5,33 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **D218's contained PVFS leftovers (PVOS D235).**
+  - **A region manifest's rows are checked before anything uses them**: a
+    content hash is 64 lowercase hex characters, a kind is `file` or `dir`,
+    a path is relative with no empty, `.` or `..` part — or the manifest is
+    refused. A region owner could publish a "hash" like `../../x`, and
+    `receive` named its partial from it (`<hash>.partial`, outside its
+    folder). `receive` refuses such an item itself too.
+  - **`ClaimWriteLease` needs write rights on every root it claims**; any
+    authenticated key could take the forest's write lease before.
+  - **A root that cannot show its `.pvfs-root` takes no new files**:
+    `writable_roots` (a create through the view) and `receiving_roots`
+    (`receive`) leave it out, so an unmounted volume's empty mountpoint is
+    never written to (the next watch would adopt it and sweep the region's
+    rows). Adopting a marker-less library stays the watch's.
+  - **The recovery phrase is never needed on the command line**: `pvfs
+    recover` and `pvfs device authorize` ask for it with no echo at a
+    terminal, or read it from stdin; `--mnemonic` still works, with a
+    warning. `device authorize --index` is asked when omitted.
+  - `pvfs fleet enroll` takes the key as `pvfs whoami` prints it
+    (`key:<hex>`); program text that said otherwise is fixed (`whoami`,
+    the self-enroll note, `forest fence`'s doc 28 §6, `serve enable`, `versions
+    --help`); `region mark` asks only when stdin and stderr are terminals;
+    `pvfsd@.service` names the right repository; the companion app is
+    stamped with the workspace's version at build.
+  - INSTALL: `pvfs recover` needs the forest's data dir — bring it back
+    (`pvfs forest restore`, `pvfs replica add`) before recovering on a new
+    machine.
 - **The trash keeps every version (PVOS D234).**
   - A deletion went to `.pvfs-trash/<day>/<path>` by `rename(2)`, so a
     second deletion of a path on one day replaced the first in the trash.

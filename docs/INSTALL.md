@@ -98,7 +98,7 @@ its log, must be there — copied back, or still in place):
 
 ```bash
 export PVFS_DATA_DIR="$HOME/pvfs-test-forest"
-pvfs recover --mnemonic "<your 24 words>"   # the flag is required: recover does not prompt
+pvfs recover        # asks for the 24 words with no echo (PVOS D235); a script pipes them in on stdin
 ```
 
 Run the automated CLI smoke suite locally:
@@ -428,7 +428,7 @@ from the instance currently holding the socket.
 | Forgot the vault passphrase | `unlock failed: wrong passphrase or corrupt vault` | Delete the vault file, re-run `init` with your written-down phrase. |
 | Keychain entry deleted / OS reinstalled | `status` warns the key is not retrievable | Delete the vault file, re-run `init` with your phrase. |
 | `no companion running at …` | Any `--via-companion` command | Start it: `pvfs-companion serve`. |
-| Machine died entirely | — | On the new machine: `pvfs recover --mnemonic "<phrase>"`, then `pvfs-companion init` with the same phrase. Your identity key derives identically, so memberships and tags carry over. |
+| Machine died entirely | — | On the new machine, bring the forest back first: `pvfs forest restore` from a `pvfs forest backup` copy, or `pvfs replica add` from a box that follows it. Then `pvfs recover` in it (it asks for the phrase) to re-derive this machine's device key — `recover` needs the forest's data dir and does not rebuild a lost one — and `pvfs-companion init` with the same phrase. Your identity key derives identically, so memberships and tags carry over. |
 | Identity key compromised | a machine that held the unlocked companion was breached | `pvfs identity replace` — one command: new key, old grants re-issued, prints a handoff for other forests (their owners run `pvfs member replace <file>`). |
 
 ---
