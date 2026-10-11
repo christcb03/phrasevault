@@ -230,7 +230,10 @@ receiving region is the one that already holds the file's folder — among
 several, the one holding a file with the same stem; a region under its
 free-space floor is passed over (`pvfs region floor`; default 5 % of the
 disk, at most 500 GB); else the emptiest. D217's `create` through the view
-uses the same rule, §10 phase 6.)*
+uses the same rule, §10 phase 6. PVOS D233, 2026-10-11: the floor is a
+floor — "the emptiest" is the emptiest above its floor, and with every
+region under its floor nothing is placed: `receive` skips the file, a
+create answers `ENOSPC`.)*
 
 *D167 (2026-09-17): the trash can be read and undone.* `pvfs trash ls [PATH]`
 lists, for every folder bound on the box it runs on, each trashed file — the

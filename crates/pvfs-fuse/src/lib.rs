@@ -60,6 +60,8 @@ pub struct PvfsFs {
     /// every file payload decoded, and a library scan can call `statfs` in a
     /// loop, so it is worth not recomputing per call.
     capacity: Option<((u64, u64), std::time::Instant)>,
+    /// PVOS D233 — a writable view's free space, and when it was measured.
+    space: Option<(pvfs_core::WritableSpace, std::time::Instant)>,
     /// D130 (doc 26 phase 6) — the VIEW mount: inodes are relative paths in
     /// the merged view, not nodes. `view` picks the mode for every handler.
     view: bool,
@@ -70,8 +72,10 @@ pub struct PvfsFs {
     /// header, and a person should ask for that explicitly.
     writable: bool,
     /// D217 — handles opened for writing, so `write`/`setattr` cannot touch a
-    /// read handle, and `read` keeps its existing path.
-    write_handles: HashMap<u64, std::fs::File>,
+    /// read handle, and `read` keeps its existing path. PVOS D233: with the
+    /// view path each was opened at, so the overlay knows when the last one
+    /// on a file closes.
+    write_handles: HashMap<u64, WriteHandle>,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     /// Directory listings, cached briefly: a library scan issues thousands
@@ -107,6 +111,12 @@ pub struct PvfsFs {
 }
 
 type Tombstones = Arc<std::sync::Mutex<HashMap<String, Tomb>>>;
+
+/// PVOS D233 — one handle open for writing: the real file, and the view path.
+struct WriteHandle {
+    file: std::fs::File,
+    rel: String,
+}
 
 /// One path deleted through this mount: the hashes that went to the trash,
 /// when, and — per region — the catalogue seq this box held at that moment.
@@ -218,6 +228,7 @@ impl PvfsFs {
                 pvfs_client::advertise::replica_route(data_dir, is_replica).unwrap_or(None)
             },
             capacity: None,
+            space: None,
             view: false,
             ino_to_path: HashMap::new(),
             path_to_ino: HashMap::new(),
@@ -267,6 +278,20 @@ impl PvfsFs {
             self.engine.total_file_bytes().unwrap_or((0, 0))
         };
         self.capacity = Some((v, std::time::Instant::now()));
+        v
+    }
+
+    /// PVOS D233 — [`Engine::writable_space`], cached for a minute like the
+    /// byte total: a copy can call `statfs` per file.
+    fn writable_space(&mut self) -> pvfs_core::WritableSpace {
+        const TTL: Duration = Duration::from_secs(60);
+        if let Some((v, at)) = self.space {
+            if at.elapsed() < TTL {
+                return v;
+            }
+        }
+        let v = self.engine.writable_space().unwrap_or_default();
+        self.space = Some((v, std::time::Instant::now()));
         v
     }
 
@@ -479,7 +504,11 @@ impl PvfsFs {
             // the moment it exists, not from the moment the watch job hashes
             // it: `ls` right after a write has to show it.
             for f in o.remembered_files_in(dir) {
-                if list.iter().any(|e| e.rel_path == f) {
+                // PVOS D233 — a catalogued entry at the path hides the file
+                // made here only while it is still shown: one a delete or a
+                // rename onto it buried is not (the new file was invisible
+                // until the catalogue caught up).
+                if list.iter().any(|e| e.rel_path == f && self.without_the_deleted(e.clone()).is_some()) {
                     continue;
                 }
                 if let Some(path) = o.remembers_file(&f) {
@@ -531,23 +560,27 @@ impl PvfsFs {
             }
             Overlay::merge(rel, pieces)
         };
+        // D217 — a file this mount created, before the watch job has it.
+        let made = |o: &Overlay| {
+            let path = o.remembers_file(rel)?;
+            let m = std::fs::metadata(&path).ok()?;
+            let mtime_ms = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(overlay::remembered_file(rel, m.len(), mtime_ms))
+        };
         let Some(e) = found.filter(Self::view_shown) else {
             self.tombstones.lock().unwrap().remove(rel); // the catalogue has caught up
-            // D217 — a file this mount created, before the watch job has it.
-            if let Some(path) = o.remembers_file(rel) {
-                if let Ok(m) = std::fs::metadata(&path) {
-                    let mtime_ms = m
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    return Some(overlay::remembered_file(rel, m.len(), mtime_ms));
-                }
-            }
-            return o.remembers_dir(rel).then(|| overlay::remembered_dir(rel));
+            return made(&o).or_else(|| o.remembers_dir(rel).then(|| overlay::remembered_dir(rel)));
         };
-        self.without_the_deleted(e)
+        // PVOS D233 — a catalogued file deleted (or renamed onto) through this
+        // mount and a new file made at its path: the new one shows, not
+        // nothing. D217 answered ENOENT for a file created where one had just
+        // been deleted — an arr's delete-then-write of a subtitle.
+        self.without_the_deleted(e).or_else(|| made(&o))
     }
 
     /// D170 — bring the session thread's tables up to date with what the
@@ -648,34 +681,44 @@ impl PvfsFs {
         if entry.kind == "dir" {
             return reply.error(libc::EISDIR);
         }
-        // D217 — a file created through this mount has no catalogued copy for
-        // the first half-minute of its life (the `watch` job has not hashed it
-        // yet). Deleting it then is a plain unlink of the bytes `create` wrote,
-        // not a trip to a region's trash: there is nothing yet to restore it
-        // from, and refusing cost an `rm` an I/O error (found on the fleet,
-        // 2026-10-04, by a tool doing exactly that).
-        let made = self.overlay.lock().unwrap().remembers_file(&rel);
-        if let Some(path) = made {
-            if std::fs::remove_file(&path).is_err() && path.exists() {
-                return reply.error(libc::EIO);
+        // PVOS D233 — a file this mount WROTE (made here, or edited since the
+        // catalogue last hashed it) goes to its region's trash from where it
+        // is, whatever the catalogue says of its bytes: a just-created file
+        // has no row to check it against, and an edited one no longer matches
+        // its row. D217 unlinked a just-created file outright — no trash, for
+        // as long as it was uncatalogued (D218 §2.1 item 4); every other
+        // deletion through PVFS is soft (D145, D169).
+        let mut dead: HashSet<String> = HashSet::new();
+        let written = self.overlay.lock().unwrap().written(&rel);
+        if let Some(w) = &written {
+            if std::fs::symlink_metadata(&w.path).is_ok() {
+                match pvfs_core::sync::move_to_trash_with_sidecar(&w.root, &w.path) {
+                    Ok(to) => {
+                        pv_info!("pvfs.mount.deleted", path = content(&rel), trash_path = content(to.display());
+                            "mount: delete of {rel} — the file written here is in the trash at {}", to.display());
+                    }
+                    Err(e) => {
+                        pv_error!("pvfs.mount.delete_failed", path = content(&rel), error = content(&e);
+                            "mount: delete of {rel} failed: {e}");
+                        return reply.error(libc::EIO);
+                    }
+                }
             }
-            let mut o = self.overlay.lock().unwrap();
-            o.made_files.remove(&rel);
-            o.dirty = true;
-            drop(o);
+            // what the catalogue still lists for it there is dead too
+            dead.extend(entry.sources.iter().filter(|c| c.region == w.region).filter_map(|c| c.content_hash.clone()));
+            self.overlay.lock().unwrap().forget_written(&rel);
             self.view_cache.clear();
-            return reply.ok();
         }
         let copies: Vec<(String, String)> = entry
             .sources
             .iter()
             .filter(|c| c.kind == "file")
+            .filter(|c| written.as_ref().is_none_or(|w| w.region != c.region))
             .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), h)))
             .collect();
-        if copies.is_empty() {
+        if copies.is_empty() && written.is_none() {
             return reply.error(libc::EIO);
         }
-        let mut dead: HashSet<String> = HashSet::new();
         let mut elsewhere: Vec<(String, String)> = Vec::new();
         for (region, hash) in copies {
             match self.engine.trash_region_path(&region, &rel, &hash) {
@@ -771,8 +814,15 @@ impl PvfsFs {
                 "mount: rename of {from} refused — `{newname}` is a name the catalogue passes over");
             return reply.error(libc::EPERM);
         }
+        // PVOS D233 — a file this mount wrote (made, or edited since the last
+        // hash) moves on its own disk with no check of its bytes against a
+        // row: a just-created file has none, and an edited one no longer
+        // matches its own. D217 answered EIO, and every write-a-temp-then-
+        // rename tool failed and left its temp behind (D218 §2.1 item 5).
+        let written_from = if is_dir { None } else { self.overlay.lock().unwrap().written(&from) };
         // What is at `to`.
         let mut replaced: Vec<(String, String)> = Vec::new();
+        let mut written_to: Option<(overlay::Written, HashSet<String>)> = None;
         if let Some(target) = self.view_entry_of(&to) {
             if flags & libc::RENAME_NOREPLACE != 0 {
                 return reply.error(libc::EEXIST);
@@ -788,35 +838,65 @@ impl PvfsFs {
                     }
                 }
                 (false, false) => {
+                    // PVOS D233 — a file written here goes to its region's
+                    // trash from where it is (the rows there are dead too).
+                    written_to = self.overlay.lock().unwrap().written(&to).map(|w| {
+                        let dead: HashSet<String> = target
+                            .sources
+                            .iter()
+                            .filter(|c| c.region == w.region)
+                            .filter_map(|c| c.content_hash.clone())
+                            .collect();
+                        (w, dead)
+                    });
                     replaced = target
                         .sources
                         .iter()
                         .filter(|c| c.kind == "file")
+                        .filter(|c| written_to.as_ref().is_none_or(|(w, _)| w.region != c.region))
                         .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), h)))
                         .collect();
-                    if replaced.is_empty() {
+                    if replaced.is_empty() && written_to.is_none() {
                         return reply.error(libc::EIO);
                     }
                 }
             }
         }
         let copies: Vec<RenameCopy> = if is_dir {
-            entry.sources.iter().filter(|c| c.kind == "dir").map(|c| (c.region.clone(), None)).collect()
+            let mut v: Vec<RenameCopy> =
+                entry.sources.iter().filter(|c| c.kind == "dir").map(|c| (c.region.clone(), None)).collect();
+            // PVOS D233 — and every region holding a file written here under
+            // it, which the catalogue may not list the folder in yet: the
+            // file must move with its folder (as `rmdir` reaches `made_regions`).
+            for r in self.overlay.lock().unwrap().written_regions_under(&from) {
+                if !v.iter().any(|c| c.0 == r) {
+                    v.push((r, None));
+                }
+            }
+            v
         } else {
             entry
                 .sources
                 .iter()
                 .filter(|c| c.kind == "file")
+                .filter(|c| written_from.as_ref().is_none_or(|w| w.region != c.region))
                 .filter_map(|c| c.content_hash.clone().map(|h| (c.region.clone(), Some((h, c.size_bytes)))))
                 .collect()
         };
         // A file move carries the hashes that moved, so a NEW file at the old
         // name is not dragged along; a folder takes everything under it.
-        let moved_hashes: Option<HashSet<String>> =
-            (!is_dir).then(|| copies.iter().filter_map(|c| c.1.as_ref().map(|(h, _)| h.clone())).collect());
+        // PVOS D233 — a written file's own rows move with it (the rows follow
+        // the rename on disk), so its hash is one that moved, not one buried.
+        let moved_hashes: Option<HashSet<String>> = (!is_dir).then(|| {
+            let mut hs: HashSet<String> = copies.iter().filter_map(|c| c.1.as_ref().map(|(h, _)| h.clone())).collect();
+            if let Some(w) = &written_from {
+                hs.extend(entry.sources.iter().filter(|c| c.region == w.region).filter_map(|c| c.content_hash.clone()));
+            }
+            hs
+        });
         let moved_regions: HashSet<String> = copies.iter().map(|c| c.0.clone()).collect();
         let overlay = Arc::clone(&self.overlay);
-        if copies.is_empty() {
+        if copies.is_empty() && written_from.is_none() {
             if !is_dir {
                 return reply.error(libc::EIO);
             }
@@ -834,6 +914,17 @@ impl PvfsFs {
 
         // 1. What is in the way goes to the trash (ours now).
         let mut dead: HashSet<String> = HashSet::new();
+        if let Some((w, rows)) = &written_to {
+            if std::fs::symlink_metadata(&w.path).is_ok() {
+                if let Err(e) = pvfs_core::sync::move_to_trash_with_sidecar(&w.root, &w.path) {
+                    pv_error!("pvfs.mount.rename_failed", path = content(&from), new_path = content(&to), error = content(&e);
+                        "mount: rename of {from} failed — the file written at {to} could not be trashed: {e}");
+                    return reply.error(libc::EIO);
+                }
+            }
+            dead.extend(rows.iter().cloned());
+            overlay.lock().unwrap().forget_written(&to);
+        }
         let mut replaced_elsewhere: Vec<(String, String)> = Vec::new();
         for (region, hash) in replaced {
             match self.engine.trash_region_path(&region, &to, &hash) {
@@ -848,10 +939,25 @@ impl PvfsFs {
                 }
             }
         }
-        // 2. Our own copies.
+        // 2. Our own copies — a file written here first.
         let mut done_here: Vec<RenameCopy> = Vec::new();
         let mut elsewhere: Vec<RenameCopy> = Vec::new();
         let mut moved_any = false;
+        let mut written_moved: Option<overlay::Written> = None;
+        if let Some(w) = &written_from {
+            match self.engine.rename_written_path(&w.region, &w.root, &from, &to) {
+                Ok(pvfs_core::RenamedHere::Moved | pvfs_core::RenamedHere::AlreadyDone) => {
+                    moved_any = true;
+                    written_moved = Some(w.clone());
+                }
+                Ok(pvfs_core::RenamedHere::Gone) => {}
+                other => {
+                    pv_warn!("pvfs.mount.rename_refused", path = content(&from), error = content(format!("{other:?}"));
+                        "mount: rename of {from} refused here: {other:?}");
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
         for c in copies {
             match self.engine.rename_region_path(&c.0, &from, &to, &expect(&c)) {
                 Ok(pvfs_core::RenamedHere::Moved) => {
@@ -867,12 +973,16 @@ impl PvfsFs {
                     for d in &done_here {
                         let _ = self.engine.rename_region_path(&d.0, &to, &from, &expect(d));
                     }
+                    if let Some(w) = &written_moved {
+                        let _ = self.engine.rename_written_path(&w.region, &w.root, &to, &from);
+                    }
                     return reply.error(libc::EIO);
                 }
             }
         }
         let held = overlay::held_seqs(&self.engine);
         let tombs = Arc::clone(&self.tombstones);
+        let written_was_moved = written_moved.is_some();
         let remember = {
             let (from, to) = (from.clone(), to.clone());
             move |mut dead: HashSet<String>| {
@@ -890,6 +1000,9 @@ impl PvfsFs {
                 let mut o = overlay.lock().unwrap();
                 if moved_hashes.is_none() {
                     o.rename_made_dirs(&from, &to);
+                    o.rename_written_under(&from, &to);
+                } else if written_was_moved {
+                    o.rename_written(&from, &to);
                 }
                 o.made_dirs.remove(&to);
                 // the holders made the folders on the way to `to`: a folder
@@ -913,12 +1026,15 @@ impl PvfsFs {
         std::thread::spawn(move || {
             let sources = sources.unwrap_or_else(|| pvfs_client::hash_cache::announced_sources(&data_dir));
             let put_back_here = |done_here: &[RenameCopy]| {
-                if done_here.is_empty() {
+                if done_here.is_empty() && written_moved.is_none() {
                     return;
                 }
                 if let Ok(engine) = Engine::open(&data_dir) {
                     for d in done_here {
                         let _ = engine.rename_region_path(&d.0, &to, &from, &expect(d));
+                    }
+                    if let Some(w) = &written_moved {
+                        let _ = engine.rename_written_path(&w.region, &w.root, &to, &from);
                     }
                 }
             };
@@ -1077,12 +1193,37 @@ impl PvfsFs {
         let (kind, size, mtime, perm) = if e.kind == "dir" {
             (FileType::Directory, 0, e.mtime_ms, 0o755)
         } else {
-            let (size, mtime) = Self::view_served(e)
-                .map(|(_, s, m)| (s, m))
+            // PVOS D233 — a file written through this mount answers from its
+            // disk until the catalogue has caught up with it: the catalogue's
+            // size is the bytes before the write, and the kernel takes it
+            // again after `TTL` — an append read back a second later came
+            // back cut to the old length.
+            let (size, mtime) = self
+                .written_attrs(&e.rel_path)
+                .or_else(|| Self::view_served(e).map(|(_, s, m)| (s, m)))
                 .unwrap_or((e.size_bytes, e.mtime_ms));
             (FileType::RegularFile, size, mtime, 0o644)
         };
         self.plain_attr(ino, kind, size, mtime, perm)
+    }
+
+    /// PVOS D233 — the size and mtime (ms) on disk of a file this mount wrote
+    /// and the catalogue has not caught up with.
+    fn written_attrs(&self, rel: &str) -> Option<(u64, u64)> {
+        let o = self.overlay.lock().unwrap();
+        if o.made_files.is_empty() && o.edited_files.is_empty() {
+            return None;
+        }
+        let w = o.written(rel)?;
+        drop(o);
+        let m = std::fs::metadata(&w.path).ok()?;
+        let mtime_ms = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Some((m.len(), mtime_ms))
     }
 
     fn plain_attr(&self, ino: u64, kind: FileType, size: u64, mtime_ms: u64, perm: u16) -> FileAttr {
@@ -1153,17 +1294,33 @@ impl PvfsFs {
             return Err(libc::EISDIR);
         }
         // D217 — a file created through this mount has no catalogued hash yet;
-        // its bytes are where `create` put them.
-        if let Some(path) = self.overlay.lock().unwrap().remembers_file(rel) {
-            let f = std::fs::File::open(&path).map_err(|_| libc::EIO)?;
-            let fh = self.next_fh;
-            self.next_fh += 1;
-            self.handles.insert(fh, f);
-            return Ok(fh);
+        // its bytes are where `create` put them. PVOS D233 — and a file edited
+        // through it reads from itself until the catalogue has hashed it again.
+        let written = self.overlay.lock().unwrap().written(rel);
+        if let Some(w) = written {
+            match std::fs::File::open(&w.path) {
+                Ok(f) => {
+                    let fh = self.next_fh;
+                    self.next_fh += 1;
+                    self.handles.insert(fh, f);
+                    return Ok(fh);
+                }
+                Err(_) if w.made => return Err(libc::EIO),
+                Err(_) => {} // gone from its disk: the catalogue's copies answer
+            }
         }
         let (hash, size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
         let fh = self.next_fh;
-        if let Some(lb) = self.engine.local_path_for_hash(&hash).ok().flatten() {
+        // PVOS D233 — this box's own copy AT THIS PATH first (when it is still
+        // the catalogued bytes), then any file here with the same bytes.
+        let local = self
+            .engine
+            .local_copy_at(rel, &hash)
+            .ok()
+            .flatten()
+            .filter(|lb| lb.size == size)
+            .or_else(|| self.engine.local_path_for_hash(&hash).ok().flatten());
+        if let Some(lb) = local {
             let f = std::fs::File::open(&lb.path).map_err(|_| libc::EIO)?;
             self.next_fh += 1;
             self.handles.insert(fh, f);
@@ -1609,15 +1766,25 @@ impl Filesystem for PvfsFs {
     ///
     /// `unlink`/`rmdir`/`rename` still work — they retire catalog entries, and
     /// none of them needs free space.
+    ///
+    /// PVOS D233 — a WRITABLE view can be written to, and says how much: the
+    /// free space of the disks `create` places on, net of their floors, and
+    /// their free inodes. A tool that checks free space before it writes
+    /// (an arr's import, a copy) was refused by the zeroes. mergerfs ignores
+    /// this branch's statfs on mediabox (`statfs_ignore=nc`, the branch is
+    /// `NC`), so it changes nothing there.
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         const BSIZE: u32 = 512;
         let (bytes, files) = self.capacity();
+        let space = if self.writable && self.view { self.writable_space() } else { Default::default() };
+        let bfree = space.free_bytes / BSIZE as u64;
+        let bavail = space.above_floor_bytes / BSIZE as u64;
         reply.statfs(
-            bytes.div_ceil(BSIZE as u64), // blocks: what the tree holds
-            0,                            // bfree
-            0,                            // bavail — nothing can be written here
-            files,                        // inodes in use
-            0,                            // ffree
+            bytes.div_ceil(BSIZE as u64).saturating_add(bfree), // blocks: what the tree holds, and the room
+            bfree,                                        // bfree
+            bavail,                                       // bavail — 0 unless writable
+            files.saturating_add(space.free_files),       // inodes
+            space.free_files,                             // ffree
             BSIZE,
             255, // NAME_MAX, matching the label cap the catalog enforces
             BSIZE,
@@ -1648,7 +1815,7 @@ impl Filesystem for PvfsFs {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -1661,7 +1828,7 @@ impl Filesystem for PvfsFs {
         if let Some(new_len) = size {
             // D217 tier 1 — truncate is an edit like any other, and gated the
             // same way: this box must already hold the bytes.
-            match self.truncate_local(ino, new_len) {
+            match self.truncate_local(ino, new_len, fh) {
                 Ok(()) => return self.getattr(_req, ino, reply),
                 Err(e) => return reply.error(e),
             }
@@ -1900,7 +2067,13 @@ impl Filesystem for PvfsFs {
             Ok(d) if !d.is_empty() => d,
             _ => return reply.error(libc::EROFS),
         };
-        let (_region, root) = self.engine.placement_for(&rel, &dests);
+        // PVOS D233 — nowhere when every disk is under its floor: the floor is
+        // a floor (D218 §2.1 item 2), not a preference a full disk loses.
+        let Some((region, root)) = self.engine.placement_for(&rel, &dests) else {
+            pv_warn!("pvfs.mount.create_refused", path = content(&rel), error_kind = "disk:floor";
+                "mount: create of {rel} refused — every disk it could go on is under its free-space floor (`pvfs region floor`)");
+            return reply.error(libc::ENOSPC);
+        };
         let path = root.join(&rel);
         if let Some(p) = path.parent() {
             if std::fs::create_dir_all(p).is_err() {
@@ -1913,8 +2086,8 @@ impl Filesystem for PvfsFs {
         };
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.write_handles.insert(fh, f);
-        self.overlay.lock().unwrap().remember_file(&rel, path);
+        self.write_handles.insert(fh, WriteHandle { file: f, rel: rel.clone() });
+        self.overlay.lock().unwrap().remember_file(&rel, path, root, &region);
         let ino = self.view_ino(&rel);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1941,33 +2114,41 @@ impl Filesystem for PvfsFs {
         reply: fuser::ReplyWrite,
     ) {
         use std::os::unix::fs::FileExt;
-        let Some(f) = self.write_handles.get(&fh) else {
+        let Some(h) = self.write_handles.get(&fh) else {
             return reply.error(libc::EBADF);
         };
-        match f.write_at(data, offset as u64) {
+        match h.file.write_at(data, offset as u64) {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _datasync: bool, reply: fuser::ReplyEmpty) {
-        match self.write_handles.get(&fh) {
-            Some(f) => match f.sync_all() {
+    /// PVOS D233 — off the session thread: syncing a large written file
+    /// takes as long as the disk takes, and fuser's session is one thread —
+    /// every Plex read waited behind it (D218 §2.1 item 7). A reply may be
+    /// sent from any thread (D165).
+    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
+        let Some(h) = self.write_handles.get(&fh) else {
+            return reply.ok();
+        };
+        let f = match h.file.try_clone() {
+            Ok(f) => f,
+            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        std::thread::spawn(move || {
+            match if datasync { f.sync_data() } else { f.sync_all() } {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
-            },
-            None => reply.ok(),
-        }
+            }
+        });
     }
 
-    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock_owner: u64, reply: fuser::ReplyEmpty) {
-        match self.write_handles.get(&fh) {
-            Some(f) => match f.sync_all() {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
-            },
-            None => reply.ok(),
-        }
+    /// PVOS D233 — a `close(2)` is not an `fsync(2)`, here as on any disk:
+    /// the bytes are already in the real file (each `write` went to it), and
+    /// a caller that wants them on the platter says so with `fsync`. D217
+    /// synced here, on the session thread.
+    fn flush(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _lock_owner: u64, reply: fuser::ReplyEmpty) {
+        reply.ok()
     }
 
     fn release(
@@ -1981,8 +2162,12 @@ impl Filesystem for PvfsFs {
         reply: fuser::ReplyEmpty,
     ) {
         // D217 — a write handle closes here too; the `watch` job picks the
-        // changed bytes up and re-hashes them.
-        self.write_handles.remove(&fh);
+        // changed bytes up and re-hashes them. PVOS D233 — the overlay may
+        // forget the file once its last write handle is gone and the
+        // catalogue has caught up.
+        if let Some(h) = self.write_handles.remove(&fh) {
+            self.overlay.lock().unwrap().closed(&h.rel);
+        }
         if let Some(ino) = self.open_inos.remove(&fh) {
             if let Some((_, n)) = self.open_attrs.get_mut(&ino) {
                 *n -= 1;
@@ -2308,12 +2493,6 @@ impl PvfsFs {
 
 
 impl PvfsFs {
-    /// D217 tier 1 — open a file for writing, if this box holds its bytes.
-    ///
-    /// `EROFS` when the mount was not told to allow edits, and `EROFS` with
-    /// nothing attempted when the bytes live on another box: copying a whole
-    /// film across the network to change a header is a decision for a person,
-    /// not a side effect of `open`.
     /// D217 tier 1 — allow edits of files whose bytes this box already holds.
     /// Off by default: turning it on is a mount decision (`pvfs mount
     /// --writable`), because it changes what the arrs and Plex can do to the
@@ -2322,71 +2501,128 @@ impl PvfsFs {
         self.writable = yes;
     }
 
-    /// D217 tier 1 — shorten a file this box holds.
-    fn truncate_local(&mut self, ino: u64, new_len: u64) -> Result<(), i32> {
-        if !self.writable {
+    /// D217 tier 1 — shorten a file this box holds. PVOS D233 — through the
+    /// write handle when the call carries one (`ftruncate`), else the file an
+    /// edit of the path would write to ([`Self::write_target`]).
+    fn truncate_local(&mut self, ino: u64, new_len: u64, fh: Option<u64>) -> Result<(), i32> {
+        if !self.writable || !self.view {
             return Err(libc::EROFS);
         }
+        let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+        if let Some(h) = fh.and_then(|fh| self.write_handles.get(&fh)) {
+            return h.file.set_len(new_len).map_err(errno);
+        }
+        self.sync_overlay();
         let rel = self.ino_to_path.get(&ino).cloned().ok_or(libc::ENOENT)?;
-        let entry = self.view_entry_of(&rel).ok_or(libc::ENOENT)?;
-        let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
-        let local = self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&local.path)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        f.set_len(new_len).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+        let w = self.write_target(&rel)?;
+        let f = std::fs::OpenOptions::new().write(true).open(&w.path).map_err(errno)?;
+        f.set_len(new_len).map_err(errno)?;
+        self.overlay.lock().unwrap().remember_edit(&rel, w.path, w.root, &w.region, false);
+        Ok(())
     }
 
+    /// D217 tier 1 — open a file for writing, if this box holds its bytes.
+    ///
+    /// `EROFS` when the mount was not told to allow edits, and `EROFS` with
+    /// nothing attempted when the bytes live on another box: copying a whole
+    /// film across the network to change a header is a decision for a person,
+    /// not a side effect of `open`.
     fn open_for_write(&mut self, ino: u64) -> Result<u64, i32> {
-        if !self.writable {
+        if !self.writable || !self.view {
             return Err(libc::EROFS);
         }
-        let rel = if self.view {
-            self.sync_overlay();
-            self.ino_to_path.get(&ino).cloned().ok_or(libc::ENOENT)?
-        } else {
-            return Err(libc::EROFS);
-        };
-        let entry = self.view_entry_of(&rel).ok_or(libc::ENOENT)?;
-        if entry.kind == "dir" {
-            return Err(libc::EISDIR);
-        }
-        let made = self.overlay.lock().unwrap().remembers_file(&rel);
-        let target = match made {
-            Some(path) => path,
-            None => {
-                let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
-                // The gate: local bytes, which is what makes the edit cheap.
-                self.engine.local_path_for_hash(&hash).ok().flatten().ok_or(libc::EROFS)?.path
-            }
-        };
+        self.sync_overlay();
+        let rel = self.ino_to_path.get(&ino).cloned().ok_or(libc::ENOENT)?;
+        let w = self.write_target(&rel)?;
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&target)
+            .open(&w.path)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        self.overlay.lock().unwrap().remember_edit(&rel, w.path, w.root, &w.region, true);
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.write_handles.insert(fh, f);
+        self.write_handles.insert(fh, WriteHandle { file: f, rel });
         Ok(fh)
+    }
+
+    /// PVOS D233 — the file an edit of view path `rel` writes to: the file
+    /// THIS mount wrote there (made, or already being edited), else this
+    /// box's own copy AT THAT PATH ([`Engine::local_copy_at`]).
+    ///
+    /// D217 asked for any local file with the served hash, and with two
+    /// byte-identical files (every empty file is one) an edit of one changed
+    /// the other (D218 §2.1 item 1). Refused with `EROFS`, and said why:
+    /// - the bytes are on another box (D217 tier 1: no copy-up);
+    /// - the view has more than one copy of the path — an edit of one would
+    ///   set the copies against each other, and the ladder may then serve the
+    ///   old bytes, so the edit looks lost;
+    /// - the copy's region is draining (staging): the drain compares it with
+    ///   the library's copy, and a `create` never lands there either.
+    fn write_target(&mut self, rel: &str) -> Result<overlay::Written, i32> {
+        let written = self.overlay.lock().unwrap().written(rel);
+        if let Some(w) = written {
+            if std::fs::symlink_metadata(&w.path).is_ok_and(|m| m.is_file()) {
+                return Ok(w);
+            }
+        }
+        let entry = self.view_entry_of(rel).ok_or(libc::ENOENT)?;
+        if entry.kind == "dir" {
+            return Err(libc::EISDIR);
+        }
+        let refuse = |why: &str| {
+            pv_info!("pvfs.mount.edit_refused", path = content(rel), reason = why;
+                "mount: edit of {rel} refused — {why}");
+            libc::EROFS
+        };
+        let copies = entry.sources.iter().filter(|c| c.kind == "file").count();
+        if copies > 1 {
+            return Err(refuse(&format!(
+                "the view has {copies} copies of it, and an edit of one would set them against each other"
+            )));
+        }
+        let (hash, _size, _) = Self::view_served(&entry).ok_or(libc::EIO)?;
+        let Some(local) = self.engine.local_copy_at(rel, &hash).ok().flatten() else {
+            return Err(refuse("its bytes are on another box (an edit changes only a file this box holds)"));
+        };
+        if self.engine.region_drains(&local.region).unwrap_or(true) {
+            return Err(refuse("its region is draining"));
+        }
+        // `<root>/<rel>`: the root is as many levels up as `rel` has parts.
+        let root = local.path.ancestors().nth(rel.split('/').count()).ok_or(libc::EIO)?.to_path_buf();
+        Ok(overlay::Written { path: local.path, root, region: local.region, made: false })
     }
 }
 
 fn opts(auto_unmount: bool, allow_other: bool) -> Vec<MountOption> {
+    view_opts(auto_unmount, allow_other, false)
+}
+
+/// PVOS D233 — [`opts`], and for a VIEW mount `DefaultPermissions`: the
+/// kernel checks each caller against the attributes the view reports (owner
+/// the mounting user, files 0644, folders 0755), as on a disk. Without it any
+/// user could create, overwrite, truncate, delete and rename library files
+/// through an `--allow-other` mount with the mounting user's rights (D218
+/// §2.1 item 6). Root — mergerfs, `sudo` — passes as on a disk. The node
+/// mount reports 0444/0555 and would lose its own user's namespace writes
+/// (D71 W2), so it is left as it was.
+fn view_opts(auto_unmount: bool, allow_other: bool, view: bool) -> Vec<MountOption> {
     // D71 W2: NOT `MountOption::RO`. The kernel enforces that flag before any
     // handler runs, so `unlink`/`rmdir`/`rename` never saw the call — the lab
     // proved it, with `rm` returning EROFS against a mount whose handlers were
     // already implemented.
     //
-    // The data path stays read-only regardless: `write`, `create` and
-    // `truncate` are simply not implemented, so the kernel answers ENOSYS and
-    // mergerfs keeps routing creates to /mnt/local. What is now permitted is
-    // exactly the NAMESPACE — which is the whole point of W2, and the one
-    // place this design was behind the read-write rclone mounts it replaces.
+    // The data path is the handlers' to refuse: a node mount, and a view
+    // mount without `--writable`, answer EROFS to `create` and a write-open
+    // (D217), so mergerfs keeps routing creates to /mnt/local. What W2 added
+    // is the NAMESPACE — the one place this design was behind the read-write
+    // rclone mounts it replaces.
     let mut o = vec![MountOption::FSName("pvfs".into())];
     if allow_other {
         o.push(MountOption::AllowOther);
+    }
+    if view {
+        o.push(MountOption::DefaultPermissions);
     }
     if auto_unmount {
         o.push(MountOption::AutoUnmount);
@@ -2440,15 +2676,15 @@ pub fn mount_view_writable(
 ) -> Result<(), PvfsError> {
     let mut fs = PvfsFs::new_view_with(data_dir, cache.clone(), None)?;
     fs.set_writable(writable);
-    match fuser::mount2(fs, mountpoint, &opts(true, allow_other)) {
+    match fuser::mount2(fs, mountpoint, &view_opts(true, allow_other, true)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let mut fs = PvfsFs::new_view_with(data_dir, cache, None)?;
             fs.set_writable(writable);
             if allow_other {
-                return fuser::mount2(fs, mountpoint, &opts(false, true)).map_err(allow_other_denied);
+                return fuser::mount2(fs, mountpoint, &view_opts(false, true, true)).map_err(allow_other_denied);
             }
-            fuser::mount2(fs, mountpoint, &opts(false, false))
+            fuser::mount2(fs, mountpoint, &view_opts(false, false, true))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }
         Err(e) => Err(PvfsError::io("fuse mount", e)),
@@ -2484,12 +2720,12 @@ pub fn spawn_view_mount_writable(
 ) -> Result<fuser::BackgroundSession, PvfsError> {
     let mut fs = PvfsFs::new_view_with(data_dir, cache.clone(), sources.clone())?;
     fs.set_writable(writable);
-    match fuser::spawn_mount2(fs, mountpoint, &opts(true, false)) {
+    match fuser::spawn_mount2(fs, mountpoint, &view_opts(true, false, true)) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let mut fs = PvfsFs::new_view_with(data_dir, cache, sources)?;
             fs.set_writable(writable);
-            fuser::spawn_mount2(fs, mountpoint, &opts(false, false))
+            fuser::spawn_mount2(fs, mountpoint, &view_opts(false, false, true))
                 .map_err(|e| PvfsError::io("fuse mount", e))
         }
         Err(e) => Err(PvfsError::io("fuse mount", e)),
@@ -2599,5 +2835,16 @@ mod tests {
     fn a_mount_is_private_by_default() {
         assert!(!opts(true, false).contains(&MountOption::AllowOther));
         assert!(!opts(false, false).contains(&MountOption::AllowOther));
+    }
+
+    /// PVOS D233: a view mount has the kernel check each caller against the
+    /// attributes it reports; the node mount (0444/0555, namespace writes by
+    /// its own user) does not.
+    #[test]
+    fn a_view_mount_checks_permissions_and_a_node_mount_does_not() {
+        for (auto, other) in [(true, true), (false, true), (true, false), (false, false)] {
+            assert!(view_opts(auto, other, true).contains(&MountOption::DefaultPermissions));
+            assert!(!opts(auto, other).contains(&MountOption::DefaultPermissions));
+        }
     }
 }

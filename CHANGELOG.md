@@ -5,6 +5,50 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **The writable view, made safe (PVOS D233; D218 §2.1).**
+  - **An edit writes the file at the path opened.** D217 asked for any
+    local file with the served hash, so with two byte-identical files (every
+    empty file is one) an edit or a truncate of one changed the other. The
+    new `Engine::local_copy_at(rel, hash)` is this box's own file at that
+    path, whose row has that hash. An edit is refused (`EROFS`, with
+    `pvfs.mount.edit_refused` saying why) when the bytes are on another box,
+    when the view has more than one copy of the path, or when the copy's
+    region drains. A read prefers the copy at its own path too.
+  - **The floor is a floor.** `placement_for` returns `None` when no
+    destination has room above its floor; a file at the root is tested too.
+    A create through the view answers `ENOSPC` (`pvfs.mount.create_refused`),
+    and `receive` skips the file with the reason.
+  - **A file written through the mount stays in it until the catalogue has
+    caught up** — the region lists it hashed, at its size and mtime on disk
+    — never while a handle has it open, and with no clock. D217 forgot a
+    created file at ten minutes, or at the watch's first (unhashed) row.
+    Until then its size and time come from the disk and its reads from the
+    file, so an append reads back whole (D217 handed the kernel the
+    catalogue's old size again after a second).
+  - **Delete, rename and truncate work on a file just written.** A delete
+    sends it to its region's trash (D217 unlinked it). A rename moves it on
+    its own disk — `Engine::rename_written_path`, which writes no sidecar,
+    since one would pin the old bytes' hash to the new ones — and a file in
+    the way goes to the trash, so write-a-temp-then-rename works. A folder
+    rename reaches every region holding a file written under it. A file made
+    where one was just deleted shows (D217 answered `ENOENT` for it until
+    the catalogue caught up).
+  - **Permissions.** Every view mount has `DefaultPermissions`: the kernel
+    checks each caller against the attributes the view reports (owner the
+    mounting user, `0644`/`0755`). Any other user can still read; only the
+    owner and root can write, delete or rename.
+  - `flush` no longer syncs; `fsync` syncs off the session thread, so a
+    large file's close or sync no longer stalls every read.
+  - `statfs` on a writable view reports the free space of the disks a
+    create may use, net of their floors (a read-only view still reports 0).
+  - The mount's start-up line says whether it is writable. `pvfs region
+    floor` asks: bare it lists this box's regions with their floors and
+    free space, with a region and no size it shows the floor and asks, and
+    `default` returns a region to the default (`sync::clear_region_floor`).
+  - Tests: `pvfs-fuse/tests/d233_writable_view.rs` (each item on a real
+    mount), `d216_placement` (the hard floor), `d133_receive_plan` (the
+    skip), the smoke run (`region floor`).
+
 - **`pvfs trash unstick`, and root-run commands that leave nothing behind
   (PVOS D232).**
   - `sudo pvfs trash unstick` clears what the purge reports stuck.
