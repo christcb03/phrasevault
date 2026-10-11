@@ -32,7 +32,7 @@ use pvfs_proto::{
     IngestFileSpecWire, IngestFileWire, IngestSessionWire, NodeInfo, ServerMsg, SignedEventWire, WriteOp,
     DATA_CHUNK, PROTO_VERSION,
 };
-use pvfs_log::{actor, content, net, pv_error, pv_info, pv_notice, pv_warn};
+use pvfs_log::{actor, content, net, pv_debug, pv_error, pv_info, pv_notice, pv_warn};
 use rand::RngCore;
 
 /// How long a challenge stays valid.
@@ -1103,7 +1103,7 @@ fn note_authority(forest: &str, events: &[pvfs_core::event::Event], tip: Option<
 /// from (PVOS D222b): refusals are logged with the peer's address.
 pub fn serve_connection_from<S: io::Read + io::Write>(
     daemon: &Daemon,
-    mut stream: S,
+    stream: S,
     local: bool,
     peer: Peer,
 ) -> io::Result<()> {
@@ -1111,6 +1111,71 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
     // that releases the lease however this scope ends.
     let conn_id = daemon.next_conn.fetch_add(1, Ordering::Relaxed);
     let _lease_guard = LeaseGuard { daemon, conn: conn_id };
+    let mut stats = ConnStats::default();
+    let r = serve_connection_inner(daemon, stream, local, peer, conn_id, &mut stats);
+    note_conn_ended(peer, &stats, &r);
+    r
+}
+
+/// PVOS D236 — what one connection did, for the line that says why it ended.
+#[derive(Default)]
+struct ConnStats {
+    started: Option<std::time::Instant>,
+    /// The principal once sign-in completed (`None` before `Ready`).
+    principal: Option<String>,
+    requests: u64,
+    last_op: Option<&'static str>,
+    /// The op being served when an I/O error ended the connection.
+    in_op: Option<&'static str>,
+}
+
+/// PVOS D236 — say why a connection ended: one line per connection, at debug.
+/// Every reason here is expected in a fleet that restarts, rolls and drops
+/// idle sockets (Chris, 2026-10-11: expected behavior logs at debug); a
+/// fault that keeps going shows on the client, as a job that keeps failing.
+fn note_conn_ended(peer: Peer, st: &ConnStats, r: &io::Result<()>) {
+    let age_ms = st.started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
+    let who = st.principal.clone().unwrap_or_else(|| "-".into());
+    let last = st.last_op.unwrap_or("-");
+    let (reason, kind, detail) = match (r, st.principal.is_some(), st.in_op) {
+        // before sign-in completed: a refusal (D222b logs it), a hang-up, a
+        // TLS handshake that never finished
+        (Ok(()), false, _) => ("before_ready", "network:closed", String::new()),
+        (Err(e), false, _) => ("before_ready", conn_error_kind(e), format!(": {e}")),
+        (Ok(()), true, _) => ("peer_closed", "network:closed", String::new()),
+        (Err(e), true, Some(op)) => ("io_during_op", conn_error_kind(e), format!(" while serving {op}: {e}")),
+        (Err(e), true, None) => ("read_error", conn_error_kind(e), format!(": {e}")),
+    };
+    pv_debug!("pvfs.conn.ended", peer_addr = net(&peer.label()), principal = actor(&who), reason = reason, error_kind = kind,
+        duration_ms = age_ms, requests = st.requests, op = last;
+        "pvfsd: connection from {} ({}) ended — {reason}{detail}; open {:.1} s, {} request(s), last {last}",
+        peer.label(), &who[..who.len().min(12)], age_ms as f64 / 1000.0, st.requests);
+}
+
+/// PVOS D236 — the kind of an I/O error that ended a connection.
+fn conn_error_kind(e: &io::Error) -> &'static str {
+    use io::ErrorKind as K;
+    match e.kind() {
+        K::UnexpectedEof | K::BrokenPipe | K::ConnectionAborted => "network:closed",
+        K::ConnectionReset => "network:reset",
+        K::TimedOut | K::WouldBlock => "network:timeout",
+        K::InvalidData if e.to_string().to_ascii_lowercase().contains("tls") || e.get_ref().is_some_and(|i| i.to_string().contains("alert")) => {
+            "network:tls"
+        }
+        K::InvalidData => "protocol:frame",
+        _ => "network:io",
+    }
+}
+
+fn serve_connection_inner<S: io::Read + io::Write>(
+    daemon: &Daemon,
+    mut stream: S,
+    local: bool,
+    peer: Peer,
+    conn_id: u64,
+    stats: &mut ConnStats,
+) -> io::Result<()> {
+    stats.started = Some(std::time::Instant::now());
     // 1. challenge (nonce registered single-use, doc 08 §4 item 7)
     let (nonce, expiry_ms) = daemon.issue_nonce();
     write_msg(
@@ -1164,6 +1229,7 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
             principal: principal.display(),
         },
     )?;
+    stats.principal = Some(principal.display());
 
     // 3. request loop
     //
@@ -1204,6 +1270,10 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
         // slate: whatever this op refuses is logged after it.
         let op = req.op_name();
         take_refusal();
+        // PVOS D236 — what this connection was doing, if it ends now
+        stats.in_op = Some(op);
+        stats.requests += 1;
+        stats.last_op = Some(op);
         // Cat uses the data plane: it writes multiple frames to the stream
         // directly rather than returning a single ServerMsg.
         match req {
@@ -1233,6 +1303,7 @@ pub fn serve_connection_from<S: io::Read + io::Write>(
                 write_msg(&mut stream, &resp)?;
             }
         }
+        stats.in_op = None;
         note_refusal(daemon, &principal, peer, op);
     }
     Ok(())

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pvfs_client::follow::{self, FollowEvent};
 use pvfs_client::watch::{self, WatchEvent};
 use pvfs_core::{serve, PvfsError, Writer};
-use pvfs_log::{content, pv_info, pv_notice, pv_warn};
+use pvfs_log::{content, pv_debug, pv_info, pv_notice, pv_warn};
 use pvfs_proto::ServeJobWire;
 
 /// How often the supervisor wakes to notice shutdown/reload and reconcile.
@@ -321,6 +321,9 @@ struct FailingRun {
     logged: Option<String>,
     failed: u64,
     since_ms: u64,
+    /// PVOS D236 — whether this run has warned (its second failure on, or an
+    /// exit at once); a run that never did recovers quietly.
+    warned: bool,
 }
 
 impl JobsState {
@@ -626,20 +629,36 @@ impl JobsState {
     ///
     /// PVOS D222 — the line is logged here, where the job and the error are
     /// at hand (`pvfs.job.failed`), and returned for tests to read.
+    ///
+    /// PVOS D236 — by Chris's rule (2026-10-11: expected, self-healing
+    /// behavior logs at debug): a run's FIRST failure is debug, since the
+    /// next pass tries again and usually succeeds (a peer restarting, an idle
+    /// connection dropped); its second consecutive failure warns, and so does
+    /// each changed text after that. A thread's exit is not routine and warns
+    /// at once. Returns the line whenever one is logged, at either level.
     fn failed(&self, fault: Fault, err: &str) -> Option<String> {
-        {
+        let warn = {
             let mut runs = self.failing.lock().unwrap();
             let r = runs
                 .entry(fault)
-                .or_insert_with(|| FailingRun { logged: None, failed: 0, since_ms: now_ms() });
+                .or_insert_with(|| FailingRun { logged: None, failed: 0, since_ms: now_ms(), warned: false });
             r.failed += 1;
-            if r.logged.as_deref() == Some(err) {
+            let warn_now = r.failed >= 2 || matches!(fault, Fault::Exit(_));
+            if r.logged.as_deref() == Some(err) && (r.warned || !warn_now) {
                 return None;
             }
             r.logged = Some(err.to_string());
-        }
+            if warn_now {
+                r.warned = true;
+            }
+            warn_now
+        };
         let line = fault.failed_line(err);
-        pv_warn!("pvfs.job.failed", job = fault.job(), error = content(err); "{line}");
+        if warn {
+            pv_warn!("pvfs.job.failed", job = fault.job(), error = content(err); "{line}");
+        } else {
+            pv_debug!("pvfs.job.failed_once", job = fault.job(), error = content(err); "{line}");
+        }
         Some(line)
     }
 
@@ -648,10 +667,17 @@ impl JobsState {
     /// `Fault`); a stopped pass (D154) or a bare connect is none.
     ///
     /// PVOS D222 — logged here (`pvfs.job.recovered`), and returned.
+    ///
+    /// PVOS D236 — a run that never warned (one failure, then a pass that
+    /// completed) recovers at debug.
     fn recovered(&self, fault: Fault) -> Option<String> {
         let r = self.failing.lock().unwrap().remove(&fault)?;
         let span_ms = now_ms().saturating_sub(r.since_ms);
         let line = fault.recovered_line(r.failed, &failing_span(span_ms));
+        if !r.warned {
+            pv_debug!("pvfs.job.recovered_quietly", job = fault.job(), failures = r.failed, duration_ms = span_ms; "{line}");
+            return Some(line);
+        }
         pv_notice!("pvfs.job.recovered", job = fault.job(), failures = r.failed, duration_ms = span_ms; "{line}");
         Some(line)
     }
@@ -2205,11 +2231,12 @@ mod tests {
         let failed = |e: &str| format!("pvfsd: watch pass failed: {e}; retrying");
         let recovered = "pvfsd: watch recovered: a pass completed after";
 
-        assert_eq!(pass(WatchEvent::ScanError(eio.into())), [failed(eio)], "the first failure is said");
+        assert_eq!(pass(WatchEvent::ScanError(eio.into())), [failed(eio)], "the first failure is said (at debug, D236)");
         let r = st.row("watch").unwrap();
         assert_eq!(r.state, "backoff");
         assert_eq!(r.last_error.as_deref(), Some(eio), "the row is as before");
-        for _ in 0..3 {
+        assert_eq!(pass(WatchEvent::ScanError(eio.into())), [failed(eio)], "the second says it again, at warn (D236)");
+        for _ in 0..2 {
             assert!(pass(WatchEvent::ScanError(eio.into())).is_empty(), "a retry with the same text is not");
         }
         assert_eq!(
@@ -2233,6 +2260,48 @@ mod tests {
         assert_eq!(back.len(), 2, "{back:?}");
         assert!(back[0].starts_with(&format!("{recovered} 1 failed pass(es) over ")), "{back:?}");
         assert_eq!(back[1], "pvfsd: watch ingested f: +2 changed 0 removed 0 unlinked 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PVOS D236 — by Chris's rule: a run's first failure is debug (the next
+    /// pass usually succeeds), its second warns; a run that never warned
+    /// recovers at debug, one that did at notice; a thread's exit warns at
+    /// once.
+    #[test]
+    fn a_first_failure_is_debug_and_a_second_warns() {
+        use pvfs_log::Severity;
+        let dir = std::env::temp_dir().join(format!("pvfsd-d236-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = JobsState::load(dir.clone()).unwrap();
+        let lost = "I/O error during routed write: protocol: connection closed (to 192.168.1.142:7434, connected 600.0 s ago, idle 60.0 s before this commit_signed)";
+        let levels = |f: &dyn Fn()| -> Vec<(Severity, String)> {
+            pvfs_log::capture(f).into_iter().map(|r| (r.severity, r.event)).collect()
+        };
+        let once = levels(&|| {
+            watch_event(&st, WatchEvent::PassStarted);
+            watch_event(&st, WatchEvent::ScanError(lost.into()));
+            watch_event(&st, WatchEvent::PassStarted);
+            watch_event(&st, WatchEvent::Quiet);
+        });
+        assert!(once.contains(&(Severity::Debug, "pvfs.job.failed_once".into())), "{once:?}");
+        assert!(once.contains(&(Severity::Debug, "pvfs.job.recovered_quietly".into())), "{once:?}");
+        assert!(!once.iter().any(|(s, _)| *s <= Severity::Notice), "nothing at notice or above for a pass that recovers: {once:?}");
+
+        let twice = levels(&|| {
+            for _ in 0..2 {
+                watch_event(&st, WatchEvent::PassStarted);
+                watch_event(&st, WatchEvent::ScanError(lost.into()));
+            }
+            watch_event(&st, WatchEvent::PassStarted);
+            watch_event(&st, WatchEvent::Quiet);
+        });
+        assert!(twice.contains(&(Severity::Warning, "pvfs.job.failed".into())), "{twice:?}");
+        assert!(twice.contains(&(Severity::Notice, "pvfs.job.recovered".into())), "{twice:?}");
+
+        let exit = levels(&|| {
+            job_exited(&st, "follow", Err(PvfsError::BadInput { field: "replica".into(), reason: "not a replica".into() }));
+        });
+        assert_eq!(exit, vec![(Severity::Warning, "pvfs.job.failed".to_string())], "an exit warns at once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2261,11 +2330,12 @@ mod tests {
         let failed = |r: &str| format!("pvfsd: follow failed: {r}; retrying");
         let recovered = "pvfsd: follow recovered: current with its source after";
 
-        assert_eq!(retrying(refused), [failed(refused)], "the first failure is said");
+        assert_eq!(retrying(refused), [failed(refused)], "the first failure is said (at debug, D236)");
         let r = st.row("follow").unwrap();
         assert_eq!(r.state, "backoff");
         assert_eq!(r.last_error.as_deref(), Some(refused), "the row is as before");
-        for _ in 0..3 {
+        assert_eq!(retrying(refused), [failed(refused)], "the second says it again, at warn (D236)");
+        for _ in 0..2 {
             assert!(retrying(refused).is_empty(), "a retry with the same text is not");
         }
         let connected = FollowEvent::Connected { target: "192.168.1.119:7701" };
@@ -2321,7 +2391,11 @@ mod tests {
         let r = st.row("watch").unwrap();
         assert_eq!(r.state, "error", "the supervisor's cue");
         assert_eq!(r.last_error, Some(limit().to_string()), "the row is as before");
-        assert!(life(failing_start(), Err(limit())).is_empty(), "the restart that fails the same way is not said");
+        assert_eq!(
+            life(failing_start(), Err(limit())),
+            std::slice::from_ref(&pass_failed),
+            "the restart that fails the same way: the pass's second failure warns (D236), the exit is not said again"
+        );
 
         // the owner is back: the pass's run ends, the exit's goes on
         let back = life(clean_start(), Err(limit()));
@@ -2419,13 +2493,16 @@ mod tests {
         assert!(tb.purge_error.as_deref().is_some_and(|e| e.contains("read trash")), "{tb:?}");
         assert_eq!((tb.measured_ms, tb.bytes, tb.retention_days), (0, 0, 7), "{tb:?}");
 
-        assert!(trash_step(&st, roots(), &never).is_empty(), "the same failure is not said again");
+        let again = trash_step(&st, roots(), &never);
+        assert_eq!(again.len(), 1, "the second failure says it again, at warn (D236): {again:?}");
+        assert!(again[0].starts_with("pvfsd: trash purge failed: bbbbbbbb: "), "{again:?}");
+        assert!(trash_step(&st, roots(), &never).is_empty(), "the same failure is not said a third time");
 
         std::fs::remove_file(b.join(".pvfs-trash")).unwrap();
         let log = trash_step(&st, roots(), &never);
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(
-            log[0].starts_with("pvfsd: trash purge recovered: a step completed after 2 failed step(s) over "),
+            log[0].starts_with("pvfsd: trash purge recovered: a step completed after 3 failed step(s) over "),
             "{log:?}"
         );
         let t = st.trash_snapshot();
@@ -2488,13 +2565,18 @@ mod tests {
             st.pass_failed("catalogue", "database or disk is full".into()).as_deref(),
             Some("pvfsd: catalogue pass failed: database or disk is full; the next pass tries again")
         );
-        assert_eq!(st.pass_failed("catalogue", "database or disk is full".into()), None, "the same text is quiet");
+        assert_eq!(
+            st.pass_failed("catalogue", "database or disk is full".into()).as_deref(),
+            Some("pvfsd: catalogue pass failed: database or disk is full; the next pass tries again"),
+            "the second failure says it again, at warn (D236)"
+        );
+        assert_eq!(st.pass_failed("catalogue", "database or disk is full".into()), None, "the same text is quiet after that");
         let changed = st.pass_failed("catalogue", "I/O error during open index.db".into()).unwrap();
         assert!(changed.ends_with("I/O error during open index.db; the next pass tries again"), "{changed}");
         assert!(st.pass_failed("receive", "no space".into()).is_some(), "another job's run is its own");
         let rec = st.pass_done("catalogue", Some("2 files could not be read".into())).unwrap();
         assert!(
-            rec.starts_with("pvfsd: catalogue recovered: a pass completed after 3 failed pass(es) over "),
+            rec.starts_with("pvfsd: catalogue recovered: a pass completed after 4 failed pass(es) over "),
             "a pass with per-file issues still completed: {rec}"
         );
         assert_eq!(st.pass_done("catalogue", None), None, "said once");

@@ -5,6 +5,22 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Why a connection ended, at the level it deserves (PVOS D236).**
+  - pvfsd logs one `pvfs.conn.ended` line per connection, at debug: the
+    reason (`peer_closed`, `before_ready`, `read_error`, `io_during_op`
+    with the op), the peer, the principal, the connection's age, the
+    requests served and the last op. It used to end silently, so nobody
+    could say why the owner closed two routed-write connections on
+    2026-10-10.
+  - A request lost with its connection says which one: `to <peer>,
+    connected <age> ago, idle <idle> before this <op>`. The error's type is
+    unchanged, so D200 reads it as before.
+  - A job's failures follow Chris's rule (expected, self-healing behavior
+    logs at debug). A run's first failure is `pvfs.job.failed_once` at
+    debug, since the next pass usually succeeds. The second consecutive
+    failure is `pvfs.job.failed` at warn. A run that never warned recovers
+    at debug (`pvfs.job.recovered_quietly`). A thread's exit still warns at
+    once.
 - **D218's contained PVFS leftovers (PVOS D235).**
   - **A region manifest's rows are checked before anything uses them**: a
     content hash is 64 lowercase hex characters, a kind is `file` or `dir`,

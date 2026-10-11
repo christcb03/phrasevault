@@ -200,6 +200,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.companion.runtime_file` | notice | system | A runtime file was rewritten, or left to another instance. |
 | `pvfs.companion.runtime_file_failed` | warning | system | A runtime file could not be read, touched or rewritten; retried later. |
 | `pvfs.companion.took_over` | notice | system | A running instance was stopped and replaced. |
+| `pvfs.conn.ended` | debug | system | Why a connection to this daemon ended (PVOS D236): `reason` (`peer_closed`, `before_ready`, `read_error`, `io_during_op`), the peer, the principal, its age (`duration_ms`), `requests` and the last `op`. One per connection; expected behavior, so debug. |
 | `pvfs.daemon.config` | notice | system | At start: the forest, the role (owner/replica), the enabled jobs, the regions by kind, the listen address (D228). |
 | `pvfs.engine.close_failed` | warning | system | The runner's own engine did not close cleanly. |
 | `pvfs.fence.diverged` | warning | system | A routed write was refused: its log diverges from this owner's. |
@@ -212,8 +213,10 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.health.tip_unjudged` | warning | system | A peer's log tip could not be judged. |
 | `pvfs.ingest.save_failed` | error | system | ingest.sessions was not saved. |
 | `pvfs.ingest.sessions_unreadable` | error | system | ingest.sessions cannot be read; the daemon exits. |
-| `pvfs.job.failed` | warning | system | A job's pass, session, thread or trash step failed (once per run and per text). |
-| `pvfs.job.recovered` | notice | system | A job's run of failures ended. |
+| `pvfs.job.failed` | warning | system | A job's pass, session or trash step failed for the second time running, or its thread exited (once per run and per text; PVOS D236). |
+| `pvfs.job.failed_once` | debug | system | A job's pass, session or trash step failed for the first time in a run: the next one tries again, and usually succeeds (PVOS D236). |
+| `pvfs.job.recovered` | notice | system | A job's run of failures that had warned ended. |
+| `pvfs.job.recovered_quietly` | debug | system | A job's run that never warned (one failure) ended (PVOS D236). |
 | `pvfs.job.reload_failed` | warning | system | serve.jobs could not be reloaded; the old config is kept. |
 | `pvfs.lease.released` | notice | system | The write lease was released. |
 | `pvfs.lease.taken` | notice | system | A connection holds the write lease. |

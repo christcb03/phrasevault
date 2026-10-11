@@ -235,6 +235,11 @@ pub struct Client {
     /// set ([`Client::set_write_tip`]): an owner behind it fences itself
     /// instead of forking the forest.
     write_tip: Option<pvfs_proto::LogTipWire>,
+    /// PVOS D236 — when the connection was made, and when a reply last came
+    /// back: a lost request says how old the connection was and how long it
+    /// had sat idle.
+    opened: std::time::Instant,
+    last_reply: std::time::Instant,
 }
 
 impl Client {
@@ -329,7 +334,10 @@ impl Client {
     fn finish(mut stream: Stream, daemon_proto: u32) -> Result<Client> {
         match read_msg::<_, ServerMsg>(&mut stream)? {
             Some(ServerMsg::Ready { principal }) => {
-                Ok(Client { stream, principal, daemon_proto, write_tip: None })
+                {
+                    let now = std::time::Instant::now();
+                    Ok(Client { stream, principal, daemon_proto, write_tip: None, opened: now, last_reply: now })
+                }
             }
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
             Some(other) => Err(unexpected("Ready", &other)),
@@ -356,8 +364,27 @@ impl Client {
     fn request(&mut self, req: ClientMsg) -> Result<ServerMsg> {
         let op = req.op_name();
         let started = std::time::Instant::now();
+        let idle = started.duration_since(self.last_reply);
         let r = self.request_untimed(req);
         let took = started.elapsed();
+        // PVOS D236 — a connection-level failure says which connection: its
+        // peer, its age, how long it sat idle before this op. The error's
+        // type is kept, so D200's classification reads it as before.
+        let r = match r {
+            Ok(m) => {
+                self.last_reply = std::time::Instant::now();
+                Ok(m)
+            }
+            Err(ClientError::Io(e)) => {
+                let ctx = self.lost_context(op, idle);
+                Err(ClientError::Io(std::io::Error::new(e.kind(), format!("{e} ({ctx})"))))
+            }
+            Err(ClientError::Protocol(m)) => Err(ClientError::Protocol(format!("{m} ({})", self.lost_context(op, idle)))),
+            Err(e @ ClientError::Server { .. }) => {
+                self.last_reply = std::time::Instant::now();
+                Err(e)
+            }
+        };
         if client_wait_is_slow(pvfs_log::is_daemon(), op, took, slow_request_threshold()) {
             if let Some(suppressed) = pvfs_log::limit("pvfs.client.request_slow", op) {
                 let peer = self.stream.peer_label();
@@ -367,6 +394,16 @@ impl Client {
             }
         }
         r
+    }
+
+    /// PVOS D236 — `to <peer>, connected <age> ago, idle <idle> before this <op>`.
+    fn lost_context(&self, op: &str, idle: std::time::Duration) -> String {
+        format!(
+            "to {}, connected {:.1} s ago, idle {:.1} s before this {op}",
+            self.stream.peer_label(),
+            self.opened.elapsed().as_secs_f64(),
+            idle.as_secs_f64()
+        )
     }
 
     fn request_untimed(&mut self, req: ClientMsg) -> Result<ServerMsg> {
