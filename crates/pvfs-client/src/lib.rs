@@ -240,6 +240,10 @@ pub struct Client {
     /// had sat idle.
     opened: std::time::Instant,
     last_reply: std::time::Instant,
+    /// The peer as it was named while connected: after a reset the socket
+    /// can no longer say (`peer_addr` fails), which the lab showed — a lost
+    /// request read "to a peer" instead of the owner's address.
+    peer: String,
 }
 
 impl Client {
@@ -336,7 +340,8 @@ impl Client {
             Some(ServerMsg::Ready { principal }) => {
                 {
                     let now = std::time::Instant::now();
-                    Ok(Client { stream, principal, daemon_proto, write_tip: None, opened: now, last_reply: now })
+                    let peer = stream.peer_label();
+                    Ok(Client { stream, principal, daemon_proto, write_tip: None, opened: now, last_reply: now, peer })
                 }
             }
             Some(ServerMsg::Error { code, message }) => Err(ClientError::Server { code, message }),
@@ -387,7 +392,7 @@ impl Client {
         };
         if client_wait_is_slow(pvfs_log::is_daemon(), op, took, slow_request_threshold()) {
             if let Some(suppressed) = pvfs_log::limit("pvfs.client.request_slow", op) {
-                let peer = self.stream.peer_label();
+                let peer = self.peer.clone();
                 pvfs_log::pv_warn!("pvfs.client.request_slow", op = op, peer_addr = &peer,
                     duration_ms = took.as_millis() as u64, suppressed = suppressed, error_kind = "slow:request";
                     "pvfs: {op} to {peer} took {:.1} s", took.as_secs_f64());
@@ -400,7 +405,7 @@ impl Client {
     fn lost_context(&self, op: &str, idle: std::time::Duration) -> String {
         format!(
             "to {}, connected {:.1} s ago, idle {:.1} s before this {op}",
-            self.stream.peer_label(),
+            self.peer,
             self.opened.elapsed().as_secs_f64(),
             idle.as_secs_f64()
         )
