@@ -188,8 +188,23 @@ pub fn announced_sources(engine: &Engine) -> Vec<ReplicaSource> {
         .collect()
 }
 
+/// Where an item's bytes collect. The hash names the file, so the pulls
+/// that build it ([`pull_into_partial_progress`], `place`) refuse an item
+/// whose hash is not a content hash first (PVOS D235: a hash comes from a
+/// peer's manifest, and `../../x.partial` is a path outside this folder).
 pub fn partial_path(it: &ReceiveItem) -> PathBuf {
     it.dest_root.join(INCOMING).join(format!("{}.partial", it.hash))
+}
+
+/// PVOS D235 — an item whose hash cannot be a file name here is refused
+/// before anything is written (defense in depth: the manifest parser
+/// refuses such a row already).
+fn check_item_hash(it: &ReceiveItem) -> Result<(), String> {
+    if pvfs_core::Engine::is_content_hash(&it.hash) && pvfs_core::Engine::safe_rel_path(&it.rel_path) {
+        Ok(())
+    } else {
+        Err(format!("refused: {:?} is not a content hash, or {:?} not a safe path", it.hash, it.rel_path))
+    }
 }
 
 /// Bring `<dest_root>/.pvfs-incoming/<hash>.partial` to the item's full,
@@ -219,6 +234,7 @@ pub fn pull_into_partial_progress(
     streams: u32,
     progress: Option<(&pvfs_core::JobProgress, pvfs_core::progress::FileToken)>,
 ) -> Result<Option<Vec<[u8; 32]>>, String> {
+    check_item_hash(it)?;
     let part = partial_path(it);
     std::fs::create_dir_all(part.parent().unwrap()).map_err(|e| format!("incoming dir: {e}"))?;
     if let Some(src) = local {
@@ -394,6 +410,7 @@ pub fn pull_into_partial_progress(
 /// library copy to the trash, parents created, one atomic rename, then the
 /// sidecar so the watch does not re-hash it.
 fn place(it: &ReceiveItem, chunks: &[[u8; 32]]) -> Result<(), String> {
+    check_item_hash(it)?;
     let part = partial_path(it);
     let dest = it.dest_root.join(&it.rel_path);
     {

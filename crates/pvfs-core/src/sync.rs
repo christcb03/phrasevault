@@ -2248,6 +2248,14 @@ fn holds_a_file(dir: &Path) -> bool {
     dirs.iter().any(|d| holds_a_file(d))
 }
 
+/// PVOS D235 — does `dir` show its marker now? What a WRITER asks before it
+/// puts a new file under a root: unlike [`verify_root_marker`] it adopts
+/// nothing (that stays the watch's), so an unmounted volume's empty
+/// mountpoint is never written to.
+pub fn root_marker_present(dir: &Path) -> bool {
+    dir.join(ROOT_MARKER).is_file()
+}
+
 /// Refuse a bound root that cannot show its marker AND has nothing in it.
 ///
 /// Same discriminator as the central store's, for the same reason: an absent

@@ -3165,6 +3165,22 @@ fn do_claim_write_lease(
     if roots.is_empty() {
         return err("bad_input", "a write lease needs at least one root");
     }
+    // PVOS D235 — the lease blocks every other writer under its roots, so
+    // only a key that may write each of them takes it (`effective_rights`
+    // masks a revoked or expired grant). Any authenticated key could before
+    // (D218 §2.2).
+    {
+        let e = daemon.reader();
+        for root in &roots {
+            let may = e.effective_rights(principal, root).map(|r| r & acl::ACL_W != 0).unwrap_or(false);
+            if !may {
+                return err(
+                    "forbidden",
+                    &format!("the write lease needs write rights on every root it claims, and this key has none on {root}"),
+                );
+            }
+        }
+    }
     let mut held = daemon.lease.lock().unwrap();
     match held.as_ref() {
         Some(l) if l.conn != conn => err(

@@ -234,8 +234,18 @@ $PVFS device revoke --mnemonic "$MNEMONIC" --pubkey "$DEV1" >/dev/null && ok "de
 
 say "recovery from mnemonic"
 rm "$PVFS_DATA_DIR/device.key"
-$PVFS recover --mnemonic "$MNEMONIC" --device-index 0 >/dev/null && ok "recover re-derives device key" || fail "recover re-derives device key"
+$PVFS recover --mnemonic "$MNEMONIC" --device-index 0 2>"$DATA/d235-warn.txt" >/dev/null && ok "recover re-derives device key" || fail "recover re-derives device key"
+qgrep 'shell history' "$DATA/d235-warn.txt" && ok "D235: and a phrase on the command line is warned about" || fail "D235: no warning for --mnemonic"
 $PVFS info >/dev/null && ok "forest usable after recovery" || fail "forest usable after recovery"
+# PVOS D235 — the phrase never has to be on the command line: piped in.
+rm "$PVFS_DATA_DIR/device.key"
+printf '%s\n' "$MNEMONIC" | $PVFS recover --device-index 0 2>"$DATA/d235-warn.txt" >/dev/null && ! qgrep 'shell history' "$DATA/d235-warn.txt" \
+  && ok "D235: recover reads the phrase from stdin, with no warning" || fail "D235: recover from stdin: $(cat "$DATA/d235-warn.txt")"
+$PVFS info >/dev/null && ok "D235: forest usable after that recovery" || fail "D235: forest after stdin recovery"
+DEV2_JSON="$(printf '%s\n' "$MNEMONIC" | $PVFS --json device authorize --index 2 2>/dev/null)"
+[ -n "$(jget "$DEV2_JSON" device_pubkey)" ] && ok "D235: device authorize reads the phrase from stdin" || fail "D235: device authorize from stdin: $DEV2_JSON"
+printf '' | $PVFS recover --device-index 0 >/dev/null 2>"$DATA/d235-warn.txt" \
+  && fail "D235: recover with no phrase at all must fail" || { qgrep 'pipe the phrase' "$DATA/d235-warn.txt" && ok "D235: no phrase, no terminal: refused, saying how" || fail "D235: no-phrase message: $(cat "$DATA/d235-warn.txt")"; }
 
 say "rebuild from log (projection is disposable)"
 rm "$PVFS_DATA_DIR/index.db"

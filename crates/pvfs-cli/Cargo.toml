@@ -23,6 +23,9 @@ nix = { workspace = true, features = ["signal"] }
 clap.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+# PVOS D235: the recovery phrase is asked with no echo, never required on
+# the command line (already in the lockfile, from pvfs-companion).
+rpassword = "7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # P7.3 (doc 20 §3): the FUSE streaming mount is Linux-only for now — macOS
