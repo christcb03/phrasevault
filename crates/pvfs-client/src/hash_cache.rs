@@ -119,6 +119,13 @@ pub struct CacheOpts {
     /// A pause between background bursts. Zero in production; a test's way
     /// to watch a fetch that a local socket would finish in milliseconds.
     pub background_pause: Duration,
+    /// PVOS D246 — how long a read someone waits on redials a holder whose
+    /// dial failed at the transport (a daemon restarting: the NAS's took one
+    /// second at the v1.4-649 roll) before the read fails.
+    pub redial_window: Duration,
+    /// PVOS D246 — after a window runs out, the holder is not dialled again
+    /// for this long: a box that is really down fails reads at once.
+    pub down_rest: Duration,
 }
 
 impl Default for CacheOpts {
@@ -137,6 +144,8 @@ impl Default for CacheOpts {
             max_age: Duration::from_secs(24 * 60 * 60),
             janitor_every: Duration::from_secs(300),
             background_pause: Duration::ZERO,
+            redial_window: Duration::from_secs(15),
+            down_rest: Duration::from_secs(30),
         }
     }
 }
@@ -715,6 +724,18 @@ struct Run {
     /// PVOS D219 — the last failed request was answered `not_found` by
     /// every box (see [`fetch_run`]).
     gone: bool,
+    /// PVOS D246 — every failure of the last round was at the transport (a
+    /// dial refused, reset or timed out; a fresh connection's stream cut), so
+    /// a redial may serve it.
+    transient: bool,
+    /// PVOS D246 — every box the last round skipped was resting after its
+    /// window ran out (`CacheInner::down`); nothing was dialled.
+    resting: bool,
+    /// PVOS D246 — the targets that failed at the transport in the last round.
+    unreachable: Vec<String>,
+    /// PVOS D246 — when this run's failing rounds began, and how many.
+    down_since: Option<Instant>,
+    attempts: u32,
 }
 
 /// Writes a ranged stream at its offset and marks each piece as it is whole.
@@ -777,6 +798,11 @@ fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
         file: None,
         last: "no announced endpoint holds these bytes".into(),
         gone: false,
+        transient: false,
+        resting: false,
+        unreachable: Vec::new(),
+        down_since: None,
+        attempts: 0,
     };
     loop {
         let job = {
@@ -802,19 +828,62 @@ fn work(cache: &Arc<CacheInner>, fetch: &Arc<HashFetch>) {
         };
         match job {
             Job::Fetch { first, end, demand } => {
-                if let Err(e) = fetch_run(cache, fetch, &sources, &mut run, first, end, demand) {
-                    let mut st = fetch.st.lock().unwrap();
-                    if !run.gone {
-                        pv_warn!("pvfs.mount.read_through_failed", hash = &fetch.hash[..8], error = content(&e);
-                            "mount: read-through of {} failed: {e}", &fetch.hash[..8]);
-                    } else if !st.gone_said {
-                        pv_info!("pvfs.mount.gone", hash = &fetch.hash[..8];
-                            "mount: {} is gone — every box asked says it holds no such bytes \
-                             (deleted or replaced since this box's catalogue last moved)",
-                            &fetch.hash[..8]
-                        );
-                        st.gone_said = true;
+                let res = fetch_run(cache, fetch, &sources, &mut run, first, end, demand);
+                if res.is_ok() {
+                    if let Some(since) = run.down_since.take() {
+                        // PVOS D246: expected (a holder restarting) and
+                        // healed — said at debug, with why and how long.
+                        pv_debug!("pvfs.mount.read_through_recovered", hash = &fetch.hash[..8],
+                            attempts = run.attempts, waited_ms = since.elapsed().as_millis() as u64,
+                            reason = content(&run.last);
+                            "mount: read-through of {} served after {} redial(s) over {} ms (was: {})",
+                            &fetch.hash[..8], run.attempts, since.elapsed().as_millis(), run.last);
+                        run.attempts = 0;
                     }
+                }
+                if let Err(e) = res {
+                    // PVOS D246 — a read someone waits on redials a holder
+                    // that failed at the transport, for a window; read-ahead
+                    // nobody waits on gives up at once.
+                    let wanted = demand || !fetch.st.lock().unwrap().demands.is_empty();
+                    if run.transient && wanted {
+                        let since = *run.down_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() < cache.opts.redial_window {
+                            run.attempts += 1;
+                            let back = Duration::from_millis(200u64 << run.attempts.min(5).saturating_sub(1))
+                                .min(Duration::from_secs(2));
+                            std::thread::sleep(back.min(cache.opts.redial_window.saturating_sub(since.elapsed())));
+                            continue;
+                        }
+                        cache.mark_down(&run.unreachable);
+                    }
+                    let waited_ms = run.down_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                    let mut st = fetch.st.lock().unwrap();
+                    if run.gone {
+                        if !st.gone_said {
+                            pv_info!("pvfs.mount.gone", hash = &fetch.hash[..8];
+                                "mount: {} is gone — every box asked says it holds no such bytes \
+                                 (deleted or replaced since this box's catalogue last moved)",
+                                &fetch.hash[..8]
+                            );
+                            st.gone_said = true;
+                        }
+                    } else if run.resting || !wanted {
+                        // PVOS D246: nobody's read failed here that was not
+                        // already said — the holder's window ran out on an
+                        // earlier read and it is resting, or this was
+                        // read-ahead no reader waits on.
+                        pv_debug!("pvfs.mount.readahead_failed", hash = &fetch.hash[..8],
+                            resting = run.resting, error = content(&e);
+                            "mount: read-through of {} not fetched now: {e}", &fetch.hash[..8]);
+                    } else {
+                        pv_warn!("pvfs.mount.read_through_failed", hash = &fetch.hash[..8],
+                            attempts = run.attempts + 1, waited_ms = waited_ms, error = content(&e);
+                            "mount: read-through of {} failed after {} attempt(s) over {} ms: {e}",
+                            &fetch.hash[..8], run.attempts + 1, waited_ms);
+                    }
+                    run.down_since = None;
+                    run.attempts = 0;
                     st.gone = run.gone.then(Instant::now);
                     st.fail_gen += 1;
                     st.last_err = e;
@@ -855,6 +924,12 @@ fn fetch_run(
     // nothing, and the read stays an I/O error.
     let mut all_said_no = !sources.is_empty() && run.bad.is_empty();
     run.gone = false;
+    // PVOS D246 — whether every failure of this round was at the transport
+    // (a redial may serve it), and whether every box was skipped as resting.
+    let mut transient = !sources.is_empty();
+    let mut tried = 0usize;
+    let mut resting = 0usize;
+    run.unreachable.clear();
     // PVOS D220 — a fetch already served bytes was being read: its holder
     // may answer from the trash if the live copy has gone there since.
     let trashed = fetch.st.lock().unwrap().fetched > 0;
@@ -862,6 +937,15 @@ fn fetch_run(
         let idx = run.cur % sources.len();
         let src = &sources[idx];
         if run.bad.contains(&idx) {
+            run.cur += 1;
+            continue;
+        }
+        tried += 1;
+        // PVOS D246: a box whose redial window ran out rests — not dialled.
+        if cache.is_down(&src.target) {
+            resting += 1;
+            run.last = format!("{}: not answering (resting after its redial window ran out)", src.target);
+            all_said_no = false;
             run.cur += 1;
             continue;
         }
@@ -875,6 +959,13 @@ fn fetch_run(
                 None => match crate::follow::dial_source(src) {
                     Ok(c) => c,
                     Err(e) => {
+                        // A refused, reset or timed-out dial is a holder
+                        // that may be restarting; anything else is not.
+                        if matches!(e, pvfs_core::PvfsError::Io { .. }) {
+                            run.unreachable.push(src.target.clone());
+                        } else {
+                            transient = false;
+                        }
                         run.last = format!("{}: {e}", src.target);
                         all_said_no = false;
                         break;
@@ -893,12 +984,15 @@ fn fetch_run(
             match streamed {
                 Ok(_) if written == len => {
                     cache.checkin(&src.target, client);
+                    cache.mark_up(&src.target);
                     run.served.insert(src.target.clone());
                     cache.fetched.fetch_add(len, Ordering::Relaxed);
                     cache.hint.store(idx, Ordering::Relaxed);
                     return Ok(());
                 }
                 Ok(_) => {
+                    // A stream cut short: a daemon stopping mid-reply.
+                    run.unreachable.push(src.target.clone());
                     run.last = format!("{}: short stream, {written} of {len} bytes", src.target);
                     all_said_no = false;
                     break;
@@ -907,6 +1001,7 @@ fn fetch_run(
                     // An error REPLY leaves the connection in control state.
                     cache.checkin(&src.target, client);
                     if code != "not_found" {
+                        transient = false;
                         run.last = format!("{}: {code}: {message}", src.target);
                         all_said_no = false;
                     }
@@ -915,6 +1010,13 @@ fn fetch_run(
                 Err(e) => {
                     run.last = format!("{}: {e}", src.target);
                     if !from_pool {
+                        // The fresh connection failed too: at the transport
+                        // (an I/O error) a restart may be under way.
+                        if matches!(e, ClientError::Io(_)) {
+                            run.unreachable.push(src.target.clone());
+                        } else {
+                            transient = false;
+                        }
                         all_said_no = false;
                         break;
                     }
@@ -924,6 +1026,11 @@ fn fetch_run(
         run.cur += 1;
     }
     run.gone = all_said_no;
+    run.resting = tried > 0 && resting == tried;
+    // A round where no box was even dialled (all resting), or where some box
+    // answered `not_found` and none failed at the transport, is not one a
+    // redial serves.
+    run.transient = transient && !run.unreachable.is_empty() && !run.resting && !run.gone;
     Err(run.last.clone())
 }
 
@@ -1260,6 +1367,9 @@ struct CacheInner {
     /// directory, so the next file is most likely on the same box: asking it
     /// first saves a `not_found` round trip per file over the WAN.
     hint: AtomicUsize,
+    /// PVOS D246 — holders whose redial window ran out, and when: not
+    /// dialled again until `down_rest` has passed.
+    down: Mutex<HashMap<String, Instant>>,
 }
 
 impl CacheInner {
@@ -1274,6 +1384,30 @@ impl CacheInner {
 
     fn checkout(&self, target: &str) -> Option<crate::Client> {
         self.pool.lock().unwrap().get_mut(target).and_then(Vec::pop)
+    }
+
+    /// PVOS D246 — is `target` resting after a redial window ran out?
+    fn is_down(&self, target: &str) -> bool {
+        let mut down = self.down.lock().unwrap();
+        match down.get(target) {
+            Some(t) if t.elapsed() < self.opts.down_rest => true,
+            Some(_) => {
+                down.remove(target);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_down(&self, targets: &[String]) {
+        let mut down = self.down.lock().unwrap();
+        for t in targets {
+            down.insert(t.clone(), Instant::now());
+        }
+    }
+
+    fn mark_up(&self, target: &str) {
+        self.down.lock().unwrap().remove(target);
     }
 
     fn checkin(&self, target: &str, client: crate::Client) {
@@ -1411,6 +1545,7 @@ impl HashCache {
             verified: AtomicU64::new(0),
             fetched: AtomicU64::new(0),
             hint: AtomicUsize::new(0),
+            down: Mutex::new(HashMap::new()),
         });
         for (path, _, partial, _, _) in inner.entries() {
             if partial {
