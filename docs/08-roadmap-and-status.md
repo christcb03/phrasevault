@@ -461,6 +461,7 @@ menu-bar "Restart agent" item. Doc 14 §2.
 | `pvfs-client` | client library — connect, handshake, requests; the fetchers, the mover, the watch, follow, catalogue, health and notify loops the jobs run | pvfs-core, pvfs-proto |
 | `pvfs-cli` | the `pvfs` CLI | pvfs-core, pvfs-client, pvfs-companion, pvfs-fuse (Linux) |
 | `pvfs-companion` | key vault + tiered signer + loopback identity agent (`pvfs-companion` binary; the macOS app wraps it) | pvfs-core, pvfs-proto |
+| `pvfs-log` | the structured log record (schema 1), journal fields, privacy rendering, `error_kind`, and the log destinations (`ship`) — docs 32, 33 | — |
 | `pvfs-fuse` | streaming FUSE mount of a node or of the merged view (`pvfs mount --view`), with its read-through cache; through the view, deletes, renames and folders (D169, D170) and, with `--writable`, edits of files this box holds and new files (D217) | pvfs-core, pvfs-client |
 
 Build/test via the Ansible pipeline to a Linux host (`deploy/ansible/`); CI mirrors it on GitHub.
