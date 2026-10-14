@@ -297,6 +297,8 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.scan.owner_unreachable` | warning | system | No route to the owner; cataloguing locally. |
 | `pvfs.scan.skipped` | warning | system | A watch pass skipped a file that needs a person. |
 | `pvfs.scan.stopped` | info | system | A watch pass stopped mid-pass. |
+| `pvfs.secure.place_failed` | warning | system | A secure put committed but its staged bytes could not be renamed over the blob (PVOS D247): `blob`, `error`. The commit stands; the next read places them. |
+| `pvfs.secure.placed_on_read` | notice | system | A secure blob's committed bytes were still staged (a crash, or a read between the commit and the rename) and were placed on read (PVOS D247): `blob`. |
 | `pvfs.serve.fatal` | error | system | pvfsd exits with an error. |
 | `pvfs.serve.listening` | notice | system | The TLS listener is up (with its transport pin). |
 | `pvfs.serve.serving` | notice | system | Serving the mount on its socket. |

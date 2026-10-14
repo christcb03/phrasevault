@@ -6278,11 +6278,12 @@ impl Engine {
         ))
     }
 
-    /// Phase 2 (doc 12 §8.3): replace the blob's ciphertext **in place**
-    /// (tmp + fsync + rename; superseded bytes unlinked) and advance the signed
-    /// ledger in the same call, authored by this device. Validation happens
-    /// before any bytes move; a crash between the write and the commit is
-    /// detected by [`secure_verify`](Self::secure_verify) as a mismatch.
+    /// Phase 2 (doc 12 §8.3): replace the blob's ciphertext and advance the
+    /// signed ledger, authored by this device. PVOS D247: the bytes are
+    /// staged beside the blob, the commit lands, and only then are they
+    /// renamed over it (superseded bytes unlinked) — a commit that fails
+    /// leaves the old, readable bytes. A crash after the commit and before
+    /// the rename is placed by the next [`secure_read`](Self::secure_read).
     /// Returns the new ciphertext hash.
     pub fn secure_put_local(&mut self, blob_id: &NodeId, ciphertext: &[u8]) -> Result<[u8; 32]> {
         self.ensure_device_active()?;
@@ -6297,8 +6298,13 @@ impl Engine {
             ev.set_author_sig(crypto::sign_digest(&self.device.signing_key, &pe.digest)?);
             events.push(ev);
         }
-        crate::storage::atomic_overwrite(&path, ciphertext)?;
-        self.commit_member_write(events)?;
+        clear_stale_staged(&path, SECURE_STAGED_STALE);
+        let staged = crate::storage::stage_beside(&path, ciphertext, &format!("local-{}", hex::encode(&hash[..8])))?;
+        if let Err(e) = self.commit_member_write(events) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+        crate::storage::place_staged(&staged, &path)?;
         Ok(hash)
     }
 
@@ -6313,9 +6319,22 @@ impl Engine {
                 })?;
         let uri = self.secure_location(blob_id)?;
         let path = crate::storage::uri_to_path(&uri)?;
-        let bytes = std::fs::read(&path).map_err(|e| PvfsError::io("read secure blob", e))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            // a first put committed and not yet placed has no blob file yet
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(PvfsError::io("read secure blob", e)),
+        };
         let actual: [u8; 32] = blake3::hash(&bytes).into();
         if actual.as_slice() != head.as_slice() {
+            // PVOS D247 — the head names bytes not yet placed: a commit that
+            // landed before its staged bytes were renamed in (a crash, or a
+            // read between the two). Place them and serve them.
+            if let Some(placed) = place_staged_matching(&path, &head) {
+                pvfs_log::pv_notice!("pvfs.secure.placed_on_read", blob = blob_id.as_str();
+                    "secure blob {blob_id}: its committed bytes were staged, not placed — placed on read");
+                return Ok(placed);
+            }
             return Err(PvfsError::Integrity {
                 kind: "secure blob",
                 id: blob_id.clone(),
@@ -6770,4 +6789,99 @@ pub(crate) fn insert_temp_link(tx: &Transaction<'_>, l: &Link) -> Result<()> {
     )
     .map_err(map_db("insert temp link"))?;
     Ok(())
+}
+
+/// PVOS D247 — a staged secure ciphertext older than this was left by a put
+/// whose commit never came (the daemon's prepare window is 30 s).
+pub const SECURE_STAGED_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// PVOS D247 — remove staged ciphertexts beside `path` older than `older_than`.
+pub fn clear_stale_staged(path: &std::path::Path, older_than: std::time::Duration) {
+    for (p, age) in crate::storage::staged_siblings(path) {
+        if age > older_than {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// PVOS D247 — the staged sibling of `path` whose bytes hash to `head`,
+/// renamed over `path`; its bytes, or `None`. A concurrent reader may place
+/// it first: then the file at `path` is read again.
+fn place_staged_matching(path: &std::path::Path, head: &[u8]) -> Option<Vec<u8>> {
+    for (staged, _) in crate::storage::staged_siblings(path) {
+        let Ok(bytes) = std::fs::read(&staged) else { continue };
+        if blake3::hash(&bytes).as_bytes().as_slice() != head {
+            continue;
+        }
+        return match crate::storage::place_staged(&staged, path) {
+            Ok(()) => Some(bytes),
+            Err(_) => std::fs::read(path)
+                .ok()
+                .filter(|b| blake3::hash(b).as_bytes().as_slice() == head),
+        };
+    }
+    None
+}
+
+#[cfg(test)]
+mod d247_tests {
+    use super::*;
+
+    fn secure_node(e: &mut Engine) -> NodeId {
+        let root = e.identity.root_node_id.clone();
+        e.add_node(
+            &root,
+            NodeSpec {
+                node_type: node::TYPE_SECURE.into(),
+                label: "vault.enc".into(),
+                payload: Vec::new(),
+                is_temp: false,
+                creation_nonce: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// PVOS D247 — the crash window: a commit landed and its staged bytes
+    /// were never placed. The next read places and serves them; with no
+    /// staged sibling a mismatch still answers `Integrity`.
+    #[test]
+    fn a_committed_put_left_staged_is_placed_by_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut e, _mn) = Engine::init(dir.path()).unwrap();
+        let blob = secure_node(&mut e);
+        e.secure_put_local(&blob, b"v1").unwrap();
+        assert_eq!(e.secure_read(&blob).unwrap(), b"v1");
+
+        // commit v2 the way secure_put_local does, and stop before the rename
+        let hash: [u8; 32] = blake3::hash(b"v2").into();
+        let me = e.device.pubkey();
+        let (prep, path) = e.prepare_secure_write(&me, &blob, &hash, 2).unwrap();
+        let mut events = Vec::new();
+        for pe in prep.events {
+            let mut ev = pe.event;
+            ev.set_author_sig(crypto::sign_digest(&e.device.signing_key, &pe.digest).unwrap());
+            events.push(ev);
+        }
+        let staged = crate::storage::stage_beside(&path, b"v2", "crash").unwrap();
+        e.commit_member_write(events).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"v1", "premise: the rename never happened");
+
+        assert_eq!(e.secure_read(&blob).unwrap(), b"v2", "the read places what the ledger names");
+        assert!(!staged.exists(), "placed, not copied");
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2");
+
+        // tampered, nothing staged: still refused
+        std::fs::write(&path, b"evil").unwrap();
+        assert!(matches!(e.secure_read(&blob), Err(PvfsError::Integrity { .. })));
+
+        // a staged file whose commit never came is left alone by a read and
+        // cleared by a put once it is stale
+        e.secure_put_local(&blob, b"v3").unwrap();
+        let orphan = crate::storage::stage_beside(&path, b"orphan", "never").unwrap();
+        assert_eq!(e.secure_read(&blob).unwrap(), b"v3");
+        assert!(orphan.exists(), "a read never places bytes the ledger does not name");
+        clear_stale_staged(&path, std::time::Duration::ZERO);
+        assert!(!orphan.exists());
+    }
 }

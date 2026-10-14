@@ -199,8 +199,9 @@ secure blobs, replica secure-erase.
    envelope → grant + verify.
 4. ☑ **Daemon path** — `SecureCat` (server verifies vs the ledger, then streams the opaque
    ciphertext on the existing data plane) and `SecurePut` (client uploads ciphertext frames →
-   daemon writes them in place and prepares the member-signed `SecureBlobUpdated` → client signs +
-   `Commit`s). Client `secure_cat`/`secure_put`; the CLI `secure put/cat/grant` **auto-route**
+   daemon stages them beside the blob and prepares the member-signed `SecureBlobUpdated` → client
+   signs + `Commit`s → the commit renames them over the blob; since PVOS D247 a commit that does
+   not land leaves the old bytes readable, and a read places committed bytes a crash left staged). Client `secure_cat`/`secure_put`; the CLI `secure put/cat/grant` **auto-route**
    through a running daemon (encrypt/decrypt stay client-side — the daemon only ever handles
    ciphertext). Integration test (`daemon_secure_put_and_cat_multi_user`): a member with `w`
    updates over the socket, the daemon writes exactly the uploaded bytes (no decryption), a
