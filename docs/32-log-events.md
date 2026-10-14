@@ -200,6 +200,8 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.companion.runtime_file` | notice | system | A runtime file was rewritten, or left to another instance. |
 | `pvfs.companion.runtime_file_failed` | warning | system | A runtime file could not be read, touched or rewritten; retried later. |
 | `pvfs.companion.took_over` | notice | system | A running instance was stopped and replaced. |
+| `pvfs.config.mode_open` | warning | security | The config dir or the client identity is open to other users and could not be narrowed (PVOS D245): `path`, `old_mode`, `error`. Once a minute per path. |
+| `pvfs.config.mode_tightened` | warning | security | The config dir (`0700`) or the client identity (`0600`) was open to group or others, and was narrowed on read (PVOS D245): `path`, `old_mode`, `mode`. Something widened a secret, so it is said once a minute per path. |
 | `pvfs.conn.ended` | debug | system | Why a connection to this daemon ended (PVOS D236): `reason` (`peer_closed`, `before_ready`, `read_error`, `io_during_op`), the peer, the principal, its age (`duration_ms`), `requests` and the last `op`. One per connection; expected behavior, so debug. |
 | `pvfs.daemon.config` | notice | system | At start: the forest, the role (owner/replica), the enabled jobs, the regions by kind, the listen address (D228). |
 | `pvfs.engine.close_failed` | warning | system | The runner's own engine did not close cleanly. |

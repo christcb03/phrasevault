@@ -1824,15 +1824,33 @@ fn load_instances() -> Result<Vec<(String, String, String)>, PvfsError> {
 }
 
 fn save_instances(list: &[(String, String, String)]) -> Result<(), PvfsError> {
+    // PVOS D245: the pins every dial trusts — the owner's to read or
+    // replace, written 0600 in a 0700 dir, by rename so no reader sees half.
+    pvfs_core::identity::ensure_config_dir()?;
     let path = instances_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
-    }
     let mut text = String::new();
     for (n, a, p) in list {
         text.push_str(&format!("{n} {a} {p}\n"));
     }
-    std::fs::write(&path, text).map_err(|e| PvfsError::io("write instances", e))
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let written = opts.open(&tmp).and_then(|mut f| {
+        use std::io::Write as _;
+        f.write_all(text.as_bytes()).and_then(|()| f.sync_all())
+    });
+    let placed = written.and_then(|()| std::fs::rename(&tmp, &path));
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    placed.map_err(|e| PvfsError::io("write instances", e))?;
+    pvfs_core::identity::tighten(&path, 0o600);
+    Ok(())
 }
 
 fn lookup_instance(name: &str) -> Result<(String, String), PvfsError> {
