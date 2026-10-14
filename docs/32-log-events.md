@@ -233,7 +233,9 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.mount.gone` | info | system | A file's bytes are gone everywhere; hidden for now. |
 | `pvfs.mount.ingest_stream` | info | system | Reads proxy an in-flight ingest. |
 | `pvfs.mount.punch_failed` | warning | system | Read pieces could not be given back to the disk. |
-| `pvfs.mount.read_through_failed` | warning | system | A read-through fetch failed; a later open retries. |
+| `pvfs.mount.readahead_failed` | debug | system | A read-through round failed where no read was failed by it (PVOS D246): read-ahead nobody waits on, or a holder still resting after its redial window ran out (`resting`). |
+| `pvfs.mount.read_through_failed` | warning | system | A read someone waits on failed (a later open retries). Since PVOS D246, only after a holder that failed at the transport was redialled for its window (15 s): `attempts`, `waited_ms`; the holder then rests 30 s, and reads fail at once without another warn. |
+| `pvfs.mount.read_through_recovered` | debug | system | A read-through served after redialling a holder that was restarting (PVOS D246): `attempts`, `waited_ms`, and the `reason` the first dial failed. Expected during a roll, so debug. |
 | `pvfs.mount.rename_failed` | error | system | A rename or relabel through a mount failed (EIO). |
 | `pvfs.mount.rename_refused` | warning | system | A rename through the view was refused. |
 | `pvfs.mount.rename_unrolled` | error | system | Copies already renamed could not be put back. |
