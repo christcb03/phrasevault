@@ -14,6 +14,10 @@ manifests).
 > fast-forwarded to the branch the fleet ran). What happened next: the re-genesis that §7 F and
 > §20 leave pending never ran on this model — doc 26 replaced the model, the fleet cut over to a
 > fresh forest on 2026-09-12 (doc 29), and this forest was deleted on 2026-09-21.
+> *(PVOS D249, 2026-10-14:)* §7's checklist is the review's working list, kept as written. What it
+> asked for that was built is in the CHANGELOG (D88–D124: dotfile sidecars, build ids, the
+> pipeline's real totals and fresh mtimes, and more). The items left unticked either died with the
+> old model and forest (B5/B6, E, F) or were built without a tick here; none is open work.
 
 ---
 
