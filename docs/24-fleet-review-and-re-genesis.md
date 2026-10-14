@@ -495,7 +495,7 @@ Ordered so each step is verifiable before the next.
       Resolved by taking the branch's file (it comments out the row pointing at
       the PRODUCTION QNAP) but keeping main's `fleet_artifacts` — the branch
       default `phrasevault-arm/target` has NO builds in it, checked on the host.
-- [ ] A2. Version strings must distinguish builds — `git describe` into
+- [x] A2. *(Built by D100, D110 and D124: `pvfs --version` and pvfsd's start line say `v1.4-<n>-g<hash>`; ticked by PVOS D249.)* Version strings must distinguish builds — `git describe` into
       `--version`, so `1.4.0` cannot mean two different binaries.
 - [ ] A3. Fix the pipeline summary: it reads the last `test result:` line, which
       is always an empty doc-test block, so it reports **0 passed and exits 0**
