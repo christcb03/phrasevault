@@ -151,6 +151,11 @@ fn a_read_waits_out_its_holders_restart_and_says_so_at_debug() {
     let mine = |event: &str| -> Vec<pvfs_log::Record> {
         cap.events(event).into_iter().filter(|r| r.line().contains("holder.sock")).collect()
     };
+    // the worker says it after the pieces land, so the reader can be first
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mine("pvfs.mount.read_through_recovered").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(mine("pvfs.mount.read_through_failed").is_empty(), "nothing at warn");
     let rec = mine("pvfs.mount.read_through_recovered");
     assert_eq!(rec.len(), 1, "one debug line says it recovered: {rec:?}");
