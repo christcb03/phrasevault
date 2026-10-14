@@ -26,6 +26,8 @@ whenever a fix is found, not only when it recurs.**
 | `rm` of a file just created through the view: `Input/output error` | [§17](#17-rm-of-a-file-just-created-through-the-view-inputoutput-error) |
 | "Disk errors" page: `trash purge failed: … Permission denied`; a `STUCK` trash bucket | [§18](#18-a-trash-bucket-the-purge-cannot-remove-permission-denied) |
 | `forbidden: use the forest at … as root` | [§19](#19-pvfs-refuses-forbidden-use-the-forest--as-root) |
+| `mount: read-through of … failed: …: Connection refused` during a roll | [§20](#20-a-read-through-the-view-fails-during-a-roll-connection-refused) |
+| `… was open to other users (mode 775) — set to 600` (`pvfs.config.mode_tightened`) | [§21](#21-was-open-to-other-users-mode-775--set-to-600) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
