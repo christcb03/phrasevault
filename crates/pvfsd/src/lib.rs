@@ -69,6 +69,9 @@ enum IngestFollowup {
     },
     /// `IngestAbort` committed — partials and progress removed, session gone.
     Abort { session: String },
+    /// PVOS D247 — a `SecurePut` committed: its staged ciphertext is renamed
+    /// over the blob. Not an ingest, but the same "work after the commit".
+    SecurePlace { staged: std::path::PathBuf, path: std::path::PathBuf },
 }
 
 /// In-memory mirror of `ingest.sessions` plus commit freezes. Lock order:
@@ -2438,9 +2441,10 @@ fn do_secure_cat<S: io::Read + io::Write>(
 }
 
 /// Receive a secure blob's new ciphertext (data frames, zero-length terminator),
-/// write it in place, and prepare the member-signed `SecureBlobUpdated` (doc 12
-/// §8.5 daemon path). The client then `Commit`s the returned prepared write. The
-/// daemon handles only ciphertext — it has no key and never decrypts.
+/// stage it beside the blob, and prepare the member-signed `SecureBlobUpdated`
+/// (doc 12 §8.5 daemon path). The client then `Commit`s the returned prepared
+/// write, and the commit places the bytes (PVOS D247). The daemon handles only
+/// ciphertext — it has no key and never decrypts.
 fn do_secure_put<S: io::Read + io::Write>(
     daemon: &Daemon,
     principal: &Principal,
@@ -2502,15 +2506,24 @@ fn do_secure_put<S: io::Read + io::Write>(
         }
     }; // lock released before the write
 
-    if let Err(pve) = pvfs_core::storage::atomic_overwrite(&path, &ciphertext) {
-        write_msg(stream, &err_from(pve))?;
-        return Ok(());
-    }
+    // PVOS D247: staged beside the blob, which keeps its old bytes — the
+    // ledger head names them until the commit lands, and a commit that
+    // never comes must not leave a secret nobody can read. The commit
+    // places them (`IngestFollowup::SecurePlace`). Staged files a client
+    // left uncommitted, older than a prepare's life, go first.
+    let prepared_id = random_id();
+    pvfs_core::engine::clear_stale_staged(&path, std::time::Duration::from_millis(PREPARE_TTL_MS));
+    let staged = match pvfs_core::storage::stage_beside(&path, &ciphertext, &prepared_id) {
+        Ok(p) => p,
+        Err(pve) => {
+            write_msg(stream, &err_from(pve))?;
+            return Ok(());
+        }
+    };
 
     // Stash the prepared ledger event; the client signs + Commits as usual.
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
     let result_id = prepared.result_id.clone();
-    let prepared_id = random_id();
     daemon.prepared.lock().unwrap().insert(
         prepared_id.clone(),
         PreparedState {
@@ -2518,7 +2531,7 @@ fn do_secure_put<S: io::Read + io::Write>(
             events: prepared.events,
             result_id: result_id.clone(),
             expiry_ms: now_ms() + PREPARE_TTL_MS,
-            followup: None,
+            followup: Some(IngestFollowup::SecurePlace { staged, path }),
         },
     );
     write_msg(
@@ -3654,6 +3667,22 @@ fn do_commit(daemon: &Daemon, principal: &Principal, prepared_id: &str, sigs: Ve
         Some(s) => s,
         None => return err("not_found", "no such prepared write (expired?)"),
     };
+    // PVOS D247 — a secure put whose commit does not land takes its staged
+    // bytes with it: the blob keeps its old, readable ones.
+    let staged = match &state.followup {
+        Some(IngestFollowup::SecurePlace { staged, .. }) => Some(staged.clone()),
+        _ => None,
+    };
+    let reply = commit_prepared(daemon, author, state, sigs);
+    if let Some(staged) = staged {
+        if !matches!(reply, ServerMsg::Committed { .. }) {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+    reply
+}
+
+fn commit_prepared(daemon: &Daemon, author: &[u8], state: PreparedState, sigs: Vec<String>) -> ServerMsg {
     if now_ms() > state.expiry_ms {
         return err("bad_input", "prepared write expired");
     }
@@ -3734,6 +3763,24 @@ fn finish_ingest_followup(
     result_id: String,
 ) -> ServerMsg {
     match followup {
+        IngestFollowup::SecurePlace { staged, path } => {
+            drop(e);
+            // PVOS D247: the ledger names these bytes now — rename them over
+            // the blob. A reader that saw the new head first may already
+            // have placed them (`secure_read`), which is as good.
+            match pvfs_core::storage::place_staged(&staged, &path) {
+                Ok(()) => {}
+                Err(_) if !staged.exists() => {}
+                Err(pve) => {
+                    // The commit landed: the bytes stay staged, and the next
+                    // read places them. Said, not refused — the write did.
+                    pv_warn!("pvfs.secure.place_failed", blob = result_id.as_str(), error = content(&pve);
+                        "pvfsd: secure blob {result_id} committed, but its bytes could not be placed ({pve}) — \
+                         the next read places them");
+                }
+            }
+            ServerMsg::Committed { id: result_id }
+        }
         IngestFollowup::Activate(rec) => {
             drop(e);
             // P10.2 (doc 23 §13): the fast path hands out partial paths —

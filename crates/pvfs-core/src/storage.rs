@@ -232,6 +232,61 @@ pub fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// PVOS D247 — a secure blob's new ciphertext, written and fsynced BESIDE
+/// the live file (`.<name>.pvfs-staged-<tag>`), which it leaves alone: the
+/// ledger head still names the old bytes until the commit lands, and a
+/// commit that never lands must not leave a blob nobody can read.
+/// [`place_staged`] puts it over the blob once the commit has.
+pub fn stage_beside(path: &Path, bytes: &[u8], tag: &str) -> Result<PathBuf> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| bad("path", format!("no parent directory: {}", path.display())))?;
+    fs::create_dir_all(dir).map_err(|e| PvfsError::io("create blob dir", e))?;
+    let staged = dir.join(format!("{}{tag}", staged_prefix(path)));
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&staged).map_err(|e| PvfsError::io("write staged blob", e))?;
+        f.write_all(bytes).map_err(|e| PvfsError::io("write staged blob", e))?;
+        f.sync_all().map_err(|e| PvfsError::io("sync staged blob", e))?;
+    }
+    Ok(staged)
+}
+
+/// PVOS D247 — rename a staged ciphertext over its blob and fsync the
+/// directory, so the swap survives power loss. The superseded bytes go with
+/// the rename (the deletability contract of [`atomic_overwrite`]).
+pub fn place_staged(staged: &Path, path: &Path) -> Result<()> {
+    fs::rename(staged, path).map_err(|e| PvfsError::io("place staged blob", e))?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let d = fs::File::open(dir).map_err(|e| PvfsError::io("open blob dir", e))?;
+        d.sync_all().map_err(|e| PvfsError::io("sync blob dir", e))?;
+    }
+    Ok(())
+}
+
+/// PVOS D247 — the staged ciphertexts beside `path`, with their age.
+pub fn staged_siblings(path: &Path) -> Vec<(PathBuf, std::time::Duration)> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else { return Vec::new() };
+    let prefix = staged_prefix(path);
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    rd.filter_map(|e| {
+        let e = e.ok()?;
+        let name = e.file_name();
+        if !name.to_str()?.starts_with(&prefix) {
+            return None;
+        }
+        let age = e.metadata().ok()?.modified().ok()?.elapsed().unwrap_or_default();
+        Some((e.path(), age))
+    })
+    .collect()
+}
+
+fn staged_prefix(path: &Path) -> String {
+    format!(".{}.pvfs-staged-", path.file_name().and_then(|n| n.to_str()).unwrap_or("blob"))
+}
+
 /// When a file last changed on THIS filesystem — `max(mtime, ctime)`.
 ///
 /// D112. The settle window asks "has it stopped moving?" and used mtime alone,
