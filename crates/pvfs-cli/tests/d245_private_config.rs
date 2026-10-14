@@ -45,7 +45,7 @@ fn instance(cfg: &std::path::Path, args: &[&str]) {
 fn instance_add_keeps_the_pins_private() {
     let s = Scratch::new();
     let cfg = s.0.join("config");
-    instance(&cfg, &["add", "nas", "192.0.2.7:7433", "aa11"]);
+    instance(&cfg, &["add", "nas", "192.0.2.7:7433", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
     let dir = cfg.join("pvfs");
     assert_eq!(mode(&dir), 0o700, "the config dir is made 0700");
     assert_eq!(mode(&dir.join("instances")), 0o600, "the pins are written 0600");
@@ -53,9 +53,9 @@ fn instance_add_keeps_the_pins_private() {
     // the mediabox shape: something opened the dir and the file to everyone
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
     std::fs::set_permissions(dir.join("instances"), std::fs::Permissions::from_mode(0o666)).unwrap();
-    instance(&cfg, &["add", "box2", "192.0.2.8:7433", "bb22"]);
+    instance(&cfg, &["add", "box2", "192.0.2.8:7433", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
     assert_eq!(mode(&dir), 0o700, "the widened dir is narrowed");
     assert_eq!(mode(&dir.join("instances")), 0o600, "the rewritten pins are 0600");
     let text = std::fs::read_to_string(dir.join("instances")).unwrap();
-    assert!(text.contains("nas 192.0.2.7:7433 aa11") && text.contains("box2 192.0.2.8:7433 bb22"), "{text}");
+    assert!(text.contains("nas 192.0.2.7:7433 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") && text.contains("box2 192.0.2.8:7433 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "{text}");
 }
