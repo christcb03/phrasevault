@@ -35,6 +35,75 @@ pub fn generate_mnemonic() -> Result<Mnemonic> {
     Mnemonic::generate_in(Language::English, 24).map_err(identity_err("mnemonic generation"))
 }
 
+/// PVOS D245 — the config dir, made if missing (`0700`), and narrowed to its
+/// owner if something opened it to group or others ([`tighten`]). It holds
+/// the client identity and the instance pins, which only this user may read
+/// or replace.
+pub fn ensure_config_dir() -> Result<std::path::PathBuf> {
+    let dir = config_dir()?;
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PvfsError::io("create config dir", e))?;
+        }
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(PvfsError::io("create config dir", e)),
+        }
+    }
+    tighten(dir, 0o700);
+    Ok(())
+}
+
+/// PVOS D245 — if `path` is open to group or others, set it to `mode` (the
+/// owner's bits only). Logged once a minute per path at warning, as a
+/// security event: something widened a secret (on mediabox and feederbox a
+/// recursive chmod had made every file under `~/.config` 0775). A chmod that
+/// fails is logged and the caller goes on — refusing would stop the box.
+pub fn tighten(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        let old = meta.permissions().mode() & 0o7777;
+        if old & 0o077 == 0 {
+            return;
+        }
+        let key = path.display().to_string();
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            Ok(()) => {
+                if let Some(n) = pvfs_log::limit("pvfs.config.mode_tightened", &key) {
+                    pvfs_log::pv_warn!(security "pvfs.config.mode_tightened",
+                        path = pvfs_log::content(&key), old_mode = format!("{old:o}"),
+                        mode = format!("{mode:o}"), suppressed = n, error_kind = "auth:secret_mode";
+                        "{key} was open to other users (mode {old:o}) — set to {mode:o}");
+                }
+            }
+            Err(e) => {
+                if let Some(n) = pvfs_log::limit("pvfs.config.mode_open", &key) {
+                    pvfs_log::pv_warn!(security "pvfs.config.mode_open",
+                        path = pvfs_log::content(&key), old_mode = format!("{old:o}"),
+                        error = pvfs_log::content(&e), suppressed = n, error_kind = "auth:secret_mode";
+                        "{key} is open to other users (mode {old:o}) and could not be narrowed: {e}");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
 /// The per-user pvfs config dir: `$XDG_CONFIG_HOME/pvfs`, else `~/.config/pvfs`.
 pub fn config_dir() -> Result<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -62,17 +131,26 @@ pub fn config_dir() -> Result<std::path::PathBuf> {
 /// the loser's write could land on top of the winner's — a 25-word file, and
 /// a dial as a stranger (GitHub CI, `serve_jobs`, 2026-09-16).
 pub fn client_identity_mnemonic() -> Result<Mnemonic> {
-    let path = config_dir()?.join("identity.phrase");
-    let dir = path.parent().unwrap();
+    client_identity_mnemonic_in(&config_dir()?)
+}
+
+/// [`client_identity_mnemonic`] in `dir` (tests name their own). PVOS D245:
+/// the dir is kept `0700` and the phrase `0600` on every read.
+pub fn client_identity_mnemonic_in(dir: &Path) -> Result<Mnemonic> {
+    let path = dir.join("identity.phrase");
     // The loop runs again only when another writer landed first, and then
     // the read succeeds; the bound is for a file that keeps disappearing.
     for _ in 0..8 {
         match std::fs::read_to_string(&path) {
-            Ok(phrase) => return parse_mnemonic(phrase.trim()),
+            Ok(phrase) => {
+                tighten(dir, 0o700);
+                tighten(&path, 0o600);
+                return parse_mnemonic(phrase.trim());
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(PvfsError::io("read identity", e)),
         }
-        std::fs::create_dir_all(dir).map_err(|e| PvfsError::io("create config dir", e))?;
+        ensure_private_dir(dir)?;
         let mn = generate_mnemonic()?;
         // pid + a process-wide counter: unique across processes and across
         // threads of one. A timestamp was not — sixteen callers released
@@ -295,6 +373,48 @@ impl DeviceKeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PVOS D245 — a widened config dir and identity are narrowed on the
+    /// next read, said once each; a second read says nothing; a fresh
+    /// identity is made in a 0700 dir.
+    #[cfg(unix)]
+    #[test]
+    fn the_identity_and_its_dir_are_kept_for_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // fresh: made 0700 / 0600, nothing logged
+        let fresh = tmp.path().join("fresh").join("pvfs");
+        let recs = pvfs_log::capture(|| {
+            client_identity_mnemonic_in(&fresh).unwrap();
+        });
+        assert_eq!(mode(&fresh), 0o700);
+        assert_eq!(mode(&fresh.join("identity.phrase")), 0o600);
+        assert!(recs.is_empty(), "{recs:?}");
+
+        // widened (the mediabox shape): narrowed, one record per path
+        let dir = tmp.path().join("wide").join("pvfs");
+        let first = client_identity_mnemonic_in(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let phrase = dir.join("identity.phrase");
+        std::fs::set_permissions(&phrase, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let recs = pvfs_log::capture(|| {
+            assert_eq!(client_identity_mnemonic_in(&dir).unwrap(), first, "the same identity, read");
+        });
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&phrase), 0o600);
+        let tightened: Vec<_> = recs.iter().filter(|r| r.event == "pvfs.config.mode_tightened").collect();
+        assert_eq!(tightened.len(), 2, "{recs:?}");
+        assert!(tightened.iter().all(|r| r.severity == pvfs_log::Severity::Warning));
+        assert!(tightened.iter().any(|r| r.line().contains("775")), "the old mode is named");
+
+        // a second read: already private, nothing said
+        let recs = pvfs_log::capture(|| {
+            client_identity_mnemonic_in(&dir).unwrap();
+        });
+        assert!(recs.is_empty(), "{recs:?}");
+    }
 
     fn fixed_mnemonic() -> Mnemonic {
         // deterministic test mnemonic from fixed entropy
