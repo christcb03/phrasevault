@@ -3686,7 +3686,7 @@ fn commit_prepared(daemon: &Daemon, author: &[u8], state: PreparedState, sigs: V
     if now_ms() > state.expiry_ms {
         return err("bad_input", "prepared write expired");
     }
-    if &state.author_pub != author {
+    if state.author_pub != author {
         return err("forbidden", "prepared write belongs to another principal");
     }
     if sigs.len() != state.events.len() {
