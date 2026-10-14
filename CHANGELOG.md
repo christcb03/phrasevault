@@ -5,6 +5,37 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A secure put lands only when it commits (PVOS D247).** `SecurePut`
+  stages the uploaded ciphertext beside the blob
+  (`.<name>.pvfs-staged-<id>`), and the commit renames it over the blob. A
+  commit that does not land removes it: a bad signature, an expired
+  prepare, or the writer failing. The blob keeps its old, readable bytes.
+  Before, the blob was overwritten at once, and a lost commit left the
+  secret unreadable (`Integrity`). A read whose blob does not match the
+  ledger head places a staged sibling that does
+  (`pvfs.secure.placed_on_read`), which covers a crash between the commit
+  and the rename. `secure_put_local` follows the same order, and a put
+  clears staged files older than 30 s.
+- **A read-through survives its holder's restart (PVOS D246).** A read
+  someone is waiting on now redials a holder that failed at the transport
+  (refused, reset, timed out, a stream cut short) for up to 15 s, with a
+  backoff from 200 ms to 2 s (`CacheOpts::redial_window`). A round that
+  recovers logs `pvfs.mount.read_through_recovered` at debug. Only a
+  window that runs out warns (`read_through_failed`, now with `attempts`
+  and `waited_ms`). That holder then rests for 30 s
+  (`CacheOpts::down_rest`), so later reads fail at once without a second
+  warn. Read-ahead nobody waits on gives up at once and says so at debug
+  (`pvfs.mount.readahead_failed`). `not_found` from every box is still
+  "gone" (D219) and never retried. Before, one refused dial during a
+  daemon restart gave the reading app an EIO.
+- **The client identity and the instance pins are the owner's alone (PVOS
+  D245).** Each time the identity is read, a config dir open to group or
+  others is set to 0700 and the identity to 0600, logged once a minute per
+  path as `pvfs.config.mode_tightened` (warning, security), or
+  `pvfs.config.mode_open` if the chmod fails. The dir is created 0700, and
+  `instances` is written 0600 by rename. mediabox's and feederbox's
+  identities had been 0775 (a recursive chmod over `~/.config`, not
+  PVFS).
 - **Why a connection ended, at the level it deserves (PVOS D236).**
   - pvfsd logs one `pvfs.conn.ended` line per connection, at debug: the
     reason (`peer_closed`, `before_ready`, `read_error`, `io_during_op`

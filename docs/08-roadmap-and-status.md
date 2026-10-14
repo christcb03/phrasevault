@@ -1,26 +1,26 @@
 # PVFS — roadmap, status, and open concerns (08)
 
-Status: **Living document.** Last updated 2026-10-04 (PVOS D218): the banner below, §5's crate map
+Status: **Living document.** Last updated 2026-10-14 (PVOS D249): the banner below, §5's crate map
 and §6 are current; §1–§4 are the record up to the 1.4.0 release (2026-08-13) and stay as they were
 written.
 
 The single place to see what's built, what's next, and the known loose ends. Phase specs live in
 docs 02–31; this is the index + the honest "what's not done yet."
 
-> **The live state (2026-10-04).**
+> **The live state (2026-10-14).**
 >
 > | | |
 > |---|---|
 > | the fleet | **mediabox owns the Media forest** since 2026-09-29 (PVOS D186): `/opt/pvfs/media`, alias `media`, forest `ae60b1db…`, and it catalogues its own two disks. feederbox is the ingest box (region `staging`, drains); the NAS holds the library (`library`, receives; `library-ext`). VM 310, the owner from the 2026-09-12 cutover to the move, was retired then and deleted on 2026-10-04 (its PVFS state kept in `mediabox:/opt/pvfs/retired-vm310/`). |
-> | the build | every box on **`v1.4-549-gea84559`**, rolled 2026-10-04 (daemons restarted about 1:00 PM Eastern; `v1.4-548` went out first that day, and `ea84559` fixed what it showed — §6.2); `v1.4-495` from 2026-09-27 until that day. Main is at the fleet's build. No release since `v1.4` ([VERSIONING.md](../VERSIONING.md)). |
-> | wire protocol | **16**, talking back to 3 — every step since 4 additive, so a roll goes box by box |
+> | the build | every box on **`v1.4-660-gddc7428`**, rolled 2026-10-14 6:39–6:43 PM Eastern, owner first (§6.2 lists every roll). Main is at the fleet's build. mediabox's view mount moves onto a new build only when nothing is open through it (Plex). No release since `v1.4` ([VERSIONING.md](../VERSIONING.md)). |
+> | wire protocol | **18**, talking back to 3 — every step since 4 additive, so a roll goes box by box |
 > | projection schema | **20**, every step since v7 migrated in place |
 > | the model | **the region model** (doc 26) since the cutover of 2026-09-12 (doc 29): each box catalogues its own disk; the log carries regions, grants and heads. The old node-model forest was deleted on 2026-09-21 — there is no way back to it. |
 > | the mover | the library's `receive` pulls by hash what only staging holds, several files and ranges at once; staging's `resolve` drains a copy only once the library serves the same bytes back |
-> | what programs read | the merged view, mounted: Sonarr and Radarr through feederbox's union (2026-09-17), Plex on mediabox in stream mode (2026-09-22). mediabox's view mount runs `--writable` since the 2026-10-04 roll (D217): a file it holds is edited in place, and a new file lands in the region that already holds its folder (D216). feederbox's mount is not `--writable`. |
+> | what programs read | the merged view, mounted: Sonarr and Radarr through feederbox's union (2026-09-17), Plex on mediabox in stream mode (2026-09-22). mediabox's view mount runs `--writable` (D217; made safe by D233, 2026-10-11): an edit writes the file opened, a new file lands in the region that already holds its folder (D216), and deletes go to a versioned trash (D234). A read waits out its holder's restart (D246). feederbox's mount is not `--writable`. |
 > | availability | A and D of the availability track (§3) are built: the owner can be lost, fenced and replaced (doc 28), and an owner outage stops no catalogue. The move itself ran on production on 2026-09-29. B, C and E are roadmap. |
-> | monitoring | the owner's `health` job, Home Assistant notifications and a status page — doc 30 |
-> | what is next | PVOS `docs/BACKLOG.md`. Its suggested order is built and rolled — one writer per daemon and skipping unchanged catalogue rows (D199), typed routed-write failures and each box's build (D200), progress while a pass runs (D207), quality in catalogue rows (D208) — and nothing is queued; its gathered items and long-range roadmap remain. |
+> | monitoring | the owner's `health` job, Home Assistant notifications and a status page (doc 30); every line a structured record (doc 32), shipped to the log server (Loki, Grafana alerts, errwatch; doc 33 and HomeLab `docs/LOGGING.md`); `pvfs diagnose` gathers every box's state in one file (D230) |
+> | what is next | PVOS `docs/BACKLOG.md`: its queued briefs, gathered items and long-range roadmap. |
 >
 > Where the detail is: §6 below (the D71+ era, by arc); [CHANGELOG.md](../CHANGELOG.md) "Unreleased"
 > (every change since 1.4.0); PVOS `docs/milestones/` (one doc per milestone); the
@@ -468,7 +468,7 @@ See [INSTALL.md](INSTALL.md); user docs: [USER-MANUAL.md](USER-MANUAL.md); statu
 
 ---
 
-## 6. The D71+ era — the media fleet (2026-08-16 → 2026-10-04)
+## 6. The D71+ era — the media fleet (2026-08-16 → 2026-10-14)
 
 After 1.4.0 the work moved from building phases to running a fleet: PVOS's media boxes, where
 PVFS replaced rclone and cloudplow. Milestones are numbered in PVOS (`docs/milestones/`); D87–D121
@@ -487,6 +487,7 @@ steps are tabled in [VERSIONING.md](../VERSIONING.md).
 | **Availability and the move** | 09-23 → 09-29 | D182, D183, D185, D186–D188, D191, D194, D196, D198 | The owner can be lost: the fence, promotion through the companion, dated log copies, `promote.sh` (D182); an owner outage stops no catalogue (D183 — protocol 12, schema 20); an owner that holds regions (D185); the Media app reads the forest through its daemon, and one write per frame ends a ~0.5 s stall per request (D187 — protocol 13); serving at normal priority with background work below it (D191); catalogue installs that write only what changed (D194). **Rolled 2026-09-27; mediabox promoted to owner on 2026-09-29** (D186). D198 then stopped the CLI from waiting on a question nobody could see (it hung the promotion ~9 minutes). |
 | **Keys and forests** | 09-25 → 09-26 | D184, D189, D190, D192, D193, D197 | One companion serves several phrases (D189); root certificates bound to their forest, `bind-certs` (D192 — protocol 14); personal forests rooted in a person's own phrase, signed in by companion or passkey (D193 — protocol 15; D190 is the model); the companion keeps its runtime files (D197). PVOS side: a fresh PVOS rooted in the companion (D184). |
 | **One writer, quality, placement, edits** | 09-30 → 10-04 | D199–D201, D206–D208, D210–D212, D216, D217 | Each box says its build in `serve status`, and a routed write's failure is judged by its type (D200); the pipeline reaps first (D201); small fleet fixes (D206); one writer per daemon, which also skips unchanged catalogue rows (D199); video quality in catalogue rows, probed with ffprobe where the bytes are (D208); each job reports its progress, and a stall is judged by it (D207); a cold read through the view asks the region's holder first (D210); an unreadable copy loses to a measured one, and mediabox measures the NAS's video over the LAN (D211 — protocol 16); the companion's session grant lasts 7 days (D212); `resolve` no longer fails a pass when an arr takes a copy mid-pass. Then the view learned to write: a new file goes where its folder already is, past a free-space floor per region (D216), and a mount started with `--writable` edits the files its box holds and creates new ones (D217). **Rolled 2026-10-04**; mediabox's view mount runs `--writable`. |
+| **Logs, trash and writes made safe** | 10-05 → 10-14 | D219–D236, D245–D247 | A read of a file its holder no longer has answers ENOENT, and a stream keeps reading through the trash (D219, D220); every line a structured record with journal fields, audit and security events, and built-in log destinations with privacy levels (D222–D225, the `pvfs-log` crate); each failure says what kind it is, slow requests are recorded, a box's log level changes for a while (D229 — protocol 17); `pvfs diagnose` (D230 — protocol 18); the companion's settings and Touch ID (D226); the trash's purge names what it cannot remove, and `sudo pvfs` is refused (D231, D232); **the writable view made safe** (D233); the trash keeps every version (D234); D218's leftovers (D235); why a connection ended, and a job's first failure at debug (D236); the client identity kept 0600 (D245); a read-through survives its holder's restart (D246); a secure put lands at commit (D247). |
 
 The last arc, commit by commit. The build is `git describe --tags` of the commit, so it can differ
 from the branch build a merge message quotes; dates Eastern.
@@ -523,7 +524,15 @@ Each box verified by content after the roll (VERSIONING.md). The builds that rea
 | `v1.4-359`, `v1.4-363`, `v1.4-385`, `v1.4-391`, `v1.4-398` | 2026-09-17 → 18 | D163, D165–D167, D169–D171, D173–D178 |
 | `v1.4-420` | 2026-09-22 | D168's `trash put`, D179, D180, D181 |
 | `v1.4-495` | 2026-09-27 | D182, D183, D185, D187–D189, D191–D194, D196, D193's PVFS part, the stream-readahead fix |
-| `v1.4-548`, **`v1.4-549`** | **2026-10-04** | D198–D201, D203, D206–D208, D210–D212, the `resolve` race fix, D216, D217. `v1.4-548` (`59eb640`) went first; within minutes the fleet showed that a file created through the view could not be deleted in its first half-minute (`ea84559`), and `v1.4-549` replaced it about 1:00 PM — the fleet today |
+| `v1.4-548`, **`v1.4-549`** | **2026-10-04** | D198–D201, D203, D206–D208, D210–D212, the `resolve` race fix, D216, D217. `v1.4-548` (`59eb640`) went first; within minutes the fleet showed that a file created through the view could not be deleted in its first half-minute (`ea84559`), and `v1.4-549` replaced it about 1:00 PM |
+| `v1.4-560` | 2026-10-05 | D219, D220, D221 |
+| `v1.4-588` | 2026-10-08, night | D222–D223: structured logging, the log destinations, the quiet mount line |
+| `v1.4-594` | 2026-10-09, 12:35 PM | D224, D225 |
+| `v1.4-635` | 2026-10-09, 9:37–9:41 PM | D226–D231 |
+| `v1.4-639` | 2026-10-10, 12:57 AM | D232 |
+| `v1.4-641` | 2026-10-11, 1:03–1:08 PM | D233, the writable view made safe |
+| `v1.4-649` | 2026-10-11, 6:02–6:11 PM | D234, D235, D236 |
+| **`v1.4-660`** | **2026-10-14, 6:39–6:43 PM** | D245, D246, D247 — the fleet today |
 
 ### 6.3 What the era changed in this document's terms
 
