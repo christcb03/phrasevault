@@ -26,6 +26,8 @@ whenever a fix is found, not only when it recurs.**
 | `rm` of a file just created through the view: `Input/output error` | [§17](#17-rm-of-a-file-just-created-through-the-view-inputoutput-error) |
 | "Disk errors" page: `trash purge failed: … Permission denied`; a `STUCK` trash bucket | [§18](#18-a-trash-bucket-the-purge-cannot-remove-permission-denied) |
 | `forbidden: use the forest at … as root` | [§19](#19-pvfs-refuses-forbidden-use-the-forest--as-root) |
+| `mount: read-through of … failed: …: Connection refused` during a roll | [§20](#20-a-read-through-the-view-fails-during-a-roll-connection-refused) |
+| `… was open to other users (mode 775) — set to 600` (`pvfs.config.mode_tightened`) | [§21](#21-was-open-to-other-users-mode-775--set-to-600) |
 
 ## 1. Duplicates across boxes: keep the better copy, move as few files as possible
 
@@ -377,6 +379,14 @@ followers (D185): that is waited out, and only a hold longer than the six
 tries fails one pass (`SQLite is busy/locked during routed scan write
 (retried 6x)` — the owner's word was `busy`, not always SQLite's).
 
+**Since PVOS D236** a job's first failure is logged at **debug**
+(`pvfs.job.failed_once`) and only a second in a row warns, so a single
+owner restart no longer reaches the warn log. The lost request names its
+connection: `to <owner>, connected <age> ago, idle <idle> before this
+<op>`, and the owner logs why each connection ended (`pvfs.conn.ended`,
+debug). Turn on `pvfs serve log-level debug --for 15` on both boxes to see
+them.
+
 ## 13. A box refuses a region claim
 
 **What it looks like.** On the phone (since PVOS D206): *"On feederbox, the
@@ -590,3 +600,42 @@ in `.pvfs` (PVOS D232):
 `replica add` and the legacy `init` refuse root. If the forest's `.pvfs` is wrongly root's (a `sudo` init), give it
 back with `sudo pvfs forest fix-permissions --mount <mount>`.
 
+## 20. A read through the view fails during a roll: "Connection refused"
+
+**What it looks like.** A box's mount logs, at warn, `mount: read-through
+of 4b5bf7ce failed: 192.168.1.237:7433: I/O error during dial …:
+Connection refused (os error 111)`, and the app reading the file (Plex,
+Bazarr) gets an I/O error. It happens when the box holding the bytes
+restarts its daemon, as every roll does (the NAS was down for one second at
+the v1.4-649 roll).
+
+**Why.** Before PVOS D246 a read-through gave a holder up after one failed
+dial, and most media has one holder.
+
+**Fix.** Since D246 (`v1.4-660`) a read someone waits on redials the
+holder for up to 15 s. A read that recovers logs only
+`pvfs.mount.read_through_recovered` at debug. A warn now means the holder
+stayed down for the whole window, and reads then fail at once for 30 s
+instead of each waiting again. Look at that box. A mount started before
+the roll still runs its old build until it is restarted: on mediabox, the
+view mount moves when Plex has nothing open (`pvfs-mount-refresh` says
+`waiting: … in use`).
+
+## 21. "was open to other users (mode 775) — set to 600"
+
+**What it looks like.** `pvfs.config.mode_tightened`, at warn, as a
+security event, naming `~/.config/pvfs` or `~/.config/pvfs/identity.phrase`
+and the mode it had.
+
+**Why.** That directory holds the box's client identity, the key that
+signs its routed writes and every dial, and the instance pins. Since PVOS
+D245 pvfs keeps them the user's alone (`0700`, `0600`) and narrows them
+whenever it reads them. On 2026-10-14 mediabox's and feederbox's were
+`0775`, after something ran a recursive chmod over the whole of `~/.config`
+(not PVFS; what did it was not found).
+
+**Fix.** Nothing for the files: they are narrowed already. Find what widened
+them: a restore, a Saltbox or Ansible task, a hand-run `chmod -R` on the
+home directory. If the chmod itself fails, `pvfs.config.mode_open` is
+logged instead: the files belong to another user, so give them back with
+`chown`.

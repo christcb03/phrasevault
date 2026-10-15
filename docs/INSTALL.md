@@ -445,7 +445,24 @@ from the instance currently holding the socket.
 | `PVFS_COMPANION_PASSPHRASE` | Vault passphrase for **non-interactive** use (pipelines, systemd). Interactive use prompts instead. |
 | `PVFS_COMPANION_KEY` | A public key (hex) naming which of a companion's phrases a `pvfs` command should use (PVOS D189; Option D §2b). Normally unset: `pvfs` names the root key of the forest the command runs on. Set it where there is no forest yet — `pvfs forest init --via-companion` against a companion that holds several phrases — or the companion answers with its default phrase. `pvfs-companion keys` prints each phrase's keys. |
 | `PVFS_FFPROBE` | Path to the `ffprobe` the daemon measures video quality with (PVOS D208). Default: `ffprobe` on `PATH`. With neither, nothing is measured. |
+| `PVFS_LOG_LEVEL` | The daemon's and CLI's log level: `error`, `warning`, `notice`, `info` (default), `debug`. `pvfs serve log-level` changes a running box's level for a while without it (doc 32). |
+| `PVFS_LOG_FORMAT` | `auto` (default: the journal under systemd, text on a terminal), `text`, `journal`, `json`, `logfmt` (doc 32). |
+| `PVFS_LOG_PRIVACY` | What this process's own output carries: `full` (default), `identified`, `minimal` — actors pseudonymised, content hashed. Log destinations have their own setting (doc 33). |
+| `PVFS_LOG_PSEUDONYM_KEY_FILE` | The key pseudonyms are made with (the same on every box of a forest, so one actor reads the same everywhere; doc 33). |
+| `PVFS_LOG_DESTINATIONS` | The log-destinations file. Default `/etc/pvfs/log-destinations.json` when it exists, else `~/.config/pvfs/log-destinations.json` (`pvfs log destinations` edits it; doc 33). |
+| `PVFS_SLOW_REQUEST_MS` | A request slower than this is logged as slow (`pvfs.request.slow`, `pvfs.client.request_slow`); default 5000. |
+| `PVFS_IDLE_TIMEOUT_SECS` | How long a connection may deliver nothing before the client stops waiting; default 180. Zero or garbage falls back to the default, never to "no timeout". |
+| `PVFS_NOTIFY_CMD` | The program notifications are sent through (default `curl`); it gets curl's arguments and the body on stdin (doc 30). |
 | `PVFS_BIN` | Used only by `smoke-test.sh` — path to the `pvfs` binary to test. |
+
+Tests and rehearsals only (never set on a fleet box): `PVFS_COMPANION_KEEP_SECS`,
+`PVFS_INSTANCE_ID`, `PVFS_SSH`, `PVFS_PROBE_REMOTE_EVERY_MS`, `PVFS_STARTUP_FOLD_WAIT_MS`,
+`PVFS_TRASH_EVERY_MS`, `PVFS_WRITER_HOLD_LOG_MS`.
+
+**The config directory** (`$XDG_CONFIG_HOME/pvfs`, else `~/.config/pvfs`) holds the box's client
+identity (`identity.phrase`, the key every dial signs with), the instance pins (`instances`) and the
+log destinations. It is the user's alone: pvfs keeps it `0700` and the identity `0600`, narrowing
+them on every read and logging `pvfs.config.mode_tightened` when it has to (PVOS D245).
 
 ---
 
@@ -458,6 +475,7 @@ from the instance currently holding the socket.
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | The server was reinstalled or keys rotated. `ssh-keygen -R <host>` then reconnect. |
 | `pvfs init` says forest exists | Use a new `PVFS_DATA_DIR` or remove the old directory (destroys data). |
 | Pipeline tests fail | Read `deploy/ansible/artifacts/<hostname>/` logs; fix locally with `cargo test` first. |
+| A running box misbehaves | `pvfs diagnose` gathers every box's build, config, clock, level, jobs and recent failures into one file; `pvfs serve log-level debug --for 15` turns up the detail for a while. [doc 31](31-common-issues-and-fixes.md) lists the known issues and their fixes. |
 
 ---
 
@@ -465,6 +483,7 @@ from the instance currently holding the socket.
 
 - **Status & roadmap:** [08-roadmap-and-status.md](08-roadmap-and-status.md)
 - **User manual:** [USER-MANUAL.md](USER-MANUAL.md)
+- **Running a fleet:** [30 — monitoring](30-monitoring-the-fleet.md) · [31 — common issues](31-common-issues-and-fixes.md) · [32 — log events](32-log-events.md) · [33 — shipping logs](33-shipping-logs.md)
 - **Changelog / versions:** [CHANGELOG.md](../CHANGELOG.md) · [VERSIONING.md](../VERSIONING.md)
 - Design specs: [00](00-architecture-decisions.md) · [01](01-core-engine-design.md) · [02](02-p0-core-engine-spec.md) · [03](03-federation-trust-and-uris.md) · [04](04-p1-storage-and-fs-ops-spec.md)
 - Version scheme: [VERSIONING.md](../VERSIONING.md)

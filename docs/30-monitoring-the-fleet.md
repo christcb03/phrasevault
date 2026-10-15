@@ -1,8 +1,8 @@
 # 30 — Monitoring the fleet: what PVFS tells you, and a worked Home Assistant build
 
-**Status: current (2026-10-04).** Pulls together what grew across PVOS
+**Status: current (2026-10-14, PVOS D249).** Pulls together what grew across PVOS
 milestones D83, D131, D135, D136, D142, D143, D146, D148, D176, D177, D178,
-D181, D182, D183, D196, D200, D206, D207 and D211. The PVFS side (§1) is
+D181, D182, D183, D196, D200, D206, D207, D211, D222, D228–D231 and D236. The PVFS side (§1) is
 product; the Home Assistant side (§2) is one deployment of it, described as a
 worked example you can copy or translate to another system. (PVOS D218,
 2026-10-04, read §1 against the code; §2's Home Assistant side was not
@@ -277,7 +277,12 @@ journalctl -u pvfsd-replica2 -o json | jq 'select(.PV_EVENT != null) | {PV_EVENT
 
 The NAS's `pvfsd.log` is plain text, as before. `PVFS_LOG_FORMAT`
 (`auto`/`text`/`journal`/`json`/`logfmt`), `PVFS_LOG_LEVEL` and
-`PVFS_LOG_PRIVACY` in a unit change that. Shipping the records to a log
+`PVFS_LOG_PRIVACY` in a unit change that. `pvfs serve log-level debug --for
+15` turns a running box's level up for a while, no restart; pvfsd and its
+mounts take it within 5 s and go back on their own (PVOS D229). Expected,
+self-healing faults are debug lines with their reason (a job's first
+failure, why a connection ended: D236), so the warn log holds what
+persists. Shipping the records to a log
 server, Splunk or a SIEM is [doc 33](33-shipping-logs.md) (PVOS D222d); our
 own log server reads the journal fields with Alloy (HomeLab
 `docs/LOGGING.md`).
@@ -547,3 +552,5 @@ means what the label says.
 | the supervise script (incl. `progress`) | PVOS `deploy/ansible/fleet/pvfs-supervise.sh` |
 | the milestones, with every deviation | PVOS `docs/milestones/D142`, `D143` (three follow-ups), `D146` |
 | hypervisor memory | HomeLab `docs/VM_MEMORY.md`, `playbooks/pve_vm_memory.yml` |
+| the log server: Loki, Grafana's alerts and dashboard, errwatch (pages any new error signature) | HomeLab `docs/LOGGING.md`, `docs/ERRWATCH.md`, `docs/MAINTENANCE_MODE.md` |
+| the Monitoring app (alerts, maintenance, the dependency map, who gets paged) | PVOS `docs/11-monitoring-app.md`, milestones D239–D244 |

@@ -126,4 +126,4 @@ node agent/companion.mjs --setup    # reconfigure (add server, change passphrase
 
 ## License
 
-GNU General Public License v3 or later. See [LICENSE](LICENSE).
+GNU General Public License v3 or later. See [LICENSE](../LICENSE).

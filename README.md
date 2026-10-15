@@ -6,7 +6,7 @@ This is a ground-up implementation in Rust: three native binaries — `pvfs` (th
 
 ## Status
 
-**Version `1.4.0` (tag `v1.4`, 2026-08-13; `v1.2`/`v1.3` tagged along the way).** 1.3 shipped the federation & sync line (replicas, write-through, TLS transport, placement + the tiered mover); 1.4 shipped serve jobs, the region arc, the streaming FUSE mount, attachment kinds, and the swarm data plane. Unreleased on main, about 550 commits past `v1.4` and what the media fleet runs: ingest sessions (doc 23) and the region model — catalogue regions, the view mount, the mover, the trash, moving the owner, monitoring (docs 26, 28–31). See the [CHANGELOG](CHANGELOG.md) and [VERSIONING.md](VERSIONING.md); ongoing work is tracked in [doc 08](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11).
+**Version `1.4.0` (tag `v1.4`, 2026-08-13; `v1.2`/`v1.3` tagged along the way).** 1.3 shipped the federation & sync line (replicas, write-through, TLS transport, placement + the tiered mover); 1.4 shipped serve jobs, the region arc, the streaming FUSE mount, attachment kinds, and the swarm data plane. Unreleased on main, about 660 commits past `v1.4` and what the media fleet runs (`v1.4-660`, 2026-10-14): ingest sessions (doc 23); the region model — catalogue regions, the view mount (writable since D217/D233), the mover, the versioned trash, moving the owner, monitoring (docs 26, 28–31); structured logs with built-in destinations and `pvfs diagnose` (docs 32, 33). See the [CHANGELOG](CHANGELOG.md) and [VERSIONING.md](VERSIONING.md); ongoing work is tracked in [doc 08](docs/08-roadmap-and-status.md); compaction is deferred by decision (doc 11).
 
 | Phase | What | State |
 |-------|------|--------|
@@ -41,6 +41,7 @@ Build locally with `cargo test --workspace`, or on a remote Linux host — see *
 - [`crates/pvfs-client`](crates/pvfs-client) — client library for the daemon
 - [`crates/pvfs-fuse`](crates/pvfs-fuse) — the FUSE filesystem behind `pvfs mount` (a node's tree, or the merged view)
 - [`crates/pvfs-companion`](crates/pvfs-companion) — `pvfs-companion`, the key vault and signing agent (doc 14)
+- [`crates/pvfs-log`](crates/pvfs-log) — the structured log record every daemon line is, and the log destinations that ship it (docs 32, 33)
 - [`apps/macos-companion/`](apps/macos-companion/) — the macOS menu-bar app around `pvfs-companion`
 - [`deploy/ansible/`](deploy/ansible/) — optional remote build, test, smoke, install pipeline (+ `pvfsd@.service`, tmpfiles)
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — Rust CI on push
@@ -76,6 +77,8 @@ See [`VERSIONING.md`](VERSIONING.md) for the layered version scheme.
 | [29-cutover-to-the-new-model.md](docs/29-cutover-to-the-new-model.md) | The cutover runbook to the new model — executed 2026-09-12 |
 | [**30-monitoring-the-fleet.md**](docs/30-monitoring-the-fleet.md) | **Monitoring** — job states, fleet health, supervision, notifications, and a worked Home Assistant build |
 | [**31-common-issues-and-fixes.md**](docs/31-common-issues-and-fixes.md) | **Common issues and fixes** — duplicates across boxes, misfiled shows, film editions, a starved watch, the arrs' recycle bin and download clients; each with the fix |
+| [32-log-events.md](docs/32-log-events.md) | **Log events** — the record every daemon line is, privacy classes, `error_kind`, and every event name PVFS logs (a test holds the code to it) |
+| [33-shipping-logs.md](docs/33-shipping-logs.md) | **Shipping logs** — the built-in destinations (Loki, Splunk HEC, syslog, GELF, Elasticsearch, OTLP, HTTPS JSON), their config and privacy levels |
 
 ## Core ideas
 

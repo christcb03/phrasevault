@@ -106,6 +106,8 @@ been kept for every op since protocol 5.
 | 14 | `BindCertificates`, and forest-bound certificates understood (a forest binds only when every box is at 14) | PVOS D192 | `v1.4-468` |
 | 15 | `CommitSigned` — events their authors signed elsewhere (a session certificate signed in a browser) | PVOS D193 | `v1.4-488` |
 | 16 | `SetRegionQuality` — what another box's header probe saw of this box's copy (mediabox probing the NAS's video) | PVOS D211 | `v1.4-541` |
+| 17 | `SetLogLevel` — a box's log level for a while, no restart (`pvfs serve log-level`) | PVOS D229 | `v1.4-618` |
+| 18 | `Diagnose` — a box's config, clock, level, jobs, stores, destinations and recent failures (`pvfs diagnose`) | PVOS D230 | `v1.4-623` |
 
 Every release tag, v1.0 to v1.4, shipped at protocol 2.
 

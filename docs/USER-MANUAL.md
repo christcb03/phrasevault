@@ -6,10 +6,11 @@ This manual covers everyday use of the `pvfs` command-line tool and sharing fore
 > Status: covers **PVFS 1.4** (forests, ACLs/tags, full daemon read/write/admin, secure blobs,
 > companion, key replacement, federation + replicas, serve jobs, regions, the streaming mount,
 > attachment kinds, and the swarm data plane) **and what main has added since, unreleased**, up to
-> the build the media fleet runs (`v1.4-549`, rolled 2026-10-04): ingest sessions (§7.12) and the
+> the build the media fleet runs (`v1.4-660`, rolled 2026-10-14): ingest sessions (§7.12) and the
 > **region model** — each box catalogues its own disk, the merged view and its mount (writable
-> since that roll; its known problems fixed by PVOS D233: §7.13), the mover, the trash, copies of the log and moving
-> the owner (§7.13). Future work is under
+> since 2026-10-04; its known problems fixed by PVOS D233: §7.13), the mover, the versioned trash,
+> copies of the log and moving the owner (§7.13) — plus log destinations, `serve log-level` and
+> `diagnose` (§10; docs 31–33). Future work is under
 > [Roadmap](#11-roadmap).
 
 ---
@@ -1312,6 +1313,11 @@ second copy of the index while it runs.
 | `pvfs serve enable\|disable\|ls\|status [job]` | Configure/inspect the daemon's background jobs (§7.11, §7.13; `serve enable --help` lists every job and what it does); bare `pvfs serve` = status. |
 | `pvfs serve exports` · `pvfs serve watch` | List the exports the `export` job keeps fresh (§7.11) · run the watcher in the foreground, ad hoc (as a daemon job: `pvfs serve enable watch`). |
 | `pvfs fleet enroll <pubkey> [--rights r\|rw\|rwa]` | Admit a box: membership + rights in one logged step (§7.9). |
+| `pvfs trash unstick [paths…] [--yes]` | Run with `sudo`: clear trash buckets the daemon's purge reports it cannot remove (`serve status`'s STUCK, a `trash_stuck` alert), usually made by root through `sudo pvfs`. Bare, it asks the daemon what is stuck and asks before each (PVOS D232). `sudo pvfs` is otherwise refused against another user's forest (D231). |
+| `pvfs serve log-level [level] [--for <minutes>]` | This box's log level for a while (`error` … `debug`, or `default`), no restart: pvfsd and its mounts take it within 5 s and go back on their own (default 60 min, at most a day). Bare, it shows the level and asks (PVOS D229). |
+| `pvfs diagnose [--this-box] [--since 1h] [--out <file>]` | One troubleshooting bundle: this box and every box it knows — build, config, clock, log level, jobs, stores, log destinations, and recent warnings and errors. Bare, it asks which boxes, how far back and where to save it (PVOS D230; doc 31). |
+| `pvfs log destinations [list\|add\|test\|remove]` · `pvfs log whois [a:…]` | Where this box's daemons ship their log records besides the journal (Loki, Splunk HEC, syslog, GELF, Elasticsearch, OTLP, HTTPS JSON; `add` asks each question) · which forest key a pseudonym in a shipped log stands for (PVOS D222d; doc 33). |
+| `pvfs recover` | Re-derive this machine's device key from the recovery phrase, asked with no echo or read from stdin — never needed on the command line (PVOS D235; §9). |
 
 Add `--json` to most commands for machine-readable output. Use `--forest <alias>` or run inside a
 mount to set the forest context for tree commands.
