@@ -14,7 +14,7 @@
 //! daemon ops on a replica. No new wire ops — no PROTO_VERSION change.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pvfs_core::engine::Engine;
 use pvfs_core::{storage, sync as psync, PvfsError};
@@ -479,6 +479,8 @@ pub struct RoutedScanWriter<'a> {
     /// This box's transport pin, so the locations it writes say WHOSE disk the
     /// bytes are on.
     pin: Option<String>,
+    /// PVOS D252 — where the route came from, to dial it again.
+    data_dir: PathBuf,
 }
 
 impl<'a> RoutedScanWriter<'a> {
@@ -487,7 +489,42 @@ impl<'a> RoutedScanWriter<'a> {
         client: &'a mut Client,
         sign: &'a dyn Fn(&[u8; 32]) -> Vec<u8>,
     ) -> Self {
-        Self { client, sign, pin: pvfs_core::storage::host_pin(data_dir) }
+        Self { client, sign, pin: pvfs_core::storage::host_pin(data_dir), data_dir: data_dir.to_path_buf() }
+    }
+
+    /// PVOS D252 — before a write goes out, a connection the owner closed
+    /// while it sat idle (a restart between passes) is replaced by a fresh
+    /// one, so the write is sent once, on a live connection. A write that
+    /// fails after it was sent is never sent again (D200): the owner may have
+    /// applied it. The caller's route holds the new connection afterwards, so
+    /// the catch-up and the next pass use it too. A failed redial fails the
+    /// write as an unreachable owner does (`Io`), never as a refusal: a scan
+    /// quarantines a refused file (D71 W4).
+    fn fresh(&mut self) -> pvfs_core::Result<()> {
+        let Some(reason) = self.client.stale() else { return Ok(()) };
+        let peer = self.client.peer_name().to_string();
+        let (age, idle) = (self.client.connected_for(), self.client.idle_for());
+        let lost = |why: String| PvfsError::Io {
+            op: "routed write".into(),
+            source: std::io::Error::other(format!(
+                "the connection to {peer} was {} after {:.1} s ({:.1} s idle), and dialing again failed: {why}",
+                reason.replace('_', " "),
+                age.as_secs_f64(),
+                idle.as_secs_f64()
+            )),
+        };
+        match replica_route(&self.data_dir, true) {
+            Ok(Some((client, _sign))) => {
+                *self.client = client;
+                pvfs_log::pv_debug!("pvfs.route.redialed", peer_addr = &peer, reason = reason,
+                    age_ms = age.as_millis() as u64, idle_ms = idle.as_millis() as u64;
+                    "pvfs: routed write: the connection to {peer} was {} after {:.1} s ({:.1} s idle); dialed again",
+                    reason.replace('_', " "), age.as_secs_f64(), idle.as_secs_f64());
+                Ok(())
+            }
+            Ok(None) => Err(lost("this box is not a replica".into())),
+            Err(e) => Err(lost(e.to_string())),
+        }
     }
 
     /// A scan finds files by local path, but the row is being written into the
@@ -508,6 +545,7 @@ impl<'a> RoutedScanWriter<'a> {
 
 impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
     fn add_folder(&mut self, parent: &str, label: &str) -> pvfs_core::Result<String> {
+        self.fresh()?;
         retry_routed(|| self.client.mkdir(parent, label, |d| (self.sign)(d)))
     }
 
@@ -519,6 +557,7 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
         mime: &str,
         content_hash: &str,
     ) -> pvfs_core::Result<String> {
+        self.fresh()?;
         retry_routed(|| {
             self.client.add_file(parent, label, size, mime, content_hash, |d| (self.sign)(d))
         })
@@ -530,26 +569,31 @@ impl pvfs_core::ScanWriter for RoutedScanWriter<'_> {
         content_hash: &str,
         size: u64,
     ) -> pvfs_core::Result<String> {
+        self.fresh()?;
         retry_routed(|| self.client.set_content_hash(file, content_hash, size, |d| (self.sign)(d)))
     }
 
     fn add_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
+        self.fresh()?;
         retry_routed(|| self.client.add_location(file, &uri, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn remove_link(&mut self, link_id: &str) -> pvfs_core::Result<()> {
         // D105 — routed like every other replica write. The wire op already
         // existed (Op::Unlink), so this needs no protocol change.
+        self.fresh()?;
         retry_routed(|| self.client.unlink(link_id, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn remove_location(&mut self, file: &str, uri: &str) -> pvfs_core::Result<()> {
         let uri = self.own(uri);
+        self.fresh()?;
         retry_routed(|| self.client.remove_location(file, &uri, |d| (self.sign)(d))).map(|_| ())
     }
 
     fn commit_region_head(&mut self, region: &str, seq: u64, hash: &str) -> pvfs_core::Result<()> {
+        self.fresh()?;
         retry_routed(|| self.client.commit_region_head(region, seq, hash, |d| (self.sign)(d)))
             .map(|_| ())
     }
