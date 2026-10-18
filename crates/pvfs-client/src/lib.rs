@@ -71,6 +71,16 @@ enum Stream {
 }
 
 impl Stream {
+    /// The socket under the stream: the Unix socket, or the TLS stream's TCP
+    /// socket (PVOS D252: [`Client::stale`] peeks it).
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            Stream::Unix(u) => u.as_raw_fd(),
+            Stream::Tls(s) => s.sock.as_raw_fd(),
+        }
+    }
+
     /// Who answers, as a log line names it (PVOS D229): `the local daemon`,
     /// or the peer's `ip:port`.
     fn peer_label(&self) -> String {
@@ -78,6 +88,39 @@ impl Stream {
             Stream::Unix(_) => "the local daemon".into(),
             Stream::Tls(s) => s.sock.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "a peer".into()),
         }
+    }
+}
+
+/// PVOS D252 — [`Client::stale`] on a socket: a peek that neither blocks nor
+/// consumes.
+fn socket_stale(fd: std::os::fd::RawFd) -> Option<&'static str> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{recv, MsgFlags};
+    let mut byte = [0u8; 1];
+    match recv(fd, &mut byte, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
+        Ok(0) => Some("peer_closed"),
+        Ok(_) => Some("unexpected_bytes"),
+        Err(Errno::EAGAIN) | Err(Errno::EINTR) => None,
+        Err(_) => Some("error"),
+    }
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn a_socket_says_whether_it_is_past_use_without_consuming_anything() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        assert_eq!(super::socket_stale(ours.as_raw_fd()), None, "live, nothing to read");
+        theirs.write_all(b"x").unwrap();
+        assert_eq!(super::socket_stale(ours.as_raw_fd()), Some("unexpected_bytes"));
+        assert_eq!(super::socket_stale(ours.as_raw_fd()), Some("unexpected_bytes"), "the peek consumed nothing");
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        assert_eq!(super::socket_stale(ours.as_raw_fd()), Some("peer_closed"));
     }
 }
 
@@ -399,6 +442,37 @@ impl Client {
             }
         }
         r
+    }
+
+    /// PVOS D252 — whether this connection is past use, asked before a
+    /// request goes out on it. The daemon writes only in answer to a request,
+    /// so between requests its socket has nothing to read. A peek that does
+    /// not block or consume says what it holds:
+    /// - nothing yet: live (`None`);
+    /// - the end of the stream: the far end closed it, as a restarting
+    ///   daemon does (`peer_closed`);
+    /// - bytes: a TLS close or a reply nobody waited for (`unexpected_bytes`);
+    /// - an error, such as a reset (`error`).
+    ///
+    /// A record rustls has already read into its own buffer is not seen
+    /// here; a request on such a connection fails as it did before.
+    pub fn stale(&self) -> Option<&'static str> {
+        socket_stale(self.stream.raw_fd())
+    }
+
+    /// The peer as it was named while connected (PVOS D236).
+    pub fn peer_name(&self) -> &str {
+        &self.peer
+    }
+
+    /// How long ago the connection was made, and how long since its last
+    /// reply (PVOS D236, D252).
+    pub fn connected_for(&self) -> std::time::Duration {
+        self.opened.elapsed()
+    }
+
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_reply.elapsed()
     }
 
     /// PVOS D236 — `to <peer>, connected <age> ago, idle <idle> before this <op>`.

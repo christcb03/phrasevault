@@ -5,6 +5,17 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **A routed write goes out on a live connection (PVOS D252).** A
+  replica's watch keeps its connection to the owner between passes. When
+  the owner closed it in between (a restart), the next pass failed with
+  `connection closed`, and only the pass after it dialed again. Before each
+  routed write the writer now peeks the socket without blocking. End of
+  stream, bytes nobody asked for, or an error means the connection is past
+  use: it dials the owner again (`pvfs.route.redialed`, debug) and sends the
+  write on the new connection. A write that fails after it was sent is
+  still not sent again: the owner may have applied it, and the next pass
+  redoes it as before. A failed redial fails the pass as an unreachable
+  owner does, and never quarantines a file.
 - **A secure put lands only when it commits (PVOS D247).** `SecurePut`
   stages the uploaded ciphertext beside the blob
   (`.<name>.pvfs-staged-<id>`), and the commit renames it over the blob. A
