@@ -5,6 +5,14 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **Every `pvfs` command asks for what it needs (PVOS D257).** At a
+  terminal, a command missing a required argument asks for it, from clap's
+  own definition (its help, and its choices when it has them, such as
+  `--kind`'s `folder` and `file`), then runs. Before, about 76 commands
+  stopped with clap's "missing" error, among them `add`, `reorder`,
+  `quality import`, `forest carry-quality`, `place … central` and `replica
+  add|repoint`. A pipe, `--json` or a redirected stderr still gets clap's
+  error: scripts pass flags.
 - **`pvfs view copies` (PVOS D255).** Every file the merged view holds
   more than once, biggest extra bytes first, with the totals: `settled`
   (two or more current copies in regions that do not drain), `in_flight`
