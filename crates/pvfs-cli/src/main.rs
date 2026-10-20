@@ -1528,6 +1528,10 @@ enum ViewCmd {
     /// Every conflicting path: two hashes at one path, or a file in one
     /// region against a folder in another
     Conflicts,
+    /// PVOS D255: every file held more than once, biggest extra bytes first:
+    /// settled (two copies in regions that do not drain), in flight (a copy
+    /// on staging beside another) or stale, with each copy's region
+    Copies,
     /// D127: for the draining regions THIS box owns, move losing or redundant
     /// copies to that region's trash (doc 26 §7.3); library regions are never
     /// touched. `--dry-run` says what would move.
@@ -7246,12 +7250,64 @@ fn run(cli: Cli) -> Result<(), PvfsError> {
             }
             Ok(())
         }
+        Cmd::View(ViewCmd::Copies) => {
+            let engine = open_for_reading(&ctx?)?;
+            let copies = engine.view_copies()?;
+            let mut drains = std::collections::HashMap::new();
+            for (id, _, _) in engine.regions()? {
+                let d = engine.region_drains(&id).unwrap_or(false);
+                drains.insert(id, d);
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "files_total": copies.files_total,
+                        "settled": copies.settled,
+                        "in_flight": copies.in_flight,
+                        "extra_bytes": copies.extra_bytes,
+                        "rows": copies.rows.iter().map(|r| serde_json::json!({
+                            "path": r.entry.rel_path,
+                            "size": r.entry.size_bytes,
+                            "kind": r.kind.as_str(),
+                            "identical": r.identical,
+                            "served": r.served,
+                            "extra_bytes": r.extra_bytes,
+                            "copies": r.entry.sources.iter().filter(|c| c.kind == "file").map(|c| serde_json::json!({
+                                "region": c.region, "size": c.size_bytes, "hash": c.content_hash,
+                                "quality": c.quality, "stale": c.stale,
+                                "drains": drains.get(&c.region).copied().unwrap_or(false),
+                            })).collect::<Vec<_>>(),
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!(
+                    "{} settled, {} in flight, {:.1} GB spent twice, of {} files",
+                    copies.settled,
+                    copies.in_flight,
+                    copies.extra_bytes as f64 / 1e9,
+                    copies.files_total
+                );
+                for r in &copies.rows {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        r.kind.as_str(),
+                        r.entry.sources.iter().filter(|c| c.kind == "file").count(),
+                        r.extra_bytes,
+                        if r.identical { "identical" } else { "different" },
+                        r.entry.rel_path
+                    );
+                }
+            }
+            engine.close()
+        }
         Cmd::View(cmd) => {
             let engine = open_for_reading(&ctx?)?;
             let entries = match &cmd {
                 ViewCmd::Ls { dir } => engine.merged_view(dir.as_deref().unwrap_or(""))?,
                 ViewCmd::Conflicts => engine.view_conflicts()?,
-                ViewCmd::Resolve { .. } | ViewCmd::Receive { .. } => unreachable!("handled above"),
+                ViewCmd::Resolve { .. } | ViewCmd::Receive { .. } | ViewCmd::Copies => unreachable!("handled above"),
             };
             if json {
                 let drains: std::collections::HashMap<String, bool> = engine
