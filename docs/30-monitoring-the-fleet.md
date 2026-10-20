@@ -407,6 +407,7 @@ a systemd timer every minute, **read-only everywhere**:
 | `pvfs region entries <id> --json` (only when a head moves) | the file lists diffed into "moved / deleted" |
 | the holder's `progress` verb (§1.3, the supervise key) | the mover: partial sizes + the receive plan |
 | `pvfs view ls <dir> --json` (cached by hash) | sizes of queued files |
+| `pvfs view copies --json` (PVOS D255; every 15 min, or when a library head moves) | the files the merged view holds more than once: settled (two copies in regions that do not drain, the card's number), in flight (a staging copy beside another), stale; each copy placed at its box's region root from that box's `stores` |
 
 It POSTs one JSON snapshot to webhook `pvfs-status`:
 

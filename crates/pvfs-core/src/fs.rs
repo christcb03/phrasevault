@@ -1117,6 +1117,83 @@ pub struct ViewCopy {
     pub stale: bool,
 }
 
+/// PVOS D255 — what a path held more than once is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopiesKind {
+    /// Two or more current copies in regions that do not drain: real
+    /// duplication, the card's number.
+    Settled,
+    /// A current copy in a draining region (staging) beside another: the
+    /// drain at work.
+    InFlight,
+    /// More than one copy only once superseded snapshots are counted.
+    Stale,
+}
+
+impl CopiesKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopiesKind::Settled => "settled",
+            CopiesKind::InFlight => "in_flight",
+            CopiesKind::Stale => "stale",
+        }
+    }
+}
+
+/// PVOS D255 — one row of [`Engine::view_copies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopiesRow {
+    pub entry: ViewEntry,
+    pub kind: CopiesKind,
+    /// One hash among the hashed copies.
+    pub identical: bool,
+    /// The region whose copy the view serves.
+    pub served: Option<NodeId>,
+    /// Every counted copy's size but the largest: the disk spent twice.
+    pub extra_bytes: u64,
+}
+
+/// PVOS D255 — [`Engine::view_copies`]: the rows, biggest extra bytes first,
+/// and the totals over the whole view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewCopies {
+    pub rows: Vec<CopiesRow>,
+    /// Merged-view files (directories not counted).
+    pub files_total: u64,
+    pub settled: u64,
+    pub in_flight: u64,
+    /// The settled rows' extra bytes.
+    pub extra_bytes: u64,
+}
+
+/// PVOS D255 — `entry` as a [`CopiesRow`], or `None` when it is held once.
+/// Counted are hashed file copies: a settled row counts its current
+/// copies in regions that do not drain, an in-flight row its current copies,
+/// a stale row all of them.
+pub fn copies_row(entry: ViewEntry, drains: &dyn Fn(&str) -> bool) -> Option<CopiesRow> {
+    let files: Vec<&ViewCopy> =
+        entry.sources.iter().filter(|c| c.kind == "file" && c.content_hash.is_some()).collect();
+    if files.len() < 2 {
+        return None;
+    }
+    let live: Vec<&ViewCopy> = files.iter().copied().filter(|c| !c.stale).collect();
+    let library: Vec<&ViewCopy> = live.iter().copied().filter(|c| !drains(&c.region)).collect();
+    let (kind, counted) = if library.len() >= 2 {
+        (CopiesKind::Settled, library)
+    } else if live.len() >= 2 && live.iter().any(|c| drains(&c.region)) {
+        (CopiesKind::InFlight, live)
+    } else {
+        (CopiesKind::Stale, files.clone())
+    };
+    let total: u64 = counted.iter().map(|c| c.size_bytes).sum();
+    let largest = counted.iter().map(|c| c.size_bytes).max().unwrap_or(0);
+    let mut hashes: Vec<&str> = files.iter().filter_map(|c| c.content_hash.as_deref()).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let served = Engine::served_copy(&entry, &crate::media::Rules::default()).map(|c| c.region.clone());
+    Some(CopiesRow { kind, identical: hashes.len() == 1, served, extra_bytes: total - largest, entry })
+}
+
 /// PVOS D233 — one row of [`Engine::region_floors`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionFloor {
@@ -3691,6 +3768,37 @@ impl Engine {
             .into_iter()
             .filter(|e| matches!(e.state, ViewState::ConflictHashes(_) | ViewState::ConflictKind))
             .collect())
+    }
+
+    /// PVOS D255 — every merged-view file held more than once, with the
+    /// totals (`pvfs view copies`; the dashboard's "multiple copies" card).
+    /// One walk of the view, as [`Self::view_conflicts`]: 0.12 s on the
+    /// owner's whole library (2026-10-19).
+    pub fn view_copies(&self) -> Result<ViewCopies> {
+        let mut drains = std::collections::HashMap::new();
+        for (id, _, _) in self.regions()? {
+            let d = self.region_drains(&id)?;
+            drains.insert(id, d);
+        }
+        let mut out = ViewCopies::default();
+        for e in self.view_paths()? {
+            if e.kind == "dir" {
+                continue;
+            }
+            out.files_total += 1;
+            let Some(row) = copies_row(e, &|r: &str| drains.get(r).copied().unwrap_or(false)) else { continue };
+            match row.kind {
+                CopiesKind::Settled => {
+                    out.settled += 1;
+                    out.extra_bytes += row.extra_bytes;
+                }
+                CopiesKind::InFlight => out.in_flight += 1,
+                CopiesKind::Stale => {}
+            }
+            out.rows.push(row);
+        }
+        out.rows.sort_by(|a, b| b.extra_bytes.cmp(&a.extra_bytes).then_with(|| a.entry.rel_path.cmp(&b.entry.rel_path)));
+        Ok(out)
     }
 
     /// D127 — the served copy of a view entry (doc 26 §7.1): for an admitted

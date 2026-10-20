@@ -66,6 +66,7 @@ pub use engine::{
 pub use error::{IntegrityReason, PvfsError, Result};
 pub use export::{ExportMode, ExportReport, ExportSkip, ExportSpec};
 pub use fs::{
+    copies_row,
     BackfillReport,
     Binding,
     BindingRow,
@@ -109,6 +110,9 @@ pub use fs::{
     UNLINK_GRACE_MS,
     UpgradeReport,
     VerifyOutcome,
+    CopiesKind,
+    CopiesRow,
+    ViewCopies,
     ViewCopy,
     ViewEntry,
     ViewState,

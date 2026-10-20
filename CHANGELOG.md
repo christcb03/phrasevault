@@ -5,6 +5,15 @@ file tracks Layer 0, the file-system engine.
 
 ## Unreleased
 
+- **`pvfs view copies` (PVOS D255).** Every file the merged view holds
+  more than once, biggest extra bytes first, with the totals: `settled`
+  (two or more current copies in regions that do not drain), `in_flight`
+  (a current copy in a draining region beside another), and `stale` (more
+  than one copy only once a superseded snapshot is counted). Each row says
+  whether the copies are identical, which copy the view serves, and the
+  extra bytes (every counted copy but the largest). Read-only, one walk of
+  the view: 0.12 s on the owner's whole library. It feeds the dashboard's
+  "multiple copies" card.
 - **A routed write goes out on a live connection (PVOS D252).** A
   replica's watch keeps its connection to the owner between passes. When
   the owner closed it in between (a restart), the next pass failed with
