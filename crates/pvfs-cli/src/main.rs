@@ -3183,6 +3183,181 @@ fn interactive_when(json: bool, stdin_tty: bool, stderr_tty: bool) -> bool {
     !json && stdin_tty && stderr_tty
 }
 
+// ---- PVOS D257: a bare command asks for what it needs ------------------------
+//
+// The workspace's first rule: never "missing --foo" at a terminal. Clap names
+// every missing required argument; for each one this asks, from clap's own
+// definition (its help, its choices), appends the answer and parses again. So
+// every command asks, including the ones added later. Non-interactive runs (a
+// pipe, --json, Ansible) keep clap's error: scripts pass flags.
+
+/// One question for one missing argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ask {
+    /// What the argument is: its help text, else its name.
+    label: String,
+    /// Its possible values, when it has them.
+    choices: Vec<String>,
+    /// Read with no echo (named like a phrase, a password, a secret, a token).
+    secret: bool,
+    /// `None` for a positional; else how to pass it (`--name`).
+    flag: Option<String>,
+    /// A positional's place, so several are appended in order.
+    index: usize,
+}
+
+fn parse_or_ask() -> Cli {
+    use std::io::IsTerminal;
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let json = argv.iter().any(|a| a == "--json");
+    let can_ask = interactive_when(json, std::io::stdin().is_terminal(), std::io::stderr().is_terminal());
+    for _ in 0..4 {
+        match Cli::try_parse_from(&argv) {
+            Ok(cli) => return cli,
+            Err(e) if can_ask && e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
+                match fill_missing(&argv, &e, &mut ask_terminal) {
+                    Some(more) if !more.is_empty() => argv.extend(more),
+                    _ => e.exit(),
+                }
+            }
+            Err(e) => e.exit(),
+        }
+    }
+    Cli::parse_from(&argv)
+}
+
+/// Ask a person at the terminal (stderr), as `prompt_line` does.
+fn ask_terminal(q: &Ask) -> Option<String> {
+    let what = if q.choices.is_empty() { q.label.clone() } else { format!("{} ({})", q.label, q.choices.join(", ")) };
+    if q.secret {
+        return rpassword::prompt_password(format!("{what} (not shown): ")).ok().filter(|v| !v.is_empty());
+    }
+    prompt_line(&what, None).ok()
+}
+
+/// The missing arguments clap named in `err`, as questions, in the order
+/// they are to be answered (flags first, then positionals by place).
+fn missing_args(argv: &[std::ffi::OsString], err: &clap::Error) -> Option<Vec<Ask>> {
+    use clap::error::{ContextKind, ContextValue};
+    use clap::CommandFactory;
+    let names: Vec<String> = match err.get(ContextKind::InvalidArg)? {
+        ContextValue::Strings(v) => v.clone(),
+        ContextValue::String(v) => vec![v.clone()],
+        _ => return None,
+    };
+    let root = Cli::command();
+    let cmd = command_for(&root, argv);
+    let mut asks = Vec::new();
+    for name in names {
+        let arg = find_arg(cmd, &root, &name)?;
+        let id = arg.get_id().as_str().to_string();
+        let label = arg
+            .get_help()
+            .map(|h| h.to_string())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| id.replace('_', " "));
+        let lower = id.to_ascii_lowercase();
+        asks.push(Ask {
+            label: label.trim().trim_end_matches('.').to_string(),
+            choices: arg.get_possible_values().iter().filter(|v| !v.is_hide_set()).map(|v| v.get_name().to_string()).collect(),
+            secret: ["phrase", "mnemonic", "password", "secret", "token"].iter().any(|w| lower.contains(w)),
+            flag: if arg.is_positional() {
+                None
+            } else {
+                Some(match (arg.get_long(), arg.get_short()) {
+                    (Some(l), _) => format!("--{l}"),
+                    (None, Some(c)) => format!("-{c}"),
+                    (None, None) => return None,
+                })
+            },
+            index: arg.get_index().unwrap_or(usize::MAX),
+        });
+    }
+    asks.sort_by_key(|a| (a.flag.is_none(), a.index));
+    Some(asks)
+}
+
+/// The subcommand `argv` names: walk down while a word is a subcommand,
+/// stepping over a flag's value.
+fn command_for<'a>(root: &'a clap::Command, argv: &[std::ffi::OsString]) -> &'a clap::Command {
+    let mut cmd = root;
+    let mut skip = false;
+    for word in argv.iter().skip(1).filter_map(|w| w.to_str()) {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            if !long.contains('=') {
+                let takes = cmd
+                    .get_arguments()
+                    .chain(root.get_arguments())
+                    .find(|a| a.get_long() == Some(long))
+                    .is_some_and(|a| a.get_action().takes_values());
+                skip = takes;
+            }
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        if let Some(sub) = cmd.find_subcommand(word) {
+            cmd = sub;
+        }
+    }
+    cmd
+}
+
+/// The argument clap rendered as `name` (`--kind <KIND>`, `-k <KIND>`,
+/// `<PARENT>`, `<FILES>...`).
+fn find_arg<'a>(cmd: &'a clap::Command, root: &'a clap::Command, name: &str) -> Option<&'a clap::Arg> {
+    let head = name.split_whitespace().next()?;
+    let all = || cmd.get_arguments().chain(root.get_arguments());
+    if let Some(long) = head.strip_prefix("--") {
+        return all().find(|a| a.get_long() == Some(long));
+    }
+    if let Some(short) = head.strip_prefix('-').and_then(|s| s.chars().next()) {
+        return all().find(|a| a.get_short() == Some(short));
+    }
+    let value = head.trim_end_matches("...").trim_start_matches('<').trim_end_matches('>');
+    cmd.get_arguments().filter(|a| a.is_positional()).find(|a| {
+        a.get_value_names()
+            .and_then(|v| v.first().map(|n| n.as_str() == value))
+            .unwrap_or_else(|| a.get_id().as_str().to_ascii_uppercase() == value)
+    })
+}
+
+/// The arguments to append once each missing one is answered; `None` when a
+/// question has no answer (clap's error then stands). An answer outside the
+/// choices is asked again, up to three times.
+fn fill_missing(
+    argv: &[std::ffi::OsString],
+    err: &clap::Error,
+    answer: &mut dyn FnMut(&Ask) -> Option<String>,
+) -> Option<Vec<std::ffi::OsString>> {
+    let mut out = Vec::new();
+    for q in missing_args(argv, err)? {
+        let mut got = None;
+        for _ in 0..3 {
+            let a = answer(&q)?;
+            let a = a.trim().to_string();
+            if !a.is_empty() && (q.choices.is_empty() || q.choices.contains(&a)) {
+                got = Some(a);
+                break;
+            }
+            if !q.choices.is_empty() {
+                eprintln!("pvfs: one of {}", q.choices.join(", "));
+            }
+        }
+        let a = got?;
+        if let Some(flag) = &q.flag {
+            out.push(flag.into());
+        }
+        out.push(a.into());
+    }
+    Some(out)
+}
+
 /// PVOS D231 — the commands that may run as a user other than the forest's:
 /// the system registry's (root's by design: `/etc/pvfs`), and creating a
 /// forest (it becomes the caller's, or the sudo caller's), and the two that
@@ -12077,7 +12252,7 @@ fn main() -> ExitCode {
     unsafe {
         let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
     }
-    let cli = Cli::parse();
+    let cli = parse_or_ask();
     let json = cli.json;
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -12359,6 +12534,100 @@ mod tests {
         assert!(e.contains("sudo -u chris pvfs"), "{e}");
         let e = refuse_root_for("make a replica", true, Some("root".into())).unwrap_err().to_string();
         assert!(e.contains("as the user its daemon will run as"), "a root shell, not sudo: {e}");
+    }
+
+    // PVOS D257 — a bare command asks for what it needs.
+    fn words(w: &[&str]) -> Vec<std::ffi::OsString> {
+        w.iter().map(|x| x.into()).collect()
+    }
+
+    /// Parse `argv`, answering every question with `answer`, as a person at
+    /// a terminal would (a filled argument can make clap ask for another).
+    fn complete(argv: &[std::ffi::OsString], answer: &mut dyn FnMut(&Ask) -> Option<String>) -> Result<Cli, clap::Error> {
+        let mut argv = argv.to_vec();
+        for _ in 0..4 {
+            match Cli::try_parse_from(&argv) {
+                Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => match fill_missing(&argv, &e, answer) {
+                    Some(more) if !more.is_empty() => argv.extend(more),
+                    _ => return Err(e),
+                },
+                other => return other,
+            }
+        }
+        Cli::try_parse_from(&argv)
+    }
+
+    #[test]
+    fn a_bare_add_asks_for_its_parent_kind_and_label() {
+        let mut asked = Vec::new();
+        let cli = complete(&words(&["pvfs", "add"]), &mut |q| {
+            asked.push(q.clone());
+            Some(match q.flag.as_deref() {
+                Some("--kind") => "folder".into(),
+                Some("--label") => "Shows".into(),
+                _ => "parent-id".into(),
+            })
+        })
+        .expect("a bare add completes once its questions are answered");
+        match cli.cmd {
+            Cmd::Add { parent, kind, label, .. } => {
+                assert_eq!((parent.as_str(), kind.as_str(), label.as_str()), ("parent-id", "folder", "Shows"))
+            }
+            _ => panic!("not add"),
+        }
+        let kind = asked.iter().find(|q| q.flag.as_deref() == Some("--kind")).expect("asked for --kind");
+        assert_eq!(kind.choices, vec!["folder".to_string(), "file".to_string()], "with its choices");
+        assert!(asked.iter().any(|q| q.flag.is_none()), "and for the positional parent");
+        assert!(asked.iter().all(|q| !q.secret));
+    }
+
+    #[test]
+    fn an_answer_outside_the_choices_is_asked_again() {
+        let mut kind_asks = 0;
+        let cli = complete(&words(&["pvfs", "add", "p", "--label", "L"]), &mut |q| {
+            assert_eq!(q.flag.as_deref(), Some("--kind"), "only --kind is missing");
+            kind_asks += 1;
+            Some(if kind_asks == 1 { "both".into() } else { "file".into() })
+        })
+        .unwrap();
+        assert_eq!(kind_asks, 2, "\"both\" is not a kind, so it asked again");
+        assert!(matches!(cli.cmd, Cmd::Add { ref kind, .. } if kind == "file"));
+    }
+
+    #[test]
+    fn every_command_can_be_completed_by_its_questions() {
+        use clap::CommandFactory;
+        fn leaves(cmd: &clap::Command, path: Vec<String>, out: &mut Vec<Vec<String>>) {
+            let subs: Vec<&clap::Command> = cmd.get_subcommands().filter(|s| s.get_name() != "help").collect();
+            if subs.is_empty() {
+                out.push(path);
+                return;
+            }
+            for s in subs {
+                let mut p = path.clone();
+                p.push(s.get_name().to_string());
+                leaves(s, p, out);
+            }
+        }
+        let mut all = Vec::new();
+        leaves(&Cli::command(), Vec::new(), &mut all);
+        let (mut asked, mut stuck) = (0, Vec::new());
+        for path in &all {
+            let mut argv = words(&["pvfs"]);
+            argv.extend(path.iter().map(std::ffi::OsString::from));
+            match Cli::try_parse_from(&argv) {
+                Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => asked += 1,
+                _ => continue,
+            }
+            let done = complete(&argv, &mut |q| Some(q.choices.first().cloned().unwrap_or_else(|| "1".into())));
+            if let Err(e) = done {
+                if e.kind() == clap::error::ErrorKind::MissingRequiredArgument {
+                    stuck.push(path.join(" "));
+                }
+            }
+        }
+        assert!(stuck.is_empty(), "these still stop on a missing argument at a terminal: {stuck:#?}");
+        assert!(asked >= 50, "the walk found the commands that need something ({asked} of {})", all.len());
     }
 
     // PVOS D198 — ask a person only when one can see the question: never
