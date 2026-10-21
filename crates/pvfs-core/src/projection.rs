@@ -2146,6 +2146,86 @@ fn require_active_author(conn: &Connection, ev: &Event, as_of_ms: u64) -> Result
     Ok(())
 }
 
+/// PVOS D265 — the nodes `ev` writes, for the control-plane write lease:
+/// exactly the nodes [`check_member_event`] checks rights on, by the same
+/// arms (a link's parent, or its child when it has none), with batch-born
+/// nodes resolved to their nearest existing ancestor as
+/// [`check_member_event_batched`] does. No catch-all: a new event kind fails
+/// to compile here until someone decides what it writes (the D100 rule).
+pub fn event_nodes(
+    conn: &Connection,
+    ev: &Event,
+    born: &std::collections::HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let resolve = |node: &str| -> String {
+        let mut cur = node.to_string();
+        for _ in 0..256 {
+            match born.get(&cur) {
+                Some(p) => cur = p.clone(),
+                None => break,
+            }
+        }
+        cur
+    };
+    let link_target = |link_id: &str| -> Result<Option<String>> {
+        let row: Option<(Option<String>, String)> = conn
+            .query_row(
+                "SELECT parent_id, child_id FROM links WHERE id = ?1",
+                params![link_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("lease link lookup"))?;
+        Ok(row.map(|(parent, child)| parent.unwrap_or(child)))
+    };
+    let one = |n: &str| Ok(vec![resolve(n)]);
+    match ev {
+        Event::AclSet { node_id, .. }
+        | Event::RegionMarked { node_id, .. }
+        | Event::RegionUnmarked { node_id, .. }
+        | Event::RegionBaseline { node_id, .. }
+        | Event::SubRegionHead { node_id, .. }
+        | Event::RegionDrainSet { node_id, .. }
+        | Event::NodePurged { node_id, .. }
+        | Event::MediaQuality { node_id, .. } => one(node_id),
+        Event::LinkCreated(l) => Ok(l.parent_id.as_deref().map(resolve).into_iter().collect()),
+        Event::NodeMovedIn { link, .. } => Ok(link.parent_id.as_deref().map(resolve).into_iter().collect()),
+        Event::NodeMovedOut { link_id, node_id, .. } => match link_target(link_id)? {
+            Some(t) => Ok(vec![t]),
+            None => one(node_id),
+        },
+        Event::LinkRemoved { link_id, .. }
+        | Event::LinkRelabeled { link_id, .. }
+        | Event::LinkReordered { link_id, .. }
+        | Event::LinkSuspended { link_id, .. }
+        | Event::LinkUnsuspended { link_id, .. } => Ok(link_target(link_id)?.into_iter().collect()),
+        Event::LinkSuperseded { old_link_id, new_link_id, .. } => {
+            let mut v: Vec<String> = link_target(old_link_id)?.into_iter().collect();
+            v.extend(link_target(new_link_id)?);
+            Ok(v)
+        }
+        Event::FileLocationAdded { file_id, .. }
+        | Event::FileLocationRemoved { file_id, .. }
+        | Event::ChunkManifestRecorded { file_id, .. } => one(file_id),
+        Event::FolderBound { folder_id, .. }
+        | Event::FolderUnbound { folder_id, .. }
+        | Event::FolderUnboundRoot { folder_id, .. } => one(folder_id),
+        Event::SecureBlobUpdated { blob_id, .. } => one(blob_id),
+        // Not about a node, or placed by the `LinkCreated` beside it (a bare
+        // node), or authorized as forest authority by its caller.
+        Event::NodeCreated(_)
+        | Event::MemberTagged { .. }
+        | Event::DeviceAuthorized { .. }
+        | Event::DeviceRevoked { .. }
+        | Event::RootRotated { .. }
+        | Event::RecoveryKeyRegistered { .. }
+        | Event::RecoveryKeyRevoked { .. }
+        | Event::CertificatesBound { .. }
+        | Event::ForestCreated { .. }
+        | Event::Unknown { .. } => Ok(Vec::new()),
+    }
+}
+
 /// Batch-aware variant of [`check_member_event`] for the live commit path
 /// (P10.0, doc 23 §9.2): one prepared batch may place a child under a parent
 /// created earlier in the same batch, or attest a file born in the same

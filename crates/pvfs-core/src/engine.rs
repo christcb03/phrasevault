@@ -4362,6 +4362,38 @@ impl Engine {
     /// Phase 2: verify each member-signed event (signature valid, author authorized,
     /// ACL satisfied) and append atomically. The events must already carry the
     /// member's signatures (see [`Event::set_author_sig`]).
+    /// PVOS D265 — the nodes these events write (for the write lease): each
+    /// event's [`projection::event_nodes`], batch-born nodes resolved as
+    /// [`Engine::commit_member_write`] resolves them.
+    pub fn write_nodes_of(&self, events: &[Event]) -> Result<Vec<String>> {
+        let created: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::NodeCreated(n) => Some(n.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut born: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ev in events {
+            if let Event::LinkCreated(l) = ev {
+                if created.contains(l.child_id.as_str()) {
+                    if let Some(p) = &l.parent_id {
+                        born.insert(l.child_id.clone(), p.clone());
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for ev in events {
+            for n in projection::event_nodes(&self.conn, ev, &born)? {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn commit_member_write(&mut self, events: Vec<Event>) -> Result<()> {
         let root = self.current_root()?;
         // P10.0 (doc 23 §9.2): a prepared batch may create a node and place
