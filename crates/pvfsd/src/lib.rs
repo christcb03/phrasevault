@@ -39,6 +39,9 @@ use rand::RngCore;
 const CHALLENGE_TTL_MS: u64 = 30_000;
 /// How long a prepared (phase-1) write awaits its signatures.
 const PREPARE_TTL_MS: u64 = 30_000;
+/// What a write under another connection's lease is told (D67 C3).
+const LEASED: &str = "this subtree is under another connection's write lease — \
+                      route the write through the daemon that serves this forest";
 /// Max decoded size of an `AddNode` inline payload — these live in the event
 /// log, so they must stay small (records, not files).
 const PAYLOAD_CAP: usize = 64 * 1024;
@@ -53,6 +56,28 @@ struct PreparedState {
     /// this prepared write commits — sessions activate, partials publish,
     /// aborts clean up. `None` for every non-ingest write.
     followup: Option<IngestFollowup>,
+}
+
+/// PVOS D265 — keep a prepared write, dropping every one past its expiry: a
+/// phase-1 write whose signatures never came used to stay until restart.
+fn stash_prepared(daemon: &Daemon, id: String, state: PreparedState) {
+    let mut held = daemon.prepared.lock().unwrap();
+    sweep_expired(&mut held, now_ms());
+    held.insert(id, state);
+}
+
+/// A swept secure put takes its staged bytes with it, as a commit that does
+/// not land does (D247).
+fn sweep_expired(held: &mut HashMap<String, PreparedState>, now: u64) {
+    held.retain(|_, p| {
+        let live = p.expiry_ms > now;
+        if !live {
+            if let Some(IngestFollowup::SecurePlace { staged, .. }) = &p.followup {
+                let _ = std::fs::remove_file(staged);
+            }
+        }
+        live
+    });
 }
 
 /// What lands when an ingest-flavored prepared write commits (doc 23 §9.4).
@@ -1520,7 +1545,7 @@ fn handle(daemon: &Daemon, principal: &Principal, req: ClientMsg, local: bool, c
             "the owner has just started and hears its followers' logs before it takes a write \
              (PVOS D182) — try again in a few seconds",
         ),
-        ClientMsg::CommitSigned { events } => do_commit_signed(daemon, principal, events),
+        ClientMsg::CommitSigned { events } => do_commit_signed(daemon, principal, events, conn),
         // P9 (doc 22): the chunk manifest — read-gated exactly like Cat.
         ClientMsg::ChunkManifest { node } => {
             let e = daemon.reader();
@@ -2524,7 +2549,7 @@ fn do_secure_put<S: io::Read + io::Write>(
     // Stash the prepared ledger event; the client signs + Commits as usual.
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
     let result_id = prepared.result_id.clone();
-    daemon.prepared.lock().unwrap().insert(
+    stash_prepared(daemon,
         prepared_id.clone(),
         PreparedState {
             author_pub: author,
@@ -2689,7 +2714,7 @@ fn do_ingest_begin(
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
     let result_id = prepared.result_id.clone();
     let prepared_id = random_id();
-    daemon.prepared.lock().unwrap().insert(
+    stash_prepared(daemon,
         prepared_id.clone(),
         PreparedState {
             author_pub: author,
@@ -2942,7 +2967,7 @@ fn do_ingest_commit(daemon: &Daemon, principal: &Principal, session: &str, file:
                     let preimages = pw.events.iter().map(|pe| hex::encode(pe.digest)).collect();
                     let result_id = pw.result_id.clone();
                     let prepared_id = random_id();
-                    daemon.prepared.lock().unwrap().insert(
+                    stash_prepared(daemon,
                         prepared_id.clone(),
                         PreparedState {
                             author_pub: author,
@@ -3103,7 +3128,7 @@ fn do_ingest_abort(
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
     let result_id = prepared.result_id.clone();
     let prepared_id = random_id();
-    daemon.prepared.lock().unwrap().insert(
+    stash_prepared(daemon,
         prepared_id.clone(),
         PreparedState {
             author_pub: author,
@@ -3210,24 +3235,27 @@ fn do_ingest_list(daemon: &Daemon, principal: &Principal, local: bool) -> Server
 /// address a link or uri rather than a node. Those are deliberately left to
 /// ACLs — a lease is a claim over a REGION of the tree, and stretching it to
 /// cover forest-wide operations would quietly make it something else.
-fn write_target(op: &WriteOp) -> Option<&str> {
+fn write_targets(op: &WriteOp) -> Vec<&str> {
     match op {
         WriteOp::Mkdir { parent, .. }
         | WriteOp::SecureCreate { parent, .. }
         | WriteOp::AddFile { parent, .. }
         | WriteOp::AddNode { parent, .. }
-        | WriteOp::Link { parent, .. } => Some(parent),
+        | WriteOp::Link { parent, .. } => vec![parent],
         WriteOp::Rm { node }
         | WriteOp::SetContentHash { node, .. }
-        | WriteOp::SetAcl { node, .. }
-        // Re-homing is a write on BOTH ends; the destination is the one that
-        // could smuggle a node INTO a leased subtree.
-        | WriteOp::Mv { node: _, new_parent: node } => Some(node),
-        WriteOp::AddLocation { file, .. } => Some(file),
-        WriteOp::CommitRegionHead { region, .. } => Some(region),
-        WriteOp::Purge { ids } => ids.first().map(String::as_str),
-        WriteOp::SetQuality { node, .. } => Some(node),
-        _ => None,
+        | WriteOp::SetAcl { node, .. } => vec![node],
+        // Re-homing is a write on BOTH ends: the destination could smuggle a
+        // node INTO a leased subtree, and the node itself could be taken OUT
+        // of one (PVOS D265 — only the destination was checked).
+        WriteOp::Mv { node, new_parent } => vec![node, new_parent],
+        WriteOp::AddLocation { file, .. } => vec![file],
+        WriteOp::CommitRegionHead { region, .. } => vec![region],
+        // Every id: a purge listing an unleased node first went unchecked on
+        // the rest (PVOS D265).
+        WriteOp::Purge { ids } => ids.iter().map(String::as_str).collect(),
+        WriteOp::SetQuality { node, .. } => vec![node],
+        _ => Vec::new(),
     }
 }
 
@@ -3401,14 +3429,8 @@ fn do_prepare_write(
     }
     // D67 C3: the lease check sits where the author is established, so no
     // write path can reach the engine having skipped it.
-    if let Some(node) = write_target(&op) {
-        if daemon.lease_denies(conn, node) {
-            return err(
-                "forbidden",
-                "this subtree is under another connection's write lease — \
-                 route the write through the daemon that serves this forest",
-            );
-        }
+    if write_targets(&op).into_iter().any(|node| daemon.lease_denies(conn, node)) {
+        return err("forbidden", LEASED);
     }
     let prepared = {
         let e = daemon.writer.lock_serving("serve: prepare");
@@ -3574,7 +3596,7 @@ fn do_prepare_write(
     let preimages = prepared.events.iter().map(|pe| hex::encode(pe.digest)).collect();
     let result_id = prepared.result_id.clone();
     let prepared_id = random_id();
-    daemon.prepared.lock().unwrap().insert(
+    stash_prepared(daemon,
         prepared_id.clone(),
         PreparedState {
             author_pub: author,
@@ -3596,7 +3618,7 @@ fn do_prepare_write(
 /// hosts their forest). The deliverer must be authenticated but needs no
 /// authority of its own: every event is verified exactly as its author's own
 /// commit would be — signature, authority, ACL — in one atomic append.
-fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEventWire>) -> ServerMsg {
+fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEventWire>, conn: u64) -> ServerMsg {
     if !matches!(principal, Principal::Key(_)) {
         return err("forbidden", "delivering signed events requires an authenticated connection");
     }
@@ -3617,6 +3639,15 @@ fn do_commit_signed(daemon: &Daemon, principal: &Principal, wire: Vec<SignedEven
             Ok(ev) => events.push(ev),
             Err(pve) => return err_from(pve),
         }
+    }
+    // PVOS D265 — pre-signed events answer to the write lease like every
+    // other write: the nodes they write, by the rights check's own rules.
+    let nodes = match daemon.reader().write_nodes_of(&events) {
+        Ok(n) => n,
+        Err(pve) => return err_from(pve),
+    };
+    if nodes.iter().any(|n| daemon.lease_denies(conn, n)) {
+        return err("forbidden", LEASED);
     }
     // The same bounded Busy retry as a two-phase commit (see do_commit),
     // with the writer released while it sleeps (D199).
@@ -3963,6 +3994,41 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PVOS D265 — an expired prepared write is dropped when another is kept,
+    // and a swept secure put takes its staged bytes with it.
+    #[test]
+    fn expired_prepared_writes_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"bytes").unwrap();
+        let state = |expiry_ms: u64, followup: Option<IngestFollowup>| PreparedState {
+            author_pub: vec![],
+            events: vec![],
+            result_id: String::new(),
+            expiry_ms,
+            followup,
+        };
+        let mut held = HashMap::new();
+        held.insert("old".to_string(), state(1_000, None));
+        held.insert(
+            "old-put".to_string(),
+            state(1_500, Some(IngestFollowup::SecurePlace { staged: staged.clone(), path: dir.path().join("p") })),
+        );
+        held.insert("live".to_string(), state(5_000, None));
+        sweep_expired(&mut held, 2_000);
+        assert_eq!(held.keys().collect::<Vec<_>>(), vec!["live"]);
+        assert!(!staged.exists(), "the swept put's staged bytes are gone");
+    }
+
+    // PVOS D265 — a move writes both ends; a purge writes every id.
+    #[test]
+    fn a_move_and_a_purge_name_every_node_they_write() {
+        let mv = WriteOp::Mv { node: "n".into(), new_parent: "p".into() };
+        assert_eq!(write_targets(&mv), vec!["n", "p"]);
+        let purge = WriteOp::Purge { ids: vec!["a".into(), "b".into(), "c".into()] };
+        assert_eq!(write_targets(&purge), vec!["a", "b", "c"]);
+    }
 
     // doc 08 §4 item 7 — a challenge nonce authorizes exactly one auth attempt
     #[test]

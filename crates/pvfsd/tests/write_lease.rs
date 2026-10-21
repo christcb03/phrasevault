@@ -150,3 +150,79 @@ fn a_key_that_may_not_write_the_roots_cannot_take_the_lease() {
     let mut w = connect(&writer);
     w.claim_write_lease(std::slice::from_ref(&root)).expect("a key that may write every root takes it");
 }
+
+/// PVOS D265 — three writes got past the lease: events delivered already
+/// signed (`CommitSigned` never asked), a move OUT of a leased subtree (only
+/// the destination was checked), and a purge whose first id was unleased
+/// (only the first was checked). The intruder holds the holder's own rights,
+/// so only the lease can refuse it.
+#[test]
+fn a_signed_event_a_move_or_a_purge_cannot_get_past_the_lease() {
+    use pvfs_core::personal::attach_sigs;
+    use pvfs_core::NodeSpec;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut engine, owner_mn) = Engine::init(dir.path()).unwrap();
+    let root = engine.identity.root_node_id.clone();
+    let key = identity::device_key(&identity::generate_mnemonic().unwrap(), "", 0).unwrap();
+    let pubkey = crypto::pubkey_bytes(&key);
+    engine.authorize_member(&owner_mn, &pubkey).unwrap();
+    // Admin too, so the purge is refused by the lease and not by its ACL.
+    engine.set_acl(&root, &Principal::Key(pubkey.clone()), acl::ACL_RWA).unwrap();
+    let folder = |label: &str| NodeSpec {
+        node_type: "folder".into(),
+        label: label.into(),
+        payload: vec![],
+        is_temp: false,
+        creation_nonce: None,
+    };
+    let control = engine.add_node(&root, folder("control")).unwrap();
+    let elsewhere = engine.add_node(&root, folder("elsewhere")).unwrap();
+    let inside = engine.add_node(&control, folder("inside")).unwrap();
+    let outside = engine.add_node(&root, folder("outside")).unwrap();
+    // Events for a node under the leased subtree, signed by the key, as a
+    // routed write or an offline signer would deliver them.
+    let prepared = engine.prepare_add_node(&pubkey, &control, folder("delivered")).unwrap();
+    let sigs = prepared.events.iter().map(|p| crypto::sign_digest(&key, &p.digest).unwrap()).collect();
+    let signed = attach_sigs(prepared.events, sigs).unwrap();
+
+    let daemon = Arc::new(Daemon::new(engine));
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("pvfsd.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    {
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _ = serve(listener, d);
+        });
+    }
+    let sign = |d: &[u8; 32]| crypto::sign_digest(&key, d).unwrap();
+    let connect = || Client::connect_signed(&sock, &pubkey, sign).unwrap();
+    let mut holder = connect();
+    holder.claim_write_lease(std::slice::from_ref(&control)).unwrap();
+    let mut intruder = connect();
+    let leased = |e: pvfs_client::ClientError| {
+        let m = e.to_string();
+        assert!(m.contains("write lease"), "refused by the lease, not something else: {m}");
+    };
+
+    // 1. Signed events under the leased subtree: refused for the intruder;
+    //    the holder delivers the very same events, so they were valid.
+    leased(intruder.commit_signed(&signed).expect_err("pre-signed events under a lease"));
+    holder.commit_signed(&signed).expect("the holder lands them");
+    let names = |c: &mut Client, n: &str| c.ls(n).unwrap().into_iter().map(|x| x.label).collect::<Vec<_>>();
+    assert!(names(&mut holder, &control).contains(&"delivered".to_string()));
+
+    // 2. A move OUT of the leased subtree.
+    leased(intruder.mv(&inside, &elsewhere, sign).expect_err("a move out of a leased subtree"));
+    assert!(names(&mut holder, &control).contains(&"inside".to_string()), "it did not move");
+
+    // 3. A purge whose first id is outside the lease.
+    leased(intruder.purge(&[outside.clone(), inside.clone()], sign).expect_err("a purge reaching into the lease"));
+    assert!(names(&mut holder, &root).contains(&"outside".to_string()), "nothing was purged");
+    assert!(names(&mut holder, &control).contains(&"inside".to_string()));
+
+    // The unleased half alone is still the intruder's to write.
+    intruder.mv(&outside, &elsewhere, sign).expect("a move outside the lease is not refused");
+    // And the holder may move what it leases.
+    holder.mv(&inside, &elsewhere, sign).expect("the holder moves out of its own lease");
+}
