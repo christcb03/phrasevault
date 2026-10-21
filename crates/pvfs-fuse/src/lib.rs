@@ -25,7 +25,7 @@ use pvfs_client::fetch::{Fetcher, SwarmProgress};
 use overlay::{GoneDir, Move, Overlay};
 use pvfs_client::hash_cache::{CacheOpts, HashCache, HashFetch, Opened, RenameCopy};
 use pvfs_core::{Engine, FilePayload, NodeId, PvfsError, ReplicaSource, TYPE_FILE};
-use pvfs_log::{content, pv_error, pv_info, pv_warn};
+use pvfs_log::{content, pv_debug, pv_error, pv_info, pv_warn};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -1359,7 +1359,17 @@ impl PvfsFs {
     }
 }
 
-fn reply_read_at(f: &std::fs::File, offset: u64, size: u32, reply: ReplyData) {
+/// PVOS D266 — what a failed read-through read answered, and why: the line
+/// that tells a gone file's ENOENT from an EIO race (the d219 CI flake).
+/// Debug: an answered read is expected, and handles itself.
+fn read_errno(rel: &str, offset: u64, size: u32, errno: i32, gone: bool, step: &str) {
+    pv_debug!("pvfs.mount.read_failed", path = content(rel), offset = offset, size = size,
+        errno = errno, gone = gone, step = step;
+        "mount: read of {rel} at {offset}+{size} answered errno {errno} (gone {gone}, at {step})");
+}
+
+/// Answer a read-through read from the part file, saying when its read fails.
+fn reply_read_at_logged(f: &std::fs::File, rel: &str, offset: u64, size: u32, reply: ReplyData) {
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; size as usize];
     match f.read_at(&mut buf, offset) {
@@ -1367,7 +1377,10 @@ fn reply_read_at(f: &std::fs::File, offset: u64, size: u32, reply: ReplyData) {
             buf.truncate(n);
             reply.data(&buf);
         }
-        Err(_) => reply.error(libc::EIO),
+        Err(_) => {
+            read_errno(rel, offset, size, libc::EIO, false, "read");
+            reply.error(libc::EIO)
+        }
     }
 }
 
@@ -1688,12 +1701,16 @@ impl Filesystem for PvfsFs {
                         hs.file = std::fs::File::open(&path).ok();
                     }
                     return match hs.file.as_ref() {
-                        Some(f) => reply_read_at(f, off, size, reply),
-                        None => reply.error(libc::EIO),
+                        Some(f) => reply_read_at_logged(f, &hs.rel, off, size, reply),
+                        None => {
+                            read_errno(&hs.rel, off, size, libc::EIO, hs.fetch.gone(), "open");
+                            reply.error(libc::EIO)
+                        }
                     };
                 }
                 Some(Err(_)) => {
                     let errno = read_failed(&self.tombstones, hs);
+                    read_errno(&hs.rel, off, size, errno, hs.fetch.gone(), "poll");
                     return reply.error(errno);
                 }
                 None => {
@@ -1702,14 +1719,21 @@ impl Filesystem for PvfsFs {
                     let (rel, held) = (hs.rel.clone(), hs.held.clone());
                     std::thread::spawn(move || match fetch.wait_range(off, len, READ_WAIT) {
                         Ok(path) => match std::fs::File::open(&path) {
-                            Ok(f) => reply_read_at(&f, off, size, reply),
-                            Err(_) => reply.error(libc::EIO),
+                            Ok(f) => reply_read_at_logged(&f, &rel, off, size, reply),
+                            Err(_) => {
+                                read_errno(&rel, off, size, libc::EIO, fetch.gone(), "open");
+                                reply.error(libc::EIO)
+                            }
                         },
                         Err(_) if fetch.gone() => {
                             bury_gone(&tombs, &rel, fetch.hash(), &held);
+                            read_errno(&rel, off, size, libc::ENOENT, true, "wait");
                             reply.error(libc::ENOENT)
                         }
-                        Err(_) => reply.error(libc::EIO),
+                        Err(_) => {
+                            read_errno(&rel, off, size, libc::EIO, false, "wait");
+                            reply.error(libc::EIO)
+                        }
                     });
                     return;
                 }

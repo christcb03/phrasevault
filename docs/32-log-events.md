@@ -232,6 +232,7 @@ anyone searching or alerting on it: say so in the CHANGELOG.
 | `pvfs.mount.dir_removed` | info | system | An rmdir was done on the boxes that held the folder. |
 | `pvfs.mount.edit_refused` | info | system | An edit through a writable view was refused (EROFS), with the reason: the bytes are on another box, the path has more than one copy, or its region is draining (PVOS D233). |
 | `pvfs.mount.gone` | info | system | A file's bytes are gone everywhere; hidden for now. |
+| `pvfs.mount.read_failed` | debug | system | A read-through read answered an error (PVOS D266): `path`, `offset`, `size`, `errno` (2 ENOENT for gone, 5 EIO), `gone`, `step` (poll, wait, open, read). Expected; it says which read answered what. |
 | `pvfs.mount.ingest_stream` | info | system | Reads proxy an in-flight ingest. |
 | `pvfs.mount.punch_failed` | warning | system | Read pieces could not be given back to the disk. |
 | `pvfs.mount.readahead_failed` | debug | system | A read-through round failed where no read was failed by it (PVOS D246): read-ahead nobody waits on, or a holder still resting after its redial window ran out (`resting`). |
