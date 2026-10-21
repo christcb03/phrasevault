@@ -40,6 +40,8 @@ pub fn request_routed(
             obj.insert(FOREST_FIELD.into(), serde_json::to_value(f).map_err(std::io::Error::other)?);
         }
     }
+    // PVOS D267 — never another user's socket at the conventional name.
+    crate::paths::check_socket(socket)?;
     let mut stream = UnixStream::connect(socket)?;
     write_msg(&mut stream, &frame)?;
     read_msg::<_, AgentResponse>(&mut stream)?.ok_or_else(|| {

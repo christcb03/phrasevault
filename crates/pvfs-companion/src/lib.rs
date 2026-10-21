@@ -46,7 +46,7 @@ pub use origins::{OriginGrant, OriginRegistry, DEFAULT_CONNECT_TTL_SECS};
 pub use pairings::{Pairing, PairingRegistry};
 pub use webagent::WebAgent;
 pub use keychain::{MemoryStore, SecretStore};
-pub use paths::{default_socket_path, default_vault_path};
+pub use paths::{check_socket, default_socket_path, default_vault_path, socket_is_ours};
 pub use policy::{ApprovalPolicy, Decision, Origin};
 pub use proto::{
     verify_code, AgentRequest, AgentResponse, ApprovalContext, ConfirmFields, ForestRef, GenesisFields, GenesisOut, KeyInfo,
