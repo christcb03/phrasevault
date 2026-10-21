@@ -110,7 +110,10 @@ fn a_read_of_a_file_its_holder_no_longer_has_is_not_found_and_the_view_moves_on(
     // PVOS D266 — at debug, so a failure's output carries every failed
     // read's errno and step (`pvfs.mount.read_failed`): the CI flake of
     // 2026-10-21 answered EIO once, and nothing said which read did.
+    // The default logger reads no environment; a daemon's does, so set one
+    // up the daemon's way, before anything logs.
     std::env::set_var("PVFS_LOG_LEVEL", "debug");
+    pvfs_log::init(pvfs_log::Config::from_env("d219_gone_reads"));
     if !fuse_available() {
         eprintln!("skipping: no /dev/fuse or fusermount on this host");
         return;
