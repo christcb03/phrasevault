@@ -1359,10 +1359,27 @@ impl PvfsFs {
     }
 }
 
+static READ_ENOENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_EIO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// PVOS D268 — how many failed read-through reads this process's mounts
+/// answered ENOENT and EIO. Some kernels turn an error answered to a
+/// page-cache read into EIO for the reader whatever the errno was, so a test
+/// that sees EIO asks here what pvfs-fuse itself said.
+pub fn read_answers() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (READ_ENOENT.load(Relaxed), READ_EIO.load(Relaxed))
+}
+
 /// PVOS D266 — what a failed read-through read answered, and why: the line
 /// that tells a gone file's ENOENT from an EIO race (the d219 CI flake).
 /// Debug: an answered read is expected, and handles itself.
 fn read_errno(rel: &str, offset: u64, size: u32, errno: i32, gone: bool, step: &str) {
+    match errno {
+        libc::ENOENT => READ_ENOENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        libc::EIO => READ_EIO.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        _ => 0,
+    };
     pv_debug!("pvfs.mount.read_failed", path = content(rel), offset = offset, size = size,
         errno = errno, gone = gone, step = step;
         "mount: read of {rel} at {offset}+{size} answered errno {errno} (gone {gone}, at {step})");
