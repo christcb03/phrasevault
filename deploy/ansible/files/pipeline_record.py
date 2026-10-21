@@ -110,33 +110,51 @@ def test_only(key):
 # ---- cargo's output -----------------------------------------------------------
 
 
+SECTION = re.compile(r"^== cargo test --no-fail-fast (.+?)\s*$")
+
+
 def parse_cargo(text):
-    """{key: {passed, failed, ignored, rerun}}, plus whether a failure named
-    no binary (a test that did not compile)."""
-    targets, current, unnamed_failure = {}, None, False
+    """{key: {passed, failed, ignored, rerun, base, exe, spec}}, plus whether
+    a failure named no binary (a test that did not compile).
+
+    A key is the binary's source and name (`tests/m2_services.rs
+    m2_services`); two packages with the same test file name (D261b: both
+    pvfs-cli and pvfsd have `tests/sigpipe.rs`) get `#2`. `exe` is the built
+    file (`sigpipe-<hash>`), and `spec` the retest section it ran in."""
+    targets, base, exe, key, unnamed_failure = {}, None, None, None, False
+    spec = None
     failed_list = []
     in_failed_list = False
     for line in text.splitlines():
+        m = SECTION.match(line)
+        if m:
+            spec = m.group(1)
+            continue
         m = RUNNING.match(line)
         if m:
-            current = f"{m.group(1)} {os.path.basename(m.group(2)).rsplit('-', 1)[0]}"
+            exe = os.path.basename(m.group(2))
+            base = f"{m.group(1)} {exe.rsplit('-', 1)[0]}"
             in_failed_list = False
             continue
         m = DOCTESTS.match(line)
         if m:
-            current = f"doc {m.group(1)}"
+            base, exe = f"doc {m.group(1)}", None
             continue
         m = RESULT.match(line)
-        if m and current:
-            targets[current] = {
+        if m and base:
+            key, n = base, 2
+            while key in targets:
+                key, n = f"{base}#{n}", n + 1
+            targets[key] = {
                 "passed": int(m.group(1)), "failed": int(m.group(2)),
                 "ignored": int(m.group(3)), "rerun": None,
+                "base": base, "exe": exe, "spec": spec,
             }
             continue
         m = RERUN.search(line)
         if m:
-            if current in targets and targets[current]["failed"]:
-                targets[current]["rerun"] = m.group(1)
+            if key in targets and targets[key]["failed"]:
+                targets[key]["rerun"] = m.group(1)
             else:
                 failed_list.append(m.group(1))
             continue
@@ -327,7 +345,8 @@ def plan(run, tree_file, repo, tests="", self_prefix="pvos"):
     if t == "not_run" or rec.get("unnamed_failure") or leaked:
         specs = ["--workspace"]
     elif t == "failed":
-        specs += [v["rerun"] for k, v in rec["targets"].items() if v.get("rerun") and k not in drop]
+        specs += [v["rerun"] for k, v in rec["targets"].items()
+                  if v.get("rerun") and v.get("base", k.split("#")[0]) not in drop]
     for s, st in rec["stages"].items():
         if s not in ("build", "test") and st not in DONE:
             stages.add(s)
@@ -344,18 +363,64 @@ def plan(run, tree_file, repo, tests="", self_prefix="pvos"):
             "tests": uniq, "drop": drop, "notes": notes}
 
 
+def filtered(spec):
+    """A spec with a test-name filter after its target runs part of a binary."""
+    t = (spec or "").split()
+    if not t or t[0] == "--workspace":
+        return len(t) > 1
+    flags = [x for x in t[2:] if x.startswith("--")]
+    takes_name = any(f in ("--test", "--bin") for f in flags)
+    return len(t) > 2 + len(flags) + (1 if takes_name else 0)
+
+
+def match_target(have, t):
+    """The record's key a rerun binary replaces, or None if it is new, or
+    "?" if it could be either of two (same file name, two packages)."""
+    if t.get("exe"):
+        hit = [k for k, v in have.items() if v.get("exe") == t["exe"]]
+        if len(hit) == 1:
+            return hit[0]
+    if t.get("spec"):
+        hit = [k for k, v in have.items() if v.get("rerun") and t["spec"].startswith(v["rerun"])]
+        if len(hit) == 1:
+            return hit[0]
+    base = t.get("base")
+    hit = [k for k, v in have.items() if v.get("base", k.split("#")[0]) == base]
+    if len(hit) == 1:
+        return hit[0]
+    return "?" if hit else None
+
+
 def merge(run, results, stages, drop="", quiet=False):
     rec = load(run)
     rcs = json.loads(stages)
-    for k in [d for d in (drop or "").split(";") if d]:
-        rec["targets"].pop(k, None)
+    notes = []
+    for d in [d for d in (drop or "").split(";") if d]:
+        hit = [k for k, v in rec["targets"].items() if v.get("base", k.split("#")[0]) == d]
+        if len(hit) == 1:
+            rec["targets"].pop(hit[0])
+        elif hit:
+            notes.append(f"{d} is in two packages; its removed file's totals were left in")
     ran = {}
     if rcs.get("test") is not None:
         with open(results, errors="replace") as f:
             targets, unnamed = parse_cargo(f.read())
         if rcs.get("whole_suite"):
             rec["targets"] = {}
-        rec["targets"].update(targets)
+        for t in targets.values():
+            if filtered(t.get("spec")):
+                notes.append(f"{t['spec']}: {t['passed']} passed, {t['failed']} failed — a filtered run, "
+                             "so the binary's totals stand until it is rerun whole")
+                continue
+            k = match_target(rec["targets"], t)
+            if k == "?":
+                notes.append(f"{t['base']} ({t.get('spec')}) matches two recorded binaries; counted as its own")
+                k = None
+            if k is None:
+                k, n = t["base"], 2
+                while k in rec["targets"]:
+                    k, n = f"{t['base']}#{n}", n + 1
+            rec["targets"][k] = t
         rec["unnamed_failure"] = unnamed_of(rcs["test"], targets, unnamed)
         rec["stages"]["test"] = test_status(rec["targets"], rec["unnamed_failure"])
         ran["test"] = sorted(targets)
@@ -369,7 +434,7 @@ def merge(run, results, stages, drop="", quiet=False):
     green = all(v in DONE for v in rec["stages"].values())
     pending = [k for k in ordered(rec["stages"]) if rec["stages"][k] not in DONE]
     return {"green": green, "pending": pending, "totals": totals_line(rec["targets"]),
-            "stages": {k: rec["stages"][k] for k in ordered(rec["stages"])}}
+            "stages": {k: rec["stages"][k] for k in ordered(rec["stages"])}, "notes": notes}
 
 
 def show(run):
@@ -442,6 +507,17 @@ def selftest():
 
     targets, unnamed = parse_cargo(CARGO_RED)
     ok(len(targets) == 4, f"four suites, got {sorted(targets)}")
+    twice = ("     Running tests/sigpipe.rs (target/debug/deps/sigpipe-aaa)\n"
+             "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+             "     Running tests/sigpipe.rs (target/debug/deps/sigpipe-bbb)\n"
+             "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+    dup, _ = parse_cargo(twice)
+    ok(sorted(dup) == ["tests/sigpipe.rs sigpipe", "tests/sigpipe.rs sigpipe#2"], f"two packages, one file name: {sorted(dup)}")
+    ok(match_target(dup, {"exe": "sigpipe-bbb", "base": "tests/sigpipe.rs sigpipe"}) == "tests/sigpipe.rs sigpipe#2", "by the built file")
+    ok(match_target(dup, {"exe": "sigpipe-ccc", "base": "tests/sigpipe.rs sigpipe"}) == "?", "ambiguous without it")
+    ok(filtered("-p pvosd --test m2_services m2_behavior_plane") and not filtered("-p pvosd --test m2_services")
+       and filtered("-p pvos-core --lib pairing") and not filtered("-p pvos-core --lib")
+       and not filtered("--workspace") and filtered("-p pvosd x") and not filtered("-p pvosd"), "which specs filter")
     ok(targets["tests/m2_services.rs m2_services"]["rerun"] == "-p pvosd --test m2_services", "cargo's rerun line")
     ok(not unnamed, "the failure has a name")
     ok(totals_line(targets).startswith("55 passed, 1 failed, 0 ignored (4 suites)"), totals_line(targets))
@@ -521,6 +597,8 @@ def selftest():
         retest = os.path.join(d, "retest.txt")
         with open(retest, "w") as f:
             f.write(CARGO_RETEST)
+        with open(retest, "w") as f:
+            f.write("== cargo test --no-fail-fast -p pvosd --test m2_services\n" + CARGO_RETEST)
         m = merge(run, retest, json.dumps({"test": 0, "smoke": 0, "cli_smoke": 0}), "tests/d260_gone.rs d260_gone")
         ok(m["green"], f"green after the retest: {m}")
         ok(m["totals"].startswith("56 passed, 0 failed, 0 ignored (4 suites)"), m["totals"])
