@@ -31,15 +31,22 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
+        id: build
         run: cargo build --workspace --all-targets
+      # PVOS D261b: every test binary runs (`--no-fail-fast`), and a test
+      # failure no longer skips clippy and the smoke — each runs once the
+      # build has, and the job still fails if any step failed.
       - name: Test (spec §14 suite)
-        run: cargo test --workspace
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo test --workspace --no-fail-fast
       - name: Clippy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         # D100 — --all-targets, so tests, benches and examples are linted too.
         # Without it the ad-hoc runs done by hand were STRICTER than the gate,
         # which is the wrong way round for a gate.
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: CLI smoke suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cargo build --release -p pvfs-cli -p pvfsd -p pvfs-companion
           PVFS_BIN="$PWD/target/release/pvfs" bash deploy/ansible/files/smoke-test.sh

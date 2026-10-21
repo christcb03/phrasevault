@@ -17,6 +17,14 @@
 #
 # The pipeline FAILS if `cargo test` fails or any CLI smoke test fails.
 # Test logs are fetched back to ./artifacts/<host>/ on the control machine.
+#
+# PVOS D261b: a failed check no longer stops the run. Every test binary runs
+# (`--no-fail-fast`), and so do the leak checks, clippy and the smoke; the
+# verdict at the end fails the run, naming each failure. Install and daemon
+# run only on a green build. Each run that built is recorded in
+# ./artifacts/runs/pvfs-<session>.json. After a change to tests or docs only,
+# `deploy/retest.sh` (`--tags retest`) reruns just the failed test binaries,
+# the changed ones, and any stage that failed or did not run.
 
 - name: PVFS pipeline — build, test, deploy
   hosts: "{{ target_hosts | default('pvfs_hosts') }}"
@@ -49,6 +57,12 @@
     # PVOS D211 — the leaked-mount check and its "before" list.
     fuse_leaks_script: "/tmp/pvfs-fuse-leaks{{ pvfs_suffix }}.sh"
     fuse_leaks_before: "/tmp/pvfs-fuse-mounts-before{{ pvfs_suffix }}.txt"
+    # PVOS D261b — the run's record on this Mac, and a retest's results.
+    record_script: "{{ playbook_dir }}/files/pipeline_record.py"
+    run_record: "{{ playbook_dir }}/artifacts/runs/pvfs{{ pvfs_suffix }}.json"
+    run_tree: "{{ playbook_dir }}/artifacts/runs/pvfs{{ pvfs_suffix }}.tree-pending.json"
+    retest_results: "/tmp/pvfs-retest-results{{ pvfs_suffix }}.txt"
+    fetched: "{{ playbook_dir }}/artifacts/{{ inventory_hostname }}"
     # How idle a build slot must be before the pipeline reclaims it (D121),
     # and the free space a run needs once the reaping is done (PVOS D201).
     reap_after_days: 2
@@ -92,6 +106,61 @@
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts.user_uid }}/bus"
 
   tasks:
+    # PVOS D261b — the tree this run syncs, by content. A run's record keeps
+    # it; a retest compares the tree now with it and refuses unless only
+    # tests and docs changed.
+    - name: Fingerprint the tree this run syncs
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      ansible.builtin.command:
+        argv: [python3, "{{ record_script }}", fingerprint, "{{ run_tree }}", "{{ playbook_dir }}/../..=pvfs"]
+      tags: [always]
+
+    # ---- retest (PVOS D261b: only what failed, after a change to tests only)
+    - name: Plan the retest
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ record_script }}"
+          - plan
+          - "{{ run_record }}"
+          - --tree
+          - "{{ run_tree }}"
+          - --repo
+          - "{{ playbook_dir }}/../.."
+          - --self
+          - pvfs
+          - --tests
+          - "{{ retest_tests | default('') }}"
+      register: retest_plan_out
+      tags: [never, retest]
+
+    - name: Read the plan
+      ansible.builtin.set_fact:
+        retest_plan: "{{ retest_plan_out.stdout | from_json }}"
+      tags: [never, retest]
+
+    - name: A retest only after a change to tests or docs
+      ansible.builtin.fail:
+        msg: "Retest refused: {{ retest_plan.why }}"
+      when: not retest_plan.ok
+      tags: [never, retest]
+
+    - name: What the retest runs
+      ansible.builtin.debug:
+        msg:
+          - "changed since the recorded run: {{ retest_plan.changed | join(', ') if retest_plan.changed else 'nothing' }}"
+          - "stages : {{ retest_plan.stages | join(', ') if retest_plan.stages else 'none — nothing failed or was left unrun' }}"
+          - "tests  : {{ retest_plan.tests | join('; ') if retest_plan.tests else 'none' }}"
+          - "notes  : {{ retest_plan.notes | join('; ') if retest_plan.notes else '-' }}"
+      tags: [never, retest]
+
     # ---- prepare ------------------------------------------------------------
     - name: Install build prerequisites
       become: true
@@ -144,7 +213,7 @@
       register: sccache_probe
       changed_when: "'linked' in sccache_probe.stdout"
       failed_when: false
-      tags: [build]
+      tags: [build, retest]
 
     - name: Install sccache from apt when the box has none
       become: true
@@ -152,7 +221,7 @@
         name: sccache
         state: present
       when: sccache_probe.rc == 3
-      tags: [build]
+      tags: [build, retest]
 
     - name: Link the apt sccache where cargo_env expects it
       ansible.builtin.file:
@@ -160,7 +229,7 @@
         dest: "{{ ansible_facts.env.HOME }}/.cargo/bin/sccache"
         state: link
       when: sccache_probe.rc == 3
-      tags: [build]
+      tags: [build, retest]
 
     # PVOS D227 — mold, which cargo_env links with. Tagged `build` like the
     # sccache tasks (not prepare+build, which `--skip-tags prepare` skips),
@@ -170,7 +239,7 @@
       ansible.builtin.apt:
         name: mold
         state: present
-      tags: [build]
+      tags: [build, retest]
 
     - name: Toolchain from rust-toolchain.toml (idempotent)
       ansible.builtin.shell: |
@@ -278,7 +347,7 @@
         state: directory
         owner: "{{ ansible_facts.user_id }}"
         mode: "0755"
-      tags: [deploy]
+      tags: [deploy, retest]
 
     - name: Sync repository to {{ pvfs_src }}
       ansible.posix.synchronize:
@@ -308,7 +377,7 @@
           # tree, which is confusing at best. Nothing under .claude/ is
           # tracked or needed to build.
           - "--exclude=.claude/"
-      tags: [deploy]
+      tags: [deploy, retest]
 
     # D100 — the build's identity, taken HERE. The source that reaches the
     # build host has no .git (see the rsync excludes), so `git describe` there
@@ -324,7 +393,7 @@
         cmd: git describe --tags --always --dirty
         chdir: "{{ playbook_dir }}/../.."
       register: build_describe
-      tags: [build]
+      tags: [build, retest]
 
     # ---- build ------------------------------------------------------------------
     - name: Build (release)
@@ -351,13 +420,13 @@
         dest: "{{ fuse_leaks_script }}"
         mode: "0755"
       when: pvfs_runs_suite | default(true) | bool
-      tags: [test, smoke]
+      tags: [test, smoke, retest]
 
     - name: The pvfs FUSE mounts before the tests
       ansible.builtin.command: "{{ fuse_leaks_script }} snapshot {{ fuse_leaks_before }}"
       changed_when: false
       when: pvfs_runs_suite | default(true) | bool
-      tags: [test, smoke]
+      tags: [test, smoke, retest]
 
     - name: Tests, then the mounts they left
       when: pvfs_runs_suite | default(true) | bool
@@ -367,13 +436,16 @@
           ansible.builtin.shell: |
             set -o pipefail
             mkdir -p "$XDG_CONFIG_HOME"
-            cargo test --workspace 2>&1 | tee {{ test_results }}
+            cargo test --workspace --no-fail-fast 2>&1 | tee {{ test_results }}
           args:
             chdir: "{{ pvfs_src }}"
             executable: /bin/bash
           environment: "{{ cargo_env | combine(suite_env) }}"
           register: test_out
           changed_when: false
+          # PVOS D261b: every binary runs (`--no-fail-fast`), and a red suite
+          # no longer stops the run; the verdict at the end fails it.
+          failed_when: false
 
         # PVOS D221 (Chris, 2026-10-05): no test is reported as ignored. A
         # manual run lives outside the suite (a cargo example); a test that
@@ -386,12 +458,63 @@
             executable: /bin/bash
           register: ignored_out
           changed_when: false
-          failed_when: ignored_out.stdout | int != 0
+          failed_when: false
       always:
         - name: No pvfs FUSE mount left behind by the tests
           ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
           register: fuse_leaks_test
           changed_when: false
+          failed_when: false
+
+    # PVOS D261b — the record and retest script's own checks, here where
+    # python3 and git are.
+    - name: Upload the pipeline record script
+      ansible.builtin.copy:
+        src: files/pipeline_record.py
+        dest: "/tmp/pvfs{{ pvfs_suffix }}-pipeline_record.py"
+        mode: "0755"
+      when: pvfs_runs_suite | default(true) | bool
+      tags: [test]
+
+    - name: The pipeline record script's self-test
+      ansible.builtin.command: python3 /tmp/pvfs{{ pvfs_suffix }}-pipeline_record.py selftest
+      register: record_selftest_out
+      changed_when: false
+      failed_when: false
+      when: pvfs_runs_suite | default(true) | bool
+      tags: [test]
+
+    # PVOS D261b — the retest's tests: each planned binary on its own (cargo's
+    # own rerun arguments; the plan accepts nothing else), then the mounts
+    # they left.
+    - name: The retest's tests, then the mounts they left
+      when: "pvfs_runs_suite | default(true) | bool and 'test' in retest_plan.stages"
+      tags: [never, retest]
+      block:
+        - name: Rerun the planned tests
+          ansible.builtin.shell: |
+            set -o pipefail
+            mkdir -p "$XDG_CONFIG_HOME"
+            : > {{ retest_results }}
+            rc=0
+            {% for spec in retest_plan.tests %}
+            echo "== cargo test --no-fail-fast {{ spec }}" | tee -a {{ retest_results }}
+            cargo test --no-fail-fast {{ spec }} 2>&1 | tee -a {{ retest_results }} || rc=1
+            {% endfor %}
+            exit $rc
+          args:
+            chdir: "{{ pvfs_src }}"
+            executable: /bin/bash
+          environment: "{{ cargo_env | combine(suite_env) }}"
+          register: retest_out
+          changed_when: false
+          failed_when: false
+      always:
+        - name: No pvfs FUSE mount left behind by the rerun tests
+          ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
+          register: fuse_leaks_test
+          changed_when: false
+          failed_when: false
 
     # ---- lint (D121) -------------------------------------------------------
     # CLIPPY IS PART OF THE PIPELINE NOW.
@@ -419,8 +542,8 @@
       environment: "{{ cargo_env }}"
       register: clippy_component
       changed_when: "'is up to date' not in clippy_component.stdout"
-      when: pvfs_runs_suite | default(true) | bool
-      tags: [test, lint]
+      when: pvfs_runs_suite | default(true) | bool and (retest_plan is not defined or 'lint' in retest_plan.stages)
+      tags: [test, lint, retest]
 
     - name: Clippy (-D warnings, all targets)
       ansible.builtin.shell: |
@@ -432,8 +555,9 @@
       environment: "{{ cargo_env }}"
       register: clippy_out
       changed_when: false
-      when: pvfs_runs_suite | default(true) | bool
-      tags: [test, lint]
+      failed_when: false
+      when: pvfs_runs_suite | default(true) | bool and (retest_plan is not defined or 'lint' in retest_plan.stages)
+      tags: [test, lint, retest]
 
     # ---- smoke (every CLI function end-to-end) ------------------------------------
     - name: Upload CLI smoke test
@@ -441,8 +565,8 @@
         src: files/smoke-test.sh
         dest: "{{ smoke_script }}"
         mode: "0755"
-      when: pvfs_runs_suite | default(true) | bool
-      tags: [smoke]
+      when: pvfs_runs_suite | default(true) | bool and (retest_plan is not defined or 'smoke' in retest_plan.stages)
+      tags: [smoke, retest]
 
     - name: Run CLI smoke tests
       ansible.builtin.shell: |
@@ -455,32 +579,122 @@
         TMPDIR: /dev/shm
       register: smoke_out
       changed_when: false
-      when: pvfs_runs_suite | default(true) | bool
-      tags: [smoke]
+      failed_when: false
+      when: pvfs_runs_suite | default(true) | bool and (retest_plan is not defined or 'smoke' in retest_plan.stages)
+      tags: [smoke, retest]
 
     - name: No pvfs FUSE mount left behind by the smoke run
       ansible.builtin.command: "{{ fuse_leaks_script }} check {{ fuse_leaks_before }}"
       register: fuse_leaks_smoke
       changed_when: false
+      failed_when: false
+      when: pvfs_runs_suite | default(true) | bool and (retest_plan is not defined or 'smoke' in retest_plan.stages or 'fuse_leaks_smoke' in retest_plan.stages)
+      tags: [smoke, retest]
+
+    # ---- the record (PVOS D261b) ------------------------------------------------
+    - name: Fetch the check results to the control machine
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ playbook_dir }}/artifacts/"
+        fail_on_missing: false
+      loop:
+        - "{{ test_results }}"
+        - "{{ clippy_results }}"
+        - "{{ smoke_results }}"
+        - "{{ retest_results }}"
       when: pvfs_runs_suite | default(true) | bool
-      tags: [smoke]
+      tags: [always]
+
+    # A run that built records itself here, before install and daemon, so a
+    # failure there still leaves a record (those two are folded in after).
+    # Install left out with `--skip-tags install` is "skipped" (a retest
+    # leaves it out too); held back by a red check, "not run".
+    - name: Record this run
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ record_script }}"
+          - record
+          - "{{ run_record }}"
+          - --tree
+          - "{{ run_tree }}"
+          - --results
+          - "{{ fetched }}{{ test_results }}"
+          - --describe
+          - "{{ build_describe.stdout | default('', true) | trim }}"
+          - --stages
+          - >-
+            {{ {'test': test_out.rc | default(none), 'fuse_leaks_test': fuse_leaks_test.rc | default(none),
+                'lint': clippy_out.rc | default(none), 'smoke': smoke_out.rc | default(none),
+                'fuse_leaks_smoke': fuse_leaks_smoke.rc | default(none),
+                'install': none if ('install' in ansible_run_tags or 'all' in ansible_run_tags) and 'install' not in ansible_skip_tags else 'skipped',
+                'daemon': none if ('daemon' in ansible_run_tags or 'all' in ansible_run_tags) and 'daemon' not in ansible_skip_tags else 'skipped'} | to_json }}
+      when: pvfs_runs_suite | default(true) | bool and build_out is defined and not (build_out.skipped | default(false))
+      tags: [always]
+
+    - name: Fold the retest's checks into the record
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ record_script }}"
+          - merge
+          - "{{ run_record }}"
+          - --results
+          - "{{ fetched }}{{ retest_results }}"
+          - --drop
+          - "{{ retest_plan.drop | join(';') }}"
+          - --stages
+          - >-
+            {{ {'test': retest_out.rc | default(none), 'whole_suite': retest_plan.tests == ['--workspace'],
+                'fuse_leaks_test': fuse_leaks_test.rc | default(none),
+                'lint': clippy_out.rc | default(none), 'smoke': smoke_out.rc | default(none),
+                'fuse_leaks_smoke': fuse_leaks_smoke.rc | default(none)} | to_json }}
+      register: retest_merge_out
+      when: pvfs_runs_suite | default(true) | bool
+      tags: [never, retest]
+
+    - name: Read the merged record
+      ansible.builtin.set_fact:
+        retest_merged: "{{ retest_merge_out.stdout | from_json }}"
+      when: retest_merge_out.stdout is defined
+      tags: [never, retest]
+
+    # Install and daemon put this build on the host; a red one is not put
+    # there. In a retest, "green" is the whole record's, but those two.
+    - name: Is the build green so far?
+      ansible.builtin.set_fact:
+        pvfs_green_so_far: >-
+          {{ (test_out.rc | default(0)) == 0 and (ignored_out.stdout | default('0') | int) == 0
+             and (fuse_leaks_test.rc | default(0)) == 0 and (clippy_out.rc | default(0)) == 0
+             and (smoke_out.rc | default(0)) == 0 and (fuse_leaks_smoke.rc | default(0)) == 0
+             and (retest_merged is not defined or (retest_merged.pending | difference(['install', 'daemon']) | length) == 0) }}
+      tags: [always]
 
     # ---- install -------------------------------------------------------------------
-    - name: Install pvfs binary to {{ pvfs_bin }}
-      become: true
-      ansible.builtin.copy:
-        src: "{{ pvfs_src }}/target/release/pvfs"
-        dest: "{{ pvfs_bin }}"
-        mode: "0755"
-        remote_src: true
-      tags: [install]
+    - name: Install a green build
+      when: pvfs_green_so_far | bool and (retest_plan is not defined or 'install' in retest_plan.stages)
+      tags: [retest]
+      block:
+        - name: Install pvfs binary to {{ pvfs_bin }}
+          become: true
+          ansible.builtin.copy:
+            src: "{{ pvfs_src }}/target/release/pvfs"
+            dest: "{{ pvfs_bin }}"
+            mode: "0755"
+            remote_src: true
+          tags: [install]
 
-    - name: Verify installed binary runs
-      ansible.builtin.command: "{{ pvfs_bin }} --version"
-      register: version_out
-      changed_when: false
-      tags: [install]
-
+        - name: Verify installed binary runs
+          ansible.builtin.command: "{{ pvfs_bin }} --version"
+          register: version_out
+          changed_when: false
+          tags: [install]
 
     # ---- daemon (pvfsd as a systemd user service — INSTALL.md Option C, automated) ----
     # Proves the *service* lifecycle on the target, not just the ad-hoc daemon the
@@ -488,195 +702,230 @@
     # client → clean stop (socket removed, doc 08 §4 item 4) → restart. The test
     # forest lives in ~/pvfs-mounts/<name>; the service is left enabled + running
     # so the host doubles as a standing daemon testbed.
-    - name: Ensure user bin / unit / mount directories exist
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        mode: "0755"
-      loop:
-        - "{{ pvfs_user_bin }}"
-        - "{{ ansible_facts.env.HOME }}/.config/systemd/user"
-        - "{{ daemon_mount }}"
-      tags: [daemon]
+    - name: The daemon, from a green build
+      when: pvfs_green_so_far | bool and (retest_plan is not defined or 'daemon' in retest_plan.stages)
+      tags: [retest]
+      block:
+        - name: Ensure user bin / unit / mount directories exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ pvfs_user_bin }}"
+            - "{{ ansible_facts.env.HOME }}/.config/systemd/user"
+            - "{{ daemon_mount }}"
+          tags: [daemon]
 
-    - name: Install user binaries (the unit runs %h/.local/bin/pvfsd)
-      ansible.builtin.copy:
-        src: "{{ pvfs_src }}/target/release/{{ item }}"
-        dest: "{{ pvfs_user_bin }}/{{ item }}"
-        mode: "0755"
-        remote_src: true
-      loop: [pvfs, pvfsd, pvfs-companion]
-      tags: [daemon]
+        - name: Install user binaries (the unit runs %h/.local/bin/pvfsd)
+          ansible.builtin.copy:
+            src: "{{ pvfs_src }}/target/release/{{ item }}"
+            dest: "{{ pvfs_user_bin }}/{{ item }}"
+            mode: "0755"
+            remote_src: true
+          loop: [pvfs, pvfsd, pvfs-companion]
+          tags: [daemon]
 
-    # D110 — the DAEMON's identity, which is the one that answers "what is this
-    # box running?" after a roll. `pvfsd --version` said a bare `pvfsd 1.4.0`
-    # until D110, so the only way to tell was to hash the binary.
-    #
-    # AFTER the install above, not with the `pvfs` check in the install stage:
-    # that binary goes to /usr/local/bin while the daemon goes to ~/.local/bin
-    # HERE, so asking earlier reads whatever pvfsd the box had before this run.
-    # The first version of this check did exactly that and failed against a
-    # stale binary while the fresh one sat unbuilt-for two lines below.
-    - name: Verify the installed daemon reports its build
-      ansible.builtin.command: "{{ pvfs_user_bin }}/pvfsd --version"
-      register: pvfsd_version_out
+        # D110 — the DAEMON's identity, which is the one that answers "what is this
+        # box running?" after a roll. `pvfsd --version` said a bare `pvfsd 1.4.0`
+        # until D110, so the only way to tell was to hash the binary.
+        #
+        # AFTER the install above, not with the `pvfs` check in the install stage:
+        # that binary goes to /usr/local/bin while the daemon goes to ~/.local/bin
+        # HERE, so asking earlier reads whatever pvfsd the box had before this run.
+        # The first version of this check did exactly that and failed against a
+        # stale binary while the fresh one sat unbuilt-for two lines below.
+        - name: Verify the installed daemon reports its build
+          ansible.builtin.command: "{{ pvfs_user_bin }}/pvfsd --version"
+          register: pvfsd_version_out
+          changed_when: false
+          failed_when: false
+          tags: [daemon]
+
+        - name: The daemon's build identity is real, not "unknown"
+          ansible.builtin.assert:
+            that:
+              - pvfsd_version_out.rc == 0
+              - "'(' in pvfsd_version_out.stdout"
+              - "'unknown' not in pvfsd_version_out.stdout"
+            fail_msg: >-
+              pvfsd reports "{{ pvfsd_version_out.stdout | default('nothing') }}".
+              A daemon that cannot name its own build cannot be verified after a
+              roll except by hashing the binary — which on the holder is the box
+              where that is hardest. Check that PVFS_BUILD reached the build.
+            quiet: true
+          tags: [daemon]
+
+        - name: Install the shared socket-dir tmpfiles snippet (doc 06 §2)
+          become: true
+          ansible.builtin.copy:
+            src: files/pvfs-tmpfiles.conf
+            dest: /etc/tmpfiles.d/pvfs.conf
+            mode: "0644"
+          tags: [daemon]
+
+        - name: Create /run/pvfs (1777) from the snippet
+          become: true
+          ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pvfs.conf
+          changed_when: false
+          tags: [daemon]
+
+        - name: Enable lingering so the user manager (and pvfsd) survives logout
+          become: true
+          ansible.builtin.command: loginctl enable-linger {{ ansible_facts.user_id }}
+          args:
+            creates: "/var/lib/systemd/linger/{{ ansible_facts.user_id }}"
+          tags: [daemon]
+
+        - name: Install the pvfsd@ user unit
+          ansible.builtin.copy:
+            src: files/pvfsd@.service
+            dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/pvfsd@.service"
+            mode: "0644"
+          tags: [daemon]
+
+        - name: Reload the user systemd manager
+          ansible.builtin.systemd:
+            scope: user
+            daemon_reload: true
+          environment: "{{ user_systemd_env }}"
+          tags: [daemon]
+
+        # PVOS D188 (found in D182's run) — the testbed is shared by every build
+        # slot, and a catalogue only moves forward: after a newer build opened it,
+        # a branch on an older schema refuses it and the stage fails for nothing.
+        # Ask THIS build; a testbed it calls newer is set aside (renamed, kept)
+        # and made again below.
+        - name: Would this build open the daemon test forest?
+          ansible.builtin.command:
+            argv: ["{{ pvfs_user_bin }}/pvfs", --json, --forest, "{{ daemon_mount }}", versions]
+          register: testbed_versions
+          changed_when: false
+          failed_when: false
+          tags: [daemon]
+
+        - name: Set aside a test forest newer than this build (made again below)
+          ansible.builtin.shell: |
+            systemctl --user stop pvfsd@{{ daemon_forest }} || true
+            mv {{ daemon_mount }} {{ daemon_mount }}.newer-schema-$(date +%s)
+          environment: "{{ user_systemd_env }}"
+          when:
+            - testbed_versions.rc == 0
+            - (testbed_versions.stdout | from_json).projection_plan.action | default('') == 'newer'
+          tags: [daemon]
+
+        - name: Ensure the daemon test forest directory exists
+          ansible.builtin.file:
+            path: "{{ daemon_mount }}"
+            state: directory
+            mode: "0755"
+          tags: [daemon]
+
+        # A disposable test forest — its recovery phrase lands in the ansible log,
+        # which is fine here; never init a real forest this way.
+        - name: Initialize the daemon test forest (first run only)
+          ansible.builtin.command:
+            cmd: "{{ pvfs_user_bin }}/pvfs forest init --mount {{ daemon_mount }}"
+            creates: "{{ daemon_mount }}/.pvfs"
+          tags: [daemon]
+
+        - name: Enable and (re)start pvfsd@{{ daemon_forest }}
+          ansible.builtin.systemd:
+            scope: user
+            name: "pvfsd@{{ daemon_forest }}"
+            enabled: true
+            state: restarted
+          environment: "{{ user_systemd_env }}"
+          tags: [daemon]
+
+        - name: Daemon answers a client over the shared socket dir
+          ansible.builtin.command:
+            cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+          environment:
+            PVFS_SOCKET_DIR: /run/pvfs
+          register: daemon_info
+          until: daemon_info.rc == 0
+          retries: 10
+          delay: 1
+          changed_when: false
+          tags: [daemon]
+
+        - name: Stop the service (graceful shutdown checkpoints + removes the socket)
+          ansible.builtin.systemd:
+            scope: user
+            name: "pvfsd@{{ daemon_forest }}"
+            state: stopped
+          environment: "{{ user_systemd_env }}"
+          tags: [daemon]
+
+        - name: Client cannot reach a stopped daemon (socket gone)
+          ansible.builtin.command:
+            cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+          environment:
+            PVFS_SOCKET_DIR: /run/pvfs
+          register: daemon_down
+          failed_when: daemon_down.rc == 0
+          changed_when: false
+          tags: [daemon]
+
+        - name: Start the daemon again and leave it running
+          ansible.builtin.systemd:
+            scope: user
+            name: "pvfsd@{{ daemon_forest }}"
+            state: started
+          environment: "{{ user_systemd_env }}"
+          tags: [daemon]
+
+        - name: Daemon is back after the restart
+          ansible.builtin.command:
+            cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
+          environment:
+            PVFS_SOCKET_DIR: /run/pvfs
+          register: daemon_info2
+          until: daemon_info2.rc == 0
+          retries: 10
+          delay: 1
+          changed_when: false
+          tags: [daemon]
+
+        - name: Capture the daemon journal for the report
+          ansible.builtin.shell: |
+            journalctl --user -u pvfsd@{{ daemon_forest }} -n 100 --no-pager \
+              > /tmp/pvfsd-journal{{ pvfs_suffix }}.txt 2>&1 || true
+          environment: "{{ user_systemd_env }}"
+          changed_when: false
+          tags: [daemon]
+
+    # PVOS D261b — install and daemon into the record: reaching here, those
+    # that ran passed (a failure in them stops the run).
+    - name: Fold install and daemon into the record
+      delegate_to: localhost
+      become: false
       changed_when: false
-      failed_when: false
-      tags: [daemon]
-
-    - name: The daemon's build identity is real, not "unknown"
-      ansible.builtin.assert:
-        that:
-          - pvfsd_version_out.rc == 0
-          - "'(' in pvfsd_version_out.stdout"
-          - "'unknown' not in pvfsd_version_out.stdout"
-        fail_msg: >-
-          pvfsd reports "{{ pvfsd_version_out.stdout | default('nothing') }}".
-          A daemon that cannot name its own build cannot be verified after a
-          roll except by hashing the binary — which on the holder is the box
-          where that is hardest. Check that PVFS_BUILD reached the build.
-        quiet: true
-      tags: [daemon]
-
-    - name: Install the shared socket-dir tmpfiles snippet (doc 06 §2)
-      become: true
-      ansible.builtin.copy:
-        src: files/pvfs-tmpfiles.conf
-        dest: /etc/tmpfiles.d/pvfs.conf
-        mode: "0644"
-      tags: [daemon]
-
-    - name: Create /run/pvfs (1777) from the snippet
-      become: true
-      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/pvfs.conf
-      changed_when: false
-      tags: [daemon]
-
-    - name: Enable lingering so the user manager (and pvfsd) survives logout
-      become: true
-      ansible.builtin.command: loginctl enable-linger {{ ansible_facts.user_id }}
-      args:
-        creates: "/var/lib/systemd/linger/{{ ansible_facts.user_id }}"
-      tags: [daemon]
-
-    - name: Install the pvfsd@ user unit
-      ansible.builtin.copy:
-        src: files/pvfsd@.service
-        dest: "{{ ansible_facts.env.HOME }}/.config/systemd/user/pvfsd@.service"
-        mode: "0644"
-      tags: [daemon]
-
-    - name: Reload the user systemd manager
-      ansible.builtin.systemd:
-        scope: user
-        daemon_reload: true
-      environment: "{{ user_systemd_env }}"
-      tags: [daemon]
-
-    # PVOS D188 (found in D182's run) — the testbed is shared by every build
-    # slot, and a catalogue only moves forward: after a newer build opened it,
-    # a branch on an older schema refuses it and the stage fails for nothing.
-    # Ask THIS build; a testbed it calls newer is set aside (renamed, kept)
-    # and made again below.
-    - name: Would this build open the daemon test forest?
       ansible.builtin.command:
-        argv: ["{{ pvfs_user_bin }}/pvfs", --json, --forest, "{{ daemon_mount }}", versions]
-      register: testbed_versions
-      changed_when: false
-      failed_when: false
-      tags: [daemon]
+        argv:
+          - python3
+          - "{{ record_script }}"
+          - merge
+          - "{{ run_record }}"
+          - --results
+          - /dev/null
+          - --quiet
+          - --stages
+          - >-
+            {{ {'install': 0 if (version_out.rc is defined) else none,
+                'daemon': 0 if (daemon_info2.rc is defined) else none} | to_json }}
+      register: install_merge_out
+      when: >-
+        pvfs_runs_suite | default(true) | bool and (version_out.rc is defined or daemon_info2.rc is defined)
+        and (retest_plan is defined or (build_out is defined and not (build_out.skipped | default(false))))
+      tags: [always]
 
-    - name: Set aside a test forest newer than this build (made again below)
-      ansible.builtin.shell: |
-        systemctl --user stop pvfsd@{{ daemon_forest }} || true
-        mv {{ daemon_mount }} {{ daemon_mount }}.newer-schema-$(date +%s)
-      environment: "{{ user_systemd_env }}"
-      when:
-        - testbed_versions.rc == 0
-        - (testbed_versions.stdout | from_json).projection_plan.action | default('') == 'newer'
-      tags: [daemon]
-
-    - name: Ensure the daemon test forest directory exists
-      ansible.builtin.file:
-        path: "{{ daemon_mount }}"
-        state: directory
-        mode: "0755"
-      tags: [daemon]
-
-    # A disposable test forest — its recovery phrase lands in the ansible log,
-    # which is fine here; never init a real forest this way.
-    - name: Initialize the daemon test forest (first run only)
-      ansible.builtin.command:
-        cmd: "{{ pvfs_user_bin }}/pvfs forest init --mount {{ daemon_mount }}"
-        creates: "{{ daemon_mount }}/.pvfs"
-      tags: [daemon]
-
-    - name: Enable and (re)start pvfsd@{{ daemon_forest }}
-      ansible.builtin.systemd:
-        scope: user
-        name: "pvfsd@{{ daemon_forest }}"
-        enabled: true
-        state: restarted
-      environment: "{{ user_systemd_env }}"
-      tags: [daemon]
-
-    - name: Daemon answers a client over the shared socket dir
-      ansible.builtin.command:
-        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
-      environment:
-        PVFS_SOCKET_DIR: /run/pvfs
-      register: daemon_info
-      until: daemon_info.rc == 0
-      retries: 10
-      delay: 1
-      changed_when: false
-      tags: [daemon]
-
-    - name: Stop the service (graceful shutdown checkpoints + removes the socket)
-      ansible.builtin.systemd:
-        scope: user
-        name: "pvfsd@{{ daemon_forest }}"
-        state: stopped
-      environment: "{{ user_systemd_env }}"
-      tags: [daemon]
-
-    - name: Client cannot reach a stopped daemon (socket gone)
-      ansible.builtin.command:
-        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
-      environment:
-        PVFS_SOCKET_DIR: /run/pvfs
-      register: daemon_down
-      failed_when: daemon_down.rc == 0
-      changed_when: false
-      tags: [daemon]
-
-    - name: Start the daemon again and leave it running
-      ansible.builtin.systemd:
-        scope: user
-        name: "pvfsd@{{ daemon_forest }}"
-        state: started
-      environment: "{{ user_systemd_env }}"
-      tags: [daemon]
-
-    - name: Daemon is back after the restart
-      ansible.builtin.command:
-        cmd: "{{ pvfs_user_bin }}/pvfs --json remote --forest {{ daemon_mount }} --anon info"
-      environment:
-        PVFS_SOCKET_DIR: /run/pvfs
-      register: daemon_info2
-      until: daemon_info2.rc == 0
-      retries: 10
-      delay: 1
-      changed_when: false
-      tags: [daemon]
-
-    - name: Capture the daemon journal for the report
-      ansible.builtin.shell: |
-        journalctl --user -u pvfsd@{{ daemon_forest }} -n 100 --no-pager \
-          > /tmp/pvfsd-journal{{ pvfs_suffix }}.txt 2>&1 || true
-      environment: "{{ user_systemd_env }}"
-      changed_when: false
-      tags: [daemon]
+    - name: Read the record after install and daemon
+      ansible.builtin.set_fact:
+        retest_merged: "{{ install_merge_out.stdout | from_json }}"
+      when: retest_plan is defined and install_merge_out.stdout is defined
+      tags: [never, retest]
 
 # ---- report ----------------------------------------------------------------------
     - name: Fetch test results to control machine
@@ -689,7 +938,7 @@
         - "{{ clippy_results }}"
         - "{{ smoke_results }}"
         - /tmp/pvfsd-journal{{ pvfs_suffix }}.txt
-      tags: [report]
+      tags: [report, retest]
 
     # D91 — the summary used to read `test_out.stdout_lines[-1]`, and the LAST
     # `test result:` line of a cargo run is always the final crate's doc-tests,
@@ -718,10 +967,44 @@
           # Honest about not having run. A recap that claims a check passed
           # when it was skipped is worse than omitting it — that is the same
           # failure as the "0 passed; 0 failed" recap D91 fixed below.
-          - "clippy  : {{ 'clean (-D warnings, --all-targets)' if clippy_out is defined and not clippy_out.skipped | default(false) else 'NOT RUN here' }}"
+          - "clippy  : {{ ('clean (-D warnings, --all-targets)' if clippy_out.rc == 0 else 'FAILED (see ' ~ clippy_results ~ ')') if (clippy_out.rc is defined) else 'NOT RUN here' }}"
           - "tests   : {{ test_totals.stdout | default('see artifacts') }}"
           - "smoke   : {{ smoke_out.stdout_lines | default([]) | select('match', '^smoke results') | list | last | default('see artifacts') }}"
           - "mounts  : tests {{ fuse_leaks_test.stdout_lines | default(['not checked']) | select('match', '^fuse leaks') | list | last | default('not checked') }}; smoke {{ fuse_leaks_smoke.stdout_lines | default(['not checked']) | select('match', '^fuse leaks') | list | last | default('not checked') }}"
           - "binary  : {{ version_out.stdout | default('n/a') }}"
           - "daemon  : {{ daemon_info2.stdout | default('not run') }}"
+          - "record  : {{ run_record }} (deploy/retest.sh reruns only what failed)"
       tags: [report]
+
+    - name: Retest summary
+      ansible.builtin.debug:
+        msg:
+          - "reran     : {{ retest_plan.tests | join('; ') if retest_plan.tests else 'no tests' }}{{ (' + ' ~ (retest_plan.stages | reject('equalto', 'test') | join(', '))) if (retest_plan.stages | reject('equalto', 'test') | list) else '' }}"
+          - "tests now : {{ retest_merged.totals | default('-') }} (the recorded run's binaries, with the rerun ones replaced)"
+          - "stages    : {{ retest_merged.stages | default({}) | to_json }}"
+          - "results   : {{ fetched }}{{ retest_results }}"
+      when: retest_merged is defined
+      tags: [never, retest]
+
+    # ---- verdict (PVOS D261b) -------------------------------------------------------
+    # Every check above ran even when an earlier one failed: only a failed
+    # build stops a run. This fails it, naming each that failed. `always`, so
+    # a partial run (`--tags test`) still fails on a red test, and a retest
+    # fails while anything in its record is still red.
+    - name: Pipeline verdict
+      ansible.builtin.fail:
+        msg: "FAILED: {{ pipeline_failures | join('; ') }}"
+      vars:
+        pipeline_failures: >-
+          {{ (['tests: ' ~ (test_totals.stdout | default(test_results))] if (test_out.rc | default(0)) != 0 else [])
+           + (['an ignored test, not allowed (D221)'] if (ignored_out.stdout | default('0') | int) != 0 else [])
+           + (['a FUSE mount left by the tests'] if (fuse_leaks_test.rc | default(0)) != 0 else [])
+           + (['the record script self-test: ' ~ (record_selftest_out.stdout | default('') ~ record_selftest_out.stderr | default(''))]
+              if (record_selftest_out.rc | default(0)) != 0 else [])
+           + (['clippy (' ~ clippy_results ~ ')'] if (clippy_out.rc | default(0)) != 0 else [])
+           + (['the CLI smoke (' ~ smoke_results ~ ')'] if (smoke_out.rc | default(0)) != 0 else [])
+           + (['a FUSE mount left by the smoke'] if (fuse_leaks_smoke.rc | default(0)) != 0 else [])
+           + (['after the retest: ' ~ retest_merged.totals ~ '; still red: ' ~ (retest_merged.pending | join(', '))]
+              if (retest_merged is defined and not retest_merged.green) else []) }}
+      when: pipeline_failures | length > 0
+      tags: [always]
