@@ -107,6 +107,10 @@ fn not_found<T: std::fmt::Debug>(r: std::io::Result<T>) -> bool {
 
 #[test]
 fn a_read_of_a_file_its_holder_no_longer_has_is_not_found_and_the_view_moves_on() {
+    // PVOS D266 — at debug, so a failure's output carries every failed
+    // read's errno and step (`pvfs.mount.read_failed`): the CI flake of
+    // 2026-10-21 answered EIO once, and nothing said which read did.
+    std::env::set_var("PVFS_LOG_LEVEL", "debug");
     if !fuse_available() {
         eprintln!("skipping: no /dev/fuse or fusermount on this host");
         return;
