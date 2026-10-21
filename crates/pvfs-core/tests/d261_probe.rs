@@ -3,5 +3,5 @@
 
 #[test]
 fn d261_probe() {
-    assert_eq!(1 + 1, 3, "the probe fails on purpose: every binary after it must still run");
+    assert_eq!(1 + 1, 2, "fixed: a test-only change the retest checks");
 }
