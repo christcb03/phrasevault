@@ -51,6 +51,19 @@ fn row(rel: &str, kind: &str, size: u64, hash: Option<String>) -> RegionEntry {
     }
 }
 
+/// PVOS D268 — a read of a gone file: "not found", or the EIO some kernels
+/// make of it (an error answered to a page-cache read reaches the reader as
+/// EIO there) — but only when pvfs-fuse itself answered ENOENT, so a mount
+/// that answered EIO still fails.
+fn reads_as_gone(r: &std::io::Result<usize>, before: (u64, u64)) -> bool {
+    let after = pvfs_fuse::read_answers();
+    match r {
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(e) if e.raw_os_error() == Some(libc::EIO) => after.0 > before.0 && after.1 == before.1,
+        _ => false,
+    }
+}
+
 #[test]
 fn a_file_half_read_through_the_view_reads_to_its_end_after_its_holder_trashes_it() {
     if !fuse_available() {
@@ -209,7 +222,9 @@ fn a_file_half_read_through_the_view_reads_to_its_end_after_its_holder_trashes_i
         pvfs_fuse::spawn_view_mount_with(&data_dir, mnt2.path(), opts, source()).unwrap(),
         mnt2.path(),
     );
+    let before = pvfs_fuse::read_answers();
     let late = std::fs::read(mnt2.path().join("TV/Show/ep.mkv")).map(|b| b.len());
-    assert!(matches!(&late, Err(e) if e.kind() == ErrorKind::NotFound), "a late open of a stale view: not found, got {late:?}");
+    assert!(reads_as_gone(&late, before), "a late open of a stale view: not found, got {late:?} (answers {:?} → {:?})",
+        before, pvfs_fuse::read_answers());
     assert!(session.unmount(), "the mount is gone before its directory (D211)");
 }

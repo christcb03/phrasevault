@@ -101,6 +101,19 @@ fn head(e: &mut Engine, r: &str, seed: &pvfs_core::Mnemonic, seq: u64, rows: &[R
     e.install_region_snapshot(&r.to_string(), seq, &manifest, source).unwrap();
 }
 
+/// PVOS D268 — a read of a gone file: "not found", or the EIO some kernels
+/// make of it (an error answered to a page-cache read reaches the reader as
+/// EIO there) — but only when pvfs-fuse itself answered ENOENT, so a mount
+/// that answered EIO still fails.
+fn reads_as_gone(r: &std::io::Result<usize>, before: (u64, u64)) -> bool {
+    let after = pvfs_fuse::read_answers();
+    match r {
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(e) if e.raw_os_error() == Some(libc::EIO) => after.0 > before.0 && after.1 == before.1,
+        _ => false,
+    }
+}
+
 fn not_found<T: std::fmt::Debug>(r: std::io::Result<T>) -> bool {
     matches!(&r, Err(e) if e.kind() == ErrorKind::NotFound)
 }
@@ -202,8 +215,10 @@ fn a_read_of_a_file_its_holder_no_longer_has_is_not_found_and_the_view_moves_on(
     let aside = tmp.path().join("aside");
     std::fs::create_dir_all(&aside).unwrap();
     std::fs::rename(files.join("TV/Show/ep.mkv"), aside.join("ep.mkv")).unwrap();
+    let before = pvfs_fuse::read_answers();
     let read = std::fs::read(&ep).map(|b| b.len());
-    assert!(matches!(&read, Err(e) if e.kind() == ErrorKind::NotFound), "a gone file reads as not found: {read:?}");
+    assert!(reads_as_gone(&read, before), "a gone file reads as not found: {read:?} (answers {:?} → {:?})",
+        before, pvfs_fuse::read_answers());
     assert_eq!(names(&show), vec!["back.mkv"], "and leaves the listing at once");
     std::thread::sleep(Duration::from_millis(1_100)); // the kernel's 1 s entry cache
     assert!(not_found(std::fs::metadata(&ep)), "stat says so too");
